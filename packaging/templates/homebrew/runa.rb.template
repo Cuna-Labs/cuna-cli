@@ -1,0 +1,20 @@
+class Runa < Formula
+  desc "Runa cloud-agent CLI"
+  homepage "https://runacode.io"
+  url "@@TARBALL_URL@@"
+  version "@@VERSION@@"
+  sha256 "@@TARBALL_SHA256@@"
+  license "Apache-2.0"
+
+  depends_on "node@22"
+
+  def install
+    system "npm", "install", "--global", "--ignore-scripts", "--prefix", libexec, cached_download
+    bin.install_symlink libexec/"bin/runa"
+  end
+
+  test do
+    output = shell_output("#{bin}/runa self-test --offline --json")
+    assert_match "@@VERSION@@", output
+  end
+end
