@@ -423,6 +423,7 @@ export class RunaRuntimeBoundary {
       ownerId: input.ownerId,
       ...(input.leaseMs === undefined ? {} : { leaseMs: input.leaseMs }),
       now: this.#clock(),
+      clock: this.#clock,
     });
     try {
       const { supervisor } = this.#syncRegistry.connect(input.configuration, this.#clock);
