@@ -89,7 +89,7 @@ async function mutateFirstReceipt(fixture, mutate) {
   await writeFile(fixture.firstReceipt, `${JSON.stringify(receipt, null, 2)}\n`);
 }
 
-test("complete platform receipts are never elevated to release authorization", async () => {
+test("TC-053-12 complete platform receipts are never elevated to release authorization", async () => {
   const fixture = await createAdmissionFixture();
   await assert.doesNotReject(verifyAdmission(fixture));
   const admission = JSON.parse(await readFile(path.join(fixture.root, "admission.json"), "utf8"));
@@ -99,7 +99,7 @@ test("complete platform receipts are never elevated to release authorization", a
   assert.ok(admission.limitations.includes("NO_AUTHENTICATED_RECEIPT_OBSERVER"));
 });
 
-test("release admission rejects failed or missing uninstall cleanup", async () => {
+test("TC-053-08 release admission rejects failed or missing uninstall cleanup", async () => {
   const failed = await createAdmissionFixture();
   await mutateFirstReceipt(failed, (receipt) => { receipt.uninstallCleanup = "FAIL"; });
   await assert.rejects(verifyAdmission(failed), /installed-artifact gates/);
@@ -109,13 +109,13 @@ test("release admission rejects failed or missing uninstall cleanup", async () =
   await assert.rejects(verifyAdmission(missing), /keys differ/);
 });
 
-test("release admission rejects unknown receipt fields", async () => {
+test("TC-053-09 release admission rejects unknown receipt fields", async () => {
   const fixture = await createAdmissionFixture();
   await mutateFirstReceipt(fixture, (receipt) => { receipt.unverifiedClaim = "PASS"; });
   await assert.rejects(verifyAdmission(fixture), /keys differ/);
 });
 
-test("release admission rejects stale or future receipts", async () => {
+test("TC-053-09 release admission rejects stale or future receipts", async () => {
   const stale = await createAdmissionFixture();
   await mutateFirstReceipt(stale, (receipt) => { receipt.observedAt = "2020-01-01T00:00:00.000Z"; });
   await assert.rejects(verifyAdmission(stale), /receipt is stale/);
@@ -125,7 +125,7 @@ test("release admission rejects stale or future receipts", async () => {
   await assert.rejects(verifyAdmission(future), /observedAt is in the future/);
 });
 
-test("release admission cannot widen receipt freshness beyond 24 hours", async () => {
+test("TC-053-09 release admission cannot widen receipt freshness beyond 24 hours", async () => {
   const fixture = await createAdmissionFixture();
   await assert.rejects(
     execute(process.execPath, [

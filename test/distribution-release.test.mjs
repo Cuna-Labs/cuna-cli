@@ -285,7 +285,7 @@ test("receipt verification rejects stale evidence", async () => {
   await assert.rejects(verifyReceipts(fixture, receipts), /receipt is stale/);
 });
 
-test("actual local artifact evidence is useful but can never authorize release", async () => {
+test("TC-053-04/08/12 actual local artifact uses its public shim, cleans up, and cannot authorize release", async () => {
   const root = await resources.createTempDirectory("runa-local-evidence-test-");
   const output = path.join(root, "local-evidence");
   const generated = JSON.parse((await execute(node, [
