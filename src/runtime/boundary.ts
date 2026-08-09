@@ -129,6 +129,7 @@ export class RunaRuntimeBoundary {
   readonly #syncHandles = new Map<string, RuntimeSyncHandle>();
   #activeTabId: string | undefined;
   #hostTerminalLease: HostTerminalLease | undefined;
+  #startupEvidenceExpiresAt = 0;
   #closed = false;
 
   constructor(options: RuntimeBoundaryOptions) {
@@ -169,6 +170,7 @@ export class RunaRuntimeBoundary {
       this.#daemon.transition("recovery_required", "local_runtime_evidence_unproven", this.#clock());
       throw runtimeFailure("remote_state_unproven", "The local runtime endpoint or durable state is not verified.");
     }
+    this.#startupEvidenceExpiresAt = evidence.expiresAt;
     return this.#daemon.transition("ready", "local_runtime_verified", this.#clock());
   }
 
@@ -423,7 +425,7 @@ export class RunaRuntimeBoundary {
       now: this.#clock(),
     });
     try {
-      const { supervisor } = this.#syncRegistry.connect(input.configuration);
+      const { supervisor } = this.#syncRegistry.connect(input.configuration, this.#clock);
       supervisor.beginReconciliation("runtime_start_requires_authoritative_manifest");
       let closed = false;
       const handle: RuntimeSyncHandle = Object.freeze({
@@ -649,6 +651,13 @@ export class RunaRuntimeBoundary {
 
   #assertReady(): void {
     this.#assertOpen();
+    if (
+      this.#daemon.snapshot().state === "ready" &&
+      this.#startupEvidenceExpiresAt <= this.#clock()
+    ) {
+      this.#daemon.transition("degraded", "startup_evidence_expired", this.#clock());
+      this.#daemon.transition("recovery_required", "runtime_evidence_refresh_required", this.#clock());
+    }
     if (this.#daemon.snapshot().state !== "ready") {
       throw runtimeFailure("remote_state_unproven", "The local runtime is not in a verified ready state.");
     }

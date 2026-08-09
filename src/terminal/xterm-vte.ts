@@ -124,6 +124,7 @@ export class XtermViewportAdapter {
   #responseWindowStartedAt = 0;
   #responseWindowEvents = 0;
   #responseWindowBytes = 0;
+  #cursorVisible = true;
   #disposed = false;
 
   constructor(options: XtermViewportOptions) {
@@ -169,6 +170,14 @@ export class XtermViewportAdapter {
       // being retained in the headless VTE link service.
       this.#terminal.parser.registerOscHandler(identifier, () => true);
     }
+    this.#terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
+      if (params.some((value) => value === 25 || (Array.isArray(value) && value.includes(25)))) this.#cursorVisible = true;
+      return false;
+    });
+    this.#terminal.parser.registerCsiHandler({ prefix: "?", final: "l" }, (params) => {
+      if (params.some((value) => value === 25 || (Array.isArray(value) && value.includes(25)))) this.#cursorVisible = false;
+      return false;
+    });
     if (options.onTerminalResponse !== undefined) {
       this.#terminal.onData((value) => this.#queueTerminalResponse("data", this.#encoder.encode(value)));
       this.#terminal.onBinary((value) => this.#queueTerminalResponse(
@@ -310,9 +319,21 @@ export class XtermViewportAdapter {
   #capture(outputSequence: bigint, replayCursor: bigint): ViewportSnapshot {
     const buffer = this.#terminal.buffer.active;
     const cells: string[] = [];
+    const displayWidths: number[] = [];
     for (let row = 0; row < this.#terminal.rows; row += 1) {
       const line = buffer.getLine(buffer.viewportY + row);
       cells.push(line?.translateToString(true) ?? "");
+      let visibleWidth = 0;
+      if (line !== undefined) {
+        for (let column = 0; column < this.#terminal.cols; column += 1) {
+          const cell = line.getCell(column);
+          const characters = cell?.getChars() ?? "";
+          if (characters !== "" && characters !== " ") {
+            visibleWidth = column + Math.max(1, cell?.getWidth() ?? 1);
+          }
+        }
+      }
+      displayWidths.push(visibleWidth);
     }
     return this.#registry.applyRenderedFrame({
       tabId: this.#tabId,
@@ -320,11 +341,14 @@ export class XtermViewportAdapter {
       outputSequence,
       replayCursor,
       cells,
+      displayWidths,
+      cursorX: buffer.cursorX,
+      cursorY: buffer.cursorY,
       modes: {
         bracketedPaste: this.#terminal.modes.bracketedPasteMode,
         mouse: this.#terminal.modes.mouseTrackingMode !== "none",
         alternateScreen: buffer.type === "alternate",
-        cursorVisible: true,
+        cursorVisible: this.#cursorVisible,
       },
     });
   }

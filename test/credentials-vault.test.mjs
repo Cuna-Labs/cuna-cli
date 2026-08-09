@@ -107,6 +107,21 @@ test("vault rotates versioned credentials and rejects stale compare-and-swap rev
   second.dispose();
 });
 
+test("expired credentials fail closed and status never reports them as present", async () => {
+  const backend = new MemorySecureBackend();
+  let now = NOW;
+  const vault = new CredentialVault({ backend, clock: () => now });
+  const material = SecretMaterial.fromUtf8("short-lived-refresh");
+  await vault.rotate({ binding: BINDING, material, expiresAt: NOW + 1 });
+  material.dispose();
+  assert.equal((await vault.status(BINDING)).state, "present");
+  now = NOW + 1;
+  assert.equal(await vault.load(BINDING), undefined);
+  const expired = await vault.status(BINDING);
+  assert.equal(expired.state, "expired");
+  assert.equal(expired.expiresAt, NOW + 1);
+});
+
 test("atomic backend failure preserves the previously valid credential", async () => {
   const backend = new MemorySecureBackend();
   const vault = new CredentialVault({ backend, clock: () => NOW });
