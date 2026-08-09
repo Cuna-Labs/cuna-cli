@@ -56,9 +56,11 @@ export function createHumanAuthClient(input: {
   readonly anonymous: HttpTransport;
   readonly authenticated: (accessToken: string) => HttpTransport;
 }): HumanAuthClient {
-  return Object.freeze({
+  const client: HumanAuthClient = {
     async bootstrap(signal) {
-      return decodeCliAuthBootstrap(await input.anonymous.request({ method: "GET", path: "/v1/cli-auth/bootstrap", signal }));
+      return decodeCliAuthBootstrap(await input.anonymous.request({
+        method: "GET", path: "/v1/cli-auth/bootstrap", ...(signal === undefined ? {} : { signal }),
+      }));
     },
     async createContinuation(request) {
       const response = await input.anonymous.request({
@@ -72,7 +74,7 @@ export function createHumanAuthClient(input: {
           profile: request.profile,
           intent_class: request.intentClass,
         },
-        signal: request.signal,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
       return decodeCliContinuationIssued(response, { browserOrigin: request.browserOrigin, state: request.state });
     },
@@ -82,7 +84,7 @@ export function createHumanAuthClient(input: {
         method: "GET",
         path: `/v1/cli-auth/continuations/${id}`,
         continuationSecret: request.secret,
-        signal: request.signal,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
       }), request.id);
     },
     async cancel(request) {
@@ -91,7 +93,7 @@ export function createHumanAuthClient(input: {
         method: "POST",
         path: `/v1/cli-auth/continuations/${id}/cancel`,
         continuationSecret: request.secret,
-        signal: request.signal,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
       }), request.id);
     },
     async exchange(request) {
@@ -105,7 +107,7 @@ export function createHumanAuthClient(input: {
           code_verifier: request.codeVerifier,
           redirect_uri: request.redirectUri,
         },
-        signal: request.signal,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
       }));
     },
     async refresh(request) {
@@ -118,22 +120,23 @@ export function createHumanAuthClient(input: {
           client_instance_id: request.clientInstanceId,
           profile: request.profile,
         },
-        signal: request.signal,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
       }));
     },
     async context(accessToken, signal) {
       return decodeCliIdentityContext(await input.authenticated(accessToken).request({
         method: "GET",
         path: "/v1/cli-auth/context",
-        signal,
+        ...(signal === undefined ? {} : { signal }),
       }));
     },
     async logout(accessToken, signal) {
       return decodeRevocation(await input.authenticated(accessToken).request({
         method: "POST",
         path: "/v1/cli-auth/logout",
-        signal,
+        ...(signal === undefined ? {} : { signal }),
       }));
     },
-  });
+  };
+  return Object.freeze(client);
 }

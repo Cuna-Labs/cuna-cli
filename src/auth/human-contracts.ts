@@ -1,10 +1,9 @@
 import { EXIT_CODES, RunaError } from "../core/errors.js";
 import { isObject } from "../core/validation.js";
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const OPAQUE_43 = /^[A-Za-z0-9_-]{43}$/u;
-const STATE = /^[A-Za-z0-9_-]{32,128}$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PROFILE = /^[^\p{Cc}\p{Cf}]{1,80}$/u;
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
 
 export type CliIntentClass =
   | "login"
@@ -89,7 +88,7 @@ function string(value: unknown, pattern: RegExp, reason: string): string {
 }
 
 function date(value: unknown, reason: string): string {
-  if (typeof value !== "string" || Number.isNaN(Date.parse(value)) || new Date(value).toISOString() !== value) {
+  if (typeof value !== "string" || !RFC3339.test(value) || Number.isNaN(Date.parse(value))) {
     return malformed(reason);
   }
   return value;
@@ -181,12 +180,10 @@ export function decodeCliContinuationIssued(
   ]);
   if (record.completion_mode !== "poll") return malformed("invalid_completion_mode");
   const id = uuid(record.id, "invalid_continuation_id");
-  const continuationSecret = `runa_ct_${string(
-    typeof record.continuation_secret === "string" ? record.continuation_secret.slice(8) : record.continuation_secret,
-    OPAQUE_43,
-    "invalid_continuation_secret",
-  )}`;
-  if (record.continuation_secret !== continuationSecret) return malformed("invalid_continuation_secret");
+  const continuationSecret = typeof record.continuation_secret === "string" &&
+    /^runa_ct_[A-Za-z0-9_-]{43}$/u.test(record.continuation_secret)
+    ? record.continuation_secret
+    : malformed("invalid_continuation_secret");
   const browserUrl = typeof record.browser_url === "string" ? record.browser_url : malformed("invalid_browser_url");
   let parsed: URL;
   try { parsed = new URL(browserUrl); } catch { return malformed("invalid_browser_url"); }

@@ -97,10 +97,11 @@ canonical default. Production requests use exactly `https://api.runacode.io`.
 Custom origins require an explicit development profile; repository content is
 never a configuration authority.
 
-`RUNA_API_KEY` is supported only as an explicit automation credential in the
-current build. It is never persisted automatically. Browser login and secure
-OS-vault refresh credentials will become available only with their accepted
-identity/continuation contracts and runtime evidence.
+`RUNA_API_KEY` is supported only as an explicit automation credential and is
+never persisted automatically. Interactive `runa login` uses the browser continuation contract without a local
+HTTP listener. Its renewable credential and binding metadata are stored only in
+the operating-system vault; access tokens remain process-memory-only. The
+automation and interactive credential authorities never fall back to each other.
 
 Never place API keys in command-line arguments, repository files, issue reports,
 terminal captures, or diagnostics.

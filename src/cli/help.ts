@@ -6,6 +6,9 @@ Usage:
   runa <command> [options]
 
 Available now:
+  login                                Sign in through the Runa browser continuation
+  whoami                               Show authoritative interactive account context
+  logout                               Revoke the interactive token family server-first
   capabilities                         Inspect current server capability truth
   machines list                        List owned Runa machines
   machines create [options]            Create a machine when server-advertised
@@ -20,7 +23,7 @@ Available now:
   self-test --offline                  Verify the installed CLI without network access
 
 Reserved and fail-closed in this build:
-  signup, login, claude, codex, openclaw, shell, connect, sync, companion
+  signup, claude, codex, openclaw, shell, connect, sync, companion
 
 Global options:
   --json              Emit versioned JSON records
@@ -33,8 +36,9 @@ Global options:
   --version           Show the CLI version
 
 Authentication:
-  This initial build accepts RUNA_API_KEY for explicit automation only.
-  Browser login remains unavailable until the server-side continuation contract is available.
+  Use runa login for a browser-assisted interactive session. The CLI uses polling;
+  it does not open a local callback listener. Refresh credentials remain in the OS vault.
+  RUNA_API_KEY selects explicit automation mode and never falls back to browser login.
 
 Canonical install:
   npm install -g @runa_laboratories/cli
