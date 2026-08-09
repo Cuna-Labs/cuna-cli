@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runacode.io/schemas/runa-cli-distribution-manifest-v1.json",
+  "title": "Runa CLI distribution projection manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "releaseEnvelope", "candidate", "provenance", "channels", "files", "recovery", "readiness"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "releaseEnvelope": {"$ref": "#/$defs/digestFile"},
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packageName", "version", "sourceCommit", "repository", "registry", "tarball", "sbom", "supportPolicy"],
+      "properties": {
+        "packageName": {"const": "@runa_laboratories/cli"},
+        "version": {"$ref": "#/$defs/semver"},
+        "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "repository": {"const": "Runa-Laboratories/runa-cli"},
+        "registry": {"const": "https://registry.npmjs.org"},
+        "tarball": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["file", "url", "sha256", "size"],
+          "properties": {
+            "file": {"type": "string", "pattern": "^[A-Za-z0-9._-]+\\.tgz$"},
+            "url": {"type": "string", "pattern": "^https://registry\\.npmjs\\.org/@runa_laboratories/cli/-/cli-[0-9A-Za-z.-]+\\.tgz$"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "size": {"type": "integer", "minimum": 1}
+          }
+        },
+        "sbom": {"$ref": "#/$defs/digestFile"},
+        "supportPolicy": {"$ref": "#/$defs/digestFile"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requiredForPublication", "evidenceStatus", "attestationDigest", "publisherReceiptDigest", "expectedRepository", "expectedWorkflow", "expectedEnvironment", "longLivedTokenAllowed"],
+      "properties": {
+        "requiredForPublication": {"const": true},
+        "evidenceStatus": {"const": "MISSING_EXTERNAL_EVIDENCE"},
+        "attestationDigest": {"type": "null"},
+        "publisherReceiptDigest": {"type": "null"},
+        "expectedRepository": {"const": "Runa-Laboratories/runa-cli"},
+        "expectedWorkflow": {"const": ".github/workflows/release.yml"},
+        "expectedEnvironment": {"const": "npm"},
+        "longLivedTokenAllowed": {"const": false}
+      }
+    },
+    "channels": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {"$ref": "#/$defs/channel"}
+    },
+    "files": {
+      "type": "object",
+      "minProperties": 5,
+      "maxProperties": 5,
+      "additionalProperties": {"$ref": "#/$defs/sha256"}
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["npmArtifactsImmutable", "overwriteForbidden", "strategy", "rehearsalStatus", "rollbackBarrier", "recoveryReceiptDigest"],
+      "properties": {
+        "npmArtifactsImmutable": {"const": true},
+        "overwriteForbidden": {"const": true},
+        "strategy": {"const": "HALT_CHANNEL_AND_FIXED_FORWARD_OR_VERIFIED_PRIOR_VERSION"},
+        "rehearsalStatus": {"const": "MISSING_EXTERNAL_EVIDENCE"},
+        "rollbackBarrier": {"const": "UNKNOWN_UNTIL_N_MINUS_1_STATE_COMPATIBILITY_EVIDENCE"},
+        "recoveryReceiptDigest": {"type": "null"}
+      }
+    },
+    "readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "blockers", "claim"],
+      "properties": {
+        "decision": {"const": "BLOCKED"},
+        "blockers": {"type": "array", "minItems": 4, "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "claim": {"const": "Generated projections are deterministic local evidence only; they do not prove publication, installation, promotion, or rollback."}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "semver": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"},
+    "digestFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "sha256"],
+      "properties": {"file": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "availability", "installerOfRecord", "platforms", "publicCommand", "immutableCommand", "artifactSha256", "projection", "liveEvidenceReceipt"],
+      "properties": {
+        "id": {"enum": ["npm", "bun", "curl", "homebrew", "aur"]},
+        "role": {"enum": ["canonical", "registry-projection", "bootstrap-projection", "formula-projection", "package-projection"]},
+        "availability": {"const": "PROJECTED_NOT_PUBLISHED"},
+        "installerOfRecord": {"enum": ["npm", "bun", "homebrew", "pacman"]},
+        "platforms": {"type": "array", "minItems": 1, "items": {"enum": ["linux-x64", "darwin-x64", "win32-x64"]}, "uniqueItems": true},
+        "publicCommand": {"type": "string", "minLength": 1},
+        "immutableCommand": {"type": "string", "minLength": 1},
+        "artifactSha256": {"$ref": "#/$defs/sha256"},
+        "projection": {"$ref": "#/$defs/digestFile"},
+        "liveEvidenceReceipt": {"type": "null"}
+      }
+    }
+  }
+}
+

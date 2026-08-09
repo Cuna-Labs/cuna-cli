@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runacode.io/schemas/runa-cli-distribution-receipt-v1.json",
+  "title": "Runa CLI installed-distribution receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "channel", "distributionManifestSha256", "candidate", "projectionSha256", "runtimeIdentity", "checks", "evidence", "observer", "observedAt"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "channel": {"enum": ["npm", "bun", "curl", "homebrew", "aur"]},
+    "distributionManifestSha256": {"$ref": "#/$defs/sha256"},
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packageName", "version", "sourceCommit", "tarballSha256", "sbomSha256"],
+      "properties": {
+        "packageName": {"const": "@runa_laboratories/cli"},
+        "version": {"type": "string", "minLength": 1},
+        "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tarballSha256": {"$ref": "#/$defs/sha256"},
+        "sbomSha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "projectionSha256": {"$ref": "#/$defs/sha256"},
+    "runtimeIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "buildDigest", "platform", "architecture", "artifactChannel", "installerOfRecord", "protocolRange"],
+      "properties": {
+        "version": {"type": "string", "minLength": 1},
+        "buildDigest": {"$ref": "#/$defs/sha256"},
+        "platform": {"enum": ["linux", "darwin", "win32"]},
+        "architecture": {"const": "x64"},
+        "artifactChannel": {"const": "npm"},
+        "installerOfRecord": {"enum": ["npm", "bun", "homebrew", "pacman"]},
+        "protocolRange": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimum", "maximum"],
+          "properties": {"minimum": {"type": "string"}, "maximum": {"type": "string"}}
+        }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selfTest", "provenance", "supportPolicy", "uninstallCleanup", "rollbackOrFixedForward"],
+      "properties": {
+        "selfTest": {"const": "PASS"},
+        "provenance": {"const": "PASS"},
+        "supportPolicy": {"const": "PASS"},
+        "uninstallCleanup": {"const": "PASS"},
+        "rollbackOrFixedForward": {"const": "PASS"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["install", "selfTest", "version", "provenance", "uninstall", "recovery"],
+      "properties": {
+        "install": {"$ref": "#/$defs/digestFile"},
+        "selfTest": {"$ref": "#/$defs/digestFile"},
+        "version": {"$ref": "#/$defs/digestFile"},
+        "provenance": {"$ref": "#/$defs/digestFile"},
+        "uninstall": {"$ref": "#/$defs/digestFile"},
+        "recovery": {"$ref": "#/$defs/digestFile"}
+      }
+    },
+    "observer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "identity"],
+      "properties": {
+        "kind": {"enum": ["github-hosted-runner", "policy-approved-real-host"]},
+        "identity": {"type": "string", "minLength": 1}
+      }
+    },
+    "observedAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digestFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "sha256"],
+      "properties": {"file": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+    }
+  }
+}
