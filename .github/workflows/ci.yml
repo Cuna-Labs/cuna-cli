@@ -72,6 +72,17 @@ jobs:
       - run: npm install --global npm@11.4.2
       - run: npm ci --ignore-scripts
       - run: npm run build
+      - name: Capture the exact hosted runner identity
+        id: toolchain
+        shell: bash
+        run: echo "runner=${ImageOS:-ubuntu24}:${ImageVersion:-unknown}:${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+      - name: Bind lockfile, dependency, contract, recipe, toolchain, and payload inputs
+        run: >-
+          node scripts/build-release-inputs.mjs
+          --source-commit "${{ github.sha }}"
+          --npm-version "$(npm --version)"
+          --runner "${{ steps.toolchain.outputs.runner }}"
+          --output evidence/release-inputs.json
       - name: Build one package tarball without lifecycle scripts
         id: pack
         shell: bash
@@ -91,10 +102,13 @@ jobs:
           node scripts/build-release-envelope.mjs
           --tarball "${{ steps.pack.outputs.file }}"
           --sbom evidence/sbom.cdx.json
+          --release-inputs evidence/release-inputs.json
           --version "$(node -p "require('./package.json').version")"
           --source-commit "${{ github.sha }}"
           --run-id "${{ github.run_id }}"
           --run-attempt "${{ github.run_attempt }}"
+          --npm-version "$(npm --version)"
+          --runner "${{ steps.toolchain.outputs.runner }}"
       - run: node scripts/verify-release-envelope.mjs
       - name: Generate all fail-closed distribution projections
         run: >-

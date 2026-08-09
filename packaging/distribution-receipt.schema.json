@@ -1,24 +1,26 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runacode.io/schemas/runa-cli-distribution-receipt-v1.json",
+  "$id": "https://runacode.io/schemas/runa-cli-distribution-receipt-v2.json",
   "title": "Runa CLI installed-distribution receipt",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "channel", "distributionManifestSha256", "candidate", "projectionSha256", "runtimeIdentity", "checks", "evidence", "observer", "observedAt"],
   "properties": {
-    "schemaVersion": {"const": 1},
+    "schemaVersion": {"const": 2},
     "channel": {"enum": ["npm", "bun", "curl", "homebrew", "aur"]},
     "distributionManifestSha256": {"$ref": "#/$defs/sha256"},
     "candidate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["packageName", "version", "sourceCommit", "tarballSha256", "sbomSha256"],
+      "required": ["packageName", "version", "sourceCommit", "tarballSha256", "sbomSha256", "releaseInputsSha256", "payloadSha256"],
       "properties": {
         "packageName": {"const": "@runa_laboratories/cli"},
         "version": {"type": "string", "minLength": 1},
         "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "tarballSha256": {"$ref": "#/$defs/sha256"},
-        "sbomSha256": {"$ref": "#/$defs/sha256"}
+        "sbomSha256": {"$ref": "#/$defs/sha256"},
+        "releaseInputsSha256": {"$ref": "#/$defs/sha256"},
+        "payloadSha256": {"$ref": "#/$defs/sha256"}
       }
     },
     "projectionSha256": {"$ref": "#/$defs/sha256"},

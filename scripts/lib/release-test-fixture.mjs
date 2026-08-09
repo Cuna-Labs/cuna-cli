@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import {
   aggregateDigest,
+  releaseInputIdentities,
   RELEASE_INPUT_BUILD_RECIPE_FILES,
   RELEASE_INPUT_CONTRACT_FILES,
   validateReleaseInputs,
@@ -11,7 +12,7 @@ export function syntheticReleaseInputs({ version = "1.2.3-preview.1", sourceComm
   const digest = "d".repeat(64);
   const contractFiles = RELEASE_INPUT_CONTRACT_FILES.map((file) => ({ file, sha256: digest }));
   const recipeFiles = RELEASE_INPUT_BUILD_RECIPE_FILES.map((file) => ({ file, sha256: digest }));
-  const componentKey = `@xterm/headless\06.0.0\0sha512-dGVzdA==\0`;
+  const componentKey = ["@xterm/headless", "6.0.0", "sha512-dGVzdA==", ""].join("\0");
   const inputs = {
     schemaVersion: 1,
     packageName: "@runa_laboratories/cli",
@@ -55,4 +56,36 @@ export function syntheticReleaseInputs({ version = "1.2.3-preview.1", sourceComm
   };
   validateReleaseInputs(inputs);
   return inputs;
+}
+
+export function syntheticReleaseEnvelope({
+  version = "1.2.3-preview.1",
+  sourceCommit = "a".repeat(40),
+  tarball,
+  sbom,
+  supportPolicy,
+  releaseInputs,
+  releaseInputsSha256,
+  runId = "42",
+} = {}) {
+  return {
+    schemaVersion: 2,
+    packageName: "@runa_laboratories/cli",
+    version,
+    sourceCommit,
+    repository: "Runa-Laboratories/runa-cli",
+    registry: "https://registry.npmjs.org",
+    tarball,
+    sbom,
+    supportPolicy,
+    releaseInputs: { file: "release-inputs.json", sha256: releaseInputsSha256 },
+    identities: releaseInputIdentities(releaseInputs),
+    authority: {
+      phase: "CANDIDATE_BUILT",
+      releaseEligible: false,
+      approval: { state: "REQUIRED_NOT_PRESENT", environment: "npm", receiptSha256: null },
+      provenance: { state: "REQUIRED_NOT_PRESENT", workflow: ".github/workflows/ci.yml", receiptSha256: null },
+    },
+    builder: { workflow: ".github/workflows/ci.yml", runId, runAttempt: "1" },
+  };
 }

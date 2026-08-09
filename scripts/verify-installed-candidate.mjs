@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { invariant, parseArgs, readJson, verifyEnvelopeFiles } from "./lib/release-evidence.mjs";
+import { invariant, parseArgs, readJson, sha256File, verifyEnvelopeFiles } from "./lib/release-evidence.mjs";
 
 const execute = promisify(execFile);
 const args = parseArgs(process.argv.slice(2));
@@ -35,6 +35,7 @@ invariant(versionJson.schema_version === "1" && versionJson.type === "result" &&
 invariant(selfTestJson.data?.ok === true, "Installed-artifact self-test did not report data.ok=true");
 invariant(versionJson.data?.version === envelope.version, "Installed version differs from candidate");
 invariant(/^[0-9a-f]{64}$/.test(versionJson.data?.buildDigest), "Installed build digest is missing or malformed");
+invariant(versionJson.data.buildDigest === envelope.identities.payloadSha256, "Installed payload identity differs from the release envelope");
 invariant(versionJson.data?.platform === process.platform, "Installed platform identity differs from runtime");
 invariant(versionJson.data?.architecture === process.arch, "Installed architecture identity differs from runtime");
 invariant(versionJson.data?.updateChannel === "npm", "Installed candidate does not identify npm as installer channel");
@@ -47,8 +48,11 @@ await mkdir(path.dirname(receiptFile), { recursive: true });
 await writeFile(
   receiptFile,
   `${JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
+    releaseEnvelopeSha256: await sha256File(path.join(root, "release-envelope.json")),
     candidateSha256: envelope.tarball.sha256,
+    releaseInputsSha256: envelope.releaseInputs.sha256,
+    identities: envelope.identities,
     sourceCommit: envelope.sourceCommit,
     platform: process.platform,
     architecture: process.arch,

@@ -30,10 +30,20 @@ await access(path.join(root, "package-lock.json"));
 const ci = await readFile(path.join(root, ".github", "workflows", "ci.yml"), "utf8");
 const generator = "node scripts/release-project-distributions.mjs";
 const verifier = "node scripts/verify-release-distributions.mjs";
+const releaseInputBuilder = "node scripts/build-release-inputs.mjs";
+const envelopeBuilder = "node scripts/build-release-envelope.mjs";
 invariant(!/(?:^|\s)node scripts\/project-distributions\.mjs(?:\s|$)/m.test(ci), "Authoritative CI still invokes the legacy distribution generator");
 invariant(!/(?:^|\s)node scripts\/verify-distribution-projections\.mjs(?:\s|$)/m.test(ci), "Authoritative CI still invokes the legacy distribution verifier");
 invariant(ci.split(generator).length - 1 === 1, "Authoritative CI must generate distributions exactly once");
 invariant(ci.split(verifier).length - 1 === 3, "Candidate, admission, and handoff must each verify the distribution bundle");
+invariant(ci.split(releaseInputBuilder).length - 1 === 1, "Authoritative CI must bind release inputs exactly once");
+invariant(ci.split(envelopeBuilder).length - 1 === 1, "Authoritative CI must build one release envelope exactly once");
+const releaseInputsAt = ci.indexOf(releaseInputBuilder);
+const envelopeAt = ci.indexOf(envelopeBuilder);
+invariant(releaseInputsAt >= 0 && envelopeAt > releaseInputsAt, "Release inputs must be bound before the immutable envelope");
+for (const argument of ["--release-inputs evidence/release-inputs.json", "--npm-version", "--runner"]) {
+  invariant(ci.includes(argument), `Immutable envelope build is missing ${argument}`);
+}
 const generatedAt = ci.indexOf(generator);
 const firstVerifiedAt = ci.indexOf(verifier);
 const candidateUploadAt = ci.indexOf("name: release-candidate");

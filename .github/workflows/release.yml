@@ -19,6 +19,10 @@ on:
         description: Exact admitted npm tarball SHA-256
         required: true
         type: string
+      candidate_envelope_sha256:
+        description: Exact immutable release-envelope v2 SHA-256
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -71,15 +75,33 @@ jobs:
           node scripts/verify-release-envelope.mjs --root admitted/release-artifacts
           node - <<'NODE'
           const fs = require('node:fs');
-          const envelope = JSON.parse(fs.readFileSync('admitted/release-artifacts/release-envelope.json'));
+          const crypto = require('node:crypto');
+          const envelopeFile = 'admitted/release-artifacts/release-envelope.json';
+          const envelopeBytes = fs.readFileSync(envelopeFile);
+          const envelope = JSON.parse(envelopeBytes);
           const admission = JSON.parse(fs.readFileSync('admitted/evidence/admission.json'));
+          const envelopeSha256 = crypto.createHash('sha256').update(envelopeBytes).digest('hex');
+          if (envelope.schemaVersion !== 2 || admission.schemaVersion !== 2) process.exit(1);
           if (envelope.version !== process.env.VERSION || envelope.sourceCommit !== process.env.SOURCE_COMMIT || envelope.tarball.sha256 !== process.env.CANDIDATE_SHA256) process.exit(1);
-          if (admission.candidateSha256 !== envelope.tarball.sha256 || admission.sourceCommit !== envelope.sourceCommit) process.exit(1);
+          if (envelopeSha256 !== process.env.CANDIDATE_ENVELOPE_SHA256 || admission.releaseEnvelopeSha256 !== envelopeSha256) process.exit(1);
+          if (admission.candidateSha256 !== envelope.tarball.sha256 || admission.sourceCommit !== envelope.sourceCommit || admission.releaseInputsSha256 !== envelope.releaseInputs.sha256) process.exit(1);
+          if (JSON.stringify(admission.identities) !== JSON.stringify(envelope.identities)) process.exit(1);
           NODE
         env:
           VERSION: ${{ inputs.version }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          CANDIDATE_ENVELOPE_SHA256: ${{ inputs.candidate_envelope_sha256 }}
+      - name: Require canonical contract authority before publication
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const inputs = JSON.parse(fs.readFileSync('admitted/release-artifacts/release-inputs.json'));
+          if (inputs.contractSet.releaseAuthority === 'UNRESOLVED_BLOCKING') {
+            throw new Error('Publication blocked: the release envelope is not bound to the canonical Runa API contract authority.');
+          }
+          NODE
       - name: Verify GitHub build provenance for the exact tarball
         env:
           GH_TOKEN: ${{ github.token }}

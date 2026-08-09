@@ -215,6 +215,20 @@ export async function verifyReleaseInputsFile(file, expected) {
   return inputs;
 }
 
+export async function verifyReleaseInputsAgainstRoot(inputs, root, { npmVersion, runner }) {
+  const rebuilt = await buildReleaseInputs({
+    root,
+    sourceCommit: inputs.sourceCommit,
+    npmVersion,
+    runner,
+  });
+  invariant(
+    JSON.stringify(rebuilt) === JSON.stringify(inputs),
+    "Release inputs do not match the checked-out source, dependency closure, toolchain, or package payload",
+  );
+  return inputs;
+}
+
 export function releaseInputIdentities(inputs) {
   validateReleaseInputs(inputs);
   return Object.freeze({

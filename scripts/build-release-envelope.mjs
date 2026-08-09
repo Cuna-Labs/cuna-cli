@@ -10,7 +10,11 @@ import {
   sha256File,
   validateEnvelope,
 } from "./lib/release-evidence.mjs";
-import { releaseInputIdentities, verifyReleaseInputsFile } from "./lib/release-inputs.mjs";
+import {
+  releaseInputIdentities,
+  verifyReleaseInputsAgainstRoot,
+  verifyReleaseInputsFile,
+} from "./lib/release-inputs.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(args.get("root") ?? process.cwd());
@@ -21,13 +25,20 @@ const releaseInputsInput = path.resolve(root, args.get("release-inputs") ?? "");
 const outputRoot = path.resolve(root, args.get("output") ?? "release-artifacts");
 const packageJson = await readJson(path.join(root, "package.json"));
 
+for (const name of ["tarball", "sbom", "release-inputs", "version", "source-commit", "run-id", "run-attempt", "npm-version", "runner"]) {
+  invariant(typeof args.get(name) === "string" && args.get(name).length > 0, `--${name} is required`);
+}
 invariant(packageJson.name === PACKAGE_NAME, `package.json name must be ${PACKAGE_NAME}`);
 invariant(typeof packageJson.version === "string", "package.json version is missing");
 invariant(args.get("version") === packageJson.version, "Requested version differs from package.json");
 invariant(args.get("source-commit") === (process.env.GITHUB_SHA ?? args.get("source-commit")), "Source commit differs from GITHUB_SHA");
 invariant(process.env.GITHUB_REPOSITORY === undefined || process.env.GITHUB_REPOSITORY === REPOSITORY, "Workflow repository is not release authority");
 
-await mkdir(outputRoot, { recursive: true });
+await stat(outputRoot).then(
+  () => { throw new Error(`Release output already exists: ${outputRoot}`); },
+  (error) => { invariant(error?.code === "ENOENT", `Unable to inspect release output: ${outputRoot}`); },
+);
+await mkdir(outputRoot, { recursive: false });
 const tarballFile = path.basename(tarballInput);
 const sbomFile = "sbom.cdx.json";
 const supportFile = "support-policy.json";
@@ -41,6 +52,10 @@ const releaseInputs = await verifyReleaseInputsFile(path.join(outputRoot, releas
   version: packageJson.version,
   sourceCommit: args.get("source-commit"),
   payloadBuildDigest: (await readJson(releaseInputsInput)).payload?.sha256,
+});
+await verifyReleaseInputsAgainstRoot(releaseInputs, root, {
+  npmVersion: args.get("npm-version"),
+  runner: args.get("runner"),
 });
 
 const envelope = {
