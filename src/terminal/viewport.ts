@@ -22,6 +22,10 @@ export interface ViewportSnapshot {
   readonly outputSequence: bigint;
   readonly replayCursor: bigint;
   readonly cells: readonly string[];
+  /** Display columns occupied by each rendered row, as measured by the VTE. */
+  readonly displayWidths: readonly number[];
+  readonly cursorX: number;
+  readonly cursorY: number;
   readonly modes: ViewportModes;
 }
 
@@ -52,6 +56,9 @@ export class ViewportRegistry {
       outputSequence: 0n,
       replayCursor: 0n,
       cells: Object.freeze(Array.from({ length: rows }, () => "")),
+      displayWidths: Object.freeze(Array.from({ length: rows }, () => 0)),
+      cursorX: 0,
+      cursorY: 0,
       modes: Object.freeze({ bracketedPaste: false, mouse: false, alternateScreen: false, cursorVisible: true }),
     });
     this.#tabs.set(tabId, snapshot);
@@ -77,6 +84,9 @@ export class ViewportRegistry {
     readonly outputSequence: bigint;
     readonly replayCursor: bigint;
     readonly cells: readonly string[];
+    readonly displayWidths?: readonly number[];
+    readonly cursorX?: number;
+    readonly cursorY?: number;
     readonly modes: ViewportModes;
   }): ViewportSnapshot {
     const current = this.require(input.tabId);
@@ -86,7 +96,17 @@ export class ViewportRegistry {
     if (input.outputSequence <= current.outputSequence || input.replayCursor < current.replayCursor) {
       throw new ViewportIsolationError("frame_regression", "Viewport sequence state cannot move backward.");
     }
-    if (input.cells.length > current.rows || input.cells.some((row) => [...row].length > current.columns || containsHostControl(row))) {
+    const displayWidths = input.displayWidths ?? input.cells.map((row) => [...row].length);
+    const cursorX = input.cursorX ?? current.cursorX;
+    const cursorY = input.cursorY ?? current.cursorY;
+    if (
+      input.cells.length > current.rows ||
+      displayWidths.length !== input.cells.length ||
+      input.cells.some((row) => containsHostControl(row)) ||
+      displayWidths.some((width) => !Number.isSafeInteger(width) || width < 0 || width > current.columns) ||
+      !Number.isSafeInteger(cursorX) || cursorX < 0 || cursorX > current.columns ||
+      !Number.isSafeInteger(cursorY) || cursorY < 0 || cursorY >= current.rows
+    ) {
       throw new ViewportIsolationError("viewport_limit", "Rendered cells exceed their isolated viewport bounds.");
     }
     const next = freezeSnapshot({
@@ -94,6 +114,9 @@ export class ViewportRegistry {
       outputSequence: input.outputSequence,
       replayCursor: input.replayCursor,
       cells: Object.freeze([...input.cells]),
+      displayWidths: Object.freeze([...displayWidths]),
+      cursorX,
+      cursorY,
       modes: Object.freeze({ ...input.modes }),
     });
     this.#tabs.set(input.tabId, next);
@@ -104,7 +127,16 @@ export class ViewportRegistry {
     validateDimensions(columns, rows);
     const current = this.require(tabId);
     const cells = current.cells.slice(0, rows).map((row) => [...row].slice(0, columns).join(""));
-    const next = freezeSnapshot({ ...current, columns, rows, cells: Object.freeze(cells) });
+    const displayWidths = current.displayWidths.slice(0, rows).map((width) => Math.min(width, columns));
+    const next = freezeSnapshot({
+      ...current,
+      columns,
+      rows,
+      cells: Object.freeze(cells),
+      displayWidths: Object.freeze(displayWidths),
+      cursorX: Math.min(current.cursorX, columns),
+      cursorY: Math.min(current.cursorY, rows - 1),
+    });
     this.#tabs.set(tabId, next);
     return next;
   }
@@ -170,6 +202,7 @@ function freezeSnapshot(snapshot: ViewportSnapshot): ViewportSnapshot {
     ...snapshot,
     binding: Object.freeze({ ...snapshot.binding }),
     cells: Object.freeze([...snapshot.cells]),
+    displayWidths: Object.freeze([...snapshot.displayWidths]),
     modes: Object.freeze({ ...snapshot.modes }),
   });
 }

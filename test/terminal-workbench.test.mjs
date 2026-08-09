@@ -142,3 +142,26 @@ test("small admitted terminals collapse to one truthful appbar row without fabri
   assert.doesNotMatch(frame.text, /48;2;/);
   assert.match(frame.text, /RUNA  Claude primary/);
 });
+
+test("workbench restores the selected remote cursor below the appbar without forcing visibility", () => {
+  const selected = tabs();
+  selected[0] = {
+    ...selected[0],
+    viewport: {
+      ...selected[0].viewport,
+      cursorX: 4,
+      cursorY: 2,
+      modes: { ...selected[0].viewport.modes, cursorVisible: false },
+    },
+  };
+  const frame = renderWorkbenchFrame({
+    columns: 80,
+    rows: 8,
+    activeTabId: "tab-claude",
+    tabs: selected,
+    appbar: model(),
+    color: false,
+  });
+  assert.match(frame.text, /\u001b\[5;5H\u001b\[\?25l$/u);
+  assert.doesNotMatch(frame.text, /\u001b\[\?25h$/u);
+});

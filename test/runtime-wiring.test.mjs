@@ -274,6 +274,34 @@ test("runtime multiplexes AgentSessions without cross-routing input and preserve
   await runtime.shutdown();
 });
 
+test("concurrent terminal input, resize, and signal writes remain serialized and monotonic", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  const connection = system.connections[0];
+  let inFlight = 0;
+  let peakInFlight = 0;
+  connection.send = async (bytes) => {
+    inFlight += 1;
+    peakInFlight = Math.max(peakInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    connection.sent.push(bytes);
+    inFlight -= 1;
+  };
+
+  await Promise.all([
+    runtime.sendInput(new TextEncoder().encode("first"), "tab-a"),
+    runtime.resize(100, 30, "tab-a"),
+    runtime.signal("interrupt", "tab-a"),
+  ]);
+
+  const frames = connection.sent.map(decodeTerminalFrame);
+  assert.equal(peakInFlight, 1);
+  assert.deepEqual(frames.map((frame) => frame.sequence), [1n, 2n, 3n]);
+  assert.deepEqual(frames.map((frame) => frame.type), ["input", "resize", "signal"]);
+  await runtime.shutdown();
+});
+
 test("terminal-generated responses require the exact tab authority and never follow active-tab focus", async () => {
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);
@@ -456,4 +484,32 @@ test("runtime startup rejects unverified local endpoint evidence", () => {
     (error) => error instanceof RuntimeBoundaryError && error.code === "remote_state_unproven",
   );
   assert.equal(runtime.daemon.state, "recovery_required");
+});
+
+test("runtime startup evidence expiry revokes readiness before later mutations", async () => {
+  const system = new FakeTerminalSystem();
+  let now = NOW;
+  const runtime = new RunaRuntimeBoundary({
+    controlPlane: system.controlPlane,
+    terminalConnector: system.connector,
+    allowedRunaOrigins: [API_ORIGIN],
+    terminalCapabilityId: CAPABILITY_ID,
+    clientInstanceId: "client-1",
+    clock: () => now,
+  });
+  runtime.start({
+    endpointOwnership: "verified",
+    durableState: "verified",
+    source: "independent-live-probe",
+    observedAt: NOW - 1,
+    expiresAt: NOW + 1,
+  });
+  now = NOW + 1;
+  await assert.rejects(
+    runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "remote_state_unproven",
+  );
+  assert.equal(runtime.daemon.state, "recovery_required");
+  assert.equal(system.createCalls.length, 0);
+  await runtime.shutdown();
 });
