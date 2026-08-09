@@ -42,13 +42,16 @@ if (args.get("self-test") === "true") {
   };
   await verifyEnvelopeFiles(envelope, root);
   await writeFile(path.join(root, "runa.tgz"), "substituted");
-  let rejected = false;
-  try {
-    await verifyEnvelopeFiles(envelope, root);
-  } catch {
-    rejected = true;
-  }
-  if (!rejected) throw new Error("Negative control failed: substituted tarball was accepted");
+  await expectRejected(() => verifyEnvelopeFiles(envelope, root), "substituted tarball was accepted");
+  await writeFile(path.join(root, "runa.tgz"), "candidate");
+  await writeFile(path.join(root, "release-inputs.json"), `${JSON.stringify({ ...releaseInputs, sourceCommit: "b".repeat(40) })}\n`);
+  await expectRejected(() => verifyEnvelopeFiles(envelope, root), "substituted release inputs were accepted");
+  const fabricatedApproval = structuredClone(envelope);
+  fabricatedApproval.authority.approval = { state: "VERIFIED", environment: "npm", receiptSha256: "f".repeat(64) };
+  await expectRejected(() => Promise.resolve(validateEnvelope(fabricatedApproval)), "fabricated approval was accepted");
+  const legacy = structuredClone(envelope);
+  legacy.schemaVersion = 1;
+  await expectRejected(() => Promise.resolve(validateEnvelope(legacy)), "release-envelope v1 was accepted");
   process.stdout.write('{"status":"negative-control-passed"}\n');
   process.exit(0);
 }
@@ -58,3 +61,13 @@ const envelope = await readJson(path.join(root, args.get("envelope") ?? "release
 validateEnvelope(envelope);
 await verifyEnvelopeFiles(envelope, root);
 process.stdout.write(`${JSON.stringify({ status: "verified", version: envelope.version, sha256: envelope.tarball.sha256 })}\n`);
+
+async function expectRejected(action, message) {
+  let rejected = false;
+  try {
+    await action();
+  } catch {
+    rejected = true;
+  }
+  if (!rejected) throw new Error(`Negative control failed: ${message}`);
+}

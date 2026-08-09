@@ -12,7 +12,13 @@ export function syntheticReleaseInputs({ version = "1.2.3-preview.1", sourceComm
   const digest = "d".repeat(64);
   const contractFiles = RELEASE_INPUT_CONTRACT_FILES.map((file) => ({ file, sha256: digest }));
   const recipeFiles = RELEASE_INPUT_BUILD_RECIPE_FILES.map((file) => ({ file, sha256: digest }));
-  const componentKey = ["@xterm/headless", "6.0.0", "sha512-dGVzdA==", ""].join("\0");
+  const componentKey = [
+    "@xterm/headless",
+    "6.0.0",
+    "https://registry.npmjs.org/@xterm/headless/-/headless-6.0.0.tgz",
+    "sha512-dGVzdA==",
+    "",
+  ].join("\0");
   const inputs = {
     schemaVersion: 1,
     packageName: "@runa_laboratories/cli",

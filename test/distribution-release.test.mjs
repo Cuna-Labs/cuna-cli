@@ -229,7 +229,7 @@ test("receipt verification detects cross-installer build drift", async () => {
   const receipt = JSON.parse(await readFile(file, "utf8"));
   receipt.runtimeIdentity.buildDigest = "f".repeat(64);
   await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
-  await assert.rejects(verifyReceipts(fixture, receipts), /Cross-installer installed build identities differ/);
+  await assert.rejects(verifyReceipts(fixture, receipts), /Installed build digest differs from the candidate payload identity/);
 });
 
 test("receipt verification detects tampered raw recovery evidence", async () => {

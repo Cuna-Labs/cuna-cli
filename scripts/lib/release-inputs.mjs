@@ -15,7 +15,7 @@ const CONTRACT_FILES = Object.freeze([
   "src/core/errors.ts",
   "src/pty/contracts.ts",
   "src/runtime/contracts.ts",
-  "src/runtime/terminal-codec.ts",
+  "src/terminal/codec.ts",
   "src/version.ts",
 ]);
 
@@ -26,8 +26,13 @@ const BUILD_RECIPE_FILES = Object.freeze([
   "packaging/admission-policy.json",
   "packaging/support-policy.json",
   "scripts/build-release-envelope.mjs",
+  "scripts/build-release-inputs.mjs",
+  "scripts/lib/release-evidence.mjs",
+  "scripts/lib/release-inputs.mjs",
   "scripts/verify-dependency-policy.mjs",
+  "scripts/verify-installed-candidate.mjs",
   "scripts/verify-package-contents.mjs",
+  "src/build-identity.ts",
   "tsconfig.json",
 ]);
 
@@ -89,9 +94,9 @@ export function validateReleaseInputs(inputs) {
     invariant(/^sha512-[A-Za-z0-9+/]+=*$/u.test(component.integrity), `Dependency integrity is invalid: ${component.name}`);
     invariant(typeof component.license === "string" && component.license.length > 0, `Dependency license is missing: ${component.name}`);
     invariant(component.bundled === true, `Runtime dependency is not bundled: ${component.name}`);
-    componentKeys.push(`${component.name}\0${component.version}\0${component.integrity}\0`);
+    componentKeys.push(`${component.name}\0${component.version}\0${component.resolved}\0${component.integrity}\0`);
   }
-  invariant(JSON.stringify(inputs.dependencyClosure.components.map((entry) => entry.name)) === JSON.stringify([...inputs.dependencyClosure.components.map((entry) => entry.name)].sort()), "Dependency closure is not sorted");
+  invariant(JSON.stringify(componentKeys) === JSON.stringify([...componentKeys].sort()), "Dependency closure is not sorted");
   invariant(createHash("sha256").update(componentKeys.join(""), "utf8").digest("hex") === inputs.dependencyClosure.aggregateSha256, "Dependency-closure aggregate digest mismatch");
 
   exactKeys(inputs.contractSet, ["algorithm", "authority", "releaseAuthority", "files", "aggregateSha256"], "contractSet");
@@ -142,11 +147,28 @@ export async function buildReleaseInputs({ root, sourceCommit, npmVersion, runne
   const rootLock = packageLock.packages?.[""];
   const runtimeNames = Object.keys(rootLock?.dependencies ?? {}).sort();
   invariant(JSON.stringify(runtimeNames) === JSON.stringify([...(packageJson.bundleDependencies ?? [])].sort()), "Runtime dependencies differ from bundleDependencies");
-  const components = runtimeNames.map((name) => {
-    const entry = packageLock.packages[`node_modules/${name}`];
-    invariant(entry && entry.inBundle === true, `Bundled lock entry is missing: ${name}`);
+  const bundledEntries = Object.entries(packageLock.packages ?? {})
+    .filter(([installPath, entry]) => installPath.includes("node_modules/") && entry?.inBundle === true)
+    .map(([installPath, entry]) => {
+      const suffix = installPath.slice(installPath.lastIndexOf("node_modules/") + "node_modules/".length);
+      const segments = suffix.split("/");
+      const name = suffix.startsWith("@") ? segments.slice(0, 2).join("/") : segments[0];
+      return {
+        name,
+        version: entry.version,
+        resolved: entry.resolved,
+        integrity: entry.integrity,
+        license: entry.license,
+        bundled: true,
+      };
+    })
+    .sort((left, right) => `${left.name}\0${left.version}\0${left.resolved}`.localeCompare(`${right.name}\0${right.version}\0${right.resolved}`));
+  for (const name of runtimeNames) {
+    invariant(bundledEntries.some((entry) => entry.name === name), `Bundled lock entry is missing: ${name}`);
+  }
+  const components = bundledEntries.map((entry) => {
     return {
-      name,
+      name: entry.name,
       version: entry.version,
       resolved: entry.resolved,
       integrity: entry.integrity,
@@ -154,7 +176,7 @@ export async function buildReleaseInputs({ root, sourceCommit, npmVersion, runne
       bundled: true,
     };
   });
-  const componentKeys = components.map((component) => `${component.name}\0${component.version}\0${component.integrity}\0`);
+  const componentKeys = components.map((component) => `${component.name}\0${component.version}\0${component.resolved}\0${component.integrity}\0`);
   const contractFiles = await digestEntries(root, CONTRACT_FILES);
   const buildRecipeFiles = await digestEntries(root, BUILD_RECIPE_FILES);
   const buildIdentityModule = await import(`${pathToFileURL(path.join(root, "dist", "build-identity.js")).href}?release-inputs=${Date.now()}`);
