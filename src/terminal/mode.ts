@@ -66,10 +66,11 @@ export class HostTerminalLease {
   static async acquire(adapter: HostTerminalAdapter): Promise<HostTerminalLease> {
     const lease = new HostTerminalLease(adapter);
     try {
-      await adapter.enterRawMode();
+      // Treat a throwing transition as potentially partially applied.
       lease.#raw = true;
-      await adapter.enterAlternateScreen();
+      await adapter.enterRawMode();
       lease.#alternate = true;
+      await adapter.enterAlternateScreen();
       return lease;
     } catch (error) {
       await lease.restore();

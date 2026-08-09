@@ -255,7 +255,7 @@ export async function inspectSyncJournal(directory: string): Promise<JournalInsp
   const metadata = await readJson<JournalMetadata>(join(directory, META_FILE));
   try {
     assertReadableSchema(metadata);
-  } catch (error) {
+  } catch {
     return Object.freeze({
       metadata,
       records: Object.freeze([]),

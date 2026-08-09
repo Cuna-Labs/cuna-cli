@@ -226,8 +226,9 @@ export class AtomicFileJournalStorage implements JournalStorage {
 
   async load(): Promise<JournalDocument | undefined> {
     try {
+      await assertPrivateDirectory(path.dirname(this.#filePath));
       const stat = await lstat(this.#filePath);
-      if (stat.isSymbolicLink() || !stat.isFile()) {
+      if (stat.isSymbolicLink() || !stat.isFile() || !isOwnerOnly(stat)) {
         throw new JournalError("unsafe_path", "The journal path is not a regular file.");
       }
       if (stat.size > MAX_JOURNAL_FILE_BYTES) {
@@ -248,6 +249,15 @@ export class AtomicFileJournalStorage implements JournalStorage {
     validateDocument(document);
     const directory = path.dirname(this.#filePath);
     await mkdir(directory, { recursive: true, mode: 0o700 });
+    await assertPrivateDirectory(directory);
+    try {
+      const existing = await lstat(this.#filePath);
+      if (existing.isSymbolicLink() || !existing.isFile() || !isOwnerOnly(existing)) {
+        throw new JournalError("unsafe_path", "The existing journal path is unsafe.");
+      }
+    } catch (error) {
+      if (!(isNodeError(error) && error.code === "ENOENT")) throw error;
+    }
     const temporaryPath = path.join(directory, `.${path.basename(this.#filePath)}.${process.pid}.${randomUUID()}.tmp`);
     const payload = Buffer.from(JSON.stringify(document), "utf8");
     if (payload.byteLength > MAX_JOURNAL_FILE_BYTES) {
@@ -361,4 +371,17 @@ function assertDigest(value: string): void {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+async function assertPrivateDirectory(directory: string): Promise<void> {
+  const stat = await lstat(directory);
+  if (stat.isSymbolicLink() || !stat.isDirectory() || !isOwnerOnly(stat)) {
+    throw new JournalError("unsafe_path", "The journal directory is not private to the daemon user.");
+  }
+}
+
+function isOwnerOnly(stat: Awaited<ReturnType<typeof lstat>>): boolean {
+  if (process.platform === "win32") return true;
+  const currentUserId = typeof process.getuid === "function" ? process.getuid() : undefined;
+  return (currentUserId === undefined || Number(stat.uid) === currentUserId) && (Number(stat.mode) & 0o077) === 0;
 }
