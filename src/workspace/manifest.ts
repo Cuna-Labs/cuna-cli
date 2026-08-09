@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants as fileConstants, type BigIntStats } from "node:fs";
-import { lstat, open, opendir, readlink, realpath } from "node:fs/promises";
-import { dirname, join, relative, sep } from "node:path";
+import { open, opendir, readlink, realpath } from "node:fs/promises";
+import { basename, dirname, join, relative, sep } from "node:path";
 
 import { detectHighConfidenceSecret, type ExclusionPolicy } from "./exclusion.js";
 import {
@@ -102,7 +102,7 @@ export async function createWorkspaceManifest(input: {
         );
       }
       if (kind === "directory") {
-        await verifyPhysicalParent(root, physicalPath);
+        await verifiedPhysicalParent(root, physicalPath);
         entries.push(Object.freeze({ path: wirePath, kind, byteLength: 0, executable: false }));
         await walk(physicalPath, wirePath);
         continue;
@@ -202,9 +202,12 @@ async function hashStableFile(
   readonly contentDigest: string;
   readonly chunks: ContentChunk[];
 }> {
-  await verifyPhysicalParent(root, physicalPath);
-  const before = await lstat(physicalPath, { bigint: true });
-  if (!before.isFile() || before.isSymbolicLink() || before.nlink > 1n) {
+  const resolvedParent = await verifiedPhysicalParent(root, physicalPath);
+  const admittedPath = join(resolvedParent, basename(physicalPath));
+  const handle = await open(admittedPath, fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW);
+  const before = await handle.stat({ bigint: true });
+  if (!before.isFile() || before.nlink > 1n) {
+    await handle.close();
     throw workspaceError(
       "snapshot_unstable",
       "The workspace file is unsafe or changed during admission.",
@@ -212,8 +215,10 @@ async function hashStableFile(
       before.nlink > 1n ? "hard_link" : "unsafe_type",
     );
   }
-  if (before.size > BigInt(limits.maximumFileBytes)) throw limitFailure("file_bytes_limit");
-  const handle = await open(physicalPath, fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW);
+  if (before.size > BigInt(limits.maximumFileBytes)) {
+    await handle.close();
+    throw limitFailure("file_bytes_limit");
+  }
   try {
     const opened = await handle.stat({ bigint: true });
     if (!sameIdentity(before, opened)) throw unstableFailure();
@@ -237,7 +242,8 @@ async function hashStableFile(
       overlap = bytes.subarray(Math.max(0, bytes.byteLength - 128));
     }
     const after = await handle.stat({ bigint: true });
-    await verifyPhysicalParent(root, physicalPath);
+    const afterParent = await verifiedPhysicalParent(root, admittedPath);
+    if (afterParent !== resolvedParent) throw unstableFailure();
     if (!sameIdentity(opened, after) || BigInt(byteLength) !== after.size) throw unstableFailure();
     if (secretCategory !== undefined) {
       throw workspaceError(
@@ -258,12 +264,13 @@ async function hashStableFile(
   }
 }
 
-async function verifyPhysicalParent(root: string, candidate: string): Promise<void> {
+async function verifiedPhysicalParent(root: string, candidate: string): Promise<string> {
   const parent = await realpath(dirname(candidate));
   const difference = relative(root, parent);
   if (difference === ".." || difference.startsWith(`..${sep}`)) {
     throw workspaceError("path_escape", "A workspace ancestor escapes the canonical root.", "policy", "symlink_escape");
   }
+  return parent;
 }
 
 function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
