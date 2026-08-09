@@ -197,17 +197,17 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     case "login":
     case "logout":
     case "whoami":
-      throw unsupportedError("browser authentication", "prd_005_036_server_contract_missing");
+      throw unsupportedError("browser authentication", "browser_auth_contract_unavailable");
     case "claude":
     case "codex":
     case "openclaw":
     case "shell":
     case "connect":
-      throw unsupportedError("terminal workspace", "prd_008_035_038_runtime_missing");
+      throw unsupportedError("terminal workspace", "terminal_runtime_unavailable");
     case "sync":
-      throw unsupportedError("workspace synchronization", "prd_032_039_040_runtime_missing");
+      throw unsupportedError("workspace synchronization", "workspace_sync_runtime_unavailable");
     case "companion":
-      throw unsupportedError("local companion", "prd_041_runtime_missing");
+      throw unsupportedError("local companion", "local_companion_unavailable");
     case "doctor": {
       rejectUnknownOptions(parsed, []);
       const data = Object.freeze({

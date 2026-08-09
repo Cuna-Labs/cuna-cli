@@ -41,25 +41,25 @@ export interface RuntimeFeatureGate {
 }
 
 export const INITIAL_RUNTIME_GATES: readonly RuntimeFeatureGate[] = Object.freeze([
-  Object.freeze({ feature: "daemon", implementation: "unsupported", reason: "prd_035_runtime_not_implemented" }),
+  Object.freeze({ feature: "daemon", implementation: "unsupported", reason: "daemon_runtime_unavailable" }),
   Object.freeze({
     feature: "terminal_workspace",
     implementation: "unsupported",
-    reason: "prd_038_vte_and_attachment_not_implemented",
+    reason: "terminal_workspace_unavailable",
   }),
   Object.freeze({
     feature: "workspace_sync",
     implementation: "unsupported",
-    reason: "prd_032_039_040_protocol_not_implemented",
+    reason: "workspace_sync_protocol_unavailable",
   }),
   Object.freeze({
     feature: "browser_auth",
     implementation: "unsupported",
-    reason: "prd_005_036_server_continuation_not_implemented",
+    reason: "browser_auth_contract_unavailable",
   }),
   Object.freeze({
     feature: "local_companion",
     implementation: "unsupported",
-    reason: "prd_041_capability_bridge_not_implemented",
+    reason: "local_companion_unavailable",
   }),
 ]);
