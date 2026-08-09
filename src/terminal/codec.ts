@@ -4,6 +4,7 @@ export const TERMINAL_PROTOCOL = "runa.terminal.v1" as const;
 export const TERMINAL_PROTOCOL_VERSION = 1 as const;
 export const MAX_TERMINAL_FRAME_BYTES = 1024 * 1024;
 export const MAX_TERMINAL_BUFFER_BYTES = MAX_TERMINAL_FRAME_BYTES * 2;
+export const MAX_TERMINAL_QUEUED_FRAMES = 4096;
 
 const HEADER_BYTES = 20;
 const MAGIC = Uint8Array.of(0x52, 0x54, 0x50, 0x31); // RTP1
@@ -80,6 +81,7 @@ export class TerminalProtocolError extends Error {
     | "unsupported_version"
     | "oversize_frame"
     | "buffer_limit"
+    | "queue_limit"
     | "unknown_critical_frame"
     | "malformed_frame"
     | "illegal_state"
@@ -196,6 +198,9 @@ export class TerminalFrameDecoder {
       const frame = decodeTerminalFrame(this.#buffer.slice(0, size));
       this.#buffer = this.#buffer.slice(size);
       if (frame !== undefined) frames.push(frame);
+      if (frames.length > MAX_TERMINAL_QUEUED_FRAMES) {
+        throw new TerminalProtocolError("queue_limit", "Too many terminal frames were decoded in one batch.");
+      }
     }
     return frames;
   }

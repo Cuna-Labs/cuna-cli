@@ -173,7 +173,7 @@ export async function* streamContentChunks(
   const handle = await open(path, fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW);
   try {
     let index = 0;
-    for await (const value of handle.createReadStream({ highWaterMark: chunkBytes })) {
+    for await (const value of handle.createReadStream({ highWaterMark: chunkBytes, autoClose: false })) {
       const bytes = Buffer.from(value as Uint8Array);
       yield Object.freeze({
         bytes,
@@ -223,7 +223,7 @@ async function hashStableFile(
     let byteLength = 0;
     let overlap = Buffer.alloc(0);
     let secretCategory: string | undefined;
-    for await (const value of handle.createReadStream({ highWaterMark: limits.chunkBytes })) {
+    for await (const value of handle.createReadStream({ highWaterMark: limits.chunkBytes, autoClose: false })) {
       const bytes = Buffer.from(value as Uint8Array);
       byteLength += bytes.byteLength;
       if (byteLength > limits.maximumFileBytes) throw limitFailure("file_bytes_limit");
