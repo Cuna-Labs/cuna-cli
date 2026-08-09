@@ -30,6 +30,7 @@ invariant(packageJson.engines?.node, "Explicit Node engine range is required");
 await access(path.join(root, "package-lock.json"));
 
 const ci = await readFile(path.join(root, ".github", "workflows", "ci.yml"), "utf8");
+const release = await readFile(path.join(root, ".github", "workflows", "release.yml"), "utf8");
 const workflow = parseYaml(ci, { prettyErrors: true, uniqueKeys: true });
 invariant(workflow && typeof workflow === "object" && !Array.isArray(workflow), "CI workflow must parse as a YAML object");
 const jobs = workflow.jobs;
@@ -100,5 +101,14 @@ invariant(
 );
 invariant(JSON.stringify(needsList(jobs.admission).sort()) === JSON.stringify(["candidate", "installed-artifact"]), "Admission must not depend on the observation-only job");
 invariant(JSON.stringify(needsList(jobs.handoff)) === JSON.stringify(["admission"]), "Handoff must depend exclusively on admission");
+invariant(
+  release.includes('[.status,.conclusion,.head_sha,.event,.head_branch,.path]') &&
+    release.includes('completed success ${SOURCE_COMMIT} push main .github/workflows/ci.yml'),
+  "Release dispatch must bind the selected run to protected-main CI by workflow path",
+);
+invariant(
+  release.includes('--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"'),
+  "Release attestation verification must bind the exact signer workflow",
+);
 
 process.stdout.write(`${JSON.stringify({ status: "verified", package: packageJson.name, version: packageJson.version })}\n`);

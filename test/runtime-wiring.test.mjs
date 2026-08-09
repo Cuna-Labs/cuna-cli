@@ -294,6 +294,109 @@ test("runtime multiplexes AgentSessions without cross-routing input and preserve
   await runtime.shutdown();
 });
 
+test("two-phase attach initializes the fenced consumer before awaiting same-chunk output", async () => {
+  const system = new FakeTerminalSystem();
+  system.outputOnReady.set("agent-a", new TextEncoder().encode("early-output"));
+  const order = [];
+  let releaseOutput;
+  const outputGate = new Promise((resolve) => { releaseOutput = resolve; });
+  const { runtime } = createRuntime(system, {
+    onTerminalReady: async (state) => {
+      order.push(`ready:${state.fencingGeneration}`);
+    },
+    onTerminalOutput: async (event) => {
+      order.push(`output:${new TextDecoder().decode(event.bytes)}`);
+      await outputGate;
+    },
+  });
+
+  let settled = false;
+  const attaching = runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 })
+    .then((value) => { settled = true; return value; });
+  await waitUntil(() => order.length === 2, "ready and early output callbacks should run");
+  assert.deepEqual(order, ["ready:1", "output:early-output"]);
+  assert.equal(settled, false, "attach may not outrun the early-output consumer");
+  releaseOutput();
+  const attached = await attaching;
+  assert.equal(attached.state, "active");
+  await runtime.shutdown();
+});
+
+test("terminal output applies backpressure and preserves order across a slow consumer", async () => {
+  const system = new FakeTerminalSystem();
+  const received = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const { runtime } = createRuntime(system, {
+    outputDeliveryTimeoutMs: 1_000,
+    onTerminalOutput: async (event) => {
+      received.push(Number(event.sequence));
+      if (event.sequence === 1n) await firstGate;
+    },
+  });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  const first = encodeTerminalFrame({ type: "output", critical: true, sequence: 1n, payload: new Uint8Array([1]) });
+  const second = encodeTerminalFrame({ type: "output", critical: true, sequence: 2n, payload: new Uint8Array([2]) });
+  const batch = new Uint8Array(first.byteLength + second.byteLength);
+  batch.set(first);
+  batch.set(second, first.byteLength);
+  system.connections[0].incoming.push(batch);
+  await waitUntil(() => received.length === 1, "the first output should reach the consumer");
+  assert.deepEqual(received, [1]);
+  releaseFirst();
+  await waitUntil(() => received.length === 2, "the second output should follow release of the first");
+  assert.deepEqual(received, [1, 2]);
+  await runtime.shutdown();
+});
+
+test("a stalled terminal output consumer fails only its tab within a bounded deadline", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime, states } = createRuntime(system, {
+    outputDeliveryTimeoutMs: 10,
+    onTerminalOutput: async () => await new Promise(() => undefined),
+  });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.push(encodeTerminalFrame({
+    type: "output",
+    critical: true,
+    sequence: 1n,
+    payload: new Uint8Array([1]),
+  }));
+  await waitUntil(() => states.some((state) => state.tabId === "tab-a" && state.state === "failed"), "stalled output should quarantine the tab");
+  assert.equal(runtime.listTerminals()[0].state, "failed");
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_terminal_protocol_failure");
+  await runtime.shutdown();
+});
+
+test("heartbeat expiry fences input while a fresh heartbeat extends the attachment lease", async () => {
+  const system = new FakeTerminalSystem();
+  let now = NOW;
+  const { runtime, states } = createRuntime(system, {
+    clock: () => now,
+    heartbeatTimeoutMs: 1_000,
+  });
+  const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  assert.equal(attached.resizeCapability, "live");
+  assert.equal(attached.heartbeatExpiresAt, NOW + 1_000);
+
+  now += 750;
+  system.connections[0].incoming.push(encodeTerminalControl("heartbeat", 2n, {}));
+  await waitUntil(() => runtime.listTerminals()[0].heartbeatObservedAt === now, "heartbeat should renew the observed lease");
+  now += 750;
+  assert.equal(runtime.refreshTerminalLiveness("tab-a").state, "active");
+
+  now += 251;
+  const sendsBeforeExpiry = system.connections[0].sent.length;
+  await assert.rejects(runtime.sendInput(new Uint8Array([65]), "tab-a"), (error) =>
+    error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected" && error.retryable === true,
+  );
+  assert.equal(system.connections[0].sent.length, sendsBeforeExpiry, "stale input must not reach the wire");
+  assert.equal(runtime.listTerminals()[0].reason, "heartbeat_expired");
+  assert.ok(states.some((state) => state.state === "interrupted" && state.reason === "heartbeat_expired"));
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_heartbeat_expired");
+  await runtime.shutdown();
+});
+
 test("concurrent terminal input, resize, and signal writes remain serialized and monotonic", async () => {
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);

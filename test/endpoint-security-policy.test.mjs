@@ -38,6 +38,17 @@ test("TC-048-18 endpoint-security policy detects representative historical execu
   }
 });
 
+test("TC-048-18 endpoint-security policy detects split-literal variants of historical patterns", () => {
+  for (const fixture of [
+    'spawn("power" + "shell.exe", ["-Encoded" + "Command", payload])',
+    'spawn("rundll" + "32.exe", ["url.dll" + ",FileProtocolHandler", target])',
+    'DllImport("advapi" + "32.dll")',
+    '"Add" + "-Type"',
+  ]) {
+    assert.throws(() => assertEndpointSecuritySource(fixture, "obfuscation negative control"), /violates endpoint-security policy/u);
+  }
+});
+
 async function runtimeFiles(root) {
   const files = [];
   for (const entry of await readdir(root, { withFileTypes: true })) {

@@ -81,8 +81,10 @@ not executable release installers. Generated files are accepted for review only 
 5. installed-artifact self-tests pass on the declared platform matrix.
 
 `distribution-receipt.schema.json` defines pre-publication typed observations
-for an installed channel. The verifier requires 22 fresh receipts: every
-required channel/platform pair on each required Node line (22.17.1 and 24.4.1).
+for an installed channel. The verifier requires 19 fresh receipts: every
+required channel/platform pair on the Node lines selected by that channel.
+npm, Bun, and curl cover 22.17.1 and 24.4.1; Homebrew and AUR cover 22.17.1
+because their public projections pin Node 22 providers.
 Receipt identity includes the Node version. Each receipt binds one immutable
 workflow-run cohort, the stable test ID, package-manager name and version,
 exact candidate invocation, isolated environment policy, public `runa` shim

@@ -240,9 +240,11 @@ async function createReceiptSet(fixture) {
   const observedAt = new Date().toISOString();
   const packageManagerVersions = { npm: "10.9.2", bun: "1.2.19", homebrew: "4.4.32", pacman: "7.0.0" };
   for (const channel of manifest.channels) {
+    const definition = supportPolicy.channels[channel.id];
+    assert.ok(definition, `support policy defines ${channel.id}`);
     for (const platformKey of channel.platforms) {
       const [platform, architecture] = platformKey.split("-");
-      for (const testedNodeVersion of supportPolicy.node.tested) {
+      for (const testedNodeVersion of definition.testedNodeVersions) {
       const nodeVersion = `v${testedNodeVersion}`;
       const id = distributionReceiptId(channel.id, platformKey, nodeVersion);
       const runtimeIdentity = {
@@ -506,7 +508,7 @@ test("typed self-authored receipts prove internal consistency but not observatio
   assert.equal(result.distributionGate, "BLOCKED");
   assert.equal(result.releaseDecision, "BLOCKED");
   assert.equal(result.releaseEligible, false);
-  assert.equal(result.receipts.length, 22);
+  assert.equal(result.receipts.length, 19);
   assert.ok(result.receipts.includes("npm-linux-x64-node22.17.1"));
   assert.ok(result.receipts.includes("npm-linux-x64-node24.4.1"));
   assert.equal(result.derivedChecks["npm-linux-x64-node22.17.1"].evidenceClass, "SELF_AUTHORED_TYPED_CLAIM");
@@ -641,7 +643,7 @@ test("receipt paths use the same canonical grammar as the published schema", () 
   }
 });
 
-test("every channel-platform pair requires both supported Node receipt cells", async () => {
+test("every channel-platform pair requires its channel-bound Node receipt cells", async () => {
   const fixture = await createFixture();
   await project(fixture);
   const receipts = await createReceiptSet(fixture);

@@ -1,4 +1,5 @@
-import { lstat, readdir, realpath } from "node:fs/promises";
+import { readFile, lstat, readdir, realpath } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { invariant, parseArgs, readJson, sha256File } from "./lib/release-evidence.mjs";
@@ -31,7 +32,7 @@ const receiptsRealRoot = await realpath(receiptsRoot);
 
 const expectedReceiptIds = channelOrder.flatMap((channel) =>
   channelDefinitions[channel].platforms.flatMap((platform) =>
-    supportPolicy.node.tested.map((nodeVersion) => distributionReceiptId(channel, platform, `v${nodeVersion}`)),
+    channelDefinitions[channel].testedNodeVersions.map((nodeVersion) => distributionReceiptId(channel, platform, `v${nodeVersion}`)),
   ),
 ).sort();
 const receiptFiles = (await readdir(receiptsRoot))
@@ -80,13 +81,24 @@ async function resolveEvidenceFile(relativeValue, label) {
   return { relative, absolute: canonical };
 }
 
+async function readBoundJson(absolute, expectedSha256, label) {
+  const bytes = await readFile(absolute);
+  const observedSha256 = createHash("sha256").update(bytes).digest("hex");
+  invariant(observedSha256 === expectedSha256, label);
+  try {
+    return JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new Error(`${label}: bound bytes are not valid JSON`);
+  }
+}
+
 for (const id of expectedReceiptIds) {
   const receiptFile = path.join(receiptsRoot, `${id}.json`);
   const receipt = await readJson(receiptFile);
   const { statement } = validateDistributionReceipt(receipt, {
     manifest,
     manifestSha256,
-    supportedNodeVersions: supportPolicy.node.tested.map((version) => `v${version}`),
+    supportedNodeVersions: channelDefinitions[receipt.attestation.statement.subject.channel].testedNodeVersions.map((version) => `v${version}`),
     supportPolicy,
     supportPolicySha256: envelope.supportPolicy.sha256,
   });
@@ -107,15 +119,16 @@ for (const id of expectedReceiptIds) {
   const rawObservations = {};
   for (const [name, observation] of Object.entries(statement.observations)) {
     const { relative, absolute } = await resolveEvidenceFile(observation.file, `${id} ${name} observation file`);
-    invariant((await sha256File(absolute)) === observation.sha256, `${id} raw observation digest mismatch: ${relative}`);
-    rawObservations[name] = await readJson(absolute);
+    rawObservations[name] = await readBoundJson(absolute, observation.sha256, `${id} raw observation digest mismatch: ${relative}`);
   }
   derivedObservationResults.set(id, validateDistributionObservations(receipt, rawObservations, { manifest }));
 
   const signingReference = receipt.attestation.signingEvidence;
   const { relative: signingRelative, absolute: signingAbsolute } = await resolveEvidenceFile(signingReference.file, `${id} signing-evidence file`);
-  invariant((await sha256File(signingAbsolute)) === signingReference.sha256, `${id} signing-evidence digest mismatch: ${signingRelative}`);
-  validateSigningVerificationEvidence(receipt, await readJson(signingAbsolute));
+  validateSigningVerificationEvidence(
+    receipt,
+    await readBoundJson(signingAbsolute, signingReference.sha256, `${id} signing-evidence digest mismatch: ${signingRelative}`),
+  );
 
   observedBuildDigests.add(statement.runtimeIdentity.buildDigest);
   observedProtocolRanges.add(JSON.stringify(statement.runtimeIdentity.protocolRange));

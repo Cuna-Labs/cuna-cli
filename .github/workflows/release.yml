@@ -78,8 +78,8 @@ jobs:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
         shell: bash
         run: |
-          RUN_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq '[.status,.conclusion,.head_sha,.event] | join(" ")')"
-          test "$RUN_STATE" = "completed success ${SOURCE_COMMIT} push"
+          RUN_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq '[.status,.conclusion,.head_sha,.event,.head_branch,.path] | join(" ")')"
+          test "$RUN_STATE" = "completed success ${SOURCE_COMMIT} push main .github/workflows/ci.yml"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-review-candidate
@@ -126,7 +126,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: gh attestation verify admitted/release-artifacts/*.tgz --repo "$GITHUB_REPOSITORY"
+        run: >-
+          gh attestation verify admitted/release-artifacts/*.tgz
+          --repo "$GITHUB_REPOSITORY"
+          --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"
       - name: Require exact registry version to be absent
         env:
           VERSION: ${{ inputs.version }}

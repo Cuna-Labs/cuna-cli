@@ -40,6 +40,7 @@
       "projectionFile": "npm/install-command.txt",
       "publicCommand": "npm install -g @runa_laboratories/cli",
       "candidateInvocationPolicy": "npm-exact-version",
+      "testedNodeVersions": ["22.17.1", "24.4.1"],
       "runtimeDependency": "node:^22.17.1 || ^24.4.1"
     },
     "bun": {
@@ -51,6 +52,7 @@
       "projectionFile": "bun/install-command.txt",
       "publicCommand": "bun add --global @runa_laboratories/cli",
       "candidateInvocationPolicy": "bun-exact-version",
+      "testedNodeVersions": ["22.17.1", "24.4.1"],
       "runtimeDependency": "node:^22.17.1 || ^24.4.1"
     },
     "curl": {
@@ -62,6 +64,7 @@
       "projectionFile": "curl/install.sh",
       "publicCommand": "curl -fsSL https://runacode.io/install | sh",
       "candidateInvocationPolicy": "verified-projection",
+      "testedNodeVersions": ["22.17.1", "24.4.1"],
       "runtimeDependency": "node+npm"
     },
     "homebrew": {
@@ -73,6 +76,7 @@
       "projectionFile": "homebrew/runa.rb",
       "publicCommand": "brew install Runa-Laboratories/tap/runa",
       "candidateInvocationPolicy": "verified-projection",
+      "testedNodeVersions": ["22.17.1"],
       "runtimeDependency": "node@22"
     },
     "aur": {
@@ -84,6 +88,7 @@
       "projectionFile": "aur/PKGBUILD",
       "publicCommand": "paru -S runa-cli-bin",
       "candidateInvocationPolicy": "verified-projection",
+      "testedNodeVersions": ["22.17.1"],
       "runtimeDependency": "nodejs-lts-jod>=22.17.1"
     }
   }

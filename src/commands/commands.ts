@@ -14,7 +14,7 @@ import type { EffectiveConfig } from "../config/config.js";
 import { publicConfig } from "../config/config.js";
 import { EXIT_CODES, RunaError, unsupportedError, usageError } from "../core/errors.js";
 import { assertIdempotencyKey, assertPublicId, assertSafeDisplayText } from "../core/validation.js";
-import { INITIAL_RUNTIME_GATES } from "../runtime/contracts.js";
+import { INITIAL_RUNTIME_GATES, type RuntimeFeatureGate } from "../runtime/contracts.js";
 import { evaluateRuntimeSupport } from "../platform/support.js";
 import { CLI_VERSION } from "../version.js";
 import {
@@ -36,6 +36,7 @@ export interface CommandContext {
   readonly client: RunaApiClient;
   readonly now: number;
   readonly credentialMode?: "automation" | "interactive";
+  readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
 }
 
 function requireCredential(context: CommandContext): void {
@@ -387,7 +388,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       const data = Object.freeze({
         platform: process.platform,
         node: process.version,
-        runtime_features: INITIAL_RUNTIME_GATES,
+        runtime_features: context.runtimeFeatures ?? INITIAL_RUNTIME_GATES,
       });
       return Object.freeze({ command: "doctor", data, human: JSON.stringify(data, null, 2) });
     }

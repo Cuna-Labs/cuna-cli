@@ -14,6 +14,7 @@ import { createPlatformCredentialBackend } from "../credentials/platform.js";
 import { CredentialVault } from "../credentials/vault.js";
 import { createPlatformAdapter, type PlatformAdapter } from "../platform/adapter.js";
 import { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "../version.js";
+import { runtimeFeatureGates, type RuntimeFeatureGate } from "../runtime/contracts.js";
 import { ROOT_HELP } from "./help.js";
 import { createOutputWriter, type CliStreams } from "./output.js";
 import { booleanOption, parseArgv, stringOption } from "./parser.js";
@@ -30,6 +31,7 @@ export interface RunCliDependencies {
   readonly credentialVault?: CredentialVault;
   readonly browser?: BrowserOpener;
   readonly signal?: AbortSignal;
+  readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
 }
 
 function defaultStreams(): CliStreams {
@@ -215,12 +217,26 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       timeoutMs,
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     }));
+    let runtimeFeatures = dependencies.runtimeFeatures;
+    if (parsed.command === "doctor" && runtimeFeatures === undefined) {
+      const backend = createPlatformCredentialBackend({
+        platform: platform.kind === "windows" ? "win32" : platform.kind === "macos" ? "darwin" : "linux",
+      });
+      let credentialBackendStatus: "verified" | "unavailable" | "unknown" = "unknown";
+      try {
+        credentialBackendStatus = (await backend.probe()).status;
+      } catch {
+        credentialBackendStatus = "unavailable";
+      }
+      runtimeFeatures = runtimeFeatureGates({ platform: platform.kind, credentialBackendStatus });
+    }
     const result = await executeCommand({
       parsed,
       config,
       client,
       now: dependencies.now?.() ?? Date.now(),
       ...(credentialMode === undefined ? {} : { credentialMode }),
+      ...(runtimeFeatures === undefined ? {} : { runtimeFeatures }),
     });
     writer.success(result.command, result.data, result.human);
     return EXIT_CODES.success;

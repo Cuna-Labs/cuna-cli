@@ -147,7 +147,7 @@ export function validateSupportPolicy(policy) {
     const constraints = CHANNEL_CONSTRAINTS[id];
     exactKeys(
       channel,
-      ["role", "availability", "artifactChannel", "installerOfRecord", "platforms", "projectionFile", "publicCommand", "candidateInvocationPolicy", "runtimeDependency"],
+      ["role", "availability", "artifactChannel", "installerOfRecord", "platforms", "projectionFile", "publicCommand", "candidateInvocationPolicy", "testedNodeVersions", "runtimeDependency"],
       `support policy channel ${id}`,
     );
     invariant(CHANNEL_ROLES.has(channel.role), `${id} role is unknown`);
@@ -167,12 +167,17 @@ export function validateSupportPolicy(policy) {
     invariant(!/[\r\n\0]/u.test(channel.publicCommand), `${id} public command is not a single safe line`);
     invariant(CANDIDATE_INVOCATION_POLICIES.has(channel.candidateInvocationPolicy), `${id} candidate-invocation policy is unknown`);
     invariant(channel.candidateInvocationPolicy === constraints.candidateInvocationPolicy, `${id} candidate-invocation policy violates its channel contract`);
+    invariant(Array.isArray(channel.testedNodeVersions) && channel.testedNodeVersions.length > 0, `${id} tested Node set is missing`);
+    invariant(new Set(channel.testedNodeVersions).size === channel.testedNodeVersions.length, `${id} tested Node set contains duplicates`);
+    invariant(channel.testedNodeVersions.every((version) => policy.node.tested.includes(version)), `${id} tested Node set leaves the support policy`);
     invariant(typeof channel.runtimeDependency === "string" && /^[A-Za-z0-9@^.+:/|><= _-]+$/u.test(channel.runtimeDependency), `${id} runtime dependency is unsafe`);
     if (id === "homebrew") {
       invariant(/^[a-z0-9@+_.-]+$/u.test(channel.runtimeDependency), "Homebrew runtime dependency is not a safe formula identity");
+      invariant(JSON.stringify(channel.testedNodeVersions) === JSON.stringify(["22.17.1"]), "Homebrew Node receipts must match the pinned node@22 provider");
     }
     if (id === "aur") {
       invariant(/^[a-z0-9@+_.-]+(?:[<>=]+[0-9][0-9A-Za-z.+_-]*)?$/u.test(channel.runtimeDependency), "AUR runtime dependency is not a safe package constraint");
+      invariant(JSON.stringify(channel.testedNodeVersions) === JSON.stringify(["22.17.1"]), "AUR Node receipts must match the nodejs-lts-jod provider");
     }
   }
   return Object.freeze([...supported].sort());
@@ -182,7 +187,11 @@ export function channelDefinitionsFromSupportPolicy(policy) {
   validateSupportPolicy(policy);
   return Object.freeze(Object.fromEntries(policy.channelOrder.map((id) => {
     const channel = policy.channels[id];
-    return [id, Object.freeze({ ...channel, platforms: Object.freeze([...channel.platforms]) })];
+    return [id, Object.freeze({
+      ...channel,
+      platforms: Object.freeze([...channel.platforms]),
+      testedNodeVersions: Object.freeze([...channel.testedNodeVersions]),
+    })];
   })));
 }
 

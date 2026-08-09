@@ -451,6 +451,21 @@ test("reserved cloud-terminal commands fail explicitly instead of simulating a s
   assert.equal(error.details.reason, "terminal_runtime_unavailable");
 });
 
+test("doctor never advertises interactive browser auth without a verified platform vault", async () => {
+  for (const kind of ["windows", "macos"]) {
+    const streams = memoryStreams();
+    const exit = await runCli(["doctor"], {
+      streams: streams.streams,
+      platform: { ...platform, kind },
+      env: {},
+    });
+    assert.equal(exit, EXIT_CODES.success);
+    const browserAuth = JSON.parse(streams.stdout()).data.runtime_features.find((item) => item.feature === "browser_auth");
+    assert.equal(browserAuth.implementation, "unsupported");
+    assert.notEqual(browserAuth.reason, "polling_continuation_v1_3");
+  }
+});
+
 test("package and runtime versions remain identical", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const streams = memoryStreams();

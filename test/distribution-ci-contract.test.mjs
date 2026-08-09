@@ -20,6 +20,7 @@ async function fixture() {
   await cp(path.join(repositoryRoot, "package-lock.json"), path.join(root, "package-lock.json"));
   await cp(path.join(repositoryRoot, "packaging", "support-policy.json"), path.join(root, "packaging", "support-policy.json"));
   await cp(path.join(repositoryRoot, ".github", "workflows", "ci.yml"), path.join(root, ".github", "workflows", "ci.yml"));
+  await cp(path.join(repositoryRoot, ".github", "workflows", "release.yml"), path.join(root, ".github", "workflows", "release.yml"));
   return root;
 }
 
@@ -158,4 +159,23 @@ test("CI contract rejects semantic validation before its locked dependencies are
     );
   await writeFile(workflow, content);
   await assert.rejects(verify(root), /dependencies must be installed before semantic workflow validation/);
+});
+
+test("CI contract rejects a release dispatch bound only to commit and event", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace(",.head_branch,.path", "")
+    .replace(" push main .github/workflows/ci.yml", " push");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /bind the selected run to protected-main CI/u);
+});
+
+test("CI contract rejects repository-only attestation verification", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace('\n          --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"', "");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /bind the exact signer workflow/u);
 });

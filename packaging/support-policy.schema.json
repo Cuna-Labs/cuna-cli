@@ -40,12 +40,12 @@
       "uniqueItems": true,
       "items": {"$ref": "#/$defs/ciMatrixEntry"},
       "allOf": [
-        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "linux"}, "architecture": {"const": "x64"}, "node": {"const": "22.17.1"}}}, "minContains": 1, "maxContains": 1},
-        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "linux"}, "architecture": {"const": "x64"}, "node": {"const": "24.4.1"}}}, "minContains": 1, "maxContains": 1},
-        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "darwin"}, "architecture": {"const": "x64"}, "node": {"const": "22.17.1"}}}, "minContains": 1, "maxContains": 1},
-        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "darwin"}, "architecture": {"const": "x64"}, "node": {"const": "24.4.1"}}}, "minContains": 1, "maxContains": 1},
-        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "win32"}, "architecture": {"const": "x64"}, "node": {"const": "22.17.1"}}}, "minContains": 1, "maxContains": 1},
-        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "win32"}, "architecture": {"const": "x64"}, "node": {"const": "24.4.1"}}}, "minContains": 1, "maxContains": 1}
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "not": {"required": ["claim"]}, "properties": {"platform": {"const": "linux"}, "architecture": {"const": "x64"}, "node": {"const": "22.17.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "not": {"required": ["claim"]}, "properties": {"platform": {"const": "linux"}, "architecture": {"const": "x64"}, "node": {"const": "24.4.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "not": {"required": ["claim"]}, "properties": {"platform": {"const": "darwin"}, "architecture": {"const": "x64"}, "node": {"const": "22.17.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "not": {"required": ["claim"]}, "properties": {"platform": {"const": "darwin"}, "architecture": {"const": "x64"}, "node": {"const": "24.4.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "not": {"required": ["claim"]}, "properties": {"platform": {"const": "win32"}, "architecture": {"const": "x64"}, "node": {"const": "22.17.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "not": {"required": ["claim"]}, "properties": {"platform": {"const": "win32"}, "architecture": {"const": "x64"}, "node": {"const": "24.4.1"}}}, "minContains": 1, "maxContains": 1}
       ]
     },
     "preGaExternalEvidence": {"type": "array", "minItems": 5, "items": {"type": "string", "minLength": 1}},
@@ -91,7 +91,7 @@
     "channel": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["role", "availability", "artifactChannel", "installerOfRecord", "platforms", "projectionFile", "publicCommand", "candidateInvocationPolicy", "runtimeDependency"],
+      "required": ["role", "availability", "artifactChannel", "installerOfRecord", "platforms", "projectionFile", "publicCommand", "candidateInvocationPolicy", "testedNodeVersions", "runtimeDependency"],
       "properties": {
         "role": {"enum": ["canonical-artifact", "registry-projection", "bootstrap-projection", "formula-projection", "package-projection"]},
         "availability": {"const": "PROJECTED_NOT_PUBLISHED"},
@@ -101,6 +101,7 @@
         "projectionFile": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"},
         "publicCommand": {"type": "string", "minLength": 1},
         "candidateInvocationPolicy": {"enum": ["npm-exact-version", "bun-exact-version", "verified-projection"]},
+        "testedNodeVersions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["22.17.1", "24.4.1"]}},
         "runtimeDependency": {"type": "string", "pattern": "^[A-Za-z0-9@^.+:/|><= _-]+$"}
       }
     }

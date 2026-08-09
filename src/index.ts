@@ -96,6 +96,7 @@ export {
 } from "./platform/adapter.js";
 export {
   INITIAL_RUNTIME_GATES,
+  runtimeFeatureGates,
   type DaemonState,
   type RuntimeFeatureGate,
   type SyncSupervisorState,
