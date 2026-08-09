@@ -248,3 +248,27 @@ test("receipt verification rejects stale evidence", async () => {
   await assert.rejects(verifyReceipts(fixture, receipts), /receipt is stale/);
 });
 
+test("actual local artifact evidence is useful but can never authorize release", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "runa-local-evidence-test-"));
+  const output = path.join(root, "local-evidence");
+  const generated = JSON.parse((await execute(node, [
+    "scripts/release-local-artifact-evidence.mjs",
+    "--root", repositoryRoot,
+    "--output", output,
+  ], { cwd: repositoryRoot, maxBuffer: 32 * 1024 * 1024, timeout: 180_000 })).stdout);
+  assert.equal(generated.status, "LOCAL_CANDIDATE_VERIFIED_NOT_RELEASE_ELIGIBLE");
+  const verified = JSON.parse((await execute(node, [
+    "scripts/verify-local-distribution-evidence.mjs",
+    "--root", output,
+  ], { cwd: repositoryRoot, maxBuffer: 4 * 1024 * 1024 })).stdout);
+  assert.equal(verified.releaseEligible, false);
+
+  const recordFile = path.join(output, "local-artifact-evidence.json");
+  const record = JSON.parse(await readFile(recordFile, "utf8"));
+  record.releaseEligible = true;
+  await writeFile(recordFile, `${JSON.stringify(record, null, 2)}\n`);
+  await assert.rejects(
+    execute(node, ["scripts/verify-local-distribution-evidence.mjs", "--root", output], { cwd: repositoryRoot }),
+    /may not claim release eligibility/,
+  );
+});
