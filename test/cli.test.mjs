@@ -207,7 +207,7 @@ test("machine list calls the real public legacy Machine projection", async () =>
 test("absent capability is a negative control: no machine mutation occurs", async () => {
   let creates = 0;
   const streams = memoryStreams();
-  const exit = await runCli(["machines", "create", "--name", "dev", "--yes", "--idempotency-key", "op_1"], {
+  const exit = await runCli(["machines", "create", "--name", "dev", "--yes", "--idempotency-key", "operation-1"], {
     streams: streams.streams,
     platform,
     env: { RUNA_API_KEY: API_KEY },
@@ -217,6 +217,40 @@ test("absent capability is a negative control: no machine mutation occurs", asyn
   assert.equal(exit, EXIT_CODES.unsupported);
   assert.equal(creates, 0);
   assert.equal(JSON.parse(streams.stderr()).error.code, "runa.capability.unknown");
+});
+
+test("malformed remote commands fail before vault, client, or configuration effects", async () => {
+  let authCalls = 0;
+  let clientCalls = 0;
+  let configReads = 0;
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", "list", "--bogus", "value", "--json"], {
+    streams: streams.streams,
+    platform: {
+      ...platform,
+      async readSafeConfig() { configReads += 1; return { exists: false }; },
+    },
+    humanAuth: {
+      async acquireAccessToken() { authCalls += 1; return "never"; },
+    },
+    clientFactory: () => {
+      clientCalls += 1;
+      return fakeClient();
+    },
+  });
+  assert.equal(exit, EXIT_CODES.usage);
+  assert.equal(authCalls, 0);
+  assert.equal(clientCalls, 0);
+  assert.equal(configReads, 0);
+  assert.equal(JSON.parse(streams.stderr()).error.code, "runa.usage.invalid");
+});
+
+test("root options cannot bypass validation by falling through to help", async () => {
+  const streams = memoryStreams();
+  const exit = await runCli(["--timeout-ms", "not-a-number", "--json"], { streams: streams.streams });
+  assert.equal(exit, EXIT_CODES.usage);
+  assert.equal(streams.stdout(), "");
+  assert.equal(JSON.parse(streams.stderr()).error.code, "runa.usage.invalid");
 });
 
 test("advertised native capability admits exactly one documented mutation", async () => {
@@ -240,7 +274,7 @@ test("advertised native capability admits exactly one documented mutation", asyn
       return { id: "m_1", name: "dev", state: "creating" };
     },
   });
-  const exit = await runCli(["machines", "create", "--name", "dev", "--yes", "--idempotency-key", "op_1"], {
+  const exit = await runCli(["machines", "create", "--name", "dev", "--yes", "--idempotency-key", "operation-1"], {
     streams: streams.streams,
     platform,
     env: { RUNA_API_KEY: API_KEY },
@@ -249,7 +283,7 @@ test("advertised native capability admits exactly one documented mutation", asyn
   });
   assert.equal(exit, EXIT_CODES.success);
   assert.equal(creates, 1);
-  assert.equal(key, "op_1");
+  assert.equal(key, "operation-1");
   assert.equal(JSON.parse(streams.stdout()).data.state, "creating");
 });
 

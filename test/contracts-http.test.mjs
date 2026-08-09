@@ -200,6 +200,28 @@ test("AgentSession client rejects producer responses bound to a sibling resource
   );
 });
 
+test("machine client enforces canonical create bounds before transport", async () => {
+  let requests = 0;
+  const client = createRunaApiClient({ async request() { requests += 1; return {}; } });
+  await assert.rejects(client.createMachine({ name: "dev" }, "short"), RunaError);
+  await assert.rejects(client.createMachine({ name: "" }, "operation-1"), RunaError);
+  await assert.rejects(client.createMachine({ name: "dev", vcpus: 9 }, "operation-2"), RunaError);
+  await assert.rejects(client.createMachine({ name: "dev", memoryMiB: 511 }, "operation-3"), RunaError);
+  assert.equal(requests, 0);
+});
+
+test("machine transition rejects a producer response bound to a sibling machine", async () => {
+  const requested = "22222222-2222-4222-8222-222222222222";
+  const sibling = "33333333-3333-4333-8333-333333333333";
+  const client = createRunaApiClient({
+    async request() { return { id: sibling, name: "sibling", status: "running" }; },
+  });
+  await assert.rejects(
+    client.transitionMachine(requested, "start"),
+    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+  );
+});
+
 test("legacy array machine responses are decoded into a safe public page", () => {
   const page = decodeMachinePage([{ id: "m_1", name: "dev", status: "running", memory_mib: 512, vcpus: 1, url: "https://internal.invalid" }]);
   assert.deepEqual(page, { items: [{ id: "m_1", name: "dev", state: "running", vcpus: 1, memoryMiB: 512 }] });

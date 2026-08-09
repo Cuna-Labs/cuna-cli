@@ -7,7 +7,7 @@ import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { packageBuildDigest, PROTOCOL_RANGE, UPDATE_CHANNEL } from "../build-identity.js";
 import { resolveConfig, type EffectiveConfig } from "../config/config.js";
-import { executeCommand } from "../commands/commands.js";
+import { executeCommand, preflightInvocation } from "../commands/commands.js";
 import { EXIT_CODES, normalizeError, RunaError, usageError, type ExitCode } from "../core/errors.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { createPlatformCredentialBackend } from "../credentials/platform.js";
@@ -80,6 +80,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   try {
     const parsed = parseArgv(argv);
     if (booleanOption(parsed, "version") || parsed.command === "version") {
+      rejectUnknownOptions(parsed, ["version"]);
+      if (parsed.command === "version" && parsed.operands.length !== 0) {
+        throw usageError("version accepts no operands.");
+      }
       const identity = Object.freeze({
         version: CLI_VERSION,
         buildDigest: await packageBuildDigest(),
@@ -95,7 +99,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }
       return EXIT_CODES.success;
     }
-    if (parsed.command === undefined || parsed.command === "help" || booleanOption(parsed, "help")) {
+    if (parsed.command === undefined) {
+      const allowedRootOptions = new Set(["help", "version", "json", "no-color"]);
+      const invalidRootOption = Object.keys(parsed.options).find((name) => !allowedRootOptions.has(name));
+      if (invalidRootOption !== undefined) throw usageError(`Option --${invalidRootOption} requires a command.`);
+    }
+    if (parsed.command === "help" || booleanOption(parsed, "help")) {
+      rejectUnknownOptions(parsed, ["help"]);
+      if (parsed.command === "help" && parsed.operands.length !== 0) throw usageError("help accepts no operands.");
       if (writer.structured) {
         writer.success(
           "help",
@@ -107,6 +118,16 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }
       return EXIT_CODES.success;
     }
+    if (parsed.command === undefined) {
+      if (writer.structured) {
+        writer.success("help", { version: CLI_VERSION, output_schema_version: OUTPUT_SCHEMA_VERSION, help: ROOT_HELP }, ROOT_HELP);
+      } else {
+        writer.text(ROOT_HELP);
+      }
+      return EXIT_CODES.success;
+    }
+
+    preflightInvocation(parsed);
 
     let timeoutMs: number;
     try {

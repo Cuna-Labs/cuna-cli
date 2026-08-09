@@ -6,6 +6,7 @@ const SAFE_CODE = /^[a-z][a-z0-9_.-]{0,127}$/u;
 // rows, reverse text direction, or hide content. They are never valid in a
 // Runa display name, state label, or workspace path.
 const UNSAFE_DISPLAY_CHARACTER = /[\p{Cc}\p{Cf}]/u;
+const IDEMPOTENCY_KEY = /^[!-~]{8,128}$/u;
 
 export function assertPublicId(value: string, label: string): string {
   if (!PUBLIC_ID.test(value)) {
@@ -16,6 +17,16 @@ export function assertPublicId(value: string, label: string): string {
 
 export function encodePublicId(value: string, label: string): string {
   return encodeURIComponent(assertPublicId(value, label));
+}
+
+export function assertIdempotencyKey(value: string): string {
+  if (!IDEMPOTENCY_KEY.test(value)) {
+    throw usageError(
+      "Invalid idempotency key.",
+      "Idempotency key must contain 8 through 128 printable ASCII characters.",
+    );
+  }
+  return value;
 }
 
 export function safeReasonCode(value: unknown): string | undefined {

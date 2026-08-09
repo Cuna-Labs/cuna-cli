@@ -13,7 +13,7 @@ import type {
 import type { EffectiveConfig } from "../config/config.js";
 import { publicConfig } from "../config/config.js";
 import { EXIT_CODES, RunaError, unsupportedError, usageError } from "../core/errors.js";
-import { assertPublicId, assertSafeDisplayText } from "../core/validation.js";
+import { assertIdempotencyKey, assertPublicId, assertSafeDisplayText } from "../core/validation.js";
 import { INITIAL_RUNTIME_GATES } from "../runtime/contracts.js";
 import { evaluateRuntimeSupport } from "../platform/support.js";
 import { CLI_VERSION } from "../version.js";
@@ -99,7 +99,7 @@ function idempotencyKey(parsed: ParsedInvocation): string {
       "Reuse the same opaque key when reconciling an uncertain result.",
     );
   }
-  return assertPublicId(value, "idempotency key");
+  return assertIdempotencyKey(value);
 }
 
 function machineRecord(machine: Machine): Readonly<Record<string, unknown>> {
@@ -155,6 +155,178 @@ function capabilityRecord(snapshot: CapabilitySnapshot): Readonly<Record<string,
       ...(capability.reasonCode === undefined ? {} : { reason_code: capability.reasonCode }),
     })),
   });
+}
+
+export function preflightInvocation(parsed: ParsedInvocation): void {
+  switch (parsed.command) {
+    case "config":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 1 || parsed.operands[0] !== "get") {
+        throw unsupportedError("configuration mutation", "config_writes_not_implemented");
+      }
+      return;
+    case "capabilities": {
+      rejectUnknownOptions(parsed, ["scope", "resource-id"]);
+      if (parsed.operands.length !== 0) throw usageError("capabilities accepts no operands.");
+      const scope = stringOption(parsed, "scope") ?? "account";
+      if (scope !== "account" && scope !== "machine" && scope !== "agent_session") {
+        throw usageError("Option --scope must be account, machine, or agent_session.");
+      }
+      const resourceId = stringOption(parsed, "resource-id");
+      if (scope === "account" && resourceId !== undefined) {
+        throw usageError("Option --resource-id is not valid for account scope.");
+      }
+      if (scope !== "account") assertPublicId(resourceId ?? "", "resource ID");
+      return;
+    }
+    case "machines":
+      preflightMachines(parsed);
+      return;
+    case "agent-sessions":
+      preflightAgentSessions(parsed);
+      return;
+    case "login":
+    case "logout":
+    case "whoami":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands.`);
+      return;
+    case "signup":
+    case "claude":
+    case "codex":
+    case "openclaw":
+    case "shell":
+    case "connect":
+    case "sync":
+    case "companion":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands in this build.`);
+      return;
+    case "doctor":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 0) throw usageError("doctor accepts no operands.");
+      return;
+    case "self-test":
+      rejectUnknownOptions(parsed, ["offline"]);
+      if (parsed.operands.length !== 0) throw usageError("self-test accepts no operands.");
+      if (!booleanOption(parsed, "offline")) {
+        throw usageError("self-test requires --offline in this release.", "Run `runa self-test --offline --json`.");
+      }
+      return;
+    case "version":
+      rejectUnknownOptions(parsed, ["help", "version"]);
+      if (parsed.operands.length !== 0) throw usageError("version accepts no operands.");
+      return;
+    case "help":
+      rejectUnknownOptions(parsed, ["help"]);
+      if (parsed.operands.length !== 0) throw usageError("help accepts no operands.");
+      return;
+    default:
+      throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run `runa --help`.");
+  }
+}
+
+function preflightMachines(parsed: ParsedInvocation): void {
+  const action = requireOperand(parsed.operands, 0, "machines action");
+  if (action === "list") {
+    rejectUnknownOptions(parsed, []);
+    if (parsed.operands.length !== 1) throw usageError("machines list accepts no operands.");
+    return;
+  }
+  if (action === "create") {
+    rejectUnknownOptions(parsed, ["name", "agent", "vcpus", "memory-mib", "background", "yes", "idempotency-key"]);
+    if (parsed.operands.length !== 1) throw usageError("machines create accepts no operands.");
+    requireConfirmation(parsed, "machines.create");
+    idempotencyKey(parsed);
+    const rawName = stringOption(parsed, "name");
+    if (rawName === undefined) throw usageError("Option --name is required.");
+    const name = assertSafeDisplayText(rawName, "machine name");
+    if (name.length < 1 || name.length > 80) throw usageError("Option --name must contain 1 through 80 characters.");
+    agentOption(parsed, false);
+    integerOption(parsed, "vcpus", 1, 8);
+    integerOption(parsed, "memory-mib", 512, 16_384);
+    return;
+  }
+  if (action === "start" || action === "pause" || action === "resume" || action === "stop" || action === "delete") {
+    rejectUnknownOptions(parsed, ["yes"]);
+    if (parsed.operands.length !== 2) throw usageError(`machines ${action} requires exactly one machine ID.`);
+    requireConfirmation(parsed, `machines.${action}`);
+    assertPublicId(requireOperand(parsed.operands, 1, "machine ID"), "machine ID");
+    return;
+  }
+  throw usageError(`Unknown machines action ${action}.`);
+}
+
+function preflightAgentSessions(parsed: ParsedInvocation): void {
+  const action = requireOperand(parsed.operands, 0, "agent-sessions action");
+  if (action === "list") {
+    rejectUnknownOptions(parsed, ["machine", "limit", "cursor"]);
+    if (parsed.operands.length !== 1) throw usageError("agent-sessions list accepts no operands.");
+    assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
+    integerOption(parsed, "limit", 1, 100);
+    const cursor = stringOption(parsed, "cursor");
+    if (cursor !== undefined && (cursor.length > 512 || /[\p{Cc}\p{Cf}]/u.test(cursor))) {
+      throw usageError("Option --cursor is malformed.");
+    }
+    return;
+  }
+  if (action === "get") {
+    rejectUnknownOptions(parsed, []);
+    if (parsed.operands.length !== 2) throw usageError("agent-sessions get requires exactly one AgentSession ID.");
+    assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    return;
+  }
+  if (action === "create") {
+    rejectUnknownOptions(parsed, [
+      "machine", "name", "agent", "cwd", "auth-mode", "credential-binding", "yes", "idempotency-key",
+    ]);
+    if (parsed.operands.length !== 1) throw usageError("agent-sessions create accepts no operands.");
+    requireConfirmation(parsed, "agent-sessions.create");
+    assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
+    agentOption(parsed, true);
+    const cwd = assertSafeDisplayText(stringOption(parsed, "cwd") ?? "/workspace", "workspace path");
+    if (!cwd.startsWith("/workspace") || cwd.split("/").includes("..") || cwd.length > 1024) {
+      throw usageError("Option --cwd must be a safe absolute path inside /workspace.");
+    }
+    const name = stringOption(parsed, "name");
+    if (name !== undefined && (assertSafeDisplayText(name, "AgentSession name").length < 1 || name.length > 80)) {
+      throw usageError("Option --name must contain 1 through 80 characters.");
+    }
+    const authMode = stringOption(parsed, "auth-mode");
+    if (authMode !== undefined && authMode !== "interactive_login" && authMode !== "credential_binding") {
+      throw usageError("Option --auth-mode must be interactive_login or credential_binding.");
+    }
+    const binding = stringOption(parsed, "credential-binding");
+    if (authMode === "credential_binding" && binding === undefined) {
+      throw usageError("Option --credential-binding is required for credential_binding auth mode.");
+    }
+    if (authMode !== "credential_binding" && binding !== undefined) {
+      throw usageError("Option --credential-binding requires --auth-mode credential_binding.");
+    }
+    if (binding !== undefined) assertPublicId(binding, "credential binding ID");
+    idempotencyKey(parsed);
+    return;
+  }
+  if (action === "terminate" || action === "rename") {
+    rejectUnknownOptions(parsed, action === "rename" ? ["name", "yes"] : ["yes"]);
+    if (parsed.operands.length !== 2) throw usageError(`agent-sessions ${action} requires exactly one AgentSession ID.`);
+    requireConfirmation(parsed, `agent-sessions.${action}`);
+    assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    if (action === "rename") {
+      const name = stringOption(parsed, "name");
+      if (name === undefined || assertSafeDisplayText(name, "AgentSession name").length < 1 || name.length > 80) {
+        throw usageError("Option --name must contain 1 through 80 characters.");
+      }
+    }
+    return;
+  }
+  if (action === "attach") {
+    rejectUnknownOptions(parsed, []);
+    if (parsed.operands.length !== 2) throw usageError("agent-sessions attach requires exactly one AgentSession ID.");
+    assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    return;
+  }
+  throw usageError(`Unknown agent-sessions action ${action}.`);
 }
 
 export async function executeCommand(context: CommandContext): Promise<CommandResult> {
@@ -329,16 +501,18 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     if (parsed.operands.length !== 1) throw usageError("machines create accepts no operands.");
     requireConfirmation(parsed, "machines.create");
     const key = idempotencyKey(parsed);
-    await requireCapability({ client, scope: "account", capabilityId: "machines.create", now });
-    const name = stringOption(parsed, "name");
-    if (name !== undefined && (name.length < 1 || name.length > 80)) {
+    const rawName = stringOption(parsed, "name");
+    if (rawName === undefined) throw usageError("Option --name is required.");
+    const name = assertSafeDisplayText(rawName, "machine name");
+    if (name.length < 1 || name.length > 80) {
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
     const agent = agentOption(parsed, false);
-    const vcpus = integerOption(parsed, "vcpus", 1, 128);
-    const memoryMiB = integerOption(parsed, "memory-mib", 128, 1_048_576);
+    const vcpus = integerOption(parsed, "vcpus", 1, 8);
+    const memoryMiB = integerOption(parsed, "memory-mib", 512, 16_384);
+    await requireCapability({ client, scope: "account", capabilityId: "machines.create", now });
     const input: MachineCreateInput = {
-      ...(name === undefined ? {} : { name }),
+      name,
       ...(agent === undefined ? {} : { agent }),
       ...(vcpus === undefined ? {} : { vcpus }),
       ...(memoryMiB === undefined ? {} : { memoryMiB }),

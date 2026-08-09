@@ -1,5 +1,5 @@
 import { EXIT_CODES, RunaError } from "../core/errors.js";
-import { assertPublicId, encodePublicId } from "../core/validation.js";
+import { assertIdempotencyKey, assertPublicId, assertSafeDisplayText, encodePublicId } from "../core/validation.js";
 import {
   decodeAgentSessionItem,
   decodeAgentSessionPage,
@@ -18,7 +18,7 @@ import {
 import type { HttpTransport } from "./http.js";
 
 export interface MachineCreateInput {
-  readonly name?: string;
+  readonly name: string;
   readonly agent?: AgentKind;
   readonly vcpus?: number;
   readonly memoryMiB?: number;
@@ -160,6 +160,35 @@ function validateAgentSessionCreate(input: AgentSessionCreateInput): void {
   }
 }
 
+function validateMachineCreate(input: MachineCreateInput, idempotencyKey: string): void {
+  assertIdempotencyKey(idempotencyKey);
+  assertSafeDisplayText(input.name, "machine name");
+  if (input.name.length < 1 || input.name.length > 80) {
+    throw new RunaError({
+      code: "runa.usage.invalid",
+      message: "Machine name must contain 1 through 80 characters.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
+  if (input.vcpus !== undefined && (!Number.isInteger(input.vcpus) || input.vcpus < 1 || input.vcpus > 8)) {
+    throw new RunaError({
+      code: "runa.usage.invalid",
+      message: "Machine vcpus must be an integer from 1 through 8.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
+  if (
+    input.memoryMiB !== undefined &&
+    (!Number.isInteger(input.memoryMiB) || input.memoryMiB < 512 || input.memoryMiB > 16_384)
+  ) {
+    throw new RunaError({
+      code: "runa.usage.invalid",
+      message: "Machine memoryMiB must be an integer from 512 through 16384.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
+}
+
 export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
   const client: RunaApiClient = {
     async discoverCapabilities(scope, resourceId) {
@@ -174,8 +203,9 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return decode(decodeMachinePage, await transport.request({ method: "GET", path: "/v1/sessions" }));
     },
     async createMachine(input, idempotencyKey) {
+      validateMachineCreate(input, idempotencyKey);
       const body = {
-        ...(input.name === undefined ? {} : { name: input.name }),
+        name: input.name,
         ...(input.agent === undefined ? {} : { agent: input.agent }),
         ...(input.vcpus === undefined ? {} : { vcpus: input.vcpus }),
         ...(input.memoryMiB === undefined ? {} : { memory_mib: input.memoryMiB }),
@@ -195,7 +225,9 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
         method: "POST",
         path: `/v1/sessions/${safeId}/${action}`,
       });
-      return decode(decodeMachineItem, raw);
+      const machine = decode(decodeMachineItem, raw);
+      if (machine.id !== id) throw malformed(new TypeError("Machine response authority does not match the requested resource."));
+      return machine;
     },
     async deleteMachine(id) {
       const safeId = encodePublicId(id, "machine ID");
