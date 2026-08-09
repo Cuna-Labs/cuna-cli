@@ -381,7 +381,7 @@ test("rich mode is evidence-gated and host acquisition restores partial state on
     leaveRawMode() { calls.push("raw-off"); },
   };
   await assert.rejects(HostTerminalLease.acquire(adapter));
-  assert.deepEqual(calls, ["raw-on", "alt-on", "modes-off", "raw-off"]);
+  assert.deepEqual(calls, ["raw-on", "alt-on", "modes-off", "alt-off", "raw-off"]);
 });
 
 test("daemon lifecycle rejects impossible shortcuts to readiness", () => {
