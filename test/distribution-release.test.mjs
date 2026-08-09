@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { sha256File } from "../scripts/lib/release-evidence.mjs";
+import { syntheticReleaseEnvelope, syntheticReleaseInputs } from "../scripts/lib/release-test-fixture.mjs";
 import { CHANNEL_DEFINITIONS, CHANNEL_ORDER } from "../scripts/release-distribution-lib.mjs";
 
 const execute = promisify(execFile);
@@ -32,13 +33,11 @@ async function createFixture() {
   };
   await writeFile(path.join(evidence, "sbom.cdx.json"), `${JSON.stringify(sbom)}\n`);
   await cp(path.join(repositoryRoot, "packaging", "support-policy.json"), path.join(evidence, "support-policy.json"));
-  const envelope = {
-    schemaVersion: 1,
-    packageName: "@runa_laboratories/cli",
+  const releaseInputs = syntheticReleaseInputs({ version, sourceCommit: "a".repeat(40) });
+  await writeFile(path.join(evidence, "release-inputs.json"), `${JSON.stringify(releaseInputs)}\n`);
+  const envelope = syntheticReleaseEnvelope({
     version,
     sourceCommit: "a".repeat(40),
-    repository: "Runa-Laboratories/runa-cli",
-    registry: "https://registry.npmjs.org",
     tarball: {
       file: tarballFile,
       url: `https://registry.npmjs.org/@runa_laboratories/cli/-/cli-${version}.tgz`,
@@ -47,8 +46,9 @@ async function createFixture() {
     },
     sbom: { file: "sbom.cdx.json", sha256: await sha256File(path.join(evidence, "sbom.cdx.json")) },
     supportPolicy: { file: "support-policy.json", sha256: await sha256File(path.join(evidence, "support-policy.json")) },
-    builder: { workflow: ".github/workflows/ci.yml", runId: "42", runAttempt: "1" },
-  };
+    releaseInputs,
+    releaseInputsSha256: await sha256File(path.join(evidence, "release-inputs.json")),
+  });
   await writeFile(path.join(evidence, "release-envelope.json"), `${JSON.stringify(envelope, null, 2)}\n`);
   return { root, evidence, distributions, envelope };
 }
@@ -160,7 +160,7 @@ async function createReceiptSet(fixture) {
         raw[evidenceName] = { file: relative, sha256: await sha256File(absolute) };
       }
       const receipt = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         channel: channel.id,
         distributionManifestSha256: manifestSha256,
         candidate: {
@@ -169,11 +169,13 @@ async function createReceiptSet(fixture) {
           sourceCommit: manifest.candidate.sourceCommit,
           tarballSha256: manifest.candidate.tarball.sha256,
           sbomSha256: manifest.candidate.sbom.sha256,
+          releaseInputsSha256: manifest.candidate.releaseInputs.sha256,
+          payloadSha256: manifest.candidate.identities.payloadSha256,
         },
         projectionSha256: channel.projection.sha256,
         runtimeIdentity: {
           version: manifest.candidate.version,
-          buildDigest: "d".repeat(64),
+          buildDigest: manifest.candidate.identities.payloadSha256,
           platform,
           architecture,
           artifactChannel: "npm",
@@ -216,7 +218,7 @@ test("complete content-addressed receipts prove channel identity but not full re
   assert.equal(result.distributionGate, "PASS");
   assert.equal(result.releaseDecision, "BLOCKED");
   assert.equal(result.receipts.length, 11);
-  assert.equal(result.installedBuildDigest, "d".repeat(64));
+  assert.equal(result.installedBuildDigest, fixture.envelope.identities.payloadSha256);
 });
 
 test("receipt verification detects cross-installer build drift", async () => {
@@ -225,9 +227,9 @@ test("receipt verification detects cross-installer build drift", async () => {
   const receipts = await createReceiptSet(fixture);
   const file = path.join(receipts, "bun-win32-x64.json");
   const receipt = JSON.parse(await readFile(file, "utf8"));
-  receipt.runtimeIdentity.buildDigest = "e".repeat(64);
+  receipt.runtimeIdentity.buildDigest = "f".repeat(64);
   await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
-  await assert.rejects(verifyReceipts(fixture, receipts), /Cross-installer installed build identities differ/);
+  await assert.rejects(verifyReceipts(fixture, receipts), /Installed build digest differs from the candidate payload identity/);
 });
 
 test("receipt verification detects tampered raw recovery evidence", async () => {

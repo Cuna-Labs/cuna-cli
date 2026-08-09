@@ -34,7 +34,7 @@ Global options:
 
 Authentication:
   This initial build accepts RUNA_API_KEY for explicit automation only.
-  Browser login remains unavailable until the PRD-005/036 server contract exists.
+  Browser login remains unavailable until the server-side continuation contract is available.
 
 Canonical install:
   npm install -g @runa_laboratories/cli

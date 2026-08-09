@@ -1,17 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runacode.io/schemas/runa-cli-distribution-manifest-v1.json",
+  "$id": "https://runacode.io/schemas/runa-cli-distribution-manifest-v2.json",
   "title": "Runa CLI distribution projection manifest",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "releaseEnvelope", "candidate", "provenance", "channels", "files", "recovery", "readiness"],
   "properties": {
-    "schemaVersion": {"const": 1},
+    "schemaVersion": {"const": 2},
     "releaseEnvelope": {"$ref": "#/$defs/digestFile"},
     "candidate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["packageName", "version", "sourceCommit", "repository", "registry", "tarball", "sbom", "supportPolicy"],
+      "required": ["packageName", "version", "sourceCommit", "repository", "registry", "tarball", "sbom", "supportPolicy", "releaseInputs", "identities"],
       "properties": {
         "packageName": {"const": "@runa_laboratories/cli"},
         "version": {"$ref": "#/$defs/semver"},
@@ -30,7 +30,9 @@
           }
         },
         "sbom": {"$ref": "#/$defs/digestFile"},
-        "supportPolicy": {"$ref": "#/$defs/digestFile"}
+        "supportPolicy": {"$ref": "#/$defs/digestFile"},
+        "releaseInputs": {"$ref": "#/$defs/digestFile"},
+        "identities": {"$ref": "#/$defs/releaseIdentities"}
       }
     },
     "provenance": {
@@ -93,6 +95,20 @@
       "required": ["file", "sha256"],
       "properties": {"file": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
     },
+    "releaseIdentities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lockfileSha256", "dependencyClosureSha256", "contractSha256", "buildRecipeSha256", "toolchainSha256", "payloadSha256", "payloadFileCount"],
+      "properties": {
+        "lockfileSha256": {"$ref": "#/$defs/sha256"},
+        "dependencyClosureSha256": {"$ref": "#/$defs/sha256"},
+        "contractSha256": {"$ref": "#/$defs/sha256"},
+        "buildRecipeSha256": {"$ref": "#/$defs/sha256"},
+        "toolchainSha256": {"$ref": "#/$defs/sha256"},
+        "payloadSha256": {"$ref": "#/$defs/sha256"},
+        "payloadFileCount": {"type": "integer", "minimum": 1}
+      }
+    },
     "channel": {
       "type": "object",
       "additionalProperties": false,
@@ -112,4 +128,3 @@
     }
   }
 }
-

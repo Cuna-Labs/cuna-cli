@@ -10,7 +10,7 @@ import {
   verifyEnvelopeFiles,
 } from "./lib/release-evidence.mjs";
 
-export const DISTRIBUTION_SCHEMA_VERSION = 1;
+export const DISTRIBUTION_SCHEMA_VERSION = 2;
 export const DISTRIBUTION_MANIFEST_FILE = "distribution-manifest.json";
 export const RELEASE_WORKFLOW = ".github/workflows/release.yml";
 export const RELEASE_ENVIRONMENT = "npm";
@@ -150,7 +150,7 @@ export function validateDistributionManifest(manifest, envelope) {
 
   exactKeys(
     manifest.candidate,
-    ["packageName", "version", "sourceCommit", "repository", "registry", "tarball", "sbom", "supportPolicy"],
+    ["packageName", "version", "sourceCommit", "repository", "registry", "tarball", "sbom", "supportPolicy", "releaseInputs", "identities"],
     "candidate",
   );
   invariant(manifest.candidate.packageName === envelope.packageName, "Distribution package mismatch");
@@ -162,6 +162,8 @@ export function validateDistributionManifest(manifest, envelope) {
     ["tarball", manifest.candidate.tarball, envelope.tarball],
     ["sbom", manifest.candidate.sbom, envelope.sbom],
     ["supportPolicy", manifest.candidate.supportPolicy, envelope.supportPolicy],
+    ["releaseInputs", manifest.candidate.releaseInputs, envelope.releaseInputs],
+    ["identities", manifest.candidate.identities, envelope.identities],
   ]) {
     invariant(JSON.stringify(observed) === JSON.stringify(expected), `${name} identity differs from the release envelope`);
   }
@@ -261,22 +263,25 @@ export function validateDistributionReceipt(receipt, { manifest, manifestSha256 
     ["schemaVersion", "channel", "distributionManifestSha256", "candidate", "projectionSha256", "runtimeIdentity", "checks", "evidence", "observer", "observedAt"],
     "distribution receipt",
   );
-  invariant(receipt.schemaVersion === 1, "Unsupported distribution-receipt schema");
+  invariant(receipt.schemaVersion === 2, "Unsupported distribution-receipt schema");
   invariant(CHANNEL_ORDER.includes(receipt.channel), `Unknown distribution channel: ${receipt.channel}`);
   invariant(receipt.distributionManifestSha256 === manifestSha256, "Receipt distribution-manifest digest mismatch");
   const channel = manifest.channels.find((entry) => entry.id === receipt.channel);
   invariant(receipt.projectionSha256 === channel.projection.sha256, "Receipt projection digest mismatch");
 
-  exactKeys(receipt.candidate, ["packageName", "version", "sourceCommit", "tarballSha256", "sbomSha256"], "receipt candidate");
+  exactKeys(receipt.candidate, ["packageName", "version", "sourceCommit", "tarballSha256", "sbomSha256", "releaseInputsSha256", "payloadSha256"], "receipt candidate");
   invariant(receipt.candidate.packageName === manifest.candidate.packageName, "Receipt package mismatch");
   invariant(receipt.candidate.version === manifest.candidate.version, "Receipt version mismatch");
   invariant(receipt.candidate.sourceCommit === manifest.candidate.sourceCommit, "Receipt source mismatch");
   invariant(receipt.candidate.tarballSha256 === manifest.candidate.tarball.sha256, "Receipt tarball mismatch");
   invariant(receipt.candidate.sbomSha256 === manifest.candidate.sbom.sha256, "Receipt SBOM mismatch");
+  invariant(receipt.candidate.releaseInputsSha256 === manifest.candidate.releaseInputs.sha256, "Receipt release-input mismatch");
+  invariant(receipt.candidate.payloadSha256 === manifest.candidate.identities.payloadSha256, "Receipt payload identity mismatch");
 
   exactKeys(receipt.runtimeIdentity, ["version", "buildDigest", "platform", "architecture", "artifactChannel", "installerOfRecord", "protocolRange"], "runtime identity");
   invariant(receipt.runtimeIdentity.version === manifest.candidate.version, "Installed runtime version mismatch");
   invariant(SHA256.test(receipt.runtimeIdentity.buildDigest), "Installed build digest is invalid");
+  invariant(receipt.runtimeIdentity.buildDigest === manifest.candidate.identities.payloadSha256, "Installed build digest differs from the candidate payload identity");
   invariant(channel.platforms.includes(`${receipt.runtimeIdentity.platform}-${receipt.runtimeIdentity.architecture}`), "Receipt platform is outside channel support");
   invariant(receipt.runtimeIdentity.artifactChannel === "npm", "All first-GA projections must resolve the canonical npm artifact channel");
   invariant(receipt.runtimeIdentity.installerOfRecord === channel.installerOfRecord, "Installed installer-of-record mismatch");

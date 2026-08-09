@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runacode.io/schemas/runa-cli-release-envelope-v1.json",
-  "title": "Runa CLI release envelope",
+  "$id": "https://runacode.io/schemas/runa-cli-release-envelope-v2.json",
+  "title": "Runa CLI immutable candidate release envelope",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -14,10 +14,13 @@
     "tarball",
     "sbom",
     "supportPolicy",
+    "releaseInputs",
+    "identities",
+    "authority",
     "builder"
   ],
   "properties": {
-    "schemaVersion": {"const": 1},
+    "schemaVersion": {"const": 2},
     "packageName": {"const": "@runa_laboratories/cli"},
     "version": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"},
     "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
@@ -36,6 +39,50 @@
     },
     "sbom": {"$ref": "#/$defs/digestFile"},
     "supportPolicy": {"$ref": "#/$defs/digestFile"},
+    "releaseInputs": {"$ref": "#/$defs/digestFile"},
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lockfileSha256", "dependencyClosureSha256", "contractSha256", "buildRecipeSha256", "toolchainSha256", "payloadSha256", "payloadFileCount"],
+      "properties": {
+        "lockfileSha256": {"$ref": "#/$defs/sha256"},
+        "dependencyClosureSha256": {"$ref": "#/$defs/sha256"},
+        "contractSha256": {"$ref": "#/$defs/sha256"},
+        "buildRecipeSha256": {"$ref": "#/$defs/sha256"},
+        "toolchainSha256": {"$ref": "#/$defs/sha256"},
+        "payloadSha256": {"$ref": "#/$defs/sha256"},
+        "payloadFileCount": {"type": "integer", "minimum": 1}
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "releaseEligible", "approval", "provenance"],
+      "properties": {
+        "phase": {"const": "CANDIDATE_BUILT"},
+        "releaseEligible": {"const": false},
+        "approval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "environment", "receiptSha256"],
+          "properties": {
+            "state": {"const": "REQUIRED_NOT_PRESENT"},
+            "environment": {"const": "npm"},
+            "receiptSha256": {"type": "null"}
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "workflow", "receiptSha256"],
+          "properties": {
+            "state": {"const": "REQUIRED_NOT_PRESENT"},
+            "workflow": {"const": ".github/workflows/ci.yml"},
+            "receiptSha256": {"type": "null"}
+          }
+        }
+      }
+    },
     "builder": {
       "type": "object",
       "additionalProperties": false,

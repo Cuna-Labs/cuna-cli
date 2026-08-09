@@ -19,6 +19,10 @@ on:
         description: Exact admitted npm tarball SHA-256
         required: true
         type: string
+      candidate_envelope_sha256:
+        description: Exact immutable release-envelope v2 SHA-256
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -33,10 +37,13 @@ jobs:
     name: immutable-preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      source_commit: ${{ steps.validate.outputs.source_commit }}
+      version: ${{ steps.validate.outputs.version }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: main
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -45,11 +52,25 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@11.19.0
       - name: Require source commit to remain protected main HEAD
+        id: validate
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          CANDIDATE_ENVELOPE_SHA256: ${{ inputs.candidate_envelope_sha256 }}
         shell: bash
         run: |
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CANDIDATE_ENVELOPE_SHA256" =~ ^[0-9a-f]{64}$ ]]
           git fetch --no-tags origin main
-          test "$(git rev-parse HEAD)" = "${{ inputs.source_commit }}"
-          test "$(git rev-parse origin/main)" = "${{ inputs.source_commit }}"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse origin/main)" = "$SOURCE_COMMIT"
+          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: Verify selected CI run identity
         env:
           GH_TOKEN: ${{ github.token }}
@@ -71,21 +92,42 @@ jobs:
           node scripts/verify-release-envelope.mjs --root admitted/release-artifacts
           node - <<'NODE'
           const fs = require('node:fs');
-          const envelope = JSON.parse(fs.readFileSync('admitted/release-artifacts/release-envelope.json'));
+          const crypto = require('node:crypto');
+          const envelopeFile = 'admitted/release-artifacts/release-envelope.json';
+          const envelopeBytes = fs.readFileSync(envelopeFile);
+          const envelope = JSON.parse(envelopeBytes);
           const admission = JSON.parse(fs.readFileSync('admitted/evidence/admission.json'));
+          const envelopeSha256 = crypto.createHash('sha256').update(envelopeBytes).digest('hex');
+          if (envelope.schemaVersion !== 2 || admission.schemaVersion !== 2) process.exit(1);
           if (envelope.version !== process.env.VERSION || envelope.sourceCommit !== process.env.SOURCE_COMMIT || envelope.tarball.sha256 !== process.env.CANDIDATE_SHA256) process.exit(1);
-          if (admission.candidateSha256 !== envelope.tarball.sha256 || admission.sourceCommit !== envelope.sourceCommit) process.exit(1);
+          if (envelopeSha256 !== process.env.CANDIDATE_ENVELOPE_SHA256 || admission.releaseEnvelopeSha256 !== envelopeSha256) process.exit(1);
+          if (admission.candidateSha256 !== envelope.tarball.sha256 || admission.sourceCommit !== envelope.sourceCommit || admission.releaseInputsSha256 !== envelope.releaseInputs.sha256) process.exit(1);
+          if (JSON.stringify(admission.identities) !== JSON.stringify(envelope.identities)) process.exit(1);
           NODE
         env:
           VERSION: ${{ inputs.version }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          CANDIDATE_ENVELOPE_SHA256: ${{ inputs.candidate_envelope_sha256 }}
+      - name: Require canonical contract authority before publication
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const inputs = JSON.parse(fs.readFileSync('admitted/release-artifacts/release-inputs.json'));
+          if (inputs.contractSet.releaseAuthority === 'UNRESOLVED_BLOCKING') {
+            throw new Error('Publication blocked: the release envelope is not bound to the canonical Runa API contract authority.');
+          }
+          NODE
       - name: Verify GitHub build provenance for the exact tarball
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: gh attestation verify admitted/release-artifacts/*.tgz --repo "$GITHUB_REPOSITORY"
-      - run: node scripts/verify-registry-version-absent.mjs --envelope admitted/release-artifacts/release-envelope.json --version "${{ inputs.version }}"
+      - name: Require exact registry version to be absent
+        env:
+          VERSION: ${{ inputs.version }}
+        run: node scripts/verify-registry-version-absent.mjs --envelope admitted/release-artifacts/release-envelope.json --version "$VERSION"
 
   publish-preview:
     name: trusted-publisher-preview
@@ -100,7 +142,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: ${{ needs.preflight.outputs.source_commit }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -115,18 +157,22 @@ jobs:
           path: admitted
       - run: node scripts/verify-release-envelope.mjs --root admitted/release-artifacts
       - name: Publish exact admitted bytes with short-lived OIDC identity
-        run: >-
-          npm publish
-          "admitted/release-artifacts/$(node -p "require('./admitted/release-artifacts/release-envelope.json').tarball.file")"
-          --provenance
-          --access public
-          --registry https://registry.npmjs.org/
-          --tag preview
+        shell: bash
+        run: |
+          TARBALL_FILE="$(node -p "require('./admitted/release-artifacts/release-envelope.json').tarball.file")"
+          [[ "$TARBALL_FILE" =~ ^[A-Za-z0-9._-]+\.tgz$ ]]
+          npm publish "admitted/release-artifacts/$TARBALL_FILE" \
+            --provenance \
+            --access public \
+            --registry https://registry.npmjs.org/ \
+            --tag preview
       - name: Verify downloaded registry bytes and preview tag
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
         run: >-
           node scripts/verify-postpublish.mjs
           --envelope admitted/release-artifacts/release-envelope.json
-          --version "${{ inputs.version }}"
+          --version "$VERSION"
           --tag preview
           --receipt admitted/evidence/npm-preview-receipt.json
       - if: always()

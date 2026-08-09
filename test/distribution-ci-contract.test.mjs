@@ -56,3 +56,19 @@ test("CI contract rejects publication authority inside candidate CI", async () =
   await writeFile(workflow, `${await readFile(workflow, "utf8")}\n# forbidden negative control\n# npm publish\n`);
   await assert.rejects(verify(root), /may not publish npm packages/);
 });
+
+test("CI contract rejects a candidate envelope not bound to release inputs", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "ci.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("--release-inputs evidence/release-inputs.json", "--support-policy packaging/support-policy.json");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /missing --release-inputs/);
+});
+
+test("CI contract rejects duplicate release-input generation", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "ci.yml");
+  await writeFile(workflow, `${await readFile(workflow, "utf8")}\n# node scripts/build-release-inputs.mjs\n`);
+  await assert.rejects(verify(root), /release inputs exactly once/);
+});

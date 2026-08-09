@@ -101,7 +101,7 @@ const files = {};
 for (const [relative, absolute] of outputs) files[relative] = await sha256File(absolute);
 
 const manifest = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   releaseEnvelope: {
     file: "release-envelope.json",
     sha256: await sha256File(envelopeFile),
@@ -115,6 +115,8 @@ const manifest = {
     tarball: envelope.tarball,
     sbom: envelope.sbom,
     supportPolicy: envelope.supportPolicy,
+    releaseInputs: envelope.releaseInputs,
+    identities: envelope.identities,
   },
   provenance: {
     requiredForPublication: true,
