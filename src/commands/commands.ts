@@ -13,7 +13,7 @@ import type {
 import type { EffectiveConfig } from "../config/config.js";
 import { publicConfig } from "../config/config.js";
 import { EXIT_CODES, RunaError, unsupportedError, usageError } from "../core/errors.js";
-import { assertPublicId } from "../core/validation.js";
+import { assertPublicId, assertSafeDisplayText } from "../core/validation.js";
 import { INITIAL_RUNTIME_GATES } from "../runtime/contracts.js";
 import { CLI_VERSION } from "../version.js";
 import {
@@ -411,11 +411,12 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     const machineId = assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
     const agent = agentOption(parsed, true);
     if (agent === undefined) throw usageError("Option --agent is required.");
-    const cwd = stringOption(parsed, "cwd") ?? "/workspace";
+    const cwd = assertSafeDisplayText(stringOption(parsed, "cwd") ?? "/workspace", "workspace path");
     if (!cwd.startsWith("/workspace") || cwd.split("/").includes("..") || cwd.length > 1024) {
       throw usageError("Option --cwd must be a safe absolute path inside /workspace.");
     }
-    const name = stringOption(parsed, "name");
+    const rawName = stringOption(parsed, "name");
+    const name = rawName === undefined ? undefined : assertSafeDisplayText(rawName, "AgentSession name");
     if (name !== undefined && (name.length < 1 || name.length > 80)) {
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
@@ -460,7 +461,8 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     if (parsed.operands.length !== 2) throw usageError("agent-sessions rename requires exactly one AgentSession ID.");
     requireConfirmation(parsed, "agent-sessions.rename");
     const id = assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
-    const name = stringOption(parsed, "name");
+    const rawName = stringOption(parsed, "name");
+    const name = rawName === undefined ? undefined : assertSafeDisplayText(rawName, "AgentSession name");
     if (name === undefined || name.length < 1 || name.length > 80) {
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
