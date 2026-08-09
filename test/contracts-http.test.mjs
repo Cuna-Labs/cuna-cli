@@ -417,6 +417,49 @@ test("HTTP errors expose only stable safe metadata", async () => {
   );
 });
 
+test("HTTP errors preserve retryability only from a closed canonical Problem", async () => {
+  const requestId = "66666666-6666-4666-8666-666666666666";
+  const makeTransport = (status, retryable, overrides = {}) => createHttpTransport({
+    baseUrl: "https://api.runacode.io",
+    fetch: async () => new Response(JSON.stringify({
+      type: "https://api.runacode.io/problems/request_failed",
+      title: "Request failed",
+      status,
+      code: "request_failed",
+      request_id: requestId,
+      retryable,
+      ...overrides,
+    }), {
+      status,
+      headers: { "content-type": "application/json", "x-request-id": "untrusted-header" },
+    }),
+  });
+
+  await assert.rejects(
+    makeTransport(503, false).request({ method: "GET", path: "/v1/capabilities" }),
+    (error) => error instanceof RunaError &&
+      error.code === "runa.network.service_unavailable" &&
+      error.retryable === false &&
+      error.details?.reason === "request_failed" &&
+      error.details?.request_id === requestId,
+  );
+  await assert.rejects(
+    makeTransport(400, true).request({ method: "GET", path: "/v1/capabilities" }),
+    (error) => error instanceof RunaError &&
+      error.code === "runa.remote.rejected" &&
+      error.retryable === true,
+  );
+  await assert.rejects(
+    makeTransport(503, false, { provider: "forbidden" }).request({
+      method: "GET",
+      path: "/v1/capabilities",
+    }),
+    (error) => error instanceof RunaError &&
+      error.retryable === true &&
+      error.details?.request_id === "untrusted-header",
+  );
+});
+
 test("invalid public IDs never reach transport (property-style adversarial corpus)", async () => {
   let calls = 0;
   const client = createRunaApiClient({ async request() { calls += 1; return {}; } });

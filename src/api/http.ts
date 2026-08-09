@@ -3,6 +3,16 @@ import { isObject, safeReasonCode } from "../core/validation.js";
 import { CLI_VERSION } from "../version.js";
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const PROBLEM_CODE = /^[a-z][a-z0-9_]{2,63}$/u;
+const PROBLEM_TYPE = /^https:\/\/api\.runacode\.io\/problems\/[a-z][a-z0-9_]{2,63}$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const PROBLEM_ACTIONS = new Set(["retry", "sign_in", "open_web", "contact_support", "none"]);
+
+interface ProblemMetadata {
+  readonly code: string;
+  readonly requestId: string;
+  readonly retryable: boolean;
+}
 
 export interface HttpRequest {
   readonly method: "GET" | "POST" | "PATCH" | "DELETE";
@@ -18,16 +28,47 @@ export interface HttpTransport {
   request(input: HttpRequest): Promise<unknown>;
 }
 
+function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata | undefined {
+  if (!isObject(body)) return undefined;
+  const required = new Set(["type", "title", "status", "code", "request_id", "retryable"]);
+  const optional = new Set(["detail", "action"]);
+  const keys = Object.keys(body);
+  if (
+    [...required].some((key) => !Object.hasOwn(body, key)) ||
+    keys.some((key) => !required.has(key) && !optional.has(key)) ||
+    typeof body.type !== "string" || !PROBLEM_TYPE.test(body.type) ||
+    typeof body.title !== "string" || body.title.length < 1 || body.title.length > 120 ||
+    !Number.isSafeInteger(body.status) || body.status !== expectedStatus ||
+    typeof body.code !== "string" || !PROBLEM_CODE.test(body.code) ||
+    typeof body.request_id !== "string" || !UUID.test(body.request_id) ||
+    typeof body.retryable !== "boolean" ||
+    (Object.hasOwn(body, "detail") &&
+      (typeof body.detail !== "string" || body.detail.length > 500)) ||
+    (Object.hasOwn(body, "action") &&
+      (typeof body.action !== "string" || !PROBLEM_ACTIONS.has(body.action)))
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    code: body.code,
+    requestId: body.request_id,
+    retryable: body.retryable,
+  });
+}
+
 function apiError(
   status: number,
   requestId: string | undefined,
   body: unknown,
   credentialKind: "api_key" | "interactive" | "anonymous",
 ): RunaError {
-  const reason = isObject(body) ? safeReasonCode(body.code) ?? safeReasonCode(body.error) : undefined;
+  const problem = problemMetadata(body, status);
+  const reason = problem?.code ??
+    (isObject(body) ? safeReasonCode(body.code) ?? safeReasonCode(body.error) : undefined);
+  const effectiveRequestId = problem?.requestId ?? requestId;
   const details = {
     http_status: status,
-    ...(requestId === undefined ? {} : { request_id: requestId }),
+    ...(effectiveRequestId === undefined ? {} : { request_id: effectiveRequestId }),
     ...(reason === undefined ? {} : { reason }),
   };
   if (status === 401) {
@@ -40,6 +81,7 @@ function apiError(
         : credentialKind === "api_key"
           ? "Replace RUNA_API_KEY with a valid automation credential."
           : "Run `runa login` or provide the required request authority.",
+      ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
   }
@@ -48,6 +90,7 @@ function apiError(
       code: "runa.policy.denied",
       message: "Runa denied this operation.",
       exitCode: EXIT_CODES.policy,
+      ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
   }
@@ -56,6 +99,7 @@ function apiError(
       code: "runa.remote.conflict",
       message: "Runa could not apply the operation because current state conflicts with it.",
       exitCode: EXIT_CODES.conflict,
+      ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
   }
@@ -64,7 +108,7 @@ function apiError(
       code: status === 429 ? "runa.network.rate_limited" : "runa.network.service_unavailable",
       message: status === 429 ? "Runa is rate limiting this request." : "The Runa service is temporarily unavailable.",
       exitCode: EXIT_CODES.network,
-      retryable: true,
+      retryable: problem?.retryable ?? true,
       details,
     });
   }
@@ -72,6 +116,7 @@ function apiError(
     code: status === 404 ? "runa.remote.not_found" : "runa.remote.rejected",
     message: status === 404 ? "The requested Runa resource or operation was not found." : "Runa rejected the request.",
     exitCode: EXIT_CODES.remote,
+    ...(problem === undefined ? {} : { retryable: problem.retryable }),
     details,
   });
 }

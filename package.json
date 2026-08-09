@@ -17,11 +17,10 @@
     "node": "^22.17.1 || ^24.4.1"
   },
   "scripts": {
-    "prebuild": "node scripts/clean-build-output.mjs",
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/run-build-operation.mjs build",
     "lint": "oxlint --deny-warnings src test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test test/*.test.mjs",
+    "test": "node scripts/run-build-operation.mjs test",
     "prepack": "npm run typecheck && npm test"
   },
   "publishConfig": {
