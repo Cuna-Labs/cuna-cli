@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { invariant } from "./release-evidence.mjs";
 
 const execute = promisify(execFile);
+const executeShellCommand = promisify(exec);
 
 export async function runNpm(npmArgs, options = {}) {
   if (process.platform !== "win32") return execute("npm", npmArgs, options);
@@ -22,11 +23,11 @@ export async function invokeInstalledRuna(prefix, args, options = {}) {
     ? path.join(prefix, "runa.cmd")
     : path.join(prefix, "bin", "runa");
   await stat(executable);
-  return execute(executable, args, {
-    ...options,
-    windowsHide: true,
-    shell: process.platform === "win32",
-  });
+  if (process.platform !== "win32") return execute(executable, args, { ...options, windowsHide: true });
+  invariant(args.every((value) => /^[A-Za-z0-9._-]+$/u.test(value)), "Installed-product probe received an unsafe Windows argument");
+  invariant(!/["&|<>^()%!\r\n]/u.test(executable), "Installed-product probe path contains a Windows command metacharacter");
+  const command = `"${executable}" ${args.join(" ")}`;
+  return executeShellCommand(command, { ...options, windowsHide: true });
 }
 
 export function installedProductPaths(prefix) {
