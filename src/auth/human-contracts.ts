@@ -91,7 +91,7 @@ function date(value: unknown, reason: string): string {
   if (typeof value !== "string" || !RFC3339.test(value) || Number.isNaN(Date.parse(value))) {
     return malformed(reason);
   }
-  return value;
+  return new Date(value).toISOString();
 }
 
 function uuid(value: unknown, reason: string): string {

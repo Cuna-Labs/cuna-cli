@@ -74,6 +74,118 @@ test("missing automation auth fails before a remote call and emits no prompt", a
   assert.equal(JSON.parse(streams.stderr()).error.code, "runa.auth.required");
 });
 
+test("explicit login, whoami, and logout dispatch only to the interactive authority", async () => {
+  const calls = [];
+  const result = {
+    profile: "default",
+    sessionId: "00000000-0000-0000-0000-000000000002",
+    context: {
+      requiredTermsVersion: "2026-08",
+      identity: "active",
+      admission: "admitted",
+      workspace: { state: "assigned", id: "00000000-0000-0000-0000-000000000003" },
+    },
+  };
+  const humanAuth = {
+    async login() { calls.push("login"); return result; },
+    async acquireAccessToken() { throw new Error("unexpected acquire"); },
+    async whoami() { calls.push("whoami"); return result; },
+    async logout() { calls.push("logout"); return { revoked: true }; },
+  };
+  for (const command of ["login", "whoami", "logout"]) {
+    const streams = memoryStreams();
+    assert.equal(await runCli([command], { streams: streams.streams, platform, env: {}, humanAuth }), EXIT_CODES.success);
+    assert.equal(JSON.parse(streams.stdout()).command, command);
+  }
+  assert.deepEqual(calls, ["login", "whoami", "logout"]);
+});
+
+test("RUNA_API_KEY automation mode never falls back to or mutates interactive auth", async () => {
+  let calls = 0;
+  const humanAuth = {
+    async login() { calls += 1; throw new Error("unexpected"); },
+    async acquireAccessToken() { calls += 1; throw new Error("unexpected"); },
+    async whoami() { calls += 1; throw new Error("unexpected"); },
+    async logout() { calls += 1; throw new Error("unexpected"); },
+  };
+  const streams = memoryStreams();
+  const exit = await runCli(["login"], {
+    streams: streams.streams,
+    platform,
+    env: { RUNA_API_KEY: API_KEY },
+    humanAuth,
+  });
+  assert.equal(exit, EXIT_CODES.auth);
+  assert.equal(JSON.parse(streams.stderr()).error.code, "runa.auth.mode_conflict");
+  assert.equal(calls, 0);
+});
+
+test("interactive bearer authenticates cloud commands without exposing or persisting the access token", async () => {
+  const accessToken = `runa_at_${"a".repeat(43)}`;
+  let observedAuthorization;
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", "list"], {
+    streams: streams.streams,
+    platform,
+    env: {},
+    humanAuth: {
+      async login() { throw new Error("unexpected"); },
+      async acquireAccessToken() { return accessToken; },
+      async whoami() { throw new Error("unexpected"); },
+      async logout() { throw new Error("unexpected"); },
+    },
+    fetch: async (_url, init) => {
+      observedAuthorization = init.headers.Authorization;
+      return new Response(JSON.stringify([]), { status: 200 });
+    },
+  });
+  assert.equal(exit, EXIT_CODES.success);
+  assert.equal(observedAuthorization, `Bearer ${accessToken}`);
+  assert.equal(streams.stdout().includes(accessToken), false);
+  assert.equal(streams.stderr().includes(accessToken), false);
+});
+
+test("interactive capabilities use memory bearer without opening login, and auth errors remain secret-free", async () => {
+  const accessToken = `runa_at_${"z".repeat(43)}`;
+  let acquires = 0;
+  let logins = 0;
+  const humanAuth = {
+    async login() { logins += 1; throw new Error("unexpected browser login"); },
+    async acquireAccessToken() { acquires += 1; return accessToken; },
+    async whoami() { throw new Error("unexpected"); },
+    async logout() { throw new Error("unexpected"); },
+  };
+  const success = memoryStreams();
+  assert.equal(await runCli(["capabilities"], {
+    streams: success.streams,
+    platform,
+    env: {},
+    humanAuth,
+    fetch: async () => new Response(JSON.stringify({
+      schema_version: "1",
+      subject_scope: "account",
+      observed_at: "2026-08-08T00:00:00.000Z",
+      expires_at: future,
+      etag: "interactive",
+      capabilities: [],
+    }), { status: 200 }),
+  }), EXIT_CODES.success);
+  assert.equal(acquires, 1);
+  assert.equal(logins, 0);
+
+  const rejected = memoryStreams();
+  assert.equal(await runCli(["capabilities"], {
+    streams: rejected.streams,
+    platform,
+    env: {},
+    humanAuth,
+    fetch: async () => new Response(JSON.stringify({ code: "cli_auth_rejected", detail: accessToken }), { status: 401 }),
+  }), EXIT_CODES.auth);
+  assert.equal(rejected.stderr().includes(accessToken), false);
+  assert.match(JSON.parse(rejected.stderr()).error.hint, /runa login/u);
+  assert.equal(logins, 0);
+});
+
 test("machine list calls the real public legacy Machine projection", async () => {
   const requests = [];
   const streams = memoryStreams();

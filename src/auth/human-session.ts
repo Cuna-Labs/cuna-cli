@@ -306,7 +306,11 @@ export function createHumanAuthService(input: {
 
   async function refreshAccess(signal?: AbortSignal): Promise<string> {
     let captured: { readonly token: string; readonly expiresAt: number } | undefined;
-    let postRotateError: RunaError | undefined;
+    const existing = await input.vault.load(credentialBinding);
+    if (existing === undefined) {
+      throw authError("runa.auth.required", "No interactive Runa session is stored.", { hint: "Run `runa login`." });
+    }
+    existing.material.dispose();
     try {
       const snapshot = await input.vault.refresh(credentialBinding, async (current) => {
         if (current === undefined) {
@@ -324,14 +328,19 @@ export function createHumanAuthService(input: {
             idempotencyKey: stableRefreshIdempotency(stored),
             ...(signal === undefined ? {} : { signal }),
           });
+          if (
+            tokens.sessionId !== stored.sessionId ||
+            tokens.refreshToken === stored.refreshToken ||
+            JSON.stringify(contextWire(tokens.context)) !== JSON.stringify(contextWire(stored.context))
+          ) {
+            try { await input.client.logout(tokens.accessToken, signal); } catch { /* best-effort family cleanup */ }
+            return { status: "rejected" } as const;
+          }
           try {
             ensureOnboardingReady(tokens.context);
-          } catch (error) {
-            try {
-              if (await input.client.logout(tokens.accessToken, signal)) return { status: "rejected" } as const;
-            } catch {
-              postRotateError = error as RunaError;
-            }
+          } catch {
+            try { await input.client.logout(tokens.accessToken, signal); } catch { /* best-effort family cleanup */ }
+            return { status: "rejected" } as const;
           }
           captured = { token: tokens.accessToken, expiresAt: Date.parse(tokens.accessExpiresAt) };
           return {
@@ -351,7 +360,6 @@ export function createHumanAuthService(input: {
       }
       throw error;
     }
-    if (postRotateError !== undefined) throw postRotateError;
     if (captured === undefined) {
       throw authError("runa.auth.refresh_unknown", "Runa could not establish a new in-memory access token.", { retryable: true });
     }
