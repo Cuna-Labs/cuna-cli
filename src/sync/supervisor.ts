@@ -217,6 +217,8 @@ export class LocalSyncSupervisor {
   }
 
   confirmConvergence(receipt: ConvergenceReceipt, now = Date.now()): void {
+    const observedAt = Date.parse(receipt.observedAt);
+    const expiresAt = Date.parse(receipt.expiresAt);
     if (
       receipt.authority !== "runa_workspace_service" ||
       receipt.bindingId !== this.configuration.bindingId ||
@@ -224,7 +226,12 @@ export class LocalSyncSupervisor {
       receipt.epoch !== this.configuration.epoch ||
       receipt.policyDigest !== this.configuration.policyDigest ||
       receipt.localManifestRoot !== receipt.canonicalManifestRoot ||
-      Date.parse(receipt.expiresAt) <= now
+      !Number.isFinite(observedAt) ||
+      !Number.isFinite(expiresAt) ||
+      observedAt > now ||
+      expiresAt <= observedAt ||
+      expiresAt <= now ||
+      !/^[A-Za-z0-9._:-]{1,256}$/u.test(receipt.canonicalRevision)
     ) {
       this.#publish({ state: "unknown", dirty: true, incrementalApplyPaused: true, reason: "convergence_evidence_invalid" });
       return;
@@ -309,8 +316,24 @@ export function progressFromReceipt(receipt: ProgressReceipt): TruthfulProgress 
   validateCount(receipt.observedBytes);
   if (receipt.totalEntries !== undefined) validateCount(receipt.totalEntries);
   if (receipt.totalBytes !== undefined) validateCount(receipt.totalBytes);
+  if (
+    (receipt.totalEntries !== undefined && receipt.observedEntries > receipt.totalEntries) ||
+    (receipt.totalBytes !== undefined && receipt.observedBytes > receipt.totalBytes) ||
+    !Number.isFinite(Date.parse(receipt.observedAt))
+  ) {
+    throw workspaceError("progress_invalid", "A progress receipt contradicts its measured bounds.", "integrity", "invalid_measurement");
+  }
   const committed = receipt.stage === "committed";
-  if (committed && (receipt.authority !== "runa_workspace_service" || receipt.canonicalRevision === undefined)) {
+  if (
+    committed &&
+    (
+      receipt.authority !== "runa_workspace_service" ||
+      receipt.canonicalRevision === undefined ||
+      !/^[A-Za-z0-9._:-]{1,256}$/u.test(receipt.canonicalRevision) ||
+      (receipt.totalEntries !== undefined && receipt.observedEntries !== receipt.totalEntries) ||
+      (receipt.totalBytes !== undefined && receipt.observedBytes !== receipt.totalBytes)
+    )
+  ) {
     throw workspaceError("progress_unproven", "Committed progress requires a server admission receipt.", "integrity", "authority_missing");
   }
   const percent = receipt.totalBytes !== undefined && receipt.totalBytes > 0
