@@ -10,7 +10,8 @@
     "dist",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
     "node": ">=22"
@@ -47,5 +48,8 @@
     "@types/node": "^22.15.0",
     "oxlint": "1.77.0",
     "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@xterm/headless": "6.0.0"
   }
 }

@@ -14,7 +14,7 @@ sha256sums=('@@TARBALL_SHA256@@')
 package() {
   local npm_cache="${srcdir}/npm-cache"
   mkdir -p "$npm_cache"
-  npm install --global --offline --ignore-scripts \
+  npm install --global --offline --ignore-scripts --no-audit --no-fund \
     --cache "$npm_cache" \
     --prefix "${pkgdir}/usr" \
     "${srcdir}/runa-cli-${pkgver}.tgz"

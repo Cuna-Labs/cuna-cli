@@ -63,6 +63,18 @@ export interface RuntimeTerminalSnapshot {
   readonly reason?: string;
 }
 
+export interface RuntimeTerminalResponse {
+  readonly tabId: string;
+  readonly binding: {
+    readonly userId: string;
+    readonly machineId: string;
+    readonly agentSessionId: string;
+    readonly processEpoch: string;
+    readonly fencingGeneration: number;
+  };
+  readonly bytes: Uint8Array;
+}
+
 export interface RuntimeSyncHandle {
   readonly bindingId: string;
   readonly fence: number;
@@ -249,6 +261,25 @@ export class RunaRuntimeBoundary {
   async sendInput(bytes: Uint8Array, tabId = this.#activeTabId): Promise<void> {
     this.#assertReady();
     const entry = this.#requireActiveTerminal(tabId);
+    await this.#sendTerminalBytes(entry, bytes);
+  }
+
+  async sendTerminalResponse(response: RuntimeTerminalResponse): Promise<void> {
+    this.#assertReady();
+    const entry = this.#requireActiveTerminal(response.tabId);
+    if (
+      response.binding.userId !== entry.observation.userId ||
+      response.binding.machineId !== entry.observation.machineId ||
+      response.binding.agentSessionId !== entry.observation.agentSessionId ||
+      response.binding.processEpoch !== entry.observation.processEpoch ||
+      response.binding.fencingGeneration !== entry.fencingGeneration
+    ) {
+      throw runtimeFailure("grant_scope_mismatch", "The terminal response targets another attachment authority.");
+    }
+    await this.#sendTerminalBytes(entry, response.bytes);
+  }
+
+  async #sendTerminalBytes(entry: TerminalEntry, bytes: Uint8Array): Promise<void> {
     this.#views.routeInput(entry.viewId, entry.fencingGeneration);
     entry.wireSequence += 1n;
     entry.inputSequence = entry.wireSequence;

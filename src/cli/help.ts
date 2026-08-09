@@ -14,6 +14,7 @@ Available now:
   agent-sessions list --machine ID     List child agent processes
   agent-sessions create --machine ID   Create a child when server-advertised
   agent-sessions get ID                Read one child process
+  agent-sessions rename ID --name NAME Rename one child process
   agent-sessions terminate ID          Terminate when server-advertised
   config get                           Show effective, redacted configuration
   self-test --offline                  Verify the installed CLI without network access

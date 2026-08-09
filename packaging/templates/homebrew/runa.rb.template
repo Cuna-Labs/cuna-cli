@@ -9,7 +9,7 @@ class Runa < Formula
   depends_on "node@22"
 
   def install
-    system "npm", "install", "--global", "--ignore-scripts", "--prefix", libexec, cached_download
+    system "npm", "install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--prefix", libexec, cached_download
     bin.install_symlink libexec/"bin/runa"
   end
 
