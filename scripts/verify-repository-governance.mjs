@@ -5,6 +5,7 @@ import { invariant, parseArgs } from "./lib/release-evidence.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(args.get("root") ?? process.cwd());
+const historyOnly = args.get("history-only") === "true";
 
 const prohibitedTrackedFiles = new Set([
   "AGENTS.md",
@@ -38,10 +39,26 @@ const tracked = spawnSync("git", ["ls-files", "-z"], {
 invariant(tracked.status === 0, `Unable to enumerate tracked files: ${tracked.stderr || "git failed"}`);
 const trackedFiles = tracked.stdout.split("\0").filter(Boolean);
 for (const file of trackedFiles) {
-  invariant(
-    !prohibitedTrackedFiles.has(file) && !prohibitedTrackedPrefixes.some((prefix) => file.startsWith(prefix)),
-    `Internal-only file is tracked by the public repository: ${file}`,
-  );
+  invariant(!isProhibited(file), `Internal-only file is tracked by the public repository: ${file}`);
+}
+
+const history = spawnSync("git", ["rev-list", "--objects", "--all"], {
+  cwd: root,
+  encoding: "utf8",
+  shell: false,
+  maxBuffer: 32 * 1024 * 1024,
+});
+invariant(history.status === 0, `Unable to enumerate repository history: ${history.stderr || "git failed"}`);
+for (const line of history.stdout.split(/\r?\n/u)) {
+  const separator = line.indexOf(" ");
+  if (separator === -1) continue;
+  const file = line.slice(separator + 1);
+  invariant(!isProhibited(file), `Internal-only file exists in public repository history: ${file}`);
+}
+
+if (historyOnly) {
+  process.stdout.write(`${JSON.stringify({ status: "history-verified" })}\n`);
+  process.exit(0);
 }
 
 async function text(relative) {
@@ -84,3 +101,7 @@ for (const file of workflowFiles) {
 }
 
 process.stdout.write(`${JSON.stringify({ status: "verified", workflows: workflowFiles.sort() })}\n`);
+
+function isProhibited(file) {
+  return prohibitedTrackedFiles.has(file) || prohibitedTrackedPrefixes.some((prefix) => file.startsWith(prefix));
+}

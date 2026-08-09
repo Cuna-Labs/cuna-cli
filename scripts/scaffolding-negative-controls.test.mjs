@@ -49,6 +49,28 @@ test("digest changes when projection bytes are substituted", async () => {
   assert.notEqual(before, after);
 });
 
+test("repository governance rejects a forbidden file that was later deleted", async () => {
+  const repository = await mkdtemp(path.join(tmpdir(), "runa-history-negative-"));
+  await execute("git", ["init", "--quiet"], { cwd: repository });
+  await execute("git", ["config", "user.name", "Runa Test"], { cwd: repository });
+  await execute("git", ["config", "user.email", "test@invalid.example"], { cwd: repository });
+  await mkdir(path.join(repository, "architecture"));
+  await writeFile(path.join(repository, "architecture", "private.md"), "internal\n");
+  await execute("git", ["add", "."], { cwd: repository });
+  await execute("git", ["commit", "--quiet", "-m", "seed forbidden history"], { cwd: repository });
+  await execute("git", ["rm", "--quiet", "architecture/private.md"], { cwd: repository });
+  await execute("git", ["commit", "--quiet", "-m", "delete forbidden file"], { cwd: repository });
+
+  await assert.rejects(
+    execute(process.execPath, [
+      path.join(repositoryRoot, "scripts", "verify-repository-governance.mjs"),
+      "--root", repository,
+      "--history-only", "true",
+    ], { cwd: repository }),
+    /Internal-only file exists in public repository history/u,
+  );
+});
+
 test("curl template verifies before installing and suppresses lifecycle scripts", async () => {
   const template = await readFile(new URL("../packaging/templates/install.sh.template", import.meta.url), "utf8");
   assert.ok(template.indexOf("sha256sum") < template.indexOf("npm install"));
