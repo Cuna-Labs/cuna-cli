@@ -83,7 +83,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p evidence
-          npm sbom --sbom-format cyclonedx > evidence/sbom.cdx.json
+          npm sbom --sbom-format cyclonedx --omit=dev > evidence/sbom.cdx.json
           node -e "const s=require('./evidence/sbom.cdx.json');if(s.bomFormat!=='CycloneDX')process.exit(1)"
       - name: Bind candidate identity
         run: >-

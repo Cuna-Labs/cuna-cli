@@ -7,6 +7,7 @@ const args = parseArgs(process.argv.slice(2));
 const tarball = path.resolve(args.get("tarball") ?? "");
 const archive = gunzipSync(await readFile(tarball));
 const entries = [];
+const bundledDependencyRoot = "package/node_modules/@xterm/headless/";
 
 function octal(buffer) {
   const text = buffer.toString("ascii").replaceAll("\0", "").trim();
@@ -41,7 +42,8 @@ for (const entry of entries) {
       entry.name === "package/NOTICE" ||
       entry.name === "package/THIRD_PARTY_NOTICES.md" ||
       entry.name === "package/README.md" ||
-      entry.name.startsWith("package/dist/"),
+      entry.name.startsWith("package/dist/") ||
+      entry.name.startsWith(bundledDependencyRoot),
     `Unexpected npm tarball content: ${entry.name}`,
   );
   if (entry.name.endsWith(".map")) {
@@ -51,10 +53,12 @@ for (const entry of entries) {
     } catch {
       throw new Error(`Malformed source map in npm tarball: ${entry.name}`);
     }
-    invariant(
-      !Array.isArray(sourceMap.sourcesContent) || sourceMap.sourcesContent.every((value) => value === null || value === ""),
-      `Source map embeds source content: ${entry.name}`,
-    );
+    if (!entry.name.startsWith(bundledDependencyRoot)) {
+      invariant(
+        !Array.isArray(sourceMap.sourcesContent) || sourceMap.sourcesContent.every((value) => value === null || value === ""),
+        `Source map embeds source content: ${entry.name}`,
+      );
+    }
     invariant(
       !Array.isArray(sourceMap.sources) || sourceMap.sources.every((value) => typeof value === "string" && !/^(?:[A-Za-z]:[\\/]|\/Users\/|\/home\/)/.test(value)),
       `Source map exposes an absolute developer path: ${entry.name}`,
@@ -73,7 +77,21 @@ for (const script of ["preinstall", "install", "postinstall"]) {
   invariant(packageJson.scripts?.[script] === undefined, `Packed package contains prohibited ${script} lifecycle`);
 }
 invariant(typeof packageJson.bin?.runa === "string", "Packed package lacks runa bin");
+invariant(
+  JSON.stringify(packageJson.bundleDependencies) === JSON.stringify(["@xterm/headless"]),
+  "Packed package must bundle the exact audited runtime dependency closure",
+);
 const binPath = `package/${packageJson.bin.runa.replace(/^\.\//, "")}`.toLowerCase();
 invariant(normalized.has(binPath), "Packed runa bin target is absent");
+
+const bundledManifest = entries.find((entry) => entry.name === `${bundledDependencyRoot}package.json`);
+invariant(bundledManifest !== undefined, "Bundled @xterm/headless manifest is absent");
+const bundledPackageJson = JSON.parse(bundledManifest.body.toString("utf8"));
+invariant(bundledPackageJson.name === "@xterm/headless", "Bundled dependency identity differs");
+invariant(bundledPackageJson.version === "6.0.0", "Bundled dependency version differs");
+invariant(bundledPackageJson.license === "MIT", "Bundled dependency license differs");
+for (const script of ["preinstall", "install", "postinstall"]) {
+  invariant(bundledPackageJson.scripts?.[script] === undefined, `Bundled dependency contains prohibited ${script} lifecycle`);
+}
 
 process.stdout.write(`${JSON.stringify({ status: "verified", package: packageJson.name, version: packageJson.version, entries: entries.length })}\n`);

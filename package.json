@@ -14,7 +14,7 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22.17.1"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -51,5 +51,8 @@
   },
   "dependencies": {
     "@xterm/headless": "6.0.0"
-  }
+  },
+  "bundleDependencies": [
+    "@xterm/headless"
+  ]
 }

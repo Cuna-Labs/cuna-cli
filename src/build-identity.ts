@@ -4,7 +4,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const packageEntries = ["LICENSE", "NOTICE", "README.md", "package.json", "dist"] as const;
+const packageEntries = [
+  "LICENSE",
+  "NOTICE",
+  "README.md",
+  "package.json",
+  "dist",
+  "node_modules/@xterm/headless",
+] as const;
 
 async function collectFiles(relativePath: string): Promise<string[]> {
   const absolutePath = path.join(packageRoot, relativePath);

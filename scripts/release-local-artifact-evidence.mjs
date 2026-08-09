@@ -45,7 +45,7 @@ try {
     maxBuffer: 4 * 1024 * 1024,
   });
 
-  const sbomResult = await runNpm(["sbom", "--sbom-format", "cyclonedx"], {
+  const sbomResult = await runNpm(["sbom", "--sbom-format", "cyclonedx", "--omit=dev"], {
     cwd: repositoryRoot,
     windowsHide: true,
     timeout: 120_000,
@@ -60,7 +60,9 @@ try {
   validateSupportPolicy(await readJson(supportSource));
 
   const installPrefix = path.join(temporaryRoot, "install-prefix");
-  await runNpm(["install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--prefix", installPrefix, tarballSource], {
+  const emptyCache = path.join(temporaryRoot, "empty-cache");
+  await mkdir(emptyCache, { recursive: false });
+  await runNpm(["install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--cache", emptyCache, "--prefix", installPrefix, tarballSource], {
     windowsHide: true,
     timeout: 180_000,
     maxBuffer: 8 * 1024 * 1024,
