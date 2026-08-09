@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 
-import { credentialFailure } from "./errors.js";
+import { CredentialBoundaryError, credentialFailure } from "./errors.js";
 
 export interface SecureProcessRequest {
   readonly executable: string;
@@ -44,6 +44,7 @@ async function runSecureProcess(request: SecureProcessRequest): Promise<SecurePr
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let oversized = false;
+    let terminationFailure: CredentialBoundaryError | undefined;
     const stdoutChunks: Uint8Array[] = [];
 
     const child = spawn(request.executable, [...request.args], {
@@ -62,9 +63,14 @@ async function runSecureProcess(request: SecureProcessRequest): Promise<SecurePr
       reject(error);
     };
 
-    const timeout = setTimeout(() => {
+    const requestTermination = (failure: CredentialBoundaryError): void => {
+      if (terminationFailure !== undefined || settled) return;
+      terminationFailure = failure;
       child.kill("SIGKILL");
-      finishReject(credentialFailure(
+    };
+
+    const timeout = setTimeout(() => {
+      requestTermination(credentialFailure(
         "credential_process_timeout",
         "The secure credential backend did not respond within the bounded time.",
         { retryable: true },
@@ -83,7 +89,10 @@ async function runSecureProcess(request: SecureProcessRequest): Promise<SecurePr
       stdoutBytes += chunk.byteLength;
       if (stdoutBytes > maximumOutputBytes) {
         oversized = true;
-        child.kill("SIGKILL");
+        requestTermination(credentialFailure(
+          "credential_output_oversized",
+          "The secure credential backend returned an oversized response.",
+        ));
         return;
       }
       stdoutChunks.push(Uint8Array.from(chunk));
@@ -91,13 +100,23 @@ async function runSecureProcess(request: SecureProcessRequest): Promise<SecurePr
 
     child.stderr.on("data", (chunk: Buffer) => {
       stderrBytes += chunk.byteLength;
-      if (stderrBytes > maximumOutputBytes) child.kill("SIGKILL");
+      if (stderrBytes > maximumOutputBytes) {
+        requestTermination(credentialFailure(
+          "credential_output_oversized",
+          "The secure credential backend returned an oversized response.",
+        ));
+      }
     });
 
     child.once("close", (exitCode, signal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (terminationFailure !== undefined) {
+        wipeChunks(stdoutChunks);
+        reject(terminationFailure);
+        return;
+      }
       if (oversized || stderrBytes > maximumOutputBytes) {
         wipeChunks(stdoutChunks);
         reject(credentialFailure(

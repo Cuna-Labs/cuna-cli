@@ -1,17 +1,10 @@
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { createOwnedTempDirectory, removeOwnedTempDirectory } from "../../scripts/lib/owned-temp.mjs";
 
 export class TestResourceLedger {
   #ownedRoots = [];
 
   async createTempDirectory(prefix) {
-    if (!/^runa-[a-z0-9-]+-$/u.test(prefix)) {
-      throw new Error("Test temp prefixes must be explicit Runa-owned identities.");
-    }
-    const base = path.resolve(tmpdir());
-    const root = path.resolve(await mkdtemp(path.join(base, prefix)));
-    if (path.dirname(root) !== base) throw new Error("Test temp root escaped the operating-system temp directory.");
+    const root = await createOwnedTempDirectory(prefix);
     this.#ownedRoots.push(root);
     return root;
   }
@@ -20,7 +13,7 @@ export class TestResourceLedger {
     const failures = [];
     for (const root of this.#ownedRoots.splice(0).reverse()) {
       try {
-        await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        await removeOwnedTempDirectory(root);
       } catch (error) {
         failures.push(new Error(`Could not remove test-owned root ${root}.`, { cause: error }));
       }

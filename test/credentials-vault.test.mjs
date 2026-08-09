@@ -269,6 +269,21 @@ test("secure process runner kills oversized output without returning it", async 
   );
 });
 
+test("secure process timeout waits for confirmed child closure before rejecting", async () => {
+  const runner = createSecureProcessRunner();
+  const startedAt = Date.now();
+  await assert.rejects(
+    runner.run({
+      executable: process.execPath,
+      cwd: process.cwd(),
+      args: ["-e", "setInterval(() => undefined, 1000)"],
+      timeoutMs: 100,
+    }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_process_timeout",
+  );
+  assert.ok(Date.now() - startedAt >= 90);
+});
+
 test("Linux Secret Service adapter transports protected values only through stdin", async () => {
   const calls = [];
   const values = new Map();

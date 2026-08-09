@@ -1,21 +1,21 @@
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs, readJson, sha256File, validateEnvelope, verifyEnvelopeFiles } from "./lib/release-evidence.mjs";
 import { releaseInputIdentities } from "./lib/release-inputs.mjs";
 import { syntheticReleaseInputs } from "./lib/release-test-fixture.mjs";
+import { withOwnedTempDirectory } from "./lib/owned-temp.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 
 if (args.get("self-test") === "true") {
-  const root = await mkdtemp(path.join(tmpdir(), "runa-envelope-test-"));
-  await mkdir(root, { recursive: true });
-  await writeFile(path.join(root, "runa.tgz"), "candidate");
-  await writeFile(path.join(root, "sbom.json"), "{}");
-  await writeFile(path.join(root, "support.json"), "{}");
-  const releaseInputs = syntheticReleaseInputs({ version: "1.2.3-test.1", sourceCommit: "a".repeat(40) });
-  await writeFile(path.join(root, "release-inputs.json"), `${JSON.stringify(releaseInputs)}\n`);
-  const envelope = {
+  await withOwnedTempDirectory("runa-envelope-test-", async (root) => {
+    await mkdir(root, { recursive: true });
+    await writeFile(path.join(root, "runa.tgz"), "candidate");
+    await writeFile(path.join(root, "sbom.json"), "{}");
+    await writeFile(path.join(root, "support.json"), "{}");
+    const releaseInputs = syntheticReleaseInputs({ version: "1.2.3-test.1", sourceCommit: "a".repeat(40) });
+    await writeFile(path.join(root, "release-inputs.json"), `${JSON.stringify(releaseInputs)}\n`);
+    const envelope = {
     schemaVersion: 2,
     packageName: "@runa_laboratories/cli",
     version: "1.2.3-test.1",
@@ -39,28 +39,28 @@ if (args.get("self-test") === "true") {
       provenance: { state: "REQUIRED_NOT_PRESENT", workflow: ".github/workflows/ci.yml", receiptSha256: null },
     },
     builder: { workflow: ".github/workflows/ci.yml", runId: "1", runAttempt: "1" },
-  };
-  await verifyEnvelopeFiles(envelope, root);
-  await writeFile(path.join(root, "runa.tgz"), "substituted");
-  await expectRejected(() => verifyEnvelopeFiles(envelope, root), "substituted tarball was accepted");
-  await writeFile(path.join(root, "runa.tgz"), "candidate");
-  await writeFile(path.join(root, "release-inputs.json"), `${JSON.stringify({ ...releaseInputs, sourceCommit: "b".repeat(40) })}\n`);
-  await expectRejected(() => verifyEnvelopeFiles(envelope, root), "substituted release inputs were accepted");
-  const fabricatedApproval = structuredClone(envelope);
-  fabricatedApproval.authority.approval = { state: "VERIFIED", environment: "npm", receiptSha256: "f".repeat(64) };
-  await expectRejected(() => Promise.resolve(validateEnvelope(fabricatedApproval)), "fabricated approval was accepted");
-  const legacy = structuredClone(envelope);
-  legacy.schemaVersion = 1;
-  await expectRejected(() => Promise.resolve(validateEnvelope(legacy)), "release-envelope v1 was accepted");
+    };
+    await verifyEnvelopeFiles(envelope, root);
+    await writeFile(path.join(root, "runa.tgz"), "substituted");
+    await expectRejected(() => verifyEnvelopeFiles(envelope, root), "substituted tarball was accepted");
+    await writeFile(path.join(root, "runa.tgz"), "candidate");
+    await writeFile(path.join(root, "release-inputs.json"), `${JSON.stringify({ ...releaseInputs, sourceCommit: "b".repeat(40) })}\n`);
+    await expectRejected(() => verifyEnvelopeFiles(envelope, root), "substituted release inputs were accepted");
+    const fabricatedApproval = structuredClone(envelope);
+    fabricatedApproval.authority.approval = { state: "VERIFIED", environment: "npm", receiptSha256: "f".repeat(64) };
+    await expectRejected(() => Promise.resolve(validateEnvelope(fabricatedApproval)), "fabricated approval was accepted");
+    const legacy = structuredClone(envelope);
+    legacy.schemaVersion = 1;
+    await expectRejected(() => Promise.resolve(validateEnvelope(legacy)), "release-envelope v1 was accepted");
+  });
   process.stdout.write('{"status":"negative-control-passed"}\n');
-  process.exit(0);
+} else {
+  const root = path.resolve(args.get("root") ?? "release-artifacts");
+  const envelope = await readJson(path.join(root, args.get("envelope") ?? "release-envelope.json"));
+  validateEnvelope(envelope);
+  await verifyEnvelopeFiles(envelope, root);
+  process.stdout.write(`${JSON.stringify({ status: "verified", version: envelope.version, sha256: envelope.tarball.sha256 })}\n`);
 }
-
-const root = path.resolve(args.get("root") ?? "release-artifacts");
-const envelope = await readJson(path.join(root, args.get("envelope") ?? "release-envelope.json"));
-validateEnvelope(envelope);
-await verifyEnvelopeFiles(envelope, root);
-process.stdout.write(`${JSON.stringify({ status: "verified", version: envelope.version, sha256: envelope.tarball.sha256 })}\n`);
 
 async function expectRejected(action, message) {
   let rejected = false;
