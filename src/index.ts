@@ -26,6 +26,13 @@ export {
   type MutationClass,
 } from "./api/contracts.js";
 export { createHttpTransport, type HttpRequest, type HttpTransport } from "./api/http.js";
+export { createPkceAuthorization, type PkceAuthorization } from "./auth/pkce.js";
+export {
+  startLoopbackCallback,
+  type LoopbackAuthorizationResult,
+  type LoopbackCallback,
+  type LoopbackHost,
+} from "./auth/loopback.js";
 export { runCli, memoryStreams, type RunCliDependencies } from "./cli/run.js";
 export { parseArgv, type ParsedInvocation } from "./cli/parser.js";
 export {

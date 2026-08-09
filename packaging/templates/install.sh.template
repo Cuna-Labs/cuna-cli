@@ -20,6 +20,7 @@ command -v curl >/dev/null 2>&1 || die 'curl is required.'
 tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t runa-install)"
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 tarball="$tmp_dir/runa-cli.tgz"
+stage_prefix="$tmp_dir/stage"
 
 curl --proto '=https' --tlsv1.2 --fail --location --show-error \
   --output "$tarball" "$TARBALL_URL"
@@ -33,7 +34,24 @@ else
   die 'A SHA-256 verifier is required.'
 fi
 
+printf '%s\n' "Verifying ${PACKAGE}@${VERSION} before changing the global installation."
+npm install --global --ignore-scripts --prefix "$stage_prefix" "$tarball"
+staged_runa="$stage_prefix/bin/runa"
+[ -x "$staged_runa" ] || die 'The staged runa executable is missing.'
+"$staged_runa" self-test --offline --json >/dev/null || die 'Staged installed-artifact self-test failed.'
+staged_identity="$("$staged_runa" version --json)"
+EXPECTED_VERSION="$VERSION" node -e '
+  const fs = require("node:fs");
+  const record = JSON.parse(fs.readFileSync(0, "utf8"));
+  const data = record && record.data;
+  if (!data || data.version !== process.env.EXPECTED_VERSION || !/^[0-9a-f]{64}$/.test(data.buildDigest) || data.updateChannel !== "npm") process.exit(1);
+' <<EOF || die 'Staged runtime identity does not match the admitted release.'
+$staged_identity
+EOF
+
 printf '%s\n' "Installing ${PACKAGE}@${VERSION} from verified npm bytes."
 npm install --global --ignore-scripts "$tarball"
 runa self-test --offline --json >/dev/null || die 'Installed-artifact self-test failed.'
-runa version --json
+active_identity="$(runa version --json)"
+[ "$active_identity" = "$staged_identity" ] || die 'Active runtime identity differs from the verified staged identity.'
+printf '%s\n' "$active_identity"

@@ -14,7 +14,13 @@ class Runa < Formula
   end
 
   test do
-    output = shell_output("#{bin}/runa self-test --offline --json")
-    assert_match "@@VERSION@@", output
+    require "json"
+
+    self_test = JSON.parse(shell_output("#{bin}/runa self-test --offline --json"))
+    assert_equal true, self_test.dig("data", "ok")
+    identity = JSON.parse(shell_output("#{bin}/runa version --json"))
+    assert_equal "@@VERSION@@", identity.dig("data", "version")
+    assert_match(/\\A[0-9a-f]{64}\\z/, identity.dig("data", "buildDigest"))
+    assert_equal "npm", identity.dig("data", "updateChannel")
   end
 end
