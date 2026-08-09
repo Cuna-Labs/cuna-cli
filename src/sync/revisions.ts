@@ -343,8 +343,7 @@ export class RevisionOverlayStore {
       const baseVersion = base.tree[path] ?? null;
       const theirs = head.tree[path] ?? tombstoneFor(path, head.revisionId);
       if (sameNullableVersion(baseVersion, head.tree[path] ?? null) || sameVersion(ours, theirs)) {
-        if (ours.kind === "tombstone") delete resultTree[path];
-        else resultTree[path] = ours;
+        resultTree[path] = ours;
         continue;
       }
       const classification = classifyConflict({
@@ -357,8 +356,7 @@ export class RevisionOverlayStore {
       if (classification.disposition === "conflict" && classification.conflict !== undefined) {
         conflicts.push(this.#conflicts.add(classification.conflict));
       } else if (classification.disposition === "ordered" && compareVectorClocks(ours.clock, theirs.clock) === "after") {
-        if (ours.kind === "tombstone") delete resultTree[path];
-        else resultTree[path] = ours;
+        resultTree[path] = ours;
       }
     }
     if (conflicts.length > 0) {
@@ -431,7 +429,6 @@ export function createWorkspaceRevision(input: {
   const manifestRoot = stableDigest("runa-revision-tree-v2", tree);
   const revisionId = stableDigest("runa-revision-v2", {
     manifestRoot,
-    parentIds,
     policyDigest: input.policyDigest,
     workspaceId: input.workspaceId,
   });

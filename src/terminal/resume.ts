@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 export const OUTPUT_RETENTION_MS = 30_000;
 export const MAX_REPLAY_BYTES = 1024 * 1024;
+export const MAX_REPLAY_FRAMES = 4096;
 export const MAX_TRACKED_INPUTS = 4096;
 
 export interface AttachmentIdentity {
@@ -189,7 +190,11 @@ export class ExclusiveAttachmentSession {
     while (this.#output.length > 0) {
       const oldest = this.#output[0];
       if (oldest === undefined) break;
-      if (this.#replayBytes <= MAX_REPLAY_BYTES && now - oldest.observedAt <= OUTPUT_RETENTION_MS) break;
+      if (
+        this.#replayBytes <= MAX_REPLAY_BYTES &&
+        this.#output.length <= MAX_REPLAY_FRAMES &&
+        now - oldest.observedAt <= OUTPUT_RETENTION_MS
+      ) break;
       this.#output.shift();
       this.#replayBytes -= oldest.payload.byteLength;
     }
