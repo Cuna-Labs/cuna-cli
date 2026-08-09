@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { resolve } from "node:path";
 
@@ -15,7 +16,14 @@ export class BuildLockError extends Error {
 }
 
 function canonicalRoot(repositoryRoot, platform = process.platform) {
-  const root = resolve(repositoryRoot).replaceAll("\\", "/");
+  const resolved = resolve(repositoryRoot);
+  let physical = resolved;
+  try {
+    physical = realpathSync.native(resolved);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const root = physical.replaceAll("\\", "/");
   return platform === "win32" ? root.toLowerCase() : root;
 }
 

@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import { win32 } from "node:path";
 
 export interface BrowserOpener {
   open(url: string): Promise<void>;
@@ -14,18 +13,10 @@ export interface BrowserCommand {
 export function resolveBrowserCommand(
   platform: NodeJS.Platform,
   url: string,
-  environment: NodeJS.ProcessEnv = process.env,
+  _environment: NodeJS.ProcessEnv = process.env,
 ): BrowserCommand {
   if (platform === "win32") {
-    const systemRoot = environment.SystemRoot ?? environment.WINDIR;
-    if (systemRoot === undefined || !win32.isAbsolute(systemRoot)) {
-      throw new Error("Windows browser opener requires an absolute SystemRoot.");
-    }
-    return {
-      executable: win32.join(systemRoot, "System32", "rundll32.exe"),
-      args: ["url.dll,FileProtocolHandler", url],
-      cwd: win32.join(systemRoot, "System32"),
-    };
+    throw new Error("Windows browser activation requires the approved signed native adapter, which is unavailable in this build.");
   }
   if (platform === "darwin") return { executable: "/usr/bin/open", args: [url], cwd: "/" };
   if (platform === "linux") return { executable: "/usr/bin/xdg-open", args: [url], cwd: "/" };

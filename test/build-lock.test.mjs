@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -8,6 +9,7 @@ import test from "node:test";
 
 import {
   acquireExclusiveBuildLock,
+  buildLockIdentity,
   buildLockEndpoint,
   BuildLockError,
 } from "../scripts/lib/exclusive-build-lock.mjs";
@@ -77,6 +79,28 @@ test("foreign endpoint identity fails closed without cleanup or takeover", async
     assert.equal(foreign.listening, true);
   } finally {
     await close(foreign);
+  }
+});
+
+test("physical checkout aliases share one build-lock identity", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "runa-build-lock-alias-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const repository = join(root, "repository");
+  const alias = join(root, "repository-alias");
+  await mkdir(repository);
+  await symlink(repository, alias, process.platform === "win32" ? "junction" : "dir");
+
+  assert.equal(buildLockIdentity(alias), buildLockIdentity(repository));
+  assert.deepEqual(buildLockEndpoint(alias), buildLockEndpoint(repository));
+
+  const owner = await acquireExclusiveBuildLock(repository, { timeoutMs: 2_000 });
+  try {
+    await assert.rejects(
+      acquireExclusiveBuildLock(alias, { timeoutMs: 60 }),
+      (error) => error instanceof BuildLockError && error.code === "build_lock_timeout",
+    );
+  } finally {
+    await owner.release();
   }
 });
 

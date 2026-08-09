@@ -11,7 +11,7 @@ exactKeys(record, [
   "schemaVersion", "authority", "releaseEligible", "limitations", "repository", "sourceCommit", "sourceTreeStatus",
   "sourceStatusSha256", "package", "artifact", "sbom", "supportPolicy", "runtimeIdentity", "observations", "environment", "generatedAt",
 ], "local artifact evidence");
-invariant(record.schemaVersion === 1, "Unsupported local-artifact evidence schema");
+invariant(record.schemaVersion === 2, "Unsupported local-artifact evidence schema");
 invariant(record.authority === "LOCAL_NON_RELEASE_EVIDENCE", "Local evidence authority was elevated");
 invariant(record.releaseEligible === false, "Local evidence may not claim release eligibility");
 invariant(record.repository === REPOSITORY, "Local evidence repository mismatch");

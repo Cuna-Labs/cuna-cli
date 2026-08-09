@@ -18,13 +18,12 @@ test("PKCE material is independent, bounded, and S256-verifiable without a callb
   assert.match(material.state, /^[A-Za-z0-9_-]{43,}$/u);
 });
 
-test("browser handoff pins approved absolute helpers and safe working directories", () => {
+test("browser handoff fails closed without a native Windows adapter and pins approved Unix helpers", () => {
   const url = "https://app.runacode.io/cli/continue#opaque";
-  assert.deepEqual(resolveBrowserCommand("win32", url, { SystemRoot: "C:\\Windows" }), {
-    executable: "C:\\Windows\\System32\\rundll32.exe",
-    args: ["url.dll,FileProtocolHandler", url],
-    cwd: "C:\\Windows\\System32",
-  });
+  assert.throws(
+    () => resolveBrowserCommand("win32", url, { SystemRoot: "C:\\Windows" }),
+    /approved signed native adapter/u,
+  );
   assert.deepEqual(resolveBrowserCommand("darwin", url, {}), {
     executable: "/usr/bin/open",
     args: [url],
@@ -35,8 +34,4 @@ test("browser handoff pins approved absolute helpers and safe working directorie
     args: [url],
     cwd: "/",
   });
-  assert.throws(
-    () => resolveBrowserCommand("win32", url, { SystemRoot: ".\\shadow" }),
-    /absolute SystemRoot/u,
-  );
 });

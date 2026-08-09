@@ -98,7 +98,7 @@ try {
   await writeFile(path.join(outputRoot, "package-contents.json"), `${JSON.stringify(JSON.parse(packageContentsResult.stdout), null, 2)}\n`, { flag: "wx" });
 
   const evidence = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     authority: "LOCAL_NON_RELEASE_EVIDENCE",
     releaseEligible: false,
     limitations: [
