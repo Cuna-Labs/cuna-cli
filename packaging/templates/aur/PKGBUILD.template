@@ -1,0 +1,21 @@
+# Generated from an admitted Runa CLI release envelope. Do not edit by hand.
+pkgname=runa-cli-bin
+pkgver=@@AUR_VERSION@@
+pkgrel=1
+pkgdesc='Runa cloud-agent CLI'
+arch=('x86_64')
+url='https://runacode.io'
+license=('Apache-2.0')
+depends=('nodejs>=22')
+makedepends=('npm')
+source=("runa-cli-${pkgver}.tgz::@@TARBALL_URL@@")
+sha256sums=('@@TARBALL_SHA256@@')
+
+package() {
+  local npm_cache="${srcdir}/npm-cache"
+  mkdir -p "$npm_cache"
+  npm install --global --offline --ignore-scripts \
+    --cache "$npm_cache" \
+    --prefix "${pkgdir}/usr" \
+    "${srcdir}/runa-cli-${pkgver}.tgz"
+}

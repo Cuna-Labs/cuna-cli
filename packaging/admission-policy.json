@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "mode": "gatekeeper",
+  "canonicalPackage": "@runa_laboratories/cli",
+  "canonicalRegistry": "https://registry.npmjs.org",
+  "allowedLicenses": ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "CC0-1.0"],
+  "blockedDependencySources": ["git", "file", "http"],
+  "installScripts": "deny-unless-explicit-expiring-security-exception",
+  "nativeCode": "deny-unless-explicit-expiring-security-exception",
+  "reachableAdvisoryThreshold": "high",
+  "advisoryEvidenceMaximumAgeHours": 24,
+  "publication": {
+    "workflow": ".github/workflows/release.yml",
+    "environment": "npm",
+    "identity": "oidc-trusted-publisher",
+    "longLivedToken": "forbidden"
+  },
+  "projections": ["bun", "curl", "homebrew", "aur"],
+  "projectionRule": "same-version-and-tarball-sha256"
+}

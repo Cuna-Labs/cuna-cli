@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+
+# Generated from an admitted Runa CLI release envelope. This template is not a
+# live installer and must retain unresolved @@...@@ markers in source control.
+PACKAGE='@runa_laboratories/cli'
+VERSION='@@VERSION@@'
+TARBALL_URL='@@TARBALL_URL@@'
+TARBALL_SHA256='@@TARBALL_SHA256@@'
+
+die() {
+  printf '%s\n' "runa installer: $*" >&2
+  exit 1
+}
+
+command -v node >/dev/null 2>&1 || die 'Node.js is required.'
+command -v npm >/dev/null 2>&1 || die 'npm is required.'
+command -v curl >/dev/null 2>&1 || die 'curl is required.'
+
+tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t runa-install)"
+trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+tarball="$tmp_dir/runa-cli.tgz"
+
+curl --proto '=https' --tlsv1.2 --fail --location --show-error \
+  --output "$tarball" "$TARBALL_URL"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  printf '%s  %s\n' "$TARBALL_SHA256" "$tarball" | sha256sum --check --strict >/dev/null
+elif command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "$tarball" | awk '{print $1}')"
+  [ "$actual" = "$TARBALL_SHA256" ] || die 'SHA-256 verification failed.'
+else
+  die 'A SHA-256 verifier is required.'
+fi
+
+printf '%s\n' "Installing ${PACKAGE}@${VERSION} from verified npm bytes."
+npm install --global --ignore-scripts "$tarball"
+runa self-test --offline --json >/dev/null || die 'Installed-artifact self-test failed.'
+runa version --json

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runacode.io/schemas/runa-cli-runtime-identity-v1.json",
+  "title": "Runa CLI version command data payload",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["version", "buildDigest", "platform", "architecture", "updateChannel", "protocolRange"],
+  "properties": {
+    "version": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"},
+    "buildDigest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "platform": {"enum": ["win32", "darwin", "linux"]},
+    "architecture": {"type": "string", "minLength": 1},
+    "updateChannel": {"enum": ["npm", "bun", "curl", "homebrew", "aur", "development"]},
+    "protocolRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum", "maximum"],
+      "properties": {
+        "minimum": {"type": "string", "minLength": 1},
+        "maximum": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "description": "This schema applies to the data object inside the versioned CLI result envelope. buildDigest identifies the runtime build/payload, not the self-containing npm archive. The independently verified install receipt binds the npm tarball SHA-256."
+}

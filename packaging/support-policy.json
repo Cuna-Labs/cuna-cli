@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "packageName": "@runa_laboratories/cli",
+  "canonicalRegistry": "https://registry.npmjs.org",
+  "architectures": ["x64"],
+  "node": {
+    "minimum": "22.17.1",
+    "tested": ["22.17.1", "24.4.1"]
+  },
+  "ciMatrix": [
+    {"id": "linux-ubuntu-22-node22-x64", "runner": "ubuntu-22.04", "platform": "linux", "architecture": "x64", "node": "22.17.1"},
+    {"id": "linux-ubuntu-24-node24-x64", "runner": "ubuntu-24.04", "platform": "linux", "architecture": "x64", "node": "24.4.1"},
+    {"id": "windows-server-2022-node22-x64", "runner": "windows-2022", "platform": "win32", "architecture": "x64", "node": "22.17.1"},
+    {"id": "windows-server-2025-node24-x64", "runner": "windows-2025", "platform": "win32", "architecture": "x64", "node": "24.4.1"},
+    {"id": "macos-14-node22-arm64-observation", "runner": "macos-14", "platform": "darwin", "architecture": "arm64", "node": "22.17.1", "claim": "observation-only"},
+    {"id": "macos-15-intel-node24-x64", "runner": "macos-15-intel", "platform": "darwin", "architecture": "x64", "node": "24.4.1"}
+  ],
+  "preGaExternalEvidence": [
+    "Windows 11 x64 installed-artifact receipt",
+    "interactive terminal behavior on physical or policy-approved virtual Windows, macOS, and Linux hosts",
+    "npm and Bun global-install receipts on every Tier-1 platform",
+    "curl and Homebrew receipts on supported macOS and Linux hosts",
+    "paru/AUR receipt on supported Arch Linux"
+  ],
+  "channels": {
+    "npm": "canonical",
+    "bun": "projection",
+    "curl": "template-not-live",
+    "homebrew": "template-not-live",
+    "aur": "template-not-live"
+  }
+}
