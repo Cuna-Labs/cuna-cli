@@ -39,6 +39,7 @@ async function writeExclusive(relative, content, mode = undefined) {
 
 async function render(templateRelative, outputRelative, mode = undefined) {
   let value = await readFile(path.join(repositoryRoot, templateRelative), "utf8");
+  value = value.replace(/\r\n?/g, "\n");
   for (const [marker, replacement] of replacements) value = value.replaceAll(marker, replacement);
   if (/@@[A-Z0-9_]+@@/.test(value)) throw new Error(`Unresolved marker in ${templateRelative}`);
   return writeExclusive(outputRelative, value, mode);
@@ -172,4 +173,3 @@ process.stdout.write(
     channels: CHANNEL_ORDER,
   })}\n`,
 );
-

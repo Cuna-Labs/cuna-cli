@@ -26,6 +26,7 @@ jobs:
         with:
           node-version: 22.17.1
       - run: node scripts/verify-repository-governance.mjs
+      - run: node governance/validate-requirement-traceability.mjs
       - run: node --test scripts/scaffolding-negative-controls.test.mjs
       - run: node scripts/verify-release-envelope.mjs --self-test true
 
@@ -49,6 +50,7 @@ jobs:
       - run: node scripts/verify-dependency-policy.mjs
       - run: npm ls --all
       - run: npm audit --audit-level=high
+      - run: npm audit signatures
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
@@ -95,8 +97,24 @@ jobs:
           --run-id "${{ github.run_id }}"
           --run-attempt "${{ github.run_attempt }}"
       - run: node scripts/verify-release-envelope.mjs
-      - run: node scripts/project-distributions.mjs
-      - run: node scripts/verify-distribution-projections.mjs
+      - name: Generate all fail-closed distribution projections
+        run: >-
+          node scripts/release-project-distributions.mjs
+          --root .
+          --evidence release-artifacts
+          --output release-artifacts/distributions
+      - name: Verify one candidate identity across npm, Bun, curl, Homebrew, and AUR
+        run: >-
+          node scripts/verify-release-distributions.mjs
+          --root .
+          --evidence release-artifacts
+          --distributions release-artifacts/distributions
+      - name: Parse generated platform packaging without executing it
+        shell: bash
+        run: |
+          sh -n release-artifacts/distributions/curl/install.sh
+          ruby -c release-artifacts/distributions/homebrew/runa.rb
+          bash -n release-artifacts/distributions/aur/PKGBUILD
       - name: Export exact support matrix
         id: matrix
         shell: bash
@@ -158,6 +176,11 @@ jobs:
           pattern: platform-*
           path: evidence/platform-receipts
           merge-multiple: true
+      - run: >-
+          node scripts/verify-release-distributions.mjs
+          --root .
+          --evidence release-artifacts
+          --distributions release-artifacts/distributions
       - run: node scripts/verify-release-admission.mjs
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -193,6 +216,11 @@ jobs:
           name: admission-receipt
           path: evidence
       - run: node scripts/verify-release-envelope.mjs
+      - run: >-
+          node scripts/verify-release-distributions.mjs
+          --root .
+          --evidence release-artifacts
+          --distributions release-artifacts/distributions
       - uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v3.2.0
         with:
           subject-path: release-artifacts/*.tgz

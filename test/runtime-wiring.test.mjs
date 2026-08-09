@@ -274,6 +274,46 @@ test("runtime multiplexes AgentSessions without cross-routing input and preserve
   await runtime.shutdown();
 });
 
+test("terminal-generated responses require the exact tab authority and never follow active-tab focus", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  const first = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await runtime.attach({ tabId: "tab-b", agentSessionId: "agent-b", columns: 80, rows: 24 });
+  runtime.switchActive("tab-b");
+  const response = {
+    tabId: "tab-a",
+    binding: {
+      userId: "user-1",
+      machineId: first.machineId,
+      agentSessionId: first.agentSessionId,
+      processEpoch: first.processEpoch,
+      fencingGeneration: first.fencingGeneration,
+    },
+    bytes: new TextEncoder().encode("\u001b[1;1R"),
+  };
+  await runtime.sendTerminalResponse(response);
+
+  const firstInput = system.connections[0].sent.map(decodeTerminalFrame).filter((frame) => frame?.type === "input");
+  const secondInput = system.connections[1].sent.map(decodeTerminalFrame).filter((frame) => frame?.type === "input");
+  assert.equal(firstInput.length, 1);
+  assert.equal(secondInput.length, 0);
+
+  for (const invalid of [
+    { ...response, binding: { ...response.binding, userId: "user-sibling" } },
+    { ...response, binding: { ...response.binding, agentSessionId: "agent-b" } },
+    { ...response, binding: { ...response.binding, processEpoch: "stale-epoch" } },
+    { ...response, binding: { ...response.binding, fencingGeneration: first.fencingGeneration + 1 } },
+  ]) {
+    await assert.rejects(
+      runtime.sendTerminalResponse(invalid),
+      (error) => error instanceof RuntimeBoundaryError && error.code === "grant_scope_mismatch",
+    );
+  }
+  assert.equal(system.connections[0].sent.map(decodeTerminalFrame).filter((frame) => frame?.type === "input").length, 1);
+  assert.equal(system.connections[1].sent.map(decodeTerminalFrame).filter((frame) => frame?.type === "input").length, 0);
+  await runtime.shutdown();
+});
+
 test("runtime reconnect obtains a fresh grant, preserves process epoch, and never reuses the old token", async () => {
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);

@@ -139,15 +139,40 @@ export function decodeMachineItem(value: unknown): Machine {
 }
 
 export type AgentKind = "claude-code" | "codex" | "openclaw";
+export type AgentAuthMode = "interactive_login" | "credential_binding";
+export type AgentSessionDesiredState = "running" | "terminated";
+export type AgentSessionRequestState =
+  | "launch_pending"
+  | "runtime_claimed"
+  | "launched"
+  | "termination_pending"
+  | "terminal"
+  | "failed";
+export type AgentSessionProcessState =
+  | "unknown"
+  | "starting"
+  | "ready"
+  | "running"
+  | "exited"
+  | "failed"
+  | "terminating"
+  | "terminated";
 export interface AgentSession {
   readonly id: string;
   readonly machineId: string;
+  readonly name: string;
   readonly agent: AgentKind;
   readonly cwd: string;
-  readonly state: string;
+  readonly authMode: AgentAuthMode;
+  readonly desiredState: AgentSessionDesiredState;
+  readonly requestState: AgentSessionRequestState;
+  readonly processState: AgentSessionProcessState;
   readonly processEpoch?: string;
-  readonly createdAt?: string;
-  readonly updatedAt?: string;
+  readonly runtimeObservedAt?: string;
+  readonly terminationRequestedAt?: string;
+  readonly rowVersion: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 export interface AgentSessionPage {
@@ -156,22 +181,51 @@ export interface AgentSessionPage {
 }
 
 const AGENTS = new Set<AgentKind>(["claude-code", "codex", "openclaw"]);
+const AUTH_MODES = new Set<AgentAuthMode>(["interactive_login", "credential_binding"]);
+const DESIRED_STATES = new Set<AgentSessionDesiredState>(["running", "terminated"]);
+const REQUEST_STATES = new Set<AgentSessionRequestState>([
+  "launch_pending", "runtime_claimed", "launched", "termination_pending", "terminal", "failed",
+]);
+const PROCESS_STATES = new Set<AgentSessionProcessState>([
+  "unknown", "starting", "ready", "running", "exited", "failed", "terminating", "terminated",
+]);
+
+function enumField<T extends string>(value: Record<string, unknown>, key: string, allowed: ReadonlySet<T>): T {
+  const decoded = requiredString(value, key);
+  if (!allowed.has(decoded as T)) throw new TypeError(`Malformed field: ${key}`);
+  return decoded as T;
+}
+
 function decodeAgentSession(value: unknown): AgentSession {
   if (!isObject(value)) throw new TypeError("Malformed agent session");
-  const agent = requiredString(value, "agent");
-  if (!AGENTS.has(agent as AgentKind)) throw new TypeError("Malformed agent kind");
+  const agent = enumField(value, "agent", AGENTS);
+  const authMode = enumField(value, "auth_mode", AUTH_MODES);
+  const desiredState = enumField(value, "desired_state", DESIRED_STATES);
+  const requestState = enumField(value, "request_state", REQUEST_STATES);
+  const processState = enumField(value, "process_state", PROCESS_STATES);
   const processEpoch = optionalString(value, "process_epoch");
-  const createdAt = optionalString(value, "created_at");
-  const updatedAt = optionalString(value, "updated_at");
+  const runtimeObservedAt = optionalString(value, "runtime_observed_at");
+  const terminationRequestedAt = optionalString(value, "termination_requested_at");
+  const rowVersion = optionalNumber(value, "row_version");
+  if (rowVersion === undefined || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
+    throw new TypeError("Malformed field: row_version");
+  }
   return Object.freeze({
     id: requiredString(value, "id"),
     machineId: requiredString(value, "machine_id"),
-    agent: agent as AgentKind,
+    name: requiredString(value, "name"),
+    agent,
     cwd: requiredString(value, "cwd"),
-    state: optionalString(value, "process_state") ?? optionalString(value, "state") ?? "unknown",
+    authMode,
+    desiredState,
+    requestState,
+    processState,
     ...(processEpoch === undefined ? {} : { processEpoch }),
-    ...(createdAt === undefined ? {} : { createdAt }),
-    ...(updatedAt === undefined ? {} : { updatedAt }),
+    ...(runtimeObservedAt === undefined ? {} : { runtimeObservedAt }),
+    ...(terminationRequestedAt === undefined ? {} : { terminationRequestedAt }),
+    rowVersion,
+    createdAt: requiredString(value, "created_at"),
+    updatedAt: requiredString(value, "updated_at"),
   });
 }
 

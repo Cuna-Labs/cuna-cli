@@ -13,10 +13,11 @@ const platform = {
   async readSafeConfig() { return { exists: false }; },
 };
 
-function capabilitySnapshot(capabilities) {
+function capabilitySnapshot(capabilities, subjectScope = "account", subjectId) {
   return {
     schemaVersion: "1",
-    subjectScope: "account",
+    subjectScope,
+    ...(subjectId === undefined ? {} : { subjectId }),
     observedAt: "2026-08-08T00:00:00.000Z",
     expiresAt: future,
     etag: "fixture",
@@ -34,6 +35,7 @@ function fakeClient(overrides = {}) {
     async listAgentSessions() { return { items: [] }; },
     async createAgentSession() { throw new Error("unexpected create agent"); },
     async getAgentSession() { throw new Error("unexpected get agent"); },
+    async renameAgentSession() { throw new Error("unexpected rename agent"); },
     async terminateAgentSession() { throw new Error("unexpected terminate agent"); },
     ...overrides,
   };
@@ -153,7 +155,7 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
         mutationClass: "reversible",
         surfaces: ["cli"],
         requiredPermissions: ["machines:update"],
-      }]);
+      }], scope, resourceId);
     },
     async transitionMachine(id, action) {
       transitions += 1;
@@ -173,6 +175,124 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
   assert.equal(transitions, 1);
   assert.deepEqual(discoveries, [{ scope: "machine", resourceId: "m_1" }]);
   assert.equal(JSON.parse(streams.stdout()).data.state, "paused");
+});
+
+function agentSession(overrides = {}) {
+  return {
+    id: "11111111-1111-4111-8111-111111111111",
+    machineId: "22222222-2222-4222-8222-222222222222",
+    name: "primary",
+    agent: "claude-code",
+    cwd: "/workspace",
+    authMode: "interactive_login",
+    desiredState: "running",
+    requestState: "launch_pending",
+    processState: "unknown",
+    rowVersion: 0,
+    createdAt: "2026-08-08T00:00:00.000Z",
+    updatedAt: "2026-08-08T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("AgentSession create keeps auth mode explicit and rename is capability-gated", async () => {
+  const machineId = "22222222-2222-4222-8222-222222222222";
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const bindingId = "44444444-4444-4444-8444-444444444444";
+  const calls = [];
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      const id = scope === "machine" ? "agent_sessions.create" : "agent_sessions.rename";
+      return capabilitySnapshot([{
+        id,
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: [`${id}:permission`],
+      }], scope, resourceId);
+    },
+    async createAgentSession(observedMachine, input, key) {
+      calls.push({ operation: "create", observedMachine, input, key });
+      return agentSession({ machineId: observedMachine, name: input.name, agent: input.agent, cwd: input.cwd, authMode: input.authMode });
+    },
+    async renameAgentSession(id, name) {
+      calls.push({ operation: "rename", id, name });
+      return agentSession({ id, name });
+    },
+  });
+
+  const createStreams = memoryStreams();
+  const createExit = await runCli([
+    "agent-sessions", "create", "--machine", machineId, "--name", "review",
+    "--agent", "codex", "--cwd", "/workspace/repo", "--auth-mode", "credential_binding",
+    "--credential-binding", bindingId, "--idempotency-key", "operation-1", "--yes",
+  ], {
+    streams: createStreams.streams,
+    platform,
+    env: { RUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(createExit, EXIT_CODES.success);
+  assert.deepEqual(calls[0], {
+    operation: "create",
+    observedMachine: machineId,
+    input: {
+      name: "review",
+      agent: "codex",
+      cwd: "/workspace/repo",
+      authMode: "credential_binding",
+      credentialBindingId: bindingId,
+    },
+    key: "operation-1",
+  });
+  assert.equal(JSON.parse(createStreams.stdout()).data.process_state, "unknown");
+
+  const renameStreams = memoryStreams();
+  const renameExit = await runCli([
+    "agent-sessions", "rename", sessionId, "--name", "renamed", "--yes",
+  ], {
+    streams: renameStreams.streams,
+    platform,
+    env: { RUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(renameExit, EXIT_CODES.success);
+  assert.deepEqual(calls[1], { operation: "rename", id: sessionId, name: "renamed" });
+  assert.equal(JSON.parse(renameStreams.stdout()).data.name, "renamed");
+});
+
+test("AgentSession capability subject mismatch blocks mutation before the client call", async () => {
+  let creates = 0;
+  const streams = memoryStreams();
+  const client = fakeClient({
+    async discoverCapabilities() {
+      return capabilitySnapshot([{
+        id: "agent_sessions.create",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["agent_sessions:create"],
+      }], "machine", "another-machine");
+    },
+    async createAgentSession() { creates += 1; return agentSession(); },
+  });
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", "22222222-2222-4222-8222-222222222222",
+    "--agent", "claude-code", "--idempotency-key", "operation-1", "--yes",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { RUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(creates, 0);
+  assert.equal(JSON.parse(streams.stderr()).error.details.reason, "subject_scope_mismatch");
 });
 
 test("reserved cloud-terminal commands fail explicitly instead of simulating a session", async () => {

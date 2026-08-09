@@ -16,11 +16,11 @@ interface WindowsResponse {
 
 const WINDOWS_CREDENTIAL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
+$stage = 'initialize'
 try {
   Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-using System.Runtime.InteropServices.ComTypes;
 public static class RunaCredentialNative {
   [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
   public struct CREDENTIAL {
@@ -28,7 +28,7 @@ public static class RunaCredentialNative {
     public UInt32 Type;
     public string TargetName;
     public string Comment;
-    public FILETIME LastWritten;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
     public UInt32 CredentialBlobSize;
     public IntPtr CredentialBlob;
     public UInt32 Persist;
@@ -47,12 +47,15 @@ public static class RunaCredentialNative {
   public static extern void CredFree(IntPtr credential);
 }
 '@
+  $stage = 'request'
   $requestText = [Console]::In.ReadToEnd()
   $request = $requestText | ConvertFrom-Json
   if ($request.operation -eq 'replace') {
+    $stage = 'replace_prepare'
     $blob = [Convert]::FromBase64String([string]$request.valueBase64)
     $pointer = [Runtime.InteropServices.Marshal]::AllocHGlobal($blob.Length)
     try {
+      $stage = 'replace_write'
       [Runtime.InteropServices.Marshal]::Copy($blob, 0, $pointer, $blob.Length)
       $credential = New-Object RunaCredentialNative+CREDENTIAL
       $credential.Type = 1
@@ -65,13 +68,15 @@ public static class RunaCredentialNative {
       if (-not [RunaCredentialNative]::CredWrite([ref]$credential, 0)) { throw 'write_failed' }
       @{ ok = $true; status = 'replaced' } | ConvertTo-Json -Compress
     } finally {
+      $stage = 'replace_cleanup'
       if ($blob) { [Array]::Clear($blob, 0, $blob.Length) }
       if ($pointer -ne [IntPtr]::Zero) {
-        for ($i = 0; $i -lt $credential.CredentialBlobSize; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($pointer, $i, 0) }
+        if ($blob) { [Runtime.InteropServices.Marshal]::Copy($blob, 0, $pointer, $blob.Length) }
         [Runtime.InteropServices.Marshal]::FreeHGlobal($pointer)
       }
     }
   } elseif ($request.operation -eq 'read') {
+    $stage = 'read'
     $credentialPointer = [IntPtr]::Zero
     if (-not [RunaCredentialNative]::CredRead([string]$request.target, 1, 0, [ref]$credentialPointer)) {
       if ([Runtime.InteropServices.Marshal]::GetLastWin32Error() -eq 1168) {
@@ -87,6 +92,7 @@ public static class RunaCredentialNative {
       } finally { [RunaCredentialNative]::CredFree($credentialPointer) }
     }
   } elseif ($request.operation -eq 'delete') {
+    $stage = 'delete'
     if ([RunaCredentialNative]::CredDelete([string]$request.target, 1, 0)) {
       @{ ok = $true; status = 'deleted' } | ConvertTo-Json -Compress
     } elseif ([Runtime.InteropServices.Marshal]::GetLastWin32Error() -eq 1168) {
@@ -94,10 +100,13 @@ public static class RunaCredentialNative {
     } else { throw 'delete_failed' }
   } else { throw 'operation_invalid' }
 } catch {
-  @{ ok = $false; status = 'failed' } | ConvertTo-Json -Compress
+  $known = @('write_failed', 'read_failed', 'delete_failed', 'operation_invalid')
+  $status = if ($known -contains $_.Exception.Message) { $_.Exception.Message } else { 'failed_' + $stage }
+  @{ ok = $false; status = $status } | ConvertTo-Json -Compress
   exit 1
 }
 `;
+const WINDOWS_CREDENTIAL_ENCODED_COMMAND = Buffer.from(WINDOWS_CREDENTIAL_SCRIPT, "utf16le").toString("base64");
 
 export function createWindowsCredentialManagerBackend(input: {
   readonly runner?: SecureProcessRunner;
@@ -116,7 +125,7 @@ export function createWindowsCredentialManagerBackend(input: {
     try {
       const result = await runner.run({
         executable,
-        args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_CREDENTIAL_SCRIPT],
+        args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", WINDOWS_CREDENTIAL_ENCODED_COMMAND],
         stdin,
         environment,
         timeoutMs: 30_000,
@@ -127,11 +136,10 @@ export function createWindowsCredentialManagerBackend(input: {
       let response: WindowsResponse;
       try {
         response = JSON.parse(output) as WindowsResponse;
-      } catch (cause) {
+      } catch {
         throw credentialFailure(
           "credential_backend_failure",
           "Windows Credential Manager returned an invalid response.",
-          { cause },
         );
       }
       if (result.exitCode !== 0 || response.ok !== true) {
@@ -155,8 +163,8 @@ export function createWindowsCredentialManagerBackend(input: {
     }
     try {
       return Uint8Array.from(Buffer.from(response.valueBase64, "base64"));
-    } catch (cause) {
-      throw credentialFailure("credential_backend_failure", "Windows Credential Manager returned an invalid protected value.", { cause });
+    } catch {
+      throw credentialFailure("credential_backend_failure", "Windows Credential Manager returned an invalid protected value.");
     }
   };
 

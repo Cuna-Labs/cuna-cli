@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createHttpTransport,
   createRunaApiClient,
+  decodeAgentSessionItem,
   decodeCapabilitySnapshot,
   decodeMachinePage,
   decideCapability,
@@ -47,6 +48,115 @@ test("expired and duplicate capability evidence is unknown", () => {
   assert.equal(decideCapability(expired, "machines.create").status, "unknown");
   const duplicate = decodeCapabilitySnapshot(snapshot([capability(), capability()]));
   assert.equal(decideCapability(duplicate, "machines.create", Date.parse("2026-08-08T00:00:00Z")).reason, "capability_ambiguous");
+});
+
+test("future-dated and inverted capability evidence is unknown", () => {
+  const futureObserved = decodeCapabilitySnapshot({
+    ...snapshot([capability()]),
+    observed_at: "2098-01-01T00:00:00.000Z",
+  });
+  assert.equal(decideCapability(futureObserved, "machines.create", Date.parse("2026-08-08T00:00:00Z")).status, "unknown");
+  const inverted = decodeCapabilitySnapshot({
+    ...snapshot([capability()]),
+    observed_at: "2099-01-02T00:00:00.000Z",
+    expires_at: "2099-01-01T00:00:00.000Z",
+  });
+  assert.equal(decideCapability(inverted, "machines.create", Date.parse("2098-01-01T00:00:00Z")).status, "unknown");
+});
+
+function agentSession(overrides = {}) {
+  return {
+    id: "11111111-1111-4111-8111-111111111111",
+    machine_id: "22222222-2222-4222-8222-222222222222",
+    name: "primary",
+    agent: "claude-code",
+    cwd: "/workspace",
+    auth_mode: "interactive_login",
+    desired_state: "running",
+    request_state: "launch_pending",
+    process_state: "unknown",
+    row_version: 0,
+    created_at: "2026-08-08T00:00:00.000Z",
+    updated_at: "2026-08-08T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("AgentSession decoder preserves separate intent and observed runtime truth", () => {
+  const decoded = decodeAgentSessionItem(agentSession({
+    request_state: "launched",
+    process_state: "running",
+    process_epoch: "33333333-3333-4333-8333-333333333333",
+    runtime_observed_at: "2026-08-08T00:00:01.000Z",
+    row_version: 4,
+  }));
+  assert.equal(decoded.name, "primary");
+  assert.equal(decoded.requestState, "launched");
+  assert.equal(decoded.processState, "running");
+  assert.equal(decoded.rowVersion, 4);
+  assert.equal(Object.hasOwn(decoded, "state"), false);
+  assert.throws(() => decodeAgentSessionItem(agentSession({ process_state: "healthy" })));
+  assert.throws(() => decodeAgentSessionItem(agentSession({ row_version: -1 })));
+});
+
+test("AgentSession client sends bounded pagination, complete create intent, and exact rename path", async () => {
+  const requests = [];
+  const client = createRunaApiClient({
+    async request(request) {
+      requests.push(request);
+      if (request.method === "GET" && request.path.includes("/agent-sessions")) {
+        return { items: [agentSession()], next_cursor: "next-opaque" };
+      }
+      return agentSession({ name: request.body?.name ?? "primary" });
+    },
+  });
+  const machineId = "22222222-2222-4222-8222-222222222222";
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const page = await client.listAgentSessions(machineId, { limit: 25, cursor: "cursor-opaque" });
+  assert.equal(page.nextCursor, "next-opaque");
+  await client.createAgentSession(machineId, {
+    name: "review",
+    agent: "codex",
+    cwd: "/workspace/repo",
+    authMode: "credential_binding",
+    credentialBindingId: "44444444-4444-4444-8444-444444444444",
+  }, "operation-1");
+  const renamed = await client.renameAgentSession(sessionId, "renamed");
+  assert.equal(renamed.name, "renamed");
+  assert.deepEqual(requests[0].query, { limit: "25", cursor: "cursor-opaque" });
+  assert.deepEqual(requests[1].body, {
+    name: "review",
+    agent: "codex",
+    cwd: "/workspace/repo",
+    auth_mode: "credential_binding",
+    credential_binding_id: "44444444-4444-4444-8444-444444444444",
+  });
+  assert.equal(requests[1].idempotencyKey, "operation-1");
+  assert.equal(requests[2].method, "PATCH");
+  assert.equal(requests[2].path, `/v1/agent-sessions/${sessionId}`);
+  assert.deepEqual(requests[2].body, { name: "renamed" });
+});
+
+test("AgentSession client rejects malformed page and auth bindings before transport", async () => {
+  let requests = 0;
+  const client = createRunaApiClient({ async request() { requests += 1; return {}; } });
+  const machineId = "22222222-2222-4222-8222-222222222222";
+  await assert.rejects(client.listAgentSessions(machineId, { limit: 0 }), RunaError);
+  await assert.rejects(client.listAgentSessions(machineId, { cursor: "bad\nvalue" }), RunaError);
+  await assert.rejects(client.createAgentSession(machineId, {
+    agent: "claude-code",
+    cwd: "/workspace/../escape",
+  }, "operation-1"), RunaError);
+  await assert.rejects(client.createAgentSession(machineId, {
+    agent: "claude-code",
+    cwd: "/workspace",
+    authMode: "credential_binding",
+  }, "operation-2"), RunaError);
+  await assert.rejects(client.renameAgentSession(
+    "11111111-1111-4111-8111-111111111111",
+    "",
+  ), RunaError);
+  assert.equal(requests, 0);
 });
 
 test("legacy array machine responses are decoded into a safe public page", () => {

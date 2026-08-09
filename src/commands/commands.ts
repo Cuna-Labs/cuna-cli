@@ -117,12 +117,21 @@ function agentSessionRecord(session: AgentSession): Readonly<Record<string, unkn
   return Object.freeze({
     id: session.id,
     machine_id: session.machineId,
+    name: session.name,
     agent: session.agent,
     cwd: session.cwd,
-    state: session.state,
+    auth_mode: session.authMode,
+    desired_state: session.desiredState,
+    request_state: session.requestState,
+    process_state: session.processState,
     ...(session.processEpoch === undefined ? {} : { process_epoch: session.processEpoch }),
-    ...(session.createdAt === undefined ? {} : { created_at: session.createdAt }),
-    ...(session.updatedAt === undefined ? {} : { updated_at: session.updatedAt }),
+    ...(session.runtimeObservedAt === undefined ? {} : { runtime_observed_at: session.runtimeObservedAt }),
+    ...(session.terminationRequestedAt === undefined
+      ? {}
+      : { termination_requested_at: session.terminationRequestedAt }),
+    row_version: session.rowVersion,
+    created_at: session.createdAt,
+    updated_at: session.updatedAt,
   });
 }
 
@@ -219,11 +228,13 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       }
       const nodeMajor = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
       const buildDigest = await packageBuildDigest();
+      const virtualTerminal = await verifyVirtualTerminalInterop();
       const checks = Object.freeze({
         node_runtime: nodeMajor >= 22,
         supported_platform: ["windows", "macos", "linux"].includes(config.platformKind),
         canonical_api_origin: config.baseUrl === "https://api.runacode.io" || config.developmentProfile,
         package_identity: /^[0-9a-f]{64}$/u.test(buildDigest),
+        virtual_terminal: virtualTerminal,
         network_requests: 0,
       });
       const ok = Object.values(checks).every((value) => value === true || value === 0);
@@ -255,6 +266,37 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     }
     default:
       throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run `runa --help`.");
+  }
+}
+
+async function verifyVirtualTerminalInterop(): Promise<boolean> {
+  let viewport: import("../terminal/xterm-vte.js").XtermViewportAdapter | undefined;
+  try {
+    const [{ ViewportRegistry }, { XtermViewportAdapter }] = await Promise.all([
+      import("../terminal/viewport.js"),
+      import("../terminal/xterm-vte.js"),
+    ]);
+    const registry = new ViewportRegistry();
+    viewport = new XtermViewportAdapter({
+      tabId: "offline-self-test",
+      binding: {
+        userId: "offline",
+        machineId: "offline",
+        agentSessionId: "offline",
+        processEpoch: "offline",
+        fencingGeneration: 1,
+      },
+      columns: 20,
+      rows: 2,
+      scrollback: 0,
+      registry,
+    });
+    const snapshot = await viewport.write(new TextEncoder().encode("runa"), 1n, 1n);
+    return snapshot.cells[0] === "runa";
+  } catch {
+    return false;
+  } finally {
+    viewport?.dispose();
   }
 }
 
@@ -336,27 +378,34 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
   requireAutomationCredential(config);
   const action = requireOperand(parsed.operands, 0, "agent-sessions action");
   if (action === "list") {
-    rejectUnknownOptions(parsed, ["machine"]);
+    rejectUnknownOptions(parsed, ["machine", "limit", "cursor"]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions list accepts no operands.");
     const machineId = assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
-    const page = await client.listAgentSessions(machineId);
+    const limit = integerOption(parsed, "limit", 1, 100);
+    const cursor = stringOption(parsed, "cursor");
+    const page = await client.listAgentSessions(machineId, {
+      ...(limit === undefined ? {} : { limit }),
+      ...(cursor === undefined ? {} : { cursor }),
+    });
     const items = page.items.map(agentSessionRecord);
     return Object.freeze({
       command: "agent-sessions.list",
       data: { items, ...(page.nextCursor === undefined ? {} : { next_cursor: page.nextCursor }) },
       human: items.length === 0
         ? "No AgentSessions found."
-        : page.items.map((item) => `${item.id}\t${item.agent}\t${item.state}\t${item.cwd}`).join("\n"),
+        : page.items.map((item) => `${item.id}\t${item.name}\t${item.agent}\t${item.processState}\t${item.cwd}`).join("\n"),
     });
   }
   if (action === "get") {
     rejectUnknownOptions(parsed, []);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions get requires exactly one AgentSession ID.");
     const session = await client.getAgentSession(requireOperand(parsed.operands, 1, "AgentSession ID"));
-    return Object.freeze({ command: "agent-sessions.get", data: agentSessionRecord(session), human: `${session.id}\t${session.agent}\t${session.state}\t${session.cwd}` });
+    return Object.freeze({ command: "agent-sessions.get", data: agentSessionRecord(session), human: `${session.id}\t${session.name}\t${session.agent}\t${session.processState}\t${session.cwd}` });
   }
   if (action === "create") {
-    rejectUnknownOptions(parsed, ["machine", "agent", "cwd", "yes", "idempotency-key"]);
+    rejectUnknownOptions(parsed, [
+      "machine", "name", "agent", "cwd", "auth-mode", "credential-binding", "yes", "idempotency-key",
+    ]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions create accepts no operands.");
     requireConfirmation(parsed, "agent-sessions.create");
     const machineId = assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
@@ -366,8 +415,35 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     if (!cwd.startsWith("/workspace") || cwd.split("/").includes("..") || cwd.length > 1024) {
       throw usageError("Option --cwd must be a safe absolute path inside /workspace.");
     }
+    const name = stringOption(parsed, "name");
+    if (name !== undefined && (name.length < 1 || name.length > 80)) {
+      throw usageError("Option --name must contain 1 through 80 characters.");
+    }
+    const rawAuthMode = stringOption(parsed, "auth-mode");
+    if (
+      rawAuthMode !== undefined &&
+      rawAuthMode !== "interactive_login" &&
+      rawAuthMode !== "credential_binding"
+    ) {
+      throw usageError("Option --auth-mode must be interactive_login or credential_binding.");
+    }
+    const credentialBinding = stringOption(parsed, "credential-binding");
+    if (rawAuthMode === "credential_binding" && credentialBinding === undefined) {
+      throw usageError("Option --credential-binding is required for credential_binding auth mode.");
+    }
+    if (rawAuthMode !== "credential_binding" && credentialBinding !== undefined) {
+      throw usageError("Option --credential-binding requires --auth-mode credential_binding.");
+    }
     await requireCapability({ client, scope: "machine", resourceId: machineId, capabilityId: "agent_sessions.create", now });
-    const session = await client.createAgentSession(machineId, { agent, cwd }, idempotencyKey(parsed));
+    const session = await client.createAgentSession(machineId, {
+      ...(name === undefined ? {} : { name }),
+      agent,
+      cwd,
+      ...(rawAuthMode === undefined ? {} : { authMode: rawAuthMode }),
+      ...(credentialBinding === undefined
+        ? {}
+        : { credentialBindingId: assertPublicId(credentialBinding, "credential binding ID") }),
+    }, idempotencyKey(parsed));
     return Object.freeze({ command: "agent-sessions.create", data: agentSessionRecord(session), human: `Created ${session.agent} AgentSession ${session.id}.` });
   }
   if (action === "terminate") {
@@ -377,10 +453,27 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     const id = assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.terminate", now });
     const session = await client.terminateAgentSession(id);
-    return Object.freeze({ command: "agent-sessions.terminate", data: agentSessionRecord(session), human: `AgentSession ${session.id} is ${session.state}.` });
+    return Object.freeze({ command: "agent-sessions.terminate", data: agentSessionRecord(session), human: `AgentSession ${session.id} is ${session.requestState}/${session.processState}.` });
   }
-  if (action === "attach" || action === "rename") {
-    throw unsupportedError(`AgentSession ${action}`, action === "attach" ? "terminal_runtime_missing" : "public_contract_missing");
+  if (action === "rename") {
+    rejectUnknownOptions(parsed, ["name", "yes"]);
+    if (parsed.operands.length !== 2) throw usageError("agent-sessions rename requires exactly one AgentSession ID.");
+    requireConfirmation(parsed, "agent-sessions.rename");
+    const id = assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    const name = stringOption(parsed, "name");
+    if (name === undefined || name.length < 1 || name.length > 80) {
+      throw usageError("Option --name must contain 1 through 80 characters.");
+    }
+    await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.rename", now });
+    const session = await client.renameAgentSession(id, name);
+    return Object.freeze({
+      command: "agent-sessions.rename",
+      data: agentSessionRecord(session),
+      human: `Renamed AgentSession ${session.id} to ${session.name}.`,
+    });
+  }
+  if (action === "attach") {
+    throw unsupportedError("AgentSession attach", "terminal_runtime_missing");
   }
   throw usageError(`Unknown agent-sessions action ${action}.`);
 }
