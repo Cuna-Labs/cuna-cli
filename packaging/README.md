@@ -81,7 +81,7 @@ node scripts/verify-distribution-receipts.mjs \
 
 Even a passing distribution-receipt gate reports the overall release as
 `BLOCKED`; approval leases, recovery state, cohort telemetry, and the other
-PRD-030 DAGs are separate mandatory evidence.
+The complete release workflow and its authorization receipts remain separate mandatory evidence.
 
 ## Local artifact evidence
 

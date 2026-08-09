@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  governance:
-    name: repository-governance
+  public-controls:
+    name: public-repository-controls
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -26,13 +26,12 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22.17.1
-      - run: node scripts/verify-repository-governance.mjs
-      - run: node --test scripts/scaffolding-negative-controls.test.mjs
+      - run: node --test scripts/release-negative-controls.test.mjs
       - run: node scripts/verify-release-envelope.mjs --self-test true
 
   source-gates:
     name: source-quality-gates
-    needs: governance
+    needs: public-controls
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

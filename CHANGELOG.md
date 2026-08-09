@@ -8,7 +8,7 @@ follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Accepted Runa CLI product requirements and executable PRD DAG validation.
+- Established the initial public CLI architecture and release controls.
 - Initial fail-closed TypeScript CLI, public API client, cross-platform adapters,
   offline installed-artifact identity, and release-admission scaffolding.
 
