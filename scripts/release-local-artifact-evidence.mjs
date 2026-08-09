@@ -35,6 +35,15 @@ try {
   const packResult = JSON.parse(pack.stdout);
   invariant(Array.isArray(packResult) && packResult.length === 1, "npm pack did not produce exactly one artifact");
   const tarballSource = path.join(temporaryRoot, packResult[0].filename);
+  const packageContentsResult = await execute(process.execPath, [
+    path.join(repositoryRoot, "scripts", "verify-package-contents.mjs"),
+    "--tarball", tarballSource,
+  ], {
+    cwd: repositoryRoot,
+    windowsHide: true,
+    timeout: 30_000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
 
   const sbomResult = await runNpm(["sbom", "--sbom-format", "cyclonedx"], {
     cwd: repositoryRoot,
@@ -87,6 +96,7 @@ try {
   await copyFile(supportSource, path.join(outputRoot, "support-policy.json"));
   await writeFile(path.join(outputRoot, "self-test.json"), `${JSON.stringify(selfTest, null, 2)}\n`, { flag: "wx" });
   await writeFile(path.join(outputRoot, "version.json"), `${JSON.stringify(version, null, 2)}\n`, { flag: "wx" });
+  await writeFile(path.join(outputRoot, "package-contents.json"), `${JSON.stringify(JSON.parse(packageContentsResult.stdout), null, 2)}\n`, { flag: "wx" });
 
   const evidence = {
     schemaVersion: 1,
@@ -113,6 +123,7 @@ try {
     supportPolicy: { file: "support-policy.json", sha256: await sha256File(path.join(outputRoot, "support-policy.json")) },
     runtimeIdentity: version.data,
     observations: {
+      packageContents: { file: "package-contents.json", sha256: await sha256File(path.join(outputRoot, "package-contents.json")) },
       selfTest: { file: "self-test.json", sha256: await sha256File(path.join(outputRoot, "self-test.json")) },
       version: { file: "version.json", sha256: await sha256File(path.join(outputRoot, "version.json")) },
     },

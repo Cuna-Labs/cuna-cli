@@ -32,8 +32,12 @@
     "observations": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["selfTest", "version"],
-      "properties": {"selfTest": {"$ref": "#/$defs/digestFile"}, "version": {"$ref": "#/$defs/digestFile"}}
+      "required": ["packageContents", "selfTest", "version"],
+      "properties": {
+        "packageContents": {"$ref": "#/$defs/digestFile"},
+        "selfTest": {"$ref": "#/$defs/digestFile"},
+        "version": {"$ref": "#/$defs/digestFile"}
+      }
     },
     "environment": {
       "type": "object",
@@ -58,4 +62,3 @@
     }
   }
 }
-

@@ -33,6 +33,7 @@ for (const [label, evidence] of [
   ["artifact", record.artifact],
   ["sbom", record.sbom],
   ["supportPolicy", record.supportPolicy],
+  ["packageContents", record.observations?.packageContents],
   ["selfTest", record.observations?.selfTest],
   ["version", record.observations?.version],
 ]) {
@@ -47,6 +48,9 @@ await validateCycloneDxSbom(path.join(root, record.sbom.file), { version: record
 validateSupportPolicy(await readJson(path.join(root, record.supportPolicy.file)));
 const selfTest = await readJson(path.join(root, record.observations.selfTest.file));
 const version = await readJson(path.join(root, record.observations.version.file));
+const packageContents = await readJson(path.join(root, record.observations.packageContents.file));
+invariant(packageContents?.status === "verified" && packageContents.package === PACKAGE_NAME, "Recorded package-content verification did not pass");
+invariant(packageContents.version === record.package.version, "Recorded package-content version mismatch");
 invariant(selfTest?.data?.ok === true, "Recorded local self-test did not pass");
 invariant(version?.data?.version === record.package.version, "Recorded local runtime version mismatch");
 invariant(version?.data?.buildDigest === record.runtimeIdentity?.buildDigest, "Recorded local build identity mismatch");
@@ -62,4 +66,3 @@ process.stdout.write(`${JSON.stringify({
   buildDigest: record.runtimeIdentity.buildDigest,
   limitations: record.limitations,
 })}\n`);
-
