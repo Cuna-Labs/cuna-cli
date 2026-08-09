@@ -28,6 +28,17 @@ export {
 export { createHttpTransport, type HttpRequest, type HttpTransport } from "./api/http.js";
 export { createPkceAuthorization, type PkceAuthorization } from "./auth/pkce.js";
 export {
+  deriveOnboardingDecision,
+  type AdmissionState,
+  type AuthorityObservation,
+  type CliAuthState,
+  type IdentityState,
+  type OnboardingDecision,
+  type OnboardingEvidence,
+  type OnboardingNextAction,
+  type WorkspaceState,
+} from "./auth/onboarding-state.js";
+export {
   startLoopbackCallback,
   type LoopbackAuthorizationResult,
   type LoopbackCallback,

@@ -1,0 +1,105 @@
+name: Distribution projection proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact protected-main source commit from the admitted candidate
+        required: true
+        type: string
+      candidate_run_id:
+        description: Successful main CI run containing admitted-release-candidate
+        required: true
+        type: string
+      candidate_sha256:
+        description: Exact admitted npm tarball SHA-256
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: distribution-proof-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+jobs:
+  project-and-verify:
+    name: deterministic-projections-not-publication
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+          registry-url: https://registry.npmjs.org
+      - run: npm install --global npm@11.19.0
+      - name: Bind the request to protected main and a successful candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          git fetch --no-tags origin main
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse origin/main)" = "$SOURCE_COMMIT"
+          RUN_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}" --jq '[.status,.conclusion,.head_sha,.event] | join(" ")')"
+          test "$RUN_STATE" = "completed success ${SOURCE_COMMIT} push"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: admitted-release-candidate
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+          path: admitted
+      - name: Verify candidate identity and independent build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          node scripts/verify-release-envelope.mjs --root admitted/release-artifacts
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const envelope = JSON.parse(fs.readFileSync('admitted/release-artifacts/release-envelope.json'));
+          if (envelope.sourceCommit !== process.env.SOURCE_COMMIT) process.exit(1);
+          if (envelope.tarball.sha256 !== process.env.CANDIDATE_SHA256) process.exit(1);
+          NODE
+          gh attestation verify admitted/release-artifacts/*.tgz --repo "$GITHUB_REPOSITORY"
+      - name: Generate deterministic channel projections
+        run: >-
+          node scripts/release-project-distributions.mjs
+          --root .
+          --evidence admitted/release-artifacts
+          --output admitted/distributions
+      - name: Verify projection identity and fail-closed availability truth
+        run: >-
+          node scripts/verify-release-distributions.mjs
+          --root .
+          --evidence admitted/release-artifacts
+          --distributions admitted/distributions
+      - name: Parse generated platform packaging
+        shell: bash
+        run: |
+          sh -n admitted/distributions/curl/install.sh
+          ruby -c admitted/distributions/homebrew/runa.rb
+          bash -n admitted/distributions/aur/PKGBUILD
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distribution-projection-${{ inputs.source_commit }}
+          path: |
+            admitted/release-artifacts/
+            admitted/distributions/
+          if-no-files-found: error
+          retention-days: 30
+
