@@ -7,6 +7,7 @@ export {
   type CapabilityDecision,
   type MachineCreateInput,
   type RunaApiClient,
+  type TerminalConnectionCreateInput,
 } from "./api/client.js";
 export {
   decodeAgentSessionItem,
@@ -14,6 +15,7 @@ export {
   decodeCapabilitySnapshot,
   decodeMachineItem,
   decodeMachinePage,
+  decodeTerminalConnectionGrant,
   type AgentKind,
   type AgentAuthMode,
   type AgentSession,
@@ -29,6 +31,11 @@ export {
   type Machine,
   type MachinePage,
   type MutationClass,
+  TERMINAL_PROTOCOL,
+  type TerminalCapabilityAvailability,
+  type TerminalCapabilityName,
+  type TerminalConnectionCapability,
+  type TerminalConnectionGrant,
 } from "./api/contracts.js";
 export { createHttpTransport, type HttpRequest, type HttpTransport } from "./api/http.js";
 export { createPkceAuthorization, type PkceAuthorization } from "./auth/pkce.js";

@@ -249,3 +249,110 @@ export function decodeAgentSessionPage(value: unknown): AgentSessionPage {
 export function decodeAgentSessionItem(value: unknown): AgentSession {
   return decodeAgentSession(value);
 }
+
+export const TERMINAL_PROTOCOL = "runa.terminal.v1" as const;
+export type TerminalCapabilityName =
+  | "acknowledgement"
+  | "heartbeat"
+  | "live_resize"
+  | "resume"
+  | "signals";
+export type TerminalCapabilityAvailability = "supported" | "unsupported" | "unknown";
+
+export interface TerminalConnectionCapability {
+  readonly name: TerminalCapabilityName;
+  readonly availability: TerminalCapabilityAvailability;
+}
+
+export interface TerminalConnectionGrant {
+  readonly terminalSessionId: string;
+  readonly resumeHandle: string;
+  readonly connectUrl: string;
+  readonly connectToken: string;
+  readonly protocol: typeof TERMINAL_PROTOCOL;
+  readonly capabilities: readonly TerminalConnectionCapability[];
+  readonly expiresAt: string;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const TERMINAL_CAPABILITY_NAMES = new Set<TerminalCapabilityName>([
+  "acknowledgement",
+  "heartbeat",
+  "live_resize",
+  "resume",
+  "signals",
+]);
+const TERMINAL_CAPABILITY_AVAILABILITY = new Set<TerminalCapabilityAvailability>([
+  "supported",
+  "unsupported",
+  "unknown",
+]);
+
+function canonicalUuid(value: Record<string, unknown>, key: string): string {
+  const decoded = requiredString(value, key);
+  if (!UUID.test(decoded)) throw new TypeError(`Malformed field: ${key}`);
+  return decoded;
+}
+
+function decodeTerminalCapability(value: unknown): TerminalConnectionCapability {
+  if (!isObject(value)) throw new TypeError("Malformed terminal capability");
+  const name = requiredString(value, "name") as TerminalCapabilityName;
+  const availability = requiredString(value, "availability") as TerminalCapabilityAvailability;
+  if (
+    !TERMINAL_CAPABILITY_NAMES.has(name) ||
+    !TERMINAL_CAPABILITY_AVAILABILITY.has(availability) ||
+    Object.keys(value).some((key) => key !== "name" && key !== "availability")
+  ) {
+    throw new TypeError("Malformed terminal capability");
+  }
+  return Object.freeze({ name, availability });
+}
+
+export function decodeTerminalConnectionGrant(value: unknown): TerminalConnectionGrant {
+  if (!isObject(value)) throw new TypeError("Malformed terminal connection grant");
+  const allowed = new Set([
+    "terminal_session_id",
+    "resume_handle",
+    "connect_url",
+    "connect_token",
+    "protocol",
+    "capabilities",
+    "expires_at",
+  ]);
+  if (Object.keys(value).some((key) => !allowed.has(key)) || !Array.isArray(value.capabilities)) {
+    throw new TypeError("Malformed terminal connection grant");
+  }
+  const terminalSessionId = canonicalUuid(value, "terminal_session_id");
+  const resumeHandle = canonicalUuid(value, "resume_handle");
+  const connectUrl = requiredString(value, "connect_url");
+  const connectToken = requiredString(value, "connect_token");
+  const protocol = requiredString(value, "protocol");
+  const expiresAt = requiredString(value, "expires_at");
+  if (
+    protocol !== TERMINAL_PROTOCOL ||
+    !/^runa_tc_[A-Za-z0-9_-]{43}$/u.test(connectToken) ||
+    connectUrl !== `wss://api.runacode.io/v1/terminal-connections/${terminalSessionId}/stream` ||
+    !Number.isFinite(Date.parse(expiresAt)) ||
+    value.capabilities.length !== TERMINAL_CAPABILITY_NAMES.size
+  ) {
+    throw new TypeError("Malformed terminal connection grant");
+  }
+  const capabilities = Object.freeze(value.capabilities.map(decodeTerminalCapability));
+  if (
+    new Set(capabilities.map((capability) => capability.name)).size !== TERMINAL_CAPABILITY_NAMES.size ||
+    [...TERMINAL_CAPABILITY_NAMES].some(
+      (name) => capabilities.filter((capability) => capability.name === name).length !== 1,
+    )
+  ) {
+    throw new TypeError("Malformed terminal capabilities");
+  }
+  return Object.freeze({
+    terminalSessionId,
+    resumeHandle,
+    connectUrl,
+    connectToken,
+    protocol: TERMINAL_PROTOCOL,
+    capabilities,
+    expiresAt,
+  });
+}

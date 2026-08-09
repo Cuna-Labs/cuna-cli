@@ -6,6 +6,7 @@ import {
   decodeCapabilitySnapshot,
   decodeMachineItem,
   decodeMachinePage,
+  decodeTerminalConnectionGrant,
   type AgentKind,
   type AgentAuthMode,
   type AgentSession,
@@ -14,6 +15,7 @@ import {
   type CapabilitySnapshot,
   type Machine,
   type MachinePage,
+  type TerminalConnectionGrant,
 } from "./contracts.js";
 import type { HttpTransport } from "./http.js";
 
@@ -38,6 +40,12 @@ export interface PageOptions {
   readonly cursor?: string;
 }
 
+export interface TerminalConnectionCreateInput {
+  readonly protocol: "runa.terminal.v1";
+  readonly clientInstanceId: string;
+  readonly resumeHandle?: string;
+}
+
 export interface RunaApiClient {
   discoverCapabilities(scope: CapabilityScope, resourceId?: string): Promise<CapabilitySnapshot>;
   listMachines(): Promise<MachinePage>;
@@ -53,6 +61,11 @@ export interface RunaApiClient {
   getAgentSession(id: string): Promise<AgentSession>;
   renameAgentSession(id: string, name: string): Promise<AgentSession>;
   terminateAgentSession(id: string): Promise<AgentSession>;
+  createTerminalConnection(
+    agentSessionId: string,
+    input: TerminalConnectionCreateInput,
+    idempotencyKey: string,
+  ): Promise<TerminalConnectionGrant>;
 }
 
 function malformed(cause: unknown): RunaError {
@@ -303,6 +316,42 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
           await transport.request({ method: "POST", path: `/v1/agent-sessions/${safeId}/terminate` }),
         ),
         { id },
+      );
+    },
+    async createTerminalConnection(agentSessionId, input, idempotencyKey) {
+      const safeId = encodePublicId(agentSessionId, "AgentSession ID");
+      assertIdempotencyKey(idempotencyKey);
+      if (!/^[A-Za-z0-9._:-]{1,256}$/u.test(input.clientInstanceId)) {
+        throw new RunaError({
+          code: "runa.usage.invalid",
+          message: "Terminal client instance ID is malformed.",
+          exitCode: EXIT_CODES.usage,
+        });
+      }
+      if (
+        input.resumeHandle !== undefined &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+          input.resumeHandle,
+        )
+      ) {
+        throw new RunaError({
+          code: "runa.usage.invalid",
+          message: "Terminal resume handle must be a canonical Runa UUID.",
+          exitCode: EXIT_CODES.usage,
+        });
+      }
+      return decode(
+        decodeTerminalConnectionGrant,
+        await transport.request({
+          method: "POST",
+          path: `/v1/agent-sessions/${safeId}/terminal-connections`,
+          body: {
+            protocol: input.protocol,
+            client_instance_id: input.clientInstanceId,
+            ...(input.resumeHandle === undefined ? {} : { resume_handle: input.resumeHandle }),
+          },
+          idempotencyKey,
+        }),
       );
     },
   };

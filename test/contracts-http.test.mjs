@@ -7,6 +7,7 @@ import {
   decodeAgentSessionItem,
   decodeCapabilitySnapshot,
   decodeMachinePage,
+  decodeTerminalConnectionGrant,
   decideCapability,
   RunaError,
 } from "../dist/index.js";
@@ -198,6 +199,89 @@ test("AgentSession client rejects producer responses bound to a sibling resource
     sessionMismatch.terminateAgentSession(requestedSession),
     (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
   );
+});
+
+function terminalGrant(overrides = {}) {
+  const terminalSessionId = "55555555-5555-4555-8555-555555555555";
+  return {
+    terminal_session_id: terminalSessionId,
+    resume_handle: "66666666-6666-4666-8666-666666666666",
+    connect_url: `wss://api.runacode.io/v1/terminal-connections/${terminalSessionId}/stream`,
+    connect_token: `runa_tc_${"A".repeat(43)}`,
+    protocol: "runa.terminal.v1",
+    capabilities: [
+      { name: "acknowledgement", availability: "supported" },
+      { name: "heartbeat", availability: "supported" },
+      { name: "live_resize", availability: "unknown" },
+      { name: "resume", availability: "supported" },
+      { name: "signals", availability: "unsupported" },
+    ],
+    expires_at: "2099-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("terminal grant decoder is closed, complete, and secret-url separated", () => {
+  const decoded = decodeTerminalConnectionGrant(terminalGrant());
+  assert.equal(decoded.protocol, "runa.terminal.v1");
+  assert.equal(decoded.capabilities.length, 5);
+  assert.equal(decoded.connectUrl.includes(decoded.connectToken), false);
+  assert.throws(() => decodeTerminalConnectionGrant(terminalGrant({ tenant_id: "forbidden" })));
+  assert.throws(() => decodeTerminalConnectionGrant(terminalGrant({
+    connect_url: `wss://api.runacode.io/v1/terminal-connections/55555555-5555-4555-8555-555555555555/stream?token=secret`,
+  })));
+  assert.throws(() => decodeTerminalConnectionGrant(terminalGrant({
+    capabilities: terminalGrant().capabilities.slice(0, 4),
+  })));
+  assert.throws(() => decodeTerminalConnectionGrant(terminalGrant({
+    capabilities: [
+      ...terminalGrant().capabilities.slice(0, 4),
+      { name: "resume", availability: "supported" },
+    ],
+  })));
+});
+
+test("terminal grant client sends exact idempotent intent and rejects unsafe inputs before transport", async () => {
+  const requests = [];
+  const client = createRunaApiClient({
+    async request(request) {
+      requests.push(request);
+      return terminalGrant();
+    },
+  });
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const grant = await client.createTerminalConnection(sessionId, {
+    protocol: "runa.terminal.v1",
+    clientInstanceId: "windows-cli-01",
+    resumeHandle: "66666666-6666-4666-8666-666666666666",
+  }, "terminal-operation-1");
+  assert.equal(grant.terminalSessionId, "55555555-5555-4555-8555-555555555555");
+  assert.deepEqual(requests[0], {
+    method: "POST",
+    path: `/v1/agent-sessions/${sessionId}/terminal-connections`,
+    body: {
+      protocol: "runa.terminal.v1",
+      client_instance_id: "windows-cli-01",
+      resume_handle: "66666666-6666-4666-8666-666666666666",
+    },
+    idempotencyKey: "terminal-operation-1",
+  });
+  await assert.rejects(
+    client.createTerminalConnection(sessionId, {
+      protocol: "runa.terminal.v1",
+      clientInstanceId: "contains space",
+    }, "terminal-operation-2"),
+    RunaError,
+  );
+  await assert.rejects(
+    client.createTerminalConnection(sessionId, {
+      protocol: "runa.terminal.v1",
+      clientInstanceId: "safe",
+      resumeHandle: "not-a-uuid",
+    }, "terminal-operation-3"),
+    RunaError,
+  );
+  assert.equal(requests.length, 1);
 });
 
 test("machine client enforces canonical create bounds before transport", async () => {
