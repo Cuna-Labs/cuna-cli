@@ -128,6 +128,29 @@ test("tab labels and viewport cells cannot inject host terminal controls", () =>
   }), WorkbenchRenderError);
 });
 
+test("trusted appbar removes bidi controls and truncates by terminal cell width", () => {
+  const unsafeTabs = tabs();
+  unsafeTabs[0] = { ...unsafeTabs[0], label: "safe\u202Eevil 界界 🚀 e\u0301" };
+  const frame = renderWorkbenchFrame({
+    columns: 20,
+    rows: 3,
+    activeTabId: "tab-claude",
+    tabs: unsafeTabs,
+    appbar: model(),
+    color: false,
+  });
+  assert.equal(frame.text.includes("\u202E"), false);
+  const appbar = frame.text.slice(frame.text.indexOf("\u001b[1;1H") + 6, frame.text.indexOf("\u001b[2;1H"));
+  let width = 0;
+  for (const character of appbar.normalize("NFC")) {
+    const point = character.codePointAt(0);
+    width += /[\p{M}\p{Cf}]/u.test(character) ? 0
+      : /\p{Extended_Pictographic}/u.test(character) || (point >= 0x1100 && point <= 0x3fffd) ? 2
+      : 1;
+  }
+  assert.equal(width, 20);
+});
+
 test("small admitted terminals collapse to one truthful appbar row without fabricated progress", () => {
   const frame = renderWorkbenchFrame({
     columns: 30,

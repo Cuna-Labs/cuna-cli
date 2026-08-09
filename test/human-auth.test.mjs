@@ -173,9 +173,13 @@ test("a second login fails before creating a new continuation or orphaning the o
 });
 
 test("cancellation and bounded timeout call the secret-authorized cancellation endpoint", async () => {
-  const cancelled = fixture();
   const controller = new AbortController();
-  controller.abort();
+  const cancelled = fixture({
+    sleep: async () => {
+      controller.abort(new Error("operator interrupt"));
+      throw new DOMException("cancelled", "AbortError");
+    },
+  });
   await assert.rejects(cancelled.service.login({ signal: controller.signal }), (error) => error.code === "runa.auth.cancelled");
   assert.equal(cancelled.client.calls.some(([name, request]) => name === "cancel" && request.secret === CT), true);
 
@@ -189,6 +193,20 @@ test("cancellation and bounded timeout call the secret-authorized cancellation e
   await assert.rejects(timed.service.login(), (error) => error.code === "runa.auth.timeout");
   assert.equal(timed.client.calls.filter(([name]) => name === "poll").length, 3);
   assert.equal(timed.client.calls.some(([name]) => name === "cancel"), true);
+});
+
+test("a pre-aborted sign-in performs no vault, browser, or network effect", async () => {
+  const subject = fixture();
+  subject.backend.probe = async () => { throw new Error("vault probe must not run"); };
+  const controller = new AbortController();
+  controller.abort(new Error("operator interrupt"));
+  await assert.rejects(
+    subject.service.login({ signal: controller.signal }),
+    (error) => error.code === "runa.auth.cancelled",
+  );
+  assert.deepEqual(subject.client.calls, []);
+  assert.deepEqual(subject.opened, []);
+  assert.equal(subject.backend.values.size, 0);
 });
 
 test("consumed replay never exchanges and post-exchange validation failure revokes the new family", async () => {

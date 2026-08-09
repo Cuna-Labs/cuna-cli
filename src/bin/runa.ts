@@ -1,4 +1,4 @@
 #!/usr/bin/env node
-import { runCli } from "../cli/run.js";
+import { runProcessCli } from "../cli/process-entrypoint.js";
 
-process.exitCode = await runCli(process.argv.slice(2));
+process.exitCode = await runProcessCli(process.argv.slice(2));

@@ -6,6 +6,7 @@ const RUNA_ORANGE = "48;2;235;86;37";
 const RUNA_ORANGE_DARK = "48;2;121;48;25";
 const WHITE = "38;2;255;255;255";
 const MUTED = "38;2;224;210;203";
+const GRAPHEME_SEGMENTER = new Intl.Segmenter("en", { granularity: "grapheme" });
 
 export interface WorkbenchTab {
   readonly id: string;
@@ -108,7 +109,7 @@ function renderTruth(model: AppbarModel, columns: number): string {
   ];
   if (model.cost !== undefined) values.push(metric("cost", model.cost, (value) => `$${value.toFixed(2)}`));
   if (model.tokensSaved !== undefined) values.push(metric("tokens saved", model.tokensSaved, String));
-  return truncate(` ${values.join("  ·  ")}`, columns);
+  return truncate(` ${values.join("  \u00b7  ")}`, columns);
 }
 
 function renderCompact(
@@ -119,7 +120,7 @@ function renderCompact(
 ): string {
   const active = tabs.find((tab) => tab.id === activeTabId);
   const identity = active === undefined ? "session" : `${agentLabel(active.agent)} ${safeText(active.label)}`;
-  return truncate(` RUNA  ${identity}  ·  ${projection("terminal", model.attachment)}  ·  ${projection("auth", model.providerAuthentication)}`, columns);
+  return truncate(` RUNA  ${identity}  \u00b7  ${projection("terminal", model.attachment)}  \u00b7  ${projection("auth", model.providerAuthentication)}`, columns);
 }
 
 function projection(label: string, value: TruthProjection<string>): string {
@@ -144,23 +145,58 @@ function agentLabel(agent: WorkbenchTab["agent"]): string {
 }
 
 function safeText(value: string): string {
-  let safe = "";
-  for (const character of value.normalize("NFC")) {
-    const point = character.codePointAt(0);
-    if (point === undefined || point <= 0x1f || (point >= 0x7f && point <= 0x9f)) continue;
-    safe += character;
-  }
+  const safe = value.normalize("NFC").replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, "");
   return safe.replace(/\s+/gu, " ").trim();
 }
 
 function truncate(value: string, columns: number): string {
-  const characters = [...value];
-  return characters.length <= columns ? value : characters.slice(0, columns).join("");
+  let result = "";
+  let width = 0;
+  for (const item of GRAPHEME_SEGMENTER.segment(value)) {
+    const nextWidth = graphemeCellWidth(item.segment);
+    if (width + nextWidth > columns) break;
+    result += item.segment;
+    width += nextWidth;
+  }
+  return result;
 }
 
 function padLine(value: string, columns: number): string {
   const truncated = truncate(value, columns);
-  return truncated + " ".repeat(Math.max(0, columns - [...truncated].length));
+  return truncated + " ".repeat(Math.max(0, columns - displayCellWidth(truncated)));
+}
+
+function displayCellWidth(value: string): number {
+  let width = 0;
+  for (const item of GRAPHEME_SEGMENTER.segment(value)) width += graphemeCellWidth(item.segment);
+  return width;
+}
+
+function graphemeCellWidth(value: string): number {
+  if (/^[\p{M}\p{Cf}]*$/u.test(value)) return 0;
+  if (/\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u.test(value)) return 2;
+  for (const character of value) {
+    const point = character.codePointAt(0);
+    if (point !== undefined && isWideCodePoint(point)) return 2;
+  }
+  return 1;
+}
+
+function isWideCodePoint(point: number): boolean {
+  return (
+    point >= 0x1100 && (
+      point <= 0x115f ||
+      point === 0x2329 || point === 0x232a ||
+      (point >= 0x2e80 && point <= 0xa4cf && point !== 0x303f) ||
+      (point >= 0xac00 && point <= 0xd7a3) ||
+      (point >= 0xf900 && point <= 0xfaff) ||
+      (point >= 0xfe10 && point <= 0xfe19) ||
+      (point >= 0xfe30 && point <= 0xfe6f) ||
+      (point >= 0xff00 && point <= 0xff60) ||
+      (point >= 0xffe0 && point <= 0xffe6) ||
+      (point >= 0x20000 && point <= 0x3fffd)
+    )
+  );
 }
 
 function assertViewportCell(value: string, displayWidth: number, columns: number): void {

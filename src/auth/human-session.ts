@@ -196,7 +196,14 @@ export function createHumanAuthService(input: {
     try { await input.client.cancel({ id, secret }); } catch { /* unknown cancellation remains server-expiring */ }
   }
 
+  function assertNotCancelled(signal?: AbortSignal): void {
+    if (signal?.aborted === true) {
+      throw authError("runa.auth.cancelled", "Runa sign-in was cancelled.");
+    }
+  }
+
   async function login(request: { readonly intentClass?: CliIntentClass; readonly signal?: AbortSignal } = {}): Promise<HumanAuthResult> {
+    assertNotCancelled(request.signal);
     const vaultStatus = await input.vault.status(credentialBinding);
     if (vaultStatus.backendStatus !== "verified") {
       throw authError(
@@ -305,6 +312,7 @@ export function createHumanAuthService(input: {
   }
 
   async function refreshAccess(signal?: AbortSignal): Promise<string> {
+    assertNotCancelled(signal);
     let captured: { readonly token: string; readonly expiresAt: number } | undefined;
     const existing = await input.vault.load(credentialBinding);
     if (existing === undefined) {
@@ -368,6 +376,7 @@ export function createHumanAuthService(input: {
   }
 
   async function acquireAccessToken(signal?: AbortSignal): Promise<string> {
+    assertNotCancelled(signal);
     if (access !== undefined && access.expiresAt - clock() > 30_000) return access.token;
     if (refreshFlight === undefined) {
       refreshFlight = refreshAccess(signal).finally(() => { refreshFlight = undefined; });

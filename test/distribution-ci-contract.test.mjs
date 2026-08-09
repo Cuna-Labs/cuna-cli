@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { TestResourceLedger } from "./support/test-resource-ledger.mjs";
 
 const execute = promisify(execFile);
 const repositoryRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const resources = new TestResourceLedger();
+test.after(() => resources.cleanup());
 
 async function fixture() {
-  const root = await mkdtemp(path.join(tmpdir(), "runa-ci-contract-"));
+  const root = await resources.createTempDirectory("runa-ci-contract-");
   await mkdir(path.join(root, ".github", "workflows"), { recursive: true });
   await cp(path.join(repositoryRoot, "package.json"), path.join(root, "package.json"));
   await cp(path.join(repositoryRoot, "package-lock.json"), path.join(root, "package-lock.json"));

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -10,13 +9,16 @@ import { promisify } from "node:util";
 import { sha256File } from "../scripts/lib/release-evidence.mjs";
 import { syntheticReleaseEnvelope, syntheticReleaseInputs } from "../scripts/lib/release-test-fixture.mjs";
 import { CHANNEL_DEFINITIONS, CHANNEL_ORDER } from "../scripts/release-distribution-lib.mjs";
+import { TestResourceLedger } from "./support/test-resource-ledger.mjs";
 
 const execute = promisify(execFile);
 const repositoryRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const node = process.execPath;
+const resources = new TestResourceLedger();
+test.after(() => resources.cleanup());
 
 async function createFixture() {
-  const root = await mkdtemp(path.join(tmpdir(), "runa-distribution-test-"));
+  const root = await resources.createTempDirectory("runa-distribution-test-");
   const evidence = path.join(root, "evidence");
   const distributions = path.join(root, "distributions");
   await mkdir(evidence, { recursive: true });
@@ -252,7 +254,7 @@ test("receipt verification rejects stale evidence", async () => {
 });
 
 test("actual local artifact evidence is useful but can never authorize release", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "runa-local-evidence-test-"));
+  const root = await resources.createTempDirectory("runa-local-evidence-test-");
   const output = path.join(root, "local-evidence");
   const generated = JSON.parse((await execute(node, [
     "scripts/release-local-artifact-evidence.mjs",

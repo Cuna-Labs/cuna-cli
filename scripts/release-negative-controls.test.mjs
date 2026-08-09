@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { sha256File, validateEnvelope } from "./lib/release-evidence.mjs";
 import { syntheticReleaseInputs } from "./lib/release-test-fixture.mjs";
 import { releaseInputIdentities } from "./lib/release-inputs.mjs";
+import { TestResourceLedger } from "../test/support/test-resource-ledger.mjs";
 
 const execute = promisify(execFile);
 const repositoryRoot = path.resolve(new URL("..", import.meta.url).pathname.replace(/^\/(?:[A-Za-z]:)/, (value) => value.slice(1)));
+const resources = new TestResourceLedger();
+test.after(() => resources.cleanup());
 
 const valid = {
   schemaVersion: 2,
@@ -74,7 +76,7 @@ test("release envelope v1 is never admissible", () => {
 });
 
 test("digest changes when projection bytes are substituted", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "runa-digest-test-"));
+  const root = await resources.createTempDirectory("runa-digest-test-");
   const file = path.join(root, "projection");
   await writeFile(file, "approved");
   const before = await sha256File(file);
@@ -91,9 +93,9 @@ test("curl template verifies before installing and suppresses lifecycle scripts"
 });
 
 test("all projections bind the envelope and reject later byte substitution", async () => {
-  const evidence = await mkdtemp(path.join(tmpdir(), "runa-projection-evidence-"));
-  const legacyOutput = await mkdtemp(path.join(tmpdir(), "runa-projection-legacy-"));
-  const authoritativeOutput = await mkdtemp(path.join(tmpdir(), "runa-projection-authoritative-"));
+  const evidence = await resources.createTempDirectory("runa-projection-evidence-");
+  const legacyOutput = await resources.createTempDirectory("runa-projection-legacy-");
+  const authoritativeOutput = await resources.createTempDirectory("runa-projection-authoritative-");
   await writeFile(path.join(evidence, "runa.tgz"), "candidate");
   await writeFile(path.join(evidence, "sbom.json"), `${JSON.stringify({
     bomFormat: "CycloneDX",
