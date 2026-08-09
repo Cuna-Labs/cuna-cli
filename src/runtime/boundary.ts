@@ -11,13 +11,13 @@ import {
 import {
   TERMINAL_PROTOCOL,
   TerminalFrameDecoder,
+  TerminalProtocolError,
   assertTerminalFrameLegal,
   decodeTerminalControl,
   encodeTerminalControl,
   encodeTerminalFrame,
   type TerminalFrame,
 } from "../terminal/codec.js";
-import { HostTerminalLease, type HostTerminalAdapter } from "../terminal/mode.js";
 
 import { admitCapability } from "./capability-gate.js";
 import { RuntimeBoundaryError, runtimeFailure } from "./errors.js";
@@ -32,6 +32,8 @@ import {
   type TerminalControlPlane,
   type TerminalWireConnection,
 } from "./terminal-transport.js";
+
+const MAX_RUNTIME_EVIDENCE_TTL_MS = 5 * 60_000;
 
 export type RuntimeTerminalState =
   | "attaching"
@@ -60,6 +62,8 @@ export interface RuntimeTerminalSnapshot {
   readonly state: RuntimeTerminalState;
   readonly fencingGeneration: number;
   readonly inputSequence: bigint;
+  readonly acknowledgedInputSequence: bigint;
+  readonly inputContinuity: "none" | "complete" | "uncertain";
   readonly outputSequence: bigint;
   readonly outputContinuity: "complete" | "unknown" | "incomplete";
   readonly resizeCapability: "live" | "initial_resize_only";
@@ -102,8 +106,10 @@ export interface RuntimeBoundaryOptions {
   readonly onTerminalOutput?: (event: {
     readonly tabId: string;
     readonly agentSessionId: string;
+    readonly binding: RuntimeTerminalResponse["binding"];
     readonly sequence: bigint;
     readonly bytes: Uint8Array;
+    readonly signal: AbortSignal;
   }) => void | Promise<void>;
   readonly onTerminalState?: (snapshot: RuntimeTerminalSnapshot) => void;
 }
@@ -120,6 +126,9 @@ interface TerminalEntry {
   resizeCapability: "live" | "initial_resize_only";
   wireSequence: bigint;
   inputSequence: bigint;
+  acknowledgedInputSequence: bigint;
+  inputContinuity: RuntimeTerminalSnapshot["inputContinuity"];
+  pendingInputSequences: Set<bigint>;
   outputSequence: bigint;
   outputContinuity: RuntimeTerminalSnapshot["outputContinuity"];
   lastHeartbeatAt: number;
@@ -130,6 +139,8 @@ interface TerminalEntry {
   connectionRevision: number;
   heartbeatSequence: bigint;
   heartbeatTimer?: NodeJS.Timeout;
+  outputAbort: AbortController;
+  reconnectIdempotencyKey?: string;
 }
 
 export class RunaRuntimeBoundary {
@@ -140,9 +151,22 @@ export class RunaRuntimeBoundary {
   readonly #views = new LocalClientViewRegistry();
   readonly #syncRegistry = new SyncSupervisorRegistry();
   readonly #terminals = new Map<string, TerminalEntry>();
+  readonly #pendingTerminalTabs = new Set<string>();
+  readonly #pendingAgentSessions = new Set<string>();
+  readonly #pendingAttaches = new Map<string, {
+    readonly abort: AbortController;
+    readonly completion: Promise<void>;
+    readonly settle: () => void;
+    readonly removeInputAbort: () => void;
+  }>();
+  readonly #pendingReconnects = new Map<string, {
+    readonly abort: AbortController;
+    readonly completion: Promise<void>;
+    readonly settle: () => void;
+    readonly removeInputAbort: () => void;
+  }>();
   readonly #syncHandles = new Map<string, RuntimeSyncHandle>();
   #activeTabId: string | undefined;
-  #hostTerminalLease: HostTerminalLease | undefined;
   #startupEvidenceExpiresAt = 0;
   #closed = false;
 
@@ -171,29 +195,24 @@ export class RunaRuntimeBoundary {
     if (this.#daemon.snapshot().state !== "absent" && this.#daemon.snapshot().state !== "stopped") {
       throw runtimeFailure("session_conflict", "The local runtime is already started.");
     }
-    this.#daemon.transition("starting", "runtime_start_requested", this.#clock());
+    const now = this.#clock();
+    this.#daemon.transition("starting", "runtime_start_requested", now);
     if (
       evidence.endpointOwnership !== "verified" ||
       evidence.durableState !== "verified" ||
       evidence.source.length === 0 ||
       !Number.isFinite(evidence.observedAt) ||
       !Number.isFinite(evidence.expiresAt) ||
+      evidence.observedAt > now ||
       evidence.expiresAt < evidence.observedAt ||
-      evidence.expiresAt <= this.#clock()
+      evidence.expiresAt - evidence.observedAt > MAX_RUNTIME_EVIDENCE_TTL_MS ||
+      evidence.expiresAt <= now
     ) {
       this.#daemon.transition("recovery_required", "local_runtime_evidence_unproven", this.#clock());
       throw runtimeFailure("remote_state_unproven", "The local runtime endpoint or durable state is not verified.");
     }
     this.#startupEvidenceExpiresAt = evidence.expiresAt;
     return this.#daemon.transition("ready", "local_runtime_verified", this.#clock());
-  }
-
-  async acquireHostTerminal(adapter: HostTerminalAdapter): Promise<void> {
-    this.#assertReady();
-    if (this.#hostTerminalLease !== undefined) {
-      throw runtimeFailure("session_conflict", "The host terminal is already owned by this runtime.");
-    }
-    this.#hostTerminalLease = await HostTerminalLease.acquire(adapter);
   }
 
   async attach(input: {
@@ -207,22 +226,54 @@ export class RunaRuntimeBoundary {
     assertIdentifier(input.tabId, "tab ID");
     assertIdentifier(input.agentSessionId, "AgentSession ID");
     assertDimensions(input.columns, input.rows);
-    if (this.#terminals.has(input.tabId)) throw runtimeFailure("session_conflict", "The terminal tab already exists.");
-    if ([...this.#terminals.values()].some((entry) => entry.observation.agentSessionId === input.agentSessionId && entry.state !== "closed")) {
+    if (this.#terminals.has(input.tabId) || this.#pendingTerminalTabs.has(input.tabId)) {
+      throw runtimeFailure("session_conflict", "The terminal tab already exists.");
+    }
+    if (
+      this.#pendingAgentSessions.has(input.agentSessionId) ||
+      [...this.#terminals.values()].some((entry) => entry.observation.agentSessionId === input.agentSessionId && entry.state !== "closed")
+    ) {
       throw runtimeFailure("session_conflict", "The AgentSession is already attached by this runtime.");
     }
 
-    const admitted = await this.#admitRemoteTerminal(input.agentSessionId);
+    this.#pendingTerminalTabs.add(input.tabId);
+    this.#pendingAgentSessions.add(input.agentSessionId);
+    const attachAbort = new AbortController();
+    let removeInputAbort = (): void => undefined;
+    if (input.signal !== undefined) {
+      const forwardAbort = (): void => attachAbort.abort(input.signal?.reason);
+      if (input.signal.aborted) forwardAbort();
+      else {
+        input.signal.addEventListener("abort", forwardAbort, { once: true });
+        removeInputAbort = () => input.signal?.removeEventListener("abort", forwardAbort);
+      }
+    }
+    let settleAttach = (): void => undefined;
+    const attachCompletion = new Promise<void>((resolve) => { settleAttach = resolve; });
+    this.#pendingAttaches.set(input.tabId, {
+      abort: attachAbort,
+      completion: attachCompletion,
+      settle: settleAttach,
+      removeInputAbort,
+    });
     let connection: TerminalWireConnection | undefined;
     let entry: TerminalEntry | undefined;
     try {
+      throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
+      const admitted = await this.#admitRemoteTerminal(input.agentSessionId);
+      this.#assertOpen();
+      throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
       const grant = await this.#createGrant(admitted.observation, admitted.capability, undefined);
+      this.#assertOpen();
+      throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
       connection = await this.#options.terminalConnector.connect({
         url: grant.connectUrl,
         token: grant.connectToken,
         protocol: TERMINAL_PROTOCOL,
-        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        signal: attachAbort.signal,
       });
+      this.#assertOpen();
+      throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
       if (connection.connectionId !== grant.terminalSessionId) {
         throw runtimeFailure("grant_scope_mismatch", "The terminal transport accepted a different Runa terminal session.");
       }
@@ -238,6 +289,9 @@ export class RunaRuntimeBoundary {
         resizeCapability: "initial_resize_only",
         wireSequence: 0n,
         inputSequence: 0n,
+        acknowledgedInputSequence: 0n,
+        inputContinuity: "none",
+        pendingInputSequences: new Set(),
         outputSequence: 0n,
         outputContinuity: "unknown",
         lastHeartbeatAt: this.#clock(),
@@ -245,9 +299,13 @@ export class RunaRuntimeBoundary {
         sendTail: Promise.resolve(),
         connectionRevision: 1,
         heartbeatSequence: 0n,
+        outputAbort: new AbortController(),
       };
       const iterator = connection.receive()[Symbol.asyncIterator]();
-      const ready = await this.#awaitReady(entry, iterator, input.signal);
+      const ready = await this.#awaitReady(entry, iterator, attachAbort.signal);
+      this.#assertOpen();
+      entry.lastHeartbeatAt = this.#clock();
+      entry.heartbeatSequence = 0n;
       entry.fencingGeneration = ready.payload.fencingGeneration;
       entry.resizeCapability = ready.payload.resizeCapability;
       entry.viewId = viewId(input.tabId, ready.payload.fencingGeneration);
@@ -269,22 +327,32 @@ export class RunaRuntimeBoundary {
       this.#terminals.set(input.tabId, entry);
       this.#activeTabId ??= input.tabId;
       await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs()));
+      this.#assertOpen();
       for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
+      this.#assertOpen();
       this.#scheduleHeartbeatWatchdog(entry, connection, entry.connectionRevision);
       this.#publish(entry);
       entry.pump = this.#pump(entry, connection, entry.connectionRevision, iterator);
       return snapshot(entry, this.#heartbeatTimeoutMs());
     } catch (error) {
-      if (entry !== undefined) {
+      if (entry !== undefined && !this.#closed && entry.state !== "closed" && entry.state !== "detached") {
         entry.state = "failed";
         entry.outputContinuity = "unknown";
         entry.reason = "terminal_attach_composition_failed";
         try { this.#views.detach(entry.viewId); } catch { /* the fenced view may not have opened */ }
         this.#publish(entry);
-        if (this.#activeTabId === entry.tabId) this.#activeTabId = undefined;
+        if (this.#activeTabId === entry.tabId) this.#activeTabId = this.#nextActiveTab(entry.tabId);
+        this.#terminals.delete(input.tabId);
       }
       if (connection !== undefined) await connection.close({ code: 1008, reason: "runa_attach_rejected" }).catch(() => undefined);
       throw error;
+    } finally {
+      const pending = this.#pendingAttaches.get(input.tabId);
+      pending?.removeInputAbort();
+      pending?.settle();
+      this.#pendingAttaches.delete(input.tabId);
+      this.#pendingTerminalTabs.delete(input.tabId);
+      this.#pendingAgentSessions.delete(input.agentSessionId);
     }
   }
 
@@ -328,16 +396,32 @@ export class RunaRuntimeBoundary {
 
   async #sendTerminalBytes(entry: TerminalEntry, bytes: Uint8Array): Promise<void> {
     const payload = bytes.slice();
-    await this.#enqueueTerminalSend(entry, async () => {
-      this.#views.routeInput(entry.viewId, entry.fencingGeneration);
-      entry.wireSequence += 1n;
-      entry.inputSequence = entry.wireSequence;
-      await entry.connection.send(encodeTerminalFrame({
+    await this.#enqueueTerminalSend(entry, async (authority) => {
+      if (entry.pendingInputSequences.size >= 4_096) {
+        entry.connectionRevision += 1;
+        entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "Terminal input acknowledgement window was exhausted."));
+        entry.state = "interrupted";
+        entry.inputContinuity = "uncertain";
+        entry.outputContinuity = "unknown";
+        entry.reason = "input_ack_window_exhausted";
+        this.#publish(entry);
+        void authority.connection.close({ code: 1001, reason: "runa_input_ack_window_exhausted" }).catch(() => undefined);
+        throw runtimeFailure("terminal_disconnected", "Terminal input acknowledgements exceeded the bounded uncertainty window.");
+      }
+      this.#views.routeInput(authority.viewId, authority.fencingGeneration);
+      const inputSequence = entry.wireSequence + 1n;
+      const frame = encodeTerminalFrame({
         type: "input",
         critical: true,
-        sequence: entry.inputSequence,
+        sequence: inputSequence,
         payload,
-      }));
+      });
+      entry.wireSequence = inputSequence;
+      entry.inputSequence = inputSequence;
+      entry.pendingInputSequences.add(entry.inputSequence);
+      entry.inputContinuity = "uncertain";
+      await authority.connection.send(frame);
+      this.#publish(entry);
     });
   }
 
@@ -347,25 +431,50 @@ export class RunaRuntimeBoundary {
     if (entry.resizeCapability !== "live") {
       throw runtimeFailure("capability_unsupported", "This terminal supports only its initial dimensions.");
     }
-    await this.#enqueueTerminalSend(entry, async () => {
-      this.#views.resize(entry.viewId, columns, rows);
+    await this.#enqueueTerminalSend(entry, async (authority) => {
+      this.#views.resize(authority.viewId, columns, rows);
       entry.wireSequence += 1n;
-      await entry.connection.send(encodeTerminalControl("resize", entry.wireSequence, { columns, rows }));
+      await authority.connection.send(encodeTerminalControl("resize", entry.wireSequence, { columns, rows }));
     });
   }
 
   async signal(signal: "interrupt" | "suspend" | "terminate", tabId = this.#activeTabId): Promise<void> {
     const entry = this.#requireActiveTerminal(tabId);
     this.#requireGrantCapability(entry, "signals");
-    await this.#enqueueTerminalSend(entry, async () => {
-      this.#views.routeInput(entry.viewId, entry.fencingGeneration);
+    await this.#enqueueTerminalSend(entry, async (authority) => {
+      this.#views.routeInput(authority.viewId, authority.fencingGeneration);
       entry.wireSequence += 1n;
-      await entry.connection.send(encodeTerminalControl("signal", entry.wireSequence, { signal }));
+      await authority.connection.send(encodeTerminalControl("signal", entry.wireSequence, { signal }));
     });
   }
 
-  async #enqueueTerminalSend(entry: TerminalEntry, operation: () => Promise<void>): Promise<void> {
-    const queued = entry.sendTail.then(operation);
+  async #enqueueTerminalSend(
+    entry: TerminalEntry,
+    operation: (authority: {
+      readonly connection: TerminalWireConnection;
+      readonly connectionRevision: number;
+      readonly viewId: string;
+      readonly fencingGeneration: number;
+    }) => Promise<void>,
+  ): Promise<void> {
+    const authority = Object.freeze({
+      connection: entry.connection,
+      connectionRevision: entry.connectionRevision,
+      viewId: entry.viewId,
+      fencingGeneration: entry.fencingGeneration,
+    });
+    const queued = entry.sendTail.then(async () => {
+      if (
+        entry.state !== "active" ||
+        entry.connection !== authority.connection ||
+        entry.connectionRevision !== authority.connectionRevision ||
+        entry.viewId !== authority.viewId ||
+        entry.fencingGeneration !== authority.fencingGeneration
+      ) {
+        throw runtimeFailure("terminal_disconnected", "Queued terminal input was fenced by a newer attachment.", { retryable: true });
+      }
+      await operation(authority);
+    });
     entry.sendTail = queued.then(() => undefined, () => undefined);
     await queued;
   }
@@ -377,29 +486,70 @@ export class RunaRuntimeBoundary {
       throw runtimeFailure("session_conflict", "Only an interrupted terminal can reconnect.");
     }
     entry.state = "reconnecting";
+    entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The previous terminal attachment was interrupted."));
     const reconnectRevision = entry.connectionRevision + 1;
     entry.connectionRevision = reconnectRevision;
     entry.outputContinuity = "unknown";
     delete entry.reason;
     this.#publish(entry);
+    const reconnectAbort = new AbortController();
+    let removeInputAbort = (): void => undefined;
+    if (input.signal !== undefined) {
+      const forwardAbort = (): void => reconnectAbort.abort(input.signal?.reason);
+      if (input.signal.aborted) forwardAbort();
+      else {
+        input.signal.addEventListener("abort", forwardAbort, { once: true });
+        removeInputAbort = () => input.signal?.removeEventListener("abort", forwardAbort);
+      }
+    }
+    let settleReconnect = (): void => undefined;
+    const reconnectCompletion = new Promise<void>((resolve) => { settleReconnect = resolve; });
+    this.#pendingReconnects.set(input.tabId, {
+      abort: reconnectAbort,
+      completion: reconnectCompletion,
+      settle: settleReconnect,
+      removeInputAbort,
+    });
+    entry.reconnectIdempotencyKey ??= this.#idempotencyKey();
     let connection: TerminalWireConnection | undefined;
     try {
+      throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
       const admitted = await this.#admitRemoteTerminal(entry.observation.agentSessionId);
-      if (admitted.observation.processEpoch !== entry.observation.processEpoch) {
+      throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
+      if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
+        throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded during admission.");
+      }
+      if (
+        admitted.observation.userId !== entry.observation.userId ||
+        admitted.observation.machineId !== entry.observation.machineId ||
+        admitted.observation.agentSessionId !== entry.observation.agentSessionId ||
+        admitted.observation.processEpoch !== entry.observation.processEpoch
+      ) {
         entry.state = "failed";
         entry.outputContinuity = "incomplete";
-        entry.reason = "process_generation_changed";
+        entry.reason = "session_authority_changed";
         this.#publish(entry);
-        throw runtimeFailure("session_discontinuous", "The remote process generation changed; this terminal cannot be resumed.");
+        throw runtimeFailure("session_discontinuous", "The remote AgentSession authority changed; this terminal cannot be resumed.");
       }
       await entry.connection.close({ code: 1001, reason: "runa_reconnect" }).catch(() => undefined);
-      const grant = await this.#createGrant(admitted.observation, admitted.capability, entry.resumeHandle);
+      throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
+      const grant = await this.#createGrant(
+        admitted.observation,
+        admitted.capability,
+        entry.resumeHandle,
+        entry.reconnectIdempotencyKey,
+      );
+      throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
+      if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
+        throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded before transport creation.");
+      }
       connection = await this.#options.terminalConnector.connect({
         url: grant.connectUrl,
         token: grant.connectToken,
         protocol: TERMINAL_PROTOCOL,
-        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        signal: reconnectAbort.signal,
       });
+      throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
       if (connection.connectionId !== grant.terminalSessionId) {
         throw runtimeFailure("grant_scope_mismatch", "The terminal transport accepted a different Runa terminal session.");
       }
@@ -415,8 +565,10 @@ export class RunaRuntimeBoundary {
         resumeHandle: grant.resumeHandle,
         lastHeartbeatAt: this.#clock(),
         heartbeatSequence: 0n,
+        outputAbort: new AbortController(),
       };
-      const ready = await this.#awaitReady(candidate, iterator, input.signal);
+      const ready = await this.#awaitReady(candidate, iterator, reconnectAbort.signal);
+      candidate.lastHeartbeatAt = this.#clock();
       if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
         throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded by detach or shutdown.");
       }
@@ -458,9 +610,11 @@ export class RunaRuntimeBoundary {
       entry.resumeHandle = grant.resumeHandle;
       entry.wireSequence = resumeSequence;
       entry.heartbeatSequence = 0n;
+      entry.outputAbort = candidate.outputAbort;
       entry.lastHeartbeatAt = candidate.lastHeartbeatAt;
       entry.state = "active";
       entry.outputContinuity = "unknown";
+      delete entry.reconnectIdempotencyKey;
       await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs()));
       for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
       this.#scheduleHeartbeatWatchdog(entry, connection, reconnectRevision);
@@ -481,20 +635,40 @@ export class RunaRuntimeBoundary {
         this.#publish(entry);
       }
       throw error;
+    } finally {
+      const pending = this.#pendingReconnects.get(input.tabId);
+      pending?.removeInputAbort();
+      pending?.settle();
+      this.#pendingReconnects.delete(input.tabId);
     }
   }
 
   async detach(tabId: string): Promise<void> {
     const entry = this.#requireTerminal(tabId);
-    if (entry.state === "closed" || entry.state === "detached") return;
+    if (entry.state === "closed") {
+      this.#terminals.delete(tabId);
+      if (this.#activeTabId === tabId) this.#activeTabId = this.#nextActiveTab(tabId);
+      return;
+    }
+    const pendingReconnect = this.#pendingReconnects.get(tabId);
+    pendingReconnect?.abort.abort(runtimeFailure("terminal_disconnected", "The terminal reconnection was detached."));
     entry.connectionRevision += 1;
+    entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The terminal attachment was detached."));
     this.#clearHeartbeatWatchdog(entry);
     try { this.#views.detach(entry.viewId); } catch { /* attach may have failed before view creation */ }
     entry.state = "detached";
     entry.reason = "explicit_detach";
     this.#publish(entry);
+    const sendDrain = entry.sendTail;
+    const pumpDrain = entry.pump;
     await entry.connection.close({ code: 1000, reason: "runa_detach" });
+    await sendDrain;
+    if (pumpDrain !== undefined) await withOutputDeadline(pumpDrain, this.#options.outputDeliveryTimeoutMs ?? 5_000);
+    if (pendingReconnect !== undefined) {
+      await withOutputDeadline(pendingReconnect.completion, this.#options.readyTimeoutMs ?? 10_000);
+    }
     if (this.#activeTabId === tabId) this.#activeTabId = this.#nextActiveTab(tabId);
+    this.#terminals.delete(tabId);
   }
 
   listTerminals(): readonly RuntimeTerminalSnapshot[] {
@@ -521,19 +695,31 @@ export class RunaRuntimeBoundary {
       clock: this.#clock,
     });
     try {
+      this.#assertOpen();
+      if (this.#syncHandles.has(input.configuration.bindingId)) {
+        throw runtimeFailure("session_conflict", "This runtime already owns the workspace sync binding.");
+      }
       const { supervisor } = this.#syncRegistry.connect(input.configuration, this.#clock);
       supervisor.beginReconciliation("runtime_start_requires_authoritative_manifest");
       let closed = false;
+      let closing: Promise<void> | undefined;
       const handle: RuntimeSyncHandle = Object.freeze({
         bindingId: input.configuration.bindingId,
         fence: journal.fence,
         supervisor,
         close: async (): Promise<void> => {
           if (closed) return;
-          closed = true;
-          this.#syncRegistry.release(input.configuration.bindingId, supervisor);
-          this.#syncHandles.delete(input.configuration.bindingId);
-          await journal.close();
+          closing ??= (async () => {
+            await journal.close();
+            this.#syncRegistry.release(input.configuration.bindingId, supervisor);
+            this.#syncHandles.delete(input.configuration.bindingId);
+            closed = true;
+          })();
+          try {
+            await closing;
+          } finally {
+            if (!closed) closing = undefined;
+          }
         },
       });
       this.#syncHandles.set(input.configuration.bindingId, handle);
@@ -552,20 +738,48 @@ export class RunaRuntimeBoundary {
       this.#daemon.transition("quiescing", "runtime_shutdown", this.#clock());
     }
     const failures: unknown[] = [];
+    const pendingAttaches = [...this.#pendingAttaches.values()];
+    const pendingReconnects = [...this.#pendingReconnects.values()];
+    for (const pending of pendingAttaches) {
+      pending.abort.abort(runtimeFailure("terminal_disconnected", "The terminal runtime was shut down."));
+    }
+    for (const pending of pendingReconnects) {
+      pending.abort.abort(runtimeFailure("terminal_disconnected", "The terminal runtime was shut down."));
+    }
     for (const entry of this.#terminals.values()) {
       entry.connectionRevision += 1;
+      entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The terminal runtime was shut down."));
       this.#clearHeartbeatWatchdog(entry);
-      try { await entry.connection.close({ code: 1000, reason: "runa_shutdown" }); } catch (error) { failures.push(error); }
+      const sendDrain = entry.sendTail;
+      const pumpDrain = entry.pump;
+      try {
+        await entry.connection.close({ code: 1000, reason: "runa_shutdown" });
+        await sendDrain;
+        if (pumpDrain !== undefined) await withOutputDeadline(pumpDrain, this.#options.outputDeliveryTimeoutMs ?? 5_000);
+      } catch (error) { failures.push(error); }
       entry.state = "closed";
       entry.reason = "runtime_shutdown";
+      try { this.#views.detach(entry.viewId); } catch { /* the view may already be detached */ }
       this.#publish(entry);
+    }
+    this.#terminals.clear();
+    this.#activeTabId = undefined;
+    for (const pending of pendingAttaches) {
+      try {
+        await withOutputDeadline(pending.completion, this.#options.readyTimeoutMs ?? 10_000);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    for (const pending of pendingReconnects) {
+      try {
+        await withOutputDeadline(pending.completion, this.#options.readyTimeoutMs ?? 10_000);
+      } catch (error) {
+        failures.push(error);
+      }
     }
     for (const handle of this.#syncHandles.values()) {
       try { await handle.close(); } catch (error) { failures.push(error); }
-    }
-    if (this.#hostTerminalLease !== undefined) {
-      try { await this.#hostTerminalLease.restore(); } catch (error) { failures.push(error); }
-      this.#hostTerminalLease = undefined;
     }
     const after = this.#daemon.snapshot().state;
     if (after === "quiescing" || after === "recovery_required" || after === "starting") {
@@ -598,12 +812,13 @@ export class RunaRuntimeBoundary {
     observation: RemoteAgentSessionEvidence,
     capability: ReturnType<typeof admitCapability>,
     resumeHandle: string | undefined,
+    idempotencyKey = this.#idempotencyKey(),
   ): Promise<TerminalConnectionGrant> {
     const grant = await this.#options.controlPlane.createTerminalConnection({
       agentSessionId: observation.agentSessionId,
       protocol: TERMINAL_PROTOCOL,
       clientInstanceId: this.#options.clientInstanceId,
-      idempotencyKey: this.#idempotencyKey(),
+      idempotencyKey,
       capabilityEvidence: capability,
       ...(resumeHandle === undefined ? {} : { resumeHandle }),
     });
@@ -633,7 +848,7 @@ export class RunaRuntimeBoundary {
     while (Date.now() < deadline) {
       if (signal?.aborted) throw runtimeFailure("terminal_disconnected", "Terminal attachment was cancelled.");
       const remaining = deadline - Date.now();
-      const result = await nextWithTimeout(iterator, remaining);
+      const result = await nextWithTimeout(iterator, remaining, signal);
       if (result.done) throw runtimeFailure("terminal_not_ready", "The terminal closed before PTY readiness was proven.");
       const frames = entry.decoder.push(result.value);
       for (let index = 0; index < frames.length; index += 1) {
@@ -674,11 +889,21 @@ export class RunaRuntimeBoundary {
         const result = await iterator.next();
         if (entry.connection !== connection || entry.connectionRevision !== connectionRevision) return;
         if (result.done) break;
-        for (const frame of entry.decoder.push(result.value)) await this.#handleAttachedFrame(entry, frame);
+        for (const frame of entry.decoder.push(result.value)) {
+          if (
+            entry.connection !== connection ||
+            entry.connectionRevision !== connectionRevision ||
+            entry.state === "closed" ||
+            entry.state === "detached" ||
+            entry.state === "failed"
+          ) return;
+          await this.#handleAttachedFrame(entry, frame);
+        }
         if (entry.state === "closed" || entry.state === "detached") return;
       }
       if (entry.state === "active" || entry.state === "reconnecting") {
         this.#clearHeartbeatWatchdog(entry);
+        entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The terminal transport closed."));
         entry.state = "interrupted";
         entry.outputContinuity = "unknown";
         entry.reason = "transport_closed_without_terminal_exit";
@@ -688,7 +913,11 @@ export class RunaRuntimeBoundary {
       if (entry.connection !== connection || entry.connectionRevision !== connectionRevision) return;
       if (entry.state === "detached" || entry.state === "closed") return;
       this.#clearHeartbeatWatchdog(entry);
-      entry.state = error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error" ? "failed" : "interrupted";
+      entry.outputAbort.abort(error);
+      entry.state = (
+        error instanceof TerminalProtocolError ||
+        (error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error")
+      ) ? "failed" : "interrupted";
       entry.outputContinuity = "unknown";
       entry.reason = safeReason(error);
       this.#publish(entry);
@@ -702,7 +931,6 @@ export class RunaRuntimeBoundary {
       if (frame.sequence <= entry.outputSequence) {
         throw runtimeFailure("terminal_protocol_error", "Terminal output sequence regressed or duplicated.");
       }
-      entry.outputSequence = frame.sequence;
       if (this.#options.onTerminalOutput !== undefined) {
         const timeoutMs = this.#options.outputDeliveryTimeoutMs ?? 5_000;
         if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
@@ -711,10 +939,19 @@ export class RunaRuntimeBoundary {
         await withOutputDeadline(Promise.resolve(this.#options.onTerminalOutput({
           tabId: entry.tabId,
           agentSessionId: entry.observation.agentSessionId,
+          binding: Object.freeze({
+            userId: entry.observation.userId,
+            machineId: entry.observation.machineId,
+            agentSessionId: entry.observation.agentSessionId,
+            processEpoch: entry.observation.processEpoch,
+            fencingGeneration: entry.fencingGeneration,
+          }),
           sequence: frame.sequence,
           bytes: frame.payload.slice(),
+          signal: entry.outputAbort.signal,
         })), timeoutMs);
       }
+      entry.outputSequence = frame.sequence;
       return;
     }
     if (frame.type === "ready") {
@@ -732,17 +969,32 @@ export class RunaRuntimeBoundary {
     if (frame.type === "acknowledgement") {
       const payload = decodeTerminalControl(frame);
       const acknowledged = BigInt(String(payload.clientSequence));
-      if (acknowledged < 1n || acknowledged > entry.inputSequence || payload.meaning !== "durably_accepted_not_executed") {
+      if (
+        acknowledged <= entry.acknowledgedInputSequence ||
+        !entry.pendingInputSequences.has(acknowledged) ||
+        payload.meaning !== "durably_accepted_not_executed"
+      ) {
         throw runtimeFailure("terminal_protocol_error", "Terminal input acknowledgement is invalid.");
       }
+      for (const sequence of entry.pendingInputSequences) {
+        if (sequence <= acknowledged) entry.pendingInputSequences.delete(sequence);
+      }
+      entry.acknowledgedInputSequence = acknowledged;
+      entry.inputContinuity = entry.pendingInputSequences.size === 0 ? "complete" : "uncertain";
+      this.#publish(entry);
       return;
     }
     if (frame.type === "exit") {
       decodeTerminalControl(frame);
       this.#clearHeartbeatWatchdog(entry);
+      entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The remote terminal process exited."));
       entry.state = "closed";
       entry.reason = "remote_process_exit";
+      try { this.#views.detach(entry.viewId); } catch { /* the view may already be detached */ }
       this.#publish(entry);
+      await entry.connection.close({ code: 1000, reason: "runa_remote_process_exit" });
+      if (this.#activeTabId === entry.tabId) this.#activeTabId = this.#nextActiveTab(entry.tabId);
+      this.#terminals.delete(entry.tabId);
       return;
     }
     if (frame.type === "error") throw this.#remoteTerminalError(frame);
@@ -839,6 +1091,7 @@ export class RunaRuntimeBoundary {
       entry.state !== "active"
     ) return;
     this.#clearHeartbeatWatchdog(entry);
+    entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The terminal heartbeat expired."));
     entry.state = "interrupted";
     entry.outputContinuity = "unknown";
     entry.reason = "heartbeat_expired";
@@ -897,6 +1150,8 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000): RuntimeTer
     state: entry.state,
     fencingGeneration: entry.fencingGeneration,
     inputSequence: entry.inputSequence,
+    acknowledgedInputSequence: entry.acknowledgedInputSequence,
+    inputContinuity: entry.inputContinuity,
     outputSequence: entry.outputSequence,
     outputContinuity: entry.outputContinuity,
     resizeCapability: entry.resizeCapability,
@@ -906,23 +1161,45 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000): RuntimeTer
   });
 }
 
-async function nextWithTimeout(iterator: AsyncIterator<Uint8Array>, timeoutMs: number): Promise<IteratorResult<Uint8Array>> {
+async function nextWithTimeout(
+  iterator: AsyncIterator<Uint8Array>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<IteratorResult<Uint8Array>> {
   let timeout: NodeJS.Timeout | undefined;
+  let removeAbort = (): void => undefined;
   try {
     return await Promise.race([
       iterator.next(),
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => reject(runtimeFailure("terminal_timeout", "The terminal readiness handshake timed out.", { retryable: true })), Math.max(1, timeoutMs));
       }),
+      new Promise<never>((_resolve, reject) => {
+        if (signal === undefined) return;
+        const abort = (): void => reject(runtimeFailure("terminal_disconnected", "Terminal attachment was cancelled.", { cause: signal.reason }));
+        if (signal.aborted) abort();
+        else {
+          signal.addEventListener("abort", abort, { once: true });
+          removeAbort = () => signal.removeEventListener("abort", abort);
+        }
+      }),
     ]);
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
+    removeAbort();
   }
 }
 
 function safeReason(error: unknown): string {
+  if (error instanceof TerminalProtocolError) return "terminal_protocol_error";
   if (error instanceof RuntimeBoundaryError) return error.code;
   return "transport_failure";
+}
+
+function throwIfAborted(signal: AbortSignal, message: string): void {
+  if (signal.aborted) {
+    throw runtimeFailure("terminal_disconnected", message, { retryable: false, cause: signal.reason });
+  }
 }
 
 function viewId(tabId: string, generation: number): string {

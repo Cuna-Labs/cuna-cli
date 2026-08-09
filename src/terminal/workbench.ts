@@ -21,6 +21,7 @@ export interface WorkbenchFrameInput {
   readonly activeTabId: string;
   readonly tabs: readonly WorkbenchTab[];
   readonly appbar: AppbarModel;
+  readonly notice?: string;
   readonly color?: boolean;
 }
 
@@ -57,8 +58,13 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
   const appbarRows = input.rows >= 5 ? 2 : 1;
   const viewportRows = input.rows - appbarRows;
   const lines = appbarRows === 2
-    ? [renderTabs(input.tabs, input.activeTabId, input.columns), renderTruth(input.appbar, input.columns)]
-    : [renderCompact(input.tabs, input.activeTabId, input.appbar, input.columns)];
+    ? [
+        renderTabs(input.tabs, input.activeTabId, input.columns),
+        input.notice === undefined ? renderTruth(input.appbar, input.columns) : truncate(` ${safeText(input.notice)}`, input.columns),
+      ]
+    : [input.notice === undefined
+        ? renderCompact(input.tabs, input.activeTabId, input.appbar, input.columns)
+        : truncate(` RUNA  ${safeText(input.notice)}`, input.columns)];
   const color = input.color !== false;
   let text = `${ESC}?25l${ESC}H`;
   for (let index = 0; index < lines.length; index += 1) {

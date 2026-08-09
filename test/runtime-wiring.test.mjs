@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { decodeTerminalFrame, encodeTerminalControl, encodeTerminalFrame, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
+import { decodeTerminalControl, decodeTerminalFrame, encodeTerminalControl, encodeTerminalFrame, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
 import { requireVerifiedPtyAdapter } from "../dist/pty/evidence-gate.js";
 import { createNodeProcessAdapter } from "../dist/pty/node-process.js";
 import { createApiTerminalControlPlane } from "../dist/runtime/api-terminal-control-plane.js";
@@ -147,7 +147,7 @@ class FakeTerminalSystem {
         this.generation += 1;
         const observed = observation(input.agentSessionId, this.epochs.get(input.agentSessionId));
         const terminalSessionId = `00000000-0000-4000-8000-${String(this.generation).padStart(12, "0")}`;
-        const token = `runa_tc_${"A".repeat(42)}${this.generation}`;
+        const token = `runa_tc_${"A".repeat(40)}${String(this.generation).padStart(3, "0")}`;
         const grant = {
           terminalSessionId,
           resumeHandle: "66666666-6666-4666-8666-666666666666",
@@ -300,6 +300,38 @@ test("runtime multiplexes AgentSessions without cross-routing input and preserve
   await runtime.shutdown();
 });
 
+test("TC-055-17 input acknowledgement tracks only input frames and exposes unacknowledged delivery as uncertain", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  assert.equal(runtime.listTerminals()[0].inputContinuity, "none");
+  await runtime.sendInput(new TextEncoder().encode("first"), "tab-a");
+  await runtime.resize(81, 24, "tab-a");
+  await runtime.sendInput(new TextEncoder().encode("second"), "tab-a");
+  assert.equal(runtime.listTerminals()[0].inputSequence, 3n);
+  assert.equal(runtime.listTerminals()[0].inputContinuity, "uncertain");
+  system.connections[0].incoming.push(encodeTerminalControl("acknowledgement", 2n, {
+    clientSequence: "3",
+    meaning: "durably_accepted_not_executed",
+  }));
+  await waitUntil(() => runtime.listTerminals()[0]?.acknowledgedInputSequence === 3n, "input ACK should commit the cumulative input cursor");
+  assert.equal(runtime.listTerminals()[0].inputContinuity, "complete");
+  await runtime.shutdown();
+
+  const invalidSystem = new FakeTerminalSystem();
+  const { runtime: invalidRuntime } = createRuntime(invalidSystem);
+  await invalidRuntime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await invalidRuntime.sendInput(new TextEncoder().encode("first"), "tab-a");
+  await invalidRuntime.resize(81, 24, "tab-a");
+  invalidSystem.connections[0].incoming.push(encodeTerminalControl("acknowledgement", 2n, {
+    clientSequence: "2",
+    meaning: "durably_accepted_not_executed",
+  }));
+  await waitUntil(() => invalidRuntime.listTerminals()[0]?.state === "failed", "a control-frame sequence cannot impersonate an input ACK");
+  assert.equal(invalidRuntime.listTerminals()[0].inputContinuity, "uncertain");
+  await invalidRuntime.shutdown();
+});
+
 test("two-phase attach initializes the fenced consumer before awaiting same-chunk output", async () => {
   const system = new FakeTerminalSystem();
   system.outputOnReady.set("agent-a", new TextEncoder().encode("early-output"));
@@ -325,6 +357,80 @@ test("two-phase attach initializes the fenced consumer before awaiting same-chun
   releaseOutput();
   const attached = await attaching;
   assert.equal(attached.state, "active");
+  await runtime.shutdown();
+});
+
+test("TC-055-13 shutdown fences an attach waiting on remote admission", async () => {
+  const system = new FakeTerminalSystem();
+  const originalDiscover = system.controlPlane.discoverCapabilities;
+  let releaseAdmission;
+  let admissionEntered = false;
+  system.controlPlane.discoverCapabilities = async (...args) => {
+    admissionEntered = true;
+    await new Promise((resolve) => { releaseAdmission = resolve; });
+    return await originalDiscover(...args);
+  };
+  const { runtime } = createRuntime(system);
+  const attaching = runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await waitUntil(() => admissionEntered, "attachment should wait on admission");
+  const stopping = runtime.shutdown();
+  releaseAdmission();
+  await stopping;
+  await assert.rejects(attaching, (error) =>
+    error instanceof RuntimeBoundaryError &&
+    (error.code === "runtime_closed" || error.code === "terminal_disconnected"));
+  assert.equal(runtime.daemon.state, "stopped");
+  assert.equal(runtime.listTerminals().length, 0);
+  assert.equal(system.connections.length, 0);
+});
+
+test("TC-055-13 concurrent attach reserves both tab and AgentSession identities before awaiting", async () => {
+  const system = new FakeTerminalSystem();
+  const originalDiscover = system.controlPlane.discoverCapabilities;
+  let releaseAdmission;
+  system.controlPlane.discoverCapabilities = async (...args) => {
+    await new Promise((resolve) => { releaseAdmission = resolve; });
+    return await originalDiscover(...args);
+  };
+  const { runtime } = createRuntime(system);
+  const first = runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await assert.rejects(
+    runtime.attach({ tabId: "tab-b", agentSessionId: "agent-a", columns: 80, rows: 24 }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "session_conflict",
+  );
+  await assert.rejects(
+    runtime.attach({ tabId: "tab-a", agentSessionId: "agent-b", columns: 80, rows: 24 }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "session_conflict",
+  );
+  releaseAdmission();
+  await first;
+  assert.equal(runtime.listTerminals().length, 1);
+  await runtime.shutdown();
+});
+
+test("TC-055-13 cancellation during remote admission creates no terminal grant", async () => {
+  const system = new FakeTerminalSystem();
+  const originalDiscover = system.controlPlane.discoverCapabilities;
+  let releaseAdmission;
+  system.controlPlane.discoverCapabilities = async (...args) => {
+    await new Promise((resolve) => { releaseAdmission = resolve; });
+    return await originalDiscover(...args);
+  };
+  const controller = new AbortController();
+  const { runtime } = createRuntime(system);
+  const attaching = runtime.attach({
+    tabId: "tab-a",
+    agentSessionId: "agent-a",
+    columns: 80,
+    rows: 24,
+    signal: controller.signal,
+  });
+  await waitUntil(() => releaseAdmission !== undefined, "attachment should enter remote admission");
+  controller.abort(new Error("user_cancelled"));
+  releaseAdmission();
+  await assert.rejects(attaching, (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected");
+  assert.equal(system.createCalls.length, 0);
+  assert.equal(system.connectCalls.length, 0);
   await runtime.shutdown();
 });
 
@@ -355,6 +461,56 @@ test("terminal output applies backpressure and preserves order across a slow con
   await runtime.shutdown();
 });
 
+test("TC-055-15 resume cursor advances only after output delivery commits", async () => {
+  const system = new FakeTerminalSystem();
+  let now = NOW;
+  let deliveryEntered = false;
+  const { runtime } = createRuntime(system, {
+    clock: () => now,
+    heartbeatTimeoutMs: 1_000,
+    onTerminalOutput: async (event) => {
+      deliveryEntered = true;
+      await new Promise((_resolve, reject) => {
+        const fail = () => reject(event.signal.reason ?? new Error("delivery aborted"));
+        if (event.signal.aborted) fail();
+        else event.signal.addEventListener("abort", fail, { once: true });
+      });
+    },
+  });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.push(encodeTerminalFrame({
+    type: "output",
+    critical: true,
+    sequence: 1n,
+    payload: Uint8Array.of(1),
+  }));
+  await waitUntil(() => deliveryEntered, "output delivery should be in flight");
+  now += 1_001;
+  assert.throws(() => runtime.refreshTerminalLiveness("tab-a"), RuntimeBoundaryError);
+  await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "aborted delivery should interrupt the tab");
+  assert.equal(runtime.listTerminals()[0].outputSequence, 0n);
+  await runtime.reconnect({ tabId: "tab-a" });
+  const resume = system.connections[1].sent.map(decodeTerminalFrame).find((frame) => frame?.type === "resume");
+  assert.equal(decodeTerminalControl(resume).afterOutputSequence, "0");
+  await runtime.shutdown();
+});
+
+test("TC-055-15 exit revokes later output decoded from the same transport message", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime, outputs } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  const exited = encodeTerminalControl("exit", 2n, { exitCode: 0, reason: "exited" });
+  const late = encodeTerminalFrame({ type: "output", critical: true, sequence: 3n, payload: Uint8Array.of(9) });
+  const batch = new Uint8Array(exited.byteLength + late.byteLength);
+  batch.set(exited);
+  batch.set(late, exited.byteLength);
+  system.connections[0].incoming.push(batch);
+  await waitUntil(() => runtime.listTerminals().length === 0, "exit should release the closed tab");
+  assert.equal(outputs.length, 0);
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_remote_process_exit");
+  await runtime.shutdown();
+});
+
 test("a stalled terminal output consumer fails only its tab within a bounded deadline", async () => {
   const system = new FakeTerminalSystem();
   const { runtime, states } = createRuntime(system, {
@@ -370,6 +526,21 @@ test("a stalled terminal output consumer fails only its tab within a bounded dea
   }));
   await waitUntil(() => states.some((state) => state.tabId === "tab-a" && state.state === "failed"), "stalled output should quarantine the tab");
   assert.equal(runtime.listTerminals()[0].state, "failed");
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_terminal_protocol_failure");
+  await runtime.shutdown();
+});
+
+test("illegal post-attach protocol frames fail the tab instead of entering reconnect churn", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.push(encodeTerminalFrame({
+    type: "input",
+    critical: true,
+    sequence: 2n,
+    payload: Uint8Array.of(1),
+  }));
+  await waitUntil(() => runtime.listTerminals()[0]?.state === "failed", "illegal server input should fail the tab");
   assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_terminal_protocol_failure");
   await runtime.shutdown();
 });
@@ -476,6 +647,114 @@ test("concurrent terminal input, resize, and signal writes remain serialized and
   await runtime.shutdown();
 });
 
+test("queued input from an interrupted attachment cannot cross the reconnect fence", async () => {
+  const system = new FakeTerminalSystem();
+  let now = NOW;
+  const { runtime } = createRuntime(system, { clock: () => now, heartbeatTimeoutMs: 1_000 });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  const oldConnection = system.connections[0];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let sendCount = 0;
+  oldConnection.send = async (bytes) => {
+    sendCount += 1;
+    if (sendCount === 1) await firstGate;
+    oldConnection.sent.push(bytes);
+  };
+  const first = runtime.sendInput(new TextEncoder().encode("first"), "tab-a");
+  await waitUntil(() => sendCount === 1, "first input should hold the old send tail");
+  const stale = runtime.sendInput(new TextEncoder().encode("stale"), "tab-a");
+  now += 1_001;
+  assert.throws(() => runtime.refreshTerminalLiveness("tab-a"), RuntimeBoundaryError);
+  const reconnected = await runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(reconnected.state, "active");
+  releaseFirst();
+  await first;
+  await assert.rejects(stale, (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected");
+  const replacementInputs = system.connections[1].sent.map(decodeTerminalFrame).filter((frame) => frame?.type === "input");
+  assert.equal(replacementInputs.length, 0, "pre-disconnect input must not execute on the replacement attachment");
+  await runtime.shutdown();
+});
+
+test("detach is a revocation barrier for queued writes and waits for the admitted send tail", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  const connection = system.connections[0];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let sendCount = 0;
+  connection.send = async (bytes) => {
+    sendCount += 1;
+    if (sendCount === 1) await firstGate;
+    connection.sent.push(bytes);
+  };
+  const first = runtime.sendInput(new TextEncoder().encode("first"), "tab-a");
+  await waitUntil(() => sendCount === 1, "first send should own the old connection");
+  const stale = runtime.sendInput(new TextEncoder().encode("stale"), "tab-a");
+  let detached = false;
+  const detaching = runtime.detach("tab-a").then(() => { detached = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(detached, false, "detach cannot report completion while an admitted send remains pending");
+  releaseFirst();
+  await first;
+  await assert.rejects(stale, (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected");
+  await detaching;
+  assert.equal(connection.sent.map(decodeTerminalFrame).filter((frame) => frame?.type === "input").length, 1);
+  await runtime.shutdown();
+});
+
+test("detach aborts and drains an in-flight terminal output consumer", async () => {
+  const system = new FakeTerminalSystem();
+  let entered = false;
+  let cancelled = false;
+  const { runtime } = createRuntime(system, {
+    onTerminalOutput: async (event) => {
+      entered = true;
+      await new Promise((resolve) => {
+        const done = () => { cancelled = true; resolve(); };
+        if (event.signal.aborted) done();
+        else event.signal.addEventListener("abort", done, { once: true });
+      });
+    },
+  });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.push(encodeTerminalFrame({
+    type: "output",
+    critical: true,
+    sequence: 1n,
+    payload: new Uint8Array([1]),
+  }));
+  await waitUntil(() => entered, "output consumer should be active");
+  await runtime.detach("tab-a");
+  assert.equal(cancelled, true);
+  assert.equal(runtime.listTerminals().length, 0);
+  await runtime.shutdown();
+});
+
+test("heartbeat lease begins only after delayed readiness is proven", async () => {
+  const system = new FakeTerminalSystem();
+  system.connectionsWithoutReady.add(1);
+  let now = NOW;
+  const { runtime } = createRuntime(system, { clock: () => now, heartbeatTimeoutMs: 1_000, readyTimeoutMs: 2_000 });
+  const attaching = runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await waitUntil(() => system.connections.length === 1, "attachment should wait for producer readiness");
+  now += 1_100;
+  const grant = [...system.grants.values()][0];
+  system.connections[0].incoming.push(encodeTerminalControl("ready", 1n, {
+    protocol: TERMINAL_PROTOCOL,
+    agentSessionId: grant.agentSessionId,
+    processEpoch: grant.processEpoch,
+    fencingGeneration: grant.attachmentGeneration,
+    resizeCapability: "live",
+  }));
+  const attached = await attaching;
+  assert.equal(attached.heartbeatObservedAt, now);
+  assert.equal(attached.heartbeatExpiresAt, now + 1_000);
+  assert.equal(runtime.refreshTerminalLiveness("tab-a").state, "active");
+  await runtime.shutdown();
+});
+
 test("terminal-generated responses require the exact tab authority and never follow active-tab focus", async () => {
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);
@@ -529,6 +808,60 @@ test("runtime reconnect obtains a fresh grant, preserves process epoch, and neve
   assert.equal(system.createCalls[1].resumeHandle, "66666666-6666-4666-8666-666666666666");
   assert.notEqual(system.connections[0].connectionId, system.connections[1].connectionId);
   assert.equal(system.connectCalls.length, 2);
+  await runtime.shutdown();
+});
+
+test("TC-055-14 reconnect cancellation during admission preserves the old transport and creates no grant", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.close();
+  await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "terminal did not become interrupted");
+  const originalDiscover = system.controlPlane.discoverCapabilities;
+  let releaseAdmission;
+  system.controlPlane.discoverCapabilities = async (...args) => {
+    await new Promise((resolve) => { releaseAdmission = resolve; });
+    return await originalDiscover(...args);
+  };
+  const controller = new AbortController();
+  const reconnecting = runtime.reconnect({ tabId: "tab-a", signal: controller.signal });
+  await waitUntil(() => releaseAdmission !== undefined, "reconnect should enter remote admission");
+  controller.abort(new Error("user_cancelled"));
+  releaseAdmission();
+  await assert.rejects(reconnecting, (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected");
+  assert.equal(system.createCalls.length, 1, "cancelled admission cannot create a replacement grant");
+  assert.equal(system.connections[0].closeCalls.length, 0, "cancellation before grant cannot mutate the old transport");
+  await runtime.shutdown();
+});
+
+test("TC-055-14 reconnect rejects reassignment of any AgentSession authority field", async () => {
+  for (const [field, replacement] of [["userId", "user-2"], ["machineId", "machine-2"]]) {
+    const system = new FakeTerminalSystem();
+    const originalObserve = system.controlPlane.observeAgentSession;
+    const { runtime } = createRuntime(system);
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    system.connections[0].incoming.close();
+    await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "terminal should become interrupted");
+    system.controlPlane.observeAgentSession = async (...args) => ({ ...(await originalObserve(...args)), [field]: replacement });
+    await assert.rejects(
+      runtime.reconnect({ tabId: "tab-a" }),
+      (error) => error instanceof RuntimeBoundaryError && error.code === "session_discontinuous",
+      field,
+    );
+    assert.equal(runtime.listTerminals()[0].state, "failed");
+    await runtime.shutdown();
+  }
+});
+
+test("detached terminal state is fully released and tab identities can be reused", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  for (let index = 0; index < 25; index += 1) {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    await runtime.detach("tab-a");
+    assert.equal(runtime.listTerminals().length, 0);
+  }
+  assert.equal(system.connections.length, 25);
   await runtime.shutdown();
 });
 
@@ -621,7 +954,7 @@ test("detach during reconnect permanently wins over a late ready frame", async (
     reconnecting,
     (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected",
   );
-  assert.equal(runtime.listTerminals()[0].state, "detached");
+  assert.equal(runtime.listTerminals().length, 0);
   assert.equal(system.connections[1].closeCalls.at(-1).reason, "runa_resume_rejected");
   await runtime.shutdown();
 });
@@ -648,6 +981,11 @@ test("a transient reconnect handshake timeout preserves the old view authority f
   assert.notEqual(retried.viewId, attached.viewId);
   assert.equal(retried.outputContinuity, "unknown");
   assert.equal(system.createCalls.length, 3);
+  assert.equal(
+    system.createCalls[1].idempotencyKey,
+    system.createCalls[2].idempotencyKey,
+    "an ambiguous reconnect retry must preserve one logical mutation identity",
+  );
   await runtime.shutdown();
 });
 
@@ -790,6 +1128,10 @@ test("Node process adapter executes argv without a shell and excludes credential
   assert.deepEqual(JSON.parse(stdout), { value: "ok", secret: null });
   assert.throws(
     () => adapter.spawn({ executable: process.execPath, args: ["-e", ""], environment: { RUNA_API_KEY: "must-not-pass" } }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "process_invalid",
+  );
+  assert.throws(
+    () => adapter.spawn({ executable: "node", args: ["--version"] }),
     (error) => error instanceof RuntimeBoundaryError && error.code === "process_invalid",
   );
 });

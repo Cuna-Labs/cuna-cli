@@ -8,6 +8,10 @@ import { TERMINAL_PROTOCOL, type TerminalReadyPayload } from "../terminal/codec.
 import type { CapabilityAdmission } from "./capability-gate.js";
 import { runtimeFailure } from "./errors.js";
 
+const CANONICAL_TIMESTAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/u;
+const MAX_REMOTE_EVIDENCE_TTL_MS = 60_000;
+const MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS = 5_000;
+
 export interface RemoteAgentSessionEvidence {
   readonly authority: "runa_agent_session_supervisor";
   readonly userId: string;
@@ -84,9 +88,15 @@ export function assertRemoteAgentSessionEvidence(input: {
     evidence.machineId.length === 0 ||
     evidence.processEpoch.length === 0 ||
     evidence.evidenceRevision.length === 0 ||
+    !CANONICAL_TIMESTAMP.test(evidence.observedAt) ||
+    !CANONICAL_TIMESTAMP.test(evidence.expiresAt) ||
     !Number.isFinite(observedAt) ||
     !Number.isFinite(expiresAt) ||
+    new Date(observedAt).toISOString() !== evidence.observedAt ||
+    new Date(expiresAt).toISOString() !== evidence.expiresAt ||
+    observedAt > now + MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS ||
     expiresAt < observedAt ||
+    expiresAt - observedAt > MAX_REMOTE_EVIDENCE_TTL_MS ||
     expiresAt <= now ||
     (evidence.state !== "ready" && evidence.state !== "running")
   ) {

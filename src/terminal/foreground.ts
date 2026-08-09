@@ -2,7 +2,7 @@ import type {
   RuntimeTerminalResponse,
   RuntimeTerminalSnapshot,
 } from "../runtime/boundary.js";
-import { runtimeFailure } from "../runtime/errors.js";
+import { RuntimeBoundaryError, runtimeFailure } from "../runtime/errors.js";
 import type { HostTerminalLease } from "./mode.js";
 import { buildAppbarModel, type AppbarModel } from "./appbar.js";
 import { renderWorkbenchFrame, type WorkbenchTab } from "./workbench.js";
@@ -14,9 +14,11 @@ const TAB_FIRST = 0x31;
 const TAB_LAST = 0x34;
 const NEXT_TAB = 0x6e;
 const DETACH = 0x64;
+const HELP = 0x3f;
 const RESIZE_COALESCE_MS = 50;
 const BRACKETED_PASTE_START = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e);
 const BRACKETED_PASTE_END = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e);
+export const MAX_FOREGROUND_PENDING_INPUT_BYTES = 1_048_576;
 
 export type ForegroundTerminalState = "idle" | "starting" | "active" | "stopping" | "stopped" | "failed";
 
@@ -30,6 +32,7 @@ export interface ForegroundTerminalRuntime {
     readonly signal?: AbortSignal;
   }): Promise<RuntimeTerminalSnapshot>;
   detach(tabId: string): Promise<void>;
+  reconnect(input: { readonly tabId: string; readonly signal?: AbortSignal }): Promise<RuntimeTerminalSnapshot>;
   sendInput(bytes: Uint8Array, tabId?: string): Promise<void>;
   resize(columns: number, rows: number, tabId?: string): Promise<void>;
   switchActive(tabId: string): RuntimeTerminalSnapshot;
@@ -56,6 +59,8 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly appbar?: () => AppbarModel;
   readonly clock?: () => number;
   readonly resizeCoalesceMs?: number;
+  readonly reconnectAttempts?: number;
+  readonly reconnectBaseDelayMs?: number;
 }
 
 interface ForegroundTab {
@@ -83,13 +88,26 @@ export class ForegroundTerminalCoordinator {
   #pasteStartMatch = 0;
   #pasteEndMatch = 0;
   #stopPromise: Promise<void> | undefined;
+  readonly #lifetimeAbort = new AbortController();
+  readonly #reconnectTasks = new Map<string, Promise<void>>();
+  #removeAbort: (() => void) | undefined;
+  #pendingInputBytes = 0;
+  #helpVisible = false;
 
   constructor(options: ForegroundTerminalCoordinatorOptions) {
     const resizeCoalesceMs = options.resizeCoalesceMs ?? RESIZE_COALESCE_MS;
     if (!Number.isSafeInteger(resizeCoalesceMs) || resizeCoalesceMs < 1 || resizeCoalesceMs > 1_000) {
       throw new RangeError("Foreground resize coalescing must be between 1 and 1000 milliseconds.");
     }
-    this.#options = Object.freeze({ ...options, resizeCoalesceMs });
+    const reconnectAttempts = options.reconnectAttempts ?? 3;
+    const reconnectBaseDelayMs = options.reconnectBaseDelayMs ?? 100;
+    if (!Number.isSafeInteger(reconnectAttempts) || reconnectAttempts < 1 || reconnectAttempts > 10) {
+      throw new RangeError("Foreground reconnect attempts must be between 1 and 10.");
+    }
+    if (!Number.isSafeInteger(reconnectBaseDelayMs) || reconnectBaseDelayMs < 1 || reconnectBaseDelayMs > 5_000) {
+      throw new RangeError("Foreground reconnect delay must be between 1 and 5000 milliseconds.");
+    }
+    this.#options = Object.freeze({ ...options, resizeCoalesceMs, reconnectAttempts, reconnectBaseDelayMs });
     this.#clock = options.clock ?? Date.now;
   }
 
@@ -108,8 +126,10 @@ export class ForegroundTerminalCoordinator {
     readonly onTerminalOutput: (event: {
       readonly tabId: string;
       readonly agentSessionId: string;
+      readonly binding: RuntimeTerminalResponse["binding"];
       readonly sequence: bigint;
       readonly bytes: Uint8Array;
+      readonly signal: AbortSignal;
     }) => Promise<void>;
     readonly onTerminalState: (snapshot: RuntimeTerminalSnapshot) => void;
   } {
@@ -127,7 +147,18 @@ export class ForegroundTerminalCoordinator {
     this.#pendingIntents = Object.freeze(intents.map((intent) => Object.freeze({ ...intent })));
     this.#state = "starting";
     try {
-      this.#lease = await this.#options.host.acquire();
+      if (signal?.aborted) throw runtimeFailure("terminal_disconnected", "Foreground terminal startup was cancelled.");
+      if (signal !== undefined) {
+        const onAbort = (): void => { void this.stop().catch(() => { this.#state = "failed"; }); };
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.#removeAbort = () => signal.removeEventListener("abort", onAbort);
+      }
+      const lease = await this.#options.host.acquire();
+      if (signal?.aborted || this.#state !== "starting") {
+        await lease.restore();
+        throw runtimeFailure("terminal_disconnected", "Foreground terminal startup was cancelled.");
+      }
+      this.#lease = lease;
       this.#removeInput = this.#options.host.onInput((bytes) => this.#queueInput(bytes));
       this.#removeResize = this.#options.host.onResize(() => this.#queueResize());
       const dimensions = admittedDimensions(this.#options.host.dimensions());
@@ -151,7 +182,11 @@ export class ForegroundTerminalCoordinator {
       await this.#render();
     } catch (error) {
       this.#state = "failed";
-      await this.stop().catch(() => undefined);
+      try {
+        await this.stop();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "Foreground terminal startup and cleanup both failed.");
+      }
       throw error;
     }
   }
@@ -165,6 +200,9 @@ export class ForegroundTerminalCoordinator {
   async #stopNow(): Promise<void> {
     if (this.#state === "stopped") return;
     this.#state = "stopping";
+    this.#lifetimeAbort.abort();
+    this.#removeAbort?.();
+    this.#removeAbort = undefined;
     if (this.#resizeTimer !== undefined) clearTimeout(this.#resizeTimer);
     this.#resizeTimer = undefined;
     this.#removeInput?.();
@@ -178,9 +216,12 @@ export class ForegroundTerminalCoordinator {
         try { await runtime.detach(tabId); } catch (error) { failures.push(error); }
       }
     }
+    try { await this.#inputTail; } catch (error) { failures.push(error); }
     for (const tab of this.#tabs.values()) tab.viewport.dispose();
     this.#tabs.clear();
     this.#pendingIntents = Object.freeze([]);
+    this.#pendingInputBytes = 0;
+    this.#reconnectTasks.clear();
     try { await this.#renderTail; } catch (error) { failures.push(error); }
     if (this.#lease !== undefined) {
       try { await this.#lease.restore(); } catch (error) { failures.push(error); }
@@ -194,6 +235,13 @@ export class ForegroundTerminalCoordinator {
     const runtime = this.#requireRuntime();
     const intent = this.#findIntent(snapshot.tabId, snapshot.agentSessionId);
     const previous = this.#tabs.get(snapshot.tabId);
+    await this.#renderTail;
+    if (
+      this.#lifetimeAbort.signal.aborted ||
+      (this.#state !== "starting" && this.#state !== "active")
+    ) {
+      throw runtimeFailure("terminal_disconnected", "Terminal readiness arrived after foreground ownership ended.");
+    }
     previous?.viewport.dispose();
     const dimensions = admittedDimensions(this.#options.host.dimensions());
     const viewport = new XtermViewportAdapter({
@@ -217,27 +265,86 @@ export class ForegroundTerminalCoordinator {
   async #terminalOutput(event: {
     readonly tabId: string;
     readonly agentSessionId: string;
+    readonly binding: RuntimeTerminalResponse["binding"];
     readonly sequence: bigint;
     readonly bytes: Uint8Array;
+    readonly signal: AbortSignal;
   }): Promise<void> {
     const tab = this.#tabs.get(event.tabId);
-    if (tab === undefined || tab.intent.agentSessionId !== event.agentSessionId) {
+    if (tab === undefined || tab.intent.agentSessionId !== event.agentSessionId || !sameSnapshotBinding(tab.snapshot, event.binding)) {
       throw runtimeFailure("grant_scope_mismatch", "Terminal output targets an unbound foreground viewport.");
     }
-    await tab.viewport.write(event.bytes, event.sequence, event.sequence);
+    await raceAbort(tab.viewport.write(event.bytes, event.sequence, event.sequence), event.signal);
+    const current = this.#tabs.get(event.tabId);
+    if (event.signal.aborted || current !== tab || !sameSnapshotBinding(tab.snapshot, event.binding)) return;
     await this.#render();
   }
 
   #terminalState(snapshot: RuntimeTerminalSnapshot): void {
     const tab = this.#tabs.get(snapshot.tabId);
-    if (tab !== undefined) tab.snapshot = snapshot;
-    if (this.#state === "active") void this.#render().catch(() => void this.stop());
+    if (tab !== undefined) {
+      tab.snapshot = snapshot;
+      if (snapshot.state === "failed" || snapshot.state === "closed" || snapshot.state === "detached") {
+        tab.viewport.dispose();
+        this.#tabs.delete(snapshot.tabId);
+        if (this.#activeTabId === snapshot.tabId) {
+          const replacement = [...this.#tabs.keys()][0];
+          this.#activeTabId = replacement;
+          if (replacement !== undefined) {
+            this.#requireRuntime().switchActive(replacement);
+            this.#registry.select(replacement);
+          }
+        }
+      }
+    }
+    if (this.#state !== "active") return;
+    if (this.#tabs.size === 0) {
+      void this.stop().catch(() => { this.#state = "failed"; });
+      return;
+    }
+    if (snapshot.state === "interrupted" && !this.#reconnectTasks.has(snapshot.tabId)) {
+      const recovery = this.#recoverTab(snapshot.tabId).catch(async () => {
+        if (this.#state === "active") await this.stop();
+      });
+      this.#reconnectTasks.set(snapshot.tabId, recovery);
+      void recovery.finally(() => this.#reconnectTasks.delete(snapshot.tabId)).catch(() => { this.#state = "failed"; });
+    }
+    void this.#render().catch(() => this.stop().catch(() => { this.#state = "failed"; }));
+  }
+
+  async #recoverTab(tabId: string): Promise<void> {
+    const attempts = this.#options.reconnectAttempts ?? 3;
+    const baseDelayMs = this.#options.reconnectBaseDelayMs ?? 100;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (this.#state !== "active" || this.#lifetimeAbort.signal.aborted) return;
+      await abortableDelay(Math.min(baseDelayMs * (2 ** attempt), 5_000), this.#lifetimeAbort.signal);
+      if (this.#state !== "active" || this.#lifetimeAbort.signal.aborted) return;
+      try {
+        await this.#requireRuntime().reconnect({ tabId, signal: this.#lifetimeAbort.signal });
+        return;
+      } catch (error) {
+        if (this.#lifetimeAbort.signal.aborted || this.#state !== "active") return;
+        if (error instanceof RuntimeBoundaryError && !error.retryable) return;
+      }
+    }
+    if (this.#state === "active") await this.#render();
   }
 
   #queueInput(bytes: Uint8Array): void {
+    if (bytes.byteLength < 1) return;
+    if (bytes.byteLength > MAX_FOREGROUND_PENDING_INPUT_BYTES || this.#pendingInputBytes + bytes.byteLength > MAX_FOREGROUND_PENDING_INPUT_BYTES) {
+      void this.stop().catch(() => { this.#state = "failed"; });
+      return;
+    }
     const payload = bytes.slice();
-    this.#inputTail = this.#inputTail.then(() => this.#routeInput(payload));
-    void this.#inputTail.catch(() => this.stop());
+    this.#pendingInputBytes += payload.byteLength;
+    const operation = this.#inputTail.then(async () => {
+      try { await this.#routeInput(payload); } finally { this.#pendingInputBytes -= payload.byteLength; }
+    });
+    this.#inputTail = operation.catch((error) => {
+      if (error instanceof RuntimeBoundaryError && (error.code === "terminal_disconnected" || error.code === "session_unknown")) return;
+      void this.stop().catch(() => { this.#state = "failed"; });
+    });
   }
 
   async #routeInput(bytes: Uint8Array): Promise<void> {
@@ -290,9 +397,14 @@ export class ForegroundTerminalCoordinator {
         this.#selectNext();
       } else if (byte === DETACH) {
         await flush();
-        void this.stop();
+        void this.stop().catch(() => { this.#state = "failed"; });
         return;
+      } else if (byte === HELP) {
+        await flush();
+        this.#helpVisible = !this.#helpVisible;
+        await this.#render();
       } else {
+        this.#helpVisible = false;
         remote.push(ESCAPE_PREFIX, byte);
       }
     }
@@ -317,7 +429,7 @@ export class ForegroundTerminalCoordinator {
     this.#requireRuntime().switchActive(tabId);
     this.#registry.select(tabId);
     this.#activeTabId = tabId;
-    void this.#render().catch(() => this.stop());
+    void this.#render().catch(() => this.stop().catch(() => { this.#state = "failed"; }));
   }
 
   #queueResize(): void {
@@ -325,21 +437,19 @@ export class ForegroundTerminalCoordinator {
     if (this.#resizeTimer !== undefined) clearTimeout(this.#resizeTimer);
     this.#resizeTimer = setTimeout(() => {
       this.#resizeTimer = undefined;
-      void this.#applyResize().catch(() => this.stop());
+      void this.#applyResize().catch(() => this.stop().catch(() => { this.#state = "failed"; }));
     }, this.#options.resizeCoalesceMs);
     this.#resizeTimer.unref();
   }
 
   async #applyResize(): Promise<void> {
-    const tabId = this.#activeTabId;
-    if (tabId === undefined) return;
-    const tab = this.#tabs.get(tabId);
-    if (tab === undefined) return;
     const dimensions = admittedDimensions(this.#options.host.dimensions());
     const rows = remoteRows(dimensions.rows);
-    await tab.viewport.resize(dimensions.columns, rows);
-    if (tab.snapshot.resizeCapability === "live") {
-      await this.#requireRuntime().resize(dimensions.columns, rows, tabId);
+    for (const [tabId, tab] of this.#tabs) {
+      await tab.viewport.resize(dimensions.columns, rows);
+      if (tab.snapshot.resizeCapability === "live" && tab.snapshot.state === "active") {
+        await this.#requireRuntime().resize(dimensions.columns, rows, tabId);
+      }
     }
     await this.#render();
   }
@@ -361,6 +471,7 @@ export class ForegroundTerminalCoordinator {
         activeTabId,
         tabs,
         appbar: this.#options.appbar?.() ?? unknownAppbar(this.#clock()),
+        ...(this.#helpVisible ? { notice: "Keys: Ctrl+] ? help · Ctrl+] 1-4 tab · Ctrl+] n next · Ctrl+] d detach · Ctrl+] Ctrl+] literal" } : {}),
       });
       await this.#options.host.write(frame.bytes);
     });
@@ -423,4 +534,43 @@ function unknownAppbar(now: number): AppbarModel {
 function advanceSequence(sequence: Uint8Array, byte: number, matched: number): number {
   if (byte === sequence[matched]) return matched + 1;
   return byte === sequence[0] ? 1 : 0;
+}
+
+function sameSnapshotBinding(snapshot: RuntimeTerminalSnapshot, binding: RuntimeTerminalResponse["binding"]): boolean {
+  return snapshot.userId === binding.userId &&
+    snapshot.machineId === binding.machineId &&
+    snapshot.agentSessionId === binding.agentSessionId &&
+    snapshot.processEpoch === binding.processEpoch &&
+    snapshot.fencingGeneration === binding.fencingGeneration;
+}
+
+async function raceAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Terminal output was cancelled.");
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(signal.reason instanceof Error ? signal.reason : new Error("Terminal output was cancelled."));
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(done, milliseconds);
+    timer.unref();
+    const onAbort = (): void => done();
+    function done(): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }

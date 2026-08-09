@@ -33,16 +33,22 @@ test("release inputs are reproducible from the checked-out source and payload", 
     "packaging/templates/homebrew/runa.rb.template",
     "packaging/templates/install.sh.template",
     "scripts/lib/release-inputs.mjs",
+    "scripts/lib/release-approval-lease.mjs",
     "scripts/release-distribution-lib.mjs",
     "scripts/release-project-distributions.mjs",
     "scripts/summarize-observation-receipts.mjs",
     "scripts/verify-distribution-receipts.mjs",
     "scripts/verify-release-admission.mjs",
+    "scripts/verify-release-approval-lease.mjs",
     "scripts/verify-release-distributions.mjs",
   ]) {
     assert.ok(boundRecipeFiles.has(releaseAuthority), `release recipe must bind ${releaseAuthority}`);
   }
-  assert.ok(inputs.contractSet.files.some((entry) => entry.file === "packaging/observation-summary.schema.json"));
+  for (const contract of [
+    "packaging/contract-authority.schema.json",
+    "packaging/observation-summary.schema.json",
+    "packaging/release-approval-lease.schema.json",
+  ]) assert.ok(inputs.contractSet.files.some((entry) => entry.file === contract));
   assert.ok(inputs.dependencyClosure.components.some((entry) => entry.name === "@xterm/headless"));
 });
 

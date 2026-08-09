@@ -5,10 +5,11 @@ import { HostTerminalLease } from "../terminal/mode.js";
 import type { ForegroundTerminalHost } from "../terminal/foreground.js";
 import { runtimeFailure } from "../runtime/errors.js";
 
-const ENTER_ALTERNATE_SCREEN = "\u001b[?1049h\u001b[H";
+const ENTER_ALTERNATE_SCREEN = "\u001b[?1049h\u001b[?2004h\u001b[H";
 const LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
 const RESET_REMOTE_MODES = "\u001b[?1000l\u001b[?1002l\u001b[?1003l\u001b[?1006l\u001b[?2004l\u001b[?25h";
 const HOST_WRITE_TIMEOUT_MS = 5_000;
+const ACTIVE_HOST_INPUTS = new WeakSet<object>();
 
 export function createNodeHostTerminalAdapter(input: {
   readonly stdin?: ReadStream;
@@ -22,9 +23,15 @@ export function createNodeHostTerminalAdapter(input: {
     throw new RangeError("Host terminal write timeout must be between 1 and 60000 milliseconds.");
   }
   let shouldPauseAfterRawMode = false;
+  let ownsRawMode = false;
   return Object.freeze({
     enterRawMode(): void {
       assertInteractive(stdin, stdout);
+      if (ACTIVE_HOST_INPUTS.has(stdin)) {
+        throw runtimeFailure("session_conflict", "This host terminal is already owned by another foreground session.");
+      }
+      ACTIVE_HOST_INPUTS.add(stdin);
+      ownsRawMode = true;
       // `readableFlowing === null` is Node's initial no-consumer state. Calling
       // resume() changes it to `true` and keeps the process alive, so restoration
       // must pause both the initial and explicitly-paused states.
@@ -43,9 +50,12 @@ export function createNodeHostTerminalAdapter(input: {
       if (stdout.isTTY) await writeWithBackpressure(stdout, new TextEncoder().encode(LEAVE_ALTERNATE_SCREEN), writeTimeoutMs);
     },
     leaveRawMode(): void {
+      if (!ownsRawMode) return;
       if (stdin.isTTY && typeof stdin.setRawMode === "function") stdin.setRawMode(false);
       if (shouldPauseAfterRawMode) stdin.pause();
       shouldPauseAfterRawMode = false;
+      ownsRawMode = false;
+      ACTIVE_HOST_INPUTS.delete(stdin);
     },
   });
 }

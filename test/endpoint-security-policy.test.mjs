@@ -24,7 +24,7 @@ test("TC-048-18 shipped runtime contains no prohibited Windows execution interme
   }
 });
 
-test("TC-048-18 endpoint-security policy detects representative historical execution patterns", () => {
+test("TC-048-18 TC-056-01/03/10 endpoint-security policy detects representative historical execution patterns", () => {
   for (const fixture of [
     "rundll32.exe url.dll,FileProtocolHandler https://example.test",
     "powershell.exe -EncodedCommand ZQB2AGkAbAA=",
@@ -46,6 +46,17 @@ test("TC-048-18 endpoint-security policy detects split-literal variants of histo
     '"Add" + "-Type"',
   ]) {
     assert.throws(() => assertEndpointSecuritySource(fixture, "obfuscation negative control"), /violates endpoint-security policy/u);
+  }
+});
+
+test("TC-056-08 public guidance never tells users to disable or bypass endpoint protection", async () => {
+  const readme = await readFile(path.join(repositoryRoot, "README.md"), "utf8");
+  for (const pattern of [
+    /(?:disable|deactivate|turn off).{0,60}(?:antivirus|defender|endpoint protection)/isu,
+    /(?:add|create|configure).{0,40}(?:antivirus )?exclusion/isu,
+    /ignore.{0,40}(?:warning|detection|quarantine)/isu,
+  ]) {
+    assert.doesNotMatch(readme, pattern);
   }
 });
 

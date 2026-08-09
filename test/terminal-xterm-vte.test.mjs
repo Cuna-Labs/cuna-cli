@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_XTERM_CELL_EXTENDERS,
   MAX_XTERM_PENDING_WRITE_BYTES,
   ViewportRegistry,
   XtermViewportAdapter,
@@ -57,6 +58,16 @@ test("VTE reports Unicode display-cell width and the remote cursor state", async
   const visible = await viewport.write(encoder.encode("\u001b[?25h"), 2n, 2n);
   assert.equal(visible.modes.cursorVisible, true);
   viewport.dispose();
+});
+
+test("TC-055-16 VTE rejects pathological cell extenders across split output frames", async () => {
+  const { viewport, registry } = adapter();
+  await viewport.write(encoder.encode(`a${"\u0301".repeat(MAX_XTERM_CELL_EXTENDERS - 1)}`), 1n, 1n);
+  await assert.rejects(
+    viewport.write(encoder.encode("\u0301\u0301"), 2n, 2n),
+    /cell complexity limit/u,
+  );
+  assert.equal(registry.list().length, 0, "a pathological cluster quarantines the viewport");
 });
 
 test("remote OSC title, hyperlink, and clipboard controls stay outside trusted host cells", async () => {

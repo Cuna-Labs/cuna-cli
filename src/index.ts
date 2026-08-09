@@ -112,6 +112,7 @@ export {
 } from "./terminal/workbench.js";
 export {
   ForegroundTerminalCoordinator,
+  MAX_FOREGROUND_PENDING_INPUT_BYTES,
   type ForegroundTabIntent,
   type ForegroundTerminalCoordinatorOptions,
   type ForegroundTerminalHost,
@@ -137,6 +138,7 @@ export {
   DEFAULT_XTERM_SCROLLBACK,
   MAX_XTERM_ACTIVE_VIEWPORTS,
   MAX_XTERM_BUFFER_CELLS,
+  MAX_XTERM_CELL_EXTENDERS,
   MAX_XTERM_GLOBAL_BUFFER_CELLS,
   MAX_XTERM_GLOBAL_PENDING_WRITE_BYTES,
   MAX_XTERM_PENDING_WRITE_BYTES,

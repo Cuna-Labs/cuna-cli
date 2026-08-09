@@ -11,9 +11,11 @@ const EXACT_VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-
 const EXACT_TOOL_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u;
 
 const CONTRACT_FILES = Object.freeze([
+  "packaging/contract-authority.schema.json",
   "packaging/distribution-manifest.schema.json",
   "packaging/distribution-receipt.schema.json",
   "packaging/observation-summary.schema.json",
+  "packaging/release-approval-lease.schema.json",
   "packaging/release-envelope.schema.json",
   "packaging/runtime-identity.schema.json",
   "packaging/support-policy.schema.json",
@@ -42,6 +44,7 @@ const BUILD_RECIPE_FILES = Object.freeze([
   "scripts/build-release-envelope.mjs",
   "scripts/build-release-inputs.mjs",
   "scripts/lib/release-evidence.mjs",
+  "scripts/lib/release-approval-lease.mjs",
   "scripts/lib/exclusive-build-lock.mjs",
   "scripts/lib/release-inputs.mjs",
   "scripts/release-distribution-lib.mjs",
@@ -54,6 +57,7 @@ const BUILD_RECIPE_FILES = Object.freeze([
   "scripts/verify-installed-candidate.mjs",
   "scripts/verify-package-contents.mjs",
   "scripts/verify-release-admission.mjs",
+  "scripts/verify-release-approval-lease.mjs",
   "scripts/verify-release-distributions.mjs",
   "scripts/verify-release-envelope.mjs",
   "src/build-identity.ts",

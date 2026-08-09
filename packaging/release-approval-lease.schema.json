@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runacode.io/schemas/runa-cli-release-approval-lease-v1.json",
+  "title": "Runa CLI release approval lease predicate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "predicateType", "decision", "package", "source", "candidate", "receiptCohort", "contractAuthority", "promotion", "review", "recovery", "issuedAt", "expiresAt", "nonce", "conditions"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "predicateType": {"const": "https://runacode.io/attestations/runa-cli-release-approval/v1"},
+    "decision": {"enum": ["READY", "READY_WITH_CONDITIONS"]},
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"const": "@runa_laboratories/cli"},
+        "version": {"$ref": "#/$defs/version"}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit", "ref"],
+      "properties": {
+        "repository": {"const": "Runa-Laboratories/runa-cli"},
+        "commit": {"$ref": "#/$defs/commit"},
+        "ref": {"const": "refs/heads/main"}
+      }
+    },
+    "candidate": {"$ref": "#/$defs/candidate"},
+    "receiptCohort": {"$ref": "#/$defs/receiptCohort"},
+    "contractAuthority": {"$ref": "#/$defs/contractAuthority"},
+    "promotion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registry", "tag", "environment"],
+      "properties": {
+        "registry": {"const": "https://registry.npmjs.org"},
+        "tag": {"const": "preview"},
+        "environment": {"const": "npm"}
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflow", "runId", "runAttempt", "environment", "approverIdentityClass", "soloOwnerRiskAccepted"],
+      "properties": {
+        "workflow": {"const": ".github/workflows/release-review.yml"},
+        "runId": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "runAttempt": {"type": "integer", "minimum": 1},
+        "environment": {"const": "release-review-npm-preview"},
+        "approverIdentityClass": {"enum": ["PROTECTED_ENVIRONMENT_REVIEWER", "SOLO_OWNER_EXPLICIT_RISK_ACCEPTANCE"]},
+        "soloOwnerRiskAccepted": {"type": "boolean"}
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planSha256", "strategy"],
+      "properties": {
+        "planSha256": {"$ref": "#/$defs/sha256"},
+        "strategy": {"enum": ["halt-and-fixed-forward", "dist-tag-recovery-and-fixed-forward"]}
+      }
+    },
+    "issuedAt": {"type": "string", "format": "date-time"},
+    "expiresAt": {"type": "string", "format": "date-time"},
+    "nonce": {"type": "string", "pattern": "^[A-Za-z0-9_-]{32,128}$"},
+    "conditions": {"type": "array", "maxItems": 1, "uniqueItems": true, "items": {"const": "PREVIEW_TAG_ONLY"}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "version": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$"},
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tarballSha256", "payloadSha256", "sbomSha256", "releaseEnvelopeSha256", "releaseInputsSha256", "distributionManifestSha256"],
+      "properties": {
+        "tarballSha256": {"$ref": "#/$defs/sha256"},
+        "payloadSha256": {"$ref": "#/$defs/sha256"},
+        "sbomSha256": {"$ref": "#/$defs/sha256"},
+        "releaseEnvelopeSha256": {"$ref": "#/$defs/sha256"},
+        "releaseInputsSha256": {"$ref": "#/$defs/sha256"},
+        "distributionManifestSha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "receiptCohort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "verificationSha256", "workflow", "runId", "runAttempt"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "verificationSha256": {"$ref": "#/$defs/sha256"},
+        "workflow": {"const": ".github/workflows/distribution-observation.yml"},
+        "runId": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "runAttempt": {"type": "integer", "minimum": 1}
+      }
+    },
+    "contractAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"],
+      "properties": {
+        "producerRepository": {"const": "Runa-Laboratories/infra"},
+        "sourceCommit": {"$ref": "#/$defs/commit"},
+        "contractSha256": {"$ref": "#/$defs/sha256"},
+        "approvalAttestationSha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

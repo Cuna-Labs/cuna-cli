@@ -99,6 +99,15 @@ Commands that depend on an unavailable producer or runtime return a stable
 unsupported/capability error and do not simulate a machine, session, or
 successful mutation.
 
+### Foreground terminal keys
+
+When the foreground terminal capability becomes available, `Ctrl+]` is Runa's
+local escape prefix. `Ctrl+] ?` toggles trusted in-terminal help; `Ctrl+] 1`…
+`4` selects a tab, `Ctrl+] n` selects the next tab, `Ctrl+] d` detaches the
+local view, and `Ctrl+] Ctrl+]` sends a literal prefix to the cloud session.
+These keys are ignored as Runa commands inside bracketed paste. Ordinary
+`Ctrl+C` and `Ctrl+Z` continue to the selected cloud session.
+
 ## Configuration and authentication
 
 Configuration precedence is flag, environment, selected user profile, then the
@@ -115,6 +124,10 @@ authorities never fall back to each other.
 
 Never place API keys in command-line arguments, repository files, issue reports,
 terminal captures, or diagnostics.
+
+Keep endpoint protection enabled while installing or running Runa. A security
+detection blocks release and should be reported with the artifact digest and
+product log; Runa does not require antivirus exclusions.
 
 ## Architecture
 

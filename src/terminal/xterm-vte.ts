@@ -15,11 +15,13 @@ export const MAX_XTERM_RESPONSE_BYTES_PER_WRITE = 4_096;
 export const MAX_XTERM_ACTIVE_VIEWPORTS = 4;
 export const MAX_XTERM_GLOBAL_BUFFER_CELLS = 2_000_000;
 export const MAX_XTERM_GLOBAL_PENDING_WRITE_BYTES = MAX_TERMINAL_FRAME_BYTES * 4;
+export const MAX_XTERM_CELL_EXTENDERS = 64;
 const MAX_XTERM_RESPONSE_EVENTS_PER_SECOND = 256;
 const MAX_XTERM_RESPONSE_BYTES_PER_SECOND = 16_384;
 const XTERM_WRITE_TIMEOUT_MS = 5_000;
 const DEFAULT_RESPONSE_DELIVERY_TIMEOUT_MS = 2_000;
 const CONTAINED_OSC_IDENTIFIERS = Object.freeze([0, 1, 2, 8, 52] as const);
+const CELL_EXTENDER = /\p{M}|\u200d/u;
 
 export interface XtermTerminalResponse {
   readonly tabId: string;
@@ -110,6 +112,7 @@ export class XtermViewportAdapter {
   readonly #registry: ViewportRegistry;
   readonly #terminal: XtermTerminal;
   readonly #encoder = new TextEncoder();
+  readonly #complexityDecoder = new TextDecoder();
   readonly #scrollback: number;
   readonly #onTerminalResponse: XtermViewportOptions["onTerminalResponse"];
   readonly #clock: () => number;
@@ -118,6 +121,7 @@ export class XtermViewportAdapter {
   readonly #responseAbort = new AbortController();
   #writeTail: Promise<void> = Promise.resolve();
   #pendingWriteBytes = 0;
+  #cellExtenderRun = 0;
   #responseBatch: XtermTerminalResponse[] | undefined;
   #responseBatchBytes = 0;
   #responseOverflow = false;
@@ -207,7 +211,15 @@ export class XtermViewportAdapter {
     const payload = bytes.slice();
     const releaseGlobalPending = this.#resourceBudget.reservePending(this.#tabId, payload.byteLength);
     this.#pendingWriteBytes += payload.byteLength;
-    const operation = this.#writeTail.then(() => this.#writeNow(payload, outputSequence, replayCursor));
+    const operation = this.#writeTail.then(async () => {
+      try {
+        this.#assertCellComplexity(payload);
+        return await this.#writeNow(payload, outputSequence, replayCursor);
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
+    });
     this.#writeTail = operation.then(() => undefined, () => undefined);
     try {
       return await operation;
@@ -321,6 +333,20 @@ export class XtermViewportAdapter {
       bytes: bytes.slice(),
       signal: this.#responseAbort.signal,
     }));
+  }
+
+  #assertCellComplexity(bytes: Uint8Array): void {
+    const decoded = this.#complexityDecoder.decode(bytes, { stream: true });
+    for (const character of decoded) {
+      if (CELL_EXTENDER.test(character)) {
+        this.#cellExtenderRun += 1;
+        if (this.#cellExtenderRun > MAX_XTERM_CELL_EXTENDERS) {
+          throw new RangeError(`Terminal output exceeds the ${MAX_XTERM_CELL_EXTENDERS}-extender cell complexity limit.`);
+        }
+      } else {
+        this.#cellExtenderRun = 0;
+      }
+    }
   }
 
   #capture(outputSequence: bigint, replayCursor: bigint, localReflow = false): ViewportSnapshot {
