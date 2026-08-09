@@ -57,6 +57,7 @@ invariant(version?.data?.buildDigest === record.runtimeIdentity?.buildDigest, "R
 invariant(version?.data?.platform === record.environment?.platform, "Recorded local platform mismatch");
 invariant(version?.data?.architecture === record.environment?.architecture, "Recorded local architecture mismatch");
 invariant(version?.data?.updateChannel === "npm", "Recorded local artifact channel mismatch");
+invariant(record.observations?.uninstallCleanup === "PASS", "Recorded local uninstall cleanup did not pass");
 invariant(!Number.isNaN(Date.parse(record.generatedAt)), "Local evidence timestamp is invalid");
 
 process.stdout.write(`${JSON.stringify({

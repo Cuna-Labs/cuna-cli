@@ -1,11 +1,9 @@
-import { execFile } from "node:child_process";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import { invariant, parseArgs, readJson, sha256File, verifyEnvelopeFiles } from "./lib/release-evidence.mjs";
+import { assertInstalledProductAbsent, invokeInstalledRuna, runNpm } from "./lib/installed-candidate-probe.mjs";
 import { withOwnedTempDirectory } from "./lib/owned-temp.mjs";
 
-const execute = promisify(execFile);
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(args.get("root") ?? "release-artifacts");
 const receiptFile = path.resolve(args.get("receipt") ?? "evidence/platform-receipt.json");
@@ -13,7 +11,11 @@ const envelope = await readJson(path.join(root, "release-envelope.json"));
 await verifyEnvelopeFiles(envelope, root);
 
 let installed = false;
-const verification = await withOwnedTempDirectory("runa-cli-install-", async (prefix) => {
+let installedPrefix;
+const verification = await withOwnedTempDirectory("runa-cli-install-", async (ownedRoot) => {
+  const prefix = path.join(ownedRoot, "installed prefix with spaces");
+  installedPrefix = prefix;
+  await mkdir(prefix, { recursive: false });
   const emptyCache = path.join(prefix, "npm-cache");
   await mkdir(emptyCache, { recursive: false });
   await runNpm(["install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--cache", emptyCache, "--prefix", prefix, path.join(root, envelope.tarball.file)], {
@@ -22,14 +24,8 @@ const verification = await withOwnedTempDirectory("runa-cli-install-", async (pr
     maxBuffer: 8 * 1024 * 1024,
   });
   installed = true;
-  const executable = process.platform === "win32"
-    ? path.join(prefix, "node_modules", "@runa_laboratories", "cli", "dist", "bin", "runa.js")
-    : path.join(prefix, "bin", "runa");
-  if (process.platform === "win32") await stat(path.join(prefix, "runa.cmd"));
-  const runExecutable = process.platform === "win32" ? process.execPath : executable;
-  const executablePrefix = process.platform === "win32" ? [executable] : [];
-  const selfTest = await execute(runExecutable, [...executablePrefix, "self-test", "--offline", "--json"], { windowsHide: true, timeout: 30_000 });
-  const version = await execute(runExecutable, [...executablePrefix, "version", "--json"], { windowsHide: true, timeout: 30_000 });
+  const selfTest = await invokeInstalledRuna(prefix, ["self-test", "--offline", "--json"], { timeout: 30_000 });
+  const version = await invokeInstalledRuna(prefix, ["version", "--json"], { timeout: 30_000 });
   const selfTestJson = JSON.parse(selfTest.stdout);
   const versionJson = JSON.parse(version.stdout);
   invariant(selfTestJson.schema_version === "1" && selfTestJson.type === "result" && selfTestJson.command === "self-test", "Self-test envelope is invalid");
@@ -61,8 +57,9 @@ const verification = await withOwnedTempDirectory("runa-cli-install-", async (pr
     observedAt: new Date().toISOString(),
   };
 }, {
-  beforeRemove: async (prefix) => {
+  beforeRemove: async () => {
     if (!installed) return;
+    const prefix = installedPrefix;
     const cleanupCache = path.join(prefix, "npm-cleanup-cache");
     await mkdir(cleanupCache, { recursive: true });
     await runNpm(["uninstall", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--cache", cleanupCache, "--prefix", prefix, envelope.packageName], {
@@ -70,7 +67,7 @@ const verification = await withOwnedTempDirectory("runa-cli-install-", async (pr
       timeout: 180_000,
       maxBuffer: 8 * 1024 * 1024,
     });
-    for (const candidate of installedPaths(prefix)) await assertAbsent(candidate);
+    await assertInstalledProductAbsent(prefix);
   },
 });
 
@@ -81,38 +78,3 @@ await writeFile(
   { flag: "wx" },
 );
 process.stdout.write(`${JSON.stringify({ status: "installed-artifact-verified", platform: process.platform, architecture: process.arch })}\n`);
-
-async function runNpm(npmArgs, options) {
-  if (process.platform !== "win32") return execute("npm", npmArgs, options);
-  const where = await execute("where.exe", ["npm.cmd"], { windowsHide: true, timeout: 10_000 });
-  const npmCommand = where.stdout.split(/\r?\n/u).map((value) => value.trim()).find(Boolean);
-  invariant(npmCommand, "npm.cmd could not be resolved from PATH");
-  const npmCli = path.join(path.dirname(npmCommand), "node_modules", "npm", "bin", "npm-cli.js");
-  await stat(npmCli);
-  return execute(process.execPath, [npmCli, ...npmArgs], options);
-}
-
-function installedPaths(prefix) {
-  if (process.platform === "win32") {
-    return [
-      path.join(prefix, "runa"),
-      path.join(prefix, "runa.cmd"),
-      path.join(prefix, "runa.ps1"),
-      path.join(prefix, "node_modules", "@runa_laboratories", "cli"),
-    ];
-  }
-  return [
-    path.join(prefix, "bin", "runa"),
-    path.join(prefix, "lib", "node_modules", "@runa_laboratories", "cli"),
-  ];
-}
-
-async function assertAbsent(candidate) {
-  try {
-    await stat(candidate);
-  } catch (error) {
-    if (error?.code === "ENOENT") return;
-    throw error;
-  }
-  throw new Error(`Installed candidate artifact remains after uninstall: ${candidate}`);
-}

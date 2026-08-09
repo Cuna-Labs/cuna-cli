@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import { PACKAGE_NAME, REPOSITORY, invariant, parseArgs, readJson, sha256File } from "./lib/release-evidence.mjs";
+import { assertInstalledProductAbsent, invokeInstalledRuna, runNpm } from "./lib/installed-candidate-probe.mjs";
 import { validateCycloneDxSbom, validateSupportPolicy } from "./release-distribution-lib.mjs";
 
 const execute = promisify(execFile);
@@ -59,7 +60,8 @@ try {
   const supportSource = path.join(repositoryRoot, "packaging", "support-policy.json");
   validateSupportPolicy(await readJson(supportSource));
 
-  const installPrefix = path.join(temporaryRoot, "install-prefix");
+  const installPrefix = path.join(temporaryRoot, "installed prefix with spaces");
+  await mkdir(installPrefix, { recursive: false });
   const emptyCache = path.join(temporaryRoot, "empty-cache");
   await mkdir(emptyCache, { recursive: false });
   await runNpm(["install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--cache", emptyCache, "--prefix", installPrefix, tarballSource], {
@@ -67,22 +69,8 @@ try {
     timeout: 180_000,
     maxBuffer: 8 * 1024 * 1024,
   });
-  const executable = process.platform === "win32"
-    ? path.join(installPrefix, "node_modules", "@runa_laboratories", "cli", "dist", "bin", "runa.js")
-    : path.join(installPrefix, "bin", "runa");
-  if (process.platform === "win32") await stat(path.join(installPrefix, "runa.cmd"));
-  const runExecutable = process.platform === "win32" ? process.execPath : executable;
-  const executablePrefix = process.platform === "win32" ? [executable] : [];
-  const selfTestResult = await execute(runExecutable, [...executablePrefix, "self-test", "--offline", "--json"], {
-    windowsHide: true,
-    timeout: 30_000,
-    maxBuffer: 4 * 1024 * 1024,
-  });
-  const versionResult = await execute(runExecutable, [...executablePrefix, "version", "--json"], {
-    windowsHide: true,
-    timeout: 30_000,
-    maxBuffer: 4 * 1024 * 1024,
-  });
+  const selfTestResult = await invokeInstalledRuna(installPrefix, ["self-test", "--offline", "--json"], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+  const versionResult = await invokeInstalledRuna(installPrefix, ["version", "--json"], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
   const selfTest = JSON.parse(selfTestResult.stdout);
   const version = JSON.parse(versionResult.stdout);
   invariant(selfTest?.data?.ok === true, "Local installed-artifact self-test failed");
@@ -90,6 +78,15 @@ try {
   invariant(/^[0-9a-f]{64}$/.test(version?.data?.buildDigest), "Local installed build digest is invalid");
   invariant(version?.data?.platform === process.platform && version?.data?.architecture === process.arch, "Local runtime platform identity differs");
   invariant(version?.data?.updateChannel === "npm", "Local artifact channel is not npm");
+
+  const cleanupCache = path.join(temporaryRoot, "cleanup-cache");
+  await mkdir(cleanupCache, { recursive: false });
+  await runNpm(["uninstall", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--cache", cleanupCache, "--prefix", installPrefix, packageJson.name], {
+    windowsHide: true,
+    timeout: 180_000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  await assertInstalledProductAbsent(installPrefix);
 
   await mkdir(outputRoot, { recursive: true });
   const tarballFile = path.basename(tarballSource);
@@ -128,6 +125,7 @@ try {
       packageContents: { file: "package-contents.json", sha256: await sha256File(path.join(outputRoot, "package-contents.json")) },
       selfTest: { file: "self-test.json", sha256: await sha256File(path.join(outputRoot, "self-test.json")) },
       version: { file: "version.json", sha256: await sha256File(path.join(outputRoot, "version.json")) },
+      uninstallCleanup: "PASS",
     },
     environment: { platform: process.platform, architecture: process.arch, node: process.version, npm: npmVersion },
     generatedAt: new Date().toISOString(),
@@ -147,14 +145,4 @@ try {
 async function digestText(value) {
   const { createHash } = await import("node:crypto");
   return createHash("sha256").update(value).digest("hex");
-}
-
-async function runNpm(npmArgs, options) {
-  if (process.platform !== "win32") return execute("npm", npmArgs, { cwd: repositoryRoot, ...options });
-  const where = await execute("where.exe", ["npm.cmd"], { windowsHide: true, timeout: 10_000 });
-  const npmCommand = where.stdout.split(/\r?\n/).map((value) => value.trim()).find(Boolean);
-  invariant(npmCommand, "npm.cmd could not be resolved from PATH");
-  const npmCli = path.join(path.dirname(npmCommand), "node_modules", "npm", "bin", "npm-cli.js");
-  await stat(npmCli);
-  return execute(process.execPath, [npmCli, ...npmArgs], { cwd: repositoryRoot, ...options });
 }
