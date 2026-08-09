@@ -21,6 +21,39 @@ function writeLine(stream: Writable, value: string): void {
   stream.write(value.endsWith("\n") ? value : `${value}\n`);
 }
 
+/**
+ * Human terminal output is a trust boundary. Preserve only the two layout
+ * controls emitted deliberately by Runa; render every other C0/C1/Unicode
+ * format control visibly so API data and error text cannot execute ANSI/OSC,
+ * alter the title/clipboard, or spoof text direction.
+ */
+export function sanitizeHumanTerminalOutput(value: string): string {
+  let result = "";
+  for (const character of value) {
+    if (character === "\n" || character === "\t") {
+      result += character;
+      continue;
+    }
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (
+      codePoint <= 0x1f ||
+      (codePoint >= 0x7f && codePoint <= 0x9f) ||
+      /\p{Cf}/u.test(character)
+    ) {
+      result += codePoint <= 0xff
+        ? `\\x${codePoint.toString(16).padStart(2, "0")}`
+        : `\\u{${codePoint.toString(16)}}`;
+      continue;
+    }
+    result += character;
+  }
+  return result;
+}
+
+function sanitizeSingleLineHumanOutput(value: string): string {
+  return sanitizeHumanTerminalOutput(value).replaceAll("\n", "\\n").replaceAll("\t", "\\t");
+}
+
 export function createOutputWriter(input: {
   readonly streams: CliStreams;
   readonly json: boolean;
@@ -35,7 +68,7 @@ export function createOutputWriter(input: {
           JSON.stringify({ schema_version: OUTPUT_SCHEMA_VERSION, type: "result", command, data }),
         );
       } else {
-        writeLine(input.streams.stdout, human);
+        writeLine(input.streams.stdout, sanitizeHumanTerminalOutput(human));
       }
     },
     error(command, error) {
@@ -56,12 +89,14 @@ export function createOutputWriter(input: {
           }),
         );
       } else {
-        writeLine(input.streams.stderr, `Error [${error.code}]: ${error.message}`);
-        if (error.hint !== undefined) writeLine(input.streams.stderr, `Next: ${error.hint}`);
+        writeLine(input.streams.stderr, sanitizeSingleLineHumanOutput(`Error [${error.code}]: ${error.message}`));
+        if (error.hint !== undefined) {
+          writeLine(input.streams.stderr, sanitizeSingleLineHumanOutput(`Next: ${error.hint}`));
+        }
       }
     },
     text(value) {
-      writeLine(input.streams.stdout, value);
+      writeLine(input.streams.stdout, sanitizeHumanTerminalOutput(value));
     },
   };
   return Object.freeze(writer);

@@ -1,4 +1,11 @@
-import { isObject, optionalNumber, optionalString, requiredString } from "../core/validation.js";
+import {
+  isObject,
+  optionalDisplayString,
+  optionalNumber,
+  optionalString,
+  requiredDisplayString,
+  requiredString,
+} from "../core/validation.js";
 
 export type CapabilityAvailability =
   | "supported"
@@ -106,15 +113,15 @@ export interface MachinePage {
 
 function decodeMachine(value: unknown): Machine {
   if (!isObject(value)) throw new TypeError("Malformed machine");
-  const state = optionalString(value, "state") ?? optionalString(value, "status") ?? "unknown";
+  const state = optionalDisplayString(value, "state") ?? optionalDisplayString(value, "status") ?? "unknown";
   const memoryMiB = optionalNumber(value, "memory_mib");
   const vcpus = optionalNumber(value, "vcpus");
-  const agent = optionalString(value, "agent");
+  const agent = optionalDisplayString(value, "agent");
   const createdAt = optionalString(value, "created_at");
   const updatedAt = optionalString(value, "updated_at");
   return Object.freeze({
     id: requiredString(value, "id"),
-    name: optionalString(value, "name") ?? optionalString(value, "slug") ?? requiredString(value, "id"),
+    name: optionalDisplayString(value, "name") ?? optionalDisplayString(value, "slug") ?? requiredString(value, "id"),
     state,
     ...(agent === undefined ? {} : { agent }),
     ...(vcpus === undefined ? {} : { vcpus }),
@@ -213,9 +220,9 @@ function decodeAgentSession(value: unknown): AgentSession {
   return Object.freeze({
     id: requiredString(value, "id"),
     machineId: requiredString(value, "machine_id"),
-    name: requiredString(value, "name"),
+    name: requiredDisplayString(value, "name"),
     agent,
-    cwd: requiredString(value, "cwd"),
+    cwd: requiredDisplayString(value, "cwd"),
     authMode,
     desiredState,
     requestState,
