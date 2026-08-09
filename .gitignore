@@ -58,3 +58,24 @@ tmp/
 *.p12
 *.pfx
 *.jks
+
+# Local product-planning, architecture, and agent-control material
+/AGENTS.md
+/CLAUDE.md
+/IMPLEMENTATION-OBJECTIVE.md
+/CODE_OF_CONDUCT.md
+/prds/
+/architecture/
+/governance/
+/packaging/DISTRIBUTION-READINESS.md
+/packaging/EXTERNAL-SETUP.md
+/test/governance-requirement-traceability.test.mjs
+/.agents/
+/.claude/
+/.codex/
+/.codex-work/
+/audits/
+/docs/internal/
+/internal/
+/plans/
+/reviews/

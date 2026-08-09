@@ -33,3 +33,7 @@ updates:
       - github-actions
     commit-message:
       prefix: ci
+    groups:
+      github-actions:
+        patterns:
+          - "*"
