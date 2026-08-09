@@ -139,6 +139,42 @@ test("advertised native capability admits exactly one documented mutation", asyn
   assert.equal(JSON.parse(streams.stdout()).data.state, "creating");
 });
 
+test("machine lifecycle uses the producer-owned grouped capability ID", async () => {
+  const discoveries = [];
+  let transitions = 0;
+  const streams = memoryStreams();
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      discoveries.push({ scope, resourceId });
+      return capabilitySnapshot([{
+        id: "machines.lifecycle",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["machines:update"],
+      }]);
+    },
+    async transitionMachine(id, action) {
+      transitions += 1;
+      assert.equal(id, "m_1");
+      assert.equal(action, "pause");
+      return { id, name: "dev", state: "paused" };
+    },
+  });
+  const exit = await runCli(["machines", "pause", "m_1", "--yes"], {
+    streams: streams.streams,
+    platform,
+    env: { RUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(exit, EXIT_CODES.success);
+  assert.equal(transitions, 1);
+  assert.deepEqual(discoveries, [{ scope: "machine", resourceId: "m_1" }]);
+  assert.equal(JSON.parse(streams.stdout()).data.state, "paused");
+});
+
 test("reserved cloud-terminal commands fail explicitly instead of simulating a session", async () => {
   const streams = memoryStreams();
   const exit = await runCli(["claude"], { streams: streams.streams, platform, env: {} });

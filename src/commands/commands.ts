@@ -307,7 +307,11 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     if (parsed.operands.length !== 2) throw usageError(`machines ${action} requires exactly one machine ID.`);
     requireConfirmation(parsed, `machines.${action}`);
     const id = assertPublicId(requireOperand(parsed.operands, 1, "machine ID"), "machine ID");
-    await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: `machines.${action}`, now });
+    // The public capability registry deliberately groups the four reversible
+    // lifecycle transitions under one semantic authority. The operation path
+    // still binds the exact action; discovery must not invent per-action IDs
+    // that the producer never advertises.
+    await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.lifecycle", now });
     const machine = await client.transitionMachine(id, action);
     return Object.freeze({
       command: `machines.${action}`,
