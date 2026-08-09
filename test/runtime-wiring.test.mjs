@@ -84,7 +84,7 @@ class FakeWireConnection {
     this.incoming = new AsyncByteQueue();
     this.sent = [];
     this.closeCalls = [];
-    this.incoming.push(initialBytes);
+    if (initialBytes !== undefined) this.incoming.push(initialBytes);
   }
 
   receive() { return this.incoming; }
@@ -104,6 +104,7 @@ class FakeTerminalSystem {
     this.epochs = new Map();
     this.generation = 0;
     this.outputOnReady = new Map();
+    this.connectionsWithoutReady = new Set();
     this.connector = {
       connect: async (input) => {
         this.connectCalls.push({ ...input, token: "redacted-by-test" });
@@ -117,12 +118,14 @@ class FakeTerminalSystem {
           resizeCapability: "live",
         });
         const output = this.outputOnReady.get(grant.agentSessionId);
-        let initial = ready;
+        let initial = this.connectionsWithoutReady.has(this.connections.length + 1) ? undefined : ready;
         if (output !== undefined) {
           const frame = encodeTerminalFrame({ type: "output", critical: true, sequence: 1n, payload: output });
-          initial = new Uint8Array(ready.byteLength + frame.byteLength);
-          initial.set(ready);
-          initial.set(frame, ready.byteLength);
+          if (initial !== undefined) {
+            initial = new Uint8Array(ready.byteLength + frame.byteLength);
+            initial.set(ready);
+            initial.set(frame, ready.byteLength);
+          }
         }
         const connection = new FakeWireConnection(grant.terminalConnectionId, initial);
         this.connections.push(connection);
@@ -355,6 +358,31 @@ test("runtime reconnect obtains a fresh grant, preserves process epoch, and neve
   assert.equal(system.createCalls[1].resumeHandle, "resume-agent-a");
   assert.notEqual(system.connections[0].connectionId, system.connections[1].connectionId);
   assert.equal(system.connectCalls.length, 2);
+  await runtime.shutdown();
+});
+
+test("a transient reconnect handshake timeout preserves the old view authority for a later retry", async () => {
+  const system = new FakeTerminalSystem();
+  system.connectionsWithoutReady.add(2);
+  const { runtime } = createRuntime(system, { readyTimeoutMs: 5 });
+  const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.close();
+  await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "terminal did not become interrupted");
+
+  await assert.rejects(
+    runtime.reconnect({ tabId: "tab-a" }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_timeout",
+  );
+  const afterTimeout = runtime.listTerminals()[0];
+  assert.equal(afterTimeout.state, "interrupted");
+  assert.equal(afterTimeout.viewId, attached.viewId, "an unproven attachment cannot replace the active view authority");
+  assert.equal(afterTimeout.outputContinuity, "unknown");
+
+  const retried = await runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(retried.state, "active");
+  assert.notEqual(retried.viewId, attached.viewId);
+  assert.equal(retried.outputContinuity, "unknown");
+  assert.equal(system.createCalls.length, 3);
   await runtime.shutdown();
 });
 

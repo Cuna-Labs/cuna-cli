@@ -101,7 +101,14 @@ test("all projections bind the envelope and reject later byte substitution", asy
     bomFormat: "CycloneDX",
     specVersion: "1.6",
     version: 1,
-    metadata: { component: { type: "application", name: "@runa_laboratories/cli", version: valid.version } },
+    metadata: {
+      component: {
+        type: "application",
+        name: "@runa_laboratories/cli",
+        version: valid.version,
+        purl: `pkg:npm/%40runa_laboratories/cli@${valid.version}`,
+      },
+    },
   })}\n`);
   await writeFile(path.join(evidence, "support.json"), await readFile(path.join(repositoryRoot, "packaging", "support-policy.json")));
   const envelope = structuredClone(valid);

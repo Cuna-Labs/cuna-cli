@@ -262,6 +262,32 @@ test("pre-aborted HTTP requests perform no fetch effect", async () => {
   assert.equal(calls, 0);
 });
 
+test("HTTP timeout retryability fails closed for requests with ambiguous side effects", async () => {
+  const fetch = async (_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+  });
+  const transport = createHttpTransport({
+    baseUrl: "https://api.runacode.io",
+    timeoutMs: 5,
+    fetch,
+  });
+
+  for (const request of [
+    { method: "POST", path: "/v1/sessions", body: { name: "dev" }, idempotencyKey: "operation-1" },
+    { method: "DELETE", path: "/v1/sessions/m_1" },
+  ]) {
+    await assert.rejects(
+      transport.request(request),
+      (error) => error instanceof RunaError && error.code === "runa.network.timeout" && error.retryable === false,
+    );
+  }
+
+  await assert.rejects(
+    transport.request({ method: "GET", path: "/v1/sessions" }),
+    (error) => error instanceof RunaError && error.code === "runa.network.timeout" && error.retryable === true,
+  );
+});
+
 test("HTTP errors expose only stable safe metadata", async () => {
   const transport = createHttpTransport({
     baseUrl: "https://api.runacode.io",

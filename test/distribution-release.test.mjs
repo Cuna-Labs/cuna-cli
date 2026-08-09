@@ -30,7 +30,15 @@ async function createFixture() {
     specVersion: "1.6",
     serialNumber: "urn:uuid:97b8e913-1cf0-4f90-8a12-ace7670af258",
     version: 1,
-    metadata: { component: { type: "application", name: "@runa_laboratories/cli", version } },
+    metadata: {
+      component: {
+        type: "application",
+        name: "@runa_laboratories/cli",
+        version,
+        purl: `pkg:npm/%40runa_laboratories/cli@${version}`,
+        "bom-ref": `@runa_laboratories/cli@${version}`,
+      },
+    },
     components: [],
   };
   await writeFile(path.join(evidence, "sbom.cdx.json"), `${JSON.stringify(sbom)}\n`);
@@ -114,6 +122,30 @@ test("a syntactically valid but semantically mismatched SBOM is rejected", async
   fixture.envelope.sbom.sha256 = await sha256File(sbomFile);
   await writeFile(path.join(fixture.evidence, "release-envelope.json"), `${JSON.stringify(fixture.envelope, null, 2)}\n`);
   await assert.rejects(project(fixture), /SBOM component version differs/);
+});
+
+test("SBOM authority follows package identity rather than checkout-derived display metadata", async () => {
+  const fixture = await createFixture();
+  const sbomFile = path.join(fixture.evidence, fixture.envelope.sbom.file);
+  const sbom = JSON.parse(await readFile(sbomFile, "utf8"));
+  sbom.metadata.component.name = path.basename(fixture.root);
+  sbom.metadata.component["bom-ref"] = fixture.root;
+  await writeFile(sbomFile, `${JSON.stringify(sbom)}\n`);
+  fixture.envelope.sbom.sha256 = await sha256File(sbomFile);
+  await writeFile(path.join(fixture.evidence, "release-envelope.json"), `${JSON.stringify(fixture.envelope, null, 2)}\n`);
+  await assert.doesNotReject(project(fixture));
+});
+
+test("SBOM display metadata cannot substitute a different package identity", async () => {
+  const fixture = await createFixture();
+  const sbomFile = path.join(fixture.evidence, fixture.envelope.sbom.file);
+  const sbom = JSON.parse(await readFile(sbomFile, "utf8"));
+  sbom.metadata.component.name = "@runa_laboratories/cli";
+  sbom.metadata.component.purl = `pkg:npm/other-package@${fixture.envelope.version}`;
+  await writeFile(sbomFile, `${JSON.stringify(sbom)}\n`);
+  fixture.envelope.sbom.sha256 = await sha256File(sbomFile);
+  await writeFile(path.join(fixture.evidence, "release-envelope.json"), `${JSON.stringify(fixture.envelope, null, 2)}\n`);
+  await assert.rejects(project(fixture), /SBOM component identity differs/);
 });
 
 test("local projection evidence cannot be relabeled as a live channel", async () => {

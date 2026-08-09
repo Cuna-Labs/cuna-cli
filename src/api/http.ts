@@ -128,6 +128,14 @@ function parseJson(bytes: Uint8Array): unknown {
   }
 }
 
+function isRetryableAfterUnknownDispatch(request: HttpRequest): boolean {
+  // A transport timeout or failure cannot prove whether a mutating request
+  // reached the authority. An idempotency key alone is not reconciliation
+  // evidence, so mutations remain fail-closed until a producer contract
+  // explicitly exposes authoritative operation-status reconciliation.
+  return request.method === "GET";
+}
+
 export function createHttpTransport(input: {
   readonly baseUrl: string;
   readonly apiKey?: string;
@@ -234,11 +242,12 @@ export function createHttpTransport(input: {
       } catch (error) {
         if (error instanceof RunaError) throw error;
         if (controller.signal.aborted) {
+          const cancelledByCaller = request.signal?.aborted ?? false;
           throw new RunaError({
-            code: request.signal?.aborted ? "runa.network.cancelled" : "runa.network.timeout",
-            message: request.signal?.aborted ? "The Runa request was cancelled." : "The Runa request timed out.",
+            code: cancelledByCaller ? "runa.network.cancelled" : "runa.network.timeout",
+            message: cancelledByCaller ? "The Runa request was cancelled." : "The Runa request timed out.",
             exitCode: EXIT_CODES.network,
-            retryable: !request.signal?.aborted,
+            retryable: !cancelledByCaller && isRetryableAfterUnknownDispatch(request),
             cause: error,
           });
         }
@@ -246,7 +255,7 @@ export function createHttpTransport(input: {
           code: "runa.network.failed",
           message: "The Runa request failed before an authoritative result was received.",
           exitCode: EXIT_CODES.network,
-          retryable: request.method === "GET",
+          retryable: isRetryableAfterUnknownDispatch(request),
           cause: error,
         });
       } finally {

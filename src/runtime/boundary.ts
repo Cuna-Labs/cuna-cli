@@ -329,42 +329,53 @@ export class RunaRuntimeBoundary {
       throw runtimeFailure("session_conflict", "Only an interrupted terminal can reconnect.");
     }
     entry.state = "reconnecting";
+    entry.outputContinuity = "unknown";
     delete entry.reason;
     this.#publish(entry);
-    const admitted = await this.#admitRemoteTerminal(entry.observation.agentSessionId);
-    if (admitted.observation.processEpoch !== entry.observation.processEpoch) {
-      entry.state = "failed";
-      entry.reason = "process_generation_changed";
-      this.#publish(entry);
-      throw runtimeFailure("session_discontinuous", "The remote process generation changed; this terminal cannot be resumed.");
-    }
-    await entry.connection.close({ code: 1001, reason: "runa_reconnect" }).catch(() => undefined);
-    const grant = await this.#createGrant(admitted.observation, admitted.capability, entry.resumeHandle);
-    const connection = await this.#options.terminalConnector.connect({
-      url: grant.connectUrl,
-      token: grant.connectToken,
-      protocol: TERMINAL_PROTOCOL,
-      ...(input.signal === undefined ? {} : { signal: input.signal }),
-    });
+    let connection: TerminalWireConnection | undefined;
     try {
+      const admitted = await this.#admitRemoteTerminal(entry.observation.agentSessionId);
+      if (admitted.observation.processEpoch !== entry.observation.processEpoch) {
+        entry.state = "failed";
+        entry.outputContinuity = "incomplete";
+        entry.reason = "process_generation_changed";
+        this.#publish(entry);
+        throw runtimeFailure("session_discontinuous", "The remote process generation changed; this terminal cannot be resumed.");
+      }
+      await entry.connection.close({ code: 1001, reason: "runa_reconnect" }).catch(() => undefined);
+      const grant = await this.#createGrant(admitted.observation, admitted.capability, entry.resumeHandle);
+      if (grant.attachmentGeneration <= entry.fencingGeneration) {
+        throw runtimeFailure("grant_invalid", "The reconnect grant did not advance the attachment fence.");
+      }
+      connection = await this.#options.terminalConnector.connect({
+        url: grant.connectUrl,
+        token: grant.connectToken,
+        protocol: TERMINAL_PROTOCOL,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+      });
       const iterator = connection.receive()[Symbol.asyncIterator]();
       const previousViewId = entry.viewId;
-      entry.connection = connection;
-      entry.observation = admitted.observation;
-      entry.decoder = new TerminalFrameDecoder();
-      entry.fencingGeneration = grant.attachmentGeneration;
-      entry.viewId = viewId(entry.tabId, grant.attachmentGeneration);
-      entry.resumeHandle = grant.resumeHandle;
-      const bufferedFrames = await this.#awaitReady(entry, grant, iterator, input.signal);
-      entry.wireSequence += 1n;
-      await connection.send(encodeTerminalControl("resume", entry.wireSequence, {
-        resumeHandle: entry.resumeHandle,
+      const nextViewId = viewId(entry.tabId, grant.attachmentGeneration);
+      const nextDecoder = new TerminalFrameDecoder();
+      const candidate: TerminalEntry = {
+        ...entry,
+        viewId: nextViewId,
+        observation: admitted.observation,
+        connection,
+        decoder: nextDecoder,
+        fencingGeneration: grant.attachmentGeneration,
+        resumeHandle: grant.resumeHandle,
+      };
+      const bufferedFrames = await this.#awaitReady(candidate, grant, iterator, input.signal);
+      const resumeSequence = entry.wireSequence + 1n;
+      await connection.send(encodeTerminalControl("resume", resumeSequence, {
+        resumeHandle: grant.resumeHandle,
         afterOutputSequence: entry.outputSequence.toString(),
       }));
-      try { this.#views.detach(previousViewId); } catch { /* the prior view may already be detached */ }
       const previous = this.#views.require(previousViewId);
+      try { this.#views.detach(previousViewId); } catch { /* the prior view may already be detached */ }
       this.#views.open({
-        viewId: entry.viewId,
+        viewId: nextViewId,
         binding: {
           userId: admitted.observation.userId,
           machineId: admitted.observation.machineId,
@@ -376,6 +387,13 @@ export class RunaRuntimeBoundary {
         columns: previous.columns,
         rows: previous.rows,
       });
+      entry.connection = connection;
+      entry.observation = admitted.observation;
+      entry.decoder = nextDecoder;
+      entry.fencingGeneration = grant.attachmentGeneration;
+      entry.viewId = nextViewId;
+      entry.resumeHandle = grant.resumeHandle;
+      entry.wireSequence = resumeSequence;
       entry.state = "active";
       entry.outputContinuity = "unknown";
       for (const frame of bufferedFrames) this.#handleAttachedFrame(entry, frame);
@@ -383,10 +401,15 @@ export class RunaRuntimeBoundary {
       entry.pump = this.#pump(entry, iterator);
       return snapshot(entry);
     } catch (error) {
-      await connection.close({ code: 1008, reason: "runa_resume_rejected" }).catch(() => undefined);
-      entry.state = "interrupted";
-      entry.reason = safeReason(error);
-      this.#publish(entry);
+      if (connection !== undefined) {
+        await connection.close({ code: 1008, reason: "runa_resume_rejected" }).catch(() => undefined);
+      }
+      if (entry.state !== "failed") {
+        entry.state = "interrupted";
+        entry.outputContinuity = "unknown";
+        entry.reason = safeReason(error);
+        this.#publish(entry);
+      }
       throw error;
     }
   }
@@ -559,12 +582,14 @@ export class RunaRuntimeBoundary {
       }
       if (entry.state === "active" || entry.state === "reconnecting") {
         entry.state = "interrupted";
+        entry.outputContinuity = "unknown";
         entry.reason = "transport_closed_without_terminal_exit";
         this.#publish(entry);
       }
     } catch (error) {
       if (entry.state === "detached" || entry.state === "closed") return;
       entry.state = error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error" ? "failed" : "interrupted";
+      entry.outputContinuity = "unknown";
       entry.reason = safeReason(error);
       this.#publish(entry);
       await entry.connection.close({ code: 1002, reason: "runa_terminal_protocol_failure" }).catch(() => undefined);
