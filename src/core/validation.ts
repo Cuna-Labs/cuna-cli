@@ -7,6 +7,7 @@ const SAFE_CODE = /^[a-z][a-z0-9_.-]{0,127}$/u;
 // Runa display name, state label, or workspace path.
 const UNSAFE_DISPLAY_CHARACTER = /[\p{Cc}\p{Cf}]/u;
 const IDEMPOTENCY_KEY = /^[!-~]{8,128}$/u;
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 export function assertPublicId(value: string, label: string): string {
   if (!PUBLIC_ID.test(value)) {
@@ -17,6 +18,17 @@ export function assertPublicId(value: string, label: string): string {
 
 export function encodePublicId(value: string, label: string): string {
   return encodeURIComponent(assertPublicId(value, label));
+}
+
+export function assertCanonicalUuid(value: string, label: string): string {
+  if (!CANONICAL_UUID.test(value)) {
+    throw usageError(`Invalid ${label}.`, `${label} must be a canonical lowercase Runa UUID.`);
+  }
+  return value;
+}
+
+export function encodeCanonicalUuid(value: string, label: string): string {
+  return encodeURIComponent(assertCanonicalUuid(value, label));
 }
 
 export function assertIdempotencyKey(value: string): string {

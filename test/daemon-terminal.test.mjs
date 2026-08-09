@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -232,12 +233,54 @@ test("ready and acknowledgement control frames preserve PTY truth and non-execut
   });
   const ready = decodeTerminalFrame(readyWire);
   assert.equal(decodeTerminalControl(ready).processEpoch, "epoch-1");
+  const unfencedReady = encodeTerminalControl("ready", 0n, {
+    protocol: "runa.terminal.v1",
+    agentSessionId: "agent-1",
+    processEpoch: "epoch-1",
+    fencingGeneration: 0,
+    resizeCapability: "live",
+  });
+  assert.throws(
+    () => decodeTerminalControl(decodeTerminalFrame(unfencedReady)),
+    (error) => error instanceof TerminalProtocolError && error.code === "invalid_payload",
+  );
   const ackWire = encodeTerminalControl("acknowledgement", 4n, {
     clientSequence: "4",
     meaning: "durably_accepted_not_executed",
   });
   const ack = decodeTerminalControl(decodeTerminalFrame(ackWire));
   assert.equal(ack.meaning, "durably_accepted_not_executed");
+});
+
+test("terminal codec remains byte-identical to the cross-runtime golden oracle", async () => {
+  const fixture = JSON.parse(await readFile(
+    new URL("./fixtures/runa-terminal-v1-golden.json", import.meta.url),
+    "utf8",
+  ));
+  const vectors = fixture.vectors;
+  const output = encodeTerminalFrame({
+    type: "output",
+    critical: true,
+    sequence: BigInt(vectors.output.sequence),
+    payload: Uint8Array.from(Buffer.from(vectors.output.payload_hex, "hex")),
+  });
+  const heartbeat = encodeTerminalControl(
+    "heartbeat",
+    BigInt(vectors.heartbeat.sequence),
+    vectors.heartbeat.payload_json,
+  );
+  const ready = encodeTerminalControl(
+    "ready",
+    BigInt(vectors.ready.sequence),
+    vectors.ready.payload_json,
+  );
+  assert.equal(Buffer.from(output).toString("hex"), vectors.output.wire_hex);
+  assert.equal(Buffer.from(heartbeat).toString("hex"), vectors.heartbeat.wire_hex);
+  assert.equal(Buffer.from(ready).toString("hex"), vectors.ready.wire_hex);
+  assert.throws(
+    () => decodeTerminalFrame(Uint8Array.from(Buffer.from(fixture.rejected_legacy_wire_hex, "hex"))),
+    (error) => error instanceof TerminalProtocolError && error.code === "invalid_magic",
+  );
 });
 
 test("takeover fences delayed input, deduplicates replay, and never claims execution", () => {

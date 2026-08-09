@@ -7,6 +7,7 @@ import {
   decodeAgentSessionItem,
   decodeCapabilitySnapshot,
   decodeMachinePage,
+  decodeRunaIdentity,
   decodeTerminalConnectionGrant,
   decideCapability,
   RunaError,
@@ -63,6 +64,33 @@ test("future-dated and inverted capability evidence is unknown", () => {
     expires_at: "2099-01-01T00:00:00.000Z",
   });
   assert.equal(decideCapability(inverted, "machines.create", Date.parse("2098-01-01T00:00:00Z")).status, "unknown");
+});
+
+test("Runa identity decoder is closed and preserves only public account authority", () => {
+  const decoded = decodeRunaIdentity({
+    id: "11111111-1111-4111-8111-111111111111",
+    email: "developer@example.test",
+    workspace: {
+      assigned: true,
+      usage: { est_spend_usd: 1, est_remaining_usd: 49, note: "estimate" },
+    },
+  });
+  assert.deepEqual(decoded, {
+    id: "11111111-1111-4111-8111-111111111111",
+    email: "developer@example.test",
+    workspaceAssigned: true,
+  });
+  assert.throws(() => decodeRunaIdentity({
+    id: "not-a-uuid",
+    email: "developer@example.test",
+    workspace: { assigned: false, waitlist_position: 1 },
+  }));
+  assert.throws(() => decodeRunaIdentity({
+    id: "11111111-1111-4111-8111-111111111111",
+    email: "developer@example.test",
+    workspace: { assigned: true, usage: {} },
+    tenant_id: "forbidden",
+  }));
 });
 
 function agentSession(overrides = {}) {
@@ -306,10 +334,12 @@ test("machine transition rejects a producer response bound to a sibling machine"
   );
 });
 
-test("legacy array machine responses are decoded into a safe public page", () => {
-  const page = decodeMachinePage([{ id: "m_1", name: "dev", status: "running", memory_mib: 512, vcpus: 1, url: "https://internal.invalid" }]);
-  assert.deepEqual(page, { items: [{ id: "m_1", name: "dev", state: "running", vcpus: 1, memoryMiB: 512 }] });
+test("legacy array shape remains safe while canonical machine identity is enforced", () => {
+  const id = "22222222-2222-4222-8222-222222222222";
+  const page = decodeMachinePage([{ id, name: "dev", status: "running", memory_mib: 512, vcpus: 1, url: "https://internal.invalid" }]);
+  assert.deepEqual(page, { items: [{ id, name: "dev", state: "running", vcpus: 1, memoryMiB: 512 }] });
   assert.equal(JSON.stringify(page).includes("internal.invalid"), false);
+  assert.throws(() => decodeMachinePage([{ id: "m_1", name: "legacy", status: "running" }]));
 });
 
 test("HTTP transport binds origin, authorization, idempotency, and public path", async () => {

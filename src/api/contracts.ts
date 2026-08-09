@@ -120,7 +120,7 @@ function decodeMachine(value: unknown): Machine {
   const createdAt = optionalString(value, "created_at");
   const updatedAt = optionalString(value, "updated_at");
   return Object.freeze({
-    id: requiredString(value, "id"),
+    id: canonicalUuid(value, "id"),
     name: optionalDisplayString(value, "name") ?? optionalDisplayString(value, "slug") ?? requiredString(value, "id"),
     state,
     ...(agent === undefined ? {} : { agent }),
@@ -159,11 +159,25 @@ export function decodeRunaIdentity(value: unknown): RunaIdentity {
   const assigned = value.workspace.assigned;
   if (typeof assigned !== "boolean") throw new TypeError("Malformed Runa workspace identity");
   const workspaceKeys = Object.keys(value.workspace);
-  if (
-    assigned
-      ? workspaceKeys.some((key) => key !== "assigned" && key !== "usage") || !isObject(value.workspace.usage)
-      : workspaceKeys.some((key) => key !== "assigned" && key !== "waitlist_position") ||
-        !Number.isSafeInteger(value.workspace.waitlist_position) || Number(value.workspace.waitlist_position) < 0
+  if (assigned) {
+    if (
+      workspaceKeys.some((key) => key !== "assigned" && key !== "usage") ||
+      !isObject(value.workspace.usage) ||
+      Object.keys(value.workspace.usage).some(
+        (key) => key !== "est_spend_usd" && key !== "est_remaining_usd" && key !== "note",
+      ) ||
+      typeof value.workspace.usage.est_spend_usd !== "number" ||
+      !Number.isFinite(value.workspace.usage.est_spend_usd) ||
+      typeof value.workspace.usage.est_remaining_usd !== "number" ||
+      !Number.isFinite(value.workspace.usage.est_remaining_usd) ||
+      typeof value.workspace.usage.note !== "string"
+    ) {
+      throw new TypeError("Malformed Runa workspace identity");
+    }
+  } else if (
+    workspaceKeys.some((key) => key !== "assigned" && key !== "waitlist_position") ||
+    !Number.isSafeInteger(value.workspace.waitlist_position) ||
+    Number(value.workspace.waitlist_position) < 0
   ) {
     throw new TypeError("Malformed Runa workspace identity");
   }
@@ -247,8 +261,8 @@ function decodeAgentSession(value: unknown): AgentSession {
     throw new TypeError("Malformed field: row_version");
   }
   return Object.freeze({
-    id: requiredString(value, "id"),
-    machineId: requiredString(value, "machine_id"),
+    id: canonicalUuid(value, "id"),
+    machineId: canonicalUuid(value, "machine_id"),
     name: requiredDisplayString(value, "name"),
     agent,
     cwd: requiredDisplayString(value, "cwd"),
@@ -256,7 +270,11 @@ function decodeAgentSession(value: unknown): AgentSession {
     desiredState,
     requestState,
     processState,
-    ...(processEpoch === undefined ? {} : { processEpoch }),
+    ...(processEpoch === undefined
+      ? {}
+      : UUID.test(processEpoch)
+        ? { processEpoch }
+        : (() => { throw new TypeError("Malformed field: process_epoch"); })()),
     ...(runtimeObservedAt === undefined ? {} : { runtimeObservedAt }),
     ...(terminationRequestedAt === undefined ? {} : { terminationRequestedAt }),
     rowVersion,

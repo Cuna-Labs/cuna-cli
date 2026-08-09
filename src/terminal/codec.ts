@@ -255,6 +255,7 @@ function validateControlPayload(type: TerminalFrameType, value: Record<string, u
         !isIdentifier(value.agentSessionId) ||
         !isIdentifier(value.processEpoch) ||
         !Number.isSafeInteger(value.fencingGeneration) ||
+        Number(value.fencingGeneration) < 1 ||
         (value.resizeCapability !== "live" && value.resizeCapability !== "initial_resize_only")
       ) throwInvalidPayload();
       return;

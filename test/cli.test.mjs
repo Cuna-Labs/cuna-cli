@@ -187,6 +187,7 @@ test("interactive capabilities use memory bearer without opening login, and auth
 });
 
 test("machine list calls the real public legacy Machine projection", async () => {
+  const machineId = "22222222-2222-4222-8222-222222222222";
   const requests = [];
   const streams = memoryStreams();
   const exit = await runCli(["machines", "list"], {
@@ -195,12 +196,12 @@ test("machine list calls the real public legacy Machine projection", async () =>
     env: { RUNA_API_KEY: API_KEY },
     fetch: async (url, init) => {
       requests.push({ url: url.toString(), init });
-      return new Response(JSON.stringify([{ id: "m_1", name: "dev", status: "running" }]), { status: 200 });
+      return new Response(JSON.stringify([{ id: machineId, name: "dev", status: "running" }]), { status: 200 });
     },
   });
   assert.equal(exit, EXIT_CODES.success);
   assert.equal(requests[0].url, "https://api.runacode.io/v1/sessions");
-  assert.equal(JSON.parse(streams.stdout()).data.items[0].id, "m_1");
+  assert.equal(JSON.parse(streams.stdout()).data.items[0].id, machineId);
   assert.equal(streams.stdout().includes(API_KEY), false);
 });
 

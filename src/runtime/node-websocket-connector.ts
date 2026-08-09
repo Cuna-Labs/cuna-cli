@@ -149,10 +149,16 @@ export function createNodeWebSocketConnector(input: {
       };
       const onClose = (): void => {
         closed = true;
+        request.signal?.removeEventListener("abort", onActiveAbort);
         queue.close();
       };
       const onTransportError = (): void => {
         queue.fail(runtimeFailure("terminal_disconnected", "The terminal WebSocket transport failed.", { retryable: true }));
+        closeSocket(1011, "runa_transport_failure");
+      };
+      const onActiveAbort = (): void => {
+        queue.fail(runtimeFailure("terminal_disconnected", "Terminal attachment was cancelled."));
+        closeSocket(1000, "runa_cancelled");
       };
       socket.addEventListener("message", onMessage);
       socket.addEventListener("close", onClose);
@@ -195,6 +201,7 @@ export function createNodeWebSocketConnector(input: {
         socket.addEventListener("error", onEarlyError);
         request.signal?.addEventListener("abort", onAbort, { once: true });
       });
+      request.signal?.addEventListener("abort", onActiveAbort, { once: true });
 
       return Object.freeze({
         connectionId,
@@ -210,6 +217,7 @@ export function createNodeWebSocketConnector(input: {
           socket.send(bytes.slice());
         },
         async close(closeInput: { readonly code?: number; readonly reason?: string } = {}): Promise<void> {
+          request.signal?.removeEventListener("abort", onActiveAbort);
           queue.close();
           closeSocket(closeInput.code ?? 1000, closeInput.reason ?? "runa_closed");
         },

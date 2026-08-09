@@ -1,5 +1,10 @@
 import { EXIT_CODES, RunaError } from "../core/errors.js";
-import { assertIdempotencyKey, assertPublicId, assertSafeDisplayText, encodePublicId } from "../core/validation.js";
+import {
+  assertCanonicalUuid,
+  assertIdempotencyKey,
+  assertSafeDisplayText,
+  encodeCanonicalUuid,
+} from "../core/validation.js";
 import {
   decodeAgentSessionItem,
   decodeAgentSessionPage,
@@ -172,7 +177,7 @@ function validateAgentSessionCreate(input: AgentSessionCreateInput): void {
     });
   }
   if (input.credentialBindingId !== undefined) {
-    assertPublicId(input.credentialBindingId, "credential binding ID");
+    assertCanonicalUuid(input.credentialBindingId, "credential binding ID");
   }
 }
 
@@ -242,7 +247,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return decode(decodeMachineItem, raw);
     },
     async transitionMachine(id, action) {
-      const safeId = encodePublicId(id, "machine ID");
+      const safeId = encodeCanonicalUuid(id, "machine ID");
       const raw = await transport.request({
         method: "POST",
         path: `/v1/sessions/${safeId}/${action}`,
@@ -252,11 +257,11 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return machine;
     },
     async deleteMachine(id) {
-      const safeId = encodePublicId(id, "machine ID");
+      const safeId = encodeCanonicalUuid(id, "machine ID");
       return transport.request({ method: "DELETE", path: `/v1/sessions/${safeId}` });
     },
     async listAgentSessions(machineId, options = {}) {
-      const safeId = encodePublicId(machineId, "machine ID");
+      const safeId = encodeCanonicalUuid(machineId, "machine ID");
       const query = validatePageOptions(options);
       const raw = await transport.request({
         method: "GET",
@@ -268,7 +273,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return page;
     },
     async createAgentSession(machineId, input, idempotencyKey) {
-      const safeId = encodePublicId(machineId, "machine ID");
+      const safeId = encodeCanonicalUuid(machineId, "machine ID");
       validateAgentSessionCreate(input);
       const raw = await transport.request({
         method: "POST",
@@ -287,7 +292,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return assertAgentSessionBinding(decode(decodeAgentSessionItem, raw), { machineId });
     },
     async getAgentSession(id) {
-      const safeId = encodePublicId(id, "AgentSession ID");
+      const safeId = encodeCanonicalUuid(id, "AgentSession ID");
       return assertAgentSessionBinding(
         decode(
           decodeAgentSessionItem,
@@ -297,7 +302,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       );
     },
     async renameAgentSession(id, name) {
-      const safeId = encodePublicId(id, "AgentSession ID");
+      const safeId = encodeCanonicalUuid(id, "AgentSession ID");
       if (name.length < 1 || name.length > 80) {
         throw new RunaError({
           code: "runa.usage.invalid",
@@ -318,7 +323,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       );
     },
     async terminateAgentSession(id) {
-      const safeId = encodePublicId(id, "AgentSession ID");
+      const safeId = encodeCanonicalUuid(id, "AgentSession ID");
       return assertAgentSessionBinding(
         decode(
           decodeAgentSessionItem,
@@ -328,7 +333,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       );
     },
     async createTerminalConnection(agentSessionId, input, idempotencyKey) {
-      const safeId = encodePublicId(agentSessionId, "AgentSession ID");
+      const safeId = encodeCanonicalUuid(agentSessionId, "AgentSession ID");
       assertIdempotencyKey(idempotencyKey);
       if (!/^[A-Za-z0-9._:-]{1,256}$/u.test(input.clientInstanceId)) {
         throw new RunaError({
