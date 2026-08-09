@@ -70,10 +70,14 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
   const cells = active.viewport.cells.slice(0, viewportRows);
   for (let row = 0; row < viewportRows; row += 1) {
     const cell = cells[row] ?? "";
-    assertViewportCell(cell, input.columns);
-    text += `${ESC}${appbarRows + row + 1};1H${ESC}0m${ESC}2K${truncate(cell, input.columns)}`;
+    const displayWidth = active.viewport.displayWidths[row] ?? 0;
+    assertViewportCell(cell, displayWidth, input.columns);
+    text += `${ESC}${appbarRows + row + 1};1H${ESC}0m${ESC}2K${cell}`;
   }
-  text += `${ESC}0m${ESC}?25h`;
+  const cursorRow = Math.min(viewportRows - 1, Math.max(0, active.viewport.cursorY));
+  const cursorColumn = Math.min(input.columns - 1, Math.max(0, active.viewport.cursorX));
+  text += `${ESC}0m${ESC}${appbarRows + cursorRow + 1};${cursorColumn + 1}H`;
+  text += active.viewport.modes.cursorVisible ? `${ESC}?25h` : `${ESC}?25l`;
   return Object.freeze({
     bytes: new TextEncoder().encode(text),
     text,
@@ -159,8 +163,8 @@ function padLine(value: string, columns: number): string {
   return truncated + " ".repeat(Math.max(0, columns - [...truncated].length));
 }
 
-function assertViewportCell(value: string, columns: number): void {
-  if ([...value].length > columns) {
+function assertViewportCell(value: string, displayWidth: number, columns: number): void {
+  if (!Number.isSafeInteger(displayWidth) || displayWidth < 0 || displayWidth > columns) {
     throw new WorkbenchRenderError("invalid_dimensions", "A viewport cell exceeds the host frame width.");
   }
   for (const character of value) {

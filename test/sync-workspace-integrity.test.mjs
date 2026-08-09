@@ -385,7 +385,8 @@ test("supervisor clients share one owner, overflow reconciles, and only a fresh 
   assert.equal(first.supervisor, second.supervisor);
   assert.throws(() => registry.connect({ ...config, policyDigest: "foreign" }), (error) => error.code === "runa.workspace.supervisor_conflict");
 
-  const supervisor = new LocalSyncSupervisor(config);
+  const convergenceNow = Date.parse("2026-08-08T00:01:00.000Z");
+  const supervisor = new LocalSyncSupervisor(config, { clock: () => convergenceNow });
   supervisor.watcherOverflow();
   assert.deepEqual(supervisor.snapshot, { state: "reconciling", dirty: true, incrementalApplyPaused: true, reason: "watcher_overflow" });
   supervisor.confirmConvergence({
@@ -399,9 +400,36 @@ test("supervisor clients share one owner, overflow reconciles, and only a fresh 
     canonicalRevision: "revision-1",
     observedAt: "2026-08-08T00:00:00.000Z",
     expiresAt: "2026-08-08T00:10:00.000Z",
-  }, Date.parse("2026-08-08T00:01:00.000Z"));
+  }, convergenceNow);
   assert.equal(supervisor.snapshot.state, "converged");
   assert.equal(supervisor.snapshot.canonicalRevision, "revision-1");
+});
+
+test("expired convergence evidence cannot remain publicly converged", () => {
+  const config = { bindingId: "b", bindingGeneration: 1, canonicalRoot: "/root", policyDigest: "p", epoch: "e" };
+  let now = Date.parse("2026-08-08T00:01:00.000Z");
+  const supervisor = new LocalSyncSupervisor(config, { clock: () => now });
+  supervisor.confirmConvergence({
+    authority: "runa_workspace_service",
+    bindingId: "b",
+    bindingGeneration: 1,
+    epoch: "e",
+    policyDigest: "p",
+    localManifestRoot: digestA,
+    canonicalManifestRoot: digestA,
+    canonicalRevision: "revision-1",
+    observedAt: "2026-08-08T00:00:00.000Z",
+    expiresAt: "2026-08-08T00:02:00.000Z",
+  }, now);
+  assert.equal(supervisor.snapshot.state, "converged");
+  now = Date.parse("2026-08-08T00:02:00.000Z");
+  assert.deepEqual(supervisor.snapshot, {
+    state: "unknown",
+    dirty: true,
+    incrementalApplyPaused: true,
+    reason: "convergence_evidence_expired",
+    evidenceExpiresAt: "2026-08-08T00:02:00.000Z",
+  });
 });
 
 test("progress exposes measured counts and refuses local-only commit claims", () => {

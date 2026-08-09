@@ -159,6 +159,47 @@ test("AgentSession client rejects malformed page and auth bindings before transp
   assert.equal(requests, 0);
 });
 
+test("AgentSession client rejects producer responses bound to a sibling resource", async () => {
+  const requestedMachine = "22222222-2222-4222-8222-222222222222";
+  const requestedSession = "11111111-1111-4111-8111-111111111111";
+  const siblingMachine = "33333333-3333-4333-8333-333333333333";
+  const siblingSession = "44444444-4444-4444-8444-444444444444";
+
+  const machineMismatch = createRunaApiClient({
+    async request(request) {
+      if (request.method === "GET") return { items: [agentSession({ machine_id: siblingMachine })] };
+      return agentSession({ machine_id: siblingMachine });
+    },
+  });
+  await assert.rejects(
+    machineMismatch.listAgentSessions(requestedMachine),
+    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+  );
+  await assert.rejects(
+    machineMismatch.createAgentSession(requestedMachine, {
+      agent: "claude-code",
+      cwd: "/workspace",
+    }, "operation-sibling"),
+    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+  );
+
+  const sessionMismatch = createRunaApiClient({
+    async request() { return agentSession({ id: siblingSession }); },
+  });
+  await assert.rejects(
+    sessionMismatch.getAgentSession(requestedSession),
+    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+  );
+  await assert.rejects(
+    sessionMismatch.renameAgentSession(requestedSession, "renamed"),
+    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+  );
+  await assert.rejects(
+    sessionMismatch.terminateAgentSession(requestedSession),
+    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+  );
+});
+
 test("legacy array machine responses are decoded into a safe public page", () => {
   const page = decodeMachinePage([{ id: "m_1", name: "dev", status: "running", memory_mib: 512, vcpus: 1, url: "https://internal.invalid" }]);
   assert.deepEqual(page, { items: [{ id: "m_1", name: "dev", state: "running", vcpus: 1, memoryMiB: 512 }] });
