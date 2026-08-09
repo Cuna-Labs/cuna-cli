@@ -60,7 +60,7 @@ try {
   validateSupportPolicy(await readJson(supportSource));
 
   const installPrefix = path.join(temporaryRoot, "install-prefix");
-  await runNpm(["install", "--global", "--ignore-scripts", "--prefix", installPrefix, tarballSource], {
+  await runNpm(["install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--prefix", installPrefix, tarballSource], {
     windowsHide: true,
     timeout: 180_000,
     maxBuffer: 8 * 1024 * 1024,

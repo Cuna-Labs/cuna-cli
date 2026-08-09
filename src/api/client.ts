@@ -1,5 +1,5 @@
 import { EXIT_CODES, RunaError } from "../core/errors.js";
-import { encodePublicId } from "../core/validation.js";
+import { assertPublicId, encodePublicId } from "../core/validation.js";
 import {
   decodeAgentSessionItem,
   decodeAgentSessionPage,
@@ -7,6 +7,7 @@ import {
   decodeMachineItem,
   decodeMachinePage,
   type AgentKind,
+  type AgentAuthMode,
   type AgentSession,
   type AgentSessionPage,
   type CapabilityScope,
@@ -25,8 +26,16 @@ export interface MachineCreateInput {
 }
 
 export interface AgentSessionCreateInput {
+  readonly name?: string;
   readonly agent: AgentKind;
   readonly cwd: string;
+  readonly authMode?: AgentAuthMode;
+  readonly credentialBindingId?: string;
+}
+
+export interface PageOptions {
+  readonly limit?: number;
+  readonly cursor?: string;
 }
 
 export interface RunaApiClient {
@@ -35,13 +44,14 @@ export interface RunaApiClient {
   createMachine(input: MachineCreateInput, idempotencyKey: string): Promise<Machine>;
   transitionMachine(id: string, action: "start" | "pause" | "resume" | "stop"): Promise<Machine>;
   deleteMachine(id: string): Promise<unknown>;
-  listAgentSessions(machineId: string): Promise<AgentSessionPage>;
+  listAgentSessions(machineId: string, options?: PageOptions): Promise<AgentSessionPage>;
   createAgentSession(
     machineId: string,
     input: AgentSessionCreateInput,
     idempotencyKey: string,
   ): Promise<AgentSession>;
   getAgentSession(id: string): Promise<AgentSession>;
+  renameAgentSession(id: string, name: string): Promise<AgentSession>;
   terminateAgentSession(id: string): Promise<AgentSession>;
 }
 
@@ -60,6 +70,80 @@ function decode<T>(decoder: (value: unknown) => T, value: unknown): T {
   } catch (error) {
     if (error instanceof RunaError) throw error;
     throw malformed(error);
+  }
+}
+
+function containsAsciiControl(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
+function validatePageOptions(options: PageOptions): Readonly<Record<string, string>> {
+  if (
+    options.limit !== undefined &&
+    (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100)
+  ) {
+    throw new RunaError({
+      code: "runa.usage.invalid",
+      message: "AgentSession page limit must be an integer from 1 through 100.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
+  if (
+    options.cursor !== undefined &&
+    (options.cursor.length < 1 || options.cursor.length > 512 || containsAsciiControl(options.cursor))
+  ) {
+    throw new RunaError({
+      code: "runa.usage.invalid",
+      message: "AgentSession cursor is malformed.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
+  return Object.freeze({
+    ...(options.limit === undefined ? {} : { limit: String(options.limit) }),
+    ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
+  });
+}
+
+function validateAgentSessionCreate(input: AgentSessionCreateInput): void {
+  if (input.name !== undefined && (input.name.length < 1 || input.name.length > 80)) {
+    throw new RunaError({
+      code: "runa.usage.invalid",
+      message: "AgentSession name must contain 1 through 80 characters.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
+  if (
+    !input.cwd.startsWith("/workspace") ||
+    (input.cwd !== "/workspace" && !input.cwd.startsWith("/workspace/")) ||
+    input.cwd.length > 1024 ||
+    input.cwd.split("/").includes("..")
+  ) {
+    throw new RunaError({
+      code: "runa.usage.invalid",
+      message: "AgentSession cwd must be a safe absolute path inside /workspace.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
+  if (input.authMode === "credential_binding" && input.credentialBindingId === undefined) {
+    throw new RunaError({
+      code: "runa.usage.invalid",
+      message: "credential_binding auth mode requires a credential binding ID.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
+  if (input.authMode !== "credential_binding" && input.credentialBindingId !== undefined) {
+    throw new RunaError({
+      code: "runa.usage.invalid",
+      message: "A credential binding ID requires credential_binding auth mode.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
+  if (input.credentialBindingId !== undefined) {
+    assertPublicId(input.credentialBindingId, "credential binding ID");
   }
 }
 
@@ -104,20 +188,31 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       const safeId = encodePublicId(id, "machine ID");
       return transport.request({ method: "DELETE", path: `/v1/sessions/${safeId}` });
     },
-    async listAgentSessions(machineId) {
+    async listAgentSessions(machineId, options = {}) {
       const safeId = encodePublicId(machineId, "machine ID");
+      const query = validatePageOptions(options);
       const raw = await transport.request({
         method: "GET",
         path: `/v1/sessions/${safeId}/agent-sessions`,
+        query,
       });
       return decode(decodeAgentSessionPage, raw);
     },
     async createAgentSession(machineId, input, idempotencyKey) {
       const safeId = encodePublicId(machineId, "machine ID");
+      validateAgentSessionCreate(input);
       const raw = await transport.request({
         method: "POST",
         path: `/v1/sessions/${safeId}/agent-sessions`,
-        body: { agent: input.agent, cwd: input.cwd },
+        body: {
+          ...(input.name === undefined ? {} : { name: input.name }),
+          agent: input.agent,
+          cwd: input.cwd,
+          ...(input.authMode === undefined ? {} : { auth_mode: input.authMode }),
+          ...(input.credentialBindingId === undefined
+            ? {}
+            : { credential_binding_id: input.credentialBindingId }),
+        },
         idempotencyKey,
       });
       return decode(decodeAgentSessionItem, raw);
@@ -127,6 +222,24 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return decode(
         decodeAgentSessionItem,
         await transport.request({ method: "GET", path: `/v1/agent-sessions/${safeId}` }),
+      );
+    },
+    async renameAgentSession(id, name) {
+      const safeId = encodePublicId(id, "AgentSession ID");
+      if (name.length < 1 || name.length > 80) {
+        throw new RunaError({
+          code: "runa.usage.invalid",
+          message: "AgentSession name must contain 1 through 80 characters.",
+          exitCode: EXIT_CODES.usage,
+        });
+      }
+      return decode(
+        decodeAgentSessionItem,
+        await transport.request({
+          method: "PATCH",
+          path: `/v1/agent-sessions/${safeId}`,
+          body: { name },
+        }),
       );
     },
     async terminateAgentSession(id) {
@@ -149,7 +262,9 @@ export function decideCapability(
   capabilityId: string,
   now = Date.now(),
 ): CapabilityDecision {
-  if (Date.parse(snapshot.expiresAt) <= now) {
+  const observedAt = Date.parse(snapshot.observedAt);
+  const expiresAt = Date.parse(snapshot.expiresAt);
+  if (expiresAt <= now || observedAt > now + 60_000 || expiresAt <= observedAt) {
     return Object.freeze({ status: "unknown", capabilityId, reason: "snapshot_expired" });
   }
   const matches = snapshot.capabilities.filter((capability) => capability.id === capabilityId);
@@ -196,6 +311,21 @@ export async function requireCapability(input: {
       });
     }
     throw error;
+  }
+  if (
+    snapshot.subjectScope !== input.scope ||
+    (input.scope !== "account" && snapshot.subjectId !== input.resourceId)
+  ) {
+    throw new RunaError({
+      code: "runa.capability.unknown",
+      message: `Runa cannot currently authorize the ${input.capabilityId} capability.`,
+      exitCode: EXIT_CODES.unsupported,
+      details: {
+        capability_id: input.capabilityId,
+        availability: "unknown",
+        reason: "subject_scope_mismatch",
+      },
+    });
   }
   const decision = decideCapability(snapshot, input.capabilityId, input.now);
   if (decision.status === "supported") return;

@@ -45,6 +45,7 @@ test("offline self-test is network-free and reports explicit checks", async () =
   assert.equal(record.data.ok, true);
   assert.equal(record.data.mode, "offline");
   assert.equal(record.data.checks.network_requests, 0);
+  assert.equal(record.data.checks.virtual_terminal, true);
   assert.match(record.data.buildDigest, /^[0-9a-f]{64}$/u);
 });
 

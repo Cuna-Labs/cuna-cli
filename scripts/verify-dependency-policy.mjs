@@ -23,6 +23,15 @@ const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "
 for (const section of ["dependencies", "optionalDependencies", "devDependencies"]) {
   for (const [name, version] of Object.entries(packageJson[section] ?? {})) {
     if (/^(git\+|git:|https?:|file:|github:|workspace:)/.test(version)) findings.push(`${section}.${name}: prohibited source ${version}`);
+    if ((section === "dependencies" || section === "optionalDependencies") && !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) {
+      findings.push(`${section}.${name}: runtime dependencies must use an exact version, received ${version}`);
+    }
+    if (section === "dependencies" || section === "optionalDependencies") {
+      const locked = lock.packages[`node_modules/${name}`];
+      if (locked === undefined || locked.version !== version) {
+        findings.push(`${section}.${name}: lock entry does not match exact runtime version ${version}`);
+      }
+    }
   }
 }
 

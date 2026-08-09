@@ -77,7 +77,7 @@ export function normalizeRelativeFile(value, label) {
 
 export function immutableCommands(version) {
   return Object.freeze({
-    npm: `npm install -g --ignore-scripts --registry=${REGISTRY} ${PACKAGE_NAME}@${version}`,
+    npm: `npm install -g --ignore-scripts --no-audit --no-fund --registry=${REGISTRY} ${PACKAGE_NAME}@${version}`,
     bun: `bun add --global --ignore-scripts --registry=${REGISTRY} ${PACKAGE_NAME}@${version}`,
     curl: CHANNEL_DEFINITIONS.curl.publicCommand,
     homebrew: CHANNEL_DEFINITIONS.homebrew.publicCommand,

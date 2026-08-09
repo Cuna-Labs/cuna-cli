@@ -88,6 +88,7 @@ test("all approved channels are deterministic projections of one blocked local c
   const secondManifest = await readFile(path.join(secondOutput, "distribution-manifest.json"), "utf8");
   assert.equal(firstManifest, secondManifest);
   for (const definition of Object.values(CHANNEL_DEFINITIONS)) {
+    assert.doesNotMatch(await readFile(path.join(fixture.distributions, definition.projectionFile), "utf8"), /\r/);
     assert.equal(
       await sha256File(path.join(fixture.distributions, definition.projectionFile)),
       await sha256File(path.join(secondOutput, definition.projectionFile)),

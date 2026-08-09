@@ -39,6 +39,7 @@ for (const entry of entries) {
     entry.name === "package/package.json" ||
       entry.name === "package/LICENSE" ||
       entry.name === "package/NOTICE" ||
+      entry.name === "package/THIRD_PARTY_NOTICES.md" ||
       entry.name === "package/README.md" ||
       entry.name.startsWith("package/dist/"),
     `Unexpected npm tarball content: ${entry.name}`,
@@ -61,7 +62,7 @@ for (const entry of entries) {
   }
 }
 
-for (const required of ["package/package.json", "package/LICENSE", "package/NOTICE", "package/README.md"]) {
+for (const required of ["package/package.json", "package/LICENSE", "package/NOTICE", "package/THIRD_PARTY_NOTICES.md", "package/README.md"]) {
   invariant(normalized.has(required.toLowerCase()), `Required package file is absent: ${required}`);
 }
 const packageEntry = entries.find((entry) => entry.name === "package/package.json");

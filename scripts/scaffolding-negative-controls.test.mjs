@@ -58,10 +58,16 @@ test("curl template verifies before installing and suppresses lifecycle scripts"
 
 test("all projections bind the envelope and reject later byte substitution", async () => {
   const evidence = await mkdtemp(path.join(tmpdir(), "runa-projection-evidence-"));
-  const output = await mkdtemp(path.join(tmpdir(), "runa-projection-output-"));
+  const legacyOutput = await mkdtemp(path.join(tmpdir(), "runa-projection-legacy-"));
+  const authoritativeOutput = await mkdtemp(path.join(tmpdir(), "runa-projection-authoritative-"));
   await writeFile(path.join(evidence, "runa.tgz"), "candidate");
-  await writeFile(path.join(evidence, "sbom.json"), "{}");
-  await writeFile(path.join(evidence, "support.json"), "{}");
+  await writeFile(path.join(evidence, "sbom.json"), `${JSON.stringify({
+    bomFormat: "CycloneDX",
+    specVersion: "1.6",
+    version: 1,
+    metadata: { component: { type: "application", name: "@runa_laboratories/cli", version: valid.version } },
+  })}\n`);
+  await writeFile(path.join(evidence, "support.json"), await readFile(path.join(repositoryRoot, "packaging", "support-policy.json")));
   const envelope = structuredClone(valid);
   envelope.tarball.sha256 = await sha256File(path.join(evidence, "runa.tgz"));
   envelope.tarball.size = 9;
@@ -73,23 +79,50 @@ test("all projections bind the envelope and reject later byte substitution", asy
     "scripts/project-distributions.mjs",
     "--root", repositoryRoot,
     "--evidence", evidence,
-    "--output", output,
+    "--output", legacyOutput,
   ], { cwd: repositoryRoot });
   await execute(process.execPath, [
     "scripts/verify-distribution-projections.mjs",
     "--root", repositoryRoot,
     "--evidence", evidence,
-    "--projections", output,
+    "--projections", legacyOutput,
+  ], { cwd: repositoryRoot });
+  await execute(process.execPath, [
+    "scripts/release-project-distributions.mjs",
+    "--root", repositoryRoot,
+    "--evidence", evidence,
+    "--output", authoritativeOutput,
+  ], { cwd: repositoryRoot });
+  await execute(process.execPath, [
+    "scripts/verify-release-distributions.mjs",
+    "--root", repositoryRoot,
+    "--evidence", evidence,
+    "--distributions", authoritativeOutput,
   ], { cwd: repositoryRoot });
 
-  await chmod(path.join(output, "install.sh"), 0o644);
-  await writeFile(path.join(output, "install.sh"), "substituted\n");
+  for (const relative of [
+    "distribution-manifest.json",
+    "npm/install-command.txt",
+    "bun/install-command.txt",
+    "curl/install.sh",
+    "homebrew/runa.rb",
+    "aur/PKGBUILD",
+  ]) {
+    assert.equal(
+      await sha256File(path.join(legacyOutput, relative)),
+      await sha256File(path.join(authoritativeOutput, relative)),
+      `legacy compatibility entry point diverged for ${relative}`,
+    );
+  }
+
+  await chmod(path.join(legacyOutput, "curl", "install.sh"), 0o644);
+  await writeFile(path.join(legacyOutput, "curl", "install.sh"), "substituted\n");
   await assert.rejects(
     execute(process.execPath, [
       "scripts/verify-distribution-projections.mjs",
       "--root", repositoryRoot,
       "--evidence", evidence,
-      "--projections", output,
+      "--projections", legacyOutput,
     ], { cwd: repositoryRoot }),
   );
 });
