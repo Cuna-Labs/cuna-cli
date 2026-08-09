@@ -34,15 +34,16 @@ export interface CommandContext {
   readonly config: EffectiveConfig;
   readonly client: RunaApiClient;
   readonly now: number;
+  readonly credentialMode?: "automation" | "interactive";
 }
 
-function requireAutomationCredential(config: EffectiveConfig): void {
-  if (config.apiKey !== undefined) return;
+function requireCredential(context: CommandContext): void {
+  if (context.credentialMode !== undefined) return;
   throw new RunaError({
     code: "runa.auth.required",
     message: "This command requires a Runa credential.",
     exitCode: EXIT_CODES.auth,
-    hint: "Set RUNA_API_KEY for explicit automation. Browser login is not available in this build.",
+    hint: "Run `runa login` for interactive use or set RUNA_API_KEY for explicit automation.",
   });
 }
 
@@ -168,7 +169,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     }
     case "capabilities": {
       rejectUnknownOptions(parsed, ["scope", "resource-id"]);
-      requireAutomationCredential(config);
+      requireCredential(context);
       const scope = stringOption(parsed, "scope") ?? "account";
       if (scope !== "account" && scope !== "machine" && scope !== "agent_session") {
         throw usageError("Option --scope must be account, machine, or agent_session.");
@@ -197,7 +198,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     case "login":
     case "logout":
     case "whoami":
-      throw unsupportedError("browser authentication", "browser_auth_contract_unavailable");
+      throw unsupportedError("browser authentication", "browser_auth_dispatch_unavailable");
     case "claude":
     case "codex":
     case "openclaw":
@@ -301,8 +302,8 @@ async function verifyVirtualTerminalInterop(): Promise<boolean> {
 }
 
 async function executeMachines(context: CommandContext): Promise<CommandResult> {
-  const { parsed, config, client, now } = context;
-  requireAutomationCredential(config);
+  const { parsed, client, now } = context;
+  requireCredential(context);
   const action = requireOperand(parsed.operands, 0, "machines action");
   if (action === "list") {
     rejectUnknownOptions(parsed, []);
@@ -374,8 +375,8 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
 }
 
 async function executeAgentSessions(context: CommandContext): Promise<CommandResult> {
-  const { parsed, config, client, now } = context;
-  requireAutomationCredential(config);
+  const { parsed, client, now } = context;
+  requireCredential(context);
   const action = requireOperand(parsed.operands, 0, "agent-sessions action");
   if (action === "list") {
     rejectUnknownOptions(parsed, ["machine", "limit", "cursor"]);

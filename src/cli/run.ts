@@ -2,15 +2,22 @@ import { Writable } from "node:stream";
 
 import { createRunaApiClient, type RunaApiClient } from "../api/client.js";
 import { createHttpTransport } from "../api/http.js";
+import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
+import { createHumanAuthClient } from "../auth/human-client.js";
+import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { packageBuildDigest, PROTOCOL_RANGE, UPDATE_CHANNEL } from "../build-identity.js";
 import { resolveConfig, type EffectiveConfig } from "../config/config.js";
 import { executeCommand } from "../commands/commands.js";
-import { EXIT_CODES, normalizeError, usageError, type ExitCode } from "../core/errors.js";
+import { EXIT_CODES, normalizeError, RunaError, usageError, type ExitCode } from "../core/errors.js";
+import { CredentialBoundaryError } from "../credentials/errors.js";
+import { createPlatformCredentialBackend } from "../credentials/platform.js";
+import { CredentialVault } from "../credentials/vault.js";
 import { createPlatformAdapter, type PlatformAdapter } from "../platform/adapter.js";
 import { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "../version.js";
 import { ROOT_HELP } from "./help.js";
 import { createOutputWriter, type CliStreams } from "./output.js";
 import { booleanOption, parseArgv, stringOption } from "./parser.js";
+import { rejectUnknownOptions } from "./parser.js";
 
 export interface RunCliDependencies {
   readonly env?: NodeJS.ProcessEnv;
@@ -19,6 +26,10 @@ export interface RunCliDependencies {
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
   readonly clientFactory?: (config: EffectiveConfig, timeoutMs: number) => RunaApiClient;
+  readonly humanAuth?: HumanAuthService;
+  readonly credentialVault?: CredentialVault;
+  readonly browser?: BrowserOpener;
+  readonly signal?: AbortSignal;
 }
 
 function defaultStreams(): CliStreams {
@@ -41,6 +52,25 @@ function parseTimeout(raw: string | undefined): number {
 
 function commandLabel(argv: readonly string[]): string {
   return argv.find((item) => !item.startsWith("-")) ?? "root";
+}
+
+function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    profile: result.profile,
+    session_id: result.sessionId,
+    required_terms_version: result.context.requiredTermsVersion,
+    identity: result.context.identity,
+    admission: result.context.admission,
+    workspace: {
+      state: result.context.workspace.state,
+      ...(result.context.workspace.id === undefined ? {} : { id: result.context.workspace.id }),
+    },
+    ...(result.context.waitlistPosition === undefined ? {} : { waitlist_position: result.context.waitlistPosition }),
+  });
+}
+
+function needsRemoteCredential(command: string | undefined): boolean {
+  return command === "capabilities" || command === "machines" || command === "agent-sessions";
 }
 
 export async function runCli(argv: readonly string[], dependencies: RunCliDependencies = {}): Promise<ExitCode> {
@@ -97,25 +127,90 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(configFile === undefined ? {} : { configFile }),
       },
     });
-    const client = dependencies.clientFactory?.(config, timeoutMs) ??
-      createRunaApiClient(
-        createHttpTransport({
-          baseUrl: config.baseUrl,
-          apiKey: config.apiKey ?? "missing",
-          timeoutMs,
-          ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
+    let humanAuth = dependencies.humanAuth;
+    const getHumanAuth = (): HumanAuthService => {
+      if (humanAuth !== undefined) return humanAuth;
+      const transportOptions = {
+        baseUrl: config.baseUrl,
+        timeoutMs,
+        ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
+      };
+      const humanClient = createHumanAuthClient({
+        anonymous: createHttpTransport(transportOptions),
+        authenticated: (accessToken) => createHttpTransport({ ...transportOptions, bearerToken: accessToken }),
+      });
+      humanAuth = createHumanAuthService({
+        config,
+        client: humanClient,
+        vault: dependencies.credentialVault ?? new CredentialVault({
+          backend: createPlatformCredentialBackend(),
+          ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
         }),
-      );
+        browser: dependencies.browser ?? createBrowserOpener(),
+        ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
+      });
+      return humanAuth;
+    };
+
+    if (parsed.command === "login" || parsed.command === "logout" || parsed.command === "whoami") {
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands.`);
+      if (config.apiKey !== undefined) {
+        throw new RunaError({
+          code: "runa.auth.mode_conflict",
+          message: "Interactive authentication is disabled while RUNA_API_KEY selects automation mode.",
+          exitCode: EXIT_CODES.auth,
+          hint: "Unset RUNA_API_KEY before managing the interactive session.",
+        });
+      }
+      if (parsed.command === "login") {
+        const result = await getHumanAuth().login(
+          dependencies.signal === undefined ? {} : { signal: dependencies.signal },
+        );
+        const data = humanResult(result);
+        writer.success("login", data, `Signed in to Runa profile ${result.profile}.`);
+      } else if (parsed.command === "whoami") {
+        const result = await getHumanAuth().whoami(dependencies.signal);
+        const data = humanResult(result);
+        writer.success("whoami", data, `${result.context.identity}\t${result.context.admission}\t${result.context.workspace.state}`);
+      } else {
+        const result = await getHumanAuth().logout(dependencies.signal);
+        writer.success("logout", result, "Signed out of Runa on this device.");
+      }
+      return EXIT_CODES.success;
+    }
+
+    let bearerToken: string | undefined;
+    let credentialMode: "automation" | "interactive" | undefined = config.apiKey === undefined ? undefined : "automation";
+    if (config.apiKey === undefined && needsRemoteCredential(parsed.command) && dependencies.clientFactory === undefined) {
+      bearerToken = await getHumanAuth().acquireAccessToken(dependencies.signal);
+      credentialMode = "interactive";
+    }
+    const client = dependencies.clientFactory?.(config, timeoutMs) ?? createRunaApiClient(createHttpTransport({
+      baseUrl: config.baseUrl,
+      ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
+      ...(bearerToken === undefined ? {} : { bearerToken }),
+      timeoutMs,
+      ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
+    }));
     const result = await executeCommand({
       parsed,
       config,
       client,
       now: dependencies.now?.() ?? Date.now(),
+      ...(credentialMode === undefined ? {} : { credentialMode }),
     });
     writer.success(result.command, result.data, result.human);
     return EXIT_CODES.success;
   } catch (unknownError) {
-    const error = normalizeError(unknownError);
+    const error = unknownError instanceof CredentialBoundaryError
+      ? new RunaError({
+          code: `runa.auth.${unknownError.code}`,
+          message: unknownError.message,
+          exitCode: EXIT_CODES.auth,
+          retryable: unknownError.retryable,
+        })
+      : normalizeError(unknownError);
     writer.error(label, error);
     return error.exitCode;
   }

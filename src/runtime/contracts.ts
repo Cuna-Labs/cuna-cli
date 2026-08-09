@@ -54,8 +54,8 @@ export const INITIAL_RUNTIME_GATES: readonly RuntimeFeatureGate[] = Object.freez
   }),
   Object.freeze({
     feature: "browser_auth",
-    implementation: "unsupported",
-    reason: "browser_auth_contract_unavailable",
+    implementation: "available",
+    reason: "polling_continuation_v1_3",
   }),
   Object.freeze({
     feature: "local_companion",

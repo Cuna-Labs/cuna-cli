@@ -10,6 +10,7 @@ export interface HttpRequest {
   readonly query?: Readonly<Record<string, string | undefined>>;
   readonly body?: unknown;
   readonly idempotencyKey?: string;
+  readonly continuationSecret?: string;
   readonly signal?: AbortSignal;
 }
 
@@ -17,7 +18,12 @@ export interface HttpTransport {
   request(input: HttpRequest): Promise<unknown>;
 }
 
-function apiError(status: number, requestId: string | undefined, body: unknown): RunaError {
+function apiError(
+  status: number,
+  requestId: string | undefined,
+  body: unknown,
+  credentialKind: "api_key" | "interactive" | "anonymous",
+): RunaError {
   const reason = isObject(body) ? safeReasonCode(body.code) ?? safeReasonCode(body.error) : undefined;
   const details = {
     http_status: status,
@@ -29,7 +35,11 @@ function apiError(status: number, requestId: string | undefined, body: unknown):
       code: "runa.auth.rejected",
       message: "Runa rejected the current credential.",
       exitCode: EXIT_CODES.auth,
-      hint: "Replace RUNA_API_KEY or use browser login when that capability is available.",
+      hint: credentialKind === "interactive"
+        ? "Run `runa login` to reauthenticate this interactive session."
+        : credentialKind === "api_key"
+          ? "Replace RUNA_API_KEY with a valid automation credential."
+          : "Run `runa login` or provide the required request authority.",
       details,
     });
   }
@@ -120,10 +130,26 @@ function parseJson(bytes: Uint8Array): unknown {
 
 export function createHttpTransport(input: {
   readonly baseUrl: string;
-  readonly apiKey: string;
+  readonly apiKey?: string;
+  readonly bearerToken?: string;
   readonly timeoutMs?: number;
   readonly fetch?: typeof globalThis.fetch;
 }): HttpTransport {
+  if (input.apiKey !== undefined && input.bearerToken !== undefined) {
+    throw new TypeError("HTTP transport accepts exactly one credential authority.");
+  }
+  const credential = input.apiKey ?? input.bearerToken;
+  const credentialKind = input.apiKey !== undefined
+    ? "api_key" as const
+    : input.bearerToken !== undefined
+      ? "interactive" as const
+      : "anonymous" as const;
+  if (
+    credential !== undefined &&
+    !/^runa_(?:sk_[A-Za-z0-9_-]{16,256}|at_[A-Za-z0-9_-]{43})$/u.test(credential)
+  ) {
+    throw new TypeError("HTTP transport credential is invalid.");
+  }
   const fetcher = input.fetch ?? globalThis.fetch;
   const timeoutMs = input.timeoutMs ?? 15_000;
   return Object.freeze({
@@ -132,6 +158,16 @@ export function createHttpTransport(input: {
         throw new RunaError({
           code: "runa.internal.invalid_api_path",
           message: "Runa refused an invalid API operation.",
+          exitCode: EXIT_CODES.internal,
+        });
+      }
+      if (
+        request.continuationSecret !== undefined &&
+        !/^runa_ct_[A-Za-z0-9_-]{43}$/u.test(request.continuationSecret)
+      ) {
+        throw new RunaError({
+          code: "runa.internal.invalid_continuation_secret",
+          message: "Runa refused an invalid continuation credential.",
           exitCode: EXIT_CODES.internal,
         });
       }
@@ -168,10 +204,13 @@ export function createHttpTransport(input: {
           method: request.method,
           headers: {
             Accept: "application/json",
-            Authorization: `Bearer ${input.apiKey}`,
+            ...(credential === undefined ? {} : { Authorization: `Bearer ${credential}` }),
             "User-Agent": `runa-cli/${CLI_VERSION}`,
             ...(body === undefined ? {} : { "Content-Type": "application/json; charset=utf-8" }),
             ...(request.idempotencyKey === undefined ? {} : { "Idempotency-Key": request.idempotencyKey }),
+            ...(request.continuationSecret === undefined
+              ? {}
+              : { "X-Runa-Continuation": request.continuationSecret }),
           },
           ...(body === undefined ? {} : { body }),
           signal: controller.signal,
@@ -179,7 +218,9 @@ export function createHttpTransport(input: {
         });
         const bytes = await readLimited(response);
         const parsed = parseJson(bytes);
-        if (!response.ok) throw apiError(response.status, response.headers.get("x-request-id") ?? undefined, parsed);
+        if (!response.ok) {
+          throw apiError(response.status, response.headers.get("x-request-id") ?? undefined, parsed, credentialKind);
+        }
         return parsed;
       } catch (error) {
         if (error instanceof RunaError) throw error;

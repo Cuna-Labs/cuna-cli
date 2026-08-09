@@ -23,6 +23,8 @@ opaque remote shell.
 
 - Versioned human and JSON output with stable error and exit-code categories.
 - Exact public Runa API-origin validation and bounded authenticated transport.
+- Polling-only browser sign-in with PKCE, OS-vault refresh rotation, and
+  memory-only access tokens.
 - Capability discovery that treats absent, stale, contradictory, or unknown
   evidence as unauthorized for mutation.
 - Machine and AgentSession command foundations over public Runa contracts.
@@ -31,10 +33,11 @@ opaque remote shell.
 - Fail-closed gates for features whose producer contract or runtime is not yet
   available.
 
-Browser authentication, cloud terminal attachment, daemon integration,
-workspace synchronization, and the local companion remain pre-release work.
-Source code or a documented interface is not evidence that a capability is
-deployed.
+Cloud terminal attachment, daemon integration, workspace synchronization, and
+the local companion remain pre-release work. Browser authentication is
+implemented against the public 1.3.0 contract, but production availability still
+depends on server configuration and release admission. Source code or a
+documented interface is not evidence that a capability is deployed.
 
 ## Quick start for contributors
 
@@ -75,6 +78,9 @@ The current foundation exposes:
 
 ```text
 runa capabilities
+runa login
+runa whoami
+runa logout
 runa machines list
 runa machines create --name NAME --idempotency-key KEY --yes
 runa machines start|pause|resume|stop ID --yes
@@ -87,7 +93,7 @@ runa version --json
 ```
 
 Commands that depend on an unavailable producer or runtime return a stable
-unsupported/capability error and do not simulate a machine, session, login, or
+unsupported/capability error and do not simulate a machine, session, or
 successful mutation.
 
 ## Configuration and authentication
@@ -97,10 +103,12 @@ canonical default. Production requests use exactly `https://api.runacode.io`.
 Custom origins require an explicit development profile; repository content is
 never a configuration authority.
 
-`RUNA_API_KEY` is supported only as an explicit automation credential in the
-current build. It is never persisted automatically. Browser login and secure
-OS-vault refresh credentials will become available only with their accepted
-identity/continuation contracts and runtime evidence.
+`RUNA_API_KEY` is supported only as an explicit automation credential and is
+never persisted automatically. Interactive `runa login` uses the browser
+continuation contract without a local HTTP listener. Its renewable credential
+and binding metadata are stored only in the operating-system vault; access
+tokens remain process-memory-only. The automation and interactive credential
+authorities never fall back to each other.
 
 Never place API keys in command-line arguments, repository files, issue reports,
 terminal captures, or diagnostics.

@@ -43,12 +43,27 @@ export {
   type OnboardingNextAction,
   type WorkspaceState,
 } from "./auth/onboarding-state.js";
+export { createBrowserOpener, type BrowserOpener } from "./auth/browser.js";
+export { createHumanAuthClient, type HumanAuthClient } from "./auth/human-client.js";
 export {
-  startLoopbackCallback,
-  type LoopbackAuthorizationResult,
-  type LoopbackCallback,
-  type LoopbackHost,
-} from "./auth/loopback.js";
+  decodeCliAuthBootstrap,
+  decodeCliContinuationIssued,
+  decodeCliContinuationStatus,
+  decodeCliIdentityContext,
+  decodeCliTokenSet,
+  decodeRevocation,
+  type CliAuthBootstrap,
+  type CliContinuationIssued,
+  type CliContinuationStatus,
+  type CliIdentityContext,
+  type CliIntentClass,
+  type CliTokenSet,
+} from "./auth/human-contracts.js";
+export {
+  createHumanAuthService,
+  type HumanAuthResult,
+  type HumanAuthService,
+} from "./auth/human-session.js";
 export { runCli, memoryStreams, type RunCliDependencies } from "./cli/run.js";
 export { parseArgv, type ParsedInvocation } from "./cli/parser.js";
 export {
