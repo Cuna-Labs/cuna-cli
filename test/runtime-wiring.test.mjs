@@ -1,0 +1,419 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import { decodeTerminalFrame, encodeTerminalControl, encodeTerminalFrame, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
+import { requireVerifiedPtyAdapter } from "../dist/pty/evidence-gate.js";
+import { createNodeProcessAdapter } from "../dist/pty/node-process.js";
+import { admitCapability } from "../dist/runtime/capability-gate.js";
+import { RunaRuntimeBoundary } from "../dist/runtime/boundary.js";
+import { RuntimeBoundaryError } from "../dist/runtime/errors.js";
+import { createUnavailableTerminalControlPlane, validateTerminalGrant } from "../dist/runtime/terminal-transport.js";
+
+const NOW = 1_800_000_000_000;
+const CAPABILITY_ID = "terminal_connections.create";
+const API_ORIGIN = "https://api.runacode.io";
+
+function capabilitySnapshot(agentSessionId, overrides = {}) {
+  return {
+    schemaVersion: "1",
+    subjectScope: "agent_session",
+    subjectId: agentSessionId,
+    observedAt: new Date(NOW - 1_000).toISOString(),
+    expiresAt: new Date(NOW + 60_000).toISOString(),
+    etag: `etag-${agentSessionId}`,
+    capabilities: [{
+      id: CAPABILITY_ID,
+      availability: "supported",
+      interaction: "native",
+      mutationClass: "reversible",
+      surfaces: ["cli"],
+      requiredPermissions: ["terminal.connect"],
+    }],
+    ...overrides,
+  };
+}
+
+function observation(agentSessionId, processEpoch = `epoch-${agentSessionId}`) {
+  return {
+    authority: "runa_agent_session_supervisor",
+    userId: "user-1",
+    machineId: "machine-1",
+    agentSessionId,
+    processEpoch,
+    state: "running",
+    observedAt: new Date(NOW - 500).toISOString(),
+    expiresAt: new Date(NOW + 30_000).toISOString(),
+    evidenceRevision: `revision-${agentSessionId}`,
+  };
+}
+
+class AsyncByteQueue {
+  #values = [];
+  #waiters = [];
+  #closed = false;
+
+  push(value) {
+    const waiter = this.#waiters.shift();
+    if (waiter === undefined) this.#values.push(value);
+    else waiter({ done: false, value });
+  }
+
+  close() {
+    this.#closed = true;
+    for (const waiter of this.#waiters.splice(0)) waiter({ done: true, value: undefined });
+  }
+
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+
+  next() {
+    const value = this.#values.shift();
+    if (value !== undefined) return Promise.resolve({ done: false, value });
+    if (this.#closed) return Promise.resolve({ done: true, value: undefined });
+    return new Promise((resolve) => this.#waiters.push(resolve));
+  }
+}
+
+class FakeWireConnection {
+  constructor(id, initialBytes) {
+    this.connectionId = id;
+    this.incoming = new AsyncByteQueue();
+    this.sent = [];
+    this.closeCalls = [];
+    this.incoming.push(initialBytes);
+  }
+
+  receive() { return this.incoming; }
+  async send(bytes) { this.sent.push(bytes); }
+  async close(input) {
+    this.closeCalls.push(input);
+    this.incoming.close();
+  }
+}
+
+class FakeTerminalSystem {
+  constructor() {
+    this.grants = new Map();
+    this.connections = [];
+    this.createCalls = [];
+    this.connectCalls = [];
+    this.epochs = new Map();
+    this.generation = 0;
+    this.outputOnReady = new Map();
+    this.connector = {
+      connect: async (input) => {
+        this.connectCalls.push({ ...input, token: "redacted-by-test" });
+        const grant = this.grants.get(input.token);
+        assert.ok(grant, "connector receives a producer-issued token");
+        const ready = encodeTerminalControl("ready", 1n, {
+          protocol: TERMINAL_PROTOCOL,
+          agentSessionId: grant.agentSessionId,
+          processEpoch: grant.processEpoch,
+          fencingGeneration: grant.attachmentGeneration,
+          resizeCapability: "live",
+        });
+        const output = this.outputOnReady.get(grant.agentSessionId);
+        let initial = ready;
+        if (output !== undefined) {
+          const frame = encodeTerminalFrame({ type: "output", critical: true, sequence: 1n, payload: output });
+          initial = new Uint8Array(ready.byteLength + frame.byteLength);
+          initial.set(ready);
+          initial.set(frame, ready.byteLength);
+        }
+        const connection = new FakeWireConnection(grant.terminalConnectionId, initial);
+        this.connections.push(connection);
+        return connection;
+      },
+    };
+    this.controlPlane = {
+      discoverCapabilities: async (_scope, resourceId) => capabilitySnapshot(resourceId),
+      observeAgentSession: async (agentSessionId) => observation(agentSessionId, this.epochs.get(agentSessionId)),
+      createTerminalConnection: async (input) => {
+        this.createCalls.push(input);
+        this.generation += 1;
+        const observed = observation(input.agentSessionId, this.epochs.get(input.agentSessionId));
+        const token = `secret-token-value-${this.generation}`;
+        const grant = {
+          terminalConnectionId: `terminal-${this.generation}`,
+          resumeHandle: `resume-${input.agentSessionId}`,
+          connectUrl: `wss://api.runacode.io/v1/terminal/${this.generation}`,
+          connectToken: token,
+          protocol: TERMINAL_PROTOCOL,
+          issuedAt: new Date(NOW).toISOString(),
+          expiresAt: new Date(NOW + 30_000).toISOString(),
+          userId: observed.userId,
+          machineId: observed.machineId,
+          agentSessionId: observed.agentSessionId,
+          processEpoch: observed.processEpoch,
+          attachmentGeneration: this.generation,
+        };
+        this.grants.set(token, grant);
+        return grant;
+      },
+    };
+  }
+}
+
+function createRuntime(system, extra = {}) {
+  const states = [];
+  const outputs = [];
+  const runtime = new RunaRuntimeBoundary({
+    controlPlane: system.controlPlane,
+    terminalConnector: system.connector,
+    allowedRunaOrigins: [API_ORIGIN],
+    terminalCapabilityId: CAPABILITY_ID,
+    clientInstanceId: "client-1",
+    clock: () => NOW,
+    idempotencyKey: (() => {
+      let value = 0;
+      return () => `idempotency-${++value}`;
+    })(),
+    readyTimeoutMs: 1_000,
+    onTerminalState: (state) => states.push(state),
+    onTerminalOutput: (event) => outputs.push(event),
+    ...extra,
+  });
+  runtime.start({
+    endpointOwnership: "verified",
+    durableState: "verified",
+    source: "test-independent-local-probe",
+    observedAt: NOW - 1,
+    expiresAt: NOW + 60_000,
+  });
+  return { runtime, states, outputs };
+}
+
+async function waitUntil(predicate, message) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.fail(message);
+}
+
+test("runtime capability admission fails closed for expired, ambiguous, and non-native evidence", () => {
+  assert.throws(
+    () => admitCapability(capabilitySnapshot("agent-1", { expiresAt: new Date(NOW).toISOString() }), {
+      id: CAPABILITY_ID,
+      scope: "agent_session",
+      subjectId: "agent-1",
+      interaction: "native",
+    }, NOW),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "capability_snapshot_expired",
+  );
+  const ambiguous = capabilitySnapshot("agent-1");
+  ambiguous.capabilities.push({ ...ambiguous.capabilities[0] });
+  assert.throws(
+    () => admitCapability(ambiguous, { id: CAPABILITY_ID, scope: "agent_session", subjectId: "agent-1" }, NOW),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "capability_unknown",
+  );
+  const browserOnly = capabilitySnapshot("agent-1");
+  browserOnly.capabilities[0] = { ...browserOnly.capabilities[0], interaction: "browser_handoff" };
+  assert.throws(
+    () => admitCapability(browserOnly, {
+      id: CAPABILITY_ID,
+      scope: "agent_session",
+      subjectId: "agent-1",
+      interaction: "native",
+    }, NOW),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "capability_unsupported",
+  );
+});
+
+test("terminal grants reject non-Runa origins, query secrets, and scope substitution", () => {
+  const observed = observation("agent-1");
+  const valid = {
+    terminalConnectionId: "terminal-1",
+    resumeHandle: "resume-agent-1",
+    connectUrl: "wss://api.runacode.io/v1/terminal/1",
+    connectToken: "secret-token-value-1",
+    protocol: TERMINAL_PROTOCOL,
+    issuedAt: new Date(NOW).toISOString(),
+    expiresAt: new Date(NOW + 30_000).toISOString(),
+    userId: observed.userId,
+    machineId: observed.machineId,
+    agentSessionId: observed.agentSessionId,
+    processEpoch: observed.processEpoch,
+    attachmentGeneration: 1,
+  };
+  assert.equal(validateTerminalGrant({ grant: valid, observation: observed, allowedRunaOrigins: [API_ORIGIN], now: NOW }), valid);
+  for (const grant of [
+    { ...valid, connectUrl: "wss://evil.example/v1/terminal/1" },
+    { ...valid, connectUrl: `wss://api.runacode.io/v1/terminal/1?token=${valid.connectToken}` },
+    { ...valid, agentSessionId: "agent-sibling" },
+  ]) {
+    assert.throws(
+      () => validateTerminalGrant({ grant, observation: observed, allowedRunaOrigins: [API_ORIGIN], now: NOW }),
+      RuntimeBoundaryError,
+    );
+  }
+});
+
+test("runtime multiplexes AgentSessions without cross-routing input and preserves post-ready output in one chunk", async () => {
+  const system = new FakeTerminalSystem();
+  system.outputOnReady.set("agent-a", new TextEncoder().encode("first-output"));
+  const { runtime, outputs } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await runtime.attach({ tabId: "tab-b", agentSessionId: "agent-b", columns: 80, rows: 24 });
+  assert.equal(outputs.length, 1, "output adjacent to ready is not dropped");
+  assert.equal(new TextDecoder().decode(outputs[0].bytes), "first-output");
+
+  await runtime.sendInput(new TextEncoder().encode("to-a"));
+  runtime.switchActive("tab-b");
+  await runtime.sendInput(new TextEncoder().encode("to-b"));
+
+  const firstSent = system.connections[0].sent.map(decodeTerminalFrame).filter(Boolean);
+  const secondSent = system.connections[1].sent.map(decodeTerminalFrame).filter(Boolean);
+  assert.deepEqual(firstSent.filter((frame) => frame.type === "input").map((frame) => new TextDecoder().decode(frame.payload)), ["to-a"]);
+  assert.deepEqual(secondSent.filter((frame) => frame.type === "input").map((frame) => new TextDecoder().decode(frame.payload)), ["to-b"]);
+  assert.notEqual(runtime.listTerminals()[0].viewId, runtime.listTerminals()[1].viewId);
+  await runtime.shutdown();
+});
+
+test("runtime reconnect obtains a fresh grant, preserves process epoch, and never reuses the old token", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.close();
+  await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "terminal did not become interrupted");
+  const reconnected = await runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(reconnected.state, "active");
+  assert.equal(reconnected.outputContinuity, "unknown", "continuity remains unknown until producer resume evidence arrives");
+  assert.equal(system.createCalls.length, 2);
+  assert.equal(system.createCalls[1].resumeHandle, "resume-agent-a");
+  assert.notEqual(system.connections[0].connectionId, system.connections[1].connectionId);
+  assert.equal(system.connectCalls.length, 2);
+  await runtime.shutdown();
+});
+
+test("runtime rejects reconnect to a replacement process before issuing a second grant", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.close();
+  await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "terminal did not become interrupted");
+  system.epochs.set("agent-a", "replacement-epoch");
+  await assert.rejects(
+    runtime.reconnect({ tabId: "tab-a" }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "session_discontinuous",
+  );
+  assert.equal(system.createCalls.length, 1, "no new connection grant is issued for a replacement process");
+  await runtime.shutdown();
+});
+
+test("missing remote AgentSession producer fails before opening a terminal", async () => {
+  let connectorCalls = 0;
+  const system = {
+    controlPlane: createUnavailableTerminalControlPlane(),
+    connector: { connect: async () => { connectorCalls += 1; throw new Error("must not run"); } },
+  };
+  const { runtime } = createRuntime(system);
+  await assert.rejects(
+    runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "control_plane_unavailable",
+  );
+  assert.equal(connectorCalls, 0);
+  await runtime.shutdown();
+});
+
+test("PTY adapter is usable only with current platform-bound live evidence", async () => {
+  const adapter = {
+    probe: async () => ({
+      status: "verified",
+      adapterId: "test-pty",
+      protocol: "runa.local-pty.v1",
+      platform: process.platform,
+      observedAt: NOW - 100,
+      expiresAt: NOW + 10_000,
+      artifactDigest: `sha256:${"a".repeat(64)}`,
+      capabilities: { rawInput: true, resize: true, signals: true, utf8: true },
+    }),
+    spawn: () => { throw new Error("not used by this gate test"); },
+  };
+  const verified = await requireVerifiedPtyAdapter({ adapter, now: NOW, platform: process.platform });
+  assert.equal(verified.evidence.status, "verified");
+  const expired = { ...adapter, probe: async () => ({ ...(await adapter.probe()), expiresAt: NOW }) };
+  await assert.rejects(
+    requireVerifiedPtyAdapter({ adapter: expired, now: NOW, platform: process.platform }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "pty_evidence_invalid",
+  );
+});
+
+test("Node process adapter executes argv without a shell and excludes credential-shaped environment", async () => {
+  const adapter = createNodeProcessAdapter();
+  const child = adapter.spawn({
+    executable: process.execPath,
+    args: ["-e", "process.stdout.write(JSON.stringify({value:'ok',secret:process.env.RUNA_API_KEY??null}))"],
+  });
+  let stdout = "";
+  for await (const chunk of child.stdout) stdout += new TextDecoder().decode(chunk);
+  const exit = await child.wait();
+  assert.equal(exit.exitCode, 0);
+  assert.deepEqual(JSON.parse(stdout), { value: "ok", secret: null });
+  assert.throws(
+    () => adapter.spawn({ executable: process.execPath, args: ["-e", ""], environment: { RUNA_API_KEY: "must-not-pass" } }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "process_invalid",
+  );
+});
+
+test("runtime sync boundary acquires one durable journal writer and begins in reconciliation", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "runa-runtime-sync-"));
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  try {
+    const configuration = {
+      bindingId: "binding-1",
+      bindingGeneration: 1,
+      canonicalRoot: path.join(directory, "workspace"),
+      policyDigest: `sha256:${"b".repeat(64)}`,
+      epoch: "epoch-1",
+    };
+    const handle = await runtime.openSync({
+      configuration,
+      journalDirectory: path.join(directory, "journal"),
+      ownerId: "runtime-owner-1",
+    });
+    assert.ok(handle.fence >= 1);
+    assert.equal(handle.supervisor.snapshot.state, "reconciling");
+    assert.equal(handle.supervisor.snapshot.incrementalApplyPaused, true);
+    await assert.rejects(
+      runtime.openSync({
+        configuration,
+        journalDirectory: path.join(directory, "journal"),
+        ownerId: "runtime-owner-2",
+      }),
+      (error) => error instanceof RuntimeBoundaryError && error.code === "session_conflict",
+    );
+    await handle.close();
+  } finally {
+    await runtime.shutdown();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("runtime startup rejects unverified local endpoint evidence", () => {
+  const system = new FakeTerminalSystem();
+  const runtime = new RunaRuntimeBoundary({
+    controlPlane: system.controlPlane,
+    terminalConnector: system.connector,
+    allowedRunaOrigins: [API_ORIGIN],
+    terminalCapabilityId: CAPABILITY_ID,
+    clientInstanceId: "client-1",
+    clock: () => NOW,
+  });
+  assert.throws(
+    () => runtime.start({
+      endpointOwnership: "unverified",
+      durableState: "verified",
+      source: "self-report",
+      observedAt: NOW - 1,
+      expiresAt: NOW + 1,
+    }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "remote_state_unproven",
+  );
+  assert.equal(runtime.daemon.state, "recovery_required");
+});

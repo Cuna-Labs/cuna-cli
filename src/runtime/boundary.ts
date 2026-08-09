@@ -414,7 +414,7 @@ export class RunaRuntimeBoundary {
       entry.reason = "runtime_shutdown";
       this.#publish(entry);
     }
-    for (const handle of [...this.#syncHandles.values()]) {
+    for (const handle of this.#syncHandles.values()) {
       try { await handle.close(); } catch (error) { failures.push(error); }
     }
     if (this.#hostTerminalLease !== undefined) {
