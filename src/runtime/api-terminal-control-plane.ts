@@ -14,10 +14,10 @@ export function createApiTerminalControlPlane(input: {
 }): TerminalControlPlane {
   const clock = input.clock ?? Date.now;
   return Object.freeze({
-    discoverCapabilities: (scope, resourceId) =>
+    discoverCapabilities: (scope: "agent_session", resourceId: string) =>
       input.client.discoverCapabilities(scope, resourceId),
 
-    async observeAgentSession(agentSessionId): Promise<RemoteAgentSessionEvidence> {
+    async observeAgentSession(agentSessionId: string): Promise<RemoteAgentSessionEvidence> {
       const [identity, session] = await Promise.all([
         input.client.getIdentity(),
         input.client.getAgentSession(agentSessionId),
@@ -53,7 +53,9 @@ export function createApiTerminalControlPlane(input: {
       });
     },
 
-    async createTerminalConnection(request) {
+    async createTerminalConnection(
+      request: Parameters<TerminalControlPlane["createTerminalConnection"]>[0],
+    ) {
       if (
         request.capabilityEvidence.scope !== "agent_session" ||
         request.capabilityEvidence.subjectId !== request.agentSessionId ||

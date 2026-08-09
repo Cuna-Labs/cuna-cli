@@ -7,6 +7,7 @@ import test from "node:test";
 import { decodeTerminalFrame, encodeTerminalControl, encodeTerminalFrame, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
 import { requireVerifiedPtyAdapter } from "../dist/pty/evidence-gate.js";
 import { createNodeProcessAdapter } from "../dist/pty/node-process.js";
+import { createApiTerminalControlPlane } from "../dist/runtime/api-terminal-control-plane.js";
 import { admitCapability } from "../dist/runtime/capability-gate.js";
 import { RunaRuntimeBoundary } from "../dist/runtime/boundary.js";
 import { RuntimeBoundaryError } from "../dist/runtime/errors.js";
@@ -430,6 +431,79 @@ test("missing remote AgentSession producer fails before opening a terminal", asy
   );
   assert.equal(connectorCalls, 0);
   await runtime.shutdown();
+});
+
+test("API terminal control plane derives fresh public observation and sends only the grant intent", async () => {
+  const calls = [];
+  const client = {
+    async getIdentity() {
+      return { id: "11111111-1111-4111-8111-111111111111", email: "dev@example.test", workspaceAssigned: true };
+    },
+    async getAgentSession(id) {
+      assert.equal(id, "agent-a");
+      return {
+        id,
+        machineId: "22222222-2222-4222-8222-222222222222",
+        name: "primary",
+        agent: "claude-code",
+        cwd: "/workspace",
+        authMode: "interactive_login",
+        desiredState: "running",
+        requestState: "launched",
+        processState: "running",
+        processEpoch: "33333333-3333-4333-8333-333333333333",
+        runtimeObservedAt: new Date(NOW - 1_000).toISOString(),
+        rowVersion: 7,
+        createdAt: new Date(NOW - 60_000).toISOString(),
+        updatedAt: new Date(NOW - 1_000).toISOString(),
+      };
+    },
+    async discoverCapabilities(_scope, resourceId) { return capabilitySnapshot(resourceId); },
+    async createTerminalConnection(agentSessionId, intent, key) {
+      calls.push({ agentSessionId, intent, key });
+      return {
+        terminalSessionId: "55555555-5555-4555-8555-555555555555",
+        resumeHandle: "66666666-6666-4666-8666-666666666666",
+        connectUrl: "wss://api.runacode.io/v1/terminal-connections/55555555-5555-4555-8555-555555555555/stream",
+        connectToken: `runa_tc_${"A".repeat(43)}`,
+        protocol: TERMINAL_PROTOCOL,
+        capabilities: [
+          { name: "acknowledgement", availability: "supported" },
+          { name: "heartbeat", availability: "supported" },
+          { name: "live_resize", availability: "supported" },
+          { name: "resume", availability: "supported" },
+          { name: "signals", availability: "supported" },
+        ],
+        expiresAt: new Date(NOW + 30_000).toISOString(),
+      };
+    },
+  };
+  const controlPlane = createApiTerminalControlPlane({ client, clock: () => NOW });
+  const evidence = await controlPlane.observeAgentSession("agent-a");
+  assert.equal(evidence.processEpoch, "33333333-3333-4333-8333-333333333333");
+  assert.equal(evidence.evidenceRevision, "agent-session-row:7");
+  const admission = admitCapability(capabilitySnapshot("agent-a"), {
+    id: CAPABILITY_ID,
+    scope: "agent_session",
+    subjectId: "agent-a",
+    surface: "cli",
+    interaction: "native",
+  }, NOW);
+  await controlPlane.createTerminalConnection({
+    agentSessionId: "agent-a",
+    protocol: TERMINAL_PROTOCOL,
+    clientInstanceId: "client-1",
+    idempotencyKey: "terminal-operation-1",
+    capabilityEvidence: admission,
+  });
+  assert.deepEqual(calls, [{
+    agentSessionId: "agent-a",
+    intent: {
+      protocol: TERMINAL_PROTOCOL,
+      clientInstanceId: "client-1",
+    },
+    key: "terminal-operation-1",
+  }]);
 });
 
 test("PTY adapter is usable only with current platform-bound live evidence", async () => {

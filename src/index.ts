@@ -141,3 +141,4 @@ export {
 } from "./terminal/xterm-vte.js";
 export { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "./version.js";
 export { createApiTerminalControlPlane } from "./runtime/api-terminal-control-plane.js";
+export { createNodeWebSocketConnector } from "./runtime/node-websocket-connector.js";
