@@ -38,6 +38,24 @@ test("wrong state is rejected and closes the listener without retaining a code",
   assert.equal(JSON.stringify(error).includes("secret-code"), false);
 });
 
+test("IPv6 loopback remains numeric and state-bound when the host supports it", async (context) => {
+  const state = "v".repeat(43);
+  let listener;
+  try {
+    listener = await startLoopbackCallback({ expectedState: state, timeoutMs: 1_000, host: "::1" });
+  } catch (error) {
+    if (error?.code === "EADDRNOTAVAIL" || error?.code === "EAFNOSUPPORT") {
+      context.skip("IPv6 loopback is unavailable on this host");
+      return;
+    }
+    throw error;
+  }
+  assert.match(listener.redirectUri, /^http:\/\/\[::1\]:\d+\/oauth\/callback$/u);
+  const response = await fetch(`${listener.redirectUri}?code=ipv6-code&state=${state}`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await listener.completion, { code: "ipv6-code" });
+});
+
 test("duplicate or unexpected callback parameters fail closed", async () => {
   const state = "d".repeat(43);
   const listener = await startLoopbackCallback({ expectedState: state, timeoutMs: 1_000 });
@@ -56,4 +74,3 @@ test("timeout and cancellation are terminal and leave no listening callback", as
   cancelled.cancel();
   await assert.rejects(cancelled.completion, (error) => error.code === "runa.auth.cancelled");
 });
-
