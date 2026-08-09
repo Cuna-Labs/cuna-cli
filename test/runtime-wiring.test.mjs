@@ -105,6 +105,7 @@ class FakeTerminalSystem {
     this.epochs = new Map();
     this.generation = 0;
     this.outputOnReady = new Map();
+    this.outputSequenceOnReady = new Map();
     this.connectionsWithoutReady = new Set();
     this.connector = {
       connect: async (input) => {
@@ -121,7 +122,12 @@ class FakeTerminalSystem {
         const output = this.outputOnReady.get(grant.agentSessionId);
         let initial = this.connectionsWithoutReady.has(this.connections.length + 1) ? undefined : ready;
         if (output !== undefined) {
-          const frame = encodeTerminalFrame({ type: "output", critical: true, sequence: 1n, payload: output });
+          const frame = encodeTerminalFrame({
+            type: "output",
+            critical: true,
+            sequence: this.outputSequenceOnReady.get(grant.agentSessionId) ?? 1n,
+            payload: output,
+          });
           if (initial !== undefined) {
             initial = new Uint8Array(ready.byteLength + frame.byteLength);
             initial.set(ready);
@@ -397,6 +403,51 @@ test("heartbeat expiry fences input while a fresh heartbeat extends the attachme
   await runtime.shutdown();
 });
 
+test("heartbeat watchdog interrupts an idle dead terminal without waiting for user input", async () => {
+  const system = new FakeTerminalSystem();
+  let now = NOW;
+  const { runtime, states } = createRuntime(system, {
+    clock: () => now,
+    heartbeatTimeoutMs: 1_000,
+  });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  now += 1_001;
+  await new Promise((resolve) => setTimeout(resolve, 1_025));
+
+  assert.equal(runtime.listTerminals()[0].state, "interrupted");
+  assert.equal(runtime.listTerminals()[0].reason, "heartbeat_expired");
+  assert.ok(states.some((state) => state.state === "interrupted" && state.reason === "heartbeat_expired"));
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_heartbeat_expired");
+  await runtime.shutdown();
+});
+
+test("late or replayed heartbeat frames cannot renew attachment authority", async () => {
+  const lateSystem = new FakeTerminalSystem();
+  let now = NOW;
+  const { runtime: lateRuntime } = createRuntime(lateSystem, {
+    clock: () => now,
+    heartbeatTimeoutMs: 1_000,
+  });
+  await lateRuntime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  now += 1_001;
+  lateSystem.connections[0].incoming.push(encodeTerminalControl("heartbeat", 2n, {}));
+  await waitUntil(() => lateRuntime.listTerminals()[0].state === "interrupted", "late heartbeat should interrupt the tab");
+  assert.equal(lateRuntime.listTerminals()[0].heartbeatObservedAt, NOW);
+  await lateRuntime.shutdown();
+
+  const replaySystem = new FakeTerminalSystem();
+  let replayNow = NOW;
+  const { runtime: replayRuntime } = createRuntime(replaySystem, { clock: () => replayNow });
+  await replayRuntime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  replayNow += 10;
+  replaySystem.connections[0].incoming.push(encodeTerminalControl("heartbeat", 2n, {}));
+  await waitUntil(() => replayRuntime.listTerminals()[0].heartbeatObservedAt === replayNow, "fresh heartbeat should be accepted");
+  replaySystem.connections[0].incoming.push(encodeTerminalControl("heartbeat", 2n, {}));
+  await waitUntil(() => replayRuntime.listTerminals()[0].state === "failed", "replayed heartbeat should fail the tab");
+  assert.equal(replaySystem.connections[0].closeCalls.at(-1).reason, "runa_terminal_protocol_failure");
+  await replayRuntime.shutdown();
+});
+
 test("concurrent terminal input, resize, and signal writes remain serialized and monotonic", async () => {
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);
@@ -478,6 +529,100 @@ test("runtime reconnect obtains a fresh grant, preserves process epoch, and neve
   assert.equal(system.createCalls[1].resumeHandle, "66666666-6666-4666-8666-666666666666");
   assert.notEqual(system.connections[0].connectionId, system.connections[1].connectionId);
   assert.equal(system.connectCalls.length, 2);
+  await runtime.shutdown();
+});
+
+test("reconnect installs the new fenced consumer before delivering same-chunk resumed output", async () => {
+  const system = new FakeTerminalSystem();
+  const order = [];
+  system.outputOnReady.set("agent-a", new TextEncoder().encode("initial"));
+  const { runtime } = createRuntime(system, {
+    onTerminalReady: async (state) => {
+      order.push(`ready:${state.fencingGeneration}`);
+    },
+    onTerminalOutput: async (event) => {
+      order.push(`output:${event.sequence}:${new TextDecoder().decode(event.bytes)}`);
+    },
+  });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.close();
+  await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "terminal did not become interrupted");
+  system.outputOnReady.set("agent-a", new TextEncoder().encode("resumed"));
+  system.outputSequenceOnReady.set("agent-a", 2n);
+
+  await runtime.reconnect({ tabId: "tab-a" });
+
+  assert.deepEqual(order, [
+    "ready:1",
+    "output:1:initial",
+    "ready:2",
+    "output:2:resumed",
+  ]);
+  await runtime.shutdown();
+});
+
+test("a stale pump cannot interrupt or close the replacement connection", async () => {
+  const system = new FakeTerminalSystem();
+  let now = NOW;
+  let releaseOldOutput;
+  let oldOutputEntered = false;
+  const oldOutputGate = new Promise((resolve) => { releaseOldOutput = resolve; });
+  const { runtime } = createRuntime(system, {
+    clock: () => now,
+    heartbeatTimeoutMs: 1_000,
+    onTerminalOutput: async () => {
+      oldOutputEntered = true;
+      await oldOutputGate;
+      throw new Error("stale renderer failure");
+    },
+  });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.push(encodeTerminalFrame({
+    type: "output",
+    critical: true,
+    sequence: 1n,
+    payload: new Uint8Array([1]),
+  }));
+  await waitUntil(() => oldOutputEntered, "old output consumer should be in flight");
+  now += 1_001;
+  assert.throws(() => runtime.refreshTerminalLiveness("tab-a"), RuntimeBoundaryError);
+
+  const reconnected = await runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(reconnected.state, "active");
+  releaseOldOutput();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(runtime.listTerminals()[0].state, "active");
+  assert.equal(system.connections[1].closeCalls.length, 0, "stale pump must not close the fresh connection");
+  await runtime.shutdown();
+});
+
+test("detach during reconnect permanently wins over a late ready frame", async () => {
+  const system = new FakeTerminalSystem();
+  system.connectionsWithoutReady.add(2);
+  const { runtime } = createRuntime(system, { readyTimeoutMs: 1_000 });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  system.connections[0].incoming.close();
+  await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "terminal did not become interrupted");
+
+  const reconnecting = runtime.reconnect({ tabId: "tab-a" });
+  await waitUntil(() => system.connections.length === 2, "replacement connection should be waiting for ready");
+  await runtime.detach("tab-a");
+  const replacementGrant = [...system.grants.values()].at(-1);
+  system.connections[1].incoming.push(encodeTerminalControl("ready", 1n, {
+    protocol: TERMINAL_PROTOCOL,
+    agentSessionId: replacementGrant.agentSessionId,
+    processEpoch: replacementGrant.processEpoch,
+    fencingGeneration: replacementGrant.attachmentGeneration,
+    resizeCapability: "live",
+  }));
+
+  await assert.rejects(
+    reconnecting,
+    (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected",
+  );
+  assert.equal(runtime.listTerminals()[0].state, "detached");
+  assert.equal(system.connections[1].closeCalls.at(-1).reason, "runa_resume_rejected");
   await runtime.shutdown();
 });
 

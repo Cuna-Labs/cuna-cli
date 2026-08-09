@@ -102,3 +102,33 @@ test("Node WebSocket connector fails closed on protocol mismatch, text frames, a
   );
   assert.equal(FakeWebSocket.instances.length, before);
 });
+
+test("asynchronous Blob conversion preserves WebSocket arrival order", async () => {
+  FakeWebSocket.instances.length = 0;
+  const connector = createNodeWebSocketConnector({ WebSocket: FakeWebSocket });
+  const connection = await connector.connect({ url: URL, token: TOKEN, protocol: "runa.terminal.v1" });
+  const socket = FakeWebSocket.instances[0];
+  let resolveFirst;
+  let resolveSecond;
+  const first = new Blob([Uint8Array.of(1)]);
+  const second = new Blob([Uint8Array.of(2)]);
+  Object.defineProperty(first, "arrayBuffer", { value: () => new Promise((resolve) => { resolveFirst = resolve; }) });
+  Object.defineProperty(second, "arrayBuffer", { value: () => new Promise((resolve) => { resolveSecond = resolve; }) });
+
+  socket.dispatchEvent(new MessageEvent("message", { data: first }));
+  socket.dispatchEvent(new MessageEvent("message", { data: second }));
+  const iterator = connection.receive()[Symbol.asyncIterator]();
+  let firstSettled = false;
+  const firstResult = iterator.next().then((value) => { firstSettled = true; return value; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(resolveSecond, undefined, "the second conversion cannot start before the first completes");
+  assert.equal(firstSettled, false);
+  resolveFirst(Uint8Array.of(1).buffer);
+  const receivedFirst = await firstResult;
+  await new Promise((resolve) => setImmediate(resolve));
+  resolveSecond(Uint8Array.of(2).buffer);
+  const receivedSecond = await iterator.next();
+  assert.deepEqual([...receivedFirst.value], [1]);
+  assert.deepEqual([...receivedSecond.value], [2]);
+  await connection.close();
+});

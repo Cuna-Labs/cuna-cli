@@ -128,6 +128,7 @@ export function createNodeWebSocketConnector(input: {
       const queue = new BoundedByteQueue();
       let opened = false;
       let closed = false;
+      let messageTail: Promise<void> = Promise.resolve();
 
       const closeSocket = (code: number, reason: string): void => {
         if (closed) return;
@@ -136,20 +137,26 @@ export function createNodeWebSocketConnector(input: {
       };
 
       const onMessage = (event: MessageEvent): void => {
-        void messageBytes(event.data).then(
-          (bytes) => {
+        messageTail = messageTail.then(async () => {
+          try {
+            const bytes = await messageBytes(event.data);
             queue.push(bytes);
             if (bytes.byteLength > MAX_MESSAGE_BYTES) closeSocket(1009, "runa_frame_too_large");
-          },
-          (error) => {
+          } catch (error) {
             queue.fail(error);
             closeSocket(1003, "runa_binary_required");
-          },
-        );
+          }
+        });
+      };
+      const cleanupActive = (): void => {
+        socket.removeEventListener("message", onMessage);
+        socket.removeEventListener("close", onClose);
+        socket.removeEventListener("error", onTransportError);
+        request.signal?.removeEventListener("abort", onActiveAbort);
       };
       const onClose = (): void => {
         closed = true;
-        request.signal?.removeEventListener("abort", onActiveAbort);
+        cleanupActive();
         queue.close();
       };
       const onTransportError = (): void => {
@@ -217,7 +224,7 @@ export function createNodeWebSocketConnector(input: {
           socket.send(bytes.slice());
         },
         async close(closeInput: { readonly code?: number; readonly reason?: string } = {}): Promise<void> {
-          request.signal?.removeEventListener("abort", onActiveAbort);
+          cleanupActive();
           queue.close();
           closeSocket(closeInput.code ?? 1000, closeInput.reason ?? "runa_closed");
         },

@@ -111,6 +111,14 @@ export {
   type WorkbenchTab,
 } from "./terminal/workbench.js";
 export {
+  ForegroundTerminalCoordinator,
+  type ForegroundTabIntent,
+  type ForegroundTerminalCoordinatorOptions,
+  type ForegroundTerminalHost,
+  type ForegroundTerminalRuntime,
+  type ForegroundTerminalState,
+} from "./terminal/foreground.js";
+export {
   buildAppbarModel,
   projectTruth,
   type AppbarModel,
@@ -143,3 +151,4 @@ export {
 export { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "./version.js";
 export { createApiTerminalControlPlane } from "./runtime/api-terminal-control-plane.js";
 export { createNodeWebSocketConnector } from "./runtime/node-websocket-connector.js";
+export { createNodeForegroundTerminalHost, createNodeHostTerminalAdapter } from "./pty/node-host-terminal.js";

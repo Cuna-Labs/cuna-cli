@@ -53,6 +53,7 @@ export interface RuntimeStartupEvidence {
 export interface RuntimeTerminalSnapshot {
   readonly tabId: string;
   readonly viewId: string;
+  readonly userId: string;
   readonly machineId: string;
   readonly agentSessionId: string;
   readonly processEpoch: string;
@@ -126,6 +127,9 @@ interface TerminalEntry {
   reason?: string;
   pump?: Promise<void>;
   sendTail: Promise<void>;
+  connectionRevision: number;
+  heartbeatSequence: bigint;
+  heartbeatTimer?: NodeJS.Timeout;
 }
 
 export class RunaRuntimeBoundary {
@@ -239,6 +243,8 @@ export class RunaRuntimeBoundary {
         lastHeartbeatAt: this.#clock(),
         resumeHandle: grant.resumeHandle,
         sendTail: Promise.resolve(),
+        connectionRevision: 1,
+        heartbeatSequence: 0n,
       };
       const iterator = connection.receive()[Symbol.asyncIterator]();
       const ready = await this.#awaitReady(entry, iterator, input.signal);
@@ -264,8 +270,9 @@ export class RunaRuntimeBoundary {
       this.#activeTabId ??= input.tabId;
       await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs()));
       for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
+      this.#scheduleHeartbeatWatchdog(entry, connection, entry.connectionRevision);
       this.#publish(entry);
-      entry.pump = this.#pump(entry, iterator);
+      entry.pump = this.#pump(entry, connection, entry.connectionRevision, iterator);
       return snapshot(entry, this.#heartbeatTimeoutMs());
     } catch (error) {
       if (entry !== undefined) {
@@ -370,6 +377,8 @@ export class RunaRuntimeBoundary {
       throw runtimeFailure("session_conflict", "Only an interrupted terminal can reconnect.");
     }
     entry.state = "reconnecting";
+    const reconnectRevision = entry.connectionRevision + 1;
+    entry.connectionRevision = reconnectRevision;
     entry.outputContinuity = "unknown";
     delete entry.reason;
     this.#publish(entry);
@@ -405,8 +414,12 @@ export class RunaRuntimeBoundary {
         capabilities: grant.capabilities,
         resumeHandle: grant.resumeHandle,
         lastHeartbeatAt: this.#clock(),
+        heartbeatSequence: 0n,
       };
       const ready = await this.#awaitReady(candidate, iterator, input.signal);
+      if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
+        throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded by detach or shutdown.");
+      }
       if (ready.payload.fencingGeneration <= entry.fencingGeneration) {
         throw runtimeFailure("grant_invalid", "The reconnect readiness frame did not advance the attachment fence.");
       }
@@ -416,6 +429,9 @@ export class RunaRuntimeBoundary {
         resumeHandle: grant.resumeHandle,
         afterOutputSequence: entry.outputSequence.toString(),
       }));
+      if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
+        throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded by detach or shutdown.");
+      }
       const previous = this.#views.require(previousViewId);
       try { this.#views.detach(previousViewId); } catch { /* the prior view may already be detached */ }
       this.#views.open({
@@ -432,6 +448,7 @@ export class RunaRuntimeBoundary {
         rows: previous.rows,
       });
       entry.connection = connection;
+      this.#clearHeartbeatWatchdog(entry);
       entry.observation = admitted.observation;
       entry.decoder = nextDecoder;
       entry.fencingGeneration = ready.payload.fencingGeneration;
@@ -440,17 +457,24 @@ export class RunaRuntimeBoundary {
       entry.viewId = nextViewId;
       entry.resumeHandle = grant.resumeHandle;
       entry.wireSequence = resumeSequence;
+      entry.heartbeatSequence = 0n;
+      entry.lastHeartbeatAt = candidate.lastHeartbeatAt;
       entry.state = "active";
       entry.outputContinuity = "unknown";
-      for (const frame of ready.bufferedFrames) this.#handleAttachedFrame(entry, frame);
+      await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs()));
+      for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
+      this.#scheduleHeartbeatWatchdog(entry, connection, reconnectRevision);
       this.#publish(entry);
-      entry.pump = this.#pump(entry, iterator);
+      entry.pump = this.#pump(entry, connection, reconnectRevision, iterator);
       return snapshot(entry, this.#heartbeatTimeoutMs());
     } catch (error) {
       if (connection !== undefined) {
         await connection.close({ code: 1008, reason: "runa_resume_rejected" }).catch(() => undefined);
       }
-      if (entry.state !== "failed") {
+      if (
+        entry.connectionRevision === reconnectRevision &&
+        entry.state !== "failed"
+      ) {
         entry.state = "interrupted";
         entry.outputContinuity = "unknown";
         entry.reason = safeReason(error);
@@ -463,6 +487,8 @@ export class RunaRuntimeBoundary {
   async detach(tabId: string): Promise<void> {
     const entry = this.#requireTerminal(tabId);
     if (entry.state === "closed" || entry.state === "detached") return;
+    entry.connectionRevision += 1;
+    this.#clearHeartbeatWatchdog(entry);
     try { this.#views.detach(entry.viewId); } catch { /* attach may have failed before view creation */ }
     entry.state = "detached";
     entry.reason = "explicit_detach";
@@ -527,6 +553,8 @@ export class RunaRuntimeBoundary {
     }
     const failures: unknown[] = [];
     for (const entry of this.#terminals.values()) {
+      entry.connectionRevision += 1;
+      this.#clearHeartbeatWatchdog(entry);
       try { await entry.connection.close({ code: 1000, reason: "runa_shutdown" }); } catch (error) { failures.push(error); }
       entry.state = "closed";
       entry.reason = "runtime_shutdown";
@@ -635,27 +663,36 @@ export class RunaRuntimeBoundary {
     }
   }
 
-  async #pump(entry: TerminalEntry, iterator: AsyncIterator<Uint8Array>): Promise<void> {
+  async #pump(
+    entry: TerminalEntry,
+    connection: TerminalWireConnection,
+    connectionRevision: number,
+    iterator: AsyncIterator<Uint8Array>,
+  ): Promise<void> {
     try {
       for (;;) {
         const result = await iterator.next();
+        if (entry.connection !== connection || entry.connectionRevision !== connectionRevision) return;
         if (result.done) break;
         for (const frame of entry.decoder.push(result.value)) await this.#handleAttachedFrame(entry, frame);
         if (entry.state === "closed" || entry.state === "detached") return;
       }
       if (entry.state === "active" || entry.state === "reconnecting") {
+        this.#clearHeartbeatWatchdog(entry);
         entry.state = "interrupted";
         entry.outputContinuity = "unknown";
         entry.reason = "transport_closed_without_terminal_exit";
         this.#publish(entry);
       }
     } catch (error) {
+      if (entry.connection !== connection || entry.connectionRevision !== connectionRevision) return;
       if (entry.state === "detached" || entry.state === "closed") return;
+      this.#clearHeartbeatWatchdog(entry);
       entry.state = error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error" ? "failed" : "interrupted";
       entry.outputContinuity = "unknown";
       entry.reason = safeReason(error);
       this.#publish(entry);
-      await entry.connection.close({ code: 1002, reason: "runa_terminal_protocol_failure" }).catch(() => undefined);
+      await connection.close({ code: 1002, reason: "runa_terminal_protocol_failure" }).catch(() => undefined);
     }
   }
 
@@ -702,6 +739,7 @@ export class RunaRuntimeBoundary {
     }
     if (frame.type === "exit") {
       decodeTerminalControl(frame);
+      this.#clearHeartbeatWatchdog(entry);
       entry.state = "closed";
       entry.reason = "remote_process_exit";
       this.#publish(entry);
@@ -710,7 +748,16 @@ export class RunaRuntimeBoundary {
     if (frame.type === "error") throw this.#remoteTerminalError(frame);
     if (frame.type === "heartbeat") {
       decodeTerminalControl(frame);
+      if (frame.sequence <= entry.heartbeatSequence) {
+        throw runtimeFailure("terminal_protocol_error", "Terminal heartbeat sequence regressed or duplicated.");
+      }
+      if (this.#clock() - entry.lastHeartbeatAt > this.#heartbeatTimeoutMs()) {
+        this.#expireHeartbeat(entry, entry.connection, entry.connectionRevision);
+        throw runtimeFailure("terminal_disconnected", "A late terminal heartbeat cannot revive an expired attachment.", { retryable: true });
+      }
+      entry.heartbeatSequence = frame.sequence;
       entry.lastHeartbeatAt = this.#clock();
+      this.#scheduleHeartbeatWatchdog(entry, entry.connection, entry.connectionRevision);
     }
   }
 
@@ -750,12 +797,53 @@ export class RunaRuntimeBoundary {
 
   #assertHeartbeatFresh(entry: TerminalEntry): void {
     if (this.#clock() - entry.lastHeartbeatAt <= this.#heartbeatTimeoutMs()) return;
+    this.#expireHeartbeat(entry, entry.connection, entry.connectionRevision);
+    throw runtimeFailure("terminal_disconnected", "The terminal heartbeat expired; input is fenced until a fresh attachment is proven.", { retryable: true });
+  }
+
+  #scheduleHeartbeatWatchdog(
+    entry: TerminalEntry,
+    connection: TerminalWireConnection,
+    connectionRevision: number,
+  ): void {
+    this.#clearHeartbeatWatchdog(entry);
+    const remaining = Math.max(1, entry.lastHeartbeatAt + this.#heartbeatTimeoutMs() - this.#clock() + 1);
+    entry.heartbeatTimer = setTimeout(() => {
+      if (
+        entry.connection !== connection ||
+        entry.connectionRevision !== connectionRevision ||
+        entry.state !== "active"
+      ) return;
+      if (this.#clock() - entry.lastHeartbeatAt <= this.#heartbeatTimeoutMs()) {
+        this.#scheduleHeartbeatWatchdog(entry, connection, connectionRevision);
+        return;
+      }
+      this.#expireHeartbeat(entry, connection, connectionRevision);
+    }, remaining);
+    entry.heartbeatTimer.unref();
+  }
+
+  #clearHeartbeatWatchdog(entry: TerminalEntry): void {
+    if (entry.heartbeatTimer !== undefined) clearTimeout(entry.heartbeatTimer);
+    delete entry.heartbeatTimer;
+  }
+
+  #expireHeartbeat(
+    entry: TerminalEntry,
+    connection: TerminalWireConnection,
+    connectionRevision: number,
+  ): void {
+    if (
+      entry.connection !== connection ||
+      entry.connectionRevision !== connectionRevision ||
+      entry.state !== "active"
+    ) return;
+    this.#clearHeartbeatWatchdog(entry);
     entry.state = "interrupted";
     entry.outputContinuity = "unknown";
     entry.reason = "heartbeat_expired";
     this.#publish(entry);
-    void entry.connection.close({ code: 1001, reason: "runa_heartbeat_expired" }).catch(() => undefined);
-    throw runtimeFailure("terminal_disconnected", "The terminal heartbeat expired; input is fenced until a fresh attachment is proven.", { retryable: true });
+    void connection.close({ code: 1001, reason: "runa_heartbeat_expired" }).catch(() => undefined);
   }
 
   #nextActiveTab(excluding: string): string | undefined {
@@ -802,6 +890,7 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000): RuntimeTer
   return Object.freeze({
     tabId: entry.tabId,
     viewId: entry.viewId,
+    userId: entry.observation.userId,
     machineId: entry.observation.machineId,
     agentSessionId: entry.observation.agentSessionId,
     processEpoch: entry.observation.processEpoch,

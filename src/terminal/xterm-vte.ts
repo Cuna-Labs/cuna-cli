@@ -3,7 +3,7 @@ import xtermHeadless from "@xterm/headless";
 import type { Terminal as XtermTerminal } from "@xterm/headless";
 
 import { MAX_TERMINAL_FRAME_BYTES } from "./codec.js";
-import { ViewportRegistry, type ViewportBinding, type ViewportSnapshot } from "./viewport.js";
+import { MAX_VIEWPORT_CELLS, ViewportRegistry, type ViewportBinding, type ViewportSnapshot } from "./viewport.js";
 
 const { Terminal } = xtermHeadless as unknown as { readonly Terminal: typeof XtermTerminal };
 export const DEFAULT_XTERM_SCROLLBACK = 1_000;
@@ -217,9 +217,16 @@ export class XtermViewportAdapter {
     }
   }
 
-  resize(columns: number, rows: number): ViewportSnapshot {
+  async resize(columns: number, rows: number): Promise<ViewportSnapshot> {
     this.#assertOpen();
     assertBufferBudget(columns, rows, this.#scrollback);
+    const operation = this.#writeTail.then(() => this.#resizeNow(columns, rows));
+    this.#writeTail = operation.then(() => undefined, () => undefined);
+    return await operation;
+  }
+
+  #resizeNow(columns: number, rows: number): ViewportSnapshot {
+    this.#assertOpen();
     const previousCells = bufferCells(this.#terminal.cols, this.#terminal.rows, this.#scrollback);
     this.#resourceBudget.resize(this.#tabId, bufferCells(columns, rows, this.#scrollback));
     try {
@@ -230,7 +237,7 @@ export class XtermViewportAdapter {
       throw error;
     }
     const current = this.#registry.require(this.#tabId);
-    return this.#capture(current.outputSequence + 1n, current.replayCursor);
+    return this.#capture(current.outputSequence, current.replayCursor, true);
   }
 
   dispose(): void {
@@ -316,7 +323,7 @@ export class XtermViewportAdapter {
     }));
   }
 
-  #capture(outputSequence: bigint, replayCursor: bigint): ViewportSnapshot {
+  #capture(outputSequence: bigint, replayCursor: bigint, localReflow = false): ViewportSnapshot {
     const buffer = this.#terminal.buffer.active;
     const cells: string[] = [];
     const displayWidths: number[] = [];
@@ -335,7 +342,7 @@ export class XtermViewportAdapter {
       }
       displayWidths.push(visibleWidth);
     }
-    return this.#registry.applyRenderedFrame({
+    const frame = {
       tabId: this.#tabId,
       binding: this.#binding,
       outputSequence,
@@ -350,7 +357,10 @@ export class XtermViewportAdapter {
         alternateScreen: buffer.type === "alternate",
         cursorVisible: this.#cursorVisible,
       },
-    });
+    };
+    return localReflow
+      ? this.#registry.applyLocalReflow(frame)
+      : this.#registry.applyRenderedFrame(frame);
   }
 
   #assertOpen(): void {
@@ -364,6 +374,7 @@ function assertBufferBudget(columns: number, rows: number, scrollback: number): 
     !Number.isSafeInteger(rows) ||
     columns < 1 ||
     rows < 1 ||
+    columns * rows > MAX_VIEWPORT_CELLS ||
     bufferCells(columns, rows, scrollback) > MAX_XTERM_BUFFER_CELLS
   ) {
     throw new RangeError(`Terminal viewport and scrollback exceed the ${MAX_XTERM_BUFFER_CELLS}-cell memory budget.`);

@@ -141,6 +141,27 @@ export class ViewportRegistry {
     return next;
   }
 
+  applyLocalReflow(input: {
+    readonly tabId: string;
+    readonly binding: ViewportBinding;
+    readonly outputSequence: bigint;
+    readonly replayCursor: bigint;
+    readonly cells: readonly string[];
+    readonly displayWidths: readonly number[];
+    readonly cursorX: number;
+    readonly cursorY: number;
+    readonly modes: ViewportModes;
+  }): ViewportSnapshot {
+    const current = this.require(input.tabId);
+    if (!sameBinding(current.binding, input.binding)) {
+      throw new ViewportIsolationError("binding_mismatch", "Local reflow targets another terminal generation.");
+    }
+    if (input.outputSequence !== current.outputSequence || input.replayCursor !== current.replayCursor) {
+      throw new ViewportIsolationError("frame_regression", "Local reflow cannot invent or change remote sequence truth.");
+    }
+    return this.#replaceCells(current, input);
+  }
+
   active(): ViewportSnapshot | undefined {
     return this.#activeTabId === undefined ? undefined : this.require(this.#activeTabId);
   }
@@ -153,6 +174,38 @@ export class ViewportRegistry {
 
   list(): readonly ViewportSnapshot[] {
     return Object.freeze([...this.#tabs.values()]);
+  }
+
+  #replaceCells(
+    current: ViewportSnapshot,
+    input: {
+      readonly cells: readonly string[];
+      readonly displayWidths: readonly number[];
+      readonly cursorX: number;
+      readonly cursorY: number;
+      readonly modes: ViewportModes;
+    },
+  ): ViewportSnapshot {
+    if (
+      input.cells.length > current.rows ||
+      input.displayWidths.length !== input.cells.length ||
+      input.cells.some((row) => containsHostControl(row)) ||
+      input.displayWidths.some((width) => !Number.isSafeInteger(width) || width < 0 || width > current.columns) ||
+      !Number.isSafeInteger(input.cursorX) || input.cursorX < 0 || input.cursorX > current.columns ||
+      !Number.isSafeInteger(input.cursorY) || input.cursorY < 0 || input.cursorY >= current.rows
+    ) {
+      throw new ViewportIsolationError("viewport_limit", "Rendered cells exceed their isolated viewport bounds.");
+    }
+    const next = freezeSnapshot({
+      ...current,
+      cells: Object.freeze([...input.cells]),
+      displayWidths: Object.freeze([...input.displayWidths]),
+      cursorX: input.cursorX,
+      cursorY: input.cursorY,
+      modes: Object.freeze({ ...input.modes }),
+    });
+    this.#tabs.set(current.tabId, next);
+    return next;
   }
 }
 

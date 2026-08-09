@@ -442,7 +442,9 @@ test("Node host terminal restoration returns stdin to its prior flow state", asy
   };
   const stdout = {
     isTTY: true,
-    write(value) { writes.push(value); return true; },
+    once() { return this; },
+    removeListener() { return this; },
+    write(value, callback) { writes.push(value); callback?.(null); return true; },
   };
 
   const lease = await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout }));
