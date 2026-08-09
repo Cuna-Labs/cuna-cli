@@ -3,7 +3,6 @@ import { createLinuxSecretServiceBackend } from "./linux-secret-service.js";
 import { createMacOsKeychainBackend } from "./native-bridge-backend.js";
 import type { SecureProcessRunner } from "./process-runner.js";
 import { createUnavailableCredentialBackend } from "./unavailable-backend.js";
-import { createWindowsCredentialManagerBackend } from "./windows-credential-manager.js";
 
 export function createPlatformCredentialBackend(input: {
   readonly platform?: NodeJS.Platform;
@@ -13,8 +12,10 @@ export function createPlatformCredentialBackend(input: {
 } = {}): SecureCredentialBackend {
   const platform = input.platform ?? process.platform;
   if (platform === "win32") {
-    return createWindowsCredentialManagerBackend({
-      ...(input.runner !== undefined && { runner: input.runner }),
+    return createUnavailableCredentialBackend({
+      backendId: "windows-native-vault-required",
+      platform,
+      reason: "The PowerShell credential bridge was removed; a signed native Windows vault bridge is required.",
       ...(input.clock !== undefined && { clock: input.clock }),
     });
   }

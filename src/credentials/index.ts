@@ -7,4 +7,3 @@ export * from "./process-runner.js";
 export * from "./secret-material.js";
 export * from "./unavailable-backend.js";
 export * from "./vault.js";
-export * from "./windows-credential-manager.js";

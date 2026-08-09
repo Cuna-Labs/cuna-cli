@@ -11,7 +11,7 @@ import {
   createMacOsKeychainBackend,
   createSecureProcessRunner,
   createUnavailableCredentialBackend,
-  createWindowsCredentialManagerBackend,
+  createPlatformCredentialBackend,
   credentialTarget,
 } from "../dist/credentials/index.js";
 
@@ -314,56 +314,6 @@ test("Linux Secret Service adapter transports protected values only through stdi
   sentinel.fill(0);
 });
 
-test("Windows Credential Manager adapter transports protected values only through stdin", async () => {
-  const calls = [];
-  const values = new Map();
-  const runner = {
-    run: async (request) => {
-      const captured = {
-        ...request,
-        args: [...request.args],
-        environment: { ...request.environment },
-        stdin: Uint8Array.from(request.stdin),
-      };
-      calls.push(captured);
-      const body = JSON.parse(new TextDecoder().decode(request.stdin));
-      let response;
-      if (body.operation === "replace") {
-        values.set(body.target, body.valueBase64);
-        response = { ok: true, status: "replaced" };
-      } else if (body.operation === "read") {
-        response = values.has(body.target)
-          ? { ok: true, status: "present", valueBase64: values.get(body.target) }
-          : { ok: true, status: "absent" };
-      } else {
-        const deleted = values.delete(body.target);
-        response = { ok: true, status: deleted ? "deleted" : "absent" };
-      }
-      return {
-        exitCode: 0,
-        signal: null,
-        stdout: new TextEncoder().encode(JSON.stringify(response)),
-        stderrPresent: false,
-      };
-    },
-  };
-  const backend = createWindowsCredentialManagerBackend({ runner, environment: { SystemRoot: "C:\\Windows" } });
-  const text = "windows-secret-sentinel";
-  const encoded = new TextEncoder().encode(text);
-  await backend.replace("opaque-target", encoded);
-  const observed = await backend.read("opaque-target");
-  assert.equal(new TextDecoder().decode(observed), text);
-  const encodedSecret = Buffer.from(text).toString("base64");
-  for (const call of calls) {
-    const publicTransport = JSON.stringify({ args: call.args, environment: call.environment });
-    assert.doesNotMatch(publicTransport, /windows-secret-sentinel/u);
-    assert.equal(publicTransport.includes(encodedSecret), false, "base64 secret must not enter argv or environment");
-  }
-  assert.equal(new TextDecoder().decode(calls[0].stdin).includes(encodedSecret), true);
-  observed.fill(0);
-  encoded.fill(0);
-});
-
 test("secure credential helpers require absolute executable and working-directory authority", async () => {
   const runner = createSecureProcessRunner();
   await assert.rejects(
@@ -376,28 +326,15 @@ test("secure credential helpers require absolute executable and working-director
   );
 });
 
-test("Windows Credential Manager pins PowerShell and cwd beneath SystemRoot", async () => {
-  const calls = [];
-  const runner = {
-    run: async (request) => {
-      calls.push(request);
-      return {
-        exitCode: 0,
-        signal: null,
-        stdout: new TextEncoder().encode(JSON.stringify({ ok: true, status: "absent" })),
-        stderrPresent: false,
-      };
-    },
-  };
-  const backend = createWindowsCredentialManagerBackend({
-    runner,
-    environment: { SystemRoot: "C:\\Windows" },
-  });
-  assert.equal(await backend.read("opaque-target"), undefined);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].executable, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
-  assert.equal(calls[0].cwd, "C:\\Windows\\System32");
-  assert.equal(Object.hasOwn(calls[0].environment, "PATH"), false);
+test("Windows fails closed until a signed native vault bridge is available", async () => {
+  const backend = createPlatformCredentialBackend({ platform: "win32", clock: () => NOW });
+  const evidence = await backend.probe();
+  assert.equal(evidence.status, "unavailable");
+  assert.equal(evidence.backendId, "windows-native-vault-required");
+  await assert.rejects(
+    backend.read("opaque-target"),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unavailable",
+  );
 });
 
 test("macOS adapter refuses argv-based Keychain fallback when no native bridge exists", async () => {
