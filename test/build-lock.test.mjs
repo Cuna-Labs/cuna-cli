@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -76,4 +78,29 @@ test("foreign endpoint identity fails closed without cleanup or takeover", async
   } finally {
     await close(foreign);
   }
+});
+
+test("an owner crash releases the kernel lock without PID-based stale cleanup", async (context) => {
+  const root = uniqueRoot("crash");
+  const moduleUrl = new URL("../scripts/lib/exclusive-build-lock.mjs", import.meta.url).href;
+  const source = [
+    `const { acquireExclusiveBuildLock } = await import(${JSON.stringify(moduleUrl)});`,
+    "await acquireExclusiveBuildLock(process.argv[1], { timeoutMs: 2000 });",
+    "process.stdout.write('LOCKED\\n');",
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", source, root], {
+    stdio: ["ignore", "pipe", "inherit"],
+    windowsHide: true,
+  });
+  context.after(() => {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  });
+  const [ready] = await once(child.stdout, "data");
+  assert.equal(String(ready), "LOCKED\n");
+
+  child.kill("SIGKILL");
+  await once(child, "close");
+  const replacement = await acquireExclusiveBuildLock(root, { timeoutMs: 2_000 });
+  await replacement.release();
 });
