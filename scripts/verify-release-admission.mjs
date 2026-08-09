@@ -9,7 +9,10 @@ const evidenceRoot = path.resolve(root, args.get("evidence") ?? "release-artifac
 const receiptsRoot = path.resolve(root, args.get("receipts") ?? "evidence/platform-receipts");
 const output = path.resolve(root, args.get("output") ?? "evidence/admission.json");
 const maximumAgeHours = Number(args.get("maximum-age-hours") ?? "24");
-invariant(Number.isFinite(maximumAgeHours) && maximumAgeHours > 0, "maximum-age-hours must be positive");
+invariant(
+  Number.isFinite(maximumAgeHours) && maximumAgeHours > 0 && maximumAgeHours <= 24,
+  "maximum-age-hours must be greater than zero and no more than 24",
+);
 const maximumFutureSkewMs = 5 * 60 * 1_000;
 const observedNow = Date.now();
 const envelope = await readJson(path.join(evidenceRoot, "release-envelope.json"));
@@ -52,14 +55,20 @@ for (const file of files) {
 invariant(JSON.stringify(observedIds.sort()) === JSON.stringify(expectedIds), "Mandatory platform receipt set differs from policy");
 
 await writeFile(output, `${JSON.stringify({
-  schemaVersion: 2,
-  decision: "CANDIDATE_ADMITTED_FOR_EXTERNAL_RELEASE_REVIEW",
+  schemaVersion: 3,
+  decision: "PLATFORM_MATRIX_VERIFIED_NOT_RELEASE_AUTHORIZED",
+  releaseEligible: false,
   releaseEnvelopeSha256,
   candidateSha256: envelope.tarball.sha256,
   releaseInputsSha256: envelope.releaseInputs.sha256,
   identities: envelope.identities,
   sourceCommit: envelope.sourceCommit,
   platformReceipts: expectedIds,
-  limitation: "This receipt does not publish, promote, or prove any installation channel is live.",
+  limitations: [
+    "NO_AUTHENTICATED_RECEIPT_OBSERVER",
+    "NO_SEMANTIC_CHANNEL_TRANSACTION_EVIDENCE",
+    "NO_CROSS_CHANNEL_UPDATE_OR_RECOVERY_REHEARSAL",
+    "NO_RELEASE_APPROVAL_LEASE",
+  ],
 }, null, 2)}\n`, { flag: "wx" });
-process.stdout.write('{"status":"admitted-for-external-release-review"}\n');
+process.stdout.write('{"status":"platform-matrix-verified-not-release-authorized","releaseEligible":false}\n');

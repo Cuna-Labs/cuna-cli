@@ -13,7 +13,7 @@ await verifyEnvelopeFiles(envelope, root);
 let installed = false;
 let installedPrefix;
 const verification = await withOwnedTempDirectory("runa-cli-install-", async (ownedRoot) => {
-  const prefix = path.join(ownedRoot, "installed prefix with spaces");
+  const prefix = path.join(ownedRoot, "installed prefix (x86) á");
   installedPrefix = prefix;
   await mkdir(prefix, { recursive: false });
   const emptyCache = path.join(prefix, "npm-cache");

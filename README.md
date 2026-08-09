@@ -3,7 +3,7 @@
 [![CI](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/codeql.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D22-339933?logo=node.js&logoColor=white)](package.json)
+[![Node.js](https://img.shields.io/badge/node-22.17.1%2B%20%7C%2024.4.1%2B-339933?logo=node.js&logoColor=white)](package.json)
 
 Run cloud development agents from a local terminal through Runa's public,
 policy-enforced control plane.
@@ -23,8 +23,9 @@ opaque remote shell.
 
 - Versioned human and JSON output with stable error and exit-code categories.
 - Exact public Runa API-origin validation and bounded authenticated transport.
-- Polling-only browser sign-in with PKCE, OS-vault refresh rotation, and
-  memory-only access tokens.
+- Polling-only browser sign-in contracts with PKCE, OS-vault refresh rotation,
+  and memory-only access tokens; native Windows browser and vault adapters are
+  still blocked and fail closed.
 - Capability discovery that treats absent, stale, contradictory, or unknown
   evidence as unauthorized for mutation.
 - Machine and AgentSession command foundations over public Runa contracts.
@@ -35,13 +36,15 @@ opaque remote shell.
 
 Cloud terminal attachment, daemon integration, workspace synchronization, and
 the local companion remain pre-release work. Browser authentication is
-implemented against the public 1.3.0 contract, but production availability still
-depends on server configuration and release admission. Source code or a
-documented interface is not evidence that a capability is deployed.
+implemented against the commit-pinned public 1.4.0 candidate contract.
+Canonical contract approval, producer deployment and native Windows adapters
+remain blocked. Source code or a documented interface is not evidence that a
+capability is deployed.
 
 ## Quick start for contributors
 
-Node.js 22 or newer is required.
+Node.js 22.17.1+ on the Node 22 line or Node.js 24.4.1+ on the Node 24 line is
+required. The current candidate supports x64 only.
 
 ```sh
 git clone https://github.com/Runa-Laboratories/runa-cli.git
@@ -63,11 +66,11 @@ node dist/bin/runa.js version --json
 
 | Surface | Command | Platform | Current status |
 | --- | --- | --- | --- |
-| npm | `npm install -g @runa_laboratories/cli` | Windows, macOS, Linux | Canonical package; publication remains gated |
-| Bun | `bun add --global @runa_laboratories/cli` | Windows, macOS, Linux | Same npm artifact; compatibility evidence pending |
-| curl | `curl -fsSL https://runacode.io/install \| sh` | macOS, Linux | Digest-bound installer projection; endpoint pending |
-| Homebrew | `brew install Runa-Laboratories/tap/runa` | macOS, Linux | Formula projection; tap pending |
-| paru/AUR | `paru -S runa-cli-bin` | Arch Linux | PKGBUILD projection; AUR ownership pending |
+| npm | `npm install -g @runa_laboratories/cli` | Windows x64, Intel macOS x64, Linux x64 | Not live; canonical publication is gated |
+| Bun | `bun add --global @runa_laboratories/cli` | Windows x64, Intel macOS x64, Linux x64 | Not live; projects the same Node-based npm artifact |
+| curl | `curl -fsSL https://runacode.io/install \| sh` | Intel macOS x64, Linux x64 | Not live; endpoint and recovery evidence are pending |
+| Homebrew | `brew install Runa-Laboratories/tap/runa` | Intel macOS x64, Linux x64 | Not live; tap and installed-product evidence are pending |
+| paru/AUR | `paru -S runa-cli-bin` | Arch Linux x64 | Not live; AUR ownership and installed-product evidence are pending |
 
 Every projection must install the exact admitted npm tarball. No channel may
 rebuild, patch, or independently version the CLI.

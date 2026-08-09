@@ -25,7 +25,7 @@ export async function invokeInstalledRuna(prefix, args, options = {}) {
   await stat(executable);
   if (process.platform !== "win32") return execute(executable, args, { ...options, windowsHide: true });
   invariant(args.every((value) => /^[A-Za-z0-9._-]+$/u.test(value)), "Installed-product probe received an unsafe Windows argument");
-  invariant(!/["&|<>^()%!\r\n]/u.test(executable), "Installed-product probe path contains a Windows command metacharacter");
+  invariant(!/["&|<>^%!\r\n]/u.test(executable), "Installed-product probe path contains a Windows command metacharacter");
   const command = `"${executable}" ${args.join(" ")}`;
   return executeShellCommand(command, { ...options, windowsHide: true });
 }

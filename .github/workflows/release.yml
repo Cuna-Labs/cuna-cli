@@ -98,11 +98,14 @@ jobs:
           const envelope = JSON.parse(envelopeBytes);
           const admission = JSON.parse(fs.readFileSync('admitted/evidence/admission.json'));
           const envelopeSha256 = crypto.createHash('sha256').update(envelopeBytes).digest('hex');
-          if (envelope.schemaVersion !== 2 || admission.schemaVersion !== 2) process.exit(1);
+          if (envelope.schemaVersion !== 2 || admission.schemaVersion !== 3) process.exit(1);
           if (envelope.version !== process.env.VERSION || envelope.sourceCommit !== process.env.SOURCE_COMMIT || envelope.tarball.sha256 !== process.env.CANDIDATE_SHA256) process.exit(1);
           if (envelopeSha256 !== process.env.CANDIDATE_ENVELOPE_SHA256 || admission.releaseEnvelopeSha256 !== envelopeSha256) process.exit(1);
           if (admission.candidateSha256 !== envelope.tarball.sha256 || admission.sourceCommit !== envelope.sourceCommit || admission.releaseInputsSha256 !== envelope.releaseInputs.sha256) process.exit(1);
           if (JSON.stringify(admission.identities) !== JSON.stringify(envelope.identities)) process.exit(1);
+          if (admission.decision !== 'CANDIDATE_ADMITTED_FOR_EXTERNAL_RELEASE_REVIEW' || admission.releaseEligible !== true) {
+            throw new Error('Publication blocked: installed-platform evidence is not authenticated semantic release authorization.');
+          }
           NODE
         env:
           VERSION: ${{ inputs.version }}

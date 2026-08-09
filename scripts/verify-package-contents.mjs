@@ -73,6 +73,12 @@ const packageEntry = entries.find((entry) => entry.name === "package/package.jso
 const packageJson = JSON.parse(packageEntry.body.toString("utf8"));
 invariant(packageJson.name === "@runa_laboratories/cli", "Packed package identity differs");
 invariant(packageJson.license === "Apache-2.0", "Packed package license differs");
+invariant(packageJson.engines?.node === "^22.17.1 || ^24.4.1", "Packed package Node support range differs");
+invariant(JSON.stringify(packageJson.cpu) === JSON.stringify(["x64"]), "Packed package architecture policy differs");
+invariant(
+  JSON.stringify(packageJson.os) === JSON.stringify(["win32", "darwin", "linux"]),
+  "Packed package operating-system policy differs",
+);
 for (const script of ["preinstall", "install", "postinstall"]) {
   invariant(packageJson.scripts?.[script] === undefined, `Packed package contains prohibited ${script} lifecycle`);
 }

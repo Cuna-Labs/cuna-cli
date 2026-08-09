@@ -60,7 +60,7 @@ try {
   const supportSource = path.join(repositoryRoot, "packaging", "support-policy.json");
   validateSupportPolicy(await readJson(supportSource));
 
-  const installPrefix = path.join(temporaryRoot, "installed prefix with spaces");
+  const installPrefix = path.join(temporaryRoot, "installed prefix (x86) á");
   await mkdir(installPrefix, { recursive: false });
   const emptyCache = path.join(temporaryRoot, "empty-cache");
   await mkdir(emptyCache, { recursive: false });

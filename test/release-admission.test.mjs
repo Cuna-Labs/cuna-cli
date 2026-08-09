@@ -89,9 +89,14 @@ async function mutateFirstReceipt(fixture, mutate) {
   await writeFile(fixture.firstReceipt, `${JSON.stringify(receipt, null, 2)}\n`);
 }
 
-test("release admission requires complete fresh installed-product receipts", async () => {
+test("complete platform receipts are never elevated to release authorization", async () => {
   const fixture = await createAdmissionFixture();
   await assert.doesNotReject(verifyAdmission(fixture));
+  const admission = JSON.parse(await readFile(path.join(fixture.root, "admission.json"), "utf8"));
+  assert.equal(admission.schemaVersion, 3);
+  assert.equal(admission.decision, "PLATFORM_MATRIX_VERIFIED_NOT_RELEASE_AUTHORIZED");
+  assert.equal(admission.releaseEligible, false);
+  assert.ok(admission.limitations.includes("NO_AUTHENTICATED_RECEIPT_OBSERVER"));
 });
 
 test("release admission rejects failed or missing uninstall cleanup", async () => {
@@ -118,4 +123,19 @@ test("release admission rejects stale or future receipts", async () => {
   const future = await createAdmissionFixture();
   await mutateFirstReceipt(future, (receipt) => { receipt.observedAt = "2099-01-01T00:00:00.000Z"; });
   await assert.rejects(verifyAdmission(future), /observedAt is in the future/);
+});
+
+test("release admission cannot widen receipt freshness beyond 24 hours", async () => {
+  const fixture = await createAdmissionFixture();
+  await assert.rejects(
+    execute(process.execPath, [
+      "scripts/verify-release-admission.mjs",
+      "--root", fixture.root,
+      "--evidence", fixture.evidence,
+      "--receipts", fixture.receipts,
+      "--output", path.join(fixture.root, "admission.json"),
+      "--maximum-age-hours", "168",
+    ], { cwd: repositoryRoot, maxBuffer: 4 * 1024 * 1024 }),
+    /no more than 24/,
+  );
 });
