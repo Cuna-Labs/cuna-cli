@@ -1,0 +1,51 @@
+{
+  "name": "@runa_laboratories/cli",
+  "version": "0.1.0",
+  "description": "The official Runa command-line interface.",
+  "type": "module",
+  "bin": {
+    "runa": "./dist/bin/runa.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "oxlint --deny-warnings src test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run typecheck && npm test"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org",
+    "provenance": true
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Runa-Laboratories/runa-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Runa-Laboratories/runa-cli/issues"
+  },
+  "homepage": "https://runacode.io",
+  "keywords": [
+    "runa",
+    "cli",
+    "cloud-development",
+    "claude-code",
+    "codex"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "oxlint": "1.77.0",
+    "typescript": "^5.8.3"
+  }
+}
