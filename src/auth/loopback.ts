@@ -31,6 +31,7 @@ function sameSecret(left: string, right: string): boolean {
 function finishResponse(response: ServerResponse, status: number): void {
   response.writeHead(status, {
     "Cache-Control": "no-store",
+    Connection: "close",
     "Content-Type": "text/plain; charset=utf-8",
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
     "Referrer-Policy": "no-referrer",
@@ -159,8 +160,13 @@ export async function startLoopbackCallback(input: {
     server.close();
     throw new Error("Loopback listener did not expose a numeric address.");
   }
-  input.signal?.addEventListener("abort", cancel, { once: true });
-  if (input.signal?.aborted === true) cancel();
+  server.on("error", () => {
+    if (settled) return;
+    settled = true;
+    if (timer !== undefined) clearTimeout(timer);
+    input.signal?.removeEventListener("abort", cancel);
+    rejectCompletion(authError("runa.auth.callback_unavailable", "The local Runa authorization callback became unavailable.", true));
+  });
   timer = setTimeout(() => {
     if (settled) return;
     settled = true;
@@ -169,6 +175,8 @@ export async function startLoopbackCallback(input: {
     rejectCompletion(authError("runa.auth.timeout", "Runa authorization timed out.", true));
   }, input.timeoutMs);
   timer.unref();
+  input.signal?.addEventListener("abort", cancel, { once: true });
+  if (input.signal?.aborted === true) cancel();
 
   const literalHost = host === "::1" ? "[::1]" : host;
   return Object.freeze({

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runacode.io/schemas/runa-cli-local-artifact-evidence-v1.json",
+  "title": "Runa CLI local non-release artifact evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "authority", "releaseEligible", "limitations", "repository", "sourceCommit", "sourceTreeStatus", "sourceStatusSha256", "package", "artifact", "sbom", "supportPolicy", "runtimeIdentity", "observations", "environment", "generatedAt"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "authority": {"const": "LOCAL_NON_RELEASE_EVIDENCE"},
+    "releaseEligible": {"const": false},
+    "limitations": {"type": "array", "minItems": 5, "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "repository": {"const": "Runa-Laboratories/runa-cli"},
+    "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sourceTreeStatus": {"enum": ["CLEAN", "DIRTY"]},
+    "sourceStatusSha256": {"$ref": "#/$defs/sha256"},
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {"name": {"const": "@runa_laboratories/cli"}, "version": {"type": "string", "minLength": 1}}
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "sha256", "size"],
+      "properties": {"file": {"type": "string", "pattern": "^[A-Za-z0-9._-]+\\.tgz$"}, "sha256": {"$ref": "#/$defs/sha256"}, "size": {"type": "integer", "minimum": 1}}
+    },
+    "sbom": {"$ref": "#/$defs/digestFile"},
+    "supportPolicy": {"$ref": "#/$defs/digestFile"},
+    "runtimeIdentity": {"type": "object"},
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selfTest", "version"],
+      "properties": {"selfTest": {"$ref": "#/$defs/digestFile"}, "version": {"$ref": "#/$defs/digestFile"}}
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "architecture", "node", "npm"],
+      "properties": {
+        "platform": {"enum": ["linux", "darwin", "win32"]},
+        "architecture": {"type": "string", "minLength": 1},
+        "node": {"type": "string", "minLength": 1},
+        "npm": {"type": "string", "minLength": 1}
+      }
+    },
+    "generatedAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digestFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "sha256"],
+      "properties": {"file": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+    }
+  }
+}
+
