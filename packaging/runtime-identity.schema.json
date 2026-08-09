@@ -1,16 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runacode.io/schemas/runa-cli-runtime-identity-v1.json",
+  "$id": "https://runacode.io/schemas/runa-cli-runtime-identity-v2.json",
   "title": "Runa CLI version command data payload",
   "type": "object",
   "additionalProperties": true,
-  "required": ["version", "buildDigest", "platform", "architecture", "updateChannel", "protocolRange"],
+  "required": ["version", "buildDigest", "platform", "architecture", "artifactChannel", "protocolRange"],
   "properties": {
     "version": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"},
     "buildDigest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "platform": {"enum": ["win32", "darwin", "linux"]},
     "architecture": {"type": "string", "minLength": 1},
-    "updateChannel": {"enum": ["npm", "bun", "curl", "homebrew", "aur", "development"]},
+    "updateChannel": {"const": "npm", "deprecated": true, "description": "Compatibility alias retained for the unpublished v1 CLI envelope transition; new consumers use artifactChannel."},
+    "artifactChannel": {"const": "npm"},
     "protocolRange": {
       "type": "object",
       "additionalProperties": false,

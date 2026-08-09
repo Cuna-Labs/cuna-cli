@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runacode.io/schemas/runa-cli-support-policy-v2.json",
+  "title": "Runa CLI support and distribution policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "packageName", "canonicalRegistry", "architectures", "node", "protocolRange", "approvedRealHosts", "ciMatrix", "preGaExternalEvidence", "channelOrder", "channels"],
+  "properties": {
+    "schemaVersion": {"const": 2},
+    "packageName": {"const": "@runa_laboratories/cli"},
+    "canonicalRegistry": {"const": "https://registry.npmjs.org"},
+    "architectures": {"const": ["x64"]},
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum", "supportedLines", "tested"],
+      "properties": {
+        "minimum": {"const": "22.17.1"},
+        "supportedLines": {"const": ["22.17.1", "24.4.1"]},
+        "tested": {"const": ["22.17.1", "24.4.1"]}
+      }
+    },
+    "protocolRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum", "maximum"],
+      "properties": {
+        "minimum": {"const": "1"},
+        "maximum": {"const": "1"}
+      }
+    },
+    "approvedRealHosts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/approvedRealHost"}
+    },
+    "ciMatrix": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/ciMatrixEntry"},
+      "allOf": [
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "linux"}, "architecture": {"const": "x64"}, "node": {"const": "22.17.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "linux"}, "architecture": {"const": "x64"}, "node": {"const": "24.4.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "darwin"}, "architecture": {"const": "x64"}, "node": {"const": "22.17.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "darwin"}, "architecture": {"const": "x64"}, "node": {"const": "24.4.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "win32"}, "architecture": {"const": "x64"}, "node": {"const": "22.17.1"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"type": "object", "required": ["platform", "architecture", "node"], "properties": {"platform": {"const": "win32"}, "architecture": {"const": "x64"}, "node": {"const": "24.4.1"}}}, "minContains": 1, "maxContains": 1}
+      ]
+    },
+    "preGaExternalEvidence": {"type": "array", "minItems": 5, "items": {"type": "string", "minLength": 1}},
+    "channelOrder": {"type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true, "items": {"enum": ["npm", "bun", "curl", "homebrew", "aur"]}},
+    "channels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["npm", "bun", "curl", "homebrew", "aur"],
+      "properties": {
+        "npm": {"allOf": [{"$ref": "#/$defs/channel"}, {"properties": {"role": {"const": "canonical-artifact"}, "installerOfRecord": {"const": "npm"}, "candidateInvocationPolicy": {"const": "npm-exact-version"}}}]},
+        "bun": {"allOf": [{"$ref": "#/$defs/channel"}, {"properties": {"role": {"const": "registry-projection"}, "installerOfRecord": {"const": "bun"}, "candidateInvocationPolicy": {"const": "bun-exact-version"}}}]},
+        "curl": {"allOf": [{"$ref": "#/$defs/channel"}, {"properties": {"role": {"const": "bootstrap-projection"}, "installerOfRecord": {"const": "npm"}, "candidateInvocationPolicy": {"const": "verified-projection"}}}]},
+        "homebrew": {"allOf": [{"$ref": "#/$defs/channel"}, {"properties": {"role": {"const": "formula-projection"}, "installerOfRecord": {"const": "homebrew"}, "candidateInvocationPolicy": {"const": "verified-projection"}, "runtimeDependency": {"pattern": "^[a-z0-9@+_.-]+$"}}}]},
+        "aur": {"allOf": [{"$ref": "#/$defs/channel"}, {"properties": {"role": {"const": "package-projection"}, "installerOfRecord": {"const": "pacman"}, "candidateInvocationPolicy": {"const": "verified-projection"}, "runtimeDependency": {"pattern": "^[a-z0-9@+_.-]+(?:[<>=]+[0-9][0-9A-Za-z.+_-]*)?$"}}}]}
+      }
+    }
+  },
+  "$defs": {
+    "approvedRealHost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runnerImage", "platform", "architecture", "node"],
+      "properties": {
+        "runnerImage": {"type": "string", "pattern": "^policy-approved:[A-Za-z0-9][A-Za-z0-9._:-]{2,111}$"},
+        "platform": {"enum": ["linux", "darwin", "win32"]},
+        "architecture": {"const": "x64"},
+        "node": {"enum": ["22.17.1", "24.4.1"]}
+      }
+    },
+    "ciMatrixEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "runner", "platform", "architecture", "node"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+        "runner": {"type": "string", "minLength": 1},
+        "platform": {"enum": ["linux", "darwin", "win32"]},
+        "architecture": {"type": "string", "minLength": 1},
+        "node": {"enum": ["22.17.1", "24.4.1"]},
+        "claim": {"const": "observation-only"}
+      }
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "availability", "artifactChannel", "installerOfRecord", "platforms", "projectionFile", "publicCommand", "candidateInvocationPolicy", "runtimeDependency"],
+      "properties": {
+        "role": {"enum": ["canonical-artifact", "registry-projection", "bootstrap-projection", "formula-projection", "package-projection"]},
+        "availability": {"const": "PROJECTED_NOT_PUBLISHED"},
+        "artifactChannel": {"const": "npm"},
+        "installerOfRecord": {"enum": ["npm", "bun", "homebrew", "pacman"]},
+        "platforms": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["linux-x64", "darwin-x64", "win32-x64"]}},
+        "projectionFile": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"},
+        "publicCommand": {"type": "string", "minLength": 1},
+        "candidateInvocationPolicy": {"enum": ["npm-exact-version", "bun-exact-version", "verified-projection"]},
+        "runtimeDependency": {"type": "string", "pattern": "^[A-Za-z0-9@^.+:/|><= _-]+$"}
+      }
+    }
+  }
+}

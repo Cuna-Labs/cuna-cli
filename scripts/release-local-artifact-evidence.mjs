@@ -77,7 +77,7 @@ try {
   invariant(version?.data?.version === packageJson.version, "Local installed version differs from package.json");
   invariant(/^[0-9a-f]{64}$/.test(version?.data?.buildDigest), "Local installed build digest is invalid");
   invariant(version?.data?.platform === process.platform && version?.data?.architecture === process.arch, "Local runtime platform identity differs");
-  invariant(version?.data?.updateChannel === "npm", "Local artifact channel is not npm");
+  invariant(version?.data?.artifactChannel === "npm", "Local artifact channel is not npm");
 
   const cleanupCache = path.join(temporaryRoot, "cleanup-cache");
   await mkdir(cleanupCache, { recursive: false });

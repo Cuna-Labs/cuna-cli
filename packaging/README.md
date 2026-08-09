@@ -1,7 +1,7 @@
 # Distribution projections
 
 npm is the canonical first-GA publication for Runa CLI. Every other surface in
-this directory is a projection of the exact admitted npm tarball; no projection
+this directory is a projection of the exact candidate npm tarball; no projection
 may rebuild, patch, re-bundle, or independently version the CLI.
 
 ## Channel status
@@ -24,11 +24,25 @@ matches bytes on disk.
 
 `distribution-manifest.schema.json` is the separate projection boundary. It
 binds the release-envelope digest, canonical tarball, CycloneDX SBOM, support
-policy, platform claim, exact immutable command, generated projection digest,
+policy, platform claim, candidate invocation, generated projection digest,
 publisher requirements, and recovery truth for every approved channel. A local
 manifest is deliberately `BLOCKED` and every channel is
 `PROJECTED_NOT_PUBLISHED`; generation cannot assert that an external channel is
 live.
+
+`support-policy.json` is the sole ordered authority for the five channels,
+their installer of record, canonical artifact channel, supported platforms,
+runtime dependencies, and CI matrix. Its v2 schema distinguishes mandatory
+x64 admission lanes from optional `observation-only` lanes. Observation data is
+identity-checked when present, but it cannot block admission, replace required
+evidence, widen support, or authorize a release.
+
+The manifest and installed-distribution receipt advance to schema v3 for this
+pre-publication contract correction. Their earlier v2 forms were never exposed
+by a live package or channel, so they are rejected instead of being treated as
+an implicit compatibility promise. The CLI's v1 JSON envelope temporarily
+retains deprecated `updateChannel: "npm"` alongside the precise
+`artifactChannel: "npm"` field for expand/contract compatibility.
 
 Generate and verify a projection bundle without publishing it:
 
@@ -48,15 +62,17 @@ The generated bundle contains five independently hashed surfaces:
 - `npm/install-command.txt` for the canonical registry package;
 - `bun/install-command.txt` for Bun's exact-version view of that package;
 - `curl/install.sh`, which downloads the exact npm tarball, verifies SHA-256,
-  stages it without lifecycle scripts, runs the offline self-test, and compares
-  staged/active runtime identity;
+  stages it without lifecycle scripts, runs the offline self-test, compares
+  staged/active runtime identity, atomically activates the new version, retains
+  the previous version for recovery, and provides an ownership-bounded
+  `--uninstall` operation;
 - `homebrew/runa.rb`, digest-pinned to the same npm tarball;
 - `aur/PKGBUILD`, digest-pinned, offline after source acquisition, and free of
   lifecycle scripts.
 
-The release workflow generates projections from the admitted envelope into an
+The release workflow generates projections from the candidate envelope into an
 ephemeral artifact. Templates intentionally contain `@@...@@` markers and are
-not executable release installers. Generated files are admitted only after:
+not executable release installers. Generated files are accepted for review only after:
 
 1. the candidate tarball and SBOM match their envelope digests;
 2. no template marker remains;
@@ -64,12 +80,26 @@ not executable release installers. Generated files are admitted only after:
 4. projection verification rejects a substituted tarball;
 5. installed-artifact self-tests pass on the declared platform matrix.
 
-`distribution-receipt.schema.json` defines the later external evidence needed
-to prove an installed channel. The verifier requires eleven fresh receipts:
-npm and Bun on Linux/macOS/Windows x64, curl and Homebrew on Linux/macOS x64,
-and AUR/paru on Linux x64. Each receipt binds raw install, self-test, version,
-provenance, uninstall, and recovery evidence by digest. All observed installed
-build digests and protocol ranges must converge.
+`distribution-receipt.schema.json` defines pre-publication typed observations
+for an installed channel. The verifier requires 22 fresh receipts: every
+required channel/platform pair on each required Node line (22.17.1 and 24.4.1).
+Receipt identity includes the Node version. Each receipt binds one immutable
+workflow-run cohort, the stable test ID, package-manager name and version,
+exact candidate invocation, isolated environment policy, public `runa` shim
+resolution, and raw install, self-test, version, provenance, uninstall, and
+recovery observations by digest. Protocol claims must equal the exact support
+policy range. A `policy-approved-real-host` is accepted only when its complete
+identity is explicitly present in `approvedRealHosts`, which is initially
+empty.
+
+Evidence paths use one schema/runtime grammar, are confined by `lstat` and
+`realpath`, and reject links, traversal, and case-insensitive reuse. A passing
+result is only `TYPED_OBSERVATION_CONSISTENCY_PASS`: producer-authored typed
+claims are internally consistent, not independently proven true. Attestation
+authentication remains `UNVERIFIED`, distribution and release remain
+`BLOCKED`, and `releaseEligible` remains `false`. Independent causal
+observation authority plus replay/lease enforcement are explicit unresolved
+release blockers.
 
 ```bash
 node scripts/verify-distribution-receipts.mjs \
@@ -81,7 +111,7 @@ node scripts/verify-distribution-receipts.mjs \
 
 Even a passing distribution-receipt gate reports the overall release as
 `BLOCKED`; approval leases, recovery state, cohort telemetry, and the other
-The complete release workflow and its authorization receipts remain separate mandatory evidence.
+release-authority receipts remain separate mandatory evidence.
 
 ## Local artifact evidence
 

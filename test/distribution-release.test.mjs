@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -8,7 +8,13 @@ import { promisify } from "node:util";
 
 import { sha256File } from "../scripts/lib/release-evidence.mjs";
 import { syntheticReleaseEnvelope, syntheticReleaseInputs } from "../scripts/lib/release-test-fixture.mjs";
-import { CHANNEL_DEFINITIONS, CHANNEL_ORDER } from "../scripts/release-distribution-lib.mjs";
+import {
+  canonicalSha256,
+  CHANNEL_DEFINITIONS,
+  CHANNEL_ORDER,
+  distributionReceiptId,
+  normalizeReceiptEvidenceFile,
+} from "../scripts/release-distribution-lib.mjs";
 import { TestResourceLedger } from "./support/test-resource-ledger.mjs";
 
 const execute = promisify(execFile);
@@ -79,6 +85,23 @@ async function verify(fixture, output = fixture.distributions) {
     "--evidence", fixture.evidence,
     "--distributions", output,
   ], { cwd: repositoryRoot, maxBuffer: 4 * 1024 * 1024 });
+}
+
+async function mutateAndRebindProjection(fixture, channelId, mutate) {
+  const manifestFile = path.join(fixture.distributions, "distribution-manifest.json");
+  const manifest = JSON.parse(await readFile(manifestFile, "utf8"));
+  const channel = manifest.channels.find((entry) => entry.id === channelId);
+  assert.ok(channel, `fixture must contain ${channelId}`);
+  const projectionFile = path.join(fixture.distributions, ...channel.projection.file.split("/"));
+  const original = await readFile(projectionFile, "utf8");
+  const mutated = mutate(original);
+  assert.notEqual(mutated, original, `${channelId} negative control must alter the projection`);
+  await chmod(projectionFile, 0o644);
+  await writeFile(projectionFile, mutated);
+  const digest = await sha256File(projectionFile);
+  channel.projection.sha256 = digest;
+  manifest.files[channel.projection.file] = digest;
+  await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 test("all approved channels are deterministic projections of one blocked local candidate", async () => {
@@ -168,6 +191,39 @@ test("cross-channel candidate substitution is rejected even with a well-formed d
   await assert.rejects(verify(fixture), /does not bind the candidate tarball/);
 });
 
+test("curl projection verification detects loss of atomic activation after digest rebinding", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  await mutateAndRebindProjection(
+    fixture,
+    "curl",
+    (source) => source.replace('mv -f "$launcher_tmp" "$launcher"', 'cp "$launcher_tmp" "$launcher"'),
+  );
+  await assert.rejects(verify(fixture), /does not atomically activate/);
+});
+
+test("Homebrew projection verification detects fallback to ambient Node after digest rebinding", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  await mutateAndRebindProjection(
+    fixture,
+    "homebrew",
+    (source) => source.replace('exec "#{node_formula.opt_bin}/node" "#{cli}" "$@"', 'exec node "#{cli}" "$@"'),
+  );
+  await assert.rejects(verify(fixture), /does not pin Node/);
+});
+
+test("AUR projection verification detects an unsupported Node-major range after digest rebinding", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  await mutateAndRebindProjection(
+    fixture,
+    "aur",
+    (source) => source.replace("depends=('nodejs-lts-jod>=22.17.1')", "depends=('nodejs>=22')"),
+  );
+  await assert.rejects(verify(fixture), /runtime dependency differs from support policy/);
+});
+
 test("generation refuses to overwrite an existing projection bundle", async () => {
   const fixture = await createFixture();
   await project(fixture);
@@ -179,24 +235,174 @@ async function createReceiptSet(fixture) {
   await mkdir(receipts, { recursive: true });
   const manifestFile = path.join(fixture.distributions, "distribution-manifest.json");
   const manifest = JSON.parse(await readFile(manifestFile, "utf8"));
+  const supportPolicy = JSON.parse(await readFile(path.join(fixture.evidence, "support-policy.json"), "utf8"));
   const manifestSha256 = await sha256File(manifestFile);
   const observedAt = new Date().toISOString();
+  const packageManagerVersions = { npm: "10.9.2", bun: "1.2.19", homebrew: "4.4.32", pacman: "7.0.0" };
   for (const channel of manifest.channels) {
     for (const platformKey of channel.platforms) {
-      const id = `${channel.id}-${platformKey}`;
       const [platform, architecture] = platformKey.split("-");
-      const raw = {};
-      for (const evidenceName of ["install", "selfTest", "version", "provenance", "uninstall", "recovery"]) {
-        const relative = `raw/${id}/${evidenceName}.txt`;
+      for (const testedNodeVersion of supportPolicy.node.tested) {
+      const nodeVersion = `v${testedNodeVersion}`;
+      const id = distributionReceiptId(channel.id, platformKey, nodeVersion);
+      const runtimeIdentity = {
+        version: manifest.candidate.version,
+        buildDigest: manifest.candidate.identities.payloadSha256,
+        platform,
+        architecture,
+        node: nodeVersion,
+        artifactChannel: "npm",
+        installerOfRecord: channel.installerOfRecord,
+        protocolRange: { minimum: "1", maximum: "1" },
+      };
+      const execution = {
+        stableTestId: "TC-053-DISTRIBUTION-CHANNEL-TRANSACTION-V1",
+        packageManager: {
+          name: channel.installerOfRecord,
+          version: packageManagerVersions[channel.installerOfRecord],
+        },
+        candidateInvocation: channel.candidateInvocation,
+        environmentPolicy: {
+          kind: "ephemeral-dedicated-prefix",
+          networkPolicy: "INSTALL_ONLY_THEN_OFFLINE",
+          userStateSentinels: true,
+          environmentId: id,
+        },
+        publicShimResolution: {
+          command: "runa",
+          resolutionMethod: "shell-path",
+          resolvedPath: platform === "win32"
+            ? `C:\\runa-receipt-fixture\\${id}\\bin\\runa.cmd`
+            : `/tmp/runa-receipt-fixture/${id}/bin/runa`,
+          internalModuleBypass: false,
+        },
+      };
+      const executionContextSha256 = canonicalSha256(execution);
+      const raw = {
+        install: {
+          schemaVersion: 1,
+          type: "INSTALL",
+          executionContextSha256,
+          commandExitCode: 0,
+          packageName: manifest.candidate.packageName,
+          version: manifest.candidate.version,
+          tarballSha256: manifest.candidate.tarball.sha256,
+          payloadSha256: manifest.candidate.identities.payloadSha256,
+          artifactChannel: "npm",
+          installerOfRecord: channel.installerOfRecord,
+          projectionSha256: channel.projection.sha256,
+        },
+        selfTest: {
+          schemaVersion: 1,
+          type: "SELF_TEST",
+          executionContextSha256,
+          commandExitCode: 0,
+          offline: true,
+          networkRequests: 0,
+          runtimeIdentity,
+        },
+        version: {
+          schemaVersion: 1,
+          type: "VERSION",
+          executionContextSha256,
+          commandExitCode: 0,
+          reportedVersion: manifest.candidate.version,
+        },
+        provenance: {
+          schemaVersion: 1,
+          type: "PROVENANCE",
+          executionContextSha256,
+          packageName: manifest.candidate.packageName,
+          version: manifest.candidate.version,
+          sourceCommit: manifest.candidate.sourceCommit,
+          tarballSha256: manifest.candidate.tarball.sha256,
+          sbomSha256: manifest.candidate.sbom.sha256,
+          releaseInputsSha256: manifest.candidate.releaseInputs.sha256,
+          payloadSha256: manifest.candidate.identities.payloadSha256,
+          projectionSha256: channel.projection.sha256,
+        },
+        uninstall: {
+          schemaVersion: 1,
+          type: "UNINSTALL",
+          executionContextSha256,
+          commandExitCode: 0,
+          managedPathsBefore: 4,
+          managedPathsAfter: 0,
+          foreignPathsBefore: 2,
+          foreignPathsAfter: 2,
+          commandAvailableAfter: false,
+        },
+        recovery: {
+          schemaVersion: 1,
+          type: "RECOVERY",
+          executionContextSha256,
+          strategy: "ROLLBACK",
+          commandExitCode: 0,
+          sourceVersion: manifest.candidate.version,
+          sourceBuildDigest: manifest.candidate.identities.payloadSha256,
+          recoveredVersion: "1.2.2",
+          recoveredBuildDigest: "b".repeat(64),
+          healthCheckExitCode: 0,
+        },
+      };
+      const observationTypes = {
+        install: "INSTALL",
+        selfTest: "SELF_TEST",
+        version: "VERSION",
+        provenance: "PROVENANCE",
+        uninstall: "UNINSTALL",
+        recovery: "RECOVERY",
+      };
+      const observationReferences = {};
+      for (const [observationName, observation] of Object.entries(raw)) {
+        const relative = `raw/${id}/${observationName}.json`;
         const absolute = path.join(receipts, ...relative.split("/"));
         await mkdir(path.dirname(absolute), { recursive: true });
-        await writeFile(absolute, `${id} ${evidenceName} PASS\n`);
-        raw[evidenceName] = { file: relative, sha256: await sha256File(absolute) };
+        await writeFile(absolute, `${JSON.stringify(observation, null, 2)}\n`);
+        observationReferences[observationName] = {
+          type: observationTypes[observationName],
+          file: relative,
+          sha256: await sha256File(absolute),
+        };
       }
-      const receipt = {
-        schemaVersion: 2,
-        channel: channel.id,
-        distributionManifestSha256: manifestSha256,
+      const matrixEntry = supportPolicy.ciMatrix.find((entry) =>
+        entry.claim !== "observation-only" &&
+        entry.platform === platform &&
+        entry.architecture === architecture &&
+        entry.node === testedNodeVersion);
+      assert.ok(matrixEntry, `fixture lacks a required support-policy lane for ${id}`);
+      const runnerImage = matrixEntry.runner;
+      const statement = {
+        schemaVersion: 1,
+        predicateType: "https://runacode.io/attestations/runa-cli-distribution-observation/v1",
+        issuer: {
+          provider: "github-actions",
+          repository: manifest.candidate.repository,
+          workflow: ".github/workflows/release.yml",
+          workflowRef: `${manifest.candidate.repository}/.github/workflows/release.yml@refs/heads/main`,
+          sourceRef: `refs/tags/v${manifest.candidate.version}`,
+          sourceCommit: manifest.candidate.sourceCommit,
+          runId: "987654321",
+          runAttempt: 1,
+        },
+        subject: {
+          receiptId: id,
+          channel: channel.id,
+          platform,
+          architecture,
+          node: nodeVersion,
+          distributionManifestSha256: manifestSha256,
+          candidatePayloadSha256: manifest.candidate.identities.payloadSha256,
+          projectionSha256: channel.projection.sha256,
+        },
+        hostPolicy: {
+          kind: "github-hosted-runner",
+          runnerImage,
+          platform,
+          architecture,
+          node: nodeVersion,
+          supportPolicySha256: manifest.candidate.supportPolicy.sha256,
+        },
         candidate: {
           packageName: manifest.candidate.packageName,
           version: manifest.candidate.version,
@@ -206,31 +412,75 @@ async function createReceiptSet(fixture) {
           releaseInputsSha256: manifest.candidate.releaseInputs.sha256,
           payloadSha256: manifest.candidate.identities.payloadSha256,
         },
-        projectionSha256: channel.projection.sha256,
-        runtimeIdentity: {
-          version: manifest.candidate.version,
-          buildDigest: manifest.candidate.identities.payloadSha256,
-          platform,
-          architecture,
-          artifactChannel: "npm",
-          installerOfRecord: channel.installerOfRecord,
-          protocolRange: { minimum: "1", maximum: "1" },
-        },
-        checks: {
-          selfTest: "PASS",
-          provenance: "PASS",
-          supportPolicy: "PASS",
-          uninstallCleanup: "PASS",
-          rollbackOrFixedForward: "PASS",
-        },
-        evidence: raw,
-        observer: { kind: "policy-approved-real-host", identity: `fixture:${id}` },
+        runtimeIdentity,
+        execution,
+        observations: observationReferences,
+        observationsSha256: canonicalSha256(observationReferences),
         observedAt,
       };
+      const statementSha256 = canonicalSha256(statement);
+      const signingRelative = `raw/${id}/signing-verification.json`;
+      const signingAbsolute = path.join(receipts, ...signingRelative.split("/"));
+      const signingEvidence = {
+        schemaVersion: 1,
+        type: "GITHUB_OIDC_SIGNATURE_VERIFICATION",
+        verificationState: "NOT_VERIFIED_PREPUBLICATION",
+        statementSha256,
+        bundleSha256: null,
+        certificateIssuer: null,
+        certificateIdentity: null,
+        verifiedAt: null,
+      };
+      await writeFile(signingAbsolute, `${JSON.stringify(signingEvidence, null, 2)}\n`);
+      const attestation = {
+        statement,
+        statementSha256,
+        signingEvidence: {
+          type: "GITHUB_OIDC_SIGNATURE_VERIFICATION",
+          file: signingRelative,
+          sha256: await sha256File(signingAbsolute),
+        },
+      };
+      const receipt = {
+        schemaVersion: 3,
+        attestation,
+        attestationSha256: canonicalSha256(attestation),
+        releaseEligible: false,
+      };
       await writeFile(path.join(receipts, `${id}.json`), `${JSON.stringify(receipt, null, 2)}\n`);
+      }
     }
   }
   return receipts;
+}
+
+function rebindReceipt(receipt) {
+  receipt.attestation.statement.observationsSha256 = canonicalSha256(receipt.attestation.statement.observations);
+  receipt.attestation.statementSha256 = canonicalSha256(receipt.attestation.statement);
+  receipt.attestationSha256 = canonicalSha256(receipt.attestation);
+}
+
+async function rebindReceiptAndSigningEvidence(receipts, receipt) {
+  rebindReceipt(receipt);
+  const signingFile = path.join(receipts, ...receipt.attestation.signingEvidence.file.split("/"));
+  const signingEvidence = JSON.parse(await readFile(signingFile, "utf8"));
+  signingEvidence.statementSha256 = receipt.attestation.statementSha256;
+  await writeFile(signingFile, `${JSON.stringify(signingEvidence, null, 2)}\n`);
+  receipt.attestation.signingEvidence.sha256 = await sha256File(signingFile);
+  receipt.attestationSha256 = canonicalSha256(receipt.attestation);
+}
+
+async function mutateRawObservation(receipts, id, observationName, mutate) {
+  const receiptFile = path.join(receipts, `${id}.json`);
+  const receipt = JSON.parse(await readFile(receiptFile, "utf8"));
+  const reference = receipt.attestation.statement.observations[observationName];
+  const observationFile = path.join(receipts, ...reference.file.split("/"));
+  const observation = JSON.parse(await readFile(observationFile, "utf8"));
+  mutate(observation);
+  await writeFile(observationFile, `${JSON.stringify(observation, null, 2)}\n`);
+  reference.sha256 = await sha256File(observationFile);
+  rebindReceipt(receipt);
+  await writeFile(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`);
 }
 
 async function verifyReceipts(fixture, receipts) {
@@ -244,14 +494,23 @@ async function verifyReceipts(fixture, receipts) {
   ], { cwd: repositoryRoot, maxBuffer: 4 * 1024 * 1024 });
 }
 
-test("complete content-addressed receipts prove channel identity but not full release readiness", async () => {
+test("typed self-authored receipts prove internal consistency but not observation truth or release readiness", async () => {
   const fixture = await createFixture();
   await project(fixture);
   const receipts = await createReceiptSet(fixture);
   const result = JSON.parse((await verifyReceipts(fixture, receipts)).stdout);
-  assert.equal(result.distributionGate, "PASS");
+  assert.equal(result.status, "TYPED_OBSERVATION_CONSISTENCY_PASS");
+  assert.equal(result.typedObservationConsistencyGate, "PASS");
+  assert.equal(result.observationTruthAuthority, "NOT_ESTABLISHED");
+  assert.equal(result.attestationAuthentication, "UNVERIFIED");
+  assert.equal(result.distributionGate, "BLOCKED");
   assert.equal(result.releaseDecision, "BLOCKED");
-  assert.equal(result.receipts.length, 11);
+  assert.equal(result.releaseEligible, false);
+  assert.equal(result.receipts.length, 22);
+  assert.ok(result.receipts.includes("npm-linux-x64-node22.17.1"));
+  assert.ok(result.receipts.includes("npm-linux-x64-node24.4.1"));
+  assert.equal(result.derivedChecks["npm-linux-x64-node22.17.1"].evidenceClass, "SELF_AUTHORED_TYPED_CLAIM");
+  assert.ok(result.residualBlockers.includes("RECEIPT_REPLAY_LEASE_AUTHORITY_NOT_PRESENT"));
   assert.equal(result.installedBuildDigest, fixture.envelope.identities.payloadSha256);
 });
 
@@ -259,30 +518,255 @@ test("receipt verification detects cross-installer build drift", async () => {
   const fixture = await createFixture();
   await project(fixture);
   const receipts = await createReceiptSet(fixture);
-  const file = path.join(receipts, "bun-win32-x64.json");
+  const file = path.join(receipts, "bun-win32-x64-node22.17.1.json");
   const receipt = JSON.parse(await readFile(file, "utf8"));
-  receipt.runtimeIdentity.buildDigest = "f".repeat(64);
+  receipt.attestation.statement.runtimeIdentity.buildDigest = "f".repeat(64);
+  rebindReceipt(receipt);
   await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
   await assert.rejects(verifyReceipts(fixture, receipts), /Installed build digest differs from the candidate payload identity/);
+});
+
+test("receipt verification rejects a Node runtime outside the bound support policy", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = (await readdir(receipts)).find((entry) => entry.endsWith(".json"));
+  assert.ok(file);
+  const receiptFile = path.join(receipts, file);
+  const receipt = JSON.parse(await readFile(receiptFile, "utf8"));
+  receipt.attestation.statement.runtimeIdentity.node = "v25.0.0";
+  receipt.attestation.statement.hostPolicy.node = "v25.0.0";
+  rebindReceipt(receipt);
+  await writeFile(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /Node version is outside the bound support policy/);
 });
 
 test("receipt verification detects tampered raw recovery evidence", async () => {
   const fixture = await createFixture();
   await project(fixture);
   const receipts = await createReceiptSet(fixture);
-  await writeFile(path.join(receipts, "raw", "aur-linux-x64", "recovery.txt"), "tampered\n");
-  await assert.rejects(verifyReceipts(fixture, receipts), /raw evidence digest mismatch/);
+  await writeFile(path.join(receipts, "raw", "aur-linux-x64-node22.17.1", "recovery.json"), "{}\n");
+  await assert.rejects(verifyReceipts(fixture, receipts), /raw observation digest mismatch/);
 });
 
 test("receipt verification rejects stale evidence", async () => {
   const fixture = await createFixture();
   await project(fixture);
   const receipts = await createReceiptSet(fixture);
-  const file = path.join(receipts, "npm-linux-x64.json");
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
   const receipt = JSON.parse(await readFile(file, "utf8"));
-  receipt.observedAt = "2020-01-01T00:00:00.000Z";
+  receipt.attestation.statement.observedAt = "2020-01-01T00:00:00.000Z";
+  rebindReceipt(receipt);
   await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
   await assert.rejects(verifyReceipts(fixture, receipts), /receipt is stale/);
+});
+
+test("semantic verification rejects producer-authored cleanup success after every digest is rebound", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  await mutateRawObservation(receipts, "npm-linux-x64-node22.17.1", "uninstall", (observation) => {
+    observation.managedPathsAfter = 1;
+  });
+  await assert.rejects(verifyReceipts(fixture, receipts), /Uninstall cleanup left managed product paths/);
+});
+
+test("issuer substitution fails even when the attacker recomputes content-addresses", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+  const receipt = JSON.parse(await readFile(file, "utf8"));
+  receipt.attestation.statement.issuer.repository = "attacker/runa-cli";
+  receipt.attestation.statement.issuer.workflowRef = "attacker/runa-cli/.github/workflows/release.yml@refs/heads/main";
+  rebindReceipt(receipt);
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /issuer repository substitution detected/);
+});
+
+test("fabricated signing-evidence hashes cannot pass content-address verification", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+  const receipt = JSON.parse(await readFile(file, "utf8"));
+  receipt.attestation.signingEvidence.sha256 = "f".repeat(64);
+  receipt.attestationSha256 = canonicalSha256(receipt.attestation);
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /signing-evidence digest mismatch/);
+});
+
+test("self-asserted OIDC verification cannot authorize a pre-publication receipt", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const id = "npm-linux-x64-node22.17.1";
+  const receiptFile = path.join(receipts, `${id}.json`);
+  const receipt = JSON.parse(await readFile(receiptFile, "utf8"));
+  const signingFile = path.join(receipts, ...receipt.attestation.signingEvidence.file.split("/"));
+  const signingEvidence = JSON.parse(await readFile(signingFile, "utf8"));
+  signingEvidence.verificationState = "VERIFIED";
+  signingEvidence.bundleSha256 = "a".repeat(64);
+  signingEvidence.certificateIssuer = "https://token.actions.githubusercontent.com";
+  signingEvidence.certificateIdentity = receipt.attestation.statement.issuer.workflowRef;
+  signingEvidence.verifiedAt = new Date().toISOString();
+  await writeFile(signingFile, `${JSON.stringify(signingEvidence, null, 2)}\n`);
+  receipt.attestation.signingEvidence.sha256 = await sha256File(signingFile);
+  receipt.attestationSha256 = canonicalSha256(receipt.attestation);
+  await writeFile(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /Cryptographic\/OIDC claims are not accepted without an independent offline verifier/);
+});
+
+test("a receipt can never self-promote to release eligible", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+  const receipt = JSON.parse(await readFile(file, "utf8"));
+  receipt.releaseEligible = true;
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /may not claim release eligibility/);
+});
+
+test("receipt paths use the same canonical grammar as the published schema", () => {
+  assert.equal(normalizeReceiptEvidenceFile("raw/npm-linux-x64-node22.17.1/version.json", "fixture"), "raw/npm-linux-x64-node22.17.1/version.json");
+  for (const rejected of [
+    "raw/npm/version evidence.json",
+    "raw\\npm\\version.json",
+    "raw/../version.json",
+    "/raw/npm/version.json",
+    "raw/npm/version.txt",
+  ]) {
+    assert.throws(() => normalizeReceiptEvidenceFile(rejected, "fixture"), /canonical|path schema|relative/);
+  }
+});
+
+test("every channel-platform pair requires both supported Node receipt cells", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  await rm(path.join(receipts, "npm-linux-x64-node24.4.1.json"));
+  await assert.rejects(verifyReceipts(fixture, receipts), /Distribution receipt set differs from policy/);
+});
+
+test("a textual policy-approved prefix cannot invent a real-host authority", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+  const receipt = JSON.parse(await readFile(file, "utf8"));
+  receipt.attestation.statement.hostPolicy.kind = "policy-approved-real-host";
+  receipt.attestation.statement.hostPolicy.runnerImage = "policy-approved:attacker-controlled-host";
+  await rebindReceiptAndSigningEvidence(receipts, receipt);
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /not an exact member of the approved support-policy host set/);
+});
+
+test("runtime protocol claims must equal the support-policy protocol range", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+  const receipt = JSON.parse(await readFile(file, "utf8"));
+  receipt.attestation.statement.runtimeIdentity.protocolRange = { minimum: "999", maximum: "999" };
+  rebindReceipt(receipt);
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /protocol range differs from the bound support policy/);
+});
+
+test("receipts from different workflow runs cannot be mixed into one cohort", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+  const receipt = JSON.parse(await readFile(file, "utf8"));
+  receipt.attestation.statement.issuer.runId = "123456789";
+  receipt.attestation.statement.issuer.runAttempt = 2;
+  await rebindReceiptAndSigningEvidence(receipts, receipt);
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /one immutable workflow-run cohort/);
+});
+
+test("manual receipt validation rejects a path forbidden by the published schema", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+  const receipt = JSON.parse(await readFile(file, "utf8"));
+  receipt.attestation.statement.observations.version.file = "raw/npm-linux-x64-node22.17.1/version evidence.json";
+  rebindReceipt(receipt);
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /violates the distribution-receipt path schema/);
+});
+
+test("evidence directories cannot be junctions or symlinks outside the receipt root", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const id = "npm-linux-x64-node22.17.1";
+  const inside = path.join(receipts, "raw", id);
+  const outside = path.join(fixture.root, "outside-receipt-evidence");
+  await cp(inside, outside, { recursive: true });
+  await rm(inside, { recursive: true });
+  await symlink(outside, inside, process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(verifyReceipts(fixture, receipts), /contains a symbolic link or junction/);
+});
+
+test("case-insensitive aliases cannot reuse one evidence file for two claims", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+  const receipt = JSON.parse(await readFile(file, "utf8"));
+  const versionReference = receipt.attestation.statement.observations.version;
+  receipt.attestation.statement.observations.provenance.file = versionReference.file.replace("raw/", "RAW/");
+  receipt.attestation.statement.observations.provenance.sha256 = versionReference.sha256;
+  rebindReceipt(receipt);
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /reused case-insensitively/);
+});
+
+test("execution claims must bind package manager, candidate invocation, environment, and public shim", async () => {
+  const mutations = [
+    [(execution) => { delete execution.packageManager.version; }, /receipt package manager keys differ/],
+    [(execution) => { execution.candidateInvocation = "npm install -g attacker"; }, /candidate invocation differs/],
+    [(execution) => { execution.environmentPolicy.environmentId = "npm-linux-x64-node24.4.1"; }, /environment identity differs/],
+    [(execution) => { execution.publicShimResolution.internalModuleBypass = true; }, /internal-module bypass/],
+    [(execution) => { execution.publicShimResolution.resolvedPath = "/tmp/runa/dist/bin/runa.js"; }, /did not resolve the public runa shim/],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const fixture = await createFixture();
+    await project(fixture);
+    const receipts = await createReceiptSet(fixture);
+    const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+    const receipt = JSON.parse(await readFile(file, "utf8"));
+    mutate(receipt.attestation.statement.execution);
+    rebindReceipt(receipt);
+    await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+    await assert.rejects(verifyReceipts(fixture, receipts), expected);
+  }
+});
+
+test("every typed observation binds the complete execution-context digest", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  await mutateRawObservation(receipts, "npm-linux-x64-node22.17.1", "install", (observation) => {
+    observation.executionContextSha256 = "f".repeat(64);
+  });
+  await assert.rejects(verifyReceipts(fixture, receipts), /does not bind the attested execution context/);
+});
+
+test("receipt verification rejects evidence beyond the bounded future skew", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
+  const receipt = JSON.parse(await readFile(file, "utf8"));
+  receipt.attestation.statement.observedAt = new Date(Date.now() + 6 * 60 * 1000).toISOString();
+  rebindReceipt(receipt);
+  await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyReceipts(fixture, receipts), /implausibly future-dated/);
 });
 
 test("TC-053-04/08/12 actual local artifact uses its public shim, cleans up, and cannot authorize release", async () => {

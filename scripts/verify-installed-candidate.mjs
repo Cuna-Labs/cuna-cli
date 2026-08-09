@@ -36,7 +36,7 @@ const verification = await withOwnedTempDirectory("runa-cli-install-", async (ow
   invariant(versionJson.data.buildDigest === envelope.identities.payloadSha256, "Installed payload identity differs from the release envelope");
   invariant(versionJson.data?.platform === process.platform, "Installed platform identity differs from runtime");
   invariant(versionJson.data?.architecture === process.arch, "Installed architecture identity differs from runtime");
-  invariant(versionJson.data?.updateChannel === "npm", "Installed candidate does not identify npm as installer channel");
+  invariant(versionJson.data?.artifactChannel === "npm", "Installed candidate does not identify npm as artifact channel");
   invariant(
     versionJson.data?.protocolRange && typeof versionJson.data.protocolRange.minimum === "string" && typeof versionJson.data.protocolRange.maximum === "string",
     "Installed protocol range is missing",

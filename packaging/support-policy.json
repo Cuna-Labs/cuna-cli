@@ -1,18 +1,25 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "packageName": "@runa_laboratories/cli",
   "canonicalRegistry": "https://registry.npmjs.org",
   "architectures": ["x64"],
   "node": {
     "minimum": "22.17.1",
+    "supportedLines": ["22.17.1", "24.4.1"],
     "tested": ["22.17.1", "24.4.1"]
   },
+  "protocolRange": {
+    "minimum": "1",
+    "maximum": "1"
+  },
+  "approvedRealHosts": [],
   "ciMatrix": [
     {"id": "linux-ubuntu-22-node22-x64", "runner": "ubuntu-22.04", "platform": "linux", "architecture": "x64", "node": "22.17.1"},
     {"id": "linux-ubuntu-24-node24-x64", "runner": "ubuntu-24.04", "platform": "linux", "architecture": "x64", "node": "24.4.1"},
     {"id": "windows-server-2022-node22-x64", "runner": "windows-2022", "platform": "win32", "architecture": "x64", "node": "22.17.1"},
     {"id": "windows-server-2025-node24-x64", "runner": "windows-2025", "platform": "win32", "architecture": "x64", "node": "24.4.1"},
     {"id": "macos-14-node22-arm64-observation", "runner": "macos-14", "platform": "darwin", "architecture": "arm64", "node": "22.17.1", "claim": "observation-only"},
+    {"id": "macos-15-intel-node22-x64", "runner": "macos-15-intel", "platform": "darwin", "architecture": "x64", "node": "22.17.1"},
     {"id": "macos-15-intel-node24-x64", "runner": "macos-15-intel", "platform": "darwin", "architecture": "x64", "node": "24.4.1"}
   ],
   "preGaExternalEvidence": [
@@ -22,11 +29,62 @@
     "curl and Homebrew receipts on supported macOS and Linux hosts",
     "paru/AUR receipt on supported Arch Linux"
   ],
+  "channelOrder": ["npm", "bun", "curl", "homebrew", "aur"],
   "channels": {
-    "npm": "canonical",
-    "bun": "projection",
-    "curl": "template-not-live",
-    "homebrew": "template-not-live",
-    "aur": "template-not-live"
+    "npm": {
+      "role": "canonical-artifact",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "npm",
+      "platforms": ["linux-x64", "darwin-x64", "win32-x64"],
+      "projectionFile": "npm/install-command.txt",
+      "publicCommand": "npm install -g @runa_laboratories/cli",
+      "candidateInvocationPolicy": "npm-exact-version",
+      "runtimeDependency": "node:^22.17.1 || ^24.4.1"
+    },
+    "bun": {
+      "role": "registry-projection",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "bun",
+      "platforms": ["linux-x64", "darwin-x64", "win32-x64"],
+      "projectionFile": "bun/install-command.txt",
+      "publicCommand": "bun add --global @runa_laboratories/cli",
+      "candidateInvocationPolicy": "bun-exact-version",
+      "runtimeDependency": "node:^22.17.1 || ^24.4.1"
+    },
+    "curl": {
+      "role": "bootstrap-projection",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "npm",
+      "platforms": ["linux-x64", "darwin-x64"],
+      "projectionFile": "curl/install.sh",
+      "publicCommand": "curl -fsSL https://runacode.io/install | sh",
+      "candidateInvocationPolicy": "verified-projection",
+      "runtimeDependency": "node+npm"
+    },
+    "homebrew": {
+      "role": "formula-projection",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "homebrew",
+      "platforms": ["linux-x64", "darwin-x64"],
+      "projectionFile": "homebrew/runa.rb",
+      "publicCommand": "brew install Runa-Laboratories/tap/runa",
+      "candidateInvocationPolicy": "verified-projection",
+      "runtimeDependency": "node@22"
+    },
+    "aur": {
+      "role": "package-projection",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "pacman",
+      "platforms": ["linux-x64"],
+      "projectionFile": "aur/PKGBUILD",
+      "publicCommand": "paru -S runa-cli-bin",
+      "candidateInvocationPolicy": "verified-projection",
+      "runtimeDependency": "nodejs-lts-jod>=22.17.1"
+    }
   }
 }

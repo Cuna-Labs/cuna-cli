@@ -84,5 +84,5 @@ export function packageBuildDigest(): Promise<string> {
   return cachedDigest;
 }
 
-export const UPDATE_CHANNEL = "npm" as const;
+export const ARTIFACT_CHANNEL = "npm" as const;
 export const PROTOCOL_RANGE = Object.freeze({ minimum: "1", maximum: "1" });

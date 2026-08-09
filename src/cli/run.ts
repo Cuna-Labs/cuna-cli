@@ -5,7 +5,7 @@ import { createHttpTransport } from "../api/http.js";
 import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
-import { packageBuildDigest, PROTOCOL_RANGE, UPDATE_CHANNEL } from "../build-identity.js";
+import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import { resolveConfig, type EffectiveConfig } from "../config/config.js";
 import { executeCommand, preflightInvocation } from "../commands/commands.js";
 import { EXIT_CODES, normalizeError, RunaError, usageError, type ExitCode } from "../core/errors.js";
@@ -89,7 +89,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         buildDigest: await packageBuildDigest(),
         platform: process.platform,
         architecture: process.arch,
-        updateChannel: UPDATE_CHANNEL,
+        updateChannel: ARTIFACT_CHANNEL,
+        artifactChannel: ARTIFACT_CHANNEL,
         protocolRange: PROTOCOL_RANGE,
       });
       if (writer.structured) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -19,8 +19,10 @@ async function createAdmissionFixture() {
   const root = await resources.createTempDirectory("runa-admission-test-");
   const evidence = path.join(root, "release-artifacts");
   const receipts = path.join(root, "receipts");
+  const observationReceipts = path.join(root, "observation-receipts");
   await mkdir(evidence, { recursive: true });
   await mkdir(receipts, { recursive: true });
+  await mkdir(observationReceipts, { recursive: true });
   const version = "1.2.3-preview.1";
   const sourceCommit = "a".repeat(40);
   const tarballFile = `runa_laboratories-cli-${version}.tgz`;
@@ -68,9 +70,33 @@ async function createAdmissionFixture() {
       uninstallCleanup: "PASS",
       observedAt: new Date().toISOString(),
     };
-    await writeFile(path.join(receipts, `${entry.id}.json`), `${JSON.stringify(receipt, null, 2)}\n`);
+    const receiptRoot = entry.claim === "observation-only" ? observationReceipts : receipts;
+    await writeFile(path.join(receiptRoot, `${entry.id}.json`), `${JSON.stringify(receipt, null, 2)}\n`);
   }
-  return { root, evidence, receipts, firstReceipt: path.join(receipts, `${policy.ciMatrix[0].id}.json`) };
+  const requiredEntry = policy.ciMatrix.find((entry) => entry.claim !== "observation-only");
+  const observationEntry = policy.ciMatrix.find((entry) => entry.claim === "observation-only");
+  assert.ok(requiredEntry, "fixture requires a release-admissible platform entry");
+  assert.ok(observationEntry, "fixture requires an observation-only platform entry");
+  return {
+    root,
+    evidence,
+    receipts,
+    observationReceipts,
+    firstReceipt: path.join(receipts, `${requiredEntry.id}.json`),
+    observationReceipt: path.join(observationReceipts, `${observationEntry.id}.json`),
+    requiredEntry,
+    observationEntry,
+  };
+}
+
+async function summarizeObservations(fixture) {
+  return execute(process.execPath, [
+    "scripts/summarize-observation-receipts.mjs",
+    "--root", fixture.root,
+    "--evidence", fixture.evidence,
+    "--receipts", fixture.observationReceipts,
+    "--output", path.join(fixture.root, "observation-summary.json"),
+  ], { cwd: repositoryRoot, maxBuffer: 4 * 1024 * 1024 });
 }
 
 async function verifyAdmission(fixture) {
@@ -96,7 +122,78 @@ test("TC-053-12 complete platform receipts are never elevated to release authori
   assert.equal(admission.schemaVersion, 3);
   assert.equal(admission.decision, "PLATFORM_MATRIX_VERIFIED_NOT_RELEASE_AUTHORIZED");
   assert.equal(admission.releaseEligible, false);
+  assert.ok(admission.platformReceipts.every((id) => !id.endsWith("-observation")));
+  assert.equal(Object.hasOwn(admission, "observationReceipts"), false);
+  assert.ok(admission.limitations.includes("OBSERVATION_ONLY_EVIDENCE_REPORTED_SEPARATELY_AND_NON_AUTHORIZING"));
   assert.ok(admission.limitations.includes("NO_AUTHENTICATED_RECEIPT_OBSERVER"));
+});
+
+test("TC-053-13 observation-only receipts are optional and never authorize unsupported architecture", async () => {
+  const fixture = await createAdmissionFixture();
+  await rm(fixture.observationReceipt);
+  await assert.doesNotReject(verifyAdmission(fixture));
+  const admission = JSON.parse(await readFile(path.join(fixture.root, "admission.json"), "utf8"));
+  assert.equal(admission.releaseEligible, false);
+  assert.equal(Object.hasOwn(admission, "observationReceipts"), false);
+  assert.ok(!admission.platformReceipts.includes(fixture.observationEntry.id));
+});
+
+test("TC-053-14 observation-only evidence cannot replace a required distribution receipt", async () => {
+  const fixture = await createAdmissionFixture();
+  await rm(fixture.firstReceipt);
+  await assert.rejects(verifyAdmission(fixture), /Missing release-admissible platform receipts/);
+});
+
+test("TC-053-15 supplied observation-only evidence is identity-checked only in the non-authorizing lateral summary", async () => {
+  const fixture = await createAdmissionFixture();
+  const receipt = JSON.parse(await readFile(fixture.observationReceipt, "utf8"));
+  receipt.architecture = "x64";
+  await writeFile(fixture.observationReceipt, `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.doesNotReject(summarizeObservations(fixture));
+  const summary = JSON.parse(await readFile(path.join(fixture.root, "observation-summary.json"), "utf8"));
+  assert.equal(summary.admissionImpact, "NONE");
+  assert.equal(summary.releaseEligible, false);
+  assert.deepEqual(summary.verifiedObservationIds, []);
+  assert.equal(summary.rejected[0].reasonCode, "RECEIPT_VALIDATION_FAILED");
+  assert.match(summary.rejected[0].message, /architecture mismatch/);
+});
+
+test("TC-053-15 a valid observation is retained without influencing admission", async () => {
+  const fixture = await createAdmissionFixture();
+  await assert.doesNotReject(summarizeObservations(fixture));
+  const summary = JSON.parse(await readFile(path.join(fixture.root, "observation-summary.json"), "utf8"));
+  assert.deepEqual(summary.expectedObservationIds, [fixture.observationEntry.id]);
+  assert.deepEqual(summary.verifiedObservationIds, [fixture.observationEntry.id]);
+  assert.deepEqual(summary.missingObservationIds, []);
+  assert.deepEqual(summary.rejected, []);
+  assert.equal(summary.admissionImpact, "NONE");
+  assert.equal(summary.releaseEligible, false);
+});
+
+test("TC-053-15 missing observation evidence remains descriptive and non-blocking", async () => {
+  const fixture = await createAdmissionFixture();
+  await rm(fixture.observationReceipt);
+  await assert.doesNotReject(summarizeObservations(fixture));
+  const summary = JSON.parse(await readFile(path.join(fixture.root, "observation-summary.json"), "utf8"));
+  assert.deepEqual(summary.missingObservationIds, [fixture.observationEntry.id]);
+  assert.deepEqual(summary.verifiedObservationIds, []);
+  assert.equal(summary.admissionImpact, "NONE");
+  assert.equal(summary.releaseEligible, false);
+});
+
+test("TC-053-15 observation receipts are rejected if injected into admission", async () => {
+  const fixture = await createAdmissionFixture();
+  await cp(fixture.observationReceipt, path.join(fixture.receipts, `${fixture.observationEntry.id}.json`));
+  await assert.rejects(verifyAdmission(fixture), /Observation-only receipts must be summarized outside admission/);
+});
+
+test("TC-053-16 an unlisted architecture receipt cannot widen platform admission", async () => {
+  const fixture = await createAdmissionFixture();
+  const receipt = JSON.parse(await readFile(fixture.observationReceipt, "utf8"));
+  receipt.platform = "linux";
+  receipt.architecture = "arm64";
+  await writeFile(path.join(fixture.receipts, "linux-arm64-unlisted.json"), `${JSON.stringify(receipt, null, 2)}\n`);
+  await assert.rejects(verifyAdmission(fixture), /Unexpected platform receipt: linux-arm64-unlisted/);
 });
 
 test("TC-053-08 release admission rejects failed or missing uninstall cleanup", async () => {

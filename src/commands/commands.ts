@@ -3,7 +3,7 @@ import {
   type MachineCreateInput,
   type RunaApiClient,
 } from "../api/client.js";
-import { packageBuildDigest, PROTOCOL_RANGE, UPDATE_CHANNEL } from "../build-identity.js";
+import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import type {
   AgentKind,
   AgentSession,
@@ -424,7 +424,8 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         buildDigest,
         platform: process.platform,
         architecture: process.arch,
-        updateChannel: UPDATE_CHANNEL,
+        updateChannel: ARTIFACT_CHANNEL,
+        artifactChannel: ARTIFACT_CHANNEL,
         protocolRange: PROTOCOL_RANGE,
         checks,
       });

@@ -6,11 +6,17 @@ class Runa < Formula
   sha256 "@@TARBALL_SHA256@@"
   license "Apache-2.0"
 
-  depends_on "node@22"
+  depends_on arch: :x86_64
+  depends_on "@@HOMEBREW_NODE_FORMULA@@"
 
   def install
-    system "npm", "install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--prefix", libexec, cached_download
-    bin.install_symlink libexec/"bin/runa"
+    node_formula = Formula["@@HOMEBREW_NODE_FORMULA@@"]
+    system node_formula.opt_bin/"npm", "install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--prefix", libexec, cached_download
+    cli = libexec/"lib/node_modules/@runa_laboratories/cli/dist/bin/runa.js"
+    (bin/"runa").write <<~SH
+      #!/bin/sh
+      exec "#{node_formula.opt_bin}/node" "#{cli}" "$@"
+    SH
   end
 
   test do
@@ -20,7 +26,7 @@ class Runa < Formula
     assert_equal true, self_test.dig("data", "ok")
     identity = JSON.parse(shell_output("#{bin}/runa version --json"))
     assert_equal "@@VERSION@@", identity.dig("data", "version")
-    assert_match(/\\A[0-9a-f]{64}\\z/, identity.dig("data", "buildDigest"))
-    assert_equal "npm", identity.dig("data", "updateChannel")
+    assert_match(/\A[0-9a-f]{64}\z/, identity.dig("data", "buildDigest"))
+    assert_equal "npm", identity.dig("data", "artifactChannel")
   end
 end

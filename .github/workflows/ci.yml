@@ -30,8 +30,12 @@ jobs:
       - run: node scripts/verify-release-envelope.mjs --self-test true
 
   source-gates:
-    name: source-quality-gates
+    name: source-quality-node-${{ matrix.node }}
     needs: public-controls
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22.17.1, 24.4.1]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -40,11 +44,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22.17.1
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm install --global npm@11.4.2
-      - run: node scripts/verify-ci-contract.mjs
       - run: npm ci --ignore-scripts
+      - run: node scripts/verify-ci-contract.mjs
       - run: node scripts/verify-dependency-policy.mjs
       - run: npm ls --all
       - run: npm audit --audit-level=high
@@ -59,7 +63,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      required_matrix: ${{ steps.matrix.outputs.required_matrix }}
+      observation_matrix: ${{ steps.matrix.outputs.observation_matrix }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -130,7 +135,9 @@ jobs:
       - name: Export exact support matrix
         id: matrix
         shell: bash
-        run: echo "matrix=$(node -e "const p=require('./packaging/support-policy.json');process.stdout.write(JSON.stringify({include:p.ciMatrix}))")" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "required_matrix=$(node -e 'const p=require("./packaging/support-policy.json");process.stdout.write(JSON.stringify({include:p.ciMatrix.filter((entry)=>entry.claim!=="observation-only")}))')" >> "$GITHUB_OUTPUT"
+          echo "observation_matrix=$(node -e 'const p=require("./packaging/support-policy.json");process.stdout.write(JSON.stringify({include:p.ciMatrix.filter((entry)=>entry.claim==="observation-only")}))')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-candidate
@@ -143,7 +150,7 @@ jobs:
     needs: candidate
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.candidate.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.candidate.outputs.required_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -164,6 +171,76 @@ jobs:
         with:
           name: platform-${{ matrix.id }}
           path: evidence/platform-receipts/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  observed-artifact:
+    name: observed-${{ matrix.id }}
+    needs: candidate
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.candidate.outputs.observation_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --global npm@11.4.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          path: release-artifacts
+      - run: node scripts/verify-release-envelope.mjs
+      - run: node scripts/verify-installed-candidate.mjs --receipt "evidence/observation-receipts/${{ matrix.id }}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: observation-${{ matrix.id }}
+          path: evidence/observation-receipts/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  observation-summary:
+    name: non-authorizing-observation-summary
+    if: always()
+    needs: [candidate, observed-artifact]
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - if: needs.candidate.result == 'success'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - if: needs.candidate.result == 'success'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+      - if: needs.candidate.result == 'success'
+        run: npm ci --ignore-scripts
+      - if: needs.candidate.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          path: release-artifacts
+      - if: needs.candidate.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: observation-*
+          path: evidence/observation-receipts
+          merge-multiple: true
+      - if: needs.candidate.result == 'success'
+        run: node scripts/summarize-observation-receipts.mjs
+      - if: needs.candidate.result == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: observation-summary
+          path: evidence/observation-summary.json
           if-no-files-found: error
           retention-days: 14
 
@@ -242,7 +319,7 @@ jobs:
           sbom-path: release-artifacts/sbom.cdx.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: admitted-release-candidate
+          name: release-review-candidate
           path: |
             release-artifacts/
             evidence/admission.json

@@ -11,7 +11,16 @@ const EXACT_VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-
 const EXACT_TOOL_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u;
 
 const CONTRACT_FILES = Object.freeze([
+  "packaging/distribution-manifest.schema.json",
+  "packaging/distribution-receipt.schema.json",
+  "packaging/observation-summary.schema.json",
+  "packaging/release-envelope.schema.json",
+  "packaging/runtime-identity.schema.json",
+  "packaging/support-policy.schema.json",
   "src/api/contracts.ts",
+  "src/cli/output.ts",
+  "src/cli/run.ts",
+  "src/commands/commands.ts",
   "src/core/errors.ts",
   "src/pty/contracts.ts",
   "src/runtime/contracts.ts",
@@ -21,19 +30,32 @@ const CONTRACT_FILES = Object.freeze([
 
 const BUILD_RECIPE_FILES = Object.freeze([
   ".github/workflows/ci.yml",
+  ".github/workflows/distribution-projection-proof.yml",
+  ".github/workflows/release.yml",
   "package.json",
   "package-lock.json",
   "packaging/admission-policy.json",
   "packaging/support-policy.json",
+  "packaging/templates/aur/PKGBUILD.template",
+  "packaging/templates/homebrew/runa.rb.template",
+  "packaging/templates/install.sh.template",
   "scripts/build-release-envelope.mjs",
   "scripts/build-release-inputs.mjs",
   "scripts/lib/release-evidence.mjs",
   "scripts/lib/exclusive-build-lock.mjs",
   "scripts/lib/release-inputs.mjs",
+  "scripts/release-distribution-lib.mjs",
+  "scripts/release-project-distributions.mjs",
   "scripts/run-build-operation.mjs",
+  "scripts/summarize-observation-receipts.mjs",
+  "scripts/verify-ci-contract.mjs",
   "scripts/verify-dependency-policy.mjs",
+  "scripts/verify-distribution-receipts.mjs",
   "scripts/verify-installed-candidate.mjs",
   "scripts/verify-package-contents.mjs",
+  "scripts/verify-release-admission.mjs",
+  "scripts/verify-release-distributions.mjs",
+  "scripts/verify-release-envelope.mjs",
   "src/build-identity.ts",
   "tsconfig.json",
 ]);
@@ -124,7 +146,8 @@ export function validateReleaseInputs(inputs) {
   invariant(inputs.payload.schemaVersion === 1 && inputs.payload.algorithm === "runa-package-payload-v1", "Payload manifest identity is invalid");
   invariant(Number.isSafeInteger(inputs.payload.fileCount) && inputs.payload.fileCount > 0, "Payload file count is invalid");
   invariant(Array.isArray(inputs.payload.files) && inputs.payload.files.length === inputs.payload.fileCount, "Payload file set differs from fileCount");
-  invariant(JSON.stringify(inputs.payload.files.map((entry) => entry.file)) === JSON.stringify([...inputs.payload.files.map((entry) => entry.file)].sort()), "Payload files are not sorted");
+  const payloadFiles = inputs.payload.files.map((entry) => entry.file);
+  invariant(JSON.stringify(payloadFiles) === JSON.stringify([...payloadFiles].sort()), "Payload files are not sorted");
   for (const entry of inputs.payload.files) {
     exactKeys(entry, ["file", "size", "sha256"], "payload file");
     invariant(typeof entry.file === "string" && entry.file.length > 0 && !path.isAbsolute(entry.file), "Payload file path is invalid");

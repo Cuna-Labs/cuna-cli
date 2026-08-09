@@ -23,6 +23,7 @@ test("version JSON carries a candidate-bound runtime identity", async () => {
   assert.match(record.data.buildDigest, /^[0-9a-f]{64}$/u);
   assert.equal(record.data.platform, process.platform);
   assert.equal(record.data.architecture, process.arch);
+  assert.equal(record.data.artifactChannel, "npm");
   assert.equal(record.data.updateChannel, "npm");
   assert.deepEqual(record.data.protocolRange, { minimum: "1", maximum: "1" });
 });
@@ -48,6 +49,8 @@ test("offline self-test is network-free and reports explicit checks", async () =
   assert.equal(record.data.checks.network_requests, 0);
   assert.equal(record.data.checks.virtual_terminal, true);
   assert.match(record.data.buildDigest, /^[0-9a-f]{64}$/u);
+  assert.equal(record.data.updateChannel, "npm");
+  assert.equal(record.data.artifactChannel, "npm");
 });
 
 test("self-test fails closed without the explicit offline mode", async () => {

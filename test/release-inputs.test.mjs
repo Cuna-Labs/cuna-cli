@@ -24,7 +24,25 @@ test("release inputs are reproducible from the checked-out source and payload", 
   const inputs = await fixture();
   await verifyReleaseInputsAgainstRoot(inputs, repositoryRoot, expected);
   assert.ok(inputs.payload.files.some((entry) => entry.file === "THIRD_PARTY_NOTICES.md"));
-  assert.ok(inputs.buildRecipe.files.some((entry) => entry.file === "scripts/lib/release-inputs.mjs"));
+  const boundRecipeFiles = new Set(inputs.buildRecipe.files.map((entry) => entry.file));
+  for (const releaseAuthority of [
+    ".github/workflows/ci.yml",
+    ".github/workflows/distribution-projection-proof.yml",
+    ".github/workflows/release.yml",
+    "packaging/templates/aur/PKGBUILD.template",
+    "packaging/templates/homebrew/runa.rb.template",
+    "packaging/templates/install.sh.template",
+    "scripts/lib/release-inputs.mjs",
+    "scripts/release-distribution-lib.mjs",
+    "scripts/release-project-distributions.mjs",
+    "scripts/summarize-observation-receipts.mjs",
+    "scripts/verify-distribution-receipts.mjs",
+    "scripts/verify-release-admission.mjs",
+    "scripts/verify-release-distributions.mjs",
+  ]) {
+    assert.ok(boundRecipeFiles.has(releaseAuthority), `release recipe must bind ${releaseAuthority}`);
+  }
+  assert.ok(inputs.contractSet.files.some((entry) => entry.file === "packaging/observation-summary.schema.json"));
   assert.ok(inputs.dependencyClosure.components.some((entry) => entry.name === "@xterm/headless"));
 });
 
