@@ -25,6 +25,7 @@ export function createLinuxSecretServiceBackend(input: {
   const read = async (target: string): Promise<Uint8Array | undefined> => {
     const result = await runner.run({
       executable,
+      cwd: "/",
       args: ["lookup", "application", "runa-cli", "credential-key", target],
       environment,
       maximumOutputBytes: MAXIMUM_VALUE_BYTES,
@@ -54,6 +55,7 @@ export function createLinuxSecretServiceBackend(input: {
     try {
       const result = await runner.run({
         executable,
+        cwd: "/",
         args: [
           "store",
           "--label=Runa CLI credential",
@@ -85,6 +87,7 @@ export function createLinuxSecretServiceBackend(input: {
     existing.fill(0);
     const result = await runner.run({
       executable,
+      cwd: "/",
       args: ["clear", "application", "runa-cli", "credential-key", target],
       environment,
       maximumOutputBytes: 4_096,

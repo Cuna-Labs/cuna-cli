@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { runCli, memoryStreams } from "../dist/cli/run.js";
+import { evaluateRuntimeSupport, isSupportedNodeVersion } from "../dist/platform/support.js";
 
 function parseSingleRecord(value) {
   const lines = value.trim().split("\n");
@@ -59,4 +60,22 @@ test("self-test fails closed without the explicit offline mode", async () => {
   const record = parseSingleRecord(capture.stderr());
   assert.equal(record.type, "error");
   assert.equal(record.error.code, "runa.usage.invalid");
+});
+
+test("runtime support rejects untested Node and architecture claims", () => {
+  assert.equal(isSupportedNodeVersion("22.17.0"), false);
+  assert.equal(isSupportedNodeVersion("22.17.1"), true);
+  assert.equal(isSupportedNodeVersion("23.9.0"), false);
+  assert.equal(isSupportedNodeVersion("24.4.0"), false);
+  assert.equal(isSupportedNodeVersion("24.4.1"), true);
+  assert.equal(isSupportedNodeVersion("25.0.0"), false);
+  assert.equal(isSupportedNodeVersion("not-semver"), false);
+  assert.deepEqual(
+    evaluateRuntimeSupport({ nodeVersion: "24.4.1", platform: "darwin", architecture: "arm64" }),
+    { nodeRuntime: true, platform: true, architecture: false },
+  );
+  assert.deepEqual(
+    evaluateRuntimeSupport({ nodeVersion: "24.4.1", platform: "freebsd", architecture: "x64" }),
+    { nodeRuntime: true, platform: false, architecture: true },
+  );
 });

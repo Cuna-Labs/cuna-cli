@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { win32 } from "node:path";
 
 import { CREDENTIAL_BACKEND_PROTOCOL, type CredentialBackendEvidence, type SecureCredentialBackend } from "./contracts.js";
 import { credentialFailure } from "./errors.js";
@@ -115,8 +116,14 @@ export function createWindowsCredentialManagerBackend(input: {
   readonly clock?: () => number;
 } = {}): SecureCredentialBackend {
   const runner = input.runner ?? createSecureProcessRunner();
-  const executable = input.executable ?? "powershell.exe";
   const environment = input.environment ?? credentialProcessEnvironment("win32");
+  const systemRoot = environment.SystemRoot ?? environment.WINDIR;
+  const executable = input.executable ?? (
+    systemRoot === undefined
+      ? ""
+      : win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+  );
+  const cwd = systemRoot === undefined ? "" : win32.join(systemRoot, "System32");
   const clock = input.clock ?? Date.now;
   let cachedEvidence: CredentialBackendEvidence | undefined;
 
@@ -125,6 +132,7 @@ export function createWindowsCredentialManagerBackend(input: {
     try {
       const result = await runner.run({
         executable,
+        cwd,
         args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", WINDOWS_CREDENTIAL_ENCODED_COMMAND],
         stdin,
         environment,

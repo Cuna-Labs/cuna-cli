@@ -15,6 +15,7 @@ import { publicConfig } from "../config/config.js";
 import { EXIT_CODES, RunaError, unsupportedError, usageError } from "../core/errors.js";
 import { assertPublicId, assertSafeDisplayText } from "../core/validation.js";
 import { INITIAL_RUNTIME_GATES } from "../runtime/contracts.js";
+import { evaluateRuntimeSupport } from "../platform/support.js";
 import { CLI_VERSION } from "../version.js";
 import {
   booleanOption,
@@ -227,12 +228,17 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
           "Run `runa self-test --offline --json`.",
         );
       }
-      const nodeMajor = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
+      const runtimeSupport = evaluateRuntimeSupport({
+        nodeVersion: process.versions.node,
+        platform: process.platform,
+        architecture: process.arch,
+      });
       const buildDigest = await packageBuildDigest();
       const virtualTerminal = await verifyVirtualTerminalInterop();
       const checks = Object.freeze({
-        node_runtime: nodeMajor >= 22,
-        supported_platform: ["windows", "macos", "linux"].includes(config.platformKind),
+        node_runtime: runtimeSupport.nodeRuntime,
+        supported_platform: runtimeSupport.platform,
+        supported_architecture: runtimeSupport.architecture,
         canonical_api_origin: config.baseUrl === "https://api.runacode.io" || config.developmentProfile,
         package_identity: /^[0-9a-f]{64}$/u.test(buildDigest),
         virtual_terminal: virtualTerminal,

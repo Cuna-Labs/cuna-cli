@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
+import { isAbsolute } from "node:path";
 
 import { credentialFailure } from "./errors.js";
 
 export interface SecureProcessRequest {
   readonly executable: string;
   readonly args: readonly string[];
+  readonly cwd: string;
   readonly stdin?: Uint8Array;
   readonly environment?: Readonly<Record<string, string>>;
   readonly timeoutMs?: number;
@@ -49,6 +51,7 @@ async function runSecureProcess(request: SecureProcessRequest): Promise<SecurePr
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
       env: request.environment === undefined ? {} : { ...request.environment },
+      cwd: request.cwd,
     });
 
     const finishReject = (error: unknown): void => {
@@ -122,8 +125,15 @@ async function runSecureProcess(request: SecureProcessRequest): Promise<SecurePr
 }
 
 function validateRequest(request: SecureProcessRequest): void {
-  if (request.executable.length < 1 || request.executable.includes("\0")) {
+  if (
+    request.executable.length < 1 ||
+    request.executable.includes("\0") ||
+    !isAbsolute(request.executable)
+  ) {
     throw credentialFailure("credential_process_failed", "The secure backend executable is invalid.");
+  }
+  if (request.cwd.length < 1 || request.cwd.includes("\0") || !isAbsolute(request.cwd)) {
+    throw credentialFailure("credential_process_failed", "The secure backend working directory is invalid.");
   }
   if (request.args.some((argument) => argument.includes("\0"))) {
     throw credentialFailure("credential_process_failed", "A secure backend argument is invalid.");

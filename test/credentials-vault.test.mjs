@@ -261,6 +261,7 @@ test("secure process runner kills oversized output without returning it", async 
   await assert.rejects(
     runner.run({
       executable: process.execPath,
+      cwd: process.cwd(),
       args: ["-e", "process.stdout.write('x'.repeat(4096))"],
       maximumOutputBytes: 32,
     }),
@@ -361,6 +362,42 @@ test("Windows Credential Manager adapter transports protected values only throug
   assert.equal(new TextDecoder().decode(calls[0].stdin).includes(encodedSecret), true);
   observed.fill(0);
   encoded.fill(0);
+});
+
+test("secure credential helpers require absolute executable and working-directory authority", async () => {
+  const runner = createSecureProcessRunner();
+  await assert.rejects(
+    runner.run({ executable: "powershell.exe", cwd: process.cwd(), args: [] }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_process_failed",
+  );
+  await assert.rejects(
+    runner.run({ executable: process.execPath, cwd: ".", args: [] }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_process_failed",
+  );
+});
+
+test("Windows Credential Manager pins PowerShell and cwd beneath SystemRoot", async () => {
+  const calls = [];
+  const runner = {
+    run: async (request) => {
+      calls.push(request);
+      return {
+        exitCode: 0,
+        signal: null,
+        stdout: new TextEncoder().encode(JSON.stringify({ ok: true, status: "absent" })),
+        stderrPresent: false,
+      };
+    },
+  };
+  const backend = createWindowsCredentialManagerBackend({
+    runner,
+    environment: { SystemRoot: "C:\\Windows" },
+  });
+  assert.equal(await backend.read("opaque-target"), undefined);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].executable, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  assert.equal(calls[0].cwd, "C:\\Windows\\System32");
+  assert.equal(Object.hasOwn(calls[0].environment, "PATH"), false);
 });
 
 test("macOS adapter refuses argv-based Keychain fallback when no native bridge exists", async () => {
