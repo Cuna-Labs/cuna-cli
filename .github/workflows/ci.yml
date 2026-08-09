@@ -26,7 +26,6 @@ jobs:
         with:
           node-version: 22.17.1
       - run: node scripts/verify-repository-governance.mjs
-      - run: node governance/validate-requirement-traceability.mjs
       - run: node --test scripts/scaffolding-negative-controls.test.mjs
       - run: node scripts/verify-release-envelope.mjs --self-test true
 
@@ -45,7 +44,6 @@ jobs:
           cache: npm
       - run: npm install --global npm@11.4.2
       - run: node scripts/verify-ci-contract.mjs
-      - run: node governance/validate-prd-dag.mjs
       - run: npm ci --ignore-scripts
       - run: node scripts/verify-dependency-policy.mjs
       - run: npm ls --all

@@ -19,5 +19,3 @@
 *.woff2 binary
 
 package-lock.json text eol=lf
-prds/** linguist-documentation
-architecture/** linguist-documentation
