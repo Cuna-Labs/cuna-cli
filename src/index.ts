@@ -15,6 +15,7 @@ export {
   decodeCapabilitySnapshot,
   decodeMachineItem,
   decodeMachinePage,
+  decodeRunaIdentity,
   decodeTerminalConnectionGrant,
   type AgentKind,
   type AgentAuthMode,
@@ -31,6 +32,7 @@ export {
   type Machine,
   type MachinePage,
   type MutationClass,
+  type RunaIdentity,
   TERMINAL_PROTOCOL,
   type TerminalCapabilityAvailability,
   type TerminalCapabilityName,
@@ -138,3 +140,4 @@ export {
   type XtermViewportOptions,
 } from "./terminal/xterm-vte.js";
 export { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "./version.js";
+export { createApiTerminalControlPlane } from "./runtime/api-terminal-control-plane.js";

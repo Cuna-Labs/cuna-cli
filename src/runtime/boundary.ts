@@ -27,6 +27,7 @@ import {
   validateTerminalGrant,
   type RemoteAgentSessionEvidence,
   type TerminalConnectionGrant,
+  type TerminalConnectionCapability,
   type TerminalConnector,
   type TerminalControlPlane,
   type TerminalWireConnection,
@@ -108,6 +109,8 @@ interface TerminalEntry {
   connection: TerminalWireConnection;
   decoder: TerminalFrameDecoder;
   fencingGeneration: number;
+  capabilities: readonly TerminalConnectionCapability[];
+  resizeCapability: "live" | "initial_resize_only";
   wireSequence: bigint;
   inputSequence: bigint;
   outputSequence: bigint;
@@ -208,14 +211,19 @@ export class RunaRuntimeBoundary {
         protocol: TERMINAL_PROTOCOL,
         ...(input.signal === undefined ? {} : { signal: input.signal }),
       });
+      if (connection.connectionId !== grant.terminalSessionId) {
+        throw runtimeFailure("grant_scope_mismatch", "The terminal transport accepted a different Runa terminal session.");
+      }
       const entry: TerminalEntry = {
         tabId: input.tabId,
-        viewId: viewId(input.tabId, grant.attachmentGeneration),
+        viewId: `pending:${grant.terminalSessionId}`,
         observation: admitted.observation,
         state: "attaching",
         connection,
         decoder: new TerminalFrameDecoder(),
-        fencingGeneration: grant.attachmentGeneration,
+        fencingGeneration: 0,
+        capabilities: grant.capabilities,
+        resizeCapability: "initial_resize_only",
         wireSequence: 0n,
         inputSequence: 0n,
         outputSequence: 0n,
@@ -224,7 +232,10 @@ export class RunaRuntimeBoundary {
         sendTail: Promise.resolve(),
       };
       const iterator = connection.receive()[Symbol.asyncIterator]();
-      const bufferedFrames = await this.#awaitReady(entry, grant, iterator, input.signal);
+      const ready = await this.#awaitReady(entry, iterator, input.signal);
+      entry.fencingGeneration = ready.payload.fencingGeneration;
+      entry.resizeCapability = ready.payload.resizeCapability;
+      entry.viewId = viewId(input.tabId, ready.payload.fencingGeneration);
       this.#views.open({
         viewId: entry.viewId,
         binding: {
@@ -232,7 +243,7 @@ export class RunaRuntimeBoundary {
           machineId: admitted.observation.machineId,
           agentSessionId: admitted.observation.agentSessionId,
           processEpoch: admitted.observation.processEpoch,
-          fencingGeneration: grant.attachmentGeneration,
+          fencingGeneration: ready.payload.fencingGeneration,
         },
         state: "active",
         columns: input.columns,
@@ -242,7 +253,7 @@ export class RunaRuntimeBoundary {
       entry.outputContinuity = "complete";
       this.#terminals.set(input.tabId, entry);
       this.#activeTabId ??= input.tabId;
-      for (const frame of bufferedFrames) this.#handleAttachedFrame(entry, frame);
+      for (const frame of ready.bufferedFrames) this.#handleAttachedFrame(entry, frame);
       this.#publish(entry);
       entry.pump = this.#pump(entry, iterator);
       return snapshot(entry);
@@ -300,6 +311,10 @@ export class RunaRuntimeBoundary {
 
   async resize(columns: number, rows: number, tabId = this.#activeTabId): Promise<void> {
     const entry = this.#requireActiveTerminal(tabId);
+    this.#requireGrantCapability(entry, "live_resize");
+    if (entry.resizeCapability !== "live") {
+      throw runtimeFailure("capability_unsupported", "This terminal supports only its initial dimensions.");
+    }
     await this.#enqueueTerminalSend(entry, async () => {
       this.#views.resize(entry.viewId, columns, rows);
       entry.wireSequence += 1n;
@@ -309,6 +324,7 @@ export class RunaRuntimeBoundary {
 
   async signal(signal: "interrupt" | "suspend" | "terminate", tabId = this.#activeTabId): Promise<void> {
     const entry = this.#requireActiveTerminal(tabId);
+    this.#requireGrantCapability(entry, "signals");
     await this.#enqueueTerminalSend(entry, async () => {
       this.#views.routeInput(entry.viewId, entry.fencingGeneration);
       entry.wireSequence += 1n;
@@ -344,29 +360,31 @@ export class RunaRuntimeBoundary {
       }
       await entry.connection.close({ code: 1001, reason: "runa_reconnect" }).catch(() => undefined);
       const grant = await this.#createGrant(admitted.observation, admitted.capability, entry.resumeHandle);
-      if (grant.attachmentGeneration <= entry.fencingGeneration) {
-        throw runtimeFailure("grant_invalid", "The reconnect grant did not advance the attachment fence.");
-      }
       connection = await this.#options.terminalConnector.connect({
         url: grant.connectUrl,
         token: grant.connectToken,
         protocol: TERMINAL_PROTOCOL,
         ...(input.signal === undefined ? {} : { signal: input.signal }),
       });
+      if (connection.connectionId !== grant.terminalSessionId) {
+        throw runtimeFailure("grant_scope_mismatch", "The terminal transport accepted a different Runa terminal session.");
+      }
       const iterator = connection.receive()[Symbol.asyncIterator]();
       const previousViewId = entry.viewId;
-      const nextViewId = viewId(entry.tabId, grant.attachmentGeneration);
       const nextDecoder = new TerminalFrameDecoder();
       const candidate: TerminalEntry = {
         ...entry,
-        viewId: nextViewId,
         observation: admitted.observation,
         connection,
         decoder: nextDecoder,
-        fencingGeneration: grant.attachmentGeneration,
+        capabilities: grant.capabilities,
         resumeHandle: grant.resumeHandle,
       };
-      const bufferedFrames = await this.#awaitReady(candidate, grant, iterator, input.signal);
+      const ready = await this.#awaitReady(candidate, iterator, input.signal);
+      if (ready.payload.fencingGeneration <= entry.fencingGeneration) {
+        throw runtimeFailure("grant_invalid", "The reconnect readiness frame did not advance the attachment fence.");
+      }
+      const nextViewId = viewId(entry.tabId, ready.payload.fencingGeneration);
       const resumeSequence = entry.wireSequence + 1n;
       await connection.send(encodeTerminalControl("resume", resumeSequence, {
         resumeHandle: grant.resumeHandle,
@@ -381,7 +399,7 @@ export class RunaRuntimeBoundary {
           machineId: admitted.observation.machineId,
           agentSessionId: admitted.observation.agentSessionId,
           processEpoch: admitted.observation.processEpoch,
-          fencingGeneration: grant.attachmentGeneration,
+          fencingGeneration: ready.payload.fencingGeneration,
         },
         state: "active",
         columns: previous.columns,
@@ -390,13 +408,15 @@ export class RunaRuntimeBoundary {
       entry.connection = connection;
       entry.observation = admitted.observation;
       entry.decoder = nextDecoder;
-      entry.fencingGeneration = grant.attachmentGeneration;
+      entry.fencingGeneration = ready.payload.fencingGeneration;
+      entry.capabilities = grant.capabilities;
+      entry.resizeCapability = ready.payload.resizeCapability;
       entry.viewId = nextViewId;
       entry.resumeHandle = grant.resumeHandle;
       entry.wireSequence = resumeSequence;
       entry.state = "active";
       entry.outputContinuity = "unknown";
-      for (const frame of bufferedFrames) this.#handleAttachedFrame(entry, frame);
+      for (const frame of ready.bufferedFrames) this.#handleAttachedFrame(entry, frame);
       this.#publish(entry);
       entry.pump = this.#pump(entry, iterator);
       return snapshot(entry);
@@ -535,18 +555,22 @@ export class RunaRuntimeBoundary {
     });
     return validateTerminalGrant({
       grant,
-      observation,
       allowedRunaOrigins: this.#options.allowedRunaOrigins,
+      requiredCapabilities: resumeHandle === undefined
+        ? ["acknowledgement", "heartbeat"]
+        : ["acknowledgement", "heartbeat", "resume"],
       now: this.#clock(),
     });
   }
 
   async #awaitReady(
     entry: TerminalEntry,
-    grant: TerminalConnectionGrant,
     iterator: AsyncIterator<Uint8Array>,
     signal: AbortSignal | undefined,
-  ): Promise<readonly TerminalFrame[]> {
+  ): Promise<{
+    readonly payload: Readonly<Record<string, unknown>> & import("../terminal/codec.js").TerminalReadyPayload;
+    readonly bufferedFrames: readonly TerminalFrame[];
+  }> {
     const deadlineMs = this.#options.readyTimeoutMs ?? 10_000;
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 60_000) {
       throw runtimeFailure("terminal_timeout", "The terminal readiness deadline is invalid.");
@@ -565,11 +589,24 @@ export class RunaRuntimeBoundary {
         if (frame.type === "error") throw this.#remoteTerminalError(frame);
         if (frame.type !== "ready") continue;
         const payload = decodeTerminalControl(frame);
-        assertReadyPayloadMatches(payload, entry.observation, grant);
-        return Object.freeze(frames.slice(index + 1));
+        assertReadyPayloadMatches(payload, entry.observation);
+        return Object.freeze({
+          payload,
+          bufferedFrames: Object.freeze(frames.slice(index + 1)),
+        });
       }
     }
     throw runtimeFailure("terminal_timeout", "The terminal did not prove PTY readiness before the deadline.", { retryable: true });
+  }
+
+  #requireGrantCapability(entry: TerminalEntry, name: TerminalConnectionCapability["name"]): void {
+    const matches = entry.capabilities.filter((capability) => capability.name === name);
+    if (matches.length !== 1 || matches[0]?.availability === "unknown") {
+      throw runtimeFailure("capability_unknown", `Runa cannot prove terminal capability ${name}.`);
+    }
+    if (matches[0]?.availability !== "supported") {
+      throw runtimeFailure("capability_unsupported", `Terminal capability ${name} is unsupported.`);
+    }
   }
 
   async #pump(entry: TerminalEntry, iterator: AsyncIterator<Uint8Array>): Promise<void> {

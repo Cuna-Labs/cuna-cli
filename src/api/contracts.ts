@@ -145,6 +145,35 @@ export function decodeMachineItem(value: unknown): Machine {
   return decodeMachine(value);
 }
 
+export interface RunaIdentity {
+  readonly id: string;
+  readonly email: string;
+  readonly workspaceAssigned: boolean;
+}
+
+export function decodeRunaIdentity(value: unknown): RunaIdentity {
+  if (!isObject(value) || !isObject(value.workspace)) throw new TypeError("Malformed Runa identity");
+  if (Object.keys(value).some((key) => key !== "id" && key !== "email" && key !== "workspace")) {
+    throw new TypeError("Malformed Runa identity");
+  }
+  const assigned = value.workspace.assigned;
+  if (typeof assigned !== "boolean") throw new TypeError("Malformed Runa workspace identity");
+  const workspaceKeys = Object.keys(value.workspace);
+  if (
+    assigned
+      ? workspaceKeys.some((key) => key !== "assigned" && key !== "usage") || !isObject(value.workspace.usage)
+      : workspaceKeys.some((key) => key !== "assigned" && key !== "waitlist_position") ||
+        !Number.isSafeInteger(value.workspace.waitlist_position) || Number(value.workspace.waitlist_position) < 0
+  ) {
+    throw new TypeError("Malformed Runa workspace identity");
+  }
+  return Object.freeze({
+    id: canonicalUuid(value, "id"),
+    email: requiredString(value, "email"),
+    workspaceAssigned: assigned,
+  });
+}
+
 export type AgentKind = "claude-code" | "codex" | "openclaw";
 export type AgentAuthMode = "interactive_login" | "credential_binding";
 export type AgentSessionDesiredState = "running" | "terminated";

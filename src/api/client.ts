@@ -6,6 +6,7 @@ import {
   decodeCapabilitySnapshot,
   decodeMachineItem,
   decodeMachinePage,
+  decodeRunaIdentity,
   decodeTerminalConnectionGrant,
   type AgentKind,
   type AgentAuthMode,
@@ -15,6 +16,7 @@ import {
   type CapabilitySnapshot,
   type Machine,
   type MachinePage,
+  type RunaIdentity,
   type TerminalConnectionGrant,
 } from "./contracts.js";
 import type { HttpTransport } from "./http.js";
@@ -47,6 +49,7 @@ export interface TerminalConnectionCreateInput {
 }
 
 export interface RunaApiClient {
+  getIdentity(): Promise<RunaIdentity>;
   discoverCapabilities(scope: CapabilityScope, resourceId?: string): Promise<CapabilitySnapshot>;
   listMachines(): Promise<MachinePage>;
   createMachine(input: MachineCreateInput, idempotencyKey: string): Promise<Machine>;
@@ -204,6 +207,12 @@ function validateMachineCreate(input: MachineCreateInput, idempotencyKey: string
 
 export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
   const client: RunaApiClient = {
+    async getIdentity() {
+      return decode(
+        decodeRunaIdentity,
+        await transport.request({ method: "GET", path: "/v1/me" }),
+      );
+    },
     async discoverCapabilities(scope, resourceId) {
       const raw = await transport.request({
         method: "GET",

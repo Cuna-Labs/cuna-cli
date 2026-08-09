@@ -127,7 +127,7 @@ class FakeTerminalSystem {
             initial.set(frame, ready.byteLength);
           }
         }
-        const connection = new FakeWireConnection(grant.terminalConnectionId, initial);
+        const connection = new FakeWireConnection(grant.terminalSessionId, initial);
         this.connections.push(connection);
         return connection;
       },
@@ -139,17 +139,22 @@ class FakeTerminalSystem {
         this.createCalls.push(input);
         this.generation += 1;
         const observed = observation(input.agentSessionId, this.epochs.get(input.agentSessionId));
-        const token = `secret-token-value-${this.generation}`;
+        const terminalSessionId = `00000000-0000-4000-8000-${String(this.generation).padStart(12, "0")}`;
+        const token = `runa_tc_${"A".repeat(42)}${this.generation}`;
         const grant = {
-          terminalConnectionId: `terminal-${this.generation}`,
-          resumeHandle: `resume-${input.agentSessionId}`,
-          connectUrl: `wss://api.runacode.io/v1/terminal/${this.generation}`,
+          terminalSessionId,
+          resumeHandle: "66666666-6666-4666-8666-666666666666",
+          connectUrl: `wss://api.runacode.io/v1/terminal-connections/${terminalSessionId}/stream`,
           connectToken: token,
           protocol: TERMINAL_PROTOCOL,
-          issuedAt: new Date(NOW).toISOString(),
+          capabilities: [
+            { name: "acknowledgement", availability: "supported" },
+            { name: "heartbeat", availability: "supported" },
+            { name: "live_resize", availability: "supported" },
+            { name: "resume", availability: "supported" },
+            { name: "signals", availability: "supported" },
+          ],
           expiresAt: new Date(NOW + 30_000).toISOString(),
-          userId: observed.userId,
-          machineId: observed.machineId,
           agentSessionId: observed.agentSessionId,
           processEpoch: observed.processEpoch,
           attachmentGeneration: this.generation,
@@ -227,30 +232,41 @@ test("runtime capability admission fails closed for expired, ambiguous, and non-
   );
 });
 
-test("terminal grants reject non-Runa origins, query secrets, and scope substitution", () => {
-  const observed = observation("agent-1");
+test("terminal grants reject non-Runa origins, query secrets, and incomplete capability evidence", () => {
+  const terminalSessionId = "55555555-5555-4555-8555-555555555555";
   const valid = {
-    terminalConnectionId: "terminal-1",
-    resumeHandle: "resume-agent-1",
-    connectUrl: "wss://api.runacode.io/v1/terminal/1",
-    connectToken: "secret-token-value-1",
+    terminalSessionId,
+    resumeHandle: "66666666-6666-4666-8666-666666666666",
+    connectUrl: `wss://api.runacode.io/v1/terminal-connections/${terminalSessionId}/stream`,
+    connectToken: `runa_tc_${"A".repeat(43)}`,
     protocol: TERMINAL_PROTOCOL,
-    issuedAt: new Date(NOW).toISOString(),
+    capabilities: [
+      { name: "acknowledgement", availability: "supported" },
+      { name: "heartbeat", availability: "supported" },
+      { name: "live_resize", availability: "supported" },
+      { name: "resume", availability: "supported" },
+      { name: "signals", availability: "supported" },
+    ],
     expiresAt: new Date(NOW + 30_000).toISOString(),
-    userId: observed.userId,
-    machineId: observed.machineId,
-    agentSessionId: observed.agentSessionId,
-    processEpoch: observed.processEpoch,
-    attachmentGeneration: 1,
   };
-  assert.equal(validateTerminalGrant({ grant: valid, observation: observed, allowedRunaOrigins: [API_ORIGIN], now: NOW }), valid);
+  assert.equal(validateTerminalGrant({
+    grant: valid,
+    allowedRunaOrigins: [API_ORIGIN],
+    requiredCapabilities: ["acknowledgement", "heartbeat"],
+    now: NOW,
+  }), valid);
   for (const grant of [
-    { ...valid, connectUrl: "wss://evil.example/v1/terminal/1" },
-    { ...valid, connectUrl: `wss://api.runacode.io/v1/terminal/1?token=${valid.connectToken}` },
-    { ...valid, agentSessionId: "agent-sibling" },
+    { ...valid, connectUrl: `wss://evil.example/v1/terminal-connections/${terminalSessionId}/stream` },
+    { ...valid, connectUrl: `${valid.connectUrl}?token=${valid.connectToken}` },
+    { ...valid, capabilities: valid.capabilities.slice(0, 4) },
   ]) {
     assert.throws(
-      () => validateTerminalGrant({ grant, observation: observed, allowedRunaOrigins: [API_ORIGIN], now: NOW }),
+      () => validateTerminalGrant({
+        grant,
+        allowedRunaOrigins: [API_ORIGIN],
+        requiredCapabilities: ["acknowledgement", "heartbeat"],
+        now: NOW,
+      }),
       RuntimeBoundaryError,
     );
   }
@@ -355,7 +371,7 @@ test("runtime reconnect obtains a fresh grant, preserves process epoch, and neve
   assert.equal(reconnected.state, "active");
   assert.equal(reconnected.outputContinuity, "unknown", "continuity remains unknown until producer resume evidence arrives");
   assert.equal(system.createCalls.length, 2);
-  assert.equal(system.createCalls[1].resumeHandle, "resume-agent-a");
+  assert.equal(system.createCalls[1].resumeHandle, "66666666-6666-4666-8666-666666666666");
   assert.notEqual(system.connections[0].connectionId, system.connections[1].connectionId);
   assert.equal(system.connectCalls.length, 2);
   await runtime.shutdown();
