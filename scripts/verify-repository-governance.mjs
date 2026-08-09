@@ -1,9 +1,48 @@
 import { readFile, readdir } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { invariant, parseArgs } from "./lib/release-evidence.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(args.get("root") ?? process.cwd());
+
+const prohibitedTrackedFiles = new Set([
+  "AGENTS.md",
+  "CLAUDE.md",
+  "CODE_OF_CONDUCT.md",
+  "IMPLEMENTATION-OBJECTIVE.md",
+  "packaging/DISTRIBUTION-READINESS.md",
+  "packaging/EXTERNAL-SETUP.md",
+  "test/governance-requirement-traceability.test.mjs",
+]);
+const prohibitedTrackedPrefixes = [
+  ".agents/",
+  ".claude/",
+  ".codex/",
+  ".codex-work/",
+  "architecture/",
+  "audits/",
+  "docs/internal/",
+  "governance/",
+  "internal/",
+  "plans/",
+  "prds/",
+  "reviews/",
+];
+
+const tracked = spawnSync("git", ["ls-files", "-z"], {
+  cwd: root,
+  encoding: "utf8",
+  shell: false,
+});
+invariant(tracked.status === 0, `Unable to enumerate tracked files: ${tracked.stderr || "git failed"}`);
+const trackedFiles = tracked.stdout.split("\0").filter(Boolean);
+for (const file of trackedFiles) {
+  invariant(
+    !prohibitedTrackedFiles.has(file) && !prohibitedTrackedPrefixes.some((prefix) => file.startsWith(prefix)),
+    `Internal-only file is tracked by the public repository: ${file}`,
+  );
+}
 
 async function text(relative) {
   return readFile(path.join(root, relative), "utf8");

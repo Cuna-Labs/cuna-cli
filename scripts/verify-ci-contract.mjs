@@ -28,9 +28,6 @@ invariant(packageJson.engines?.node, "Explicit Node engine range is required");
 await access(path.join(root, "package-lock.json"));
 
 const ci = await readFile(path.join(root, ".github", "workflows", "ci.yml"), "utf8");
-const traceabilityGate = "node governance/validate-requirement-traceability.mjs";
-invariant(ci.split(traceabilityGate).length - 1 === 1, "Authoritative CI must run requirement traceability exactly once");
-invariant(ci.indexOf(traceabilityGate) < ci.indexOf("source-gates:"), "Requirement traceability must run in the governance job");
 const generator = "node scripts/release-project-distributions.mjs";
 const verifier = "node scripts/verify-release-distributions.mjs";
 invariant(!/(?:^|\s)node scripts\/project-distributions\.mjs(?:\s|$)/m.test(ci), "Authoritative CI still invokes the legacy distribution generator");
