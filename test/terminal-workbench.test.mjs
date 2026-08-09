@@ -162,6 +162,6 @@ test("workbench restores the selected remote cursor below the appbar without for
     appbar: model(),
     color: false,
   });
-  assert.match(frame.text, /\u001b\[5;5H\u001b\[\?25l$/u);
-  assert.doesNotMatch(frame.text, /\u001b\[\?25h$/u);
+  assert.equal(frame.text.endsWith("\u001b[5;5H\u001b[?25l"), true);
+  assert.equal(frame.text.endsWith("\u001b[?25h"), false);
 });
