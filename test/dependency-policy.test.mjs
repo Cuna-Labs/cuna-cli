@@ -32,3 +32,26 @@ test("dependency policy rejects ranged runtime dependencies that can drift for g
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("dependency policy rejects a lock entry whose source bytes are not bound", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "runa-dependency-policy-"));
+  try {
+    await writeFile(path.join(root, "package.json"), JSON.stringify({
+      dependencies: { example: "1.2.3" },
+    }));
+    await writeFile(path.join(root, "package-lock.json"), JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        "": {},
+        "node_modules/example": { version: "1.2.3" },
+      },
+    }));
+
+    const result = spawnSync(process.execPath, [verifier, "--root", root], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}${result.stderr}`, /missing canonical resolved source/u);
+    assert.match(`${result.stdout}${result.stderr}`, /missing or non-SHA-512 integrity/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
