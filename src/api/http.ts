@@ -154,6 +154,15 @@ export function createHttpTransport(input: {
   const timeoutMs = input.timeoutMs ?? 15_000;
   return Object.freeze({
     async request(request: HttpRequest): Promise<unknown> {
+      if (request.signal?.aborted === true) {
+        throw new RunaError({
+          code: "runa.network.cancelled",
+          message: "The Runa request was cancelled.",
+          exitCode: EXIT_CODES.network,
+          retryable: false,
+          cause: request.signal.reason,
+        });
+      }
       if (!request.path.startsWith("/v1/") || request.path.includes("..") || request.path.includes("?")) {
         throw new RunaError({
           code: "runa.internal.invalid_api_path",

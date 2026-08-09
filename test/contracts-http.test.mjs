@@ -222,6 +222,24 @@ test("HTTP transport binds origin, authorization, idempotency, and public path",
   assert.equal(observed.init.headers["Idempotency-Key"], "op_1");
 });
 
+test("pre-aborted HTTP requests perform no fetch effect", async () => {
+  let calls = 0;
+  const controller = new AbortController();
+  controller.abort(new Error("cancel-before-dispatch"));
+  const transport = createHttpTransport({
+    baseUrl: "https://api.runacode.io",
+    fetch: async () => {
+      calls += 1;
+      return new Response("{}", { status: 200 });
+    },
+  });
+  await assert.rejects(
+    transport.request({ method: "GET", path: "/v1/sessions", signal: controller.signal }),
+    (error) => error instanceof RunaError && error.code === "runa.network.cancelled",
+  );
+  assert.equal(calls, 0);
+});
+
 test("HTTP errors expose only stable safe metadata", async () => {
   const transport = createHttpTransport({
     baseUrl: "https://api.runacode.io",
