@@ -143,6 +143,7 @@ export class LocalSyncSupervisor {
   readonly operationQueue: BoundedOperationQueue;
   readonly terminalQueue: BoundedOperationQueue;
   readonly #listeners = new Set<(snapshot: SupervisorSnapshot) => void>();
+  readonly #clock: () => number;
   #snapshot: SupervisorSnapshot = Object.freeze({
     state: "recovering",
     dirty: false,
@@ -156,6 +157,7 @@ export class LocalSyncSupervisor {
       readonly syncBytes?: number;
       readonly terminalOperations?: number;
       readonly terminalBytes?: number;
+      readonly clock?: () => number;
     },
   ) {
     this.configuration = Object.freeze({ ...configuration });
@@ -164,15 +166,29 @@ export class LocalSyncSupervisor {
       limits?.terminalOperations ?? 1_024,
       limits?.terminalBytes ?? 8 * 1024 * 1024,
     );
+    this.#clock = limits?.clock ?? Date.now;
   }
 
   get snapshot(): SupervisorSnapshot {
+    if (
+      this.#snapshot.state === "converged" &&
+      this.#snapshot.evidenceExpiresAt !== undefined &&
+      Date.parse(this.#snapshot.evidenceExpiresAt) <= this.#clock()
+    ) {
+      return Object.freeze({
+        state: "unknown",
+        dirty: true,
+        incrementalApplyPaused: true,
+        reason: "convergence_evidence_expired",
+        evidenceExpiresAt: this.#snapshot.evidenceExpiresAt,
+      });
+    }
     return this.#snapshot;
   }
 
   subscribe(listener: (snapshot: SupervisorSnapshot) => void): () => void {
     this.#listeners.add(listener);
-    listener(this.#snapshot);
+    listener(this.snapshot);
     return () => this.#listeners.delete(listener);
   }
 
@@ -193,11 +209,11 @@ export class LocalSyncSupervisor {
   }
 
   conflictObserved(): void {
-    this.#publish({ state: "conflicted", dirty: this.#snapshot.dirty, incrementalApplyPaused: false, reason: "path_conflict" });
+    this.#publish({ state: "conflicted", dirty: this.snapshot.dirty, incrementalApplyPaused: false, reason: "path_conflict" });
   }
 
   markLiveUnverified(): void {
-    this.#publish({ state: "live_unverified", dirty: this.#snapshot.dirty, incrementalApplyPaused: false });
+    this.#publish({ state: "live_unverified", dirty: this.snapshot.dirty, incrementalApplyPaused: false });
   }
 
   confirmConvergence(receipt: ConvergenceReceipt, now = Date.now()): void {
@@ -231,7 +247,10 @@ export class LocalSyncSupervisor {
 export class SyncSupervisorRegistry {
   readonly #supervisors = new Map<string, LocalSyncSupervisor>();
 
-  connect(configuration: SupervisorConfiguration): { readonly supervisor: LocalSyncSupervisor; readonly created: boolean } {
+  connect(
+    configuration: SupervisorConfiguration,
+    clock: () => number = Date.now,
+  ): { readonly supervisor: LocalSyncSupervisor; readonly created: boolean } {
     const existing = this.#supervisors.get(configuration.bindingId);
     if (existing !== undefined) {
       if (!sameConfiguration(existing.configuration, configuration)) {
@@ -244,7 +263,7 @@ export class SyncSupervisorRegistry {
       }
       return Object.freeze({ supervisor: existing, created: false });
     }
-    const supervisor = new LocalSyncSupervisor(configuration);
+    const supervisor = new LocalSyncSupervisor(configuration, { clock });
     this.#supervisors.set(configuration.bindingId, supervisor);
     return Object.freeze({ supervisor, created: true });
   }
@@ -336,4 +355,3 @@ function validateCount(value: number): void {
 function queueFailure(reason: string) {
   return workspaceError("queue_invalid", "The bounded synchronization queue cannot accept the operation.", "policy", reason);
 }
-

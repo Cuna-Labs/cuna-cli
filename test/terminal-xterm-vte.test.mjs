@@ -42,6 +42,23 @@ test("headless VTE preserves split UTF-8 and resolves remote control sequences i
   viewport.dispose();
 });
 
+test("VTE reports Unicode display-cell width and the remote cursor state", async () => {
+  const { viewport } = adapter();
+  const snapshot = await viewport.write(
+    encoder.encode("\u4e2de\u0301\u{1F642}\u001b[?25l"),
+    1n,
+    1n,
+  );
+  assert.equal(snapshot.cells[0], "\u4e2de\u0301\u{1F642}");
+  assert.equal(snapshot.displayWidths[0], 4);
+  assert.equal(snapshot.cursorX, 4);
+  assert.equal(snapshot.cursorY, 0);
+  assert.equal(snapshot.modes.cursorVisible, false);
+  const visible = await viewport.write(encoder.encode("\u001b[?25h"), 2n, 2n);
+  assert.equal(visible.modes.cursorVisible, true);
+  viewport.dispose();
+});
+
 test("remote OSC title, hyperlink, and clipboard controls stay outside trusted host cells", async () => {
   const responses = [];
   const { viewport } = adapter({ onTerminalResponse: (bytes) => responses.push(bytes) });
