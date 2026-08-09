@@ -44,7 +44,7 @@ export interface CredentialSnapshot {
 export interface CredentialStatus {
   readonly backendId: string;
   readonly backendStatus: CredentialBackendStatus;
-  readonly state: "present" | "absent" | "corrupt" | "revoked" | "unavailable";
+  readonly state: "present" | "expired" | "absent" | "corrupt" | "revoked" | "unavailable";
   readonly bindingDigest: string;
   readonly revision?: number;
   readonly expiresAt?: number;

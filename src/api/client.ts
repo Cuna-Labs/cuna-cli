@@ -73,6 +73,19 @@ function decode<T>(decoder: (value: unknown) => T, value: unknown): T {
   }
 }
 
+function assertAgentSessionBinding(
+  session: AgentSession,
+  expected: { readonly id?: string; readonly machineId?: string },
+): AgentSession {
+  if (
+    (expected.id !== undefined && session.id !== expected.id) ||
+    (expected.machineId !== undefined && session.machineId !== expected.machineId)
+  ) {
+    throw malformed(new TypeError("AgentSession response authority does not match the requested resource."));
+  }
+  return session;
+}
+
 function containsAsciiControl(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
@@ -196,7 +209,9 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
         path: `/v1/sessions/${safeId}/agent-sessions`,
         query,
       });
-      return decode(decodeAgentSessionPage, raw);
+      const page = decode(decodeAgentSessionPage, raw);
+      for (const session of page.items) assertAgentSessionBinding(session, { machineId });
+      return page;
     },
     async createAgentSession(machineId, input, idempotencyKey) {
       const safeId = encodePublicId(machineId, "machine ID");
@@ -215,13 +230,16 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
         },
         idempotencyKey,
       });
-      return decode(decodeAgentSessionItem, raw);
+      return assertAgentSessionBinding(decode(decodeAgentSessionItem, raw), { machineId });
     },
     async getAgentSession(id) {
       const safeId = encodePublicId(id, "AgentSession ID");
-      return decode(
-        decodeAgentSessionItem,
-        await transport.request({ method: "GET", path: `/v1/agent-sessions/${safeId}` }),
+      return assertAgentSessionBinding(
+        decode(
+          decodeAgentSessionItem,
+          await transport.request({ method: "GET", path: `/v1/agent-sessions/${safeId}` }),
+        ),
+        { id },
       );
     },
     async renameAgentSession(id, name) {
@@ -233,20 +251,26 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
           exitCode: EXIT_CODES.usage,
         });
       }
-      return decode(
-        decodeAgentSessionItem,
-        await transport.request({
-          method: "PATCH",
-          path: `/v1/agent-sessions/${safeId}`,
-          body: { name },
-        }),
+      return assertAgentSessionBinding(
+        decode(
+          decodeAgentSessionItem,
+          await transport.request({
+            method: "PATCH",
+            path: `/v1/agent-sessions/${safeId}`,
+            body: { name },
+          }),
+        ),
+        { id },
       );
     },
     async terminateAgentSession(id) {
       const safeId = encodePublicId(id, "AgentSession ID");
-      return decode(
-        decodeAgentSessionItem,
-        await transport.request({ method: "POST", path: `/v1/agent-sessions/${safeId}/terminate` }),
+      return assertAgentSessionBinding(
+        decode(
+          decodeAgentSessionItem,
+          await transport.request({ method: "POST", path: `/v1/agent-sessions/${safeId}/terminate` }),
+        ),
+        { id },
       );
     },
   };
