@@ -9,7 +9,9 @@ import {
   createHumanAuthService,
   decodeCliAuthBootstrap,
   decodeCliContinuationIssued,
+  decodeCliContinuationStatus,
   decodeCliTokenSet,
+  decodeRevocation,
   RunaError,
 } from "../dist/index.js";
 
@@ -316,5 +318,14 @@ test("exact decoders reject widened, mismatched, and malformed auth responses", 
   assert.throws(() => decodeCliContinuationIssued({ ...issued, browser_url: issued.browser_url.replace(UUID_A, UUID_B) }, {
     browserOrigin: "https://app.runacode.io", state: STATE,
   }));
+  assert.throws(() => decodeCliContinuationStatus({
+    id: UUID_B,
+    phase: "completed",
+    expires_at: "2026-08-08T00:10:00.000Z",
+    required_terms_version: "2026-08",
+  }, UUID_A));
   assert.throws(() => decodeCliTokenSet({ access_token: AT }));
+  assert.equal(decodeRevocation({ revoked: true }), true);
+  assert.throws(() => decodeRevocation({ revoked: false }));
+  assert.throws(() => decodeRevocation({ revoked: true, ambiguous: true }));
 });
