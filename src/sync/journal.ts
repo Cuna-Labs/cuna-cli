@@ -62,6 +62,7 @@ export class DurableSyncJournal {
   readonly #ownerId: string;
   readonly #fence: number;
   readonly #leaseMs: number;
+  readonly #clock: () => number;
   #metadata: JournalMetadata;
   #records: JournalRecord[];
   #tail: Promise<void> = Promise.resolve();
@@ -74,6 +75,7 @@ export class DurableSyncJournal {
     readonly leaseMs: number;
     readonly metadata: JournalMetadata;
     readonly records: JournalRecord[];
+    readonly clock: () => number;
   }) {
     this.#directory = input.directory;
     this.#ownerId = input.ownerId;
@@ -81,6 +83,7 @@ export class DurableSyncJournal {
     this.#leaseMs = input.leaseMs;
     this.#metadata = input.metadata;
     this.#records = input.records;
+    this.#clock = input.clock;
   }
 
   static async open(input: {
@@ -90,6 +93,7 @@ export class DurableSyncJournal {
     readonly ownerId: string;
     readonly leaseMs?: number;
     readonly now?: number;
+    readonly clock?: () => number;
   }): Promise<DurableSyncJournal> {
     const leaseMs = input.leaseMs ?? 30_000;
     const now = input.now ?? Date.now();
@@ -116,6 +120,7 @@ export class DurableSyncJournal {
         leaseMs,
         metadata,
         records: [...inspection.records],
+        clock: input.clock ?? Date.now,
       });
     } catch (error) {
       await releaseLeaseFile(leasePath, input.ownerId, fence);
@@ -169,7 +174,7 @@ export class DurableSyncJournal {
           "operation_id_reuse",
         );
       }
-      const existing = sameOperation.find((record) => record.state === "queued");
+      const existing = sameOperation.at(-1);
       if (existing !== undefined) {
         result = existing;
         return;
@@ -236,7 +241,12 @@ export class DurableSyncJournal {
   async #assertLease(): Promise<void> {
     if (this.#closed) throw journalFailure("writer_closed");
     const lease = await readJson<LeaseRecord>(join(this.#directory, LEASE_FILE));
-    if (lease.ownerId !== this.#ownerId || lease.fence !== this.#fence) {
+    if (
+      lease.ownerId !== this.#ownerId ||
+      lease.fence !== this.#fence ||
+      !Number.isSafeInteger(lease.expiresAt) ||
+      lease.expiresAt <= this.#clock()
+    ) {
       throw workspaceError("writer_fenced", "The journal writer lease has been fenced.", "conflict", "stale_fence");
     }
   }
@@ -271,21 +281,33 @@ export async function inspectSyncJournal(directory: string): Promise<JournalInsp
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const records: JournalRecord[] = [];
+  const latestByOperation = new Map<string, JournalRecord>();
   let previousChecksum = "0".repeat(64);
+  let previousFence = 0;
   for (const [index, line] of text.split("\n").filter(Boolean).entries()) {
     try {
       const record = JSON.parse(line) as JournalRecord;
       const { checksum, ...body } = record;
+      const previousOperation = latestByOperation.get(record.operationId);
       if (
+        !validRecordShape(record) ||
         record.recordSequence !== index + 1 ||
         record.previousChecksum !== previousChecksum ||
-        hashRecord(body) !== checksum
+        hashRecord(body) !== checksum ||
+        record.intentHash !== hashIntent(record) ||
+        record.fence < previousFence ||
+        record.fence > metadata.lastFence ||
+        (previousOperation === undefined
+          ? record.state !== "queued"
+          : previousOperation.intentHash !== record.intentHash || !allowedTransition(previousOperation.state, record.state))
       ) {
         throw new Error("invalid chain");
       }
       validateIntent(record);
       records.push(Object.freeze(record));
+      latestByOperation.set(record.operationId, record);
       previousChecksum = checksum;
+      previousFence = record.fence;
     } catch {
       return Object.freeze({
         metadata,
@@ -415,7 +437,7 @@ function allowedTransition(from: JournalOperationState, to: JournalOperationStat
   const allowed: Readonly<Record<JournalOperationState, readonly JournalOperationState[]>> = {
     queued: ["sending", "conflicted"],
     sending: ["uncertain", "acknowledged", "conflicted"],
-    uncertain: ["acknowledged", "sending", "conflicted"],
+    uncertain: ["acknowledged", "conflicted"],
     acknowledged: ["applied", "conflicted"],
     applied: [],
     conflicted: [],
@@ -440,6 +462,25 @@ function hashIntent(intent: JournalIntent): string {
       operationId: intent.operationId,
     }))
     .digest("hex");
+}
+
+function validRecordShape(record: JournalRecord): boolean {
+  if (record === null || typeof record !== "object") return false;
+  const keys = Object.keys(record).sort();
+  const expected = [
+    "baseGeneration", "byteLength", "checksum", "digest", "fence", "intentHash",
+    "operationId", "previousChecksum", "recordSequence", "state",
+  ];
+  return (
+    keys.length === expected.length &&
+    keys.every((key, index) => key === expected[index]) &&
+    Number.isSafeInteger(record.recordSequence) && record.recordSequence >= 1 &&
+    Number.isSafeInteger(record.fence) && record.fence >= 1 &&
+    /^[a-f0-9]{64}$/u.test(record.intentHash) &&
+    /^[a-f0-9]{64}$/u.test(record.previousChecksum) &&
+    /^[a-f0-9]{64}$/u.test(record.checksum) &&
+    (["queued", "sending", "uncertain", "acknowledged", "applied", "conflicted"] as const).includes(record.state)
+  );
 }
 
 function hashRecord(body: Omit<JournalRecord, "checksum">): string {

@@ -346,11 +346,52 @@ test("journal replay is idempotent and unknown outcome requires an authoritative
   assert.deepEqual(inspection.recoveryActions, [{ operationId: "op-1", action: "query_outcome" }]);
 });
 
+test("journal terminal replay is idempotent, expired writers fail, and uncertain work cannot be blindly resent", async (t) => {
+  const directory = await temporaryDirectory(t);
+  let now = 100;
+  const journal = await DurableSyncJournal.open({
+    directory,
+    bindingId: "binding",
+    bindingGeneration: 1,
+    ownerId: "writer",
+    leaseMs: 10,
+    now,
+    clock: () => now,
+  });
+  const intent = { operationId: "op-final", baseGeneration: 1, digest: digestA, byteLength: 5 };
+  await journal.append(intent);
+  await journal.transition(intent.operationId, "sending");
+  await journal.transition(intent.operationId, "acknowledged");
+  const applied = await journal.transition(intent.operationId, "applied");
+  const replay = await journal.append(intent);
+  assert.equal(replay.recordSequence, applied.recordSequence);
+  assert.equal(replay.state, "applied");
+
+  const uncertain = { operationId: "op-uncertain", baseGeneration: 1, digest: digestB, byteLength: 1 };
+  await journal.append(uncertain);
+  await journal.transition(uncertain.operationId, "sending");
+  await journal.transition(uncertain.operationId, "uncertain");
+  await assert.rejects(
+    journal.transition(uncertain.operationId, "sending"),
+    (error) => error.code === "runa.workspace.journal_invalid",
+  );
+  now = 110;
+  await assert.rejects(
+    journal.append({ operationId: "late", baseGeneration: 1, digest: digestA, byteLength: 1 }),
+    (error) => error.code === "runa.workspace.writer_fenced",
+  );
+  await journal.close();
+});
+
 test("expired crash lease transfers with fencing and corrupt journal requires reconciliation", async (t) => {
   const directory = await temporaryDirectory(t);
-  const crashed = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "old", leaseMs: 10, now: 0 });
+  let crashedNow = 0;
+  const crashed = await DurableSyncJournal.open({
+    directory, bindingId: "binding", bindingGeneration: 1, ownerId: "old", leaseMs: 10, now: crashedNow, clock: () => crashedNow,
+  });
   await crashed.append({ operationId: "op-old", baseGeneration: 1, digest: digestA, byteLength: 1 });
-  const recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "new", leaseMs: 10, now: 11 });
+  crashedNow = 11;
+  const recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "new", leaseMs: 10, now: 11, clock: () => 11 });
   await assert.rejects(
     crashed.append({ operationId: "op-stale", baseGeneration: 1, digest: digestB, byteLength: 1 }),
     (error) => error.code === "runa.workspace.writer_fenced",
