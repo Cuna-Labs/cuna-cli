@@ -33,7 +33,8 @@ opaque remote shell.
 
 Browser authentication, cloud terminal attachment, daemon integration,
 workspace synchronization, and the local companion remain pre-release work.
-Their presence in the accepted PRDs is not evidence that they are deployed.
+Source code or a documented interface is not evidence that a capability is
+deployed.
 
 ## Quick start for contributors
 
@@ -46,7 +47,6 @@ npm ci --ignore-scripts
 npm run lint
 npm run typecheck
 npm test
-node governance/validate-prd-dag.mjs
 ```
 
 Inspect the local build without making a network request:
@@ -125,9 +125,6 @@ workflows, terminal behavior, local daemon coordination, and synchronization.
 TypeScript and Python SDKs remain explicit programmatic REST clients and do not
 absorb watchers, PTYs, browser control, or implicit login behavior.
 
-Architecture decisions are recorded in [`architecture/`](architecture/README.md)
-and accepted product requirements in [`prds/`](prds/README.md).
-
 ## Release and security
 
 Release workflows construct one immutable npm candidate, generate an SBOM and
@@ -142,9 +139,8 @@ customer data.
 ## Contributing
 
 Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before proposing changes. Every
-behavioral change needs a stable requirement/test identity, and every public
-contract change must update producer and consumers in an expand-contract
-campaign.
+behavioral change needs executable test evidence, and every public contract
+change must update producer and consumers through an expand-contract campaign.
 
 ## License
 

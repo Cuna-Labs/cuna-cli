@@ -56,12 +56,3 @@ test("CI contract rejects publication authority inside candidate CI", async () =
   await writeFile(workflow, `${await readFile(workflow, "utf8")}\n# forbidden negative control\n# npm publish\n`);
   await assert.rejects(verify(root), /may not publish npm packages/);
 });
-
-test("CI contract rejects removal of accepted-PRD requirement traceability", async () => {
-  const root = await fixture();
-  const workflow = path.join(root, ".github", "workflows", "ci.yml");
-  const content = (await readFile(workflow, "utf8"))
-    .replace("      - run: node governance/validate-requirement-traceability.mjs\n", "");
-  await writeFile(workflow, content);
-  await assert.rejects(verify(root), /requirement traceability exactly once/);
-});
