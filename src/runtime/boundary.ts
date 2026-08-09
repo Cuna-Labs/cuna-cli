@@ -115,6 +115,7 @@ interface TerminalEntry {
   resumeHandle: string;
   reason?: string;
   pump?: Promise<void>;
+  sendTail: Promise<void>;
 }
 
 export class RunaRuntimeBoundary {
@@ -218,6 +219,7 @@ export class RunaRuntimeBoundary {
         outputSequence: 0n,
         outputContinuity: "unknown",
         resumeHandle: grant.resumeHandle,
+        sendTail: Promise.resolve(),
       };
       const iterator = connection.receive()[Symbol.asyncIterator]();
       const bufferedFrames = await this.#awaitReady(entry, grant, iterator, input.signal);
@@ -280,29 +282,42 @@ export class RunaRuntimeBoundary {
   }
 
   async #sendTerminalBytes(entry: TerminalEntry, bytes: Uint8Array): Promise<void> {
-    this.#views.routeInput(entry.viewId, entry.fencingGeneration);
-    entry.wireSequence += 1n;
-    entry.inputSequence = entry.wireSequence;
-    await entry.connection.send(encodeTerminalFrame({
-      type: "input",
-      critical: true,
-      sequence: entry.inputSequence,
-      payload: bytes.slice(),
-    }));
+    const payload = bytes.slice();
+    await this.#enqueueTerminalSend(entry, async () => {
+      this.#views.routeInput(entry.viewId, entry.fencingGeneration);
+      entry.wireSequence += 1n;
+      entry.inputSequence = entry.wireSequence;
+      await entry.connection.send(encodeTerminalFrame({
+        type: "input",
+        critical: true,
+        sequence: entry.inputSequence,
+        payload,
+      }));
+    });
   }
 
   async resize(columns: number, rows: number, tabId = this.#activeTabId): Promise<void> {
     const entry = this.#requireActiveTerminal(tabId);
-    this.#views.resize(entry.viewId, columns, rows);
-    entry.wireSequence += 1n;
-    await entry.connection.send(encodeTerminalControl("resize", entry.wireSequence, { columns, rows }));
+    await this.#enqueueTerminalSend(entry, async () => {
+      this.#views.resize(entry.viewId, columns, rows);
+      entry.wireSequence += 1n;
+      await entry.connection.send(encodeTerminalControl("resize", entry.wireSequence, { columns, rows }));
+    });
   }
 
   async signal(signal: "interrupt" | "suspend" | "terminate", tabId = this.#activeTabId): Promise<void> {
     const entry = this.#requireActiveTerminal(tabId);
-    this.#views.routeInput(entry.viewId, entry.fencingGeneration);
-    entry.wireSequence += 1n;
-    await entry.connection.send(encodeTerminalControl("signal", entry.wireSequence, { signal }));
+    await this.#enqueueTerminalSend(entry, async () => {
+      this.#views.routeInput(entry.viewId, entry.fencingGeneration);
+      entry.wireSequence += 1n;
+      await entry.connection.send(encodeTerminalControl("signal", entry.wireSequence, { signal }));
+    });
+  }
+
+  async #enqueueTerminalSend(entry: TerminalEntry, operation: () => Promise<void>): Promise<void> {
+    const queued = entry.sendTail.then(operation);
+    entry.sendTail = queued.then(() => undefined, () => undefined);
+    await queued;
   }
 
   async reconnect(input: { readonly tabId: string; readonly signal?: AbortSignal }): Promise<RuntimeTerminalSnapshot> {
