@@ -301,7 +301,7 @@ test("reserved cloud-terminal commands fail explicitly instead of simulating a s
   assert.equal(exit, EXIT_CODES.unsupported);
   const error = JSON.parse(streams.stderr()).error;
   assert.equal(error.code, "runa.capability.unsupported");
-  assert.equal(error.details.reason, "prd_008_035_038_runtime_missing");
+  assert.equal(error.details.reason, "terminal_runtime_unavailable");
 });
 
 test("package and runtime versions remain identical", async () => {
