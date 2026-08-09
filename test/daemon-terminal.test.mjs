@@ -36,6 +36,7 @@ import { AttachmentError, ExclusiveAttachmentSession } from "../dist/terminal/re
 import { ViewportIsolationError, ViewportRegistry } from "../dist/terminal/viewport.js";
 import { buildAppbarModel, projectTruth } from "../dist/terminal/appbar.js";
 import { HostTerminalLease, selectTerminalMode } from "../dist/terminal/mode.js";
+import { createNodeHostTerminalAdapter } from "../dist/pty/node-host-terminal.js";
 
 const text = new TextEncoder();
 const digestA = `sha256:${"a".repeat(64)}`;
@@ -382,6 +383,37 @@ test("rich mode is evidence-gated and host acquisition restores partial state on
   };
   await assert.rejects(HostTerminalLease.acquire(adapter));
   assert.deepEqual(calls, ["raw-on", "alt-on", "modes-off", "alt-off", "raw-off"]);
+});
+
+test("Node host terminal restoration returns stdin to its prior flow state", async () => {
+  let paused = true;
+  let raw = false;
+  const writes = [];
+  const stdin = {
+    isTTY: true,
+    get readableFlowing() { return paused ? false : true; },
+    isPaused: () => paused,
+    setRawMode(value) { raw = value; },
+    resume() { paused = false; return this; },
+    pause() { paused = true; return this; },
+  };
+  const stdout = {
+    isTTY: true,
+    write(value) { writes.push(value); return true; },
+  };
+
+  const lease = await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout }));
+  assert.equal(raw, true);
+  assert.equal(paused, false);
+  await lease.restore();
+  assert.equal(raw, false);
+  assert.equal(paused, true);
+  assert.equal(writes.length, 3);
+
+  paused = false;
+  const flowingLease = await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout }));
+  await flowingLease.restore();
+  assert.equal(paused, false);
 });
 
 test("daemon lifecycle rejects impossible shortcuts to readiness", () => {

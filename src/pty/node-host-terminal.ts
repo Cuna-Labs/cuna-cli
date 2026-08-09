@@ -13,9 +13,14 @@ export function createNodeHostTerminalAdapter(input: {
 } = {}): HostTerminalAdapter {
   const stdin = input.stdin ?? process.stdin;
   const stdout = input.stdout ?? process.stdout;
+  let shouldPauseAfterRawMode = false;
   return Object.freeze({
     enterRawMode(): void {
       assertInteractive(stdin, stdout);
+      // `readableFlowing === null` is Node's initial no-consumer state. Calling
+      // resume() changes it to `true` and keeps the process alive, so restoration
+      // must pause both the initial and explicitly-paused states.
+      shouldPauseAfterRawMode = stdin.readableFlowing !== true;
       stdin.setRawMode(true);
       stdin.resume();
     },
@@ -31,6 +36,8 @@ export function createNodeHostTerminalAdapter(input: {
     },
     leaveRawMode(): void {
       if (stdin.isTTY && typeof stdin.setRawMode === "function") stdin.setRawMode(false);
+      if (shouldPauseAfterRawMode) stdin.pause();
+      shouldPauseAfterRawMode = false;
     },
   });
 }
