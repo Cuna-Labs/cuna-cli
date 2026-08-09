@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runacode.io/schemas/runa-cli-release-envelope-v1.json",
+  "title": "Runa CLI release envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "packageName",
+    "version",
+    "sourceCommit",
+    "repository",
+    "registry",
+    "tarball",
+    "sbom",
+    "supportPolicy",
+    "builder"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "packageName": {"const": "@runa_laboratories/cli"},
+    "version": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"},
+    "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "repository": {"const": "Runa-Laboratories/runa-cli"},
+    "registry": {"const": "https://registry.npmjs.org"},
+    "tarball": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "url", "sha256", "size"],
+      "properties": {
+        "file": {"type": "string", "pattern": "^[A-Za-z0-9._-]+\\.tgz$"},
+        "url": {"type": "string", "pattern": "^https://registry\\.npmjs\\.org/@runa_laboratories/cli/-/cli-[0-9A-Za-z.-]+\\.tgz$"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size": {"type": "integer", "minimum": 1}
+      }
+    },
+    "sbom": {"$ref": "#/$defs/digestFile"},
+    "supportPolicy": {"$ref": "#/$defs/digestFile"},
+    "builder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflow", "runId", "runAttempt"],
+      "properties": {
+        "workflow": {"const": ".github/workflows/ci.yml"},
+        "runId": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "runAttempt": {"type": "string", "pattern": "^[1-9][0-9]*$"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digestFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "sha256"],
+      "properties": {
+        "file": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

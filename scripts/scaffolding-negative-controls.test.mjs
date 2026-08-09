@@ -1,0 +1,95 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { promisify } from "node:util";
+import { sha256File, validateEnvelope } from "./lib/release-evidence.mjs";
+
+const execute = promisify(execFile);
+const repositoryRoot = path.resolve(new URL("..", import.meta.url).pathname.replace(/^\/(?:[A-Za-z]:)/, (value) => value.slice(1)));
+
+const valid = {
+  schemaVersion: 1,
+  packageName: "@runa_laboratories/cli",
+  version: "1.2.3-preview.1",
+  sourceCommit: "b".repeat(40),
+  repository: "Runa-Laboratories/runa-cli",
+  registry: "https://registry.npmjs.org",
+  tarball: {
+    file: "runa.tgz",
+    url: "https://registry.npmjs.org/@runa_laboratories/cli/-/cli-1.2.3-preview.1.tgz",
+    sha256: "a".repeat(64),
+    size: 1,
+  },
+  sbom: { file: "sbom.json", sha256: "b".repeat(64) },
+  supportPolicy: { file: "support.json", sha256: "c".repeat(64) },
+  builder: { workflow: ".github/workflows/ci.yml", runId: "123", runAttempt: "1" },
+};
+
+test("release envelope rejects a mutable source URL", () => {
+  const candidate = structuredClone(valid);
+  candidate.tarball.url = "https://github.com/Runa-Laboratories/runa-cli/archive/refs/heads/main.tar.gz";
+  assert.throws(() => validateEnvelope(candidate), /canonical exact-version npm URL/);
+});
+
+test("release envelope rejects an unknown field", () => {
+  const candidate = { ...structuredClone(valid), approved: true };
+  assert.throws(() => validateEnvelope(candidate), /keys differ/);
+});
+
+test("digest changes when projection bytes are substituted", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "runa-digest-test-"));
+  const file = path.join(root, "projection");
+  await writeFile(file, "approved");
+  const before = await sha256File(file);
+  await writeFile(file, "substituted");
+  const after = await sha256File(file);
+  assert.notEqual(before, after);
+});
+
+test("curl template verifies before installing and suppresses lifecycle scripts", async () => {
+  const template = await readFile(new URL("../packaging/templates/install.sh.template", import.meta.url), "utf8");
+  assert.ok(template.indexOf("sha256sum") < template.indexOf("npm install"));
+  assert.match(template, /--ignore-scripts/);
+  assert.doesNotMatch(template, /eval\s/);
+});
+
+test("all projections bind the envelope and reject later byte substitution", async () => {
+  const evidence = await mkdtemp(path.join(tmpdir(), "runa-projection-evidence-"));
+  const output = await mkdtemp(path.join(tmpdir(), "runa-projection-output-"));
+  await writeFile(path.join(evidence, "runa.tgz"), "candidate");
+  await writeFile(path.join(evidence, "sbom.json"), "{}");
+  await writeFile(path.join(evidence, "support.json"), "{}");
+  const envelope = structuredClone(valid);
+  envelope.tarball.sha256 = await sha256File(path.join(evidence, "runa.tgz"));
+  envelope.tarball.size = 9;
+  envelope.sbom.sha256 = await sha256File(path.join(evidence, "sbom.json"));
+  envelope.supportPolicy.sha256 = await sha256File(path.join(evidence, "support.json"));
+  await writeFile(path.join(evidence, "release-envelope.json"), `${JSON.stringify(envelope)}\n`);
+
+  await execute(process.execPath, [
+    "scripts/project-distributions.mjs",
+    "--root", repositoryRoot,
+    "--evidence", evidence,
+    "--output", output,
+  ], { cwd: repositoryRoot });
+  await execute(process.execPath, [
+    "scripts/verify-distribution-projections.mjs",
+    "--root", repositoryRoot,
+    "--evidence", evidence,
+    "--projections", output,
+  ], { cwd: repositoryRoot });
+
+  await chmod(path.join(output, "install.sh"), 0o644);
+  await writeFile(path.join(output, "install.sh"), "substituted\n");
+  await assert.rejects(
+    execute(process.execPath, [
+      "scripts/verify-distribution-projections.mjs",
+      "--root", repositoryRoot,
+      "--evidence", evidence,
+      "--projections", output,
+    ], { cwd: repositoryRoot }),
+  );
+});
