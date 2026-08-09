@@ -2,6 +2,8 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs, readJson, sha256File, validateEnvelope, verifyEnvelopeFiles } from "./lib/release-evidence.mjs";
+import { releaseInputIdentities } from "./lib/release-inputs.mjs";
+import { syntheticReleaseInputs } from "./lib/release-test-fixture.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -11,8 +13,10 @@ if (args.get("self-test") === "true") {
   await writeFile(path.join(root, "runa.tgz"), "candidate");
   await writeFile(path.join(root, "sbom.json"), "{}");
   await writeFile(path.join(root, "support.json"), "{}");
+  const releaseInputs = syntheticReleaseInputs({ version: "1.2.3-test.1", sourceCommit: "a".repeat(40) });
+  await writeFile(path.join(root, "release-inputs.json"), `${JSON.stringify(releaseInputs)}\n`);
   const envelope = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     packageName: "@runa_laboratories/cli",
     version: "1.2.3-test.1",
     sourceCommit: "a".repeat(40),
@@ -26,6 +30,14 @@ if (args.get("self-test") === "true") {
     },
     sbom: { file: "sbom.json", sha256: await sha256File(path.join(root, "sbom.json")) },
     supportPolicy: { file: "support.json", sha256: await sha256File(path.join(root, "support.json")) },
+    releaseInputs: { file: "release-inputs.json", sha256: await sha256File(path.join(root, "release-inputs.json")) },
+    identities: releaseInputIdentities(releaseInputs),
+    authority: {
+      phase: "CANDIDATE_BUILT",
+      releaseEligible: false,
+      approval: { state: "REQUIRED_NOT_PRESENT", environment: "npm", receiptSha256: null },
+      provenance: { state: "REQUIRED_NOT_PRESENT", workflow: ".github/workflows/ci.yml", receiptSha256: null },
+    },
     builder: { workflow: ".github/workflows/ci.yml", runId: "1", runAttempt: "1" },
   };
   await verifyEnvelopeFiles(envelope, root);

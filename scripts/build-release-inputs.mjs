@@ -17,4 +17,4 @@ invariant(typeof runner === "string", "--runner is required");
 const inputs = await buildReleaseInputs({ root, sourceCommit, npmVersion, runner });
 await mkdir(path.dirname(output), { recursive: true });
 await writeFile(output, `${JSON.stringify(inputs, null, 2)}\n`, { flag: "wx" });
-process.stdout.write(`${JSON.stringify({ status: "release-inputs-bound", sha256: inputs.payload.buildDigest })}\n`);
+process.stdout.write(`${JSON.stringify({ status: "release-inputs-bound", sha256: inputs.payload.sha256 })}\n`);

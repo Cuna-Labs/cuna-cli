@@ -49,7 +49,7 @@ function validateDigestEntries(entries, expectedFiles, label) {
   }
 }
 
-function aggregateDigest(entries) {
+export function aggregateDigest(entries) {
   const hash = createHash("sha256");
   for (const entry of entries) {
     hash.update(entry.file, "utf8");
@@ -85,7 +85,7 @@ export function validateReleaseInputs(inputs) {
     exactKeys(component, ["name", "version", "resolved", "integrity", "license", "bundled"], "dependency component");
     invariant(typeof component.name === "string" && component.name.length > 0, "Dependency name is missing");
     invariant(EXACT_VERSION.test(component.version), `Dependency version is invalid: ${component.name}`);
-    invariant(component.resolved === `${component.resolved}` && component.resolved.startsWith("https://registry.npmjs.org/"), `Dependency source is not canonical npm: ${component.name}`);
+    invariant(typeof component.resolved === "string" && component.resolved.startsWith("https://registry.npmjs.org/"), `Dependency source is not canonical npm: ${component.name}`);
     invariant(/^sha512-[A-Za-z0-9+/]+=*$/u.test(component.integrity), `Dependency integrity is invalid: ${component.name}`);
     invariant(typeof component.license === "string" && component.license.length > 0, `Dependency license is missing: ${component.name}`);
     invariant(component.bundled === true, `Runtime dependency is not bundled: ${component.name}`);
@@ -105,7 +105,6 @@ export function validateReleaseInputs(inputs) {
     ["buildRecipe", inputs.buildRecipe, "runa-cli-build-recipe-files-v1", BUILD_RECIPE_FILES],
   ]) {
     invariant(value.algorithm === algorithm, `${label} algorithm differs`);
-    invariant(value.algorithm === algorithm, `${label} algorithm differs`);
     validateDigestEntries(value.files, files, label);
     invariant(aggregateDigest(value.files) === value.aggregateSha256, `${label} aggregate digest mismatch`);
   }
@@ -118,6 +117,7 @@ export function validateReleaseInputs(inputs) {
   invariant(inputs.payload.schemaVersion === 1 && inputs.payload.algorithm === "runa-package-payload-v1", "Payload manifest identity is invalid");
   invariant(Number.isSafeInteger(inputs.payload.fileCount) && inputs.payload.fileCount > 0, "Payload file count is invalid");
   invariant(Array.isArray(inputs.payload.files) && inputs.payload.files.length === inputs.payload.fileCount, "Payload file set differs from fileCount");
+  invariant(JSON.stringify(inputs.payload.files.map((entry) => entry.file)) === JSON.stringify([...inputs.payload.files.map((entry) => entry.file)].sort()), "Payload files are not sorted");
   for (const entry of inputs.payload.files) {
     exactKeys(entry, ["file", "size", "sha256"], "payload file");
     invariant(typeof entry.file === "string" && entry.file.length > 0 && !path.isAbsolute(entry.file), "Payload file path is invalid");
@@ -213,6 +213,19 @@ export async function verifyReleaseInputsFile(file, expected) {
   invariant(inputs.sourceCommit === expected.sourceCommit, "Release-input source differs from envelope");
   invariant(inputs.payload.sha256 === expected.payloadBuildDigest, "Release-input payload differs from envelope");
   return inputs;
+}
+
+export function releaseInputIdentities(inputs) {
+  validateReleaseInputs(inputs);
+  return Object.freeze({
+    lockfileSha256: inputs.packageLock.sha256,
+    dependencyClosureSha256: inputs.dependencyClosure.aggregateSha256,
+    contractSha256: inputs.contractSet.aggregateSha256,
+    buildRecipeSha256: inputs.buildRecipe.aggregateSha256,
+    toolchainSha256: createHash("sha256").update(JSON.stringify(inputs.toolchain), "utf8").digest("hex"),
+    payloadSha256: inputs.payload.sha256,
+    payloadFileCount: inputs.payload.fileCount,
+  });
 }
 
 export const RELEASE_INPUT_CONTRACT_FILES = CONTRACT_FILES;

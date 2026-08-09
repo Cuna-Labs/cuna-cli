@@ -10,12 +10,14 @@ import {
   sha256File,
   validateEnvelope,
 } from "./lib/release-evidence.mjs";
+import { releaseInputIdentities, verifyReleaseInputsFile } from "./lib/release-inputs.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(args.get("root") ?? process.cwd());
 const tarballInput = path.resolve(root, args.get("tarball") ?? "");
 const sbomInput = path.resolve(root, args.get("sbom") ?? "");
 const supportInput = path.resolve(root, args.get("support-policy") ?? "packaging/support-policy.json");
+const releaseInputsInput = path.resolve(root, args.get("release-inputs") ?? "");
 const outputRoot = path.resolve(root, args.get("output") ?? "release-artifacts");
 const packageJson = await readJson(path.join(root, "package.json"));
 
@@ -29,12 +31,20 @@ await mkdir(outputRoot, { recursive: true });
 const tarballFile = path.basename(tarballInput);
 const sbomFile = "sbom.cdx.json";
 const supportFile = "support-policy.json";
+const releaseInputsFile = "release-inputs.json";
 await copyFile(tarballInput, path.join(outputRoot, tarballFile));
 await copyFile(sbomInput, path.join(outputRoot, sbomFile));
 await copyFile(supportInput, path.join(outputRoot, supportFile));
+await copyFile(releaseInputsInput, path.join(outputRoot, releaseInputsFile));
+const releaseInputs = await verifyReleaseInputsFile(path.join(outputRoot, releaseInputsFile), {
+  packageName: packageJson.name,
+  version: packageJson.version,
+  sourceCommit: args.get("source-commit"),
+  payloadBuildDigest: (await readJson(releaseInputsInput)).payload?.sha256,
+});
 
 const envelope = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   packageName: PACKAGE_NAME,
   version: packageJson.version,
   sourceCommit: args.get("source-commit"),
@@ -48,6 +58,14 @@ const envelope = {
   },
   sbom: { file: sbomFile, sha256: await sha256File(path.join(outputRoot, sbomFile)) },
   supportPolicy: { file: supportFile, sha256: await sha256File(path.join(outputRoot, supportFile)) },
+  releaseInputs: { file: releaseInputsFile, sha256: await sha256File(path.join(outputRoot, releaseInputsFile)) },
+  identities: releaseInputIdentities(releaseInputs),
+  authority: {
+    phase: "CANDIDATE_BUILT",
+    releaseEligible: false,
+    approval: { state: "REQUIRED_NOT_PRESENT", environment: "npm", receiptSha256: null },
+    provenance: { state: "REQUIRED_NOT_PRESENT", workflow: ".github/workflows/ci.yml", receiptSha256: null },
+  },
   builder: {
     workflow: ".github/workflows/ci.yml",
     runId: args.get("run-id"),

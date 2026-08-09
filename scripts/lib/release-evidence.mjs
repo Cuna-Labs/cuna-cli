@@ -58,10 +58,10 @@ function safeRelativeFile(value, label) {
 export function validateEnvelope(envelope) {
   exactKeys(
     envelope,
-    ["schemaVersion", "packageName", "version", "sourceCommit", "repository", "registry", "tarball", "sbom", "supportPolicy", "builder"],
+    ["schemaVersion", "packageName", "version", "sourceCommit", "repository", "registry", "tarball", "sbom", "supportPolicy", "releaseInputs", "identities", "authority", "builder"],
     "release envelope",
   );
-  invariant(envelope.schemaVersion === 1, "Unsupported release-envelope schema");
+  invariant(envelope.schemaVersion === 2, "Unsupported release-envelope schema");
   invariant(envelope.packageName === PACKAGE_NAME, "Unexpected package name");
   invariant(SEMVER.test(envelope.version), "Version must be exact SemVer without build metadata");
   invariant(COMMIT.test(envelope.sourceCommit), "sourceCommit must be a lowercase 40-character SHA");
@@ -75,11 +75,33 @@ export function validateEnvelope(envelope) {
   invariant(SHA256.test(envelope.tarball.sha256), "Tarball SHA-256 is invalid");
   invariant(Number.isSafeInteger(envelope.tarball.size) && envelope.tarball.size > 0, "Tarball size is invalid");
 
-  for (const [label, value] of [["sbom", envelope.sbom], ["supportPolicy", envelope.supportPolicy]]) {
+  for (const [label, value] of [["sbom", envelope.sbom], ["supportPolicy", envelope.supportPolicy], ["releaseInputs", envelope.releaseInputs]]) {
     exactKeys(value, ["file", "sha256"], label);
     safeRelativeFile(value.file, `${label}.file`);
     invariant(SHA256.test(value.sha256), `${label}.sha256 is invalid`);
   }
+
+  exactKeys(
+    envelope.identities,
+    ["lockfileSha256", "dependencyClosureSha256", "contractSha256", "buildRecipeSha256", "toolchainSha256", "payloadSha256", "payloadFileCount"],
+    "identities",
+  );
+  for (const field of ["lockfileSha256", "dependencyClosureSha256", "contractSha256", "buildRecipeSha256", "toolchainSha256", "payloadSha256"]) {
+    invariant(SHA256.test(envelope.identities[field]), `identities.${field} is invalid`);
+  }
+  invariant(Number.isSafeInteger(envelope.identities.payloadFileCount) && envelope.identities.payloadFileCount > 0, "identities.payloadFileCount is invalid");
+
+  exactKeys(envelope.authority, ["phase", "releaseEligible", "approval", "provenance"], "authority");
+  invariant(envelope.authority.phase === "CANDIDATE_BUILT", "Candidate authority phase is invalid");
+  invariant(envelope.authority.releaseEligible === false, "A candidate envelope may not claim release authority");
+  exactKeys(envelope.authority.approval, ["state", "environment", "receiptSha256"], "authority.approval");
+  invariant(envelope.authority.approval.state === "REQUIRED_NOT_PRESENT", "Candidate envelope contains fabricated approval state");
+  invariant(envelope.authority.approval.environment === "npm", "Candidate approval environment is invalid");
+  invariant(envelope.authority.approval.receiptSha256 === null, "Candidate envelope contains a fabricated approval receipt");
+  exactKeys(envelope.authority.provenance, ["state", "workflow", "receiptSha256"], "authority.provenance");
+  invariant(envelope.authority.provenance.state === "REQUIRED_NOT_PRESENT", "Candidate envelope contains fabricated provenance state");
+  invariant(envelope.authority.provenance.workflow === ".github/workflows/ci.yml", "Candidate provenance workflow is invalid");
+  invariant(envelope.authority.provenance.receiptSha256 === null, "Candidate envelope contains a fabricated provenance receipt");
 
   exactKeys(envelope.builder, ["workflow", "runId", "runAttempt"], "builder");
   invariant(envelope.builder.workflow === ".github/workflows/ci.yml", "Unexpected builder workflow");
@@ -92,7 +114,18 @@ export async function verifyEnvelopeFiles(envelope, root) {
   const tarball = path.resolve(root, envelope.tarball.file);
   const sbom = path.resolve(root, safeRelativeFile(envelope.sbom.file, "sbom.file"));
   const supportPolicy = path.resolve(root, safeRelativeFile(envelope.supportPolicy.file, "supportPolicy.file"));
+  const releaseInputs = path.resolve(root, safeRelativeFile(envelope.releaseInputs.file, "releaseInputs.file"));
   invariant((await sha256File(tarball)) === envelope.tarball.sha256, "Tarball digest mismatch");
   invariant((await sha256File(sbom)) === envelope.sbom.sha256, "SBOM digest mismatch");
   invariant((await sha256File(supportPolicy)) === envelope.supportPolicy.sha256, "Support-policy digest mismatch");
+  invariant((await sha256File(releaseInputs)) === envelope.releaseInputs.sha256, "Release-inputs digest mismatch");
+  const { releaseInputIdentities, verifyReleaseInputsFile } = await import("./release-inputs.mjs");
+  const inputs = await verifyReleaseInputsFile(releaseInputs, {
+    packageName: envelope.packageName,
+    version: envelope.version,
+    sourceCommit: envelope.sourceCommit,
+    payloadBuildDigest: envelope.identities.payloadSha256,
+  });
+  invariant(JSON.stringify(releaseInputIdentities(inputs)) === JSON.stringify(envelope.identities), "Release-input identities differ from envelope");
+  return inputs;
 }
