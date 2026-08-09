@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, open, readFile, rename } from "node:fs/promises";
+import { constants as fileConstants } from "node:fs";
+import { lstat, mkdir, open, rename } from "node:fs/promises";
 import path from "node:path";
 
 import type { FenceToken } from "./lease.js";
@@ -225,16 +226,18 @@ export class AtomicFileJournalStorage implements JournalStorage {
   }
 
   async load(): Promise<JournalDocument | undefined> {
+    let handle;
     try {
       await assertPrivateDirectory(path.dirname(this.#filePath));
-      const stat = await lstat(this.#filePath);
-      if (stat.isSymbolicLink() || !stat.isFile() || !isOwnerOnly(stat)) {
+      handle = await open(this.#filePath, fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW);
+      const stat = await handle.stat();
+      if (!stat.isFile() || !isOwnerOnly(stat)) {
         throw new JournalError("unsafe_path", "The journal path is not a regular file.");
       }
       if (stat.size > MAX_JOURNAL_FILE_BYTES) {
         throw new JournalError("journal_corrupt", "The journal file exceeds the recovery limit.");
       }
-      const bytes = await readFile(this.#filePath);
+      const bytes = await handle.readFile();
       const parsed: unknown = JSON.parse(bytes.toString("utf8"));
       validateDocument(parsed);
       return freezeDocument(parsed);
@@ -242,6 +245,8 @@ export class AtomicFileJournalStorage implements JournalStorage {
       if (isNodeError(error) && error.code === "ENOENT") return undefined;
       if (error instanceof JournalError) throw error;
       throw new JournalError("journal_corrupt", "The journal cannot be recovered safely.", { cause: error });
+    } finally {
+      await handle?.close();
     }
   }
 

@@ -1,4 +1,5 @@
-import { lstat, readFile, stat } from "node:fs/promises";
+import { constants as fileConstants } from "node:fs";
+import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 
@@ -76,31 +77,31 @@ async function readSafeConfig(
   path: string,
   maximumBytes: number,
 ): Promise<SafeFileSnapshot> {
-  let metadata;
+  let handle;
   try {
-    metadata = await lstat(path);
+    handle = await open(path, fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return Object.freeze({ exists: false });
     throw configFileError("unreadable", error);
   }
-  if (!metadata.isFile() || metadata.isSymbolicLink()) {
-    throw configFileError("unsafe_type");
-  }
-  if (metadata.size > maximumBytes) throw configFileError("oversized");
-  if (kind !== "windows") {
-    const current = await stat(path);
-    if (expectedUserId !== undefined && current.uid !== expectedUserId) {
-      throw configFileError("wrong_owner");
-    }
-    if ((current.mode & 0o022) !== 0) throw configFileError("unsafe_permissions");
-  }
   try {
-    const text = await readFile(path, { encoding: "utf8" });
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw configFileError("unsafe_type");
+    if (metadata.size > maximumBytes) throw configFileError("oversized");
+    if (kind !== "windows") {
+      if (expectedUserId !== undefined && metadata.uid !== expectedUserId) {
+        throw configFileError("wrong_owner");
+      }
+      if ((metadata.mode & 0o022) !== 0) throw configFileError("unsafe_permissions");
+    }
+    const text = await handle.readFile({ encoding: "utf8" });
     if (Buffer.byteLength(text, "utf8") > maximumBytes) throw configFileError("oversized");
     return Object.freeze({ exists: true, text });
   } catch (error) {
     if (error instanceof RunaError) throw error;
     throw configFileError("unreadable", error);
+  } finally {
+    await handle.close();
   }
 }
 
