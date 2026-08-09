@@ -112,8 +112,14 @@ export async function validateCycloneDxSbom(file, envelope) {
   invariant(Number.isSafeInteger(sbom.version) && sbom.version >= 1, "SBOM document version is invalid");
   const component = sbom.metadata?.component;
   invariant(component && typeof component === "object", "SBOM metadata.component is missing");
-  invariant(component.name === PACKAGE_NAME, "SBOM component name differs from the release package");
   invariant(component.version === envelope.version, "SBOM component version differs from the release candidate");
+  const scopedPurl = `pkg:npm/%40runa_laboratories/cli@${envelope.version}`;
+  const scopedBomRef = `${PACKAGE_NAME}@${envelope.version}`;
+  invariant(
+    component.name === PACKAGE_NAME
+      || (component.name === "runa-cli" && component.purl === scopedPurl && component["bom-ref"] === scopedBomRef),
+    "SBOM component identity differs from the release package",
+  );
   return sbom;
 }
 
