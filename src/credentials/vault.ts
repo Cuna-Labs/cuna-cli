@@ -63,6 +63,10 @@ export class CredentialVault {
     if (encoded === undefined) return undefined;
     try {
       const decoded = decodeEnvelope(encoded, bindingDigest(normalized));
+      if (decoded.header.expiresAt !== null && decoded.header.expiresAt <= this.#clock()) {
+        decoded.payload.fill(0);
+        return undefined;
+      }
       return {
         material: SecretMaterial.fromBytes(decoded.payload),
         revision: decoded.header.revision,
@@ -326,7 +330,7 @@ export class CredentialVault {
     return {
       backendId: this.#backend.backendId,
       backendStatus: "verified",
-      state: "present",
+      state: expiresAt !== undefined && expiresAt <= this.#clock() ? "expired" : "present",
       bindingDigest: bindingDigest(binding),
       revision,
       ...(expiresAt !== undefined && { expiresAt }),
