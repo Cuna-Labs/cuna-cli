@@ -21,6 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -83,7 +84,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p evidence
-          npm sbom --sbom-format cyclonedx > evidence/sbom.cdx.json
+          npm sbom --sbom-format cyclonedx --omit=dev > evidence/sbom.cdx.json
           node -e "const s=require('./evidence/sbom.cdx.json');if(s.bomFormat!=='CycloneDX')process.exit(1)"
       - name: Bind candidate identity
         run: >-
