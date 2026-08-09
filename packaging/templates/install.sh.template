@@ -35,7 +35,7 @@ else
 fi
 
 printf '%s\n' "Verifying ${PACKAGE}@${VERSION} before changing the global installation."
-npm install --global --ignore-scripts --prefix "$stage_prefix" "$tarball"
+npm install --global --ignore-scripts --offline --no-audit --no-fund --prefix "$stage_prefix" "$tarball"
 staged_runa="$stage_prefix/bin/runa"
 [ -x "$staged_runa" ] || die 'The staged runa executable is missing.'
 "$staged_runa" self-test --offline --json >/dev/null || die 'Staged installed-artifact self-test failed.'
@@ -50,7 +50,7 @@ $staged_identity
 EOF
 
 printf '%s\n' "Installing ${PACKAGE}@${VERSION} from verified npm bytes."
-npm install --global --ignore-scripts "$tarball"
+npm install --global --ignore-scripts --offline --no-audit --no-fund "$tarball"
 runa self-test --offline --json >/dev/null || die 'Installed-artifact self-test failed.'
 active_identity="$(runa version --json)"
 [ "$active_identity" = "$staged_identity" ] || die 'Active runtime identity differs from the verified staged identity.'

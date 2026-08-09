@@ -3,6 +3,7 @@ export {
   decideCapability,
   requireCapability,
   type AgentSessionCreateInput,
+  type PageOptions,
   type CapabilityDecision,
   type MachineCreateInput,
   type RunaApiClient,
@@ -14,8 +15,12 @@ export {
   decodeMachineItem,
   decodeMachinePage,
   type AgentKind,
+  type AgentAuthMode,
   type AgentSession,
+  type AgentSessionDesiredState,
   type AgentSessionPage,
+  type AgentSessionProcessState,
+  type AgentSessionRequestState,
   type Capability,
   type CapabilityAvailability,
   type CapabilityInteraction,
@@ -73,4 +78,41 @@ export {
   type TerminalWorkspaceState,
   type TruthState,
 } from "./runtime/contracts.js";
+export {
+  renderWorkbenchFrame,
+  WorkbenchRenderError,
+  type WorkbenchFrame,
+  type WorkbenchFrameInput,
+  type WorkbenchTab,
+} from "./terminal/workbench.js";
+export {
+  buildAppbarModel,
+  projectTruth,
+  type AppbarModel,
+  type ProjectionStatus,
+  type StatusEvidence,
+  type TruthProjection,
+} from "./terminal/appbar.js";
+export {
+  ViewportIsolationError,
+  ViewportRegistry,
+  type ViewportBinding,
+  type ViewportModes,
+  type ViewportSnapshot,
+} from "./terminal/viewport.js";
+export {
+  DEFAULT_XTERM_SCROLLBACK,
+  MAX_XTERM_ACTIVE_VIEWPORTS,
+  MAX_XTERM_BUFFER_CELLS,
+  MAX_XTERM_GLOBAL_BUFFER_CELLS,
+  MAX_XTERM_GLOBAL_PENDING_WRITE_BYTES,
+  MAX_XTERM_PENDING_WRITE_BYTES,
+  MAX_XTERM_RESPONSE_BYTES_PER_WRITE,
+  MAX_XTERM_RESPONSE_EVENTS_PER_WRITE,
+  MAX_XTERM_SCROLLBACK,
+  XtermResourceBudget,
+  XtermViewportAdapter,
+  type XtermTerminalResponse,
+  type XtermViewportOptions,
+} from "./terminal/xterm-vte.js";
 export { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "./version.js";

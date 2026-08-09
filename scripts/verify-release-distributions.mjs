@@ -57,6 +57,7 @@ invariant(bun === expectedBun, "Bun projection content differs from the determin
 for (const id of ["curl", "homebrew", "aur"]) {
   const relative = CHANNEL_DEFINITIONS[id].projectionFile;
   const content = await readFile(path.join(distributionsRoot, relative), "utf8");
+  invariant(!content.includes("\r"), `${id} projection is not canonical LF text`);
   invariant(!/@@[A-Z0-9_]+@@/.test(content), `Unresolved template marker in ${id}`);
   invariant(content.includes(envelope.version.replaceAll("-", id === "aur" ? "_" : "-")), `${id} omits the exact version`);
   invariant(content.includes(envelope.tarball.url), `${id} omits the canonical exact-version tarball URL`);
@@ -76,11 +77,13 @@ const brew = await readFile(path.join(distributionsRoot, CHANNEL_DEFINITIONS.hom
 invariant(brew.includes(`version "${envelope.version}"`), "Homebrew formula version is not exact");
 invariant(brew.includes(`sha256 "${envelope.tarball.sha256}"`), "Homebrew formula digest is not exact");
 invariant(brew.includes('"--ignore-scripts"'), "Homebrew formula permits npm lifecycle scripts");
+invariant(brew.includes('"--offline"') && brew.includes('"--no-audit"') && brew.includes('"--no-fund"'), "Homebrew formula may perform undeclared package-manager network calls");
 invariant(brew.includes('assert_equal "npm", identity.dig("data", "updateChannel")'), "Homebrew test omits canonical artifact-channel identity");
 
 const aur = await readFile(path.join(distributionsRoot, CHANNEL_DEFINITIONS.aur.projectionFile), "utf8");
 invariant(aur.includes("arch=('x86_64')"), "AUR projection claims an unverified architecture");
 invariant(aur.includes("--offline --ignore-scripts"), "AUR package phase is not offline and lifecycle-script-free");
+invariant(aur.includes("--no-audit --no-fund"), "AUR package phase may perform undeclared package-manager network calls");
 invariant(aur.includes("self-test --offline --json"), "AUR package does not run the network-free self-test");
 invariant(aur.includes(`\"version\":\"${envelope.version}\"`), "AUR package does not verify the exact installed version");
 
@@ -91,4 +94,3 @@ process.stdout.write(`${JSON.stringify({
   channels: manifest.channels.map((channel) => ({ id: channel.id, availability: channel.availability })),
   blockers: manifest.readiness.blockers,
 })}\n`);
-
