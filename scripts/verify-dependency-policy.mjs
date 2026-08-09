@@ -13,9 +13,29 @@ for (const [location, entry] of Object.entries(lock.packages)) {
   if (!location) continue;
   if (entry.link) findings.push(`${location}: linked dependency`);
   if (entry.hasInstallScript) findings.push(`${location}: install script`);
-  if (entry.resolved) {
-    if (!entry.resolved.startsWith("https://registry.npmjs.org/")) findings.push(`${location}: non-canonical source ${entry.resolved}`);
-    if (!entry.integrity) findings.push(`${location}: missing integrity`);
+  if (typeof entry.resolved !== "string" || entry.resolved.length === 0) {
+    findings.push(`${location}: missing canonical resolved source`);
+  } else {
+    try {
+      const resolved = new URL(entry.resolved);
+      if (
+        resolved.protocol !== "https:" ||
+        resolved.hostname !== "registry.npmjs.org" ||
+        resolved.port !== "" ||
+        resolved.username !== "" ||
+        resolved.password !== "" ||
+        resolved.search !== "" ||
+        resolved.hash !== "" ||
+        !resolved.pathname.startsWith("/")
+      ) {
+        findings.push(`${location}: non-canonical source ${entry.resolved}`);
+      }
+    } catch {
+      findings.push(`${location}: invalid resolved source ${entry.resolved}`);
+    }
+  }
+  if (typeof entry.integrity !== "string" || !/^sha512-[A-Za-z0-9+/]+={0,2}$/u.test(entry.integrity)) {
+    findings.push(`${location}: missing or non-SHA-512 integrity`);
   }
 }
 
