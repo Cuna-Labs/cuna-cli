@@ -1,0 +1,210 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  governance:
+    name: repository-governance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+      - run: node scripts/verify-repository-governance.mjs
+      - run: node --test scripts/scaffolding-negative-controls.test.mjs
+      - run: node scripts/verify-release-envelope.mjs --self-test true
+
+  source-gates:
+    name: source-quality-gates
+    needs: governance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+          cache: npm
+      - run: npm install --global npm@11.4.2
+      - run: node scripts/verify-ci-contract.mjs
+      - run: node governance/validate-prd-dag.mjs
+      - run: npm ci --ignore-scripts
+      - run: node scripts/verify-dependency-policy.mjs
+      - run: npm ls --all
+      - run: npm audit --audit-level=high
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+
+  candidate:
+    name: immutable-candidate
+    needs: source-gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+          cache: npm
+      - run: npm install --global npm@11.4.2
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Build one package tarball without lifecycle scripts
+        id: pack
+        shell: bash
+        run: |
+          npm pack --ignore-scripts --json > npm-pack.json
+          TARBALL="$(node -e "const p=require('./npm-pack.json');if(!Array.isArray(p)||p.length!==1||!p[0].filename)process.exit(1);process.stdout.write(p[0].filename)")"
+          echo "file=$TARBALL" >> "$GITHUB_OUTPUT"
+      - run: node scripts/verify-package-contents.mjs --tarball "${{ steps.pack.outputs.file }}"
+      - name: Generate CycloneDX SBOM from the exact lock and install tree
+        shell: bash
+        run: |
+          mkdir -p evidence
+          npm sbom --sbom-format cyclonedx > evidence/sbom.cdx.json
+          node -e "const s=require('./evidence/sbom.cdx.json');if(s.bomFormat!=='CycloneDX')process.exit(1)"
+      - name: Bind candidate identity
+        run: >-
+          node scripts/build-release-envelope.mjs
+          --tarball "${{ steps.pack.outputs.file }}"
+          --sbom evidence/sbom.cdx.json
+          --version "$(node -p "require('./package.json').version")"
+          --source-commit "${{ github.sha }}"
+          --run-id "${{ github.run_id }}"
+          --run-attempt "${{ github.run_attempt }}"
+      - run: node scripts/verify-release-envelope.mjs
+      - run: node scripts/project-distributions.mjs
+      - run: node scripts/verify-distribution-projections.mjs
+      - name: Export exact support matrix
+        id: matrix
+        shell: bash
+        run: echo "matrix=$(node -e "const p=require('./packaging/support-policy.json');process.stdout.write(JSON.stringify({include:p.ciMatrix}))")" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate
+          path: release-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  installed-artifact:
+    name: installed-${{ matrix.id }}
+    needs: candidate
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.candidate.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --global npm@11.4.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          path: release-artifacts
+      - run: node scripts/verify-release-envelope.mjs
+      - run: node scripts/verify-installed-candidate.mjs --receipt "evidence/platform-receipts/${{ matrix.id }}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: platform-${{ matrix.id }}
+          path: evidence/platform-receipts/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  admission:
+    name: release-admission
+    needs: [candidate, installed-artifact]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          path: release-artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: platform-*
+          path: evidence/platform-receipts
+          merge-multiple: true
+      - run: node scripts/verify-release-admission.mjs
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: admission-receipt
+          path: evidence/admission.json
+          if-no-files-found: error
+          retention-days: 14
+
+  handoff:
+    name: immutable-release-handoff
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          path: release-artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: admission-receipt
+          path: evidence
+      - run: node scripts/verify-release-envelope.mjs
+      - uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v3.2.0
+        with:
+          subject-path: release-artifacts/*.tgz
+      - uses: actions/attest-sbom@51e74621a501c89df81fc1391c5a8f4cfc9fab2f # v3
+        with:
+          subject-path: release-artifacts/*.tgz
+          sbom-path: release-artifacts/sbom.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: admitted-release-candidate
+          path: |
+            release-artifacts/
+            evidence/admission.json
+          if-no-files-found: error
+          retention-days: 14

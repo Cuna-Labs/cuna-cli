@@ -1,0 +1,60 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Candidate, release, and verification evidence
+release-artifacts/
+evidence/
+*.tgz
+npm-pack.json
+sbom.cdx.json
+
+# Runtime and diagnostic output
+*.log
+logs/
+*.pid
+*.pid.lock
+*.trace
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.runa/
+*.local.json
+*.local.yaml
+*.local.yml
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test and tool caches
+.cache/
+.nyc_output/
+.vitest/
+.turbo/
+.eslintcache
+
+# Local verification/install prefixes and runtime coordination state
+.tmp-*/
+tmp/
+*.sock
+*.pipe
+*.journal
+*.journal.lock
+*.lease
+
+# Private key material must never enter source control
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
