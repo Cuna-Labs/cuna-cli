@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   CREDENTIAL_BRANDS,
+  CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR,
   CREDENTIAL_FAMILY_INFIXES,
+  credentialFamilyValidator,
   decodeAuditRecords,
   isBrowserCallbackNonce,
 } from "../dist/index.js";
@@ -30,8 +32,9 @@ const REQUIRED_CREDENTIAL_FAMILY_INFIXES = [
   "ct", // browser sign-in continuation secret
   "tc", // one-use terminal connect token
   "se", // session credential
-  "sc", // session credential
+  "sc", // supervisor control bearer, live on the production edge today
   "cb", // browser callback nonce
+  "cr", // browser continuation resume handle, minted by the console
 ];
 
 const OPAQUE_SUFFIX = "A".repeat(43);
@@ -130,6 +133,49 @@ test("no credential brand or family can reach stdout through an audit record", (
         );
       }
     }
+  }
+});
+
+/**
+ * The infix list and the wire grammar are two halves of the authority, and they
+ * drifted: `cb` sat in the infix list with no grammar entry, so a call site that
+ * needed to validate a browser callback nonce had nothing to import and wrote
+ * its own regex. Every hand-rolled copy this repository grew started that way.
+ *
+ * A family must therefore be either validated here or explicitly recorded as
+ * unvalidated. Adding one and forgetting the grammar now fails; so does listing
+ * an exception that has since acquired a grammar.
+ */
+test("every minted family is either validated by the authority or recorded as unvalidated", () => {
+  const unvalidated = new Set(CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR);
+  for (const infix of new Set([...REQUIRED_CREDENTIAL_FAMILY_INFIXES, ...CREDENTIAL_FAMILY_INFIXES])) {
+    const validator = credentialFamilyValidator(infix);
+    assert.equal(
+      validator === undefined,
+      unvalidated.has(infix),
+      validator === undefined
+        ? `${infix} has no wire grammar and is not recorded in CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR`
+        : `${infix} has a wire grammar but is still recorded as unvalidated`,
+    );
+  }
+  for (const infix of unvalidated) {
+    assert.equal(CREDENTIAL_FAMILY_INFIXES.includes(infix), true, `${infix} is recorded as unvalidated but is not a minted family`);
+  }
+});
+
+test("every validated family accepts its own mint and nothing else", () => {
+  for (const infix of new Set([...REQUIRED_CREDENTIAL_FAMILY_INFIXES, ...CREDENTIAL_FAMILY_INFIXES])) {
+    const validator = credentialFamilyValidator(infix);
+    if (validator === undefined) continue;
+    for (const brand of REQUIRED_CREDENTIAL_BRANDS) {
+      assert.equal(validator(`${brand}_${infix}_${OPAQUE_SUFFIX}`), true, `${brand}_${infix}_ must authenticate`);
+    }
+    // A family must not accept another family's value, or a rename lands on one
+    // side and every value keeps authenticating under the wrong grammar.
+    const other = infix === "at" ? "rt" : "at";
+    assert.equal(validator(`cuna_${other}_${OPAQUE_SUFFIX}`), false, `${infix} must reject a ${other} value`);
+    assert.equal(validator(`nope_${infix}_${OPAQUE_SUFFIX}`), false, `${infix} must reject an unminted brand`);
+    assert.equal(validator(`cuna_${infix}_`), false, `${infix} must reject an empty suffix`);
   }
 });
 

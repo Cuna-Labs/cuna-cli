@@ -36,11 +36,18 @@ export type CredentialBrand = (typeof CREDENTIAL_BRANDS)[number];
 export const CREDENTIAL_FAMILY_INFIXES = Object.freeze([
   // sk secret key · at access token · rt refresh token · ct continuation
   // tc terminal connect · se/sc session credentials · cb browser callback nonce
+  // cr browser continuation resume handle
   //
   // `cb` was absent while the service minted `cuna_cb_…` for every human
   // sign-in, so the workspace secret detector uploaded it instead of blocking
   // it — exactly the failure this module's header warns about.
-  "sk", "at", "rt", "ct", "tc", "se", "sc", "cb",
+  //
+  // `cr` repeated that failure one family later, in a repository this module
+  // does not reach: the console mints `cuna_cr_…` from 32 random bytes as a
+  // continuation resume handle and puts it in localStorage, a BroadcastChannel
+  // name and a URL fragment. It is a bearer capability, so a resume link pasted
+  // into a synced workspace was uploaded rather than blocked.
+  "sk", "at", "rt", "ct", "tc", "se", "sc", "cb", "cr",
 ] as const);
 
 export type CredentialFamilyInfix = (typeof CREDENTIAL_FAMILY_INFIXES)[number];
@@ -77,9 +84,24 @@ const CREDENTIAL_GRAMMAR = Object.freeze({
   continuation: Object.freeze({ infix: "ct", suffix: OPAQUE_SECRET }),
   terminalConnect: Object.freeze({ infix: "tc", suffix: OPAQUE_SECRET }),
   browserCallbackNonce: Object.freeze({ infix: "cb", suffix: OPAQUE_SECRET }),
+  browserResumeHandle: Object.freeze({ infix: "cr", suffix: OPAQUE_SECRET }),
+  supervisorControl: Object.freeze({ infix: "sc", suffix: OPAQUE_SECRET }),
 }) satisfies Readonly<Record<string, { readonly infix: CredentialFamilyInfix; readonly suffix: string }>>;
 
 export type CredentialFamily = keyof typeof CREDENTIAL_GRAMMAR;
+
+/**
+ * Families that are minted but have no wire grammar here yet. This list is the
+ * reason the hand-rolled copies existed: `cb` was in the infix list with no
+ * grammar entry, so a call site that needed to validate a callback nonce had
+ * nothing to import and wrote its own regex. Every entry here is therefore a
+ * standing invitation to repeat that, and the accompanying test forces a family
+ * to be either validated or explicitly listed — never silently absent.
+ *
+ * `se` remains here because its minted suffix shape has not been observed. Do
+ * not guess one: a grammar narrower than the mint rejects live credentials.
+ */
+export const CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR = Object.freeze(["se"] as const);
 
 const BRAND_GROUP = `(?:${CREDENTIAL_BRANDS.join("|")})`;
 
@@ -153,6 +175,22 @@ export function isTerminalConnectToken(value: string): boolean {
 /** The nonce the browser carries back from a human sign-in handoff. */
 export function isBrowserCallbackNonce(value: string): boolean {
   return BROWSER_CALLBACK_NONCE.test(value);
+}
+
+const FAMILY_VALIDATORS: ReadonlyMap<string, RegExp> = new Map(
+  (Object.keys(CREDENTIAL_GRAMMAR) as readonly CredentialFamily[])
+    .map((family) => [CREDENTIAL_GRAMMAR[family].infix, credentialPattern(family)] as const),
+);
+
+/**
+ * The validator for one family infix, or `undefined` when that family has no
+ * wire grammar yet. Prefer the named predicates above at fixed call sites; this
+ * exists so a test can prove every minted family is either validated here or
+ * explicitly recorded as unvalidated.
+ */
+export function credentialFamilyValidator(infix: string): ((value: string) => boolean) | undefined {
+  const pattern = FAMILY_VALIDATORS.get(infix);
+  return pattern === undefined ? undefined : (value: string) => pattern.test(value);
 }
 
 /**
