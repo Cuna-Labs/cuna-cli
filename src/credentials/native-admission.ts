@@ -379,15 +379,19 @@ async function readBoundedRegularFile(
   maximumBytes: number,
   platform: SupportedPlatform,
 ): Promise<Buffer> {
-  const before = await lstat(file).catch(() => undefined);
-  if (before === undefined || !before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > maximumBytes) {
-    throw unverified();
-  }
-  await assertCanonicalPath(file, platform);
-  const handle = await open(file, "r");
-  const bytes = Buffer.alloc(before.size);
-  let offset = 0;
+  const handle = await open(file, "r").catch(() => { throw unverified(); });
+  let bytes: Buffer | undefined;
   try {
+    const before = await handle.stat();
+    const linked = await lstat(file).catch(() => undefined);
+    if (
+      !before.isFile() || before.nlink !== 1 || before.size > maximumBytes ||
+      linked === undefined || !linked.isFile() || linked.isSymbolicLink() ||
+      linked.dev !== before.dev || linked.ino !== before.ino
+    ) throw unverified();
+    await assertCanonicalPath(file, platform);
+    bytes = Buffer.alloc(before.size);
+    let offset = 0;
     while (offset < bytes.byteLength) {
       const { bytesRead } = await handle.read(bytes, offset, bytes.byteLength - offset, offset);
       if (bytesRead === 0) break;
@@ -403,7 +407,7 @@ async function readBoundedRegularFile(
     }
     return bytes;
   } catch (error) {
-    bytes.fill(0);
+    bytes?.fill(0);
     throw error;
   } finally {
     await handle.close();
@@ -415,16 +419,19 @@ async function sha256RegularFile(
   maximumBytes: number,
   platform: SupportedPlatform,
 ): Promise<string> {
-  const before = await lstat(file).catch(() => undefined);
-  if (before === undefined || !before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > maximumBytes) {
-    throw unverified();
-  }
-  await assertCanonicalPath(file, platform);
-  const handle = await open(file, "r");
+  const handle = await open(file, "r").catch(() => { throw unverified(); });
   const buffer = Buffer.allocUnsafe(64 * 1024);
   const digest = createHash("sha256");
   let offset = 0;
   try {
+    const before = await handle.stat();
+    const linked = await lstat(file).catch(() => undefined);
+    if (
+      !before.isFile() || before.nlink !== 1 || before.size > maximumBytes ||
+      linked === undefined || !linked.isFile() || linked.isSymbolicLink() ||
+      linked.dev !== before.dev || linked.ino !== before.ino
+    ) throw unverified();
+    await assertCanonicalPath(file, platform);
     for (;;) {
       const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, offset);
       if (bytesRead === 0) break;

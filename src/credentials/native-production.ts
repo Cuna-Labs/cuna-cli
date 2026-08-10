@@ -233,16 +233,23 @@ function platformPackageFiles(platform: "win32" | "darwin"): readonly string[] {
 }
 
 async function readBoundedCanonicalRegularFile(file: string, maximumBytes: number): Promise<Buffer> {
-  const before = await lstat(file).catch(() => undefined);
-  if (before === undefined || !before.isFile() || before.isSymbolicLink() || before.nlink !== 1 ||
-      before.size > maximumBytes) throw unavailable("A native package file is not a bounded regular file.");
-  if (normalize(await realpath(file)) !== normalize(file)) {
-    throw unavailable("A native package file does not have a canonical path.");
-  }
-  const handle = await open(file, "r");
-  const bytes = Buffer.alloc(before.size);
-  let offset = 0;
+  const handle = await open(file, "r").catch(() => {
+    throw unavailable("A native package file is not a bounded regular file.");
+  });
+  let bytes: Buffer | undefined;
   try {
+    const before = await handle.stat();
+    const linked = await lstat(file).catch(() => undefined);
+    if (!before.isFile() || before.nlink !== 1 || before.size > maximumBytes ||
+        linked === undefined || !linked.isFile() || linked.isSymbolicLink() ||
+        linked.dev !== before.dev || linked.ino !== before.ino) {
+      throw unavailable("A native package file is not a bounded regular file.");
+    }
+    if (normalize(await realpath(file)) !== normalize(file)) {
+      throw unavailable("A native package file does not have a canonical path.");
+    }
+    bytes = Buffer.alloc(before.size);
+    let offset = 0;
     while (offset < bytes.byteLength) {
       const { bytesRead } = await handle.read(bytes, offset, bytes.byteLength - offset, offset);
       if (bytesRead === 0) break;
@@ -256,7 +263,7 @@ async function readBoundedCanonicalRegularFile(file: string, maximumBytes: numbe
     }
     return bytes;
   } catch (error) {
-    bytes.fill(0);
+    bytes?.fill(0);
     throw error;
   } finally {
     await handle.close();
