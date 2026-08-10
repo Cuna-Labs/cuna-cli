@@ -58,7 +58,7 @@ test("--no-sync without a committed local binding performs no producer mutation"
   const client = { async createWorkspaceBinding() { creates += 1; throw new Error("unexpected"); } };
   await assert.rejects(
     effects(client, state).synchronizeWorkspace({ machineId: MACHINE, localPath: project, syncMode: "disabled", signal: new AbortController().signal }),
-    (error) => error.code === "runa.journey.workspace_binding_required",
+    (error) => error.code === "cuna.journey.workspace_binding_required",
   );
   assert.equal(creates, 0);
 });

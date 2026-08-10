@@ -218,7 +218,7 @@ function networkFailure() {
 
 function conflict(reason) {
   const error = new Error(reason);
-  error.code = "runa.remote.conflict";
+  error.code = "cuna.remote.conflict";
   error.exitCode = 6;
   return error;
 }
@@ -378,7 +378,7 @@ test("queue overflow, disk exhaustion, watcher overflow, and a second writer rem
 
   await assert.rejects(
     ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness(), { maximumPendingOperations: 1 })),
-    (error) => error.code === "runa.workspace.workspace_busy",
+    (error) => error.code === "cuna.workspace.workspace_busy",
   );
 
   const disk = await fixture(t);

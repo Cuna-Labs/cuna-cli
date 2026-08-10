@@ -82,7 +82,7 @@ test("ambiguous machine authority performs no mutation", async () => {
   });
   await assert.rejects(
     orchestrateAgentJourney({ intent: intent(), effects: fx }),
-    (error) => error.code === "runa.journey.ambiguous" && error.details.candidates.length === 2,
+    (error) => error.code === "cuna.journey.ambiguous" && error.details.candidates.length === 2,
   );
   assert.deepEqual(fx.calls, ["inspect-workspace", "observe-machines"]);
 });
@@ -114,7 +114,7 @@ test("unreconcilable create outcome fails closed without duplicate creation", as
   });
   await assert.rejects(
     orchestrateAgentJourney({ intent: intent(), effects: fx }),
-    (error) => error.code === "runa.journey.machine_create_outcome_unreconcilable" && error.retryable === false,
+    (error) => error.code === "cuna.journey.machine_create_outcome_unreconcilable" && error.retryable === false,
   );
   assert.equal(creates, 1);
 });
@@ -128,7 +128,7 @@ test("exhausted AgentSession create recovery fails closed before attach", async 
   });
   await assert.rejects(
     orchestrateAgentJourney({ intent: intent(), effects: fx }),
-    (error) => error.code === "runa.journey.agent_session_create_outcome_unreconcilable" &&
+    (error) => error.code === "cuna.journey.agent_session_create_outcome_unreconcilable" &&
       error.details.recovery === "exhausted",
   );
   assert.equal(creates, 1);
@@ -156,7 +156,7 @@ test("cancellation at every effect boundary stops downstream work and reconciles
     });
     await assert.rejects(
       orchestrateAgentJourney({ intent: intent(), effects: fx, signal: controller.signal }),
-      (error) => error.code === "runa.journey.cancelled",
+      (error) => error.code === "cuna.journey.cancelled",
     );
     assert.equal(reconciliations, 1, phase);
     assert.equal(reached.at(-1), phase);

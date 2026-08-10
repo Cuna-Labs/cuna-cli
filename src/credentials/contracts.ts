@@ -1,6 +1,6 @@
 import type { SecretMaterial } from "./secret-material.js";
 
-export const CREDENTIAL_BACKEND_PROTOCOL = "runa.secure-vault.v1" as const;
+export const CREDENTIAL_BACKEND_PROTOCOL = "cuna.secure-vault.v1" as const;
 
 export interface CredentialBinding {
   readonly profileId: string;

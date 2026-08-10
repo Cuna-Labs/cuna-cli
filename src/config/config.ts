@@ -1,6 +1,6 @@
 import { posix, win32 } from "node:path";
 
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { isSecretApiKey } from "../core/namespace.js";
 import { isObject } from "../core/validation.js";
 import type { PlatformAdapter } from "../platform/adapter.js";
@@ -38,9 +38,9 @@ interface UserConfig {
   readonly profiles: Readonly<Record<string, ProfileRecord>>;
 }
 
-function configError(reason: string, source?: ConfigSource): RunaError {
-  return new RunaError({
-    code: "runa.config.invalid",
+function configError(reason: string, source?: ConfigSource): CunaError {
+  return new CunaError({
+    code: "cuna.config.invalid",
     message: "Cuna configuration is invalid.",
     exitCode: EXIT_CODES.usage,
     hint: "Run `cuna config get --json` after correcting the selected user profile.",

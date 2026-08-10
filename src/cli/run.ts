@@ -9,7 +9,7 @@ import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } f
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import { resolveConfig, type EffectiveConfig } from "../config/config.js";
 import { executeCommand, preflightInvocation } from "../commands/commands.js";
-import { EXIT_CODES, normalizeError, RunaError, usageError, type ExitCode } from "../core/errors.js";
+import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { createPlatformCredentialBackend } from "../credentials/platform.js";
 import { CredentialVault } from "../credentials/vault.js";
@@ -149,7 +149,7 @@ function nodePlatform(kind: PlatformAdapter["kind"]): NodeJS.Platform {
   return kind === "windows" ? "win32" : kind === "macos" ? "darwin" : "linux";
 }
 
-function runtimeError(error: RuntimeBoundaryError): RunaError {
+function runtimeError(error: RuntimeBoundaryError): CunaError {
   const exitCode = error.code === "session_conflict"
     ? EXIT_CODES.conflict
     : error.code === "capability_unsupported" || error.code === "control_plane_unavailable" || error.code === "pty_unavailable"
@@ -159,8 +159,8 @@ function runtimeError(error: RuntimeBoundaryError): RunaError {
         : error.code.startsWith("capability_") || error.code.startsWith("grant_") || error.code === "remote_state_unproven"
           ? EXIT_CODES.policy
           : EXIT_CODES.remote;
-  return new RunaError({
-    code: `runa.runtime.${error.code}`,
+  return new CunaError({
+    code: `cuna.runtime.${error.code}`,
     message: error.message,
     exitCode,
     retryable: error.retryable,
@@ -314,8 +314,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         throw usageError(`${parsed.command} accepts no operands.`);
       }
       if (config.apiKey !== undefined) {
-        throw new RunaError({
-          code: "runa.auth.mode_conflict",
+        throw new CunaError({
+          code: "cuna.auth.mode_conflict",
           message: "Interactive authentication is disabled while CUNA_API_KEY selects automation mode.",
           exitCode: EXIT_CODES.auth,
           hint: "Unset CUNA_API_KEY before managing the interactive session.",
@@ -370,8 +370,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     const client = dependencies.clientFactory?.(config, timeoutMs) ?? createRunaApiClient(httpTransport!);
     if (journeyIntent?.target === "reconcile") {
       if (credentialMode === undefined) {
-        throw new RunaError({
-          code: "runa.auth.required",
+        throw new CunaError({
+          code: "cuna.auth.required",
           message: "The automatic Cuna journey requires authenticated account authority.",
           exitCode: EXIT_CODES.auth,
         });
@@ -389,8 +389,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         });
       } else {
         if (httpTransport === undefined) {
-          throw new RunaError({
-            code: "runa.journey.workspace_transport_unavailable",
+          throw new CunaError({
+            code: "cuna.journey.workspace_transport_unavailable",
             message: "The injected API client did not provide authenticated workspace-sync transport authority.",
             exitCode: EXIT_CODES.unsupported,
           });
@@ -398,8 +398,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const identity = await client.getIdentity(dependencies.signal);
         const workspaceId = identity.workspaceId;
         if (workspaceId === undefined) {
-          throw new RunaError({
-            code: "runa.journey.workspace_identity_unavailable",
+          throw new CunaError({
+            code: "cuna.journey.workspace_identity_unavailable",
             message: "The signed-in account has no assigned workspace authority.",
             exitCode: EXIT_CODES.auth,
           });
@@ -499,8 +499,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     return EXIT_CODES.success;
   } catch (unknownError) {
     const error = unknownError instanceof CredentialBoundaryError
-      ? new RunaError({
-          code: `runa.auth.${unknownError.code}`,
+      ? new CunaError({
+          code: `cuna.auth.${unknownError.code}`,
           message: unknownError.message,
           exitCode: EXIT_CODES.auth,
           retryable: unknownError.retryable,

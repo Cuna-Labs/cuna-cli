@@ -39,7 +39,7 @@ function capabilitySnapshot(agentSessionId, overrides = {}) {
 
 function observation(agentSessionId, processEpoch = `epoch-${agentSessionId}`) {
   return {
-    authority: "runa_agent_session_supervisor",
+    authority: "cuna_agent_session_supervisor",
     userId: "user-1",
     machineId: "machine-1",
     agentSessionId,
@@ -611,7 +611,7 @@ test("TC-055-15 exit revokes later output decoded from the same transport messag
   system.connections[0].incoming.push(batch);
   await waitUntil(() => runtime.listTerminals().length === 0, "exit should release the closed tab");
   assert.equal(outputs.length, 0);
-  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_remote_process_exit");
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "cuna_remote_process_exit");
   await runtime.shutdown();
 });
 
@@ -630,7 +630,7 @@ test("a stalled terminal output consumer fails only its tab within a bounded dea
   }));
   await waitUntil(() => states.some((state) => state.tabId === "tab-a" && state.state === "failed"), "stalled output should quarantine the tab");
   assert.equal(runtime.listTerminals()[0].state, "failed");
-  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_terminal_protocol_failure");
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "cuna_terminal_protocol_failure");
   await runtime.shutdown();
 });
 
@@ -645,7 +645,7 @@ test("illegal post-attach protocol frames fail the tab instead of entering recon
     payload: Uint8Array.of(1),
   }));
   await waitUntil(() => runtime.listTerminals()[0]?.state === "failed", "illegal server input should fail the tab");
-  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_terminal_protocol_failure");
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "cuna_terminal_protocol_failure");
   await runtime.shutdown();
 });
 
@@ -674,7 +674,7 @@ test("heartbeat expiry fences input while a fresh heartbeat extends the attachme
   assert.equal(system.connections[0].sent.length, sendsBeforeExpiry, "stale input must not reach the wire");
   assert.equal(runtime.listTerminals()[0].reason, "heartbeat_expired");
   assert.ok(states.some((state) => state.state === "interrupted" && state.reason === "heartbeat_expired"));
-  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_heartbeat_expired");
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "cuna_heartbeat_expired");
   await runtime.shutdown();
 });
 
@@ -692,7 +692,7 @@ test("heartbeat watchdog interrupts an idle dead terminal without waiting for us
   assert.equal(runtime.listTerminals()[0].state, "interrupted");
   assert.equal(runtime.listTerminals()[0].reason, "heartbeat_expired");
   assert.ok(states.some((state) => state.state === "interrupted" && state.reason === "heartbeat_expired"));
-  assert.equal(system.connections[0].closeCalls.at(-1).reason, "runa_heartbeat_expired");
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "cuna_heartbeat_expired");
   await runtime.shutdown();
 });
 
@@ -719,7 +719,7 @@ test("late or replayed heartbeat frames cannot renew attachment authority", asyn
   await waitUntil(() => replayRuntime.listTerminals()[0].heartbeatObservedAt === replayNow, "fresh heartbeat should be accepted");
   replaySystem.connections[0].incoming.push(encodeTerminalControl("heartbeat", 2n, {}));
   await waitUntil(() => replayRuntime.listTerminals()[0].state === "failed", "replayed heartbeat should fail the tab");
-  assert.equal(replaySystem.connections[0].closeCalls.at(-1).reason, "runa_terminal_protocol_failure");
+  assert.equal(replaySystem.connections[0].closeCalls.at(-1).reason, "cuna_terminal_protocol_failure");
   await replayRuntime.shutdown();
 });
 
@@ -1085,7 +1085,7 @@ test("detach during reconnect permanently wins over a late ready frame", async (
     (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected",
   );
   assert.equal(runtime.listTerminals().length, 0);
-  assert.equal(system.connections[1].closeCalls.at(-1).reason, "runa_resume_rejected");
+  assert.equal(system.connections[1].closeCalls.at(-1).reason, "cuna_resume_rejected");
   await runtime.shutdown();
 });
 
@@ -1268,7 +1268,7 @@ test("PTY adapter is usable only with current platform-bound live evidence", asy
     probe: async () => ({
       status: "verified",
       adapterId: "test-pty",
-      protocol: "runa.local-pty.v1",
+      protocol: "cuna.local-pty.v1",
       platform: process.platform,
       observedAt: NOW - 100,
       expiresAt: NOW + 10_000,

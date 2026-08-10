@@ -14,7 +14,7 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import type { ExclusionPolicy } from "../workspace/exclusion.js";
 import { createWorkspaceManifest, type ManifestEntry, type WorkspaceManifest } from "../workspace/manifest.js";
 import {
@@ -1181,12 +1181,12 @@ async function transitionIfPossible(journal: DurableSyncJournal | undefined, ope
 }
 
 function classifyFailure(error: unknown): { readonly status: "paused" | "reconciling" | "conflicted" | "recovery_required"; readonly reason: string } {
-  if (error instanceof RunaError) {
+  if (error instanceof CunaError) {
     const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
     if (
-      error.code === "runa.workspace_sync.contract_mismatch" ||
-      error.code === "runa.workspace.path_invalid" ||
-      error.code === "runa.workspace.path_escape"
+      error.code === "cuna.workspace_sync.contract_mismatch" ||
+      error.code === "cuna.workspace.path_invalid" ||
+      error.code === "cuna.workspace.path_escape"
     ) return { status: "recovery_required", reason };
     if (error.exitCode === EXIT_CODES.conflict) return { status: "conflicted", reason };
     if (error.exitCode === EXIT_CODES.policy || error.exitCode === EXIT_CODES.usage || error.exitCode === EXIT_CODES.unsupported) {
@@ -1200,7 +1200,7 @@ function classifyFailure(error: unknown): { readonly status: "paused" | "reconci
 }
 
 function isAbort(error: unknown): boolean {
-  return error instanceof RunaError && error.details?.reason === "cancelled";
+  return error instanceof CunaError && error.details?.reason === "cancelled";
 }
 
 function isSameOrInside(root: string, candidate: string): boolean {
@@ -1231,9 +1231,9 @@ function sha256(value: Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function syncFailure(reason: string, exitCode: number, cause?: unknown): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.continuous_failed",
+function syncFailure(reason: string, exitCode: number, cause?: unknown): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.continuous_failed",
     message: "Continuous workspace synchronization could not preserve its safety contract.",
     exitCode: exitCode as typeof EXIT_CODES[keyof typeof EXIT_CODES],
     details: { reason },

@@ -413,7 +413,7 @@ export class RunaRuntimeBoundary {
         this.#terminals.delete(input.tabId);
       }
       if (connection !== undefined) {
-        try { await connection.close({ code: 1008, reason: "runa_attach_rejected" }); } catch (cleanupError) {
+        try { await connection.close({ code: 1008, reason: "cuna_attach_rejected" }); } catch (cleanupError) {
           completionFailure = cleanupError;
           reportedError = new AggregateError([error, cleanupError], "Terminal attachment failed and its transport cleanup was incomplete.");
         }
@@ -485,7 +485,7 @@ export class RunaRuntimeBoundary {
         entry.outputContinuity = "unknown";
         entry.reason = "input_ack_window_exhausted";
         this.#publish(entry);
-        void authority.connection.close({ code: 1001, reason: "runa_input_ack_window_exhausted" }).catch(() => undefined);
+        void authority.connection.close({ code: 1001, reason: "cuna_input_ack_window_exhausted" }).catch(() => undefined);
         throw runtimeFailure("terminal_disconnected", "Terminal input acknowledgements exceeded the bounded uncertainty window.");
       }
       this.#views.routeInput(authority.viewId, authority.fencingGeneration);
@@ -612,7 +612,7 @@ export class RunaRuntimeBoundary {
         this.#publish(entry);
         throw runtimeFailure("session_discontinuous", "The remote AgentSession authority changed; this terminal cannot be resumed.");
       }
-      await entry.connection.close({ code: 1001, reason: "runa_reconnect" });
+      await entry.connection.close({ code: 1001, reason: "cuna_reconnect" });
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
       const grant = await this.#createGrant(
         admitted.observation,
@@ -718,7 +718,7 @@ export class RunaRuntimeBoundary {
     } catch (error) {
       let reportedError: unknown = error;
       if (connection !== undefined) {
-        try { await connection.close({ code: 1008, reason: "runa_resume_rejected" }); } catch (cleanupError) {
+        try { await connection.close({ code: 1008, reason: "cuna_resume_rejected" }); } catch (cleanupError) {
           completionFailure = cleanupError;
           reportedError = new AggregateError([error, cleanupError], "Terminal reconnection failed and its replacement transport cleanup was incomplete.");
         }
@@ -759,7 +759,7 @@ export class RunaRuntimeBoundary {
     this.#publish(entry);
     const sendDrain = entry.sendTail;
     const pumpDrain = entry.pump;
-    await entry.connection.close({ code: 1000, reason: "runa_detach" });
+    await entry.connection.close({ code: 1000, reason: "cuna_detach" });
     await sendDrain;
     if (pumpDrain !== undefined) await withOutputDeadline(pumpDrain, this.#options.outputDeliveryTimeoutMs ?? 5_000);
     if (pendingReconnect !== undefined) {
@@ -889,7 +889,7 @@ export class RunaRuntimeBoundary {
       const sendDrain = entry.sendTail;
       const pumpDrain = entry.pump;
       try {
-        await entry.connection.close({ code: 1000, reason: "runa_shutdown" });
+        await entry.connection.close({ code: 1000, reason: "cuna_shutdown" });
         await sendDrain;
         if (pumpDrain !== undefined) await withOutputDeadline(pumpDrain, this.#options.outputDeliveryTimeoutMs ?? 5_000);
       } catch (error) {
@@ -1137,7 +1137,7 @@ export class RunaRuntimeBoundary {
       entry.outputContinuity = "unknown";
       entry.reason = safeReason(error);
       this.#publish(entry);
-      await connection.close({ code: 1002, reason: "runa_terminal_protocol_failure" }).catch(() => undefined);
+      await connection.close({ code: 1002, reason: "cuna_terminal_protocol_failure" }).catch(() => undefined);
     }
   }
 
@@ -1208,7 +1208,7 @@ export class RunaRuntimeBoundary {
       entry.reason = "remote_process_exit";
       try { this.#views.detach(entry.viewId); } catch { /* the view may already be detached */ }
       this.#publish(entry);
-      await entry.connection.close({ code: 1000, reason: "runa_remote_process_exit" });
+      await entry.connection.close({ code: 1000, reason: "cuna_remote_process_exit" });
       if (this.#activeTabId === entry.tabId) this.#activeTabId = this.#nextActiveTab(entry.tabId);
       this.#terminals.delete(entry.tabId);
       return;
@@ -1312,7 +1312,7 @@ export class RunaRuntimeBoundary {
     entry.outputContinuity = "unknown";
     entry.reason = "heartbeat_expired";
     this.#publish(entry);
-    void connection.close({ code: 1001, reason: "runa_heartbeat_expired" }).catch(() => undefined);
+    void connection.close({ code: 1001, reason: "cuna_heartbeat_expired" }).catch(() => undefined);
   }
 
   #nextActiveTab(excluding: string): string | undefined {

@@ -15,7 +15,22 @@ export type ExitCode = (typeof EXIT_CODES)[keyof typeof EXIT_CODES];
 export type SafeErrorScalar = string | number | boolean | null;
 export type SafeErrorDetails = Readonly<Record<string, SafeErrorScalar | readonly SafeErrorScalar[]>>;
 
-export class RunaError extends Error {
+/**
+ * The single namespace every error code this CLI emits is minted under.
+ *
+ * Codes reach the user twice — as `error.code` in `--json` records and as
+ * `Error [code]:` on a terminal — so the namespace is product surface, not an
+ * internal tag. It lives here as one constant so a rename is one edit rather
+ * than the ninety-one scattered literals it used to be.
+ *
+ * This is NOT the wire namespace. Protocol identifiers the service mints and
+ * compares by exact equality (`runa.terminal.v1`, `runa.agent-auth.v1`, the
+ * `runa.auth.<token>` WebSocket subprotocol) are not error codes and are not
+ * derived from this constant.
+ */
+export const ERROR_NAMESPACE = "cuna" as const;
+
+export class CunaError extends Error {
   readonly code: string;
   readonly exitCode: ExitCode;
   readonly hint: string | undefined;
@@ -32,7 +47,7 @@ export class RunaError extends Error {
     readonly cause?: unknown;
   }) {
     super(input.message, { cause: input.cause });
-    this.name = "RunaError";
+    this.name = "CunaError";
     this.code = input.code;
     this.exitCode = input.exitCode;
     this.hint = input.hint;
@@ -41,18 +56,27 @@ export class RunaError extends Error {
   }
 }
 
-export function usageError(message: string, hint?: string): RunaError {
-  return new RunaError({
-    code: "runa.usage.invalid",
+/**
+ * @deprecated Renamed to `CunaError`. Retained for one release so an internal
+ * import that was missed fails loudly at review time rather than silently at
+ * runtime; remove after the first published release.
+ */
+export const RunaError = CunaError;
+/** @deprecated Renamed to `CunaError`. */
+export type RunaError = CunaError;
+
+export function usageError(message: string, hint?: string): CunaError {
+  return new CunaError({
+    code: "cuna.usage.invalid",
     message,
     exitCode: EXIT_CODES.usage,
     ...(hint === undefined ? {} : { hint }),
   });
 }
 
-export function unsupportedError(feature: string, reason = "not_implemented"): RunaError {
-  return new RunaError({
-    code: "runa.capability.unsupported",
+export function unsupportedError(feature: string, reason = "not_implemented"): CunaError {
+  return new CunaError({
+    code: "cuna.capability.unsupported",
     message: `The ${feature} capability is not available in this CLI build or server contract.`,
     exitCode: EXIT_CODES.unsupported,
     hint: "Run `cuna capabilities` to inspect current server support.",
@@ -60,10 +84,10 @@ export function unsupportedError(feature: string, reason = "not_implemented"): R
   });
 }
 
-export function normalizeError(error: unknown): RunaError {
-  if (error instanceof RunaError) return error;
-  return new RunaError({
-    code: "runa.internal.unexpected",
+export function normalizeError(error: unknown): CunaError {
+  if (error instanceof CunaError) return error;
+  return new CunaError({
+    code: "cuna.internal.unexpected",
     message: "Cuna could not complete the command because of an internal failure.",
     exitCode: EXIT_CODES.internal,
     hint: "Retry once. If the problem persists, run `cuna doctor --json` and contact Cuna support.",

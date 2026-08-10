@@ -99,7 +99,15 @@ export {
   type ConfigSource,
   type EffectiveConfig,
 } from "./config/config.js";
-export { EXIT_CODES, RunaError, type ExitCode, type SafeErrorDetails } from "./core/errors.js";
+export {
+  ERROR_NAMESPACE,
+  EXIT_CODES,
+  CunaError,
+  /** @deprecated Renamed to `CunaError`; removed after the first published release. */
+  RunaError,
+  type ExitCode,
+  type SafeErrorDetails,
+} from "./core/errors.js";
 export {
   API_ORIGINS,
   API_WEBSOCKET_ORIGINS,

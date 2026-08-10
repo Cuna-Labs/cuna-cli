@@ -1,4 +1,4 @@
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { isAccessToken, isContinuationSecret, isRefreshToken } from "../core/namespace.js";
 import { isObject } from "../core/validation.js";
 
@@ -73,8 +73,8 @@ export interface CliTokenSet {
 }
 
 function malformed(reason: string): never {
-  throw new RunaError({
-    code: "runa.remote.malformed_response",
+  throw new CunaError({
+    code: "cuna.remote.malformed_response",
     message: "Cuna returned a response that does not match the CLI authentication contract.",
     exitCode: EXIT_CODES.remote,
     details: { reason },

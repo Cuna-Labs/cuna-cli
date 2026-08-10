@@ -1,6 +1,6 @@
 import type { AgentSession, Machine } from "../api/contracts.js";
 import { decideCapability, requireCapability, type RunaApiClient } from "../api/client.js";
-import { EXIT_CODES, RunaError, type ExitCode } from "../core/errors.js";
+import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import type { MachineSelectionState } from "./selection.js";
 import type {
   AgentJourneyEffects,
@@ -28,8 +28,8 @@ export interface ApiAgentJourneyEffectsInput {
   readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 }
 
-function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.remote, details?: Record<string, string>): RunaError {
-  return new RunaError({ code, message, exitCode, ...(details === undefined ? {} : { details }) });
+function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.remote, details?: Record<string, string>): CunaError {
+  return new CunaError({ code, message, exitCode, ...(details === undefined ? {} : { details }) });
 }
 
 function recency(machine: Machine, now: number): "recent" | "not_recent" | "unknown" {
@@ -84,7 +84,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
     async observeMachines({ signal }) {
       const page = await input.client.listMachines(signal);
       if (page.nextCursor !== undefined) {
-        throw fail("runa.journey.machine_page_incomplete", "Machine selection requires a complete bounded collection.", EXIT_CODES.policy);
+        throw fail("cuna.journey.machine_page_incomplete", "Machine selection requires a complete bounded collection.", EXIT_CODES.policy);
       }
       return Promise.all(page.items.map(async (machine) => {
         let support: "supported" | "unsupported" | "unknown" = "unknown";
@@ -136,7 +136,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create", now: now(), signal });
       if (!await input.authorizeMachineCreate({ requestedAgent, signal })) {
         throw fail(
-          "runa.journey.machine_create_not_authorized",
+          "cuna.journey.machine_create_not_authorized",
           "Machine creation was not authorized.",
           EXIT_CODES.policy,
         );
@@ -159,7 +159,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           return Object.freeze({ id: machine.id, state: machineState(machine.state) });
         }
         if (request.state === "terminal_failed" || request.action === "none") {
-          throw fail("runa.journey.machine_create_failed", "Machine creation reached an authoritative failure.");
+          throw fail("cuna.journey.machine_create_failed", "Machine creation reached an authoritative failure.");
         }
         await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
       }
@@ -172,24 +172,24 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       } else if (state === "stopped") {
         state = machineState((await input.client.transitionMachine(machineId, "start", signal)).state);
       } else if (state === "deleted" || state === "error" || state === "unknown") {
-        throw fail("runa.journey.machine_not_reusable", "The selected machine is not safely reusable.", EXIT_CODES.policy);
+        throw fail("cuna.journey.machine_not_reusable", "The selected machine is not safely reusable.", EXIT_CODES.policy);
       }
       for (let attempt = 0; attempt < MACHINE_POLL_LIMIT; attempt += 1) {
         if (state === "running") return Object.freeze({ id: machineId, state });
         const observed = await input.client.getMachine(machineId, signal);
         state = machineState(observed.state);
         if (state === "deleted" || state === "error" || state === "unknown") {
-          throw fail("runa.journey.machine_not_ready", "The machine did not reach running state.");
+          throw fail("cuna.journey.machine_not_ready", "The machine did not reach running state.");
         }
         await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
       }
-      throw fail("runa.journey.machine_ready_timeout", "Machine readiness remained unproven.", EXIT_CODES.network);
+      throw fail("cuna.journey.machine_ready_timeout", "Machine readiness remained unproven.", EXIT_CODES.network);
     },
     synchronizeWorkspace: input.synchronizeWorkspace,
     async observeAgentSessions({ machineId, signal }) {
       const page = await input.client.listAgentSessions(machineId, { limit: 100 }, signal);
       if (page.nextCursor !== undefined) {
-        throw fail("runa.journey.agent_session_page_incomplete", "AgentSession selection requires a complete bounded collection.", EXIT_CODES.policy);
+        throw fail("cuna.journey.agent_session_page_incomplete", "AgentSession selection requires a complete bounded collection.", EXIT_CODES.policy);
       }
       return Object.freeze(page.items.map(sessionObservation));
     },
@@ -220,14 +220,14 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         );
       } catch (error) {
         const uncertain =
-          error instanceof RunaError &&
-          (error.code === "runa.network.timeout" || error.code === "runa.network.failed");
+          error instanceof CunaError &&
+          (error.code === "cuna.network.timeout" || error.code === "cuna.network.failed");
         if (!uncertain || signal.aborted) throw error;
         try {
           session = await input.client.inspectAgentSessionCreate(idempotencyKey, signal);
         } catch (inspectionError) {
           if (
-            !(inspectionError instanceof RunaError) ||
+            !(inspectionError instanceof CunaError) ||
             inspectionError.code !== "agent_session_not_found" ||
             signal.aborted
           ) {
@@ -253,7 +253,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         session.authMode !== authMode
       ) {
         throw fail(
-          "runa.journey.agent_session_create_authority_mismatch",
+          "cuna.journey.agent_session_create_authority_mismatch",
           "Recovered AgentSession authority does not match the requested canonical intent.",
           EXIT_CODES.conflict,
         );
@@ -267,11 +267,11 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           return Object.freeze({ id: session.id, machineId: session.machineId });
         }
         if (["exited", "failed", "terminated"].includes(session.processState)) {
-          throw fail("runa.journey.agent_session_failed", "The AgentSession reached a terminal state before attach.");
+          throw fail("cuna.journey.agent_session_failed", "The AgentSession reached a terminal state before attach.");
         }
         await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
       }
-      throw fail("runa.journey.agent_session_ready_timeout", "AgentSession readiness remained unproven.", EXIT_CODES.network);
+      throw fail("cuna.journey.agent_session_ready_timeout", "AgentSession readiness remained unproven.", EXIT_CODES.network);
     },
     attach: input.attach,
     async reconcileCancellation({ ledger, signal }) {

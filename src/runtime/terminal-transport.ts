@@ -14,7 +14,7 @@ const MAX_REMOTE_EVIDENCE_TTL_MS = 60_000;
 const MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS = 5_000;
 
 export interface RemoteAgentSessionEvidence {
-  readonly authority: "runa_agent_session_supervisor";
+  readonly authority: "cuna_agent_session_supervisor";
   readonly userId: string;
   readonly machineId: string;
   readonly agentSessionId: string;
@@ -94,7 +94,7 @@ export function assertRemoteAgentSessionEvidence(input: {
   const observedAt = Date.parse(evidence.observedAt);
   const expiresAt = Date.parse(evidence.expiresAt);
   if (
-    evidence.authority !== "runa_agent_session_supervisor" ||
+    evidence.authority !== "cuna_agent_session_supervisor" ||
     evidence.agentSessionId !== input.expectedAgentSessionId ||
     evidence.userId.length === 0 ||
     evidence.machineId.length === 0 ||

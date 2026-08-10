@@ -62,7 +62,7 @@ test("self-test fails closed without the explicit offline mode", async () => {
   assert.notEqual(exitCode, 0);
   const record = parseSingleRecord(capture.stderr());
   assert.equal(record.type, "error");
-  assert.equal(record.error.code, "runa.usage.invalid");
+  assert.equal(record.error.code, "cuna.usage.invalid");
 });
 
 test("runtime support admits the architecture-neutral x64 and arm64 package", () => {

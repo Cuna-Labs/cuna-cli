@@ -62,7 +62,7 @@ function capability(id, availability = "supported") {
 
 function observation(id, overrides = {}) {
   return {
-    authority: "runa_agent_session_supervisor",
+    authority: "cuna_agent_session_supervisor",
     userId: "user-1",
     machineId: "33333333-3333-4333-8333-333333333333",
     agentSessionId: id,

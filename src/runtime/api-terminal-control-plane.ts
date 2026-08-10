@@ -52,7 +52,7 @@ export function createApiTerminalControlPlane(input: {
         );
       }
       return Object.freeze({
-        authority: "runa_agent_session_supervisor",
+        authority: "cuna_agent_session_supervisor",
         userId: identity.id,
         machineId: session.machineId,
         agentSessionId: session.id,

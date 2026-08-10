@@ -3,7 +3,7 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 
 export type PlatformKind = "windows" | "macos" | "linux";
 
@@ -37,8 +37,8 @@ export function resolvePlatformKind(platform: NodeJS.Platform): PlatformKind {
   if (platform === "win32") return "windows";
   if (platform === "darwin") return "macos";
   if (platform === "linux") return "linux";
-  throw new RunaError({
-    code: "runa.platform.unsupported",
+  throw new CunaError({
+    code: "cuna.platform.unsupported",
     message: `The ${platform} operating system is not supported.`,
     exitCode: EXIT_CODES.unsupported,
     details: { platform },
@@ -103,16 +103,16 @@ async function readSafeConfig(
     if (Buffer.byteLength(text, "utf8") > maximumBytes) throw configFileError("oversized");
     return Object.freeze({ exists: true, text });
   } catch (error) {
-    if (error instanceof RunaError) throw error;
+    if (error instanceof CunaError) throw error;
     throw configFileError("unreadable", error);
   } finally {
     await handle.close();
   }
 }
 
-function configFileError(reason: string, cause?: unknown): RunaError {
-  return new RunaError({
-    code: "runa.config.unsafe_file",
+function configFileError(reason: string, cause?: unknown): CunaError {
+  return new CunaError({
+    code: "cuna.config.unsafe_file",
     message: "The Cuna configuration file is unavailable or unsafe.",
     exitCode: EXIT_CODES.policy,
     hint: "Fix the user-owned configuration file permissions or select a safe file explicitly.",

@@ -193,6 +193,31 @@ test("product service applies project exclusions and returns only committed rece
   assert.equal(JSON.parse(checkpoint).phase, "committed");
 });
 
+test("project exclusions are honoured under both the .cunaignore and .runaignore names", async (t) => {
+  const excludedSecret = "DO_NOT_TRANSMIT_THIS_SECRET_92834";
+  const digests = [];
+  for (const exclusionFile of [".cunaignore", ".runaignore"]) {
+    const root = await temporaryDirectory(t, "cuna-exclusion-root-");
+    const checkpointRoot = await temporaryDirectory(t, "cuna-exclusion-state-");
+    await mkdir(join(root, "private"));
+    await writeFile(join(root, exclusionFile), "private/**\n");
+    await writeFile(join(root, "keep.txt"), "hello from cuna\n");
+    await writeFile(join(root, "private", "secret.txt"), excludedSecret);
+    const authority = new RecordingAuthority();
+
+    const receipt = await synchronizeLocalWorkspace(productInput(root, checkpointRoot, authority));
+
+    assert.equal(receipt.phase, "committed");
+    assert.equal(receipt.files, 2);
+    assert.equal(receipt.bytes, Buffer.byteLength("private/**\nhello from cuna\n"));
+    const serializedRequests = JSON.stringify(authority.requests);
+    assert.equal(serializedRequests.includes(excludedSecret), false);
+    assert.equal(serializedRequests.includes("private/secret.txt"), false);
+    digests.push(receipt.exclusion_policy_digest);
+  }
+  assert.equal(digests[0], digests[1]);
+});
+
 test("continuous product lifecycle starts only from the durable initial commit and uploads a later local edit", async (t) => {
   const root = await temporaryDirectory(t, "cuna-continuous-root-");
   const checkpointRoot = await temporaryDirectory(t, "cuna-continuous-state-");
@@ -222,7 +247,7 @@ test("continuous product lifecycle starts only from the durable initial commit a
   const restartedReceipt = await synchronizeLocalWorkspace(restartedInput);
   await assert.rejects(
     startContinuousWorkspaceSync({ ...restartedInput, initialReceipt: restartedReceipt }),
-    (error) => error.code === "runa.workspace.workspace_busy" && error.details.reason === "active_writer",
+    (error) => error.code === "cuna.workspace.workspace_busy" && error.details.reason === "active_writer",
   );
   await supervisor.stop();
   const restarted = await startContinuousWorkspaceSync({ ...restartedInput, initialReceipt: restartedReceipt });
@@ -237,23 +262,23 @@ test("identity, generation, and authenticated authority fail before local filesy
   const noCalls = { authentication: "authenticated", credentialAuthority: "api_key", async request() { throw new Error("network must not run"); } };
   await assert.rejects(
     synchronizeLocalWorkspace(productInput(nonexistentRoot, nonexistentRoot, noCalls, { workspaceId: "NOT-A-UUID" })),
-    (error) => error.code === "runa.usage.invalid",
+    (error) => error.code === "cuna.usage.invalid",
   );
   await assert.rejects(
     synchronizeLocalWorkspace(productInput(nonexistentRoot, nonexistentRoot, noCalls, { workspaceBindingId: "NOT-A-UUID" })),
-    (error) => error.code === "runa.usage.invalid",
+    (error) => error.code === "cuna.usage.invalid",
   );
   await assert.rejects(
     synchronizeLocalWorkspace(productInput(nonexistentRoot, nonexistentRoot, noCalls, { workspaceBindingId: workspaceId })),
-    (error) => error.code === "runa.workspace_sync.invalid" && error.details.reason === "workspace_binding_id_domain",
+    (error) => error.code === "cuna.workspace_sync.invalid" && error.details.reason === "workspace_binding_id_domain",
   );
   await assert.rejects(
     synchronizeLocalWorkspace(productInput(nonexistentRoot, nonexistentRoot, noCalls, { baseGeneration: undefined })),
-    (error) => error.code === "runa.workspace_sync.invalid" && error.details.reason === "base_generation",
+    (error) => error.code === "cuna.workspace_sync.invalid" && error.details.reason === "base_generation",
   );
   await assert.rejects(
     synchronizeLocalWorkspace(productInput(nonexistentRoot, nonexistentRoot, { async request() { throw new Error("network must not run"); } })),
-    (error) => error.code === "runa.auth.required",
+    (error) => error.code === "cuna.auth.required",
   );
 });
 
@@ -263,13 +288,13 @@ test("unsafe storage boundaries are rejected before exclusion parsing or network
   const authority = new RecordingAuthority();
   await assert.rejects(
     synchronizeLocalWorkspace(productInput(root, root, authority)),
-    (error) => error.code === "runa.workspace_sync.unsafe_root" && error.details.reason === "checkpoint_inside_workspace",
+    (error) => error.code === "cuna.workspace_sync.unsafe_root" && error.details.reason === "checkpoint_inside_workspace",
   );
   assert.equal(authority.requests.length, 0);
 
   await assert.rejects(
     synchronizeLocalWorkspace(productInput(parse(root).root, root, authority)),
-    (error) => error.code === "runa.workspace_sync.unsafe_root" && error.details.reason === "filesystem_root",
+    (error) => error.code === "cuna.workspace_sync.unsafe_root" && error.details.reason === "filesystem_root",
   );
   assert.equal(authority.requests.length, 0);
 });
@@ -289,7 +314,7 @@ test("unexpected lower-level failures cannot disclose local paths or secret valu
   await assert.rejects(
     synchronizeLocalWorkspace(productInput(root, checkpointRoot, authority)),
     (error) =>
-      error.code === "runa.workspace_sync.failed" &&
+      error.code === "cuna.workspace_sync.failed" &&
       !error.message.includes(root) &&
       !error.message.includes(secret) &&
       error.cause === undefined,
@@ -315,7 +340,7 @@ test("unsafe policy input is not followed or decoded and cannot leak external co
   const authority = new RecordingAuthority();
   await assert.rejects(
     synchronizeLocalWorkspace(productInput(root, checkpointRoot, authority)),
-    (error) => error.code === "runa.workspace_sync.policy_unavailable",
+    (error) => error.code === "cuna.workspace_sync.policy_unavailable",
   );
   assert.equal(authority.requests.length, 0);
 });

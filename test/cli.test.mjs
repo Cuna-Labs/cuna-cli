@@ -91,7 +91,7 @@ test("missing automation auth fails before a remote call and emits no prompt", a
   });
   assert.equal(exit, EXIT_CODES.auth);
   assert.equal(calls, 0);
-  assert.equal(JSON.parse(streams.stderr()).error.code, "runa.auth.required");
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.auth.required");
 });
 
 test("TC-037-03/07 records and authorizations remain capability-gated read-only parity operations", async () => {
@@ -417,7 +417,7 @@ test("CUNA_API_KEY automation mode never falls back to or mutates interactive au
     humanAuth,
   });
   assert.equal(exit, EXIT_CODES.auth);
-  assert.equal(JSON.parse(streams.stderr()).error.code, "runa.auth.mode_conflict");
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.auth.mode_conflict");
   assert.equal(calls, 0);
 });
 
@@ -518,7 +518,7 @@ test("absent capability is a negative control: no machine mutation occurs", asyn
   });
   assert.equal(exit, EXIT_CODES.unsupported);
   assert.equal(creates, 0);
-  assert.equal(JSON.parse(streams.stderr()).error.code, "runa.capability.unknown");
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.capability.unknown");
 });
 
 test("malformed remote commands fail before vault, client, or configuration effects", async () => {
@@ -544,7 +544,7 @@ test("malformed remote commands fail before vault, client, or configuration effe
   assert.equal(authCalls, 0);
   assert.equal(clientCalls, 0);
   assert.equal(configReads, 0);
-  assert.equal(JSON.parse(streams.stderr()).error.code, "runa.usage.invalid");
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.usage.invalid");
 });
 
 test("root options cannot bypass validation by falling through to help", async () => {
@@ -552,7 +552,7 @@ test("root options cannot bypass validation by falling through to help", async (
   const exit = await runCli(["--timeout-ms", "not-a-number", "--json"], { streams: streams.streams });
   assert.equal(exit, EXIT_CODES.usage);
   assert.equal(streams.stdout(), "");
-  assert.equal(JSON.parse(streams.stderr()).error.code, "runa.usage.invalid");
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.usage.invalid");
 });
 
 test("advertised native capability admits exactly one documented mutation", async () => {
@@ -984,7 +984,7 @@ test("TC-055-11 non-TTY and JSON foreground requests fail before auth, configura
     });
     assert.equal(exit, EXIT_CODES.usage);
     assert.equal(effects, 0);
-    assert.equal(JSON.parse(input.streams.stderr()).error.code, "runa.usage.invalid");
+    assert.equal(JSON.parse(input.streams.stderr()).error.code, "cuna.usage.invalid");
   }
 });
 

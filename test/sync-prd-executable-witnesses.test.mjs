@@ -87,7 +87,7 @@ test("TC-039-01 same-base AgentSessions have private upper layers and cannot obs
   assert.equal(changedSecond.changes["only-a.txt"], undefined);
   assert.throws(
     () => apply(store, { ...changedFirst, agentSessionId: "session-b" }, "intrusion.txt", version(digestC, "b")),
-    (error) => error.code === "runa.workspace.overlay_unavailable",
+    (error) => error.code === "cuna.workspace.overlay_unavailable",
   );
   assert.equal(store.head.revisionId, initial.revisionId, "unmerged upper-layer writes must not reach canonical head");
 });
@@ -113,7 +113,7 @@ test("TC-039-03 concurrent same-intent merge retries create exactly one canonica
   const fenced = outcomes.filter((outcome) => outcome.status === "rejected");
   assert.equal(committed.length, 1);
   assert.equal(fenced.length, 1);
-  assert.equal(fenced[0].reason.code, "runa.workspace.overlay_stale");
+  assert.equal(fenced[0].reason.code, "cuna.workspace.overlay_stale");
   assert.equal(store.head.revisionId, committed[0].value.revision.revisionId);
   assert.deepEqual(store.head.parentIds, [initial.revisionId]);
 });
@@ -191,7 +191,7 @@ test("TC-039-10 missing confinement or atomic rename rejects strong mode before 
   ]) {
     assert.throws(
       () => store.allocateOverlay(overlayInput(initial, "session", "overlay", unavailable)),
-      (error) => error.code === "runa.workspace.overlay_unsupported",
+      (error) => error.code === "cuna.workspace.overlay_unsupported",
     );
   }
   const admitted = store.allocateOverlay(overlayInput(initial, "session", "overlay"));
@@ -213,7 +213,7 @@ test("TC-040-02 compatible clients share one supervisor and incompatible root or
   ]) {
     assert.throws(
       () => registry.connect(incompatible),
-      (error) => error.code === "runa.workspace.supervisor_conflict",
+      (error) => error.code === "cuna.workspace.supervisor_conflict",
     );
   }
   assert.equal(registry.connect(configuration).supervisor, first.supervisor);
@@ -280,7 +280,7 @@ test("TC-040-07 progress uses measured milestones and cannot claim readiness wit
       totalBytes: 100,
       observedAt: "2026-08-09T00:00:00.000Z",
     }),
-    (error) => error.code === "runa.workspace.progress_unproven",
+    (error) => error.code === "cuna.workspace.progress_unproven",
   );
   const admitted = progressFromReceipt({
     authority: "runa_workspace_service",
@@ -308,7 +308,7 @@ test("TC-040-12 manifest omission is explained only by explicit exclusion policy
   const reads = [];
   const manifest = await createWorkspaceManifest({
     root,
-    policy: compileExclusionPolicy([{ source: "runaignore", text: "cache/**\n" }], capabilities),
+    policy: compileExclusionPolicy([{ source: "cunaignore", text: "cache/**\n" }], capabilities),
     capabilities,
     beforeContentRead: (path) => reads.push(path),
   });

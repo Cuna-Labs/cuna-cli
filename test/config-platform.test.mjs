@@ -6,7 +6,7 @@ import {
   DEFAULT_BASE_URL,
   resolveConfig,
   resolvePlatformPaths,
-  RunaError,
+  CunaError,
 } from "../dist/index.js";
 
 function fakePlatform(text) {
@@ -61,11 +61,11 @@ test("CUNA_API_KEY admits every credential brand the service has issued", async 
   }
   await assert.rejects(
     resolveConfig({ platform: fakePlatform(), env: { CUNA_API_KEY: `evil_sk_${"a".repeat(43)}` } }),
-    (error) => error instanceof RunaError && error.details?.reason === "invalid_api_key",
+    (error) => error instanceof CunaError && error.details?.reason === "invalid_api_key",
   );
   await assert.rejects(
     resolveConfig({ platform: fakePlatform(), env: { CUNA_API_KEY: "cuna_sk_short" } }),
-    (error) => error instanceof RunaError && error.details?.reason === "invalid_api_key",
+    (error) => error instanceof CunaError && error.details?.reason === "invalid_api_key",
   );
 });
 
@@ -126,14 +126,14 @@ test("an invalid higher-precedence origin fails instead of falling through", asy
   });
   await assert.rejects(
     resolveConfig({ platform: fakePlatform(text), env: { CUNA_PROFILE: "dev", CUNA_BASE_URL: "file:///etc/passwd" } }),
-    (error) => error instanceof RunaError && error.code === "runa.config.invalid",
+    (error) => error instanceof CunaError && error.code === "cuna.config.invalid",
   );
 });
 
 test("custom origins require an explicit development profile", async () => {
   await assert.rejects(
     resolveConfig({ platform: fakePlatform(), env: { CUNA_BASE_URL: "https://staging.example" } }),
-    (error) => error instanceof RunaError && error.details.reason === "custom_origin_requires_development_profile",
+    (error) => error instanceof CunaError && error.details.reason === "custom_origin_requires_development_profile",
   );
   const text = JSON.stringify({
     schema_version: 1,
@@ -147,6 +147,6 @@ test("secret-shaped fields in the user configuration are rejected", async () => 
   const text = JSON.stringify({ schema_version: 1, profiles: { default: { api_key: "cuna_sk_should_never_load" } } });
   await assert.rejects(
     resolveConfig({ platform: fakePlatform(text), env: {} }),
-    (error) => error instanceof RunaError && error.details.reason === "unsafe_profile_field",
+    (error) => error instanceof CunaError && error.details.reason === "unsafe_profile_field",
   );
 });

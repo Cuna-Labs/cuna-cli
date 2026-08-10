@@ -166,7 +166,7 @@ export function createNodeWebSocketConnector(input: {
         } catch (error) {
           discardPendingConversions = true;
           queue.fail(error);
-          closeSocket(1003, "runa_binary_required");
+          closeSocket(1003, "cuna_binary_required");
           return;
         }
         try {
@@ -182,7 +182,7 @@ export function createNodeWebSocketConnector(input: {
         } catch (error) {
           discardPendingConversions = true;
           queue.fail(error);
-          closeSocket(1009, "runa_frame_queue_limit");
+          closeSocket(1009, "cuna_frame_queue_limit");
           return;
         }
         pendingConversionBytes += expectedBytes;
@@ -198,7 +198,7 @@ export function createNodeWebSocketConnector(input: {
           } catch (error) {
             discardPendingConversions = true;
             queue.fail(error);
-            closeSocket(1003, "runa_binary_required");
+            closeSocket(1003, "cuna_binary_required");
           } finally {
             pendingConversionBytes -= expectedBytes;
             pendingConversionMessages -= 1;
@@ -222,12 +222,12 @@ export function createNodeWebSocketConnector(input: {
       const onTransportError = (): void => {
         discardPendingConversions = true;
         queue.fail(runtimeFailure("terminal_disconnected", "The terminal WebSocket transport failed.", { retryable: true }));
-        closeSocket(1011, "runa_transport_failure");
+        closeSocket(1011, "cuna_transport_failure");
       };
       const onActiveAbort = (): void => {
         discardPendingConversions = true;
         queue.fail(runtimeFailure("terminal_disconnected", "Terminal attachment was cancelled."));
-        closeSocket(1000, "runa_cancelled");
+        closeSocket(1000, "cuna_cancelled");
       };
       socket.addEventListener("message", onMessage);
       socket.addEventListener("close", onClose);
@@ -243,7 +243,7 @@ export function createNodeWebSocketConnector(input: {
         const onOpen = (): void => {
           cleanup();
           if (socket.protocol !== request.protocol) {
-            closeSocket(1002, "runa_protocol_mismatch");
+            closeSocket(1002, "cuna_protocol_mismatch");
             reject(runtimeFailure("terminal_protocol_error", "The terminal WebSocket negotiated an unexpected protocol."));
             return;
           }
@@ -262,7 +262,7 @@ export function createNodeWebSocketConnector(input: {
         };
         const onAbort = (): void => {
           cleanup();
-          closeSocket(1000, "runa_cancelled");
+          closeSocket(1000, "cuna_cancelled");
           reject(runtimeFailure("terminal_disconnected", "Terminal attachment was cancelled."));
         };
         socket.addEventListener("open", onOpen);
@@ -284,7 +284,7 @@ export function createNodeWebSocketConnector(input: {
             throw runtimeFailure("terminal_disconnected", "The terminal WebSocket is not open.");
           }
           if (socket.bufferedAmount + bytes.byteLength > MAX_BUFFERED_SEND_BYTES) {
-            closeSocket(1011, "runa_backpressure_limit");
+            closeSocket(1011, "cuna_backpressure_limit");
             throw runtimeFailure("terminal_disconnected", "The terminal send queue exceeded its bounded memory budget.", { retryable: true });
           }
           socket.send(bytes.slice());
@@ -292,7 +292,7 @@ export function createNodeWebSocketConnector(input: {
         async close(closeInput: { readonly code?: number; readonly reason?: string } = {}): Promise<void> {
           cleanupActive();
           queue.close();
-          closeSocket(closeInput.code ?? 1000, closeInput.reason ?? "runa_closed");
+          closeSocket(closeInput.code ?? 1000, closeInput.reason ?? "cuna_closed");
         },
       });
     },

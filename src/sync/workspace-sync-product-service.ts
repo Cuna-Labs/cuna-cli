@@ -4,7 +4,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 import type { HttpTransport } from "../api/http.js";
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { assertCanonicalUuid } from "../core/validation.js";
 import { compileExclusionPolicy, type ExclusionRuleSource } from "../workspace/exclusion.js";
 import { createWorkspaceManifest, type ManifestLimits } from "../workspace/manifest.js";
@@ -155,7 +155,7 @@ export async function synchronizeLocalWorkspace(
       selected_protocol: receipt.selected_protocol,
     });
   } catch (error) {
-    if (error instanceof RunaError) throw error;
+    if (error instanceof CunaError) throw error;
     throw unexpectedFailure();
   }
 }
@@ -196,8 +196,8 @@ export async function startContinuousWorkspaceSync(
     initialManifest.policyDigest !== input.initialReceipt.exclusion_policy_digest ||
     input.initialReceipt.generation < 1
   ) {
-    throw new RunaError({
-      code: "runa.workspace_sync.initial_manifest_unproven",
+    throw new CunaError({
+      code: "cuna.workspace_sync.initial_manifest_unproven",
       message: "Continuous synchronization requires the exact admitted initial workspace generation.",
       exitCode: EXIT_CODES.conflict,
     });
@@ -215,8 +215,8 @@ export async function startContinuousWorkspaceSync(
     initialCheckpoint.exclusion_policy_digest !== input.initialReceipt.exclusion_policy_digest ||
     initialCheckpoint.selected_protocol !== input.initialReceipt.selected_protocol
   ) {
-    throw new RunaError({
-      code: "runa.workspace_sync.initial_checkpoint_unproven",
+    throw new CunaError({
+      code: "cuna.workspace_sync.initial_checkpoint_unproven",
       message: "Continuous synchronization requires the durable initial commit authority.",
       exitCode: EXIT_CODES.conflict,
     });
@@ -271,8 +271,8 @@ export async function startContinuousWorkspaceSync(
       const bytes = Buffer.from(response.data.content_base64, "base64");
       if (bytes.byteLength !== byteLength) {
         bytes.fill(0);
-        throw new RunaError({
-          code: "runa.workspace_sync.chunk_mismatch",
+        throw new CunaError({
+          code: "cuna.workspace_sync.chunk_mismatch",
           message: "The downloaded workspace chunk did not match the requested length.",
           exitCode: EXIT_CODES.policy,
         });
@@ -323,8 +323,8 @@ function validateAuthority(input: SynchronizeLocalWorkspaceInput): void {
       input.transport.credentialAuthority !== "interactive") ||
     typeof input.transport.request !== "function"
   ) {
-    throw new RunaError({
-      code: "runa.auth.required",
+    throw new CunaError({
+      code: "cuna.auth.required",
       message: "Workspace synchronization requires authenticated Cuna authority.",
       exitCode: EXIT_CODES.auth,
     });
@@ -340,7 +340,7 @@ async function canonicalWorkspaceRoot(value: string): Promise<string> {
     if (resolve(canonical) === resolve(parse(canonical).root)) throw unsafeRoot("filesystem_root");
     return canonical;
   } catch (error) {
-    if (error instanceof RunaError) throw error;
+    if (error instanceof CunaError) throw error;
     throw unsafeRoot("workspace_root_unavailable");
   }
 }
@@ -355,7 +355,7 @@ async function canonicalCheckpointRoot(value: string, workspaceRoot: string): Pr
     if (isSameOrInside(workspaceRoot, canonical)) throw unsafeRoot("checkpoint_inside_workspace");
     return canonical;
   } catch (error) {
-    if (error instanceof RunaError) throw error;
+    if (error instanceof CunaError) throw error;
     throw unsafeRoot("checkpoint_root_unavailable");
   }
 }
@@ -367,15 +367,25 @@ async function assertSafeDerivedCheckpoint(directory: string, workspaceRoot: str
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw unsafeRoot("checkpoint_binding_type");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    if (error instanceof RunaError) throw error;
+    if (error instanceof CunaError) throw error;
     throw unsafeRoot("checkpoint_binding_unavailable");
   }
 }
 
+/**
+ * The product exclusion file is read under both brands and reported under one.
+ * `.cunaignore` is the current name; `.runaignore` predates the rename and is
+ * still honoured so a workspace written before it does not silently start
+ * uploading the paths it excludes. Acceptance may only ever widen: never drop
+ * `.runaignore`, and never report `runaignore` — the label reaches the user in
+ * `cuna.workspace.policy_invalid` details.
+ */
 async function readProjectExclusionPolicy(root: string): Promise<readonly ExclusionRuleSource[]> {
+  const current = await readPolicyFile(join(root, ".cunaignore"));
+  const text = current.length > 0 ? current : await readPolicyFile(join(root, ".runaignore"));
   return Object.freeze([
     Object.freeze({ source: "gitignore" as const, text: await readPolicyFile(join(root, ".gitignore")) }),
-    Object.freeze({ source: "runaignore" as const, text: await readPolicyFile(join(root, ".runaignore")) }),
+    Object.freeze({ source: "cunaignore" as const, text }),
   ]);
 }
 
@@ -389,7 +399,7 @@ async function readPolicyFile(path: string): Promise<string> {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
-    if (error instanceof RunaError) throw error;
+    if (error instanceof CunaError) throw error;
     throw unsafePolicy("policy_file_unavailable");
   } finally {
     await handle?.close();
@@ -427,36 +437,36 @@ function isSameOrInside(root: string, candidate: string): boolean {
   return difference === "" || (!difference.startsWith(`..${sep}`) && difference !== ".." && !isAbsolute(difference));
 }
 
-function invalidInput(reason: string): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.invalid",
+function invalidInput(reason: string): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.invalid",
     message: "Workspace synchronization input is invalid.",
     exitCode: EXIT_CODES.usage,
     details: { reason },
   });
 }
 
-function unsafeRoot(reason: string): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.unsafe_root",
+function unsafeRoot(reason: string): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.unsafe_root",
     message: "Workspace synchronization refused an unsafe local storage boundary.",
     exitCode: EXIT_CODES.policy,
     details: { reason },
   });
 }
 
-function unsafePolicy(reason: string): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.policy_unavailable",
+function unsafePolicy(reason: string): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.policy_unavailable",
     message: "Workspace synchronization could not safely read the project exclusion policy.",
     exitCode: EXIT_CODES.policy,
     details: { reason },
   });
 }
 
-function unexpectedFailure(): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.failed",
+function unexpectedFailure(): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.failed",
     message: "Workspace synchronization failed before a safe result was available.",
     exitCode: EXIT_CODES.internal,
   });

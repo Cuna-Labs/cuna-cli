@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { RunaError } from "../dist/core/errors.js";
+import { CunaError } from "../dist/core/errors.js";
 import { createHttpTransport } from "../dist/api/http.js";
 import { createWorkspaceManifest, compileExclusionPolicy } from "../dist/workspace/index.js";
 import {
@@ -63,8 +63,8 @@ function envelope(data) {
 }
 
 function networkFailure() {
-  return new RunaError({
-    code: "runa.network.failed",
+  return new CunaError({
+    code: "cuna.network.failed",
     message: "The Runa request outcome is unknown.",
     exitCode: 5,
   });
@@ -150,8 +150,8 @@ class FakeWorkspaceService {
       assert.equal(request.manifest_root, this.commitRoot);
     }
     if (this.options.conflictCommit) {
-      throw new RunaError({
-        code: "runa.remote.conflict",
+      throw new CunaError({
+        code: "cuna.remote.conflict",
         message: "Generation conflict.",
         exitCode: 6,
         details: { reason: "workspace_sync_generation_conflict" },
@@ -258,7 +258,7 @@ test("public sync client emits all frozen routes, verifies downloaded bytes, and
   assert.ok(requests.filter((request) => request.method !== "GET").every((request) => request.idempotencyKey === key));
   await assert.rejects(
     client.begin(workspaceId, { workspace_binding_id: workspaceId, machine_id: machineId, base_generation: 0, exclusion_policy_digest: policy, protocol: { minimum: 1, maximum: 2 }, minimum_reader: 1, minimum_writer: 1 }, key),
-    (error) => error.code === "runa.workspace_sync.invalid_request" && error.details.reason === "workspace_binding_id_domain",
+    (error) => error.code === "cuna.workspace_sync.invalid_request" && error.details.reason === "workspace_binding_id_domain",
   );
   assert.equal(requests.length, 7);
 });
@@ -277,7 +277,7 @@ test("downloaded workspace chunks reject non-canonical or digest-mismatched cont
   });
   await assert.rejects(
     client.downloadChunk(syncId, "0".repeat(64), 2),
-    (error) => error.code === "runa.workspace_sync.contract_mismatch" && error.details.reason === "chunk_content_mismatch",
+    (error) => error.code === "cuna.workspace_sync.contract_mismatch" && error.details.reason === "chunk_content_mismatch",
   );
 });
 
@@ -321,11 +321,11 @@ test("ambiguous begin and commit outcomes resume after process restart with one 
   const store = new FileWorkspaceSyncCheckpointStore(state);
   const service = new FakeWorkspaceService({ loseBeginOnce: true, policyDigest: manifest.policyDigest });
   const first = new WorkspaceSyncCoordinator({ client: service, checkpointStore: store, chunkSource: source, maximumAttempts: 1 });
-  await assert.rejects(first.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "runa.network.failed");
+  await assert.rejects(first.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "cuna.network.failed");
   assert.equal((await store.load()).phase, "begin_pending");
   service.options.loseCommitOnce = true;
   const second = new WorkspaceSyncCoordinator({ client: service, checkpointStore: store, chunkSource: source, maximumAttempts: 1 });
-  await assert.rejects(second.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "runa.network.failed");
+  await assert.rejects(second.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "cuna.network.failed");
   assert.equal((await store.load()).phase, "commit_pending");
   const third = new WorkspaceSyncCoordinator({ client: service, checkpointStore: store, chunkSource: source, maximumAttempts: 2, sleep: async () => undefined });
   const result = await third.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest });
@@ -350,7 +350,7 @@ test("missing chunks use bounded backpressure and malicious missing-digest claim
   let reads = 0;
   const guardedSource = { async read(...args) { reads += 1; return source.read(...args); } };
   const hostileCoordinator = new WorkspaceSyncCoordinator({ client: hostile, checkpointStore: new FileWorkspaceSyncCheckpointStore(hostileState), chunkSource: guardedSource, maximumAttempts: 1 });
-  await assert.rejects(hostileCoordinator.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "runa.workspace_sync.contract_mismatch");
+  await assert.rejects(hostileCoordinator.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "cuna.workspace_sync.contract_mismatch");
   assert.equal(reads, 0);
 });
 
@@ -359,12 +359,12 @@ test("generation conflict persists fail-closed and checkpoint/error evidence con
   const state = await temporaryDirectory(t);
   const service = new FakeWorkspaceService({ policyDigest: manifest.policyDigest, conflictCommit: true });
   const coordinator = new WorkspaceSyncCoordinator({ client: service, checkpointStore: new FileWorkspaceSyncCheckpointStore(state), chunkSource: source, maximumAttempts: 1 });
-  await assert.rejects(coordinator.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "runa.remote.conflict" && !error.message.includes(root));
+  await assert.rejects(coordinator.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "cuna.remote.conflict" && !error.message.includes(root));
   assert.equal((await new FileWorkspaceSyncCheckpointStore(state).load()).phase, "conflicted");
   const persisted = await readFile(join(state, "workspace-sync.checkpoint.json"), "utf8");
   assert.equal(persisted.includes(root), false);
   const calls = service.keys.size;
-  await assert.rejects(coordinator.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "runa.workspace_sync.conflict");
+  await assert.rejects(coordinator.synchronize({ workspaceId, workspaceBindingId, machineId, baseGeneration: 0, manifest }), (error) => error.code === "cuna.workspace_sync.conflict");
   assert.equal(service.keys.size, calls);
 });
 

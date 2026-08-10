@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { isObject } from "../core/validation.js";
 import type { ManifestEntry, WorkspaceManifest } from "../workspace/manifest.js";
 
@@ -483,9 +483,9 @@ function enumValue<T extends string>(value: unknown, allowed: readonly T[], labe
   return value as T;
 }
 
-function protocolFailure(reason: string): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.contract_mismatch",
+function protocolFailure(reason: string): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.contract_mismatch",
     message: "Cuna returned workspace synchronization data that does not match the public contract.",
     exitCode: EXIT_CODES.remote,
     details: { reason },

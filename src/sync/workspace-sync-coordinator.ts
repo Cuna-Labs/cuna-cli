@@ -4,7 +4,7 @@ import { chmod, link, lstat, mkdir, open, readFile, realpath, rename, unlink } f
 import { hostname } from "node:os";
 import { join } from "node:path";
 
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { assertCanonicalUuid } from "../core/validation.js";
 import { assertLexicallyInsideRoot } from "../workspace/paths.js";
 import type { WorkspaceManifest } from "../workspace/manifest.js";
@@ -356,7 +356,7 @@ export class FileWorkspaceSyncCheckpointStore implements WorkspaceSyncCheckpoint
       return decodeCheckpointRecord(JSON.parse(await readFile(this.#path, "utf8")) as unknown);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      if (error instanceof RunaError) throw error;
+      if (error instanceof CunaError) throw error;
       throw invalidCheckpoint(error);
     }
   }
@@ -485,7 +485,7 @@ export class FileWorkspaceSyncCheckpointStore implements WorkspaceSyncCheckpoint
       if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 16_384) throw leaseLost();
       return decodeLease(JSON.parse(await readFile(this.#leasePath, "utf8")) as unknown);
     } catch (error) {
-      if (error instanceof RunaError) throw error;
+      if (error instanceof CunaError) throw error;
       throw leaseLost();
     }
   }
@@ -657,51 +657,51 @@ function boundedInteger(value: unknown, minimum: number, maximum: number, reason
 }
 
 function isAmbiguousOrRetryable(error: unknown): boolean {
-  return error instanceof RunaError && (error.retryable || error.code === "runa.network.failed" || error.code === "runa.network.timeout" || error.code === "runa.network.service_unavailable");
+  return error instanceof CunaError && (error.retryable || error.code === "cuna.network.failed" || error.code === "cuna.network.timeout" || error.code === "cuna.network.service_unavailable");
 }
 
 function isAuthoritativeConflict(error: unknown): boolean {
-  if (!(error instanceof RunaError)) return false;
+  if (!(error instanceof CunaError)) return false;
   const reason = error.details?.reason;
-  return error.code === "runa.remote.conflict" || reason === "workspace_sync_generation_conflict" || reason === "workspace_sync_policy_conflict" || reason === "workspace_sync_manifest_conflict" || reason === "workspace_sync_idempotency_conflict";
+  return error.code === "cuna.remote.conflict" || reason === "workspace_sync_generation_conflict" || reason === "workspace_sync_policy_conflict" || reason === "workspace_sync_manifest_conflict" || reason === "workspace_sync_idempotency_conflict";
 }
 
-function invalid(reason: string): RunaError {
-  return new RunaError({ code: "runa.workspace_sync.invalid", message: "Workspace synchronization input is invalid.", exitCode: EXIT_CODES.usage, details: { reason } });
+function invalid(reason: string): CunaError {
+  return new CunaError({ code: "cuna.workspace_sync.invalid", message: "Workspace synchronization input is invalid.", exitCode: EXIT_CODES.usage, details: { reason } });
 }
 
-function conflict(reason: string): RunaError {
-  return new RunaError({ code: "runa.workspace_sync.conflict", message: "Workspace synchronization requires explicit reconciliation.", exitCode: EXIT_CODES.conflict, details: { reason } });
+function conflict(reason: string): CunaError {
+  return new CunaError({ code: "cuna.workspace_sync.conflict", message: "Workspace synchronization requires explicit reconciliation.", exitCode: EXIT_CODES.conflict, details: { reason } });
 }
 
-function contractMismatch(reason: string): RunaError {
-  return new RunaError({ code: "runa.workspace_sync.contract_mismatch", message: "Workspace synchronization authority contradicted the admitted manifest.", exitCode: EXIT_CODES.remote, details: { reason } });
+function contractMismatch(reason: string): CunaError {
+  return new CunaError({ code: "cuna.workspace_sync.contract_mismatch", message: "Workspace synchronization authority contradicted the admitted manifest.", exitCode: EXIT_CODES.remote, details: { reason } });
 }
 
-function invalidCheckpoint(cause?: unknown): RunaError {
-  return new RunaError({ code: "runa.workspace_sync.checkpoint_invalid", message: "The durable workspace synchronization checkpoint cannot be used safely.", exitCode: EXIT_CODES.conflict, cause });
+function invalidCheckpoint(cause?: unknown): CunaError {
+  return new CunaError({ code: "cuna.workspace_sync.checkpoint_invalid", message: "The durable workspace synchronization checkpoint cannot be used safely.", exitCode: EXIT_CODES.conflict, cause });
 }
 
-function leaseBusy(): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.checkpoint_busy",
+function leaseBusy(): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.checkpoint_busy",
     message: "Another local process is synchronizing this workspace binding.",
     exitCode: EXIT_CODES.conflict,
     retryable: true,
   });
 }
 
-function leaseLost(): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.checkpoint_lease_lost",
+function leaseLost(): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.checkpoint_lease_lost",
     message: "The workspace synchronization checkpoint lease is no longer authoritative.",
     exitCode: EXIT_CODES.conflict,
   });
 }
 
-function staleCheckpoint(reason: string): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.checkpoint_stale",
+function staleCheckpoint(reason: string): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.checkpoint_stale",
     message: "A stale workspace synchronization writer was fenced from durable state.",
     exitCode: EXIT_CODES.conflict,
     details: { reason },

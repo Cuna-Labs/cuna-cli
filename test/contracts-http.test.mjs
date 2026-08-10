@@ -18,7 +18,7 @@ import {
   decodeRunaIdentity,
   decodeTerminalConnectionGrant,
   decideCapability,
-  RunaError,
+  CunaError,
 } from "../dist/index.js";
 
 const future = "2026-08-08T00:00:30.000Z";
@@ -225,7 +225,7 @@ test("machine get binds the exact public machine authority before selection", as
   });
   await assert.rejects(
     substituted.getMachine(machineId),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
 });
 
@@ -429,7 +429,7 @@ test("AgentSession auth client uses the child route and rejects sibling evidence
   });
   await assert.rejects(
     sibling.getAgentSessionAuth(requested),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
 });
 
@@ -472,7 +472,7 @@ test("AgentSession provider logout sends and confirms one exact process generati
   });
   await assert.rejects(
     sibling.logoutAgentSessionAuth(id, epoch),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
   assert.throws(() => decodeAgentSessionAuthLogout(agentSessionAuthLogout({ principal_uid: 63001 })));
 });
@@ -494,7 +494,7 @@ test("AgentSession create recovery uses the original idempotency key on a read-o
   }]);
   await assert.rejects(
     client.inspectAgentSessionCreate("short"),
-    (error) => error instanceof RunaError && error.code === "runa.usage.invalid",
+    (error) => error instanceof CunaError && error.code === "cuna.usage.invalid",
   );
   assert.equal(requests.length, 1);
 });
@@ -545,31 +545,31 @@ test("AgentSession client rejects malformed page and auth bindings before transp
   let requests = 0;
   const client = createRunaApiClient({ async request() { requests += 1; return {}; } });
   const machineId = "22222222-2222-4222-8222-222222222222";
-  await assert.rejects(client.listAgentSessions(machineId, { limit: 0 }), RunaError);
-  await assert.rejects(client.listAgentSessions(machineId, { cursor: "bad\nvalue" }), RunaError);
+  await assert.rejects(client.listAgentSessions(machineId, { limit: 0 }), CunaError);
+  await assert.rejects(client.listAgentSessions(machineId, { cursor: "bad\nvalue" }), CunaError);
   await assert.rejects(client.createAgentSession(machineId, {
     agent: "claude-code",
     cwd: "/workspace/../escape",
     workspaceBindingId: "33333333-3333-4333-8333-333333333333",
     workspaceGeneration: 7,
-  }, "operation-1"), RunaError);
+  }, "operation-1"), CunaError);
   await assert.rejects(client.createAgentSession(machineId, {
     agent: "claude-code",
     cwd: "/workspace",
     workspaceBindingId: "33333333-3333-4333-8333-333333333333",
     workspaceGeneration: 7,
     authMode: "credential_binding",
-  }, "operation-2"), RunaError);
+  }, "operation-2"), CunaError);
   await assert.rejects(client.createAgentSession(machineId, {
     agent: "claude-code",
     cwd: "/workspace",
     workspaceBindingId: "33333333-3333-4333-8333-333333333333",
     workspaceGeneration: 0,
-  }, "operation-3"), RunaError);
+  }, "operation-3"), CunaError);
   await assert.rejects(client.renameAgentSession(
     "11111111-1111-4111-8111-111111111111",
     "",
-  ), RunaError);
+  ), CunaError);
   assert.equal(requests, 0);
 });
 
@@ -587,7 +587,7 @@ test("AgentSession client rejects producer responses bound to a sibling resource
   });
   await assert.rejects(
     machineMismatch.listAgentSessions(requestedMachine),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
   await assert.rejects(
     machineMismatch.createAgentSession(requestedMachine, {
@@ -596,7 +596,7 @@ test("AgentSession client rejects producer responses bound to a sibling resource
       workspaceBindingId: "33333333-3333-4333-8333-333333333333",
       workspaceGeneration: 7,
     }, "operation-sibling"),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
 
   const workspaceMismatch = createRunaApiClient({
@@ -611,7 +611,7 @@ test("AgentSession client rejects producer responses bound to a sibling resource
       workspaceBindingId: "33333333-3333-4333-8333-333333333333",
       workspaceGeneration: 7,
     }, "operation-workspace-substitution"),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
 
   const sessionMismatch = createRunaApiClient({
@@ -619,15 +619,15 @@ test("AgentSession client rejects producer responses bound to a sibling resource
   });
   await assert.rejects(
     sessionMismatch.getAgentSession(requestedSession),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
   await assert.rejects(
     sessionMismatch.renameAgentSession(requestedSession, "renamed"),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
   await assert.rejects(
     sessionMismatch.terminateAgentSession(requestedSession),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
 });
 
@@ -735,7 +735,7 @@ test("terminal grant client sends exact idempotent intent and rejects unsafe inp
       protocol: "runa.terminal.v1",
       clientInstanceId: "contains space",
     }, "terminal-operation-2"),
-    RunaError,
+    CunaError,
   );
   await assert.rejects(
     client.createTerminalConnection(sessionId, {
@@ -743,7 +743,7 @@ test("terminal grant client sends exact idempotent intent and rejects unsafe inp
       clientInstanceId: "safe",
       resumeHandle: "not-a-uuid",
     }, "terminal-operation-3"),
-    RunaError,
+    CunaError,
   );
   assert.equal(requests.length, 1);
 });
@@ -751,10 +751,10 @@ test("terminal grant client sends exact idempotent intent and rejects unsafe inp
 test("machine client enforces canonical create bounds before transport", async () => {
   let requests = 0;
   const client = createRunaApiClient({ async request() { requests += 1; return {}; } });
-  await assert.rejects(client.createMachine({ name: "dev" }, "short"), RunaError);
-  await assert.rejects(client.createMachine({ name: "" }, "operation-1"), RunaError);
-  await assert.rejects(client.createMachine({ name: "dev", vcpus: 9 }, "operation-2"), RunaError);
-  await assert.rejects(client.createMachine({ name: "dev", memoryMiB: 511 }, "operation-3"), RunaError);
+  await assert.rejects(client.createMachine({ name: "dev" }, "short"), CunaError);
+  await assert.rejects(client.createMachine({ name: "" }, "operation-1"), CunaError);
+  await assert.rejects(client.createMachine({ name: "dev", vcpus: 9 }, "operation-2"), CunaError);
+  await assert.rejects(client.createMachine({ name: "dev", memoryMiB: 511 }, "operation-3"), CunaError);
   assert.equal(requests, 0);
 });
 
@@ -766,7 +766,7 @@ test("machine transition rejects a producer response bound to a sibling machine"
   });
   await assert.rejects(
     client.transitionMachine(requested, "start"),
-    (error) => error instanceof RunaError && error.code === "runa.remote.malformed_response",
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
   );
 });
 
@@ -834,7 +834,7 @@ test("pre-aborted HTTP requests perform no fetch effect", async () => {
   });
   await assert.rejects(
     transport.request({ method: "GET", path: "/v1/sessions", signal: controller.signal }),
-    (error) => error instanceof RunaError && error.code === "runa.network.cancelled",
+    (error) => error instanceof CunaError && error.code === "cuna.network.cancelled",
   );
   assert.equal(calls, 0);
 });
@@ -855,13 +855,13 @@ test("HTTP timeout retryability fails closed for requests with ambiguous side ef
   ]) {
     await assert.rejects(
       transport.request(request),
-      (error) => error instanceof RunaError && error.code === "runa.network.timeout" && error.retryable === false,
+      (error) => error instanceof CunaError && error.code === "cuna.network.timeout" && error.retryable === false,
     );
   }
 
   await assert.rejects(
     transport.request({ method: "GET", path: "/v1/sessions" }),
-    (error) => error instanceof RunaError && error.code === "runa.network.timeout" && error.retryable === true,
+    (error) => error instanceof CunaError && error.code === "cuna.network.timeout" && error.retryable === true,
   );
 });
 
@@ -876,7 +876,7 @@ test("HTTP errors expose only stable safe metadata", async () => {
   });
   await assert.rejects(
     transport.request({ method: "POST", path: "/v1/sessions/m_1/stop" }),
-    (error) => error instanceof RunaError && error.code === "runa.policy.denied" && JSON.stringify(error.details).includes("cuna_sk_bad") === false,
+    (error) => error instanceof CunaError && error.code === "cuna.policy.denied" && JSON.stringify(error.details).includes("cuna_sk_bad") === false,
   );
 });
 
@@ -909,8 +909,8 @@ test("HTTP errors preserve retryability only from a closed canonical Problem", a
   ])) {
     await assert.rejects(
       makeTransport(origin, 503, false).request({ method: "GET", path: "/v1/capabilities" }),
-      (error) => error instanceof RunaError &&
-        error.code === "runa.network.service_unavailable" &&
+      (error) => error instanceof CunaError &&
+        error.code === "cuna.network.service_unavailable" &&
         error.retryable === false &&
         error.details?.reason === "request_failed" &&
         error.details?.request_id === requestId,
@@ -918,8 +918,8 @@ test("HTTP errors preserve retryability only from a closed canonical Problem", a
     );
     await assert.rejects(
       makeTransport(origin, 400, true).request({ method: "GET", path: "/v1/capabilities" }),
-      (error) => error instanceof RunaError &&
-        error.code === "runa.remote.rejected" &&
+      (error) => error instanceof CunaError &&
+        error.code === "cuna.remote.rejected" &&
         error.retryable === true,
       origin,
     );
@@ -928,7 +928,7 @@ test("HTTP errors preserve retryability only from a closed canonical Problem", a
         method: "GET",
         path: "/v1/capabilities",
       }),
-      (error) => error instanceof RunaError &&
+      (error) => error instanceof CunaError &&
         error.retryable === true &&
         error.details?.request_id === "untrusted-header",
       origin,
@@ -938,7 +938,7 @@ test("HTTP errors preserve retryability only from a closed canonical Problem", a
   // A Problem minted under an origin the service never issues stays undecoded.
   await assert.rejects(
     makeTransport("https://api.evil.test", 503, false).request({ method: "GET", path: "/v1/capabilities" }),
-    (error) => error instanceof RunaError &&
+    (error) => error instanceof CunaError &&
       error.retryable === true &&
       error.details?.request_id === "untrusted-header",
   );
@@ -987,8 +987,8 @@ test("workspace sync Problems preserve only the negotiated protocol and canonica
   ])) {
     await assert.rejects(
       makeTransport(426, {}, origin).request({ method: "POST", path: "/v1/workspaces/w_1/sync-sessions" }),
-      (error) => error instanceof RunaError &&
-        error.code === "runa.remote.rejected" &&
+      (error) => error instanceof CunaError &&
+        error.code === "cuna.remote.rejected" &&
         error.retryable === false &&
         error.details?.reason === "workspace_sync_protocol_incompatible" &&
         error.details?.selected_protocol === 2 &&
@@ -1000,14 +1000,14 @@ test("workspace sync Problems preserve only the negotiated protocol and canonica
   // An origin the service never mints stays undecoded.
   await assert.rejects(
     makeTransport(426, {}, "https://api.evil.test").request({ method: "POST", path: "/v1/workspaces/w_1/sync-sessions" }),
-    (error) => error instanceof RunaError &&
+    (error) => error instanceof CunaError &&
       error.details?.selected_protocol === undefined &&
       error.details?.capabilities === undefined,
   );
   await assert.rejects(
     makeTransport(503).request({ method: "GET", path: "/v1/workspaces/w_1/sync-sessions/a_1/changes" }),
-    (error) => error instanceof RunaError &&
-      error.code === "runa.network.service_unavailable" &&
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.network.service_unavailable" &&
       error.retryable === true &&
       error.details?.selected_protocol === null &&
       Array.isArray(error.details?.capabilities) &&
@@ -1022,8 +1022,8 @@ test("workspace sync Problems preserve only the negotiated protocol and canonica
   ]) {
     await assert.rejects(
       makeTransport(503, malformed).request({ method: "GET", path: "/v1/workspaces/w_1/sync-sessions/a_1/changes" }),
-      (error) => error instanceof RunaError &&
-        error.code === "runa.network.service_unavailable" &&
+      (error) => error instanceof CunaError &&
+        error.code === "cuna.network.service_unavailable" &&
         error.retryable === true &&
         error.details?.request_id === "untrusted-header" &&
         error.details?.selected_protocol === undefined &&
@@ -1036,7 +1036,7 @@ test("invalid public IDs never reach transport (property-style adversarial corpu
   let calls = 0;
   const client = createRunaApiClient({ async request() { calls += 1; return {}; } });
   for (const candidate of ["", "../x", "a/b", "a?b", " a", "a b", "💥", "x".repeat(129)]) {
-    await assert.rejects(client.getAgentSession(candidate), RunaError);
+    await assert.rejects(client.getAgentSession(candidate), CunaError);
   }
   assert.equal(calls, 0);
 });

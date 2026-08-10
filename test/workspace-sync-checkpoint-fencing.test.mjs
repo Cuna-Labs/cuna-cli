@@ -155,7 +155,7 @@ test("two process-style coordinators admit one writer and preserve its committed
   while (firstCalls.length === 0) await new Promise((resolve) => setImmediate(resolve));
   await assert.rejects(
     synchronize(second),
-    (error) => error.code === "runa.workspace_sync.checkpoint_busy" && error.retryable === true,
+    (error) => error.code === "cuna.workspace_sync.checkpoint_busy" && error.retryable === true,
   );
   assert.deepEqual(secondCalls, []);
 
@@ -191,7 +191,7 @@ test("causal negative control fences a stale transaction after a newer lease com
 
   await assert.rejects(
     staleTransaction.save(checkpoint("conflicted", "2026-08-09T00:02:00.000Z")),
-    (error) => error.code === "runa.workspace_sync.checkpoint_lease_lost",
+    (error) => error.code === "cuna.workspace_sync.checkpoint_lease_lost",
   );
   assert.equal((await firstStore.load()).phase, "committed");
   const document = JSON.parse(await readFile(join(directory, "workspace-sync.checkpoint.json"), "utf8"));
@@ -216,7 +216,7 @@ test("a pre-binding checkpoint is preserved but cannot authorize work under a gu
   const store = new FileWorkspaceSyncCheckpointStore(directory);
   await assert.rejects(
     store.load(),
-    (error) => error.code === "runa.workspace_sync.checkpoint_invalid",
+    (error) => error.code === "cuna.workspace_sync.checkpoint_invalid",
   );
   assert.equal(await readFile(path, "utf8"), serialized);
 });

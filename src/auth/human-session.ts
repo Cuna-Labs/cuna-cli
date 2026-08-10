@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 
 import type { EffectiveConfig } from "../config/config.js";
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { isRefreshToken } from "../core/namespace.js";
 import type { CredentialBinding } from "../credentials/contracts.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
@@ -60,8 +60,8 @@ function authError(code: string, message: string, options: {
   readonly retryable?: boolean;
   readonly hint?: string;
   readonly details?: Readonly<Record<string, string | number | boolean | null>>;
-} = {}): RunaError {
-  return new RunaError({ code, message, exitCode: EXIT_CODES.auth, ...options });
+} = {}): CunaError {
+  return new CunaError({ code, message, exitCode: EXIT_CODES.auth, ...options });
 }
 
 function binding(config: EffectiveConfig): CredentialBinding {
@@ -100,10 +100,10 @@ function encodeStored(session: StoredHumanSession): SecretMaterial {
 function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSession {
   let parsed: unknown;
   try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch {
-    throw authError("runa.auth.session_corrupt", "The protected Cuna sign-in session is malformed.");
+    throw authError("cuna.auth.session_corrupt", "The protected Cuna sign-in session is malformed.");
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw authError("runa.auth.session_corrupt", "The protected Cuna sign-in session is malformed.");
+    throw authError("cuna.auth.session_corrupt", "The protected Cuna sign-in session is malformed.");
   }
   const record = parsed as Record<string, unknown>;
   const legacy = record.version === 1;
@@ -118,7 +118,7 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
       ];
   const keys = Object.keys(record).sort();
   if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
-    throw authError("runa.auth.session_corrupt", "The protected Cuna sign-in session has an invalid shape.");
+    throw authError("cuna.auth.session_corrupt", "The protected Cuna sign-in session has an invalid shape.");
   }
   if (
     (!legacy && record.version !== 2) ||
@@ -132,7 +132,7 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
         "agent_sessions.read", "agent_sessions.create",
       ]).has(record.intent_class as CliIntentClass))
   ) {
-    throw authError("runa.auth.session_corrupt", "The protected Cuna sign-in session failed validation.");
+    throw authError("cuna.auth.session_corrupt", "The protected Cuna sign-in session failed validation.");
   }
   return Object.freeze({
     version: 2,
@@ -179,9 +179,9 @@ function stableRefreshIdempotency(session: StoredHumanSession): string {
 }
 
 function isAuthoritativeRefreshRejection(error: unknown): boolean {
-  if (!(error instanceof RunaError)) return false;
+  if (!(error instanceof CunaError)) return false;
   const reason = error.details?.reason;
-  return error.code === "runa.auth.rejected" ||
+  return error.code === "cuna.auth.rejected" ||
     reason === "cli_auth_rejected" || reason === "cli_refresh_reuse" ||
     reason === "cli_session_revoked" || reason === "terms_version_mismatch";
 }
@@ -189,7 +189,7 @@ function isAuthoritativeRefreshRejection(error: unknown): boolean {
 function ensureOnboardingReady(context: CliIdentityContext): void {
   if (context.identity === "active" && context.admission === "admitted" && context.workspace.state === "assigned") return;
   throw authError(
-    "runa.auth.onboarding_incomplete",
+    "cuna.auth.onboarding_incomplete",
     "Cuna sign-in completed, but the account is not ready for CLI work.",
     { hint: "Finish identity verification, admission, terms, and workspace assignment in the browser." },
   );
@@ -211,7 +211,7 @@ function ensureSignupContext(
     context.workspace.id !== undefined;
   if (waitlisted || admitted) return;
   throw authError(
-    "runa.auth.signup_state_invalid",
+    "cuna.auth.signup_state_invalid",
     "Cuna could not prove a valid waitlist-only signup state.",
   );
 }
@@ -277,7 +277,7 @@ export function createHumanAuthService(input: {
   function now(): number {
     const observed = clock();
     if (!Number.isSafeInteger(observed) || observed < 0 || (lastObservedNow !== undefined && observed < lastObservedNow)) {
-      throw authError("runa.auth.clock_untrusted", "The local authentication clock is not trustworthy.");
+      throw authError("cuna.auth.clock_untrusted", "The local authentication clock is not trustworthy.");
     }
     lastObservedNow = observed;
     return observed;
@@ -293,7 +293,7 @@ export function createHumanAuthService(input: {
 
   function cachedAccessToken(): string {
     if (access === undefined || access.expiresAt - now() <= 30_000) {
-      throw authError("runa.auth.refresh_unknown", "Cuna could not establish a fresh in-memory access token.", { retryable: true });
+      throw authError("cuna.auth.refresh_unknown", "Cuna could not establish a fresh in-memory access token.", { retryable: true });
     }
     return access.material.withBytes((bytes) => new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   }
@@ -304,7 +304,7 @@ export function createHumanAuthService(input: {
 
   function assertNotCancelled(signal?: AbortSignal): void {
     if (signal?.aborted === true) {
-      throw authError("runa.auth.cancelled", "Cuna sign-in was cancelled.");
+      throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
     }
   }
 
@@ -314,7 +314,7 @@ export function createHumanAuthService(input: {
     return await new Promise<void>((resolve, reject) => {
       const abort = (): void => {
         signal.removeEventListener("abort", abort);
-        reject(authError("runa.auth.cancelled", "Cuna sign-in was cancelled."));
+        reject(authError("cuna.auth.cancelled", "Cuna sign-in was cancelled."));
       };
       signal.addEventListener("abort", abort, { once: true });
       void flight.then(
@@ -336,33 +336,33 @@ export function createHumanAuthService(input: {
     const vaultStatus = await input.vault.status(credentialBinding);
     if (vaultStatus.backendStatus !== "verified") {
       throw authError(
-        "runa.auth.vault_unavailable",
+        "cuna.auth.vault_unavailable",
         "Interactive sign-in requires the verified operating-system credential vault.",
       );
     }
     if (vaultStatus.state === "present") {
       throw authError(
-        "runa.auth.already_signed_in",
+        "cuna.auth.already_signed_in",
         "This Cuna profile already has an interactive session.",
         { hint: "Run `cuna logout` before signing in again." },
       );
     }
     if (vaultStatus.state === "corrupt") {
       throw authError(
-        "runa.auth.session_corrupt",
+        "cuna.auth.session_corrupt",
         "The protected Cuna session is corrupt and cannot be replaced implicitly.",
         { hint: "Remove the damaged credential through the operating-system credential manager." },
       );
     }
     const bootstrap = await input.client.bootstrap(request.signal);
     if (!bootstrap.enabled || bootstrap.browserOrigin === null) {
-      throw authError("runa.auth.unavailable", "Interactive Cuna sign-in is not enabled for this environment.");
+      throw authError("cuna.auth.unavailable", "Interactive Cuna sign-in is not enabled for this environment.");
     }
     if (intentClass === "signup") {
       const signup = await input.client.signupCapability(request.signal);
       if (!signup.enabled || signup.enrollment !== "waitlist_only") {
         throw authError(
-          "runa.auth.signup_unavailable",
+          "cuna.auth.signup_unavailable",
           "Waitlist-only self-service signup is not enabled for this environment.",
         );
       }
@@ -382,17 +382,17 @@ export function createHumanAuthService(input: {
     });
     try {
       if (Date.parse(issued.expiresAt) <= now()) {
-        throw authError("runa.auth.continuation_expired", "Cuna issued an already-expired sign-in continuation.");
+        throw authError("cuna.auth.continuation_expired", "Cuna issued an already-expired sign-in continuation.");
       }
       await input.browser.open(issued.browserUrl);
       let interval = Math.max(bootstrap.pollAfterMs, issued.pollAfterMs);
       for (let attempt = 0; attempt < bootstrap.pollLimit; attempt += 1) {
-        if (request.signal?.aborted) throw authError("runa.auth.cancelled", "Cuna sign-in was cancelled.");
+        if (request.signal?.aborted) throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
         const remaining = Date.parse(issued.expiresAt) - now();
         if (remaining <= 0) break;
         try { await sleep(Math.min(interval, remaining), request.signal); } catch {
-          if (request.signal?.aborted) throw authError("runa.auth.cancelled", "Cuna sign-in was cancelled.");
-          throw authError("runa.auth.poll_failed", "Cuna could not continue sign-in polling.", { retryable: true });
+          if (request.signal?.aborted) throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
+          throw authError("cuna.auth.poll_failed", "Cuna could not continue sign-in polling.", { retryable: true });
         }
         const status = await input.client.continuation({
           id: issued.id,
@@ -400,15 +400,15 @@ export function createHumanAuthService(input: {
           ...(request.signal === undefined ? {} : { signal: request.signal }),
         });
         if (Date.parse(status.expiresAt) !== Date.parse(issued.expiresAt)) {
-          throw authError("runa.auth.continuation_mismatch", "Cuna returned contradictory continuation authority.");
+          throw authError("cuna.auth.continuation_mismatch", "Cuna returned contradictory continuation authority.");
         }
         if (status.phase === "issued") {
           interval = Math.max(bootstrap.pollAfterMs, status.pollAfterMs ?? interval);
           continue;
         }
-        if (status.phase === "cancelled") throw authError("runa.auth.cancelled", "Cuna sign-in was cancelled.");
-        if (status.phase === "expired") throw authError("runa.auth.continuation_expired", "Cuna sign-in expired.");
-        if (status.phase === "consumed") throw authError("runa.auth.continuation_consumed", "This Cuna sign-in was already exchanged.");
+        if (status.phase === "cancelled") throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
+        if (status.phase === "expired") throw authError("cuna.auth.continuation_expired", "Cuna sign-in expired.");
+        if (status.phase === "consumed") throw authError("cuna.auth.continuation_consumed", "This Cuna sign-in was already exchanged.");
         const tokens = await input.client.exchange({
           id: issued.id,
           continuationSecret: issued.continuationSecret,
@@ -420,14 +420,14 @@ export function createHumanAuthService(input: {
         try {
           const exchangedAt = now();
           if (Date.parse(tokens.refreshExpiresAt) <= exchangedAt || Date.parse(tokens.accessExpiresAt) <= exchangedAt) {
-            throw authError("runa.auth.token_expired", "Cuna returned an already-expired sign-in session.");
+            throw authError("cuna.auth.token_expired", "Cuna returned an already-expired sign-in session.");
           }
           if (
             tokens.context.requiredTermsVersion !== status.requiredTermsVersion ||
             (status.context !== undefined &&
               JSON.stringify(contextWire(status.context)) !== JSON.stringify(contextWire(tokens.context)))
           ) {
-            throw authError("runa.auth.context_mismatch", "Cuna returned contradictory sign-in context authority.");
+            throw authError("cuna.auth.context_mismatch", "Cuna returned contradictory sign-in context authority.");
           }
           if (intentClass === "signup") {
             ensureSignupContext(tokens.context, false);
@@ -455,7 +455,7 @@ export function createHumanAuthService(input: {
           throw error;
         }
       }
-      throw authError("runa.auth.timeout", "Cuna sign-in did not complete within its bounded polling window.", { retryable: true });
+      throw authError("cuna.auth.timeout", "Cuna sign-in did not complete within its bounded polling window.", { retryable: true });
     } catch (error) {
       await cancelBestEffort(issued.id, issued.continuationSecret);
       throw error;
@@ -467,13 +467,13 @@ export function createHumanAuthService(input: {
     let captured: { readonly material: SecretMaterial; readonly expiresAt: number } | undefined;
     const existing = await input.vault.load(credentialBinding);
     if (existing === undefined) {
-      throw authError("runa.auth.required", "No interactive Cuna session is stored.", { hint: "Run `cuna login`." });
+      throw authError("cuna.auth.required", "No interactive Cuna session is stored.", { hint: "Run `cuna login`." });
     }
     existing.material.dispose();
     try {
       const snapshot = await input.vault.refresh(credentialBinding, async (current) => {
         if (current === undefined) {
-          throw authError("runa.auth.required", "No interactive Cuna session is stored.", { hint: "Run `cuna login`." });
+          throw authError("cuna.auth.required", "No interactive Cuna session is stored.", { hint: "Run `cuna login`." });
         }
         const stored = current.material.withBytes((bytes) => decodeStored(bytes, input.config));
         if (Date.parse(stored.refreshExpiresAt) <= now()) {
@@ -531,12 +531,12 @@ export function createHumanAuthService(input: {
     } catch (error) {
       captured?.material.dispose();
       if (error instanceof CredentialBoundaryError && error.code === "credential_revoked") {
-        throw authError("runa.auth.reauthentication_required", "The Cuna session was rejected and removed.", { hint: "Run `cuna login`." });
+        throw authError("cuna.auth.reauthentication_required", "The Cuna session was rejected and removed.", { hint: "Run `cuna login`." });
       }
       throw error;
     }
     if (captured === undefined) {
-      throw authError("runa.auth.refresh_unknown", "Cuna could not establish a new in-memory access token.", { retryable: true });
+      throw authError("cuna.auth.refresh_unknown", "Cuna could not establish a new in-memory access token.", { retryable: true });
     }
     access?.material.dispose();
     access = captured;
@@ -561,7 +561,7 @@ export function createHumanAuthService(input: {
     const token = await acquireAccessToken(signal);
     const context = await input.client.context(token, signal);
     const snapshot = await input.vault.load(credentialBinding);
-    if (snapshot === undefined) throw authError("runa.auth.required", "No interactive Cuna session is stored.");
+    if (snapshot === undefined) throw authError("cuna.auth.required", "No interactive Cuna session is stored.");
     try {
       const stored = snapshot.material.withBytes((bytes) => decodeStored(bytes, input.config));
       return Object.freeze({ profile: stored.profile, sessionId: stored.sessionId, context });
@@ -571,7 +571,7 @@ export function createHumanAuthService(input: {
   async function logout(signal?: AbortSignal): Promise<{ readonly revoked: true }> {
     const token = await acquireAccessToken(signal);
     const revoked = await input.client.logout(token, signal);
-    if (revoked !== true) throw authError("runa.auth.logout_unknown", "Cuna could not confirm server-side logout.", { retryable: true });
+    if (revoked !== true) throw authError("cuna.auth.logout_unknown", "Cuna could not confirm server-side logout.", { retryable: true });
     await input.vault.delete(credentialBinding);
     access?.material.dispose();
     access = undefined;

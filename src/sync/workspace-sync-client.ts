@@ -1,4 +1,4 @@
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { assertCanonicalUuid, encodeCanonicalUuid } from "../core/validation.js";
 import type { HttpTransport } from "../api/http.js";
 import {
@@ -69,8 +69,8 @@ export function createWorkspaceSyncClient(transport: HttpTransport): WorkspaceSy
       validateDigest(digest);
       validateIdempotencyKey(idempotencyKey);
       if (bytes.byteLength > WORKSPACE_SYNC_LIMITS.chunkBytes || sha256(bytes) !== digest) {
-        throw new RunaError({
-          code: "runa.workspace_sync.chunk_mismatch",
+        throw new CunaError({
+          code: "cuna.workspace_sync.chunk_mismatch",
           message: "The workspace chunk does not match its declared digest and length.",
           exitCode: EXIT_CODES.policy,
         });
@@ -161,18 +161,18 @@ function validateDigest(value: string): void {
   if (!/^[0-9a-f]{64}$/u.test(value)) throw invalidRequest("digest");
 }
 
-function invalidRequest(reason: string): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.invalid_request",
+function invalidRequest(reason: string): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.invalid_request",
     message: "The workspace synchronization request is malformed.",
     exitCode: EXIT_CODES.usage,
     details: { reason },
   });
 }
 
-function scopeMismatch(): RunaError {
-  return new RunaError({
-    code: "runa.workspace_sync.scope_mismatch",
+function scopeMismatch(): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.scope_mismatch",
     message: "Cuna returned workspace synchronization authority for a different scope.",
     exitCode: EXIT_CODES.policy,
   });

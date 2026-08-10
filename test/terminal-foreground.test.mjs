@@ -226,14 +226,14 @@ test("supervisor lifecycle evidence is projected independently and expires witho
     ...intents[0],
     agentSessionLifecycle: {
       value: "running",
-      source: "runa_agent_session_supervisor",
+      source: "cuna_agent_session_supervisor",
       observedAt: 100,
       expiresAt: 175,
       correlationId: "revision-1",
     },
     providerAuthentication: {
       value: "authenticated",
-      source: "runa_agent_auth:runa.agent-auth.v1:provider_cli_login_status",
+      source: "cuna_agent_auth:runa.agent-auth.v1:provider_cli_login_status",
       observedAt: 100,
       expiresAt: 175,
       correlationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

@@ -1,4 +1,4 @@
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import {
   assertCanonicalUuid,
   assertIdempotencyKey,
@@ -140,9 +140,9 @@ export interface RunaApiClient {
   ): Promise<TerminalConnectionGrant>;
 }
 
-function malformed(cause: unknown): RunaError {
-  return new RunaError({
-    code: "runa.remote.malformed_response",
+function malformed(cause: unknown): CunaError {
+  return new CunaError({
+    code: "cuna.remote.malformed_response",
     message: "Cuna returned a response that does not match the public contract.",
     exitCode: EXIT_CODES.remote,
     cause,
@@ -153,7 +153,7 @@ function decode<T>(decoder: (value: unknown) => T, value: unknown): T {
   try {
     return decoder(value);
   } catch (error) {
-    if (error instanceof RunaError) throw error;
+    if (error instanceof CunaError) throw error;
     throw malformed(error);
   }
 }
@@ -193,8 +193,8 @@ function validatePageOptions(options: PageOptions): Readonly<Record<string, stri
     options.limit !== undefined &&
     (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100)
   ) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "AgentSession page limit must be an integer from 1 through 100.",
       exitCode: EXIT_CODES.usage,
     });
@@ -203,8 +203,8 @@ function validatePageOptions(options: PageOptions): Readonly<Record<string, stri
     options.cursor !== undefined &&
     (options.cursor.length < 1 || options.cursor.length > 512 || containsAsciiControl(options.cursor))
   ) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "AgentSession cursor is malformed.",
       exitCode: EXIT_CODES.usage,
     });
@@ -218,15 +218,15 @@ function validatePageOptions(options: PageOptions): Readonly<Record<string, stri
 function validateAgentSessionCreate(input: AgentSessionCreateInput): void {
   assertCanonicalUuid(input.workspaceBindingId, "workspace binding ID");
   if (!Number.isSafeInteger(input.workspaceGeneration) || input.workspaceGeneration < 1) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "AgentSession workspace generation must be a positive safe integer.",
       exitCode: EXIT_CODES.usage,
     });
   }
   if (input.name !== undefined && (input.name.length < 1 || input.name.length > 80)) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "AgentSession name must contain 1 through 80 characters.",
       exitCode: EXIT_CODES.usage,
     });
@@ -237,22 +237,22 @@ function validateAgentSessionCreate(input: AgentSessionCreateInput): void {
     input.cwd.length > 1024 ||
     input.cwd.split("/").includes("..")
   ) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "AgentSession cwd must be a safe absolute path inside /workspace.",
       exitCode: EXIT_CODES.usage,
     });
   }
   if (input.authMode === "credential_binding" && input.credentialBindingId === undefined) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "credential_binding auth mode requires a credential binding ID.",
       exitCode: EXIT_CODES.usage,
     });
   }
   if (input.authMode !== "credential_binding" && input.credentialBindingId !== undefined) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "A credential binding ID requires credential_binding auth mode.",
       exitCode: EXIT_CODES.usage,
     });
@@ -266,15 +266,15 @@ function validateMachineCreate(input: MachineCreateInput, idempotencyKey: string
   assertIdempotencyKey(idempotencyKey);
   assertSafeDisplayText(input.name, "machine name");
   if (input.name.length < 1 || input.name.length > 80) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "Machine name must contain 1 through 80 characters.",
       exitCode: EXIT_CODES.usage,
     });
   }
   if (input.vcpus !== undefined && (!Number.isInteger(input.vcpus) || input.vcpus < 1 || input.vcpus > 8)) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "Machine vcpus must be an integer from 1 through 8.",
       exitCode: EXIT_CODES.usage,
     });
@@ -283,8 +283,8 @@ function validateMachineCreate(input: MachineCreateInput, idempotencyKey: string
     input.memoryMiB !== undefined &&
     (!Number.isInteger(input.memoryMiB) || input.memoryMiB < 512 || input.memoryMiB > 16_384)
   ) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "Machine memoryMiB must be an integer from 512 through 16384.",
       exitCode: EXIT_CODES.usage,
     });
@@ -297,8 +297,8 @@ function validateWorkspaceBindingIdentity(input: WorkspaceBindingIdentityInput):
   assertCanonicalUuid(input.localInstanceId, "local instance ID");
   assertCanonicalUuid(input.machineId, "machine ID");
   if (!/^[0-9a-f]{64}$/u.test(input.exclusionPolicyDigest)) {
-    throw new RunaError({
-      code: "runa.usage.invalid",
+    throw new CunaError({
+      code: "cuna.usage.invalid",
       message: "Workspace exclusion policy digest must be a lowercase SHA-256 digest.",
       exitCode: EXIT_CODES.usage,
     });
@@ -433,19 +433,19 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       validateWorkspaceBindingIdentity(input);
       assertIdempotencyKey(idempotencyKey);
       if (!Array.isArray(input.excludedPrefixes) || input.excludedPrefixes.length > 10_000) {
-        throw new RunaError({ code: "runa.usage.invalid", message: "Workspace excluded prefixes are invalid.", exitCode: EXIT_CODES.usage });
+        throw new CunaError({ code: "cuna.usage.invalid", message: "Workspace excluded prefixes are invalid.", exitCode: EXIT_CODES.usage });
       }
       const prefixes = input.excludedPrefixes.map((prefix) => {
         if (typeof prefix !== "string" || prefix.length < 1 || prefix.length > 4_096 ||
           prefix.startsWith("/") || prefix.startsWith("\\") || prefix.includes("\\") ||
           containsAsciiControl(prefix) || /^[A-Za-z]:/u.test(prefix) ||
           prefix.split("/").some((part) => part === "" || part === "." || part === "..")) {
-          throw new RunaError({ code: "runa.usage.invalid", message: "Workspace excluded prefixes are invalid.", exitCode: EXIT_CODES.usage });
+          throw new CunaError({ code: "cuna.usage.invalid", message: "Workspace excluded prefixes are invalid.", exitCode: EXIT_CODES.usage });
         }
         return prefix;
       });
       if (new Set(prefixes).size !== prefixes.length) {
-        throw new RunaError({ code: "runa.usage.invalid", message: "Workspace excluded prefixes must be unique.", exitCode: EXIT_CODES.usage });
+        throw new CunaError({ code: "cuna.usage.invalid", message: "Workspace excluded prefixes must be unique.", exitCode: EXIT_CODES.usage });
       }
       const authority = decode(
         decodeWorkspaceBindingAuthority,
@@ -592,8 +592,8 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
     async renameAgentSession(id, name) {
       const safeId = encodeCanonicalUuid(id, "AgentSession ID");
       if (name.length < 1 || name.length > 80) {
-        throw new RunaError({
-          code: "runa.usage.invalid",
+        throw new CunaError({
+          code: "cuna.usage.invalid",
           message: "AgentSession name must contain 1 through 80 characters.",
           exitCode: EXIT_CODES.usage,
         });
@@ -624,8 +624,8 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       const safeId = encodeCanonicalUuid(agentSessionId, "AgentSession ID");
       assertIdempotencyKey(idempotencyKey);
       if (!/^[A-Za-z0-9._:-]{1,256}$/u.test(input.clientInstanceId)) {
-        throw new RunaError({
-          code: "runa.usage.invalid",
+        throw new CunaError({
+          code: "cuna.usage.invalid",
           message: "Terminal client instance ID is malformed.",
           exitCode: EXIT_CODES.usage,
         });
@@ -636,8 +636,8 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
           input.resumeHandle,
         )
       ) {
-        throw new RunaError({
-          code: "runa.usage.invalid",
+        throw new CunaError({
+          code: "cuna.usage.invalid",
           message: "Terminal resume handle must be a canonical Cuna UUID.",
           exitCode: EXIT_CODES.usage,
         });
@@ -709,9 +709,9 @@ export async function requireCapability(input: {
   try {
     snapshot = await input.client.discoverCapabilities(input.scope, input.resourceId, input.signal);
   } catch (error) {
-    if (error instanceof RunaError && error.code === "runa.remote.not_found") {
-      throw new RunaError({
-        code: "runa.capability.discovery_unavailable",
+    if (error instanceof CunaError && error.code === "cuna.remote.not_found") {
+      throw new CunaError({
+        code: "cuna.capability.discovery_unavailable",
         message: "This Cuna deployment does not expose capability discovery.",
         exitCode: EXIT_CODES.unsupported,
         hint: "No mutation was attempted. Update the Cuna server contract before retrying.",
@@ -725,8 +725,8 @@ export async function requireCapability(input: {
     snapshot.subjectScope !== input.scope ||
     (input.scope !== "account" && snapshot.subjectId !== input.resourceId)
   ) {
-    throw new RunaError({
-      code: "runa.capability.unknown",
+    throw new CunaError({
+      code: "cuna.capability.unknown",
       message: `Cuna cannot currently authorize the ${input.capabilityId} capability.`,
       exitCode: EXIT_CODES.unsupported,
       details: {
@@ -738,13 +738,13 @@ export async function requireCapability(input: {
   }
   const decision = decideCapability(snapshot, input.capabilityId, input.now, input.allowedInteractions);
   if (decision.status === "supported") return;
-  throw new RunaError({
+  throw new CunaError({
     code:
       decision.status === "temporarily_unavailable"
-        ? "runa.capability.temporarily_unavailable"
+        ? "cuna.capability.temporarily_unavailable"
         : decision.status === "unsupported"
-          ? "runa.capability.unsupported"
-          : "runa.capability.unknown",
+          ? "cuna.capability.unsupported"
+          : "cuna.capability.unknown",
     message: `Cuna cannot currently authorize the ${input.capabilityId} capability.`,
     exitCode:
       decision.status === "temporarily_unavailable" ? EXIT_CODES.network : EXIT_CODES.unsupported,

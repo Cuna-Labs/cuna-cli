@@ -118,7 +118,7 @@ test("abort during the open event cannot escape the handshake cancellation fence
     connector.connect({ url: URL, token: TOKEN, protocol: "runa.terminal.v1", signal: controller.signal }),
     (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected",
   );
-  assert.equal(AbortAfterOpenWebSocket.instances[0].closeCalls.at(-1).reason, "runa_cancelled");
+  assert.equal(AbortAfterOpenWebSocket.instances[0].closeCalls.at(-1).reason, "cuna_cancelled");
 });
 
 test("asynchronous Blob conversion preserves WebSocket arrival order", async () => {
@@ -207,7 +207,7 @@ test("TC-055-16 receive overflow and stalled Blob conversion fail immediately an
     await new Promise((resolve) => setImmediate(resolve));
   }
   await assert.rejects(overflowed.receive()[Symbol.asyncIterator]().next(), /receive queue exceeded/u);
-  assert.equal(overflowSocket.closeCalls.at(-1).reason, "runa_binary_required");
+  assert.equal(overflowSocket.closeCalls.at(-1).reason, "cuna_binary_required");
   await assert.rejects(overflowed.send(Uint8Array.of(1)), /not open/u);
 
   FakeWebSocket.instances.length = 0;

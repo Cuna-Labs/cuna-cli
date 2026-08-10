@@ -350,7 +350,7 @@ async function observeProviderAuthentication(input: Readonly<{
   }
   return Object.freeze({
     value: status.state,
-    source: `runa_agent_auth:${status.adapterVersion}:${status.evidenceClass}`,
+    source: `cuna_agent_auth:${status.adapterVersion}:${status.evidenceClass}`,
     observedAt,
     expiresAt: validUntil,
     correlationId: status.observationId,

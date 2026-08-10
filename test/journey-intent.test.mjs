@@ -11,7 +11,7 @@ const CREDENTIAL_BINDING_ID = "20000000-0000-4000-8000-000000000002";
 
 function assertUsageError(operation, messagePattern) {
   assert.throws(operation, (error) => {
-    assert.equal(error?.code, "runa.usage.invalid");
+    assert.equal(error?.code, "cuna.usage.invalid");
     assert.equal(error?.exitCode, 2);
     if (messagePattern !== undefined) assert.match(error.message, messagePattern);
     return true;

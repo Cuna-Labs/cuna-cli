@@ -14,7 +14,7 @@ import {
   decodeCliSignupCapability,
   decodeCliTokenSet,
   decodeRevocation,
-  RunaError,
+  CunaError,
 } from "../dist/index.js";
 
 const NOW = Date.parse("2026-08-08T00:00:00.000Z");
@@ -248,7 +248,7 @@ test("waitlist-only signup stores a restricted session and permits one pinned ad
   });
   await assert.rejects(
     substituted.service.acquireAccessToken(),
-    (error) => error.code === "runa.auth.reauthentication_required",
+    (error) => error.code === "cuna.auth.reauthentication_required",
   );
   assert.equal(signedUp.backend.values.size, 0);
 });
@@ -280,7 +280,7 @@ test("a second login fails before creating a new continuation or orphaning the o
   const subject = fixture();
   await subject.service.login();
   const creates = subject.client.calls.filter(([name]) => name === "create").length;
-  await assert.rejects(subject.service.login(), (error) => error.code === "runa.auth.already_signed_in");
+  await assert.rejects(subject.service.login(), (error) => error.code === "cuna.auth.already_signed_in");
   assert.equal(subject.client.calls.filter(([name]) => name === "create").length, creates);
 });
 
@@ -292,7 +292,7 @@ test("cancellation and bounded timeout call the secret-authorized cancellation e
       throw new DOMException("cancelled", "AbortError");
     },
   });
-  await assert.rejects(cancelled.service.login({ signal: controller.signal }), (error) => error.code === "runa.auth.cancelled");
+  await assert.rejects(cancelled.service.login({ signal: controller.signal }), (error) => error.code === "cuna.auth.cancelled");
   assert.equal(cancelled.client.calls.some(([name, request]) => name === "cancel" && request.secret === CT), true);
 
   const timedClient = fakeClient({
@@ -302,7 +302,7 @@ test("cancellation and bounded timeout call the secret-authorized cancellation e
     },
   });
   const timed = fixture({ client: timedClient });
-  await assert.rejects(timed.service.login(), (error) => error.code === "runa.auth.timeout");
+  await assert.rejects(timed.service.login(), (error) => error.code === "cuna.auth.timeout");
   assert.equal(timed.client.calls.filter(([name]) => name === "poll").length, 3);
   assert.equal(timed.client.calls.some(([name]) => name === "cancel"), true);
 });
@@ -314,7 +314,7 @@ test("a pre-aborted sign-in performs no vault, browser, or network effect", asyn
   controller.abort(new Error("operator interrupt"));
   await assert.rejects(
     subject.service.login({ signal: controller.signal }),
-    (error) => error.code === "runa.auth.cancelled",
+    (error) => error.code === "cuna.auth.cancelled",
   );
   assert.deepEqual(subject.client.calls, []);
   assert.deepEqual(subject.opened, []);
@@ -329,7 +329,7 @@ test("consumed replay never exchanges and post-exchange validation failure revok
     },
   });
   const replay = fixture({ client: replayClient });
-  await assert.rejects(replay.service.login(), (error) => error.code === "runa.auth.continuation_consumed");
+  await assert.rejects(replay.service.login(), (error) => error.code === "cuna.auth.continuation_consumed");
   assert.equal(replay.client.calls.some(([name]) => name === "exchange"), false);
 
   const mismatchClient = fakeClient({
@@ -339,7 +339,7 @@ test("consumed replay never exchanges and post-exchange validation failure revok
     },
   });
   const mismatch = fixture({ client: mismatchClient });
-  await assert.rejects(mismatch.service.login(), (error) => error.code === "runa.auth.context_mismatch");
+  await assert.rejects(mismatch.service.login(), (error) => error.code === "cuna.auth.context_mismatch");
   assert.equal(mismatch.client.calls.some(([name, token]) => name === "logout" && token === AT), true);
   assert.equal(mismatch.backend.values.size, 0);
 
@@ -385,7 +385,7 @@ test("one cancelled refresh waiter neither aborts nor poisons the shared credent
   await entered;
   const surviving = subject.service.acquireAccessToken();
   controller.abort(new Error("caller no longer needs the token"));
-  await assert.rejects(cancelled, (error) => error.code === "runa.auth.cancelled");
+  await assert.rejects(cancelled, (error) => error.code === "cuna.auth.cancelled");
   releaseRefresh();
   assert.equal(await surviving, AT_2);
   const refreshes = client.calls.filter(([name]) => name === "refresh");
@@ -398,13 +398,13 @@ test("authoritative refresh rejection deletes the family while unknown failure p
   await first.service.login();
   const rejectedClient = fakeClient({
     async refresh() {
-      throw new RunaError({
-        code: "runa.auth.rejected", message: "rejected", exitCode: 3, details: { reason: "cli_refresh_reuse" },
+      throw new CunaError({
+        code: "cuna.auth.rejected", message: "rejected", exitCode: 3, details: { reason: "cli_refresh_reuse" },
       });
     },
   });
   const rejected = fixture({ backend: first.backend, client: rejectedClient });
-  await assert.rejects(rejected.service.acquireAccessToken(), (error) => error.code === "runa.auth.reauthentication_required");
+  await assert.rejects(rejected.service.acquireAccessToken(), (error) => error.code === "cuna.auth.reauthentication_required");
   assert.equal(first.backend.values.size, 0);
 
   const second = fixture();
@@ -429,7 +429,7 @@ test("authoritative refresh rejection deletes the family while unknown failure p
       async logout(token) { this.calls.push(["logout", token]); throw new Error("unknown logout"); },
     }),
   });
-  await assert.rejects(invalidContext.service.acquireAccessToken(), (error) => error.code === "runa.auth.reauthentication_required");
+  await assert.rejects(invalidContext.service.acquireAccessToken(), (error) => error.code === "cuna.auth.reauthentication_required");
   assert.equal(third.backend.values.size, 0);
   assert.equal(invalidContext.client.calls.some(([name, token]) => name === "logout" && token === AT_2), true);
 });
@@ -485,7 +485,7 @@ test("human authentication rejects clock rollback and tokens that expire during 
   now = NOW - 1;
   await assert.rejects(
     rollback.service.acquireAccessToken(),
-    (error) => error.code === "runa.auth.clock_untrusted",
+    (error) => error.code === "cuna.auth.clock_untrusted",
   );
 
   const original = fixture();
@@ -501,7 +501,7 @@ test("human authentication rejects clock rollback and tokens that expire during 
   const slow = fixture({ backend: original.backend, client: slowClient, clock: () => slowNow });
   await assert.rejects(
     slow.service.acquireAccessToken(),
-    (error) => error.code === "runa.auth.reauthentication_required",
+    (error) => error.code === "cuna.auth.reauthentication_required",
   );
   assert.equal(original.backend.values.size, 0, "an already-expired rotated family is removed rather than cached");
 });

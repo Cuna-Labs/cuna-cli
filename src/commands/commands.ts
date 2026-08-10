@@ -12,7 +12,7 @@ import type {
 } from "../api/contracts.js";
 import type { EffectiveConfig } from "../config/config.js";
 import { DEFAULT_BASE_URL, publicConfig } from "../config/config.js";
-import { EXIT_CODES, RunaError, unsupportedError, usageError } from "../core/errors.js";
+import { EXIT_CODES, CunaError, unsupportedError, usageError } from "../core/errors.js";
 import { assertCanonicalUuid, assertIdempotencyKey, assertPublicId, assertSafeDisplayText } from "../core/validation.js";
 import { preflightAgentJourneyInvocation } from "../journey/intent.js";
 import { INITIAL_RUNTIME_GATES, type RuntimeFeatureGate } from "../runtime/contracts.js";
@@ -42,8 +42,8 @@ export interface CommandContext {
 
 function requireCredential(context: CommandContext): void {
   if (context.credentialMode !== undefined) return;
-  throw new RunaError({
-    code: "runa.auth.required",
+  throw new CunaError({
+    code: "cuna.auth.required",
     message: "This command requires a Cuna credential.",
     exitCode: EXIT_CODES.auth,
     hint: "Run `cuna login` for interactive use or set CUNA_API_KEY for explicit automation.",
@@ -85,8 +85,8 @@ function agentOption(parsed: ParsedInvocation, required: boolean): AgentKind | u
 
 function requireConfirmation(parsed: ParsedInvocation, command: string): void {
   if (booleanOption(parsed, "yes")) return;
-  throw new RunaError({
-    code: "runa.confirmation.required",
+  throw new CunaError({
+    code: "cuna.confirmation.required",
     message: `The ${command} mutation requires explicit confirmation in this initial build.`,
     exitCode: EXIT_CODES.policy,
     hint: `Review the target and repeat with --yes.`,
@@ -628,8 +628,8 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         session.authMode !== "interactive_login" ||
         (session.agent !== "claude-code" && session.agent !== "codex")
       ) {
-        throw new RunaError({
-          code: "runa.agent.auth_logout_unavailable",
+        throw new CunaError({
+          code: "cuna.agent.auth_logout_unavailable",
           message: "Provider sign-out is unavailable for this AgentSession.",
           exitCode: EXIT_CODES.policy,
           hint: "Select a running Claude Code or Codex AgentSession using interactive sign-in.",
@@ -649,8 +649,8 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         receipt.authMode !== session.authMode ||
         receipt.agent !== session.agent
       ) {
-        throw new RunaError({
-          code: "runa.remote.malformed_response",
+        throw new CunaError({
+          code: "cuna.remote.malformed_response",
           message: "Cuna returned a provider sign-out receipt for another AgentSession authority.",
           exitCode: EXIT_CODES.remote,
         });
@@ -735,8 +735,8 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         checks,
       });
       if (!ok) {
-        throw new RunaError({
-          code: "runa.self_test.failed",
+        throw new CunaError({
+          code: "cuna.self_test.failed",
           message: "The installed Cuna CLI failed an offline integrity check.",
           exitCode: EXIT_CODES.internal,
           details: {
@@ -776,8 +776,8 @@ async function verifyVirtualTerminalInterop(): Promise<boolean> {
       scrollback: 0,
       registry,
     });
-    const snapshot = await viewport.write(new TextEncoder().encode("runa"), 1n, 1n);
-    return snapshot.cells[0] === "runa";
+    const snapshot = await viewport.write(new TextEncoder().encode("cuna"), 1n, 1n);
+    return snapshot.cells[0] === "cuna";
   } catch {
     return false;
   } finally {

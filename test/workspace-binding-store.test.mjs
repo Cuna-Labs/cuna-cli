@@ -119,7 +119,7 @@ test("a record is returned only when profile, user, workspace, machine, policy, 
   ]) {
     await assert.rejects(
       loadWorkspaceBinding({ startPath: root, expected: expectations(mismatch) }),
-      (error) => error.code === "runa.workspace.identity_unproven" &&
+      (error) => error.code === "cuna.workspace.identity_unproven" &&
         error.details?.reason === "binding_owner_mismatch",
     );
   }
@@ -151,8 +151,8 @@ test("concurrent creation and update use a kernel writer lock plus revision, gen
   assert.equal(updates.filter((result) => result.status === "fulfilled").length, 1);
   const stale = updates.find((result) => result.status === "rejected");
   assert.ok([
-    "runa.workspace.binding_stale",
-    "runa.workspace.workspace_busy",
+    "cuna.workspace.binding_stale",
+    "cuna.workspace.workspace_busy",
   ].includes(stale.reason.code));
 
   const admitted = updates.find((result) => result.status === "fulfilled").value;
@@ -162,7 +162,7 @@ test("concurrent creation and update use a kernel writer lock plus revision, gen
       binding: draft({ ...winningDraft, policyDigest: "d".repeat(64), generation: 1 }),
       expected,
     }),
-    (error) => error.code === "runa.workspace.binding_stale",
+    (error) => error.code === "cuna.workspace.binding_stale",
   );
   await assert.rejects(
     persistWorkspaceBinding({
@@ -170,7 +170,7 @@ test("concurrent creation and update use a kernel writer lock plus revision, gen
       binding: draft({ ...winningDraft, policyDigest: admitted.policyDigest, generation: 0 }),
       expected: workspaceBindingCompareAndSwap(admitted),
     }),
-    (error) => error.code === "runa.workspace.identity_unproven",
+    (error) => error.code === "cuna.workspace.identity_unproven",
   );
 });
 
@@ -183,7 +183,7 @@ test("corruption, ambiguous fields, copied metadata, and hardlinked metadata fai
   await writeFile(recordPath, JSON.stringify({ ...source, unexpected_authority: true }), { mode: 0o600 });
   await assert.rejects(
     loadWorkspaceBinding({ startPath: root, expected: expectations() }),
-    (error) => error.code === "runa.workspace.binding_corrupt",
+    (error) => error.code === "cuna.workspace.binding_corrupt",
   );
 
   await writeFile(recordPath, original, { mode: 0o600 });
@@ -192,7 +192,7 @@ test("corruption, ambiguous fields, copied metadata, and hardlinked metadata fai
   await writeFile(join(copy, ".runa", "workspace.json"), original, { mode: 0o600 });
   await assert.rejects(
     loadWorkspaceBinding({ startPath: copy, expected: expectations() }),
-    (error) => error.code === "runa.workspace.identity_unproven",
+    (error) => error.code === "cuna.workspace.identity_unproven",
   );
 
   const outside = join(await temporaryDirectory(t), "outside.json");
@@ -201,7 +201,7 @@ test("corruption, ambiguous fields, copied metadata, and hardlinked metadata fai
   await link(outside, recordPath);
   await assert.rejects(
     loadWorkspaceBinding({ startPath: root, expected: expectations() }),
-    (error) => error.code === "runa.workspace.binding_store_unsafe",
+    (error) => error.code === "cuna.workspace.binding_store_unsafe",
   );
   assert.equal(await readFile(outside, "utf8"), original);
   assert.equal(record.integrityDigest.length, 64);
@@ -239,7 +239,7 @@ test("interrupted private temporary records are recovered before the next atomic
   if (process.platform !== "win32") await chmod(orphan, 0o600);
   await assert.rejects(
     loadWorkspaceBinding({ startPath: root, expected: expectations() }),
-    (error) => error.code === "runa.workspace.binding_recovery_required",
+    (error) => error.code === "cuna.workspace.binding_recovery_required",
   );
   await assert.rejects(
     persistWorkspaceBinding({
@@ -247,7 +247,7 @@ test("interrupted private temporary records are recovered before the next atomic
       binding: draft({ generation: 1 }),
       expected: { ...workspaceBindingCompareAndSwap(first), recordRevision: 999 },
     }),
-    (error) => error.code === "runa.workspace.binding_stale",
+    (error) => error.code === "cuna.workspace.binding_stale",
   );
   assert.equal((await lstat(orphan)).isFile(), true);
   const updated = await persistWorkspaceBinding({
@@ -279,7 +279,7 @@ test("clock rollback is rejected before replacing the admitted record", async (t
       expected: workspaceBindingCompareAndSwap(first),
       now: new Date("2026-08-09T00:00:00.000Z"),
     }),
-    (error) => error.code === "runa.workspace.binding_corrupt" && error.details?.reason === "clock_rollback",
+    (error) => error.code === "cuna.workspace.binding_corrupt" && error.details?.reason === "clock_rollback",
   );
   const retained = await loadWorkspaceBinding({ startPath: root, expected: expectations() });
   assert.equal(retained?.record.integrityDigest, first.integrityDigest);
@@ -303,8 +303,8 @@ test("symlink or junction roots and marker paths are rejected instead of followe
   }
   await assert.rejects(
     discoverWorkspaceBindingMarker({ startPath: alias }),
-    (error) => error.code === "runa.workspace.binding_store_unsafe" ||
-      error.code === "runa.workspace.root_unsafe",
+    (error) => error.code === "cuna.workspace.binding_store_unsafe" ||
+      error.code === "cuna.workspace.root_unsafe",
   );
 
   const separate = await temporaryDirectory(t);
@@ -322,7 +322,7 @@ test("symlink or junction roots and marker paths are rejected instead of followe
   }
   await assert.rejects(
     loadWorkspaceBinding({ startPath: physical, expected: expectations() }),
-    (error) => error.code === "runa.workspace.binding_store_unsafe",
+    (error) => error.code === "cuna.workspace.binding_store_unsafe",
   );
 });
 
@@ -345,7 +345,7 @@ test("persistence rejects a linked metadata directory without writing into or ch
   const modeBefore = (await lstat(outside)).mode & 0o777;
   await assert.rejects(
     persistWorkspaceBinding({ root, binding: draft(), expected: null }),
-    (error) => error.code === "runa.workspace.binding_store_unsafe",
+    (error) => error.code === "cuna.workspace.binding_store_unsafe",
   );
   await assert.rejects(lstat(join(outside, "workspace.json")), (error) => error.code === "ENOENT");
   if (process.platform !== "win32") assert.equal((await lstat(outside)).mode & 0o777, modeBefore);
@@ -363,7 +363,7 @@ test("an incompatible durable record is rejected before any mutation", async (t)
       binding: draft({ generation: 1 }),
       expected: workspaceBindingCompareAndSwap(first),
     }),
-    (error) => error.code === "runa.workspace.binding_corrupt",
+    (error) => error.code === "cuna.workspace.binding_corrupt",
   );
   assert.equal(JSON.parse(await readFile(recordPath, "utf8")).schemaVersion, 3);
   assert.equal(dirname(recordPath), join(root, ".runa"));

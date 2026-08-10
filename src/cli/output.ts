@@ -1,6 +1,6 @@
 import type { Writable } from "node:stream";
 
-import type { RunaError } from "../core/errors.js";
+import type { CunaError } from "../core/errors.js";
 import { OUTPUT_SCHEMA_VERSION } from "../version.js";
 
 export interface CliStreams {
@@ -13,7 +13,7 @@ export interface CliStreams {
 export interface OutputWriter {
   readonly structured: boolean;
   success(command: string, data: unknown, human: string): void;
-  error(command: string, error: RunaError): void;
+  error(command: string, error: CunaError): void;
   text(value: string): void;
 }
 

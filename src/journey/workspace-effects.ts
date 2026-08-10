@@ -3,7 +3,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { RunaApiClient } from "../api/client.js";
-import { EXIT_CODES, RunaError, type ExitCode } from "../core/errors.js";
+import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import type { ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.js";
 import {
   inspectWorkspaceSyncPolicy,
@@ -25,8 +25,8 @@ export interface WorkspaceJourneyEffectsInput {
   readonly filesystemCapabilities: FilesystemCapabilities;
 }
 
-function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.conflict): RunaError {
-  return new RunaError({ code, message, exitCode });
+function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.conflict): CunaError {
+  return new CunaError({ code, message, exitCode });
 }
 
 function bindingKey(workspaceId: string, userId: string, canonicalRoot: string): string {
@@ -95,7 +95,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       if (inspected.local !== undefined) {
         const record = inspected.local.record;
         if (record.machineId !== machineId || record.policyDigest !== inspected.policy.exclusionPolicyDigest) {
-          throw fail("runa.journey.workspace_binding_conflict", "The local project binding does not authorize the selected machine and exclusion policy.");
+          throw fail("cuna.journey.workspace_binding_conflict", "The local project binding does not authorize the selected machine and exclusion policy.");
         }
         authority = await input.client.getWorkspaceBinding(record.bindingId, {
           workspaceId: input.workspaceId,
@@ -106,7 +106,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         }, signal);
       } else {
         if (syncMode === "disabled") {
-          throw fail("runa.journey.workspace_binding_required", "--no-sync requires an existing remotely committed workspace binding.", EXIT_CODES.policy);
+          throw fail("cuna.journey.workspace_binding_required", "--no-sync requires an existing remotely committed workspace binding.", EXIT_CODES.policy);
         }
         const intentDigest = bindingKey(input.workspaceId, input.userId, inspected.policy.canonicalRoot);
         // These identities are stable for this owner/root and installation.
@@ -127,7 +127,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
 
       if (syncMode === "disabled") {
         if (authority.activeGeneration < 1) {
-          throw fail("runa.journey.workspace_generation_unavailable", "--no-sync cannot attach until the binding has a committed workspace generation.", EXIT_CODES.policy);
+          throw fail("cuna.journey.workspace_generation_unavailable", "--no-sync cannot attach until the binding has a committed workspace generation.", EXIT_CODES.policy);
         }
         return Object.freeze({ bindingId: authority.bindingId, workspaceIdentity: authority.bindingId, generation: authority.activeGeneration, remoteCwd: authority.remoteRoot });
       }
@@ -157,7 +157,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         committedAuthority.activeManifestRoot !== receipt.manifest_root
       ) {
         throw fail(
-          "runa.journey.workspace_commit_unproven",
+          "cuna.journey.workspace_commit_unproven",
           "The WorkspaceBinding authority does not confirm the committed synchronization receipt.",
           EXIT_CODES.remote,
         );

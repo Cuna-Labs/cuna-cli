@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { EXIT_CODES, RunaError } from "../dist/index.js";
+import { EXIT_CODES, CunaError } from "../dist/index.js";
 import { createApiAgentJourneyEffects } from "../dist/journey/api-effects.js";
 
 const MACHINE_ID = "22222222-2222-4222-8222-222222222222";
@@ -64,8 +64,8 @@ test("uncertain AgentSession create recovers by the exact original idempotency k
     async discoverCapabilities() { return capability(); },
     async createAgentSession() {
       calls.push("create");
-      throw new RunaError({
-        code: "runa.network.timeout",
+      throw new CunaError({
+        code: "cuna.network.timeout",
         message: "unknown dispatch",
         exitCode: EXIT_CODES.network,
       });
@@ -96,8 +96,8 @@ test("recovered AgentSession with substituted authority is rejected before attac
   const client = {
     async discoverCapabilities() { return capability(); },
     async createAgentSession() {
-      throw new RunaError({
-        code: "runa.network.failed",
+      throw new CunaError({
+        code: "cuna.network.failed",
         message: "unknown dispatch",
         exitCode: EXIT_CODES.network,
       });
@@ -121,7 +121,7 @@ test("recovered AgentSession with substituted authority is rejected before attac
       signal: new AbortController().signal,
     }),
     (error) =>
-      error instanceof RunaError &&
-      error.code === "runa.journey.agent_session_create_authority_mismatch",
+      error instanceof CunaError &&
+      error.code === "cuna.journey.agent_session_create_authority_mismatch",
   );
 });

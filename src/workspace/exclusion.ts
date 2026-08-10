@@ -18,7 +18,7 @@ export interface ExclusionDecision {
 }
 
 export interface ExclusionRuleSource {
-  readonly source: "gitignore" | "runaignore" | "cli";
+  readonly source: "gitignore" | "cunaignore" | "cli";
   readonly text: string;
 }
 

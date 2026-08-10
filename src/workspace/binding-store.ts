@@ -862,7 +862,7 @@ function oneOf<const T extends readonly string[]>(value: unknown, choices: T): T
 function isWorkspaceRecordError(error: unknown): boolean {
   return error instanceof Error && "code" in error &&
     typeof (error as { code?: unknown }).code === "string" &&
-    (error as { code: string }).code.startsWith("runa.workspace.");
+    (error as { code: string }).code.startsWith("cuna.workspace.");
 }
 
 function corruptRecord(reason: string) {

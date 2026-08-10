@@ -84,7 +84,7 @@ test("workspace binding identity is distinct, canonical, tenant-bound, and gener
     workspaceId: "workspace_1",
     machineId: "machine_1",
     canonicalLocalRoot: root,
-  }), (error) => error.code === "runa.workspace.identity_unproven");
+  }), (error) => error.code === "cuna.workspace.identity_unproven");
 });
 
 test("portable path property corpus rejects traversal, platform aliases, devices, and malformed components", () => {
@@ -102,7 +102,7 @@ test("portable path property corpus rejects traversal, platform aliases, devices
     "a/./b",
     `bad\0name`,
   ]) {
-    assert.throws(() => normalizeWirePath(candidate, windowsCapabilities), (error) => error.code === "runa.workspace.path_invalid");
+    assert.throws(() => normalizeWirePath(candidate, windowsCapabilities), (error) => error.code === "cuna.workspace.path_invalid");
   }
   assert.equal(normalizeWirePath("src/caf\u00e9.ts", windowsCapabilities), "src/caf\u00e9.ts");
 });
@@ -110,11 +110,11 @@ test("portable path property corpus rejects traversal, platform aliases, devices
 test("case and Unicode normalization collisions quarantine before materialization", () => {
   assert.throws(
     () => assertNoPortableCollisions(["README", "readme"], windowsCapabilities),
-    (error) => error.code === "runa.workspace.portability_conflict",
+    (error) => error.code === "cuna.workspace.portability_conflict",
   );
   assert.throws(
     () => assertNoPortableCollisions(["caf\u00e9", "cafe\u0301"], windowsCapabilities),
-    (error) => error.code === "runa.workspace.portability_conflict",
+    (error) => error.code === "cuna.workspace.portability_conflict",
   );
   assert.doesNotThrow(() => assertNoPortableCollisions(["README", "readme"], linuxCapabilities));
 });
@@ -127,7 +127,7 @@ test("exclusion policy runs before content reads and never opens immutable secre
   await mkdir(join(root, "dist"));
   await writeFile(join(root, "dist", "generated.js"), "generated");
   await writeFile(join(root, "source.ts"), "export const safe = true;\n");
-  const policy = compileExclusionPolicy([{ source: "runaignore", text: "dist/**\n" }], linuxCapabilities);
+  const policy = compileExclusionPolicy([{ source: "cunaignore", text: "dist/**\n" }], linuxCapabilities);
   const opened = [];
   const manifest = await createWorkspaceManifest({
     root,
@@ -148,7 +148,7 @@ test("admitted high-confidence secrets are blocked without exposing their value"
   const policy = compileExclusionPolicy([], linuxCapabilities);
   await assert.rejects(
     createWorkspaceManifest({ root, policy, capabilities: linuxCapabilities }),
-    (error) => error.code === "runa.workspace.secret_blocked" && !error.message.includes("super-sensitive"),
+    (error) => error.code === "cuna.workspace.secret_blocked" && !error.message.includes("super-sensitive"),
   );
 });
 
@@ -173,7 +173,7 @@ for (const prefix of [
     await assert.rejects(
       createWorkspaceManifest({ root, policy, capabilities: linuxCapabilities }),
       (error) =>
-        error.code === "runa.workspace.secret_blocked" &&
+        error.code === "cuna.workspace.secret_blocked" &&
         !error.message.includes(material),
       `${prefix} must be detected as a service token and must never be uploaded`,
     );
@@ -214,7 +214,7 @@ test("symlink and junction escape is rejected before outside content is read", a
       allowSafeRelativeSymlinks: true,
       beforeContentRead: (path) => opened.push(path),
     }),
-    (error) => error.code === "runa.workspace.path_escape",
+    (error) => error.code === "cuna.workspace.path_escape",
   );
   assert.deepEqual(opened, []);
 });
@@ -301,7 +301,7 @@ test("conflict resolution uses generation CAS and identical bytes converge", () 
   const store = new ConflictStore();
   store.add(divergent);
   const preview = store.preview(divergent.conflictId, 1);
-  assert.throws(() => store.resolve(divergent.conflictId, 1, "ours"), (error) => error.code === "runa.workspace.conflict_stale");
+  assert.throws(() => store.resolve(divergent.conflictId, 1, "ours"), (error) => error.code === "cuna.workspace.conflict_stale");
   const resolved = store.resolve(divergent.conflictId, preview.generation, "ours");
   assert.equal(resolved.state, "resolved");
   assert.equal(store.get(divergent.conflictId).ours.digest, digestA);
@@ -332,7 +332,7 @@ test("AgentSession overlays are private and disjoint merge histories converge de
     capabilities: linuxCapabilities,
     version: version(digestA, { a: 1 }, "a"),
     accountedBytes: 1,
-  }), (error) => error.code === "runa.workspace.overlay_unavailable");
+  }), (error) => error.code === "cuna.workspace.overlay_unavailable");
 
   const changedA = store.applyChange({ overlayId: a.overlayId, agentSessionId: "session-a", expectedGeneration: a.generation, path: "a", capabilities: linuxCapabilities, version: version(digestA, { a: 1 }, "a"), accountedBytes: 1 });
   const changedB = store.applyChange({ overlayId: b.overlayId, agentSessionId: "session-b", expectedGeneration: b.generation, path: "b", capabilities: linuxCapabilities, version: version(digestB, { b: 1 }, "b"), accountedBytes: 1 });
@@ -354,7 +354,7 @@ test("overlay quota failure preserves canonical head and a crashed session remai
   assert.throws(() => store.applyChange({
     overlayId: "o", agentSessionId: "s", expectedGeneration: overlay.generation, path: "a",
     capabilities: linuxCapabilities, version: version(digestA, { s: 1 }, "op"), accountedBytes: 2,
-  }), (error) => error.code === "runa.workspace.overlay_full");
+  }), (error) => error.code === "cuna.workspace.overlay_full");
   assert.equal(store.head.revisionId, initial.revisionId);
   assert.equal(store.retainAfterExit("o", "s", "2026-09-08T00:00:00.000Z").state, "retained");
 });
@@ -414,12 +414,12 @@ test("journal terminal replay is idempotent, expired writers fail, and uncertain
   await journal.transition(uncertain.operationId, "uncertain");
   await assert.rejects(
     journal.transition(uncertain.operationId, "sending"),
-    (error) => error.code === "runa.workspace.journal_invalid",
+    (error) => error.code === "cuna.workspace.journal_invalid",
   );
   now = 110;
   await assert.rejects(
     journal.append({ operationId: "late", baseGeneration: 1, digest: digestA, byteLength: 1 }),
-    (error) => error.code === "runa.workspace.writer_fenced",
+    (error) => error.code === "cuna.workspace.writer_fenced",
   );
   await journal.close();
 });
@@ -435,11 +435,11 @@ test("an expired live writer stays fenced without allowing split-brain takeover"
   crashedNow = 11;
   await assert.rejects(
     DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "new", leaseMs: 10, clock: () => 11 }),
-    (error) => error.code === "runa.workspace.workspace_busy",
+    (error) => error.code === "cuna.workspace.workspace_busy",
   );
   await assert.rejects(
     stale.append({ operationId: "op-stale", baseGeneration: 1, digest: digestB, byteLength: 1 }),
-    (error) => error.code === "runa.workspace.writer_fenced",
+    (error) => error.code === "cuna.workspace.writer_fenced",
   );
   await stale.close();
   const recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "new", leaseMs: 10, clock: () => 11 });
@@ -485,7 +485,7 @@ test("a crashed process releases kernel writer authority and the next process ad
   assert.equal(firstFence, 1);
   await assert.rejects(
     DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "parent" }),
-    (error) => error.code === "runa.workspace.workspace_busy",
+    (error) => error.code === "cuna.workspace.workspace_busy",
   );
   child.kill("SIGKILL");
   await new Promise((resolve) => child.once("close", resolve));
@@ -510,13 +510,13 @@ test("journal lease acquisition and renewal use only the configured trusted cloc
       now: 10_000,
       clock: () => now,
     }),
-    (error) => error.code === "runa.workspace.workspace_busy",
+    (error) => error.code === "cuna.workspace.workspace_busy",
   );
   await owner.renew(10_000);
   now = 111;
   await assert.rejects(
     owner.append({ operationId: "expired", baseGeneration: 1, digest: digestA, byteLength: 1 }),
-    (error) => error.code === "runa.workspace.writer_fenced",
+    (error) => error.code === "cuna.workspace.writer_fenced",
   );
   await owner.close();
 });
@@ -530,7 +530,7 @@ test("journal fails closed on clock rollback, arithmetic overflow, and lease exp
   now = 99;
   await assert.rejects(
     rollback.renew(),
-    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "clock_rollback",
+    (error) => error.code === "cuna.workspace.journal_invalid" && error.details?.reason === "clock_rollback",
   );
   await rollback.close();
 
@@ -540,7 +540,7 @@ test("journal fails closed on clock rollback, arithmetic overflow, and lease exp
       directory: overflowDirectory, bindingId: "binding", bindingGeneration: 1, ownerId: "overflow", leaseMs: 1,
       clock: () => Number.MAX_SAFE_INTEGER,
     }),
-    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "lease_overflow",
+    (error) => error.code === "cuna.workspace.journal_invalid" && error.details?.reason === "lease_overflow",
   );
 
   const slowDirectory = await temporaryDirectory(t);
@@ -550,7 +550,7 @@ test("journal fails closed on clock rollback, arithmetic overflow, and lease exp
       directory: slowDirectory, bindingId: "binding", bindingGeneration: 1, ownerId: "slow", leaseMs: 10,
       clock: () => observations.shift() ?? 111,
     }),
-    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "lease_expired_during_open",
+    (error) => error.code === "cuna.workspace.journal_invalid" && error.details?.reason === "lease_expired_during_open",
   );
   const recovered = await DurableSyncJournal.open({
     directory: slowDirectory, bindingId: "binding", bindingGeneration: 1, ownerId: "recovered", leaseMs: 10, clock: () => 112,
@@ -566,7 +566,7 @@ test("journal rejects a symlinked directory instead of following caller-controll
   await symlink(target, alias, process.platform === "win32" ? "junction" : "dir");
   await assert.rejects(
     DurableSyncJournal.open({ directory: alias, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" }),
-    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "directory_untrusted",
+    (error) => error.code === "cuna.workspace.journal_invalid" && error.details?.reason === "directory_untrusted",
   );
 });
 
@@ -579,7 +579,7 @@ test("journal rejects a symlinked ancestor rather than trusting only the final d
   await symlink(physical, alias, process.platform === "win32" ? "junction" : "dir");
   await assert.rejects(
     DurableSyncJournal.open({ directory: join(alias, "nested"), bindingId: "binding", bindingGeneration: 1, ownerId: "writer" }),
-    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "directory_untrusted",
+    (error) => error.code === "cuna.workspace.journal_invalid" && error.details?.reason === "directory_untrusted",
   );
 });
 
@@ -592,7 +592,7 @@ test("journal rejects hardlinked child files without modifying the outside targe
   await link(outside, join(directory, "journal.ndjson"));
   await assert.rejects(
     DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" }),
-    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "file_untrusted",
+    (error) => error.code === "cuna.workspace.journal_invalid" && error.details?.reason === "file_untrusted",
   );
   assert.equal(await readFile(outside, "utf8"), "outside-evidence\n");
 });
@@ -617,7 +617,7 @@ test("supervisor clients share one owner, overflow reconciles, and only a fresh 
   assert.equal(first.created, true);
   assert.equal(second.created, false);
   assert.equal(first.supervisor, second.supervisor);
-  assert.throws(() => registry.connect({ ...config, policyDigest: "foreign" }), (error) => error.code === "runa.workspace.supervisor_conflict");
+  assert.throws(() => registry.connect({ ...config, policyDigest: "foreign" }), (error) => error.code === "cuna.workspace.supervisor_conflict");
 
   const convergenceNow = Date.parse("2026-08-08T00:01:00.000Z");
   const supervisor = new LocalSyncSupervisor(config, { clock: () => convergenceNow });
@@ -676,7 +676,7 @@ test("progress exposes measured counts and refuses local-only commit claims", ()
   assert.throws(() => progressFromReceipt({
     authority: "local_manifest", stage: "committed", observedEntries: 10, observedBytes: 100,
     observedAt: "2026-08-08T00:00:00.000Z",
-  }), (error) => error.code === "runa.workspace.progress_unproven");
+  }), (error) => error.code === "cuna.workspace.progress_unproven");
 });
 
 test("N and N-1 durable schema fixtures reject unsafe mutation before a lease is created", async (t) => {
@@ -690,7 +690,7 @@ test("N and N-1 durable schema fixtures reject unsafe mutation before a lease is
   assert.equal(futureInspection.requiresReconciliation, true);
   await assert.rejects(
     DurableSyncJournal.open({ directory: future, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" }),
-    (error) => error.code === "runa.workspace.schema_incompatible",
+    (error) => error.code === "cuna.workspace.schema_incompatible",
   );
   await assert.rejects(readFile(join(future, "writer.lease")), (error) => error.code === "ENOENT");
 
@@ -703,7 +703,7 @@ test("N and N-1 durable schema fixtures reject unsafe mutation before a lease is
   assert.equal((await inspectSyncJournal(previous)).requiresReconciliation, false);
   await assert.rejects(
     DurableSyncJournal.open({ directory: previous, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" }),
-    (error) => error.code === "runa.workspace.schema_incompatible",
+    (error) => error.code === "cuna.workspace.schema_incompatible",
   );
 });
 

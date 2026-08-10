@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { AgentAuthMode, AgentKind } from "../api/contracts.js";
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 import type { ReconciledAgentJourneyIntent } from "./intent.js";
 import {
   planAgentSessionSelection,
@@ -146,9 +146,9 @@ function frozenLedger(ledger: MutableLedger): JourneyResourceLedger {
   });
 }
 
-function cancelled(): RunaError {
-  return new RunaError({
-    code: "runa.journey.cancelled",
+function cancelled(): CunaError {
+  return new CunaError({
+    code: "cuna.journey.cancelled",
     message: "The Cuna journey was cancelled before completion.",
     exitCode: EXIT_CODES.network,
     retryable: true,
@@ -162,10 +162,10 @@ function selectionFailure(
     ReturnType<typeof planMachineSelection> | ReturnType<typeof planAgentSessionSelection>,
     { readonly kind: "select" }
   >,
-): RunaError {
+): CunaError {
   const candidates = plan.kind === "ambiguous" ? plan.candidates.map((candidate) => candidate.id) : undefined;
-  return new RunaError({
-    code: plan.kind === "ambiguous" ? "runa.journey.ambiguous" : "runa.journey.authority_unavailable",
+  return new CunaError({
+    code: plan.kind === "ambiguous" ? "cuna.journey.ambiguous" : "cuna.journey.authority_unavailable",
     message: plan.kind === "ambiguous"
       ? `More than one exact ${target} candidate remains.`
       : `Cuna could not prove a safe ${target} selection.`,
@@ -181,9 +181,9 @@ function selectionFailure(
   });
 }
 
-function unreconcilableCreate(cause: unknown): RunaError {
-  return new RunaError({
-    code: "runa.journey.machine_create_outcome_unreconcilable",
+function unreconcilableCreate(cause: unknown): CunaError {
+  return new CunaError({
+    code: "cuna.journey.machine_create_outcome_unreconcilable",
     message: "Cuna cannot prove whether the machine-create request committed.",
     exitCode: EXIT_CODES.remote,
     retryable: false,
@@ -193,9 +193,9 @@ function unreconcilableCreate(cause: unknown): RunaError {
   });
 }
 
-function unreconcilableAgentSessionCreate(cause: unknown): RunaError {
-  return new RunaError({
-    code: "runa.journey.agent_session_create_outcome_unreconcilable",
+function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
+  return new CunaError({
+    code: "cuna.journey.agent_session_create_outcome_unreconcilable",
     message: "Cuna cannot prove whether the AgentSession create request committed.",
     exitCode: EXIT_CODES.remote,
     retryable: false,
@@ -312,8 +312,8 @@ export async function orchestrateAgentJourney(input: {
       }),
     });
     if (machine.state !== "running") {
-      throw new RunaError({
-        code: "runa.journey.machine_not_ready",
+      throw new CunaError({
+        code: "cuna.journey.machine_not_ready",
         message: "The selected machine did not reach authoritative running state.",
         exitCode: EXIT_CODES.remote,
       });
@@ -394,7 +394,7 @@ export async function orchestrateAgentJourney(input: {
       workspaceGeneration: workspace.generation,
     });
   } catch (error) {
-    if (signal.aborted || (error instanceof RunaError && error.code === "runa.journey.cancelled")) {
+    if (signal.aborted || (error instanceof CunaError && error.code === "cuna.journey.cancelled")) {
       const cleanupSignal = AbortSignal.timeout(5_000);
       try {
         await input.effects.reconcileCancellation({ ledger: frozenLedger(ledger), signal: cleanupSignal });
