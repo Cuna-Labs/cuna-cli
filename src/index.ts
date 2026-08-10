@@ -12,7 +12,13 @@ export {
 export {
   decodeAgentSessionItem,
   decodeAgentSessionPage,
+  decodeAgentSessionAuth,
+  decodeAgentSessionAuthLogout,
+  decodeApiKeyList,
+  decodeAuditRecords,
   decodeCapabilitySnapshot,
+  decodeCredentialRules,
+  decodeOk,
   decodeMachineItem,
   decodeMachinePage,
   decodeRunaIdentity,
@@ -20,15 +26,23 @@ export {
   type AgentKind,
   type AgentAuthMode,
   type AgentSession,
+  type AgentSessionAuth,
+  type AgentSessionAuthEvidenceClass,
+  type AgentSessionAuthState,
   type AgentSessionDesiredState,
   type AgentSessionPage,
   type AgentSessionProcessState,
   type AgentSessionRequestState,
+  type ApiKeyMetadata,
+  type AuditRecord,
   type Capability,
   type CapabilityAvailability,
   type CapabilityInteraction,
   type CapabilityScope,
   type CapabilitySnapshot,
+  type CredentialRule,
+  type CredentialRuleTarget,
+  type JsonValue,
   type Machine,
   type MachinePage,
   type MutationClass,
@@ -59,6 +73,7 @@ export {
   decodeCliContinuationIssued,
   decodeCliContinuationStatus,
   decodeCliIdentityContext,
+  decodeCliSignupCapability,
   decodeCliTokenSet,
   decodeRevocation,
   type CliAuthBootstrap,
@@ -66,6 +81,7 @@ export {
   type CliContinuationStatus,
   type CliIdentityContext,
   type CliIntentClass,
+  type CliSignupCapability,
   type CliTokenSet,
 } from "./auth/human-contracts.js";
 export {
@@ -120,6 +136,11 @@ export {
   type ForegroundTerminalState,
 } from "./terminal/foreground.js";
 export {
+  PassthroughTerminalCoordinator,
+  admitPassthroughDimensions,
+  type PassthroughTerminalCoordinatorOptions,
+} from "./terminal/passthrough.js";
+export {
   buildAppbarModel,
   projectTruth,
   type AppbarModel,
@@ -151,6 +172,18 @@ export {
   type XtermViewportOptions,
 } from "./terminal/xterm-vte.js";
 export { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "./version.js";
-export { createApiTerminalControlPlane } from "./runtime/api-terminal-control-plane.js";
-export { createNodeWebSocketConnector } from "./runtime/node-websocket-connector.js";
-export { createNodeForegroundTerminalHost, createNodeHostTerminalAdapter } from "./pty/node-host-terminal.js";
+export {
+  planAgentSessionSelection,
+  planJourneySelection,
+  planMachineSelection,
+  type AgentSessionSelectionInput,
+  type AgentSessionSelectionObservation,
+  type AgentSessionSelectionPlan,
+  type JourneySelectionInput,
+  type JourneySelectionPlan,
+  type MachineSelectionInput,
+  type MachineSelectionObservation,
+  type MachineSelectionPlan,
+  type SafeAgentSessionCandidate,
+  type SafeMachineCandidate,
+} from "./journey/index.js";

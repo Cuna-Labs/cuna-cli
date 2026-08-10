@@ -5,7 +5,7 @@ import { createNodeWebSocketConnector } from "../dist/runtime/node-websocket-con
 import { RuntimeBoundaryError } from "../dist/runtime/errors.js";
 
 const TERMINAL_ID = "55555555-5555-4555-8555-555555555555";
-const URL = `wss://api.runacode.io/v1/terminal-connections/${TERMINAL_ID}/stream`;
+const URL = `wss://api.getcuna.com/v1/terminal-connections/${TERMINAL_ID}/stream`;
 const TOKEN = `runa_tc_${"A".repeat(43)}`;
 
 class FakeWebSocket extends EventTarget {

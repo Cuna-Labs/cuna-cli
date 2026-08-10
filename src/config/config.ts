@@ -4,7 +4,7 @@ import { EXIT_CODES, RunaError } from "../core/errors.js";
 import { isObject } from "../core/validation.js";
 import type { PlatformAdapter } from "../platform/adapter.js";
 
-export const DEFAULT_BASE_URL = "https://api.runacode.io" as const;
+export const DEFAULT_BASE_URL = "https://api.getcuna.com" as const;
 const MAX_CONFIG_BYTES = 65_536;
 
 export type ConfigSource = "flag" | "environment" | "profile" | "default";
@@ -40,9 +40,9 @@ interface UserConfig {
 function configError(reason: string, source?: ConfigSource): RunaError {
   return new RunaError({
     code: "runa.config.invalid",
-    message: "Runa configuration is invalid.",
+    message: "Cuna configuration is invalid.",
     exitCode: EXIT_CODES.usage,
-    hint: "Run `runa config get --json` after correcting the selected user profile.",
+    hint: "Run `cuna config get --json` after correcting the selected user profile.",
     details: { reason, ...(source === undefined ? {} : { source }) },
   });
 }
@@ -134,9 +134,18 @@ export async function resolveConfig(input: {
   const env = input.env ?? process.env;
   const overrides = input.overrides ?? {};
   const joinPath = input.platform.kind === "windows" ? win32.join : posix.join;
-  const configFile =
-    overrides.configFile ?? env.RUNA_CONFIG_FILE ?? joinPath(input.platform.paths.configDirectory, "config.json");
-  const file = await input.platform.readSafeConfig(configFile, MAX_CONFIG_BYTES);
+  const explicitConfigFile = overrides.configFile ?? env.CUNA_CONFIG_FILE;
+  const preferredConfigFile = joinPath(input.platform.paths.configDirectory, "config.json");
+  let configFile = explicitConfigFile ?? preferredConfigFile;
+  let file = await input.platform.readSafeConfig(configFile, MAX_CONFIG_BYTES);
+  if (!file.exists && explicitConfigFile === undefined && input.platform.paths.legacyConfigDirectory !== undefined) {
+    const legacyConfigFile = joinPath(input.platform.paths.legacyConfigDirectory, "config.json");
+    const legacyFile = await input.platform.readSafeConfig(legacyConfigFile, MAX_CONFIG_BYTES);
+    if (legacyFile.exists) {
+      configFile = legacyConfigFile;
+      file = legacyFile;
+    }
+  }
   const userConfig: UserConfig = file.exists
     ? parseUserConfig(file.text ?? "")
     : Object.freeze({ profiles: Object.freeze({}) });
@@ -146,8 +155,8 @@ export async function resolveConfig(input: {
   if (overrides.profile !== undefined) {
     profile = parseProfileName(overrides.profile, "flag");
     profileSource = "flag";
-  } else if (env.RUNA_PROFILE !== undefined) {
-    profile = parseProfileName(env.RUNA_PROFILE, "environment");
+  } else if (env.CUNA_PROFILE !== undefined) {
+    profile = parseProfileName(env.CUNA_PROFILE, "environment");
     profileSource = "environment";
   } else if (userConfig.selectedProfile !== undefined) {
     profile = userConfig.selectedProfile;
@@ -166,8 +175,8 @@ export async function resolveConfig(input: {
   if (overrides.baseUrl !== undefined) {
     rawBaseUrl = overrides.baseUrl;
     baseUrlSource = "flag";
-  } else if (env.RUNA_BASE_URL !== undefined) {
-    rawBaseUrl = env.RUNA_BASE_URL;
+  } else if (env.CUNA_BASE_URL !== undefined) {
+    rawBaseUrl = env.CUNA_BASE_URL;
     baseUrlSource = "environment";
   } else if (selected?.baseUrl !== undefined) {
     rawBaseUrl = selected.baseUrl;
@@ -177,8 +186,8 @@ export async function resolveConfig(input: {
     baseUrlSource = "default";
   }
 
-  const apiKey = env.RUNA_API_KEY;
-  if (apiKey !== undefined && !/^runa_sk_[A-Za-z0-9_-]{16,256}$/u.test(apiKey)) {
+  const apiKey = env.CUNA_API_KEY;
+  if (apiKey !== undefined && !/^cuna_sk_[A-Za-z0-9_-]{16,256}$/u.test(apiKey)) {
     throw configError("invalid_api_key", "environment");
   }
   return Object.freeze({

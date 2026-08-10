@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { appendFile, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -50,7 +51,7 @@ const digestA = "a".repeat(64);
 const digestB = "b".repeat(64);
 async function temporaryDirectory(t) {
   const directory = await mkdtemp(join(tmpdir(), "runa-sync-test-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.after(() => rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   return directory;
 }
 
@@ -383,25 +384,177 @@ test("journal terminal replay is idempotent, expired writers fail, and uncertain
   await journal.close();
 });
 
-test("expired crash lease transfers with fencing and corrupt journal requires reconciliation", async (t) => {
+test("an expired live writer stays fenced without allowing split-brain takeover", async (t) => {
   const directory = await temporaryDirectory(t);
   let crashedNow = 0;
-  const crashed = await DurableSyncJournal.open({
+  const stale = await DurableSyncJournal.open({
     directory, bindingId: "binding", bindingGeneration: 1, ownerId: "old", leaseMs: 10, now: crashedNow, clock: () => crashedNow,
   });
-  await crashed.append({ operationId: "op-old", baseGeneration: 1, digest: digestA, byteLength: 1 });
+  t.after(() => stale.close().catch(() => undefined));
+  await stale.append({ operationId: "op-old", baseGeneration: 1, digest: digestA, byteLength: 1 });
   crashedNow = 11;
-  const recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "new", leaseMs: 10, now: 11, clock: () => 11 });
   await assert.rejects(
-    crashed.append({ operationId: "op-stale", baseGeneration: 1, digest: digestB, byteLength: 1 }),
+    DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "new", leaseMs: 10, clock: () => 11 }),
+    (error) => error.code === "runa.workspace.workspace_busy",
+  );
+  await assert.rejects(
+    stale.append({ operationId: "op-stale", baseGeneration: 1, digest: digestB, byteLength: 1 }),
     (error) => error.code === "runa.workspace.writer_fenced",
   );
+  await stale.close();
+  const recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "new", leaseMs: 10, clock: () => 11 });
+  assert.equal(recovered.fence, 2);
   await recovered.close();
-  await crashed.close();
   await appendFile(join(directory, "journal.ndjson"), "{corrupt\n");
   const inspection = await inspectSyncJournal(directory);
   assert.equal(inspection.requiresReconciliation, true);
   assert.equal(inspection.reason, "checksum_or_sequence_gap");
+});
+
+test("a crashed process releases kernel writer authority and the next process advances the fence", async (t) => {
+  const directory = await temporaryDirectory(t);
+  const script = `
+    import { DurableSyncJournal } from ${JSON.stringify(new URL("../dist/sync/index.js", import.meta.url).href)};
+    const journal = await DurableSyncJournal.open({ directory: process.argv[1], bindingId: "binding", bindingGeneration: 1, ownerId: "child", leaseMs: 60000 });
+    process.stdout.write(String(journal.fence) + "\\n");
+    setInterval(() => undefined, 1000);
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, directory], {
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill("SIGKILL");
+    await new Promise((resolve) => child.once("close", resolve));
+  });
+  const firstFence = await new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      const line = stdout.split("\n", 1)[0];
+      if (line !== "") resolve(Number(line));
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`journal child exited early (${code}): ${stderr}`)));
+  });
+  assert.equal(firstFence, 1);
+  await assert.rejects(
+    DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "parent" }),
+    (error) => error.code === "runa.workspace.workspace_busy",
+  );
+  child.kill("SIGKILL");
+  await new Promise((resolve) => child.once("close", resolve));
+  const recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "parent" });
+  assert.equal(recovered.fence, 2);
+  await recovered.close();
+});
+
+test("journal lease acquisition and renewal use only the configured trusted clock", async (t) => {
+  const directory = await temporaryDirectory(t);
+  let now = 100;
+  const owner = await DurableSyncJournal.open({
+    directory, bindingId: "binding", bindingGeneration: 1, ownerId: "owner", leaseMs: 10, clock: () => now,
+  });
+  await assert.rejects(
+    DurableSyncJournal.open({
+      directory,
+      bindingId: "binding",
+      bindingGeneration: 1,
+      ownerId: "attacker",
+      leaseMs: 10,
+      now: 10_000,
+      clock: () => now,
+    }),
+    (error) => error.code === "runa.workspace.workspace_busy",
+  );
+  await owner.renew(10_000);
+  now = 111;
+  await assert.rejects(
+    owner.append({ operationId: "expired", baseGeneration: 1, digest: digestA, byteLength: 1 }),
+    (error) => error.code === "runa.workspace.writer_fenced",
+  );
+  await owner.close();
+});
+
+test("journal fails closed on clock rollback, arithmetic overflow, and lease expiry during slow open", async (t) => {
+  const rollbackDirectory = await temporaryDirectory(t);
+  let now = 100;
+  const rollback = await DurableSyncJournal.open({
+    directory: rollbackDirectory, bindingId: "binding", bindingGeneration: 1, ownerId: "rollback", leaseMs: 10, clock: () => now,
+  });
+  now = 99;
+  await assert.rejects(
+    rollback.renew(),
+    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "clock_rollback",
+  );
+  await rollback.close();
+
+  const overflowDirectory = await temporaryDirectory(t);
+  await assert.rejects(
+    DurableSyncJournal.open({
+      directory: overflowDirectory, bindingId: "binding", bindingGeneration: 1, ownerId: "overflow", leaseMs: 1,
+      clock: () => Number.MAX_SAFE_INTEGER,
+    }),
+    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "lease_overflow",
+  );
+
+  const slowDirectory = await temporaryDirectory(t);
+  const observations = [100, 111];
+  await assert.rejects(
+    DurableSyncJournal.open({
+      directory: slowDirectory, bindingId: "binding", bindingGeneration: 1, ownerId: "slow", leaseMs: 10,
+      clock: () => observations.shift() ?? 111,
+    }),
+    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "lease_expired_during_open",
+  );
+  const recovered = await DurableSyncJournal.open({
+    directory: slowDirectory, bindingId: "binding", bindingGeneration: 1, ownerId: "recovered", leaseMs: 10, clock: () => 112,
+  });
+  await recovered.close();
+});
+
+test("journal rejects a symlinked directory instead of following caller-controlled path authority", async (t) => {
+  const root = await temporaryDirectory(t);
+  const target = join(root, "physical");
+  const alias = join(root, "alias");
+  await mkdir(target);
+  await symlink(target, alias, process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(
+    DurableSyncJournal.open({ directory: alias, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" }),
+    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "directory_untrusted",
+  );
+});
+
+test("journal rejects a symlinked ancestor rather than trusting only the final directory component", async (t) => {
+  const root = await temporaryDirectory(t);
+  const physical = join(root, "physical");
+  const nested = join(physical, "nested");
+  const alias = join(root, "alias");
+  await mkdir(nested, { recursive: true });
+  await symlink(physical, alias, process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(
+    DurableSyncJournal.open({ directory: join(alias, "nested"), bindingId: "binding", bindingGeneration: 1, ownerId: "writer" }),
+    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "directory_untrusted",
+  );
+});
+
+test("journal rejects hardlinked child files without modifying the outside target", async (t) => {
+  const directory = await temporaryDirectory(t);
+  const outside = join(await temporaryDirectory(t), "outside.ndjson");
+  await writeFile(outside, "outside-evidence\n");
+  const initializer = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "init" });
+  await initializer.close();
+  await link(outside, join(directory, "journal.ndjson"));
+  await assert.rejects(
+    DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" }),
+    (error) => error.code === "runa.workspace.journal_invalid" && error.details?.reason === "file_untrusted",
+  );
+  assert.equal(await readFile(outside, "utf8"), "outside-evidence\n");
 });
 
 test("queue full marks the root dirty, preserves admitted intents, and never crosses a delete barrier", () => {

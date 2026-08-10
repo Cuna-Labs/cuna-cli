@@ -1,0 +1,22 @@
+{
+  "name": "@cuna_labs/cli-native-darwin-x64",
+  "version": "0.1.0",
+  "description": "Signed native authentication artifacts for Cuna CLI on macOS x64.",
+  "license": "Apache-2.0",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "cuna-native-authority.node",
+    "runa-native-bridge",
+    "runa-native-bridge.manifest.json",
+    "runa-native-bridge.spdx.json",
+    "runa-native-bridge.provenance.json"
+  ],
+  "exports": {
+    "./package.json": "./package.json"
+  }
+}

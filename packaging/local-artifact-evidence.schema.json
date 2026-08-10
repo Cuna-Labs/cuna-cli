@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runacode.io/schemas/runa-cli-local-artifact-evidence-v1.json",
-  "title": "Runa CLI local non-release artifact evidence",
+  "$id": "https://getcuna.com/schemas/cuna-cli-local-artifact-evidence-v1.json",
+  "title": "Cuna CLI local non-release artifact evidence",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "authority", "releaseEligible", "limitations", "repository", "sourceCommit", "sourceTreeStatus", "sourceStatusSha256", "package", "artifact", "sbom", "supportPolicy", "runtimeIdentity", "observations", "environment", "generatedAt"],
@@ -10,7 +10,7 @@
     "authority": {"const": "LOCAL_NON_RELEASE_EVIDENCE"},
     "releaseEligible": {"const": false},
     "limitations": {"type": "array", "minItems": 5, "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
-    "repository": {"const": "Runa-Laboratories/runa-cli"},
+    "repository": {"const": "Cuna-Labs/cuna-cli"},
     "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "sourceTreeStatus": {"enum": ["CLEAN", "DIRTY"]},
     "sourceStatusSha256": {"$ref": "#/$defs/sha256"},
@@ -18,7 +18,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["name", "version"],
-      "properties": {"name": {"const": "@runa_laboratories/cli"}, "version": {"type": "string", "minLength": 1}}
+      "properties": {"name": {"const": "@cuna_labs/cli"}, "version": {"type": "string", "minLength": 1}}
     },
     "artifact": {
       "type": "object",

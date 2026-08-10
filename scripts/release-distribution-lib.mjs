@@ -26,13 +26,23 @@ const CANDIDATE_INVOCATION_POLICIES = new Set(["npm-exact-version", "bun-exact-v
 const CHANNEL_ROLES = new Set(["canonical-artifact", "registry-projection", "bootstrap-projection", "formula-projection", "package-projection"]);
 const RECEIPT_EVIDENCE_FILE = /^(?!\/)(?!.*(?:^|\/)\.\.?(?:\/|$))[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\.json$/u;
 const PACKAGE_MANAGER_VERSION = /^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$/u;
-const STABLE_DISTRIBUTION_TEST_ID = "TC-053-DISTRIBUTION-CHANNEL-TRANSACTION-V1";
+const STABLE_DISTRIBUTION_TEST_ID = "CUNA-DISTRIBUTION-CHANNEL-TRANSACTION-V1";
 const CHANNEL_CONSTRAINTS = Object.freeze({
   npm: Object.freeze({ role: "canonical-artifact", installerOfRecord: "npm", candidateInvocationPolicy: "npm-exact-version" }),
   bun: Object.freeze({ role: "registry-projection", installerOfRecord: "bun", candidateInvocationPolicy: "bun-exact-version" }),
   curl: Object.freeze({ role: "bootstrap-projection", installerOfRecord: "npm", candidateInvocationPolicy: "verified-projection" }),
   homebrew: Object.freeze({ role: "formula-projection", installerOfRecord: "homebrew", candidateInvocationPolicy: "verified-projection" }),
   aur: Object.freeze({ role: "package-projection", installerOfRecord: "pacman", candidateInvocationPolicy: "verified-projection" }),
+});
+const BUN_WINDOWS_BLOCK = Object.freeze({
+  platform: "win32-x64",
+  availability: "RELEASE_BLOCKED",
+  reasonCode: "BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS",
+  verifiedAffectedVersions: Object.freeze(["1.3.14"]),
+  upstreamRepository: "oven-sh/bun",
+  upstreamCommit: "0d9b296af33f2b851fcbf4df3e9ec89751734ba4",
+  fallbackChannel: "npm",
+  readmissionGate: "A supported Bun release must prove isolated global install, public-shim execution, global uninstall, and zero remaining package-managed paths on every Windows Tier-1 Node lane.",
 });
 
 export function exactKeys(value, expected, label) {
@@ -74,7 +84,10 @@ export function validateSupportPolicy(policy) {
   invariant(policy.schemaVersion === 2, "Unsupported support-policy schema");
   invariant(policy.packageName === PACKAGE_NAME, "Support policy package mismatch");
   invariant(policy.canonicalRegistry === REGISTRY, "Support policy registry mismatch");
-  invariant(JSON.stringify(policy.architectures) === JSON.stringify(["x64"]), "Support policy architecture claim differs from the admitted x64 set");
+  invariant(
+    JSON.stringify(policy.architectures) === JSON.stringify(["x64", "arm64"]),
+    "Support policy package architecture claim differs from the architecture-neutral runtime closure",
+  );
   exactKeys(policy.node, ["minimum", "supportedLines", "tested"], "support policy Node range");
   invariant(policy.node.minimum === "22.17.1", "Support policy Node minimum differs from the admitted runtime floor");
   invariant(
@@ -135,6 +148,20 @@ export function validateSupportPolicy(policy) {
       );
     }
   }
+  for (const platform of SUPPORTED_PLATFORMS) {
+    for (const node of policy.node.tested) {
+      invariant(
+        policy.ciMatrix.some(
+          (entry) =>
+            entry.claim === "observation-only" &&
+            entry.platform === platform &&
+            entry.architecture === "arm64" &&
+            entry.node === node,
+        ),
+        `Support policy lacks non-authorizing ${platform}-arm64 observation for Node ${node}`,
+      );
+    }
+  }
   invariant(
     Array.isArray(policy.channelOrder) && policy.channelOrder.length === APPROVED_CHANNEL_IDS.size &&
       new Set(policy.channelOrder).size === policy.channelOrder.length &&
@@ -147,7 +174,7 @@ export function validateSupportPolicy(policy) {
     const constraints = CHANNEL_CONSTRAINTS[id];
     exactKeys(
       channel,
-      ["role", "availability", "artifactChannel", "installerOfRecord", "platforms", "projectionFile", "publicCommand", "candidateInvocationPolicy", "testedNodeVersions", "runtimeDependency"],
+      ["role", "availability", "artifactChannel", "installerOfRecord", "platforms", "blockedPlatforms", "projectionFile", "publicCommand", "candidateInvocationPolicy", "testedNodeVersions", "runtimeDependency"],
       `support policy channel ${id}`,
     );
     invariant(CHANNEL_ROLES.has(channel.role), `${id} role is unknown`);
@@ -161,6 +188,33 @@ export function validateSupportPolicy(policy) {
     for (const platform of channel.platforms) {
       invariant(SUPPORTED_PLATFORM_KEYS.has(platform), `${id} claims unsupported platform ${platform}`);
       invariant(supported.has(platform), `${id} claims platform ${platform} without a support-matrix lane`);
+    }
+    invariant(Array.isArray(channel.blockedPlatforms), `${id} blocked-platform set is missing`);
+    const blockedPlatformIds = new Set();
+    for (const blocked of channel.blockedPlatforms) {
+      exactKeys(
+        blocked,
+        ["platform", "availability", "reasonCode", "verifiedAffectedVersions", "upstreamRepository", "upstreamCommit", "fallbackChannel", "readmissionGate"],
+        `${id} blocked platform`,
+      );
+      invariant(SUPPORTED_PLATFORM_KEYS.has(blocked.platform), `${id} blocks unknown platform ${blocked.platform}`);
+      invariant(!channel.platforms.includes(blocked.platform), `${id} platform ${blocked.platform} cannot be both supported and blocked`);
+      invariant(!blockedPlatformIds.has(blocked.platform), `${id} blocked-platform set contains duplicates`);
+      blockedPlatformIds.add(blocked.platform);
+      invariant(blocked.availability === "RELEASE_BLOCKED", `${id} blocked platform weakens release status`);
+      invariant(typeof blocked.reasonCode === "string" && /^[A-Z][A-Z0-9_]{7,127}$/u.test(blocked.reasonCode), `${id} blocked-platform reason code is invalid`);
+      invariant(Array.isArray(blocked.verifiedAffectedVersions) && blocked.verifiedAffectedVersions.length > 0, `${id} blocked platform lacks a verified affected version`);
+      invariant(blocked.verifiedAffectedVersions.every((version) => /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/u.test(version)), `${id} blocked platform has an invalid affected version`);
+      invariant(typeof blocked.upstreamRepository === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(blocked.upstreamRepository), `${id} blocked platform has an invalid upstream repository`);
+      invariant(typeof blocked.upstreamCommit === "string" && /^[0-9a-f]{40}$/u.test(blocked.upstreamCommit), `${id} blocked platform has an invalid upstream commit`);
+      invariant(APPROVED_CHANNEL_IDS.has(blocked.fallbackChannel) && blocked.fallbackChannel !== id, `${id} blocked platform fallback is invalid`);
+      invariant(policy.channels[blocked.fallbackChannel]?.platforms?.includes(blocked.platform), `${id} blocked platform fallback does not support ${blocked.platform}`);
+      invariant(typeof blocked.readmissionGate === "string" && blocked.readmissionGate.length >= 32 && blocked.readmissionGate.length <= 512, `${id} blocked platform lacks a bounded readmission gate`);
+    }
+    if (id === "bun") {
+      invariant(JSON.stringify(channel.blockedPlatforms) === JSON.stringify([BUN_WINDOWS_BLOCK]), "Bun Windows block differs from the verified upstream defect and re-admission gate");
+    } else {
+      invariant(channel.blockedPlatforms.length === 0, `${id} contains an unapproved platform block`);
     }
     normalizeRelativeFile(channel.projectionFile, `${id}.projectionFile`);
     invariant(typeof channel.publicCommand === "string" && channel.publicCommand.length > 0, `${id} public command is missing`);
@@ -190,6 +244,10 @@ export function channelDefinitionsFromSupportPolicy(policy) {
     return [id, Object.freeze({
       ...channel,
       platforms: Object.freeze([...channel.platforms]),
+      blockedPlatforms: Object.freeze(channel.blockedPlatforms.map((blocked) => Object.freeze({
+        ...blocked,
+        verifiedAffectedVersions: Object.freeze([...blocked.verifiedAffectedVersions]),
+      }))),
       testedNodeVersions: Object.freeze([...channel.testedNodeVersions]),
     })];
   })));
@@ -229,7 +287,7 @@ export async function validateCycloneDxSbom(file, envelope) {
   const component = sbom.metadata?.component;
   invariant(component && typeof component === "object", "SBOM metadata.component is missing");
   invariant(component.version === envelope.version, "SBOM component version differs from the release candidate");
-  const scopedPurl = `pkg:npm/%40runa_laboratories/cli@${envelope.version}`;
+  const scopedPurl = `pkg:npm/%40cuna_labs/cli@${envelope.version}`;
   invariant(
     component.purl === scopedPurl,
     "SBOM component identity differs from the release package",
@@ -305,7 +363,7 @@ export function validateDistributionManifest(manifest, envelope, channelDefiniti
     const definition = channelDefinitions[id];
     exactKeys(
       channel,
-      ["id", "role", "availability", "artifactChannel", "installerOfRecord", "runtimeDependency", "platforms", "publicCommand", "candidateInvocation", "artifactSha256", "projection", "liveEvidenceReceipt"],
+      ["id", "role", "availability", "artifactChannel", "installerOfRecord", "runtimeDependency", "platforms", "blockedPlatforms", "publicCommand", "candidateInvocation", "artifactSha256", "projection", "liveEvidenceReceipt"],
       `channel ${id}`,
     );
     invariant(channel.id === id, `Channel order or identity mismatch at ${id}`);
@@ -315,6 +373,7 @@ export function validateDistributionManifest(manifest, envelope, channelDefiniti
     invariant(channel.installerOfRecord === definition.installerOfRecord, `${id} installer-of-record mismatch`);
     invariant(channel.runtimeDependency === definition.runtimeDependency, `${id} runtime-dependency mismatch`);
     invariant(JSON.stringify(channel.platforms) === JSON.stringify(definition.platforms), `${id} platform claim mismatch`);
+    invariant(JSON.stringify(channel.blockedPlatforms) === JSON.stringify(definition.blockedPlatforms), `${id} blocked-platform claim mismatch`);
     invariant(channel.publicCommand === definition.publicCommand, `${id} public command mismatch`);
     invariant(channel.candidateInvocation === commands[id], `${id} candidate invocation mismatch`);
     invariant(channel.artifactSha256 === envelope.tarball.sha256, `${id} does not bind the candidate tarball`);
@@ -350,6 +409,9 @@ export function validateDistributionManifest(manifest, envelope, channelDefiniti
   const blockers = new Set(manifest.readiness.blockers);
   for (const blocker of [
     "PUBLISHED_NPM_TARBALL_AND_PROVENANCE_NOT_VERIFIED",
+    "SIGNED_PLATFORM_CREDENTIAL_BROWSER_BRIDGES_MISSING",
+    "WINDOWS_OWNED_PROCESS_HANDLE_IDENTITY_AUTHORITY_MISSING",
+    "BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS",
     "CHANNEL_INSTALL_RECEIPTS_MISSING",
     "ROLLBACK_OR_FIXED_FORWARD_REHEARSAL_MISSING",
     "OBSERVATION_THRESHOLDS_AND_TELEMETRY_MISSING",
@@ -440,7 +502,7 @@ export function validateDistributionReceipt(receipt, {
     "attestation statement",
   );
   invariant(statement.schemaVersion === 1, "Unsupported distribution-attestation statement schema");
-  invariant(statement.predicateType === "https://runacode.io/attestations/runa-cli-distribution-observation/v1", "Distribution-attestation predicate type is invalid");
+  invariant(statement.predicateType === "https://getcuna.com/attestations/cuna-cli-distribution-observation/v1", "Distribution-attestation predicate type is invalid");
 
   exactKeys(statement.issuer, ["provider", "repository", "workflow", "workflowRef", "sourceRef", "sourceCommit", "runId", "runAttempt"], "attestation issuer");
   invariant(statement.issuer.provider === "github-actions", "Attestation issuer provider is not admissible");
@@ -528,14 +590,14 @@ export function validateDistributionReceipt(receipt, {
   invariant(statement.execution.environmentPolicy.userStateSentinels === true, "Receipt environment omits user-state sentinels");
   invariant(statement.execution.environmentPolicy.environmentId === statement.subject.receiptId, "Receipt environment identity differs from its matrix cell");
   exactKeys(statement.execution.publicShimResolution, ["command", "resolutionMethod", "resolvedPath", "internalModuleBypass"], "receipt public shim resolution");
-  invariant(statement.execution.publicShimResolution.command === "runa" && statement.execution.publicShimResolution.resolutionMethod === "shell-path", "Receipt did not resolve the public runa command through the shell");
-  invariant(statement.execution.publicShimResolution.internalModuleBypass === false, "Receipt used an internal-module bypass instead of the public runa shim");
+  invariant(statement.execution.publicShimResolution.command === "cuna" && statement.execution.publicShimResolution.resolutionMethod === "shell-path", "Receipt did not resolve the public cuna command through the shell");
+  invariant(statement.execution.publicShimResolution.internalModuleBypass === false, "Receipt used an internal-module bypass instead of the public cuna shim");
   const resolvedShim = statement.execution.publicShimResolution.resolvedPath;
   invariant(typeof resolvedShim === "string" && resolvedShim.length > 0 && resolvedShim.length <= 1024 && !/[\r\n\0]/u.test(resolvedShim), "Receipt public shim path is invalid");
   if (statement.subject.platform === "win32") {
-    invariant(path.win32.isAbsolute(resolvedShim) && path.win32.basename(resolvedShim).toLowerCase() === "runa.cmd", "Windows receipt did not resolve the public runa.cmd shim");
+    invariant(path.win32.isAbsolute(resolvedShim) && path.win32.basename(resolvedShim).toLowerCase() === "cuna.cmd", "Windows receipt did not resolve the public cuna.cmd shim");
   } else {
-    invariant(path.posix.isAbsolute(resolvedShim) && path.posix.basename(resolvedShim) === "runa", "POSIX receipt did not resolve the public runa shim");
+    invariant(path.posix.isAbsolute(resolvedShim) && path.posix.basename(resolvedShim) === "cuna", "POSIX receipt did not resolve the public cuna shim");
   }
 
   exactKeys(statement.observations, Object.keys(OBSERVATION_TYPES), "receipt observations");

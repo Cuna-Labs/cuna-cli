@@ -24,14 +24,24 @@ export interface RemoteAgentSessionEvidence {
   readonly evidenceRevision: string;
 }
 
+/**
+ * Immutable authority admitted before a terminal attach begins. The runtime
+ * revalidates this exact process generation and capability revision before and
+ * after issuing a one-use connection grant.
+ */
+export interface TerminalAttachmentAdmission {
+  readonly observation: RemoteAgentSessionEvidence;
+  readonly capability: CapabilityAdmission;
+}
+
 export type {
   TerminalConnectionCapability,
   TerminalConnectionGrant,
 } from "../api/contracts.js";
 
 export interface TerminalControlPlane {
-  discoverCapabilities(scope: "agent_session", resourceId: string): Promise<CapabilitySnapshot>;
-  observeAgentSession(agentSessionId: string): Promise<RemoteAgentSessionEvidence>;
+  discoverCapabilities(scope: "agent_session", resourceId: string, signal?: AbortSignal): Promise<CapabilitySnapshot>;
+  observeAgentSession(agentSessionId: string, signal?: AbortSignal): Promise<RemoteAgentSessionEvidence>;
   createTerminalConnection(input: {
     readonly agentSessionId: string;
     readonly protocol: typeof TERMINAL_PROTOCOL;
@@ -39,6 +49,7 @@ export interface TerminalControlPlane {
     readonly idempotencyKey: string;
     readonly capabilityEvidence: CapabilityAdmission;
     readonly resumeHandle?: string;
+    readonly signal?: AbortSignal;
   }): Promise<TerminalConnectionGrant>;
 }
 
@@ -62,7 +73,7 @@ export function createUnavailableTerminalControlPlane(): TerminalControlPlane {
   const unavailable = async (): Promise<never> => {
     throw runtimeFailure(
       "control_plane_unavailable",
-      "This Runa deployment does not expose the AgentSession terminal producer contract.",
+      "This Cuna deployment does not expose the AgentSession terminal producer contract.",
     );
   };
   return Object.freeze({
@@ -138,7 +149,7 @@ export function validateTerminalGrant(input: {
   for (const required of input.requiredCapabilities ?? []) {
     const matches = grant.capabilities.filter((capability) => capability.name === required);
     if (matches.length !== 1 || matches[0]?.availability === "unknown") {
-      throw runtimeFailure("capability_unknown", `Runa cannot prove terminal capability ${required}.`);
+      throw runtimeFailure("capability_unknown", `Cuna cannot prove terminal capability ${required}.`);
     }
     if (matches[0]?.availability !== "supported") {
       throw runtimeFailure("capability_unsupported", `Terminal capability ${required} is unsupported.`);
@@ -160,7 +171,7 @@ export function validateTerminalGrant(input: {
     url.pathname !== `/v1/terminal-connections/${grant.terminalSessionId}/stream` ||
     !input.allowedRunaOrigins.some((origin) => toWebSocketOrigin(origin) === url.origin)
   ) {
-    throw runtimeFailure("grant_invalid", "The terminal connection URL is not an allowlisted Runa origin.");
+    throw runtimeFailure("grant_invalid", "The terminal connection URL is not an allowlisted Cuna origin.");
   }
   if (grant.connectUrl.includes(grant.connectToken)) {
     throw runtimeFailure("grant_invalid", "The terminal token must not be embedded in the connection URL.");

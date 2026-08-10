@@ -8,39 +8,52 @@ import {
 } from "./contracts.js";
 import { createUnavailableCredentialBackend } from "./unavailable-backend.js";
 
-export function createMacOsKeychainBackend(input: {
+export function createNativeBridgeBackend(input: {
+  readonly platform: "win32" | "darwin";
   readonly bridge?: NativeCredentialBridge;
   readonly clock?: () => number;
-} = {}): SecureCredentialBackend {
+}): SecureCredentialBackend {
   const clock = input.clock ?? Date.now;
   if (input.bridge === undefined) {
     return createUnavailableCredentialBackend({
-      backendId: "macos-keychain",
-      platform: "darwin",
-      reason: "A native memory-only Keychain bridge is not installed; argv-based password writes are prohibited.",
+      backendId: input.platform === "win32" ? "windows-native-vault-required" : "macos-keychain",
+      platform: input.platform,
+      reason: "An admitted signed native credential bridge is not installed.",
       clock,
     });
   }
   const bridge = input.bridge;
+  if (bridge.platform !== input.platform) {
+    return createUnavailableCredentialBackend({
+      backendId: bridge.backendId,
+      platform: input.platform,
+      reason: "The native credential bridge platform binding does not match this runtime.",
+      clock,
+    });
+  }
   let cachedEvidence: CredentialBackendEvidence | undefined;
   const backend: SecureCredentialBackend = {
     backendId: bridge.backendId,
-    platform: "darwin",
+    platform: input.platform,
     probe: async () => {
       const now = clock();
       if (cachedEvidence !== undefined && cachedEvidence.expiresAt > now) return cachedEvidence;
       const target = `runa-cli:probe:${randomBytes(16).toString("hex")}`;
       const sentinel = randomBytes(32);
+      let cleanupProven = false;
+      let observed: Uint8Array | undefined;
       try {
         await bridge.replace(target, sentinel);
-        const observed = await bridge.read(target);
-        await bridge.delete(target);
+        observed = await bridge.read(target);
         const verified = observed !== undefined && equalBytes(observed, sentinel);
         observed?.fill(0);
+        observed = undefined;
+        await bridge.delete(target);
+        cleanupProven = true;
         cachedEvidence = {
           protocol: CREDENTIAL_BACKEND_PROTOCOL,
           backendId: bridge.backendId,
-          platform: "darwin",
+          platform: input.platform,
           status: verified ? "verified" : "unknown",
           observedAt: now,
           expiresAt: now + 60_000,
@@ -51,7 +64,7 @@ export function createMacOsKeychainBackend(input: {
         cachedEvidence = {
           protocol: CREDENTIAL_BACKEND_PROTOCOL,
           backendId: bridge.backendId,
-          platform: "darwin",
+          platform: input.platform,
           status: "unavailable",
           observedAt: now,
           expiresAt: now + 5_000,
@@ -59,8 +72,28 @@ export function createMacOsKeychainBackend(input: {
           reason: "The native Keychain bridge failed its live round trip.",
         };
       } finally {
+        observed?.fill(0);
         sentinel.fill(0);
-        try { await bridge.delete(target); } catch { /* best-effort probe cleanup */ }
+        if (!cleanupProven) {
+          try {
+            await bridge.delete(target);
+            cleanupProven = true;
+          } catch {
+            cleanupProven = false;
+          }
+        }
+      }
+      if (!cleanupProven) {
+        cachedEvidence = {
+          protocol: CREDENTIAL_BACKEND_PROTOCOL,
+          backendId: bridge.backendId,
+          platform: input.platform,
+          status: "unavailable",
+          observedAt: now,
+          expiresAt: now + 5_000,
+          source: "probe_failed",
+          reason: "The native credential bridge could not prove probe cleanup.",
+        };
       }
       return cachedEvidence;
     },
@@ -69,6 +102,13 @@ export function createMacOsKeychainBackend(input: {
     delete: async (target) => bridge.delete(target),
   };
   return backend;
+}
+
+export function createMacOsKeychainBackend(input: {
+  readonly bridge?: NativeCredentialBridge;
+  readonly clock?: () => number;
+} = {}): SecureCredentialBackend {
+  return createNativeBridgeBackend({ platform: "darwin", ...input });
 }
 
 function equalBytes(left: Uint8Array, right: Uint8Array): boolean {

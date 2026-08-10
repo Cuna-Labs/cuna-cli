@@ -1,54 +1,65 @@
-# Runa CLI
+# Cuna CLI
 
-[![CI](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/codeql.yml)
+[![CI](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-22.17.1%2B%20%7C%2024.4.1%2B-339933?logo=node.js&logoColor=white)](package.json)
 
-Run cloud development agents from a local terminal through Runa's public,
+Run cloud development agents from a local terminal through Cuna's public,
 policy-enforced control plane.
 
-Runa CLI is designed to make Claude Code, Codex, OpenClaw, and future agents
+Cuna CLI is designed to make Claude Code, Codex, OpenClaw, and future agents
 feel local while their processes, durable sessions, and isolated workspaces run
-on Runa cloud machines. The CLI keeps machine lifecycle, synchronization,
+on Cuna cloud machines. The CLI keeps machine lifecycle, synchronization,
 authorizations, and runtime evidence explicit instead of hiding them behind an
 opaque remote shell.
 
 > [!WARNING]
-> Runa CLI is under active implementation and is not GA. The npm, Bun, curl,
+> Cuna CLI is under active implementation and is not GA. The npm, Bun, curl,
 > Homebrew, and AUR commands below are the approved distribution interfaces;
 > this repository does not claim that every channel is live yet.
 
 ## Current capabilities
 
 - Versioned human and JSON output with stable error and exit-code categories.
-- Exact public Runa API-origin validation and bounded authenticated transport.
+- Exact public Cuna API-origin validation and bounded authenticated transport.
 - Polling-only browser sign-in contracts with PKCE, OS-vault refresh rotation,
   and memory-only access tokens; native Windows browser and vault adapters are
   still blocked and fail closed.
 - Capability discovery that treats absent, stale, contradictory, or unknown
   evidence as unauthorized for mutation.
-- Machine and AgentSession command foundations over public Runa contracts.
+- Machine and AgentSession command foundations over public Cuna contracts.
 - Explicit Windows, macOS, and Linux path/configuration adapters.
 - Network-free installed-artifact identity and self-test.
 - Fail-closed gates for features whose producer contract or runtime is not yet
   available.
 
-Cloud terminal attachment, daemon integration, workspace synchronization, and
+Foreground terminal attachment is implemented as a capability-gated preview and
+fails before terminal ownership unless the server proves a current native
+AgentSession terminal producer. Daemon integration, workspace synchronization, and
 the local companion remain pre-release work. Browser authentication is
-implemented against the commit-pinned public 1.4.0 candidate contract.
+implemented against the local public 1.5.0 candidate contract. Its immutable
+contract gitlink and provenance approval remain release-blocked.
 Canonical contract approval, producer deployment and native Windows adapters
 remain blocked. Source code or a documented interface is not evidence that a
 capability is deployed.
 
+The Windows native credential and browser boundary additionally requires an
+owned `CreateProcessW` process handle to remain live through loaded-image
+verification and protected-stdin handoff. PID-only or path-only checks are not
+accepted. Until that authority is implemented, signed, and independently
+verified, those native operations and the release remain blocked.
+
 ## Quick start for contributors
 
 Node.js 22.17.1+ on the Node 22 line or Node.js 24.4.1+ on the Node 24 line is
-required. The current candidate supports x64 only.
+required. The npm payload is architecture-neutral for x64 and arm64. The
+release-admitted distribution matrix remains x64 until the non-authorizing
+arm64 installed-artifact lanes produce reviewable receipts.
 
 ```sh
-git clone https://github.com/Runa-Laboratories/runa-cli.git
-cd runa-cli
+git clone https://github.com/Cuna-Labs/cuna-cli.git
+cd cuna-cli
 npm ci --ignore-scripts
 npm run lint
 npm run typecheck
@@ -58,41 +69,50 @@ npm test
 Inspect the local build without making a network request:
 
 ```sh
-node dist/bin/runa.js self-test --offline --json
-node dist/bin/runa.js version --json
+node dist/bin/cuna.js self-test --offline --json
+node dist/bin/cuna.js version --json
 ```
 
 ## Installation interfaces
 
 | Surface | Command | Platform | Current status |
 | --- | --- | --- | --- |
-| npm | `npm install -g @runa_laboratories/cli` | Windows x64, Intel macOS x64, Linux x64 | Not live; canonical publication is gated |
-| Bun | `bun add --global @runa_laboratories/cli` | Windows x64, Intel macOS x64, Linux x64 | Not live; projects the same Node-based npm artifact |
-| curl | `curl -fsSL https://runacode.io/install \| sh` | Intel macOS x64, Linux x64 | Not live; endpoint and recovery evidence are pending |
-| Homebrew | `brew install Runa-Laboratories/tap/runa` | Intel macOS x64, Linux x64 | Not live; tap and installed-product evidence are pending |
-| paru/AUR | `paru -S runa-cli-bin` | Arch Linux x64 | Not live; AUR ownership and installed-product evidence are pending |
+| npm | `npm install -g @cuna_labs/cli` | Architecture-neutral payload; Windows, macOS, and Linux arm64 remain observational | Not live; canonical publication is gated and x64 is the release-admitted matrix |
+| Bun | `bun add --global @cuna_labs/cli` | Linux x64 and Intel macOS x64; Windows x64 is explicitly blocked | Not live; Windows must use the npm command until Bun proves clean global uninstall |
+| curl | `curl -fsSL https://getcuna.com/install \| sh` | Intel macOS x64, Linux x64 | Not live; endpoint and recovery evidence are pending |
+| Homebrew | `brew install Cuna-Labs/tap/cuna` | Intel macOS x64, Linux x64 | Not live; tap and installed-product evidence are pending |
+| paru/AUR | `paru -S cuna-cli-bin` | Arch Linux x64 | Not live; AUR ownership and installed-product evidence are pending |
 
 Every projection must install the exact admitted npm tarball. No channel may
 rebuild, patch, or independently version the CLI.
+
+Windows remains a Tier-1 Cuna platform through npm. Bun 1.3.14 removes the
+global package record and package directory on Windows but leaves its generated
+`cuna.exe` and `cuna.bunx` shims behind. Cuna does not claim ownership of those
+package-manager paths and will not delete them from a lifecycle script. The Bun
+Windows projection remains release-blocked until a supported Bun release proves
+isolated install, public-shim execution, uninstall, and zero remaining managed
+paths on every admitted Windows Node lane. Use
+`npm install -g @cuna_labs/cli` on Windows.
 
 ## Command surface
 
 The current foundation exposes:
 
 ```text
-runa capabilities
-runa login
-runa whoami
-runa logout
-runa machines list
-runa machines create --name NAME --idempotency-key KEY --yes
-runa machines start|pause|resume|stop ID --yes
-runa machines delete ID --yes
-runa agent-sessions list --machine ID
-runa agent-sessions create --machine ID --agent claude-code --idempotency-key KEY --yes
-runa config get
-runa self-test --offline --json
-runa version --json
+cuna capabilities
+cuna login
+cuna whoami
+cuna logout
+cuna machines list
+cuna machines create --name NAME --idempotency-key KEY --yes
+cuna machines start|pause|resume|stop ID --yes
+cuna machines delete ID --yes
+cuna agent-sessions list --machine ID
+cuna agent-sessions create --machine ID --agent claude-code --idempotency-key KEY --yes
+cuna config get
+cuna self-test --offline --json
+cuna version --json
 ```
 
 Commands that depend on an unavailable producer or runtime return a stable
@@ -101,22 +121,23 @@ successful mutation.
 
 ### Foreground terminal keys
 
-When the foreground terminal capability becomes available, `Ctrl+]` is Runa's
+When the foreground terminal capability becomes available, `Ctrl+]` is Cuna's
 local escape prefix. `Ctrl+] ?` toggles trusted in-terminal help; `Ctrl+] 1`…
 `4` selects a tab, `Ctrl+] n` selects the next tab, `Ctrl+] d` detaches the
 local view, and `Ctrl+] Ctrl+]` sends a literal prefix to the cloud session.
-These keys are ignored as Runa commands inside bracketed paste. Ordinary
+These keys are ignored as Cuna commands inside bracketed paste. Ordinary
 `Ctrl+C` and `Ctrl+Z` continue to the selected cloud session.
 
 ## Configuration and authentication
 
 Configuration precedence is flag, environment, selected user profile, then the
-canonical default. Production requests use exactly `https://api.runacode.io`.
+canonical default. Production requests use exactly `https://api.getcuna.com`.
 Custom origins require an explicit development profile; repository content is
 never a configuration authority.
 
-`RUNA_API_KEY` is supported only as an explicit automation credential and is
-never persisted automatically. Interactive `runa login` uses the browser
+`CUNA_API_KEY` is the only explicit automation credential environment variable
+accepted by this pre-GA CLI. It is never persisted automatically. Interactive
+`cuna login` uses the browser
 continuation contract without a local HTTP listener. Its renewable credential
 and binding metadata are stored only in the operating-system vault; access
 tokens remain process-memory-only. The automation and interactive credential
@@ -125,19 +146,19 @@ authorities never fall back to each other.
 Never place API keys in command-line arguments, repository files, issue reports,
 terminal captures, or diagnostics.
 
-Keep endpoint protection enabled while installing or running Runa. A security
+Keep endpoint protection enabled while installing or running Cuna. A security
 detection blocks release and should be reported with the artifact digest and
-product log; Runa does not require antivirus exclusions.
+product log; Cuna does not require antivirus exclusions.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  User["Local developer terminal"] --> CLI["Runa CLI"]
+  User["Local developer terminal"] --> CLI["Cuna CLI"]
   CLI --> Daemon["Per-user local daemon"]
-  CLI --> API["Public Runa API"]
+  CLI --> API["Public Cuna API"]
   Daemon --> Sync["Workspace sync supervisor"]
-  API --> Machine["Runa cloud machine"]
+  API --> Machine["Cuna cloud machine"]
   Machine --> Sessions["Independent AgentSessions"]
   CLI --> Viewports["Isolated terminal viewports"]
   Viewports --> Sessions
@@ -168,7 +189,7 @@ change must update producer and consumers through an expand-contract campaign.
 
 ## License
 
-Copyright 2026 Runa Laboratories. Licensed under the
+Copyright 2026 Cuna Labs. Licensed under the
 [Apache License 2.0](LICENSE). See [`NOTICE`](NOTICE) for attribution.
 
 ## Project status

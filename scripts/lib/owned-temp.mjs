@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 export async function createOwnedTempDirectory(prefix) {
-  if (!/^runa-[a-z0-9-]+-$/u.test(prefix)) {
-    throw new Error("Temporary prefixes must be explicit Runa-owned identities.");
+  if (!/^(?:cuna|runa)-[a-z0-9-]+-$/u.test(prefix)) {
+    throw new Error("Temporary prefixes must be explicit Cuna-owned identities.");
   }
   const base = path.resolve(tmpdir());
   const root = path.resolve(await mkdtemp(path.join(base, prefix)));
@@ -15,8 +15,8 @@ export async function createOwnedTempDirectory(prefix) {
 export async function removeOwnedTempDirectory(root) {
   const base = path.resolve(tmpdir());
   const resolved = path.resolve(root);
-  if (path.dirname(resolved) !== base || !path.basename(resolved).startsWith("runa-")) {
-    throw new Error("Refusing to remove a directory that is not an exact Runa-owned temp root.");
+  if (path.dirname(resolved) !== base || !/^(?:cuna|runa)-/u.test(path.basename(resolved))) {
+    throw new Error("Refusing to remove a directory that is not an exact Cuna-owned temp root.");
   }
   await rm(resolved, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 }

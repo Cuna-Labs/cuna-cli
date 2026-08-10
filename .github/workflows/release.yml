@@ -23,6 +23,18 @@ on:
         description: Exact immutable release-envelope v2 SHA-256
         required: true
         type: string
+      approval_run_id:
+        description: Successful protected release-review run containing the signed approval lease
+        required: true
+        type: string
+      approval_lease_sha256:
+        description: Exact signed release-approval lease SHA-256
+        required: true
+        type: string
+      approval_expectation_sha256:
+        description: Exact release-approval expectation SHA-256
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -59,6 +71,9 @@ jobs:
           RUN_ID: ${{ inputs.candidate_run_id }}
           CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
           CANDIDATE_ENVELOPE_SHA256: ${{ inputs.candidate_envelope_sha256 }}
+          APPROVAL_RUN_ID: ${{ inputs.approval_run_id }}
+          APPROVAL_LEASE_SHA256: ${{ inputs.approval_lease_sha256 }}
+          APPROVAL_EXPECTATION_SHA256: ${{ inputs.approval_expectation_sha256 }}
         shell: bash
         run: |
           [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]
@@ -66,6 +81,9 @@ jobs:
           [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$CANDIDATE_ENVELOPE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$APPROVAL_LEASE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_EXPECTATION_SHA256" =~ ^[0-9a-f]{64}$ ]]
           git fetch --no-tags origin main
           test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
           test "$(git rev-parse origin/main)" = "$SOURCE_COMMIT"
@@ -119,7 +137,7 @@ jobs:
           const fs = require('node:fs');
           const inputs = JSON.parse(fs.readFileSync('admitted/release-artifacts/release-inputs.json'));
           if (inputs.contractSet.releaseAuthority === 'UNRESOLVED_BLOCKING') {
-            throw new Error('Publication blocked: the release envelope is not bound to the canonical Runa API contract authority.');
+            throw new Error('Publication blocked: the release envelope is not bound to the canonical Cuna API contract authority.');
           }
           NODE
       - name: Verify GitHub build provenance for the exact tarball
@@ -130,6 +148,46 @@ jobs:
           gh attestation verify admitted/release-artifacts/*.tgz
           --repo "$GITHUB_REPOSITORY"
           --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"
+      - name: Verify protected release-review run identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL_RUN_ID: ${{ inputs.approval_run_id }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        shell: bash
+        run: |
+          APPROVAL_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${APPROVAL_RUN_ID}" --jq '[.status,.conclusion,.head_sha,.event,.head_branch,.path] | join(" ")')"
+          test "$APPROVAL_STATE" = "completed success ${SOURCE_COMMIT} workflow_dispatch main .github/workflows/release-review.yml"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-approval-lease
+          run-id: ${{ inputs.approval_run_id }}
+          github-token: ${{ github.token }}
+          path: admitted/approval
+      - name: Verify approval lease identity and semantic binding
+        env:
+          APPROVAL_LEASE_SHA256: ${{ inputs.approval_lease_sha256 }}
+          APPROVAL_EXPECTATION_SHA256: ${{ inputs.approval_expectation_sha256 }}
+        shell: bash
+        run: |
+          test "$(sha256sum admitted/approval/release-approval-lease.json | cut -d' ' -f1)" = "$APPROVAL_LEASE_SHA256"
+          test "$(sha256sum admitted/approval/release-approval-expectation.json | cut -d' ' -f1)" = "$APPROVAL_EXPECTATION_SHA256"
+          node scripts/verify-release-approval-lease.mjs \
+            --root admitted/approval \
+            --lease release-approval-lease.json \
+            --expectation release-approval-expectation.json
+      - name: Verify cryptographic provenance of the exact approval lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: >-
+          gh attestation verify admitted/approval/release-approval-lease.json
+          --repo "$GITHUB_REPOSITORY"
+          --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-review.yml"
+      - name: Block publication until one-use approval nonce consumption is configured
+        shell: bash
+        run: |
+          echo "::error title=Release approval authority unavailable::RELEASE_APPROVAL_NONCE_CONSUMPTION_AUTHORITY_NOT_CONFIGURED"
+          exit 1
       - name: Require exact registry version to be absent
         env:
           VERSION: ${{ inputs.version }}

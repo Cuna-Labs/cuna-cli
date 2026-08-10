@@ -2,18 +2,20 @@ import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { invariant, parseArgs, readJson } from "./lib/release-evidence.mjs";
+import { validateSupportPolicy } from "./release-distribution-lib.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(args.get("root") ?? process.cwd());
 const packageJson = await readJson(path.join(root, "package.json"));
 const supportPolicy = await readJson(path.join(root, "packaging", "support-policy.json"));
+validateSupportPolicy(supportPolicy);
 
-invariant(packageJson.name === "@runa_laboratories/cli", "Unexpected package name");
+invariant(packageJson.name === "@cuna_labs/cli", "Unexpected package name");
 invariant(packageJson.license === "Apache-2.0", "package.json license must be Apache-2.0");
 invariant(packageJson.private !== true, "Release package is marked private");
 invariant(packageJson.publishConfig?.registry === "https://registry.npmjs.org", "Registry is not canonical npm");
 invariant(packageJson.publishConfig?.access === "public", "npm access must be public");
-invariant(packageJson.bin?.runa && typeof packageJson.bin.runa === "string", "package.json must expose exactly the runa binary");
+invariant(Object.keys(packageJson.bin ?? {}).length === 1 && typeof packageJson.bin?.cuna === "string", "package.json must expose exactly the cuna binary");
 invariant(Object.keys(packageJson.bin).length === 1, "package.json exposes unexpected binaries");
 for (const requiredFile of ["dist", "README.md", "LICENSE", "NOTICE"]) {
   invariant(packageJson.files?.includes(requiredFile), `package.json files must include ${requiredFile}`);
@@ -35,15 +37,52 @@ const workflow = parseYaml(ci, { prettyErrors: true, uniqueKeys: true });
 invariant(workflow && typeof workflow === "object" && !Array.isArray(workflow), "CI workflow must parse as a YAML object");
 const jobs = workflow.jobs;
 invariant(jobs && typeof jobs === "object" && !Array.isArray(jobs), "CI workflow jobs are missing");
-for (const job of ["public-controls", "source-gates", "candidate", "installed-artifact", "observed-artifact", "observation-summary", "admission", "handoff"]) {
+for (const job of ["public-controls", "source-gates", "native-source-gates", "native-evidence-gates", "candidate", "installed-artifact", "observed-artifact", "observation-summary", "admission", "handoff"]) {
   invariant(jobs[job] && typeof jobs[job] === "object", `CI workflow job is missing: ${job}`);
   invariant(Array.isArray(jobs[job].steps), `CI workflow job has no executable steps: ${job}`);
 }
+const needsList = (job) => Array.isArray(job.needs) ? job.needs : typeof job.needs === "string" ? [job.needs] : [];
+
+invariant(
+  JSON.stringify(needsList(jobs.candidate).sort()) === JSON.stringify(["native-evidence-gates", "native-source-gates", "source-gates"]),
+  "Candidate generation must depend on Node, native source, and native evidence gates",
+);
+const nativeMatrix = jobs["native-source-gates"].strategy?.matrix?.include;
+invariant(
+  Array.isArray(nativeMatrix) &&
+    JSON.stringify(nativeMatrix.map((entry) => entry.id).sort()) === JSON.stringify(["linux-x64", "macos-x64", "windows-x64"]),
+  "Native source gates must compile all three Tier-1 platform families",
+);
+const nativeRuns = jobs["native-source-gates"].steps
+  .map((step) => step?.run)
+  .filter((run) => typeof run === "string")
+  .join("\n");
+for (const command of [
+  "cargo +1.97.1 fmt --all -- --check",
+  "cargo +1.97.1 check --workspace --all-targets --locked",
+  "cargo +1.97.1 test --workspace --locked",
+  "cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings",
+]) invariant(nativeRuns.includes(command), `Native source gate is missing: ${command}`);
+const nativeEvidenceRuns = jobs["native-evidence-gates"].steps
+  .map((step) => step?.run)
+  .filter((run) => typeof run === "string")
+  .join("\n");
+for (const command of [
+  "cargo +1.97.1 build --workspace --release --locked",
+  "scripts/capture-native-windows-identity.ps1",
+  "node scripts/generate-native-release-evidence.mjs",
+  "node scripts/verify-native-release-evidence.mjs --evidence evidence/native-local",
+  "--require-production true",
+  "Unsigned/local manifest is not production-admissible",
+]) invariant(nativeEvidenceRuns.includes(command), `Native evidence gate is missing: ${command}`);
+invariant(
+  JSON.stringify(needsList(jobs["native-evidence-gates"])) === JSON.stringify(["native-source-gates"]),
+  "Native evidence generation must follow all native source gates",
+);
 const allSteps = Object.values(jobs).flatMap((job) => Array.isArray(job?.steps) ? job.steps : []);
 const runCommands = allSteps.map((step) => step?.run).filter((run) => typeof run === "string");
 const executableWorkflow = runCommands.join("\n");
 const countExecutable = (command) => runCommands.reduce((total, run) => total + run.split(command).length - 1, 0);
-const needsList = (job) => Array.isArray(job.needs) ? job.needs : typeof job.needs === "string" ? [job.needs] : [];
 const generator = "node scripts/release-project-distributions.mjs";
 const verifier = "node scripts/verify-release-distributions.mjs";
 const releaseInputBuilder = "node scripts/build-release-inputs.mjs";
@@ -71,7 +110,7 @@ invariant(generatedAt >= 0 && firstVerifiedAt > generatedAt, "Distribution verif
 invariant(candidateVerifierStep >= 0 && candidateUploadAt > candidateVerifierStep, "Candidate upload must follow distribution verification");
 for (const command of [
   "sh -n release-artifacts/distributions/curl/install.sh",
-  "ruby -c release-artifacts/distributions/homebrew/runa.rb",
+  "ruby -c release-artifacts/distributions/homebrew/cuna.rb",
   "bash -n release-artifacts/distributions/aur/PKGBUILD",
 ]) invariant(candidateRuns.includes(command), `Generated packaging syntax gate is missing: ${command}`);
 invariant(!/npm\s+publish/.test(executableWorkflow), "Candidate CI may not publish npm packages");
@@ -109,6 +148,20 @@ invariant(
 invariant(
   release.includes('--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"'),
   "Release attestation verification must bind the exact signer workflow",
+);
+const approvalSemanticAt = release.indexOf("node scripts/verify-release-approval-lease.mjs");
+const approvalAttestationAt = release.indexOf('--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-review.yml"');
+const approvalNonceBlockAt = release.indexOf("RELEASE_APPROVAL_NONCE_CONSUMPTION_AUTHORITY_NOT_CONFIGURED");
+const npmPublishAt = release.indexOf("npm publish");
+invariant(
+  release.includes("completed success ${SOURCE_COMMIT} workflow_dispatch main .github/workflows/release-review.yml"),
+  "Release approval must bind the protected release-review workflow identity",
+);
+invariant(approvalSemanticAt >= 0, "Release publication DAG must semantically bind the approval lease");
+invariant(approvalAttestationAt > approvalSemanticAt, "Release approval attestation must follow semantic lease verification");
+invariant(
+  approvalNonceBlockAt > approvalAttestationAt && npmPublishAt > approvalNonceBlockAt,
+  "Publication must remain fail-closed before npm publish until one-use nonce consumption is configured",
 );
 
 process.stdout.write(`${JSON.stringify({ status: "verified", package: packageJson.name, version: packageJson.version })}\n`);

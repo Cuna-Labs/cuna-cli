@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -15,15 +15,15 @@ import { createUnavailableTerminalControlPlane, validateTerminalGrant } from "..
 
 const NOW = 1_800_000_000_000;
 const CAPABILITY_ID = "terminal_connections.create";
-const API_ORIGIN = "https://api.runacode.io";
+const API_ORIGIN = "https://api.getcuna.com";
 
 function capabilitySnapshot(agentSessionId, overrides = {}) {
   return {
-    schemaVersion: "1",
+    schemaVersion: "1.0",
     subjectScope: "agent_session",
     subjectId: agentSessionId,
     observedAt: new Date(NOW - 1_000).toISOString(),
-    expiresAt: new Date(NOW + 60_000).toISOString(),
+    expiresAt: new Date(NOW + 59_000).toISOString(),
     etag: `etag-${agentSessionId}`,
     capabilities: [{
       id: CAPABILITY_ID,
@@ -151,7 +151,7 @@ class FakeTerminalSystem {
         const grant = {
           terminalSessionId,
           resumeHandle: "66666666-6666-4666-8666-666666666666",
-          connectUrl: `wss://api.runacode.io/v1/terminal-connections/${terminalSessionId}/stream`,
+          connectUrl: `wss://api.getcuna.com/v1/terminal-connections/${terminalSessionId}/stream`,
           connectToken: token,
           protocol: TERMINAL_PROTOCOL,
           capabilities: [
@@ -202,6 +202,45 @@ function createRuntime(system, extra = {}) {
   return { runtime, states, outputs };
 }
 
+test("TC-055-12 foreground readiness remains distinct from daemon and cannot authorize sync", async () => {
+  const system = new FakeTerminalSystem();
+  const runtime = new RunaRuntimeBoundary({
+    mode: "foreground",
+    controlPlane: system.controlPlane,
+    terminalConnector: system.connector,
+    allowedRunaOrigins: [API_ORIGIN],
+    terminalCapabilityId: CAPABILITY_ID,
+    clientInstanceId: "foreground-client",
+    clock: () => NOW,
+  });
+  assert.equal(runtime.daemon.state, "absent");
+  assert.equal(runtime.foreground.state, "absent");
+  assert.throws(() => runtime.start({
+    endpointOwnership: "verified",
+    durableState: "verified",
+    source: "forged-daemon-evidence",
+    observedAt: NOW - 1,
+    expiresAt: NOW + 1_000,
+  }), /cannot claim daemon readiness/u);
+  runtime.startForeground();
+  assert.equal(runtime.foreground.state, "ready");
+  assert.equal(runtime.daemon.state, "absent");
+  await assert.rejects(runtime.openSync({
+    configuration: {
+      bindingId: "binding-1",
+      bindingGeneration: 1,
+      localRoot: "/workspace",
+      remoteRoot: "/workspace",
+      conflictPolicy: "manual",
+    },
+    journalDirectory: "/not/reached",
+    ownerId: "owner-1",
+  }), /cannot own workspace synchronization/u);
+  await runtime.shutdown();
+  assert.equal(runtime.foreground.state, "stopped");
+  assert.equal(runtime.daemon.state, "absent");
+});
+
 async function waitUntil(predicate, message) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return;
@@ -211,6 +250,15 @@ async function waitUntil(predicate, message) {
 }
 
 test("runtime capability admission fails closed for expired, ambiguous, and non-native evidence", () => {
+  assert.throws(
+    () => admitCapability(capabilitySnapshot("agent-1", { schemaVersion: "2.0" }), {
+      id: CAPABILITY_ID,
+      scope: "agent_session",
+      subjectId: "agent-1",
+      interaction: "native",
+    }, NOW),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "capability_unknown",
+  );
   assert.throws(
     () => admitCapability(capabilitySnapshot("agent-1", { expiresAt: new Date(NOW).toISOString() }), {
       id: CAPABILITY_ID,
@@ -244,7 +292,7 @@ test("terminal grants reject non-Runa origins, query secrets, and incomplete cap
   const valid = {
     terminalSessionId,
     resumeHandle: "66666666-6666-4666-8666-666666666666",
-    connectUrl: `wss://api.runacode.io/v1/terminal-connections/${terminalSessionId}/stream`,
+    connectUrl: `wss://api.getcuna.com/v1/terminal-connections/${terminalSessionId}/stream`,
     connectToken: `runa_tc_${"A".repeat(43)}`,
     protocol: TERMINAL_PROTOCOL,
     capabilities: [
@@ -384,12 +432,64 @@ test("TC-055-13 shutdown fences an attach waiting on remote admission", async ()
   assert.equal(system.connections.length, 0);
 });
 
+test("shutdown retains failed terminal cleanup authority and retries it to completion", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  const connection = system.connections[0];
+  const close = connection.close.bind(connection);
+  let failOnce = true;
+  connection.close = async (input) => {
+    if (failOnce) {
+      failOnce = false;
+      connection.closeCalls.push(input);
+      throw new Error("simulated close failure");
+    }
+    await close(input);
+  };
+
+  await assert.rejects(runtime.shutdown(), AggregateError);
+  assert.equal(runtime.listTerminals().length, 1, "failed cleanup remains owned for retry");
+  await runtime.shutdown();
+  assert.equal(runtime.listTerminals().length, 0);
+  assert.equal(connection.closeCalls.length, 2);
+  await runtime.shutdown();
+  assert.equal(connection.closeCalls.length, 2, "completed shutdown is idempotent");
+});
+
+test("shutdown fences an in-flight sync open and waits until its lease is released", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "runa-runtime-sync-shutdown-"));
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  const journalDirectory = path.join(directory, "journal");
+  const opening = runtime.openSync({
+    configuration: {
+      bindingId: "binding-shutdown",
+      bindingGeneration: 1,
+      canonicalRoot: path.join(directory, "workspace"),
+      policyDigest: `sha256:${"c".repeat(64)}`,
+      epoch: "epoch-shutdown",
+    },
+    journalDirectory,
+    ownerId: "runtime-owner",
+  });
+  const stopping = runtime.shutdown();
+  await assert.rejects(opening, (error) => error instanceof RuntimeBoundaryError && error.code === "runtime_closed");
+  await stopping;
+  await assert.rejects(access(path.join(journalDirectory, "writer.lease")), (error) => error.code === "ENOENT");
+  await rm(directory, { recursive: true, force: true });
+});
+
 test("TC-055-13 concurrent attach reserves both tab and AgentSession identities before awaiting", async () => {
   const system = new FakeTerminalSystem();
   const originalDiscover = system.controlPlane.discoverCapabilities;
   let releaseAdmission;
+  let admissionBlocked = false;
   system.controlPlane.discoverCapabilities = async (...args) => {
-    await new Promise((resolve) => { releaseAdmission = resolve; });
+    if (!admissionBlocked) {
+      admissionBlocked = true;
+      await new Promise((resolve) => { releaseAdmission = resolve; });
+    }
     return await originalDiscover(...args);
   };
   const { runtime } = createRuntime(system);
@@ -412,8 +512,12 @@ test("TC-055-13 cancellation during remote admission creates no terminal grant",
   const system = new FakeTerminalSystem();
   const originalDiscover = system.controlPlane.discoverCapabilities;
   let releaseAdmission;
+  let admissionBlocked = false;
   system.controlPlane.discoverCapabilities = async (...args) => {
-    await new Promise((resolve) => { releaseAdmission = resolve; });
+    if (!admissionBlocked) {
+      admissionBlocked = true;
+      await new Promise((resolve) => { releaseAdmission = resolve; });
+    }
     return await originalDiscover(...args);
   };
   const controller = new AbortController();
@@ -673,6 +777,32 @@ test("queued input from an interrupted attachment cannot cross the reconnect fen
   await assert.rejects(stale, (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_disconnected");
   const replacementInputs = system.connections[1].sent.map(decodeTerminalFrame).filter((frame) => frame?.type === "input");
   assert.equal(replacementInputs.length, 0, "pre-disconnect input must not execute on the replacement attachment");
+  await runtime.shutdown();
+});
+
+test("receipt-time input authority rejects a tab that reconnected before the coordinator drained its queue", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  const original = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  const oldBinding = {
+    userId: original.userId,
+    machineId: original.machineId,
+    agentSessionId: original.agentSessionId,
+    processEpoch: original.processEpoch,
+    fencingGeneration: original.fencingGeneration,
+  };
+  system.connections[0].incoming.close();
+  await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "the original attachment should be interrupted");
+  const replacement = await runtime.reconnect({ tabId: "tab-a" });
+  assert.ok(replacement.fencingGeneration > oldBinding.fencingGeneration);
+
+  const replacementWire = system.connections.at(-1);
+  const sentBefore = replacementWire.sent.length;
+  await assert.rejects(
+    runtime.sendInput(new TextEncoder().encode("old receipt"), "tab-a", oldBinding),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "grant_scope_mismatch",
+  );
+  assert.equal(replacementWire.sent.length, sentBefore);
   await runtime.shutdown();
 });
 
@@ -1039,6 +1169,7 @@ test("API terminal control plane derives fresh public observation and sends only
         processState: "running",
         processEpoch: "33333333-3333-4333-8333-333333333333",
         runtimeObservedAt: new Date(NOW - 1_000).toISOString(),
+        runtimeExpiresAt: new Date(NOW + 30_000).toISOString(),
         rowVersion: 7,
         createdAt: new Date(NOW - 60_000).toISOString(),
         updatedAt: new Date(NOW - 1_000).toISOString(),
@@ -1050,7 +1181,7 @@ test("API terminal control plane derives fresh public observation and sends only
       return {
         terminalSessionId: "55555555-5555-4555-8555-555555555555",
         resumeHandle: "66666666-6666-4666-8666-666666666666",
-        connectUrl: "wss://api.runacode.io/v1/terminal-connections/55555555-5555-4555-8555-555555555555/stream",
+        connectUrl: "wss://api.getcuna.com/v1/terminal-connections/55555555-5555-4555-8555-555555555555/stream",
         connectToken: `runa_tc_${"A".repeat(43)}`,
         protocol: TERMINAL_PROTOCOL,
         capabilities: [
@@ -1067,6 +1198,7 @@ test("API terminal control plane derives fresh public observation and sends only
   const controlPlane = createApiTerminalControlPlane({ client, clock: () => NOW });
   const evidence = await controlPlane.observeAgentSession("agent-a");
   assert.equal(evidence.processEpoch, "33333333-3333-4333-8333-333333333333");
+  assert.equal(evidence.expiresAt, new Date(NOW + 30_000).toISOString());
   assert.equal(evidence.evidenceRevision, "agent-session-row:7");
   const admission = admitCapability(capabilitySnapshot("agent-a"), {
     id: CAPABILITY_ID,
@@ -1090,6 +1222,45 @@ test("API terminal control plane derives fresh public observation and sends only
     },
     key: "terminal-operation-1",
   }]);
+});
+
+test("API terminal control plane never fabricates missing or invalid supervisor lease expiry", async () => {
+  const base = {
+    id: "agent-a",
+    machineId: "22222222-2222-4222-8222-222222222222",
+    processState: "running",
+    processEpoch: "33333333-3333-4333-8333-333333333333",
+    runtimeObservedAt: new Date(NOW - 1_000).toISOString(),
+    runtimeExpiresAt: new Date(NOW + 30_000).toISOString(),
+    rowVersion: 7,
+  };
+  const invalid = [
+    { ...base, runtimeExpiresAt: undefined },
+    { ...base, runtimeExpiresAt: new Date(NOW).toISOString() },
+    { ...base, runtimeExpiresAt: new Date(NOW - 2_000).toISOString() },
+    { ...base, runtimeExpiresAt: new Date(NOW + 60_000).toISOString() },
+    {
+      ...base,
+      runtimeObservedAt: new Date(NOW + 6_000).toISOString(),
+      runtimeExpiresAt: new Date(NOW + 7_000).toISOString(),
+    },
+    { ...base, runtimeExpiresAt: "not-a-date" },
+  ];
+  for (const session of invalid) {
+    const controlPlane = createApiTerminalControlPlane({
+      clock: () => NOW,
+      client: {
+        async getIdentity() {
+          return { id: "11111111-1111-4111-8111-111111111111", workspaceAssigned: true };
+        },
+        async getAgentSession() { return session; },
+      },
+    });
+    await assert.rejects(
+      controlPlane.observeAgentSession("agent-a"),
+      (error) => error instanceof RuntimeBoundaryError && error.code === "remote_state_unproven",
+    );
+  }
 });
 
 test("PTY adapter is usable only with current platform-bound live evidence", async () => {
@@ -1119,7 +1290,7 @@ test("Node process adapter executes argv without a shell and excludes credential
   const adapter = createNodeProcessAdapter();
   const child = adapter.spawn({
     executable: process.execPath,
-    args: ["-e", "process.stdout.write(JSON.stringify({value:'ok',secret:process.env.RUNA_API_KEY??null}))"],
+    args: ["-e", "process.stdout.write(JSON.stringify({value:'ok',secret:process.env.CUNA_API_KEY??null}))"],
   });
   let stdout = "";
   for await (const chunk of child.stdout) stdout += new TextDecoder().decode(chunk);
@@ -1127,7 +1298,7 @@ test("Node process adapter executes argv without a shell and excludes credential
   assert.equal(exit.exitCode, 0);
   assert.deepEqual(JSON.parse(stdout), { value: "ok", secret: null });
   assert.throws(
-    () => adapter.spawn({ executable: process.execPath, args: ["-e", ""], environment: { RUNA_API_KEY: "must-not-pass" } }),
+    () => adapter.spawn({ executable: process.execPath, args: ["-e", ""], environment: { CUNA_API_KEY: "must-not-pass" } }),
     (error) => error instanceof RuntimeBoundaryError && error.code === "process_invalid",
   );
   assert.throws(

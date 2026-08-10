@@ -21,7 +21,7 @@ export function syntheticReleaseInputs({ version = "1.2.3-preview.1", sourceComm
   ].join("\0");
   const inputs = {
     schemaVersion: 1,
-    packageName: "@runa_laboratories/cli",
+    packageName: "@cuna_labs/cli",
     version,
     sourceCommit,
     packageLock: { file: "package-lock.json", sha256: digest, lockfileVersion: 3 },
@@ -39,14 +39,14 @@ export function syntheticReleaseInputs({ version = "1.2.3-preview.1", sourceComm
       aggregateSha256: createHash("sha256").update(componentKey, "utf8").digest("hex"),
     },
     contractSet: {
-      algorithm: "runa-cli-public-contract-files-v1",
-      authority: "RUNA_CLI_LOCAL_CONSUMER_SNAPSHOT",
+      algorithm: "cuna-cli-public-contract-files-v1",
+      authority: "CUNA_CLI_LOCAL_CONSUMER_SNAPSHOT",
       releaseAuthority: "UNRESOLVED_BLOCKING",
       files: contractFiles,
       aggregateSha256: aggregateDigest(contractFiles),
     },
     buildRecipe: {
-      algorithm: "runa-cli-build-recipe-files-v1",
+      algorithm: "cuna-cli-build-recipe-files-v1",
       commands: ["npm ci --ignore-scripts"],
       files: recipeFiles,
       aggregateSha256: aggregateDigest(recipeFiles),
@@ -54,7 +54,7 @@ export function syntheticReleaseInputs({ version = "1.2.3-preview.1", sourceComm
     toolchain: { node: "22.17.1", npm: "11.4.2", typescript: "5.9.3", runner: "ubuntu-24.04" },
     payload: {
       schemaVersion: 1,
-      algorithm: "runa-package-payload-v1",
+      algorithm: "cuna-package-payload-v1",
       fileCount: 1,
       files: [{ file: "package.json", size: 2, sha256: digest }],
       sha256: "e".repeat(64),
@@ -76,10 +76,10 @@ export function syntheticReleaseEnvelope({
 } = {}) {
   return {
     schemaVersion: 2,
-    packageName: "@runa_laboratories/cli",
+    packageName: "@cuna_labs/cli",
     version,
     sourceCommit,
-    repository: "Runa-Laboratories/runa-cli",
+    repository: "Cuna-Labs/cuna-cli",
     registry: "https://registry.npmjs.org",
     tarball,
     sbom,

@@ -12,7 +12,8 @@ export const EXIT_CODES = Object.freeze({
 
 export type ExitCode = (typeof EXIT_CODES)[keyof typeof EXIT_CODES];
 
-export type SafeErrorDetails = Readonly<Record<string, string | number | boolean | null>>;
+export type SafeErrorScalar = string | number | boolean | null;
+export type SafeErrorDetails = Readonly<Record<string, SafeErrorScalar | readonly SafeErrorScalar[]>>;
 
 export class RunaError extends Error {
   readonly code: string;
@@ -54,7 +55,7 @@ export function unsupportedError(feature: string, reason = "not_implemented"): R
     code: "runa.capability.unsupported",
     message: `The ${feature} capability is not available in this CLI build or server contract.`,
     exitCode: EXIT_CODES.unsupported,
-    hint: "Run `runa capabilities` to inspect current server support.",
+    hint: "Run `cuna capabilities` to inspect current server support.",
     details: { feature, reason },
   });
 }
@@ -63,9 +64,9 @@ export function normalizeError(error: unknown): RunaError {
   if (error instanceof RunaError) return error;
   return new RunaError({
     code: "runa.internal.unexpected",
-    message: "Runa could not complete the command because of an internal failure.",
+    message: "Cuna could not complete the command because of an internal failure.",
     exitCode: EXIT_CODES.internal,
-    hint: "Retry once. If the problem persists, run `runa doctor --json` and contact Runa support.",
+    hint: "Retry once. If the problem persists, run `cuna doctor --json` and contact Cuna support.",
     cause: error,
   });
 }

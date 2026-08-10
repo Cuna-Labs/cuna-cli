@@ -34,9 +34,9 @@ function sameFields(left, right, fields) {
 export function validateContractAuthority(authority) {
   exactKeys(authority, ["schemaVersion", "authority", "status", "producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"], "contract authority");
   invariant(authority.schemaVersion === 1, "Unsupported contract-authority schema");
-  invariant(authority.authority === "RUNA_CANONICAL_PUBLIC_API_CONTRACT", "Contract authority is not canonical");
+  invariant(authority.authority === "CUNA_CANONICAL_PUBLIC_API_CONTRACT", "Contract authority is not canonical");
   invariant(authority.status === "APPROVED", "Contract authority is not approved");
-  invariant(authority.producerRepository === "Runa-Laboratories/infra", "Contract producer repository is invalid");
+  invariant(authority.producerRepository === "Cuna-Labs/infra", "Contract producer repository is invalid");
   invariant(COMMIT.test(authority.sourceCommit), "Contract source commit is invalid");
   digest(authority.contractSha256, "Contract digest");
   digest(authority.approvalAttestationSha256, "Contract approval attestation digest");
@@ -56,12 +56,12 @@ function validateConditions(lease) {
 export function validateReleaseApprovalLeaseShape(lease, now = Date.now()) {
   exactKeys(lease, ["schemaVersion", "predicateType", "decision", "package", "source", "candidate", "receiptCohort", "contractAuthority", "promotion", "review", "recovery", "issuedAt", "expiresAt", "nonce", "conditions"], "release approval lease");
   invariant(lease.schemaVersion === 1, "Unsupported release-approval lease schema");
-  invariant(lease.predicateType === "https://runacode.io/attestations/runa-cli-release-approval/v1", "Release-approval predicate type differs");
+  invariant(lease.predicateType === "https://getcuna.com/attestations/cuna-cli-release-approval/v1", "Release-approval predicate type differs");
   invariant(lease.decision === "READY" || lease.decision === "READY_WITH_CONDITIONS", "Release decision is not authorizing");
   exactKeys(lease.package, ["name", "version"], "lease package");
-  invariant(lease.package.name === "@runa_laboratories/cli" && VERSION.test(lease.package.version), "Lease package identity is invalid");
+  invariant(lease.package.name === "@cuna_labs/cli" && VERSION.test(lease.package.version), "Lease package identity is invalid");
   exactKeys(lease.source, ["repository", "commit", "ref"], "lease source");
-  invariant(lease.source.repository === "Runa-Laboratories/runa-cli", "Lease repository differs");
+  invariant(lease.source.repository === "Cuna-Labs/cuna-cli", "Lease repository differs");
   invariant(COMMIT.test(lease.source.commit) && lease.source.ref === "refs/heads/main", "Lease source identity is invalid");
   exactKeys(lease.candidate, CANDIDATE_FIELDS, "lease candidate");
   for (const [name, value] of Object.entries(lease.candidate)) digest(value, `Candidate ${name}`);
@@ -70,7 +70,7 @@ export function validateReleaseApprovalLeaseShape(lease, now = Date.now()) {
   digest(lease.receiptCohort.verificationSha256, "Receipt verification digest");
   invariant(lease.receiptCohort.workflow === ".github/workflows/distribution-observation.yml", "Receipt observer workflow differs");
   invariant(/^[1-9][0-9]*$/u.test(lease.receiptCohort.runId) && Number.isSafeInteger(lease.receiptCohort.runAttempt) && lease.receiptCohort.runAttempt > 0, "Receipt workflow identity is invalid");
-  validateContractAuthority({ schemaVersion: 1, authority: "RUNA_CANONICAL_PUBLIC_API_CONTRACT", status: "APPROVED", ...lease.contractAuthority });
+  validateContractAuthority({ schemaVersion: 1, authority: "CUNA_CANONICAL_PUBLIC_API_CONTRACT", status: "APPROVED", ...lease.contractAuthority });
   exactKeys(lease.contractAuthority, ["producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"], "lease contract authority");
   exactKeys(lease.promotion, ["registry", "tag", "environment"], "lease promotion");
   invariant(lease.promotion.registry === "https://registry.npmjs.org" && lease.promotion.tag === "preview" && lease.promotion.environment === "npm", "Lease promotion target is invalid");
@@ -117,7 +117,7 @@ export function validateReleaseApprovalLease(lease, input, now = Date.now()) {
   for (const [name, value] of Object.entries(input.candidate)) digest(value, `Expected candidate ${name}`);
   exactKeys(input.receiptCohort, ["sha256", "verificationSha256", "runId", "runAttempt"], "expected receipt cohort");
   exactKeys(input.contractAuthority, ["producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"], "expected contract authority");
-  validateContractAuthority({ schemaVersion: 1, authority: "RUNA_CANONICAL_PUBLIC_API_CONTRACT", status: "APPROVED", ...input.contractAuthority });
+  validateContractAuthority({ schemaVersion: 1, authority: "CUNA_CANONICAL_PUBLIC_API_CONTRACT", status: "APPROVED", ...input.contractAuthority });
   exactKeys(input.review, ["runId", "runAttempt", "approverIdentityClass", "soloOwnerRiskAccepted"], "expected release review");
   exactKeys(input.recovery, ["planSha256", "strategy"], "expected recovery");
   invariant(lease.decision === input.decision, "Release approval decision differs");

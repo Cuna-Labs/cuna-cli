@@ -3,6 +3,7 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+/native/target/
 
 # Candidate, release, and verification evidence
 release-artifacts/

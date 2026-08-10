@@ -92,7 +92,7 @@ jobs:
         shell: bash
         run: |
           sh -n admitted/distributions/curl/install.sh
-          ruby -c admitted/distributions/homebrew/runa.rb
+          ruby -c admitted/distributions/homebrew/cuna.rb
           bash -n admitted/distributions/aur/PKGBUILD
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

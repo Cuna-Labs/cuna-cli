@@ -1,7 +1,8 @@
 import { Writable } from "node:stream";
+import { createInterface } from "node:readline/promises";
 
 import { createRunaApiClient, type RunaApiClient } from "../api/client.js";
-import { createHttpTransport } from "../api/http.js";
+import { createHttpTransport, type HttpRequest } from "../api/http.js";
 import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
@@ -12,13 +13,30 @@ import { EXIT_CODES, normalizeError, RunaError, usageError, type ExitCode } from
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { createPlatformCredentialBackend } from "../credentials/platform.js";
 import { CredentialVault } from "../credentials/vault.js";
+import {
+  conservativeFilesystemCapabilities,
+  createApiAgentJourneyEffects,
+  createWorkspaceJourneyEffects,
+  orchestrateAgentJourney,
+  preflightAgentJourneyInvocation,
+  type AgentJourneyEffects,
+  type ReconciledAgentJourneyIntent,
+} from "../journey/index.js";
 import { createPlatformAdapter, type PlatformAdapter } from "../platform/adapter.js";
 import { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "../version.js";
 import { runtimeFeatureGates, type RuntimeFeatureGate } from "../runtime/contracts.js";
+import { RuntimeBoundaryError } from "../runtime/errors.js";
+import {
+  runNodeForegroundSessions,
+  selectNodeForegroundPresentation,
+  type ForegroundSessionRunner,
+  type ForegroundPresentationMode,
+} from "../runtime/node-foreground-session.js";
 import { ROOT_HELP } from "./help.js";
 import { createOutputWriter, type CliStreams } from "./output.js";
 import { booleanOption, parseArgv, stringOption } from "./parser.js";
 import { rejectUnknownOptions } from "./parser.js";
+import type { ParsedInvocation } from "./parser.js";
 
 export interface RunCliDependencies {
   readonly env?: NodeJS.ProcessEnv;
@@ -32,6 +50,29 @@ export interface RunCliDependencies {
   readonly browser?: BrowserOpener;
   readonly signal?: AbortSignal;
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
+  readonly foregroundTerminalRunner?: ForegroundSessionRunner;
+  readonly automaticJourneyEffectsFactory?: (input: {
+    readonly client: RunaApiClient;
+    readonly intent: ReconciledAgentJourneyIntent;
+    readonly config: EffectiveConfig;
+    readonly platform: PlatformAdapter;
+    readonly credentialMode: "automation" | "interactive";
+    readonly signal?: AbortSignal;
+  }) => AgentJourneyEffects;
+  readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw", signal: AbortSignal) => Promise<boolean>;
+}
+
+async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw", signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return false;
+  const prompt = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+  try {
+    const answer = await prompt.question(`No compatible machine is available. Create one for ${agent}? [y/N] `, { signal });
+    return answer.trim().toLocaleLowerCase("en-US") === "y" || answer.trim().toLocaleLowerCase("en-US") === "yes";
+  } catch {
+    return false;
+  } finally {
+    prompt.close();
+  }
 }
 
 function defaultStreams(): CliStreams {
@@ -71,8 +112,61 @@ function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>>
   });
 }
 
-function needsRemoteCredential(command: string | undefined): boolean {
-  return command === "capabilities" || command === "machines" || command === "agent-sessions";
+function needsRemoteCredential(command: string | undefined, foreground: ForegroundSelection | undefined): boolean {
+  return command === "capabilities" || command === "machines" || command === "agent-sessions" ||
+    command === "agent" ||
+    command === "records" || command === "authorizations" || command === "api-keys" ||
+    command === "account" || command === "workspace" || command === "usage" ||
+    command === "claude" || command === "codex" || command === "openclaw" || foreground !== undefined;
+}
+
+interface ForegroundSelection {
+  readonly agentSessionIds: readonly string[];
+  readonly expectedAgentKinds?: readonly ("claude-code" | "codex" | "openclaw")[];
+}
+
+function foregroundSelection(parsed: ParsedInvocation): ForegroundSelection | undefined {
+  if (parsed.command === "connect") return Object.freeze({ agentSessionIds: parsed.operands });
+  if (parsed.command === "agent-sessions" && parsed.operands[0] === "attach") {
+    return Object.freeze({ agentSessionIds: parsed.operands.slice(1) });
+  }
+  const expectedAgent: "claude-code" | "codex" | "openclaw" | undefined = parsed.command === "claude"
+    ? "claude-code"
+    : parsed.command === "codex" || parsed.command === "openclaw"
+      ? parsed.command
+      : undefined;
+  const agentSessionId = stringOption(parsed, "agent-session");
+  if (expectedAgent !== undefined && agentSessionId !== undefined) {
+    return Object.freeze({
+      agentSessionIds: Object.freeze([agentSessionId]),
+      expectedAgentKinds: Object.freeze([expectedAgent]),
+    });
+  }
+  return undefined;
+}
+
+function nodePlatform(kind: PlatformAdapter["kind"]): NodeJS.Platform {
+  return kind === "windows" ? "win32" : kind === "macos" ? "darwin" : "linux";
+}
+
+function runtimeError(error: RuntimeBoundaryError): RunaError {
+  const exitCode = error.code === "session_conflict"
+    ? EXIT_CODES.conflict
+    : error.code === "capability_unsupported" || error.code === "control_plane_unavailable" || error.code === "pty_unavailable"
+      ? EXIT_CODES.unsupported
+      : error.code === "capability_unavailable" || error.code === "terminal_disconnected" || error.code === "terminal_timeout"
+        ? EXIT_CODES.network
+        : error.code.startsWith("capability_") || error.code.startsWith("grant_") || error.code === "remote_state_unproven"
+          ? EXIT_CODES.policy
+          : EXIT_CODES.remote;
+  return new RunaError({
+    code: `runa.runtime.${error.code}`,
+    message: error.message,
+    exitCode,
+    retryable: error.retryable,
+    ...(error.safeDetails === undefined ? {} : { details: error.safeDetails }),
+    cause: error,
+  });
 }
 
 export async function runCli(argv: readonly string[], dependencies: RunCliDependencies = {}): Promise<ExitCode> {
@@ -132,13 +226,41 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
 
     preflightInvocation(parsed);
 
+    const journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "openclaw"
+      ? preflightAgentJourneyInvocation(parsed)
+      : undefined;
+
+    const foreground = foregroundSelection(parsed);
+    if ((foreground !== undefined || journeyIntent?.target === "reconcile") &&
+      (writer.structured || !streams.stdinIsTTY || !streams.stdoutIsTTY)) {
+      throw usageError(
+        "Foreground AgentSession attachment requires an interactive terminal and does not support JSON output.",
+        "Run this command directly in an interactive terminal without --json or output redirection.",
+      );
+    }
+    const effectiveEnvironment = dependencies.env ?? process.env;
+    const platform = dependencies.platform ?? createPlatformAdapter({ env: effectiveEnvironment });
+    let foregroundPresentation: ForegroundPresentationMode | undefined;
+    if (foreground !== undefined) {
+      foregroundPresentation = selectNodeForegroundPresentation({
+        platform: nodePlatform(platform.kind),
+        environment: effectiveEnvironment,
+        ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+      });
+      if (foregroundPresentation === "plain" && foreground.agentSessionIds.length !== 1) {
+        throw usageError(
+          "Plain passthrough mode attaches exactly one AgentSession.",
+          "Select one AgentSession or use an admitted rich terminal for the multi-tab workbench.",
+        );
+      }
+    }
+
     let timeoutMs: number;
     try {
       timeoutMs = parseTimeout(stringOption(parsed, "timeout-ms"));
     } catch {
       throw usageError("Option --timeout-ms must be an integer from 100 through 120000.");
     }
-    const platform = dependencies.platform ?? createPlatformAdapter({ env: dependencies.env ?? process.env });
     const profile = stringOption(parsed, "profile");
     const baseUrl = stringOption(parsed, "base-url");
     const configFile = stringOption(parsed, "config-file");
@@ -176,47 +298,182 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       return humanAuth;
     };
 
-    if (parsed.command === "login" || parsed.command === "logout" || parsed.command === "whoami") {
+    if (
+      parsed.command === "signup" ||
+      parsed.command === "login" ||
+      parsed.command === "logout" ||
+      parsed.command === "whoami" ||
+      parsed.command === "access"
+    ) {
       rejectUnknownOptions(parsed, []);
-      if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands.`);
+      if (parsed.command === "access") {
+        if (parsed.operands.length !== 1 || parsed.operands[0] !== "status") {
+          throw usageError("access requires the status action.");
+        }
+      } else if (parsed.operands.length !== 0) {
+        throw usageError(`${parsed.command} accepts no operands.`);
+      }
       if (config.apiKey !== undefined) {
         throw new RunaError({
           code: "runa.auth.mode_conflict",
-          message: "Interactive authentication is disabled while RUNA_API_KEY selects automation mode.",
+          message: "Interactive authentication is disabled while CUNA_API_KEY selects automation mode.",
           exitCode: EXIT_CODES.auth,
-          hint: "Unset RUNA_API_KEY before managing the interactive session.",
+          hint: "Unset CUNA_API_KEY before managing the interactive session.",
         });
       }
-      if (parsed.command === "login") {
+      if (parsed.command === "signup") {
+        const result = await getHumanAuth().signup(
+          dependencies.signal === undefined ? {} : { signal: dependencies.signal },
+        );
+        const data = humanResult(result);
+        writer.success(
+          "signup",
+          data,
+          result.context.admission === "waitlisted"
+            ? `Cuna saved your waitlist place for profile ${result.profile}.`
+            : `Cuna completed signup for profile ${result.profile}.`,
+        );
+      } else if (parsed.command === "login") {
         const result = await getHumanAuth().login(
           dependencies.signal === undefined ? {} : { signal: dependencies.signal },
         );
         const data = humanResult(result);
-        writer.success("login", data, `Signed in to Runa profile ${result.profile}.`);
-      } else if (parsed.command === "whoami") {
+        writer.success("login", data, `Signed in to Cuna profile ${result.profile}.`);
+      } else if (parsed.command === "whoami" || parsed.command === "access") {
         const result = await getHumanAuth().whoami(dependencies.signal);
         const data = humanResult(result);
-        writer.success("whoami", data, `${result.context.identity}\t${result.context.admission}\t${result.context.workspace.state}`);
+        writer.success(
+          parsed.command === "access" ? "access.status" : "whoami",
+          data,
+          `${result.context.identity}\t${result.context.admission}\t${result.context.workspace.state}`,
+        );
       } else {
         const result = await getHumanAuth().logout(dependencies.signal);
-        writer.success("logout", result, "Signed out of Runa on this device.");
+        writer.success("logout", result, "Signed out of Cuna on this device.");
       }
       return EXIT_CODES.success;
     }
 
     let bearerToken: string | undefined;
     let credentialMode: "automation" | "interactive" | undefined = config.apiKey === undefined ? undefined : "automation";
-    if (config.apiKey === undefined && needsRemoteCredential(parsed.command) && dependencies.clientFactory === undefined) {
+    if (config.apiKey === undefined && needsRemoteCredential(parsed.command, foreground) && dependencies.clientFactory === undefined) {
       bearerToken = await getHumanAuth().acquireAccessToken(dependencies.signal);
       credentialMode = "interactive";
     }
-    const client = dependencies.clientFactory?.(config, timeoutMs) ?? createRunaApiClient(createHttpTransport({
+    const httpTransport = dependencies.clientFactory === undefined ? createHttpTransport({
       baseUrl: config.baseUrl,
       ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
       ...(bearerToken === undefined ? {} : { bearerToken }),
       timeoutMs,
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
-    }));
+    }) : undefined;
+    const client = dependencies.clientFactory?.(config, timeoutMs) ?? createRunaApiClient(httpTransport!);
+    if (journeyIntent?.target === "reconcile") {
+      if (credentialMode === undefined) {
+        throw new RunaError({
+          code: "runa.auth.required",
+          message: "The automatic Cuna journey requires authenticated account authority.",
+          exitCode: EXIT_CODES.auth,
+        });
+      }
+      let effects: AgentJourneyEffects;
+      let stopJourneyWorkspace: (() => Promise<void>) | undefined;
+      if (dependencies.automaticJourneyEffectsFactory !== undefined) {
+        effects = dependencies.automaticJourneyEffectsFactory({
+          client,
+          intent: journeyIntent,
+          config,
+          platform,
+          credentialMode,
+          ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+        });
+      } else {
+        if (httpTransport === undefined) {
+          throw new RunaError({
+            code: "runa.journey.workspace_transport_unavailable",
+            message: "The injected API client did not provide authenticated workspace-sync transport authority.",
+            exitCode: EXIT_CODES.unsupported,
+          });
+        }
+        const identity = await client.getIdentity(dependencies.signal);
+        const workspaceId = identity.workspaceId;
+        if (workspaceId === undefined) {
+          throw new RunaError({
+            code: "runa.journey.workspace_identity_unavailable",
+            message: "The signed-in account has no assigned workspace authority.",
+            exitCode: EXIT_CODES.auth,
+          });
+        }
+        const workspace = createWorkspaceJourneyEffects({
+          client,
+          transport: Object.freeze({
+            request: (request: HttpRequest) => httpTransport.request(request),
+            authentication: "authenticated" as const,
+            credentialAuthority: credentialMode === "interactive" ? "interactive" as const : "api_key" as const,
+          }),
+          profileId: config.profile,
+          userId: identity.id,
+          workspaceId,
+          stateDirectory: platform.paths.stateDirectory,
+          filesystemCapabilities: conservativeFilesystemCapabilities(platform.kind),
+        });
+        stopJourneyWorkspace = () => workspace.stopContinuousSync();
+        const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
+        effects = createApiAgentJourneyEffects({
+          client,
+          inspectWorkspace: workspace.inspectWorkspace,
+          synchronizeWorkspace: workspace.synchronizeWorkspace,
+          authorizeMachineCreate: async ({ requestedAgent, signal }) =>
+            (dependencies.authorizeMachineCreate ?? confirmMachineCreate)(requestedAgent, signal),
+          attach: async ({ agentSessionId, expectedAgent, signal }) => {
+            const presentationMode = selectNodeForegroundPresentation({
+              platform: nodePlatform(platform.kind),
+              environment: effectiveEnvironment,
+              ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+            });
+            await runner({
+              client,
+              baseUrl: config.baseUrl,
+              agentSessionIds: [agentSessionId],
+              expectedAgentKinds: [expectedAgent],
+              color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+              hostPlatform: nodePlatform(platform.kind),
+              presentationMode,
+              ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+              signal,
+            });
+          },
+          ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+        });
+      }
+      try {
+        await orchestrateAgentJourney({
+          intent: journeyIntent,
+          effects,
+          ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+        });
+      } finally {
+        await stopJourneyWorkspace?.();
+      }
+      return EXIT_CODES.success;
+    }
+    if (foreground !== undefined) {
+      const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
+      await runner({
+        client,
+        baseUrl: config.baseUrl,
+        agentSessionIds: foreground.agentSessionIds,
+        ...(foreground.expectedAgentKinds === undefined
+          ? {}
+          : { expectedAgentKinds: foreground.expectedAgentKinds }),
+        color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+        hostPlatform: nodePlatform(platform.kind),
+        ...(foregroundPresentation === undefined ? {} : { presentationMode: foregroundPresentation }),
+        ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+        ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+      });
+      return EXIT_CODES.success;
+    }
     let runtimeFeatures = dependencies.runtimeFeatures;
     if (parsed.command === "doctor" && runtimeFeatures === undefined) {
       const backend = createPlatformCredentialBackend({
@@ -248,6 +505,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           exitCode: EXIT_CODES.auth,
           retryable: unknownError.retryable,
         })
+      : unknownError instanceof RuntimeBoundaryError
+        ? runtimeError(unknownError)
       : normalizeError(unknownError);
     writer.error(label, error);
     return error.exitCode;

@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { access, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -31,6 +34,8 @@ class MemorySecureBackend {
     this.replaceCalls = 0;
     this.readCalls = 0;
     this.failNextReplace = false;
+    this.commitThenThrowNextReplace = false;
+    this.ambiguousNextReplace = false;
   }
 
   async probe() {
@@ -53,6 +58,16 @@ class MemorySecureBackend {
 
   async replace(target, value) {
     this.replaceCalls += 1;
+    if (this.commitThenThrowNextReplace) {
+      this.commitThenThrowNextReplace = false;
+      this.values.set(target, Uint8Array.from(value));
+      throw new Error("simulated lost replacement acknowledgement");
+    }
+    if (this.ambiguousNextReplace) {
+      this.ambiguousNextReplace = false;
+      this.values.set(target, new TextEncoder().encode("foreign-corrupt-state"));
+      throw new Error("simulated ambiguous replacement");
+    }
     if (this.failNextReplace) {
       this.failNextReplace = false;
       throw new Error("simulated atomic replacement failure");
@@ -138,6 +153,34 @@ test("atomic backend failure preserves the previously valid credential", async (
   replacement.dispose();
 });
 
+test("commit-then-throw replacement is reconciled by read-back and ambiguous state is never retried as failure", async () => {
+  const backend = new MemorySecureBackend();
+  const vault = new CredentialVault({ backend, clock: () => NOW });
+  const first = SecretMaterial.fromUtf8("credential-before-ack-loss");
+  await vault.rotate({ binding: BINDING, material: first });
+  backend.commitThenThrowNextReplace = true;
+  const committed = SecretMaterial.fromUtf8("credential-after-ack-loss");
+  const status = await vault.rotate({ binding: BINDING, material: committed, expectedRevision: 1 });
+  assert.equal(status.revision, 2, "authoritative read-back proves the lost acknowledgement committed");
+  const loaded = await vault.load(BINDING);
+  assert.equal(loaded.revision, 2);
+  assert.equal(utf8(loaded.material), "credential-after-ack-loss");
+  loaded.material.dispose();
+
+  backend.ambiguousNextReplace = true;
+  const ambiguous = SecretMaterial.fromUtf8("credential-with-unknown-outcome");
+  await assert.rejects(
+    vault.rotate({ binding: BINDING, material: ambiguous, expectedRevision: 2 }),
+    (error) => error instanceof CredentialBoundaryError &&
+      error.code === "credential_backend_failure" &&
+      error.retryable === false &&
+      error.safeDetails?.replacementOutcome === "ambiguous",
+  );
+  first.dispose();
+  committed.dispose();
+  ambiguous.dispose();
+});
+
 test("concurrent refreshes coalesce once and produce one atomic revision", async () => {
   const backend = new MemorySecureBackend();
   const vault = new CredentialVault({ backend, clock: () => NOW });
@@ -159,6 +202,41 @@ test("concurrent refreshes coalesce once and produce one atomic revision", async
     assert.equal(utf8(snapshot.material), "refresh-new");
     snapshot.material.dispose();
   }
+  original.dispose();
+});
+
+test("failed refresh replacement wipes every owned copy and preserves the previous revision", { concurrency: false }, async () => {
+  const backend = new MemorySecureBackend();
+  const vault = new CredentialVault({ backend, clock: () => NOW });
+  const original = SecretMaterial.fromUtf8("refresh-before-failure");
+  await vault.rotate({ binding: BINDING, material: original });
+  backend.failNextReplace = true;
+
+  const copied = [];
+  const copyBytes = SecretMaterial.prototype.copyBytes;
+  SecretMaterial.prototype.copyBytes = function captureOwnedCopy() {
+    const bytes = copyBytes.call(this);
+    copied.push(bytes);
+    return bytes;
+  };
+  let candidate;
+  try {
+    await assert.rejects(vault.refresh(BINDING, async () => {
+      candidate = SecretMaterial.fromUtf8("refresh-copy-must-be-wiped");
+      return { status: "rotated", material: candidate, expiresAt: NOW + 60_000 };
+    }));
+  } finally {
+    SecretMaterial.prototype.copyBytes = copyBytes;
+  }
+
+  assert.equal(copied.length, 1);
+  assert.equal(copied[0].every((byte) => byte === 0), true);
+  assert.throws(() => candidate.copyBytes(), (error) =>
+    error instanceof CredentialBoundaryError && error.code === "credential_missing");
+  const loaded = await vault.load(BINDING);
+  assert.equal(loaded.revision, 1);
+  assert.equal(utf8(loaded.material), "refresh-before-failure");
+  loaded.material.dispose();
   original.dispose();
 });
 
@@ -256,6 +334,31 @@ test("self-reported or cross-platform vault evidence cannot authorize credential
   secret.dispose();
 });
 
+test("vault rejects clock rollback and evidence that expires while the native probe is in flight", async () => {
+  const backend = new MemorySecureBackend();
+  let now = NOW;
+  const vault = new CredentialVault({ backend, clock: () => now });
+  assert.equal((await vault.status(BINDING)).state, "absent");
+  now = NOW - 1;
+  assert.equal((await vault.status(BINDING)).state, "unavailable");
+
+  let slowNow = NOW;
+  const slowBackend = new MemorySecureBackend();
+  slowBackend.probe = async () => {
+    const evidence = await MemorySecureBackend.prototype.probe.call(slowBackend);
+    slowNow = NOW + 60_000;
+    return evidence;
+  };
+  const slowVault = new CredentialVault({ backend: slowBackend, clock: () => slowNow });
+  const material = SecretMaterial.fromUtf8("must-not-cross-expired-probe");
+  await assert.rejects(
+    slowVault.rotate({ binding: BINDING, material }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unverified",
+  );
+  assert.equal(slowBackend.replaceCalls, 0);
+  material.dispose();
+});
+
 test("secure process runner kills oversized output without returning it", async () => {
   const runner = createSecureProcessRunner();
   await assert.rejects(
@@ -282,6 +385,66 @@ test("secure process timeout waits for confirmed child closure before rejecting"
     (error) => error instanceof CredentialBoundaryError && error.code === "credential_process_timeout",
   );
   assert.ok(Date.now() - startedAt >= 90);
+});
+
+test("post-spawn loaded-image rejection kills the identified child before protected stdin is released", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "runa-stdin-admission-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const marker = path.join(root, "stdin-observed.txt");
+  const runner = createSecureProcessRunner();
+  let spawnedPid;
+  await assert.rejects(
+    runner.run({
+      executable: process.execPath,
+      cwd: process.cwd(),
+      args: [
+        "-e",
+        "const fs=require('node:fs');let n=0;process.stdin.on('data',(b)=>n+=b.length);process.stdin.on('end',()=>fs.writeFileSync(process.argv[1],String(n)));",
+        marker,
+      ],
+      stdin: Uint8Array.from([11, 22, 33, 44]),
+      beforeStdin: async (child) => {
+        spawnedPid = child.pid;
+        assert.equal(child.platform, process.platform);
+        throw new Error("loaded image does not match the admitted descriptor");
+      },
+    }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unverified",
+  );
+  await assert.rejects(access(marker), { code: "ENOENT" });
+  assert.ok(Number.isSafeInteger(spawnedPid) && spawnedPid > 0);
+  assert.throws(() => process.kill(spawnedPid, 0), { code: "ESRCH" });
+});
+
+test("secure process runner retains and releases the process-instance lease around protected stdin", async () => {
+  const runner = createSecureProcessRunner();
+  let releaseCalls = 0;
+  const result = await runner.run({
+    executable: process.execPath,
+    cwd: process.cwd(),
+    args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('accepted'))"],
+    stdin: Uint8Array.from([11, 22, 33, 44]),
+    beforeStdin: async () => ({ release: () => { releaseCalls += 1; } }),
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(new TextDecoder().decode(result.stdout), "accepted");
+  assert.equal(result.stdinAdmissionConfirmed, true);
+  assert.equal(releaseCalls, 1);
+  result.stdout.fill(0);
+});
+
+test("secure process runner fails closed when the process-instance lease cannot be released", async () => {
+  const runner = createSecureProcessRunner();
+  await assert.rejects(
+    runner.run({
+      executable: process.execPath,
+      cwd: process.cwd(),
+      args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>process.exit(0))"],
+      stdin: Uint8Array.from([11, 22, 33, 44]),
+      beforeStdin: async () => ({ release: () => { throw new Error("handle release failed"); } }),
+    }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unverified",
+  );
 });
 
 test("Linux Secret Service adapter transports protected values only through stdin", async () => {

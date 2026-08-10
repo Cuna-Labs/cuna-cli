@@ -86,7 +86,7 @@ function terminalSessionId(url: string): string {
   const match = /^\/v1\/terminal-connections\/([^/]+)\/stream$/u.exec(parsed.pathname);
   const id = match?.[1];
   if (id === undefined || !UUID.test(id)) {
-    throw runtimeFailure("grant_invalid", "The terminal WebSocket URL has no canonical Runa terminal session.");
+    throw runtimeFailure("grant_invalid", "The terminal WebSocket URL has no canonical Cuna terminal session.");
   }
   return id;
 }
@@ -138,7 +138,7 @@ export function createNodeWebSocketConnector(input: {
       try {
         socket = new WebSocketAuthority(request.url, [request.protocol, authProtocol]);
       } catch (error) {
-        throw runtimeFailure("terminal_disconnected", "Runa could not start the terminal WebSocket handshake.", {
+        throw runtimeFailure("terminal_disconnected", "Cuna could not start the terminal WebSocket handshake.", {
           retryable: true,
           cause: error,
         });

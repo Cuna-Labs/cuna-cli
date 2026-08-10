@@ -18,10 +18,10 @@ export async function runNpm(npmArgs, options = {}) {
   return execute(process.execPath, [npmCli, ...npmArgs], options);
 }
 
-export async function invokeInstalledRuna(prefix, args, options = {}) {
+export async function invokeInstalledCuna(prefix, args, options = {}) {
   const executable = process.platform === "win32"
-    ? path.join(prefix, "runa.cmd")
-    : path.join(prefix, "bin", "runa");
+    ? path.join(prefix, "cuna.cmd")
+    : path.join(prefix, "bin", "cuna");
   await stat(executable);
   if (process.platform !== "win32") return execute(executable, args, { ...options, windowsHide: true });
   invariant(args.every((value) => /^[A-Za-z0-9._-]+$/u.test(value)), "Installed-product probe received an unsafe Windows argument");
@@ -33,15 +33,15 @@ export async function invokeInstalledRuna(prefix, args, options = {}) {
 export function installedProductPaths(prefix) {
   if (process.platform === "win32") {
     return [
-      path.join(prefix, "runa"),
-      path.join(prefix, "runa.cmd"),
-      path.join(prefix, "runa.ps1"),
-      path.join(prefix, "node_modules", "@runa_laboratories", "cli"),
+      path.join(prefix, "cuna"),
+      path.join(prefix, "cuna.cmd"),
+      path.join(prefix, "cuna.ps1"),
+      path.join(prefix, "node_modules", "@cuna_labs", "cli"),
     ];
   }
   return [
-    path.join(prefix, "bin", "runa"),
-    path.join(prefix, "lib", "node_modules", "@runa_laboratories", "cli"),
+    path.join(prefix, "bin", "cuna"),
+    path.join(prefix, "lib", "node_modules", "@cuna_labs", "cli"),
   ];
 }
 

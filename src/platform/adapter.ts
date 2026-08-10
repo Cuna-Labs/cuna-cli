@@ -11,6 +11,8 @@ export interface PlatformPaths {
   readonly configDirectory: string;
   readonly stateDirectory: string;
   readonly runtimeDirectory: string;
+  /** Read-only upgrade fallback. New state is always written beneath Cuna paths. */
+  readonly legacyConfigDirectory?: string;
 }
 
 export interface SafeFileSnapshot {
@@ -49,25 +51,28 @@ export function resolvePlatformPaths(input: PlatformEnvironment): PlatformPaths 
     const appData = input.env.APPDATA ?? win32.join(input.homeDirectory, "AppData", "Roaming");
     const localAppData = input.env.LOCALAPPDATA ?? win32.join(input.homeDirectory, "AppData", "Local");
     return Object.freeze({
-      configDirectory: win32.join(appData, "Runa"),
-      stateDirectory: win32.join(localAppData, "Runa", "State"),
-      runtimeDirectory: win32.join(localAppData, "Runa", "Runtime"),
+      configDirectory: win32.join(appData, "Cuna"),
+      stateDirectory: win32.join(localAppData, "Cuna", "State"),
+      runtimeDirectory: win32.join(localAppData, "Cuna", "Runtime"),
+      legacyConfigDirectory: win32.join(appData, "Runa"),
     });
   }
   if (kind === "macos") {
     return Object.freeze({
-      configDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Runa"),
-      stateDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Runa", "State"),
-      runtimeDirectory: posix.join(input.env.TMPDIR ?? "/tmp", `runa-${input.userId ?? "user"}`),
+      configDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Cuna"),
+      stateDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Cuna", "State"),
+      runtimeDirectory: posix.join(input.env.TMPDIR ?? "/tmp", `cuna-${input.userId ?? "user"}`),
+      legacyConfigDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Runa"),
     });
   }
   const configRoot = input.env.XDG_CONFIG_HOME ?? posix.join(input.homeDirectory, ".config");
   const stateRoot = input.env.XDG_STATE_HOME ?? posix.join(input.homeDirectory, ".local", "state");
   const runtimeRoot = input.env.XDG_RUNTIME_DIR ?? posix.join(input.homeDirectory, ".local", "run");
   return Object.freeze({
-    configDirectory: posix.join(configRoot, "runa"),
-    stateDirectory: posix.join(stateRoot, "runa"),
-    runtimeDirectory: posix.join(runtimeRoot, "runa"),
+    configDirectory: posix.join(configRoot, "cuna"),
+    stateDirectory: posix.join(stateRoot, "cuna"),
+    runtimeDirectory: posix.join(runtimeRoot, "cuna"),
+    legacyConfigDirectory: posix.join(configRoot, "runa"),
   });
 }
 
@@ -108,7 +113,7 @@ async function readSafeConfig(
 function configFileError(reason: string, cause?: unknown): RunaError {
   return new RunaError({
     code: "runa.config.unsafe_file",
-    message: "The Runa configuration file is unavailable or unsafe.",
+    message: "The Cuna configuration file is unavailable or unsafe.",
     exitCode: EXIT_CODES.policy,
     hint: "Fix the user-owned configuration file permissions or select a safe file explicitly.",
     details: { reason },

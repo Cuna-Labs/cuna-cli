@@ -23,7 +23,7 @@ function writeLine(stream: Writable, value: string): void {
 
 /**
  * Human terminal output is a trust boundary. Preserve only the two layout
- * controls emitted deliberately by Runa; render every other C0/C1/Unicode
+ * controls emitted deliberately by Cuna; render every other C0/C1/Unicode
  * format control visibly so API data and error text cannot execute ANSI/OSC,
  * alter the title/clipboard, or spoof text direction.
  */

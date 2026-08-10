@@ -2,12 +2,14 @@ import type { HttpTransport } from "../api/http.js";
 import { encodePublicId } from "../core/validation.js";
 import {
   decodeCliAuthBootstrap,
+  decodeCliSignupCapability,
   decodeCliContinuationIssued,
   decodeCliContinuationStatus,
   decodeCliIdentityContext,
   decodeCliTokenSet,
   decodeRevocation,
   type CliAuthBootstrap,
+  type CliSignupCapability,
   type CliContinuationIssued,
   type CliContinuationStatus,
   type CliIdentityContext,
@@ -17,6 +19,7 @@ import {
 
 export interface HumanAuthClient {
   bootstrap(signal?: AbortSignal): Promise<CliAuthBootstrap>;
+  signupCapability(signal?: AbortSignal): Promise<CliSignupCapability>;
   createContinuation(input: {
     readonly state: string;
     readonly codeChallenge: string;
@@ -60,6 +63,13 @@ export function createHumanAuthClient(input: {
     async bootstrap(signal) {
       return decodeCliAuthBootstrap(await input.anonymous.request({
         method: "GET", path: "/v1/cli-auth/bootstrap", ...(signal === undefined ? {} : { signal }),
+      }));
+    },
+    async signupCapability(signal) {
+      return decodeCliSignupCapability(await input.anonymous.request({
+        method: "GET",
+        path: "/v1/cli-auth/signup-capability",
+        ...(signal === undefined ? {} : { signal }),
       }));
     },
     async createContinuation(request) {

@@ -11,9 +11,10 @@ import type {
   Machine,
 } from "../api/contracts.js";
 import type { EffectiveConfig } from "../config/config.js";
-import { publicConfig } from "../config/config.js";
+import { DEFAULT_BASE_URL, publicConfig } from "../config/config.js";
 import { EXIT_CODES, RunaError, unsupportedError, usageError } from "../core/errors.js";
-import { assertIdempotencyKey, assertPublicId, assertSafeDisplayText } from "../core/validation.js";
+import { assertCanonicalUuid, assertIdempotencyKey, assertPublicId, assertSafeDisplayText } from "../core/validation.js";
+import { preflightAgentJourneyInvocation } from "../journey/intent.js";
 import { INITIAL_RUNTIME_GATES, type RuntimeFeatureGate } from "../runtime/contracts.js";
 import { evaluateRuntimeSupport } from "../platform/support.js";
 import { CLI_VERSION } from "../version.js";
@@ -43,9 +44,9 @@ function requireCredential(context: CommandContext): void {
   if (context.credentialMode !== undefined) return;
   throw new RunaError({
     code: "runa.auth.required",
-    message: "This command requires a Runa credential.",
+    message: "This command requires a Cuna credential.",
     exitCode: EXIT_CODES.auth,
-    hint: "Run `runa login` for interactive use or set RUNA_API_KEY for explicit automation.",
+    hint: "Run `cuna login` for interactive use or set CUNA_API_KEY for explicit automation.",
   });
 }
 
@@ -120,6 +121,12 @@ function agentSessionRecord(session: AgentSession): Readonly<Record<string, unkn
   return Object.freeze({
     id: session.id,
     machine_id: session.machineId,
+    ...(session.workspaceBindingId === undefined
+      ? {}
+      : {
+          workspace_binding_id: session.workspaceBindingId,
+          workspace_generation: session.workspaceGeneration,
+        }),
     name: session.name,
     agent: session.agent,
     cwd: session.cwd,
@@ -129,6 +136,7 @@ function agentSessionRecord(session: AgentSession): Readonly<Record<string, unkn
     process_state: session.processState,
     ...(session.processEpoch === undefined ? {} : { process_epoch: session.processEpoch }),
     ...(session.runtimeObservedAt === undefined ? {} : { runtime_observed_at: session.runtimeObservedAt }),
+    ...(session.runtimeExpiresAt === undefined ? {} : { runtime_expires_at: session.runtimeExpiresAt }),
     ...(session.terminationRequestedAt === undefined
       ? {}
       : { termination_requested_at: session.terminationRequestedAt }),
@@ -183,25 +191,105 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
     case "machines":
       preflightMachines(parsed);
       return;
+    case "records":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 1 || parsed.operands[0] !== "list") {
+        throw usageError("records requires the list action.");
+      }
+      return;
+    case "authorizations":
+      rejectUnknownOptions(parsed, ["machine"]);
+      if (parsed.operands.length !== 1 || parsed.operands[0] !== "list") {
+        throw usageError("authorizations requires the list action.");
+      }
+      assertCanonicalUuid(stringOption(parsed, "machine") ?? "", "machine ID");
+      return;
+    case "account":
+    case "workspace": {
+      rejectUnknownOptions(parsed, []);
+      const action = requireOperand(parsed.operands, 0, `${parsed.command} action`);
+      if ((action !== "show" && action !== "open") || parsed.operands.length !== 1) {
+        throw usageError(`${parsed.command} requires the show or open action.`);
+      }
+      return;
+    }
+    case "usage":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 1 || parsed.operands[0] !== "show") {
+        throw usageError("usage requires the show action.");
+      }
+      return;
+    case "api-keys": {
+      const action = requireOperand(parsed.operands, 0, "api-keys action");
+      if (action === "list") {
+        rejectUnknownOptions(parsed, []);
+        if (parsed.operands.length !== 1) throw usageError("api-keys list accepts no operands.");
+        return;
+      }
+      if (action === "revoke") {
+        rejectUnknownOptions(parsed, ["yes"]);
+        if (parsed.operands.length !== 2) throw usageError("api-keys revoke requires exactly one API key ID.");
+        requireConfirmation(parsed, "api-keys.revoke");
+        assertCanonicalUuid(parsed.operands[1] ?? "", "API key ID");
+        return;
+      }
+      if (action === "create") {
+        throw unsupportedError("API key creation", "api_key_create_reconciliation_unavailable");
+      }
+      throw usageError(`Unknown api-keys action ${action}.`);
+    }
     case "agent-sessions":
       preflightAgentSessions(parsed);
       return;
+    case "agent": {
+      rejectUnknownOptions(parsed, ["agent-session", "yes"]);
+      if (parsed.operands.length !== 1 || parsed.operands[0] !== "logout") {
+        throw usageError("agent requires the logout action.");
+      }
+      requireConfirmation(parsed, "agent.logout");
+      assertCanonicalUuid(
+        stringOption(parsed, "agent-session") ?? "",
+        "AgentSession ID",
+      );
+      return;
+    }
     case "login":
     case "logout":
     case "whoami":
       rejectUnknownOptions(parsed, []);
       if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands.`);
       return;
+    case "access":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 1 || parsed.operands[0] !== "status") {
+        throw usageError("access requires the status action.");
+      }
+      return;
     case "signup":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 0) throw usageError("signup accepts no operands.");
+      return;
     case "claude":
     case "codex":
-    case "openclaw":
+    case "openclaw": {
+      preflightAgentJourneyInvocation(parsed);
+      return;
+    }
     case "shell":
-    case "connect":
     case "sync":
     case "companion":
       rejectUnknownOptions(parsed, []);
       if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands in this build.`);
+      return;
+    case "connect":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length < 1 || parsed.operands.length > 4) {
+        throw usageError("connect requires one through four explicit AgentSession IDs.");
+      }
+      if (new Set(parsed.operands).size !== parsed.operands.length) {
+        throw usageError("connect requires distinct AgentSession IDs.");
+      }
+      for (const agentSessionId of parsed.operands) assertCanonicalUuid(agentSessionId, "AgentSession ID");
       return;
     case "doctor":
       rejectUnknownOptions(parsed, []);
@@ -211,7 +299,7 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
       rejectUnknownOptions(parsed, ["offline"]);
       if (parsed.operands.length !== 0) throw usageError("self-test accepts no operands.");
       if (!booleanOption(parsed, "offline")) {
-        throw usageError("self-test requires --offline in this release.", "Run `runa self-test --offline --json`.");
+        throw usageError("self-test requires --offline in this release.", "Run `cuna self-test --offline --json`.");
       }
       return;
     case "version":
@@ -223,7 +311,7 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
       if (parsed.operands.length !== 0) throw usageError("help accepts no operands.");
       return;
     default:
-      throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run `runa --help`.");
+      throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run `cuna --help`.");
   }
 }
 
@@ -274,16 +362,24 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
   if (action === "get") {
     rejectUnknownOptions(parsed, []);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions get requires exactly one AgentSession ID.");
-    assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     return;
   }
   if (action === "create") {
     rejectUnknownOptions(parsed, [
-      "machine", "name", "agent", "cwd", "auth-mode", "credential-binding", "yes", "idempotency-key",
+      "machine", "workspace-binding-id", "workspace-generation", "name", "agent", "cwd",
+      "auth-mode", "credential-binding", "yes", "idempotency-key",
     ]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions create accepts no operands.");
     requireConfirmation(parsed, "agent-sessions.create");
     assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
+    assertCanonicalUuid(
+      stringOption(parsed, "workspace-binding-id") ?? "",
+      "workspace binding ID",
+    );
+    if (integerOption(parsed, "workspace-generation", 1, Number.MAX_SAFE_INTEGER) === undefined) {
+      throw usageError("Option --workspace-generation is required.");
+    }
     agentOption(parsed, true);
     const cwd = assertSafeDisplayText(stringOption(parsed, "cwd") ?? "/workspace", "workspace path");
     if (!cwd.startsWith("/workspace") || cwd.split("/").includes("..") || cwd.length > 1024) {
@@ -312,7 +408,7 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
     rejectUnknownOptions(parsed, action === "rename" ? ["name", "yes"] : ["yes"]);
     if (parsed.operands.length !== 2) throw usageError(`agent-sessions ${action} requires exactly one AgentSession ID.`);
     requireConfirmation(parsed, `agent-sessions.${action}`);
-    assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     if (action === "rename") {
       const name = stringOption(parsed, "name");
       if (name === undefined || assertSafeDisplayText(name, "AgentSession name").length < 1 || name.length > 80) {
@@ -324,7 +420,7 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
   if (action === "attach") {
     rejectUnknownOptions(parsed, []);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions attach requires exactly one AgentSession ID.");
-    assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     return;
   }
   throw usageError(`Unknown agent-sessions action ${action}.`);
@@ -366,12 +462,220 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     }
     case "machines":
       return executeMachines(context);
+    case "records": {
+      requireCredential(context);
+      await requireCapability({
+        client,
+        scope: "account",
+        capabilityId: "records.list",
+        now: context.now,
+        allowedInteractions: ["read_only"],
+      });
+      const records = await client.listRecords();
+      const data = Object.freeze({
+        items: records.map((record) => Object.freeze({
+          id: record.id,
+          machine_id: record.machineId,
+          kind: record.kind,
+          summary: record.summary,
+          detail: record.detail,
+          created_at: record.createdAt,
+        })),
+      });
+      return Object.freeze({
+        command: "records.list",
+        data,
+        human: records.length === 0
+          ? "No records found."
+          : records.map((record) => `${record.createdAt}\t${record.machineId}\t${record.kind}\t${record.summary}`).join("\n"),
+      });
+    }
+    case "authorizations": {
+      requireCredential(context);
+      const machineId = assertCanonicalUuid(stringOption(parsed, "machine") ?? "", "machine ID");
+      await requireCapability({
+        client,
+        scope: "machine",
+        resourceId: machineId,
+        capabilityId: "authorizations.list",
+        now: context.now,
+        allowedInteractions: ["read_only"],
+      });
+      const rules = await client.listAuthorizations(machineId);
+      const data = Object.freeze({
+        machine_id: machineId,
+        items: rules.map((rule) => Object.freeze({
+          id: rule.id,
+          host: rule.host,
+          path: rule.path,
+          credential: rule.credential,
+          target: Object.freeze({
+            kind: rule.target.kind,
+            name: rule.target.name,
+            format: rule.target.format,
+          }),
+          cache_ttl_seconds: rule.cacheTtlSeconds,
+        })),
+      });
+      return Object.freeze({
+        command: "authorizations.list",
+        data,
+        human: rules.length === 0
+          ? "No injection authorizations are active for this machine."
+          : rules.map((rule) => `${rule.id}\t${rule.host}${rule.path}\t${rule.target.kind}:${rule.target.name}\t${rule.credential}`).join("\n"),
+      });
+    }
+    case "account": {
+      requireCredential(context);
+      if (parsed.operands[0] === "open") {
+        throw unsupportedError("account browser handoff", "browser_handoff_authority_unavailable");
+      }
+      const identity = await client.getIdentity();
+      const data = Object.freeze({ id: identity.id, email: identity.email });
+      return Object.freeze({ command: "account.show", data, human: `${identity.id}\t${identity.email}` });
+    }
+    case "workspace": {
+      requireCredential(context);
+      if (parsed.operands[0] === "open") {
+        throw unsupportedError("workspace browser handoff", "browser_handoff_authority_unavailable");
+      }
+      const identity = await client.getIdentity();
+      const data = Object.freeze({
+        assigned: identity.workspaceAssigned,
+        ...(identity.waitlistPosition === undefined
+          ? {}
+          : { waitlist_position: identity.waitlistPosition }),
+      });
+      return Object.freeze({
+        command: "workspace.show",
+        data,
+        human: identity.workspaceAssigned
+          ? "A Cuna workspace is assigned to this account."
+          : `No Cuna workspace is assigned. Waitlist position: ${identity.waitlistPosition ?? "unknown"}.`,
+      });
+    }
+    case "usage": {
+      requireCredential(context);
+      const identity = await client.getIdentity();
+      if (identity.workspaceUsage === undefined) {
+        throw unsupportedError("workspace usage", "workspace_usage_unavailable");
+      }
+      const data = Object.freeze({
+        estimated_spend_usd: identity.workspaceUsage.estimatedSpendUsd,
+        estimated_remaining_usd: identity.workspaceUsage.estimatedRemainingUsd,
+        note: identity.workspaceUsage.note,
+      });
+      return Object.freeze({
+        command: "usage.show",
+        data,
+        human: `$${identity.workspaceUsage.estimatedSpendUsd.toFixed(2)} estimated spend; ` +
+          `$${identity.workspaceUsage.estimatedRemainingUsd.toFixed(2)} estimated remaining. ${identity.workspaceUsage.note}`,
+      });
+    }
+    case "api-keys": {
+      requireCredential(context);
+      await requireCapability({ client, scope: "account", capabilityId: "api_keys.manage", now: context.now });
+      const action = requireOperand(parsed.operands, 0, "api-keys action");
+      if (action === "list") {
+        const keys = await client.listApiKeys();
+        const data = Object.freeze({
+          items: keys.map((key) => Object.freeze({
+            id: key.id,
+            name: key.name,
+            prefix: key.prefix,
+            last_four: key.lastFour,
+            created_at: key.createdAt,
+            expires_at: key.expiresAt,
+            last_used_at: key.lastUsedAt,
+            revoked_at: key.revokedAt,
+          })),
+        });
+        return Object.freeze({
+          command: "api-keys.list",
+          data,
+          human: keys.length === 0
+            ? "No API keys found."
+            : keys.map((key) => `${key.id}\t${key.name}\t${key.prefix}…${key.lastFour}\t${key.revokedAt === null ? "active" : "revoked"}`).join("\n"),
+        });
+      }
+      if (action === "revoke") {
+        const id = assertCanonicalUuid(parsed.operands[1] ?? "", "API key ID");
+        await client.revokeApiKey(id);
+        return Object.freeze({
+          command: "api-keys.revoke",
+          data: Object.freeze({ id, revoked: true }),
+          human: `Revoked API key ${id}.`,
+        });
+      }
+      throw unsupportedError("API key creation", "api_key_create_reconciliation_unavailable");
+    }
     case "agent-sessions":
       return executeAgentSessions(context);
+    case "agent": {
+      requireCredential(context);
+      rejectUnknownOptions(parsed, ["agent-session", "yes"]);
+      if (parsed.operands.length !== 1 || parsed.operands[0] !== "logout") {
+        throw usageError("agent requires the logout action.");
+      }
+      requireConfirmation(parsed, "agent.logout");
+      const id = assertCanonicalUuid(
+        stringOption(parsed, "agent-session") ?? "",
+        "AgentSession ID",
+      );
+      const session = await client.getAgentSession(id);
+      if (
+        session.processEpoch === undefined ||
+        session.authMode !== "interactive_login" ||
+        (session.agent !== "claude-code" && session.agent !== "codex")
+      ) {
+        throw new RunaError({
+          code: "runa.agent.auth_logout_unavailable",
+          message: "Provider sign-out is unavailable for this AgentSession.",
+          exitCode: EXIT_CODES.policy,
+          hint: "Select a running Claude Code or Codex AgentSession using interactive sign-in.",
+        });
+      }
+      await requireCapability({
+        client,
+        scope: "agent_session",
+        resourceId: id,
+        capabilityId: "agent_sessions.auth_logout",
+        now: context.now,
+      });
+      const receipt = await client.logoutAgentSessionAuth(id, session.processEpoch);
+      if (
+        receipt.agentSessionId !== session.id ||
+        receipt.processEpoch !== session.processEpoch ||
+        receipt.authMode !== session.authMode ||
+        receipt.agent !== session.agent
+      ) {
+        throw new RunaError({
+          code: "runa.remote.malformed_response",
+          message: "Cuna returned a provider sign-out receipt for another AgentSession authority.",
+          exitCode: EXIT_CODES.remote,
+        });
+      }
+      return Object.freeze({
+        command: "agent.logout",
+        data: Object.freeze({
+          observation_id: receipt.observationId,
+          agent_session_id: receipt.agentSessionId,
+          process_epoch: receipt.processEpoch,
+          auth_mode: receipt.authMode,
+          agent: receipt.agent,
+          agent_version: receipt.agentVersion,
+          adapter_version: receipt.adapterVersion,
+          observed_at: receipt.observedAt,
+          outcome: receipt.outcome,
+        }),
+        human: `Signed out ${session.agent} in AgentSession ${session.id}.`,
+      });
+    }
     case "signup":
     case "login":
     case "logout":
     case "whoami":
+    case "access":
       throw unsupportedError("browser authentication", "browser_auth_dispatch_unavailable");
     case "claude":
     case "codex":
@@ -398,7 +702,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       if (!booleanOption(parsed, "offline")) {
         throw usageError(
           "self-test requires --offline in this release.",
-          "Run `runa self-test --offline --json`.",
+          "Run `cuna self-test --offline --json`.",
         );
       }
       const runtimeSupport = evaluateRuntimeSupport({
@@ -412,7 +716,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         node_runtime: runtimeSupport.nodeRuntime,
         supported_platform: runtimeSupport.platform,
         supported_architecture: runtimeSupport.architecture,
-        canonical_api_origin: config.baseUrl === "https://api.runacode.io" || config.developmentProfile,
+        canonical_api_origin: config.baseUrl === DEFAULT_BASE_URL || config.developmentProfile,
         package_identity: /^[0-9a-f]{64}$/u.test(buildDigest),
         virtual_terminal: virtualTerminal,
         network_requests: 0,
@@ -433,7 +737,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       if (!ok) {
         throw new RunaError({
           code: "runa.self_test.failed",
-          message: "The installed Runa CLI failed an offline integrity check.",
+          message: "The installed Cuna CLI failed an offline integrity check.",
           exitCode: EXIT_CODES.internal,
           details: {
             failed_checks: Object.entries(checks)
@@ -446,7 +750,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       return Object.freeze({ command: "self-test", data, human: "Offline self-test passed." });
     }
     default:
-      throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run `runa --help`.");
+      throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run `cuna --help`.");
   }
 }
 
@@ -582,16 +886,31 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
   if (action === "get") {
     rejectUnknownOptions(parsed, []);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions get requires exactly one AgentSession ID.");
-    const session = await client.getAgentSession(requireOperand(parsed.operands, 1, "AgentSession ID"));
+    const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    const session = await client.getAgentSession(id);
     return Object.freeze({ command: "agent-sessions.get", data: agentSessionRecord(session), human: `${session.id}\t${session.name}\t${session.agent}\t${session.processState}\t${session.cwd}` });
   }
   if (action === "create") {
     rejectUnknownOptions(parsed, [
-      "machine", "name", "agent", "cwd", "auth-mode", "credential-binding", "yes", "idempotency-key",
+      "machine", "workspace-binding-id", "workspace-generation", "name", "agent", "cwd",
+      "auth-mode", "credential-binding", "yes", "idempotency-key",
     ]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions create accepts no operands.");
     requireConfirmation(parsed, "agent-sessions.create");
     const machineId = assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
+    const workspaceBindingId = assertCanonicalUuid(
+      stringOption(parsed, "workspace-binding-id") ?? "",
+      "workspace binding ID",
+    );
+    const workspaceGeneration = integerOption(
+      parsed,
+      "workspace-generation",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    if (workspaceGeneration === undefined) {
+      throw usageError("Option --workspace-generation is required.");
+    }
     const agent = agentOption(parsed, true);
     if (agent === undefined) throw usageError("Option --agent is required.");
     const cwd = assertSafeDisplayText(stringOption(parsed, "cwd") ?? "/workspace", "workspace path");
@@ -623,10 +942,12 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
       ...(name === undefined ? {} : { name }),
       agent,
       cwd,
+      workspaceBindingId,
+      workspaceGeneration,
       ...(rawAuthMode === undefined ? {} : { authMode: rawAuthMode }),
       ...(credentialBinding === undefined
         ? {}
-        : { credentialBindingId: assertPublicId(credentialBinding, "credential binding ID") }),
+        : { credentialBindingId: assertCanonicalUuid(credentialBinding, "credential binding ID") }),
     }, idempotencyKey(parsed));
     return Object.freeze({ command: "agent-sessions.create", data: agentSessionRecord(session), human: `Created ${session.agent} AgentSession ${session.id}.` });
   }
@@ -634,7 +955,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     rejectUnknownOptions(parsed, ["yes"]);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions terminate requires exactly one AgentSession ID.");
     requireConfirmation(parsed, "agent-sessions.terminate");
-    const id = assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.terminate", now });
     const session = await client.terminateAgentSession(id);
     return Object.freeze({ command: "agent-sessions.terminate", data: agentSessionRecord(session), human: `AgentSession ${session.id} is ${session.requestState}/${session.processState}.` });
@@ -643,7 +964,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     rejectUnknownOptions(parsed, ["name", "yes"]);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions rename requires exactly one AgentSession ID.");
     requireConfirmation(parsed, "agent-sessions.rename");
-    const id = assertPublicId(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     const rawName = stringOption(parsed, "name");
     const name = rawName === undefined ? undefined : assertSafeDisplayText(rawName, "AgentSession name");
     if (name === undefined || name.length < 1 || name.length > 80) {

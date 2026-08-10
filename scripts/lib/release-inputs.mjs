@@ -39,7 +39,7 @@ const BUILD_RECIPE_FILES = Object.freeze([
   "packaging/admission-policy.json",
   "packaging/support-policy.json",
   "packaging/templates/aur/PKGBUILD.template",
-  "packaging/templates/homebrew/runa.rb.template",
+  "packaging/templates/homebrew/cuna.rb.template",
   "packaging/templates/install.sh.template",
   "scripts/build-release-envelope.mjs",
   "scripts/build-release-inputs.mjs",
@@ -128,14 +128,14 @@ export function validateReleaseInputs(inputs) {
   invariant(createHash("sha256").update(componentKeys.join(""), "utf8").digest("hex") === inputs.dependencyClosure.aggregateSha256, "Dependency-closure aggregate digest mismatch");
 
   exactKeys(inputs.contractSet, ["algorithm", "authority", "releaseAuthority", "files", "aggregateSha256"], "contractSet");
-  invariant(inputs.contractSet.authority === "RUNA_CLI_LOCAL_CONSUMER_SNAPSHOT", "Contract-set authority differs");
+  invariant(inputs.contractSet.authority === "CUNA_CLI_LOCAL_CONSUMER_SNAPSHOT", "Contract-set authority differs");
   invariant(inputs.contractSet.releaseAuthority === "UNRESOLVED_BLOCKING", "Local contract set may not claim canonical release authority");
   exactKeys(inputs.buildRecipe, ["algorithm", "commands", "files", "aggregateSha256"], "buildRecipe");
   invariant(Array.isArray(inputs.buildRecipe.commands) && inputs.buildRecipe.commands.length > 0, "Build-recipe commands are missing");
   for (const command of inputs.buildRecipe.commands) invariant(typeof command === "string" && command.length > 0, "Build-recipe command is invalid");
   for (const [label, value, algorithm, files] of [
-    ["contractSet", inputs.contractSet, "runa-cli-public-contract-files-v1", CONTRACT_FILES],
-    ["buildRecipe", inputs.buildRecipe, "runa-cli-build-recipe-files-v1", BUILD_RECIPE_FILES],
+    ["contractSet", inputs.contractSet, "cuna-cli-public-contract-files-v1", CONTRACT_FILES],
+    ["buildRecipe", inputs.buildRecipe, "cuna-cli-build-recipe-files-v1", BUILD_RECIPE_FILES],
   ]) {
     invariant(value.algorithm === algorithm, `${label} algorithm differs`);
     validateDigestEntries(value.files, files, label);
@@ -147,7 +147,7 @@ export function validateReleaseInputs(inputs) {
   invariant(typeof inputs.toolchain.runner === "string" && inputs.toolchain.runner.length > 0, "toolchain.runner is missing");
 
   exactKeys(inputs.payload, ["schemaVersion", "algorithm", "fileCount", "files", "sha256"], "payload");
-  invariant(inputs.payload.schemaVersion === 1 && inputs.payload.algorithm === "runa-package-payload-v1", "Payload manifest identity is invalid");
+  invariant(inputs.payload.schemaVersion === 1 && inputs.payload.algorithm === "cuna-package-payload-v1", "Payload manifest identity is invalid");
   invariant(Number.isSafeInteger(inputs.payload.fileCount) && inputs.payload.fileCount > 0, "Payload file count is invalid");
   invariant(Array.isArray(inputs.payload.files) && inputs.payload.files.length === inputs.payload.fileCount, "Payload file set differs from fileCount");
   const payloadFiles = inputs.payload.files.map((entry) => entry.file);
@@ -227,14 +227,14 @@ export async function buildReleaseInputs({ root, sourceCommit, npmVersion, runne
       aggregateSha256: createHash("sha256").update(componentKeys.join(""), "utf8").digest("hex"),
     },
     contractSet: {
-      algorithm: "runa-cli-public-contract-files-v1",
-      authority: "RUNA_CLI_LOCAL_CONSUMER_SNAPSHOT",
+      algorithm: "cuna-cli-public-contract-files-v1",
+      authority: "CUNA_CLI_LOCAL_CONSUMER_SNAPSHOT",
       releaseAuthority: "UNRESOLVED_BLOCKING",
       files: contractFiles,
       aggregateSha256: aggregateDigest(contractFiles),
     },
     buildRecipe: {
-      algorithm: "runa-cli-build-recipe-files-v1",
+      algorithm: "cuna-cli-build-recipe-files-v1",
       commands: [
         "npm ci --ignore-scripts",
         "npm run build",

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runacode.io/schemas/runa-cli-runtime-identity-v2.json",
-  "title": "Runa CLI version command data payload",
+  "$id": "https://getcuna.com/schemas/cuna-cli-runtime-identity-v2.json",
+  "title": "Cuna CLI version command data payload",
   "type": "object",
   "additionalProperties": true,
   "required": ["version", "buildDigest", "platform", "architecture", "artifactChannel", "protocolRange"],

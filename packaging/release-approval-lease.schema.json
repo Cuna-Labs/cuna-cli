@@ -1,20 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runacode.io/schemas/runa-cli-release-approval-lease-v1.json",
-  "title": "Runa CLI release approval lease predicate",
+  "$id": "https://getcuna.com/schemas/cuna-cli-release-approval-lease-v1.json",
+  "title": "Cuna CLI release approval lease predicate",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "predicateType", "decision", "package", "source", "candidate", "receiptCohort", "contractAuthority", "promotion", "review", "recovery", "issuedAt", "expiresAt", "nonce", "conditions"],
   "properties": {
     "schemaVersion": {"const": 1},
-    "predicateType": {"const": "https://runacode.io/attestations/runa-cli-release-approval/v1"},
+    "predicateType": {"const": "https://getcuna.com/attestations/cuna-cli-release-approval/v1"},
     "decision": {"enum": ["READY", "READY_WITH_CONDITIONS"]},
     "package": {
       "type": "object",
       "additionalProperties": false,
       "required": ["name", "version"],
       "properties": {
-        "name": {"const": "@runa_laboratories/cli"},
+        "name": {"const": "@cuna_labs/cli"},
         "version": {"$ref": "#/$defs/version"}
       }
     },
@@ -23,7 +23,7 @@
       "additionalProperties": false,
       "required": ["repository", "commit", "ref"],
       "properties": {
-        "repository": {"const": "Runa-Laboratories/runa-cli"},
+        "repository": {"const": "Cuna-Labs/cuna-cli"},
         "commit": {"$ref": "#/$defs/commit"},
         "ref": {"const": "refs/heads/main"}
       }
@@ -102,7 +102,7 @@
       "additionalProperties": false,
       "required": ["producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"],
       "properties": {
-        "producerRepository": {"const": "Runa-Laboratories/infra"},
+        "producerRepository": {"const": "Cuna-Labs/infra"},
         "sourceCommit": {"$ref": "#/$defs/commit"},
         "contractSha256": {"$ref": "#/$defs/sha256"},
         "approvalAttestationSha256": {"$ref": "#/$defs/sha256"}

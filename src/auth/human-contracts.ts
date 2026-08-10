@@ -6,6 +6,7 @@ const PROFILE = /^[^\p{Cc}\p{Cf}]{1,80}$/u;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
 
 export type CliIntentClass =
+  | "signup"
   | "login"
   | "account.read"
   | "machines.read"
@@ -15,7 +16,7 @@ export type CliIntentClass =
 
 export interface CliIdentityContext {
   readonly requiredTermsVersion: string;
-  readonly identity: "unknown" | "verification_required" | "active" | "disabled";
+  readonly identity: "unknown" | "signup_required" | "verification_required" | "active" | "disabled";
   readonly admission: "not_requested" | "waitlisted" | "admitted";
   readonly workspace: { readonly state: "assigned" | "unavailable"; readonly id?: string };
   readonly waitlistPosition?: number;
@@ -31,6 +32,13 @@ export interface CliAuthBootstrap {
   readonly accessTokenTtlSeconds: 600;
   readonly refreshFamilyTtlSeconds: 2592000;
   readonly browserOrigin: string | null;
+}
+
+export interface CliSignupCapability {
+  readonly enabled: boolean;
+  readonly enrollment: "waitlist_only";
+  readonly identityMethods: readonly [] | readonly ["email_password", "oauth"];
+  readonly reasonCode?: "remote_signup_abuse_controls_unverified";
 }
 
 export interface CliContinuationIssued {
@@ -66,7 +74,7 @@ export interface CliTokenSet {
 function malformed(reason: string): never {
   throw new RunaError({
     code: "runa.remote.malformed_response",
-    message: "Runa returned a response that does not match the CLI authentication contract.",
+    message: "Cuna returned a response that does not match the CLI authentication contract.",
     exitCode: EXIT_CODES.remote,
     details: { reason },
   });
@@ -112,7 +120,7 @@ export function decodeCliIdentityContext(value: unknown): CliIdentityContext {
     ["waitlist_position"],
   );
   const identity = record.identity;
-  if (!new Set(["unknown", "verification_required", "active", "disabled"]).has(identity as string)) {
+  if (!new Set(["unknown", "signup_required", "verification_required", "active", "disabled"]).has(identity as string)) {
     return malformed("invalid_identity");
   }
   const admission = record.admission;
@@ -171,6 +179,38 @@ export function decodeCliAuthBootstrap(value: unknown): CliAuthBootstrap {
   });
 }
 
+export function decodeCliSignupCapability(value: unknown): CliSignupCapability {
+  const record = exact(value, ["enabled", "enrollment", "identity_methods"], ["reason_code"]);
+  const methods = record.identity_methods;
+  if (
+    typeof record.enabled !== "boolean" ||
+    record.enrollment !== "waitlist_only" ||
+    !Array.isArray(methods) ||
+    !(methods.length === 0 ||
+      (methods.length === 2 &&
+        methods[0] === "email_password" &&
+        methods[1] === "oauth")) ||
+    (record.reason_code !== undefined &&
+      record.reason_code !== "remote_signup_abuse_controls_unverified") ||
+    (record.enabled &&
+      (record.reason_code !== undefined || methods.length !== 2)) ||
+    (!record.enabled && methods.length !== 0) ||
+    (!record.enabled && record.reason_code === undefined)
+  ) {
+    return malformed("invalid_signup_capability");
+  }
+  return Object.freeze({
+    enabled: record.enabled,
+    enrollment: "waitlist_only",
+    identityMethods: record.enabled
+      ? (["email_password", "oauth"] as const)
+      : ([] as const),
+    ...(record.reason_code === undefined
+      ? {}
+      : { reasonCode: record.reason_code }),
+  });
+}
+
 export function decodeCliContinuationIssued(
   value: unknown,
   expected: { readonly browserOrigin: string; readonly state: string },
@@ -181,7 +221,7 @@ export function decodeCliContinuationIssued(
   if (record.completion_mode !== "poll") return malformed("invalid_completion_mode");
   const id = uuid(record.id, "invalid_continuation_id");
   const continuationSecret = typeof record.continuation_secret === "string" &&
-    /^runa_ct_[A-Za-z0-9_-]{43}$/u.test(record.continuation_secret)
+    /^(?:cuna|runa)_ct_[A-Za-z0-9_-]{43}$/u.test(record.continuation_secret)
     ? record.continuation_secret
     : malformed("invalid_continuation_secret");
   const browserUrl = typeof record.browser_url === "string" ? record.browser_url : malformed("invalid_browser_url");
@@ -196,7 +236,7 @@ export function decodeCliContinuationIssued(
     return malformed("browser_binding_mismatch");
   }
   const browserNonce = fragment.get("nonce");
-  if (browserNonce === null || !/^runa_cb_[A-Za-z0-9_-]{43}$/u.test(browserNonce)) {
+  if (browserNonce === null || !/^(?:cuna|runa)_cb_[A-Za-z0-9_-]{43}$/u.test(browserNonce)) {
     return malformed("invalid_browser_nonce");
   }
   return Object.freeze({
@@ -236,9 +276,9 @@ export function decodeCliTokenSet(value: unknown): CliTokenSet {
     "refresh_expires_at", "session_id", "context",
   ]);
   if (record.token_type !== "Bearer" || record.expires_in !== 600) return malformed("invalid_token_type_or_ttl");
-  const accessToken = typeof record.access_token === "string" && /^runa_at_[A-Za-z0-9_-]{43}$/u.test(record.access_token)
+  const accessToken = typeof record.access_token === "string" && /^(?:cuna|runa)_at_[A-Za-z0-9_-]{43}$/u.test(record.access_token)
     ? record.access_token : malformed("invalid_access_token");
-  const refreshToken = typeof record.refresh_token === "string" && /^runa_rt_[A-Za-z0-9_-]{43}$/u.test(record.refresh_token)
+  const refreshToken = typeof record.refresh_token === "string" && /^(?:cuna|runa)_rt_[A-Za-z0-9_-]{43}$/u.test(record.refresh_token)
     ? record.refresh_token : malformed("invalid_refresh_token");
   const accessExpiresAt = date(record.access_expires_at, "invalid_access_expiry");
   const refreshExpiresAt = date(record.refresh_expires_at, "invalid_refresh_expiry");

@@ -19,7 +19,7 @@ test("PKCE material is independent, bounded, and S256-verifiable without a callb
 });
 
 test("browser handoff fails closed without a native Windows adapter and pins approved Unix helpers", () => {
-  const url = "https://app.runacode.io/cli/continue#opaque";
+  const url = "https://app.getcuna.com/cli/continue#opaque";
   assert.throws(
     () => resolveBrowserCommand("win32", url, { SystemRoot: "C:\\Windows" }),
     /approved signed native adapter/u,

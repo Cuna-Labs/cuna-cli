@@ -37,6 +37,11 @@ interface RefreshFlight {
   waiters: number;
 }
 
+interface DecodedEnvelope {
+  readonly header: EnvelopeHeader;
+  readonly payload: Uint8Array;
+}
+
 export class CredentialVault {
   readonly #backend: SecureCredentialBackend;
   readonly #clock: () => number;
@@ -44,6 +49,7 @@ export class CredentialVault {
   readonly #queues = new Map<string, Promise<void>>();
   readonly #refreshes = new Map<string, RefreshFlight>();
   readonly #revoked = new Set<string>();
+  #lastObservedNow: number | undefined;
 
   constructor(input: {
     readonly backend: SecureCredentialBackend;
@@ -63,7 +69,7 @@ export class CredentialVault {
     if (encoded === undefined) return undefined;
     try {
       const decoded = decodeEnvelope(encoded, bindingDigest(normalized));
-      if (decoded.header.expiresAt !== null && decoded.header.expiresAt <= this.#clock()) {
+      if (decoded.header.expiresAt !== null && decoded.header.expiresAt <= this.#now()) {
         decoded.payload.fill(0);
         return undefined;
       }
@@ -96,16 +102,16 @@ export class CredentialVault {
             { retryable: true },
           );
         }
-        const nextRevision = (current?.header.revision ?? 0) + 1;
+        const nextRevision = safeRevisionIncrement(current?.header.revision ?? 0);
         const encoded = input.material.withBytes((bytes) => encodeEnvelope({
           binding: normalized,
           revision: nextRevision,
-          storedAt: this.#clock(),
+          storedAt: this.#now(),
           ...(input.expiresAt !== undefined && { expiresAt: input.expiresAt }),
           payload: bytes,
         }));
         try {
-          await this.#backend.replace(target, encoded);
+          await this.#replaceWithReconciliation(target, encoded, normalized, current);
         } finally {
           encoded.fill(0);
         }
@@ -172,12 +178,15 @@ export class CredentialVault {
     const normalized = normalizeBinding(binding);
     const target = credentialTarget(normalized);
     let evidence;
+    let observedNow: number;
     try {
+      this.#now();
       evidence = await this.#backend.probe();
+      observedNow = this.#now();
     } catch {
       return this.#unavailableStatus(normalized);
     }
-    if (!validEvidence(evidence, this.#backend, this.#platform, this.#clock())) {
+    if (!validEvidence(evidence, this.#backend, this.#platform, observedNow)) {
       return this.#unavailableStatus(normalized);
     }
     if (this.#revoked.has(target)) {
@@ -251,21 +260,27 @@ export class CredentialVault {
           "The renewable credential was rejected and has been removed.",
         );
       }
-      const nextRevision = (currentEnvelope?.header.revision ?? 0) + 1;
-      const nextBytes = refreshed.material.copyBytes();
-      const encoded = encodeEnvelope({
-        binding,
-        revision: nextRevision,
-        storedAt: this.#clock(),
-        ...(refreshed.expiresAt !== undefined && { expiresAt: refreshed.expiresAt }),
-        payload: nextBytes,
-      });
+      const nextRevision = safeRevisionIncrement(currentEnvelope?.header.revision ?? 0);
+      let nextBytes: Uint8Array | undefined;
+      let encoded: Uint8Array | undefined;
+      let replaced = false;
       try {
-        await this.#backend.replace(target, encoded);
+        nextBytes = refreshed.material.copyBytes();
+        encoded = encodeEnvelope({
+          binding,
+          revision: nextRevision,
+          storedAt: this.#now(),
+          ...(refreshed.expiresAt !== undefined && { expiresAt: refreshed.expiresAt }),
+          payload: nextBytes,
+        });
+        await this.#replaceWithReconciliation(target, encoded, binding, currentEnvelope);
+        replaced = true;
       } finally {
-        encoded.fill(0);
+        encoded?.fill(0);
+        if (!replaced) nextBytes?.fill(0);
         refreshed.material.dispose();
       }
+      if (nextBytes === undefined) throw credentialFailure("credential_refresh_failed", "Credential refresh did not produce protected material.");
       this.#revoked.delete(target);
       return {
         bytes: nextBytes,
@@ -278,10 +293,7 @@ export class CredentialVault {
     }
   }
 
-  async #readEnvelope(target: string, binding: CredentialBinding): Promise<{
-    readonly header: EnvelopeHeader;
-    readonly payload: Uint8Array;
-  } | undefined> {
+  async #readEnvelope(target: string, binding: CredentialBinding): Promise<DecodedEnvelope | undefined> {
     const encoded = await this.#backend.read(target);
     if (encoded === undefined) return undefined;
     try {
@@ -292,6 +304,7 @@ export class CredentialVault {
   }
 
   async #requireBackend(): Promise<void> {
+    this.#now();
     let evidence;
     try {
       evidence = await this.#backend.probe();
@@ -302,13 +315,67 @@ export class CredentialVault {
         { cause },
       );
     }
-    if (!validEvidence(evidence, this.#backend, this.#platform, this.#clock())) {
+    if (!validEvidence(evidence, this.#backend, this.#platform, this.#now())) {
       throw credentialFailure(
         evidence.status === "unavailable" ? "credential_backend_unavailable" : "credential_backend_unverified",
         "The secure credential store lacks current platform-bound evidence.",
         { safeDetails: { backendId: this.#backend.backendId, status: evidence.status } },
       );
     }
+  }
+
+  async #replaceWithReconciliation(
+    target: string,
+    encoded: Uint8Array,
+    binding: CredentialBinding,
+    previous: DecodedEnvelope | undefined,
+  ): Promise<void> {
+    try {
+      await this.#backend.replace(target, encoded);
+      return;
+    } catch {
+      // A native vault can commit and still lose its acknowledgement. Retrying an
+      // unknown replacement would rotate the same logical credential twice. Read
+      // back by stable target and adjudicate the effect before returning.
+    }
+    let observed: Uint8Array | undefined;
+    try {
+      observed = await this.#backend.read(target);
+      if (observed !== undefined && bytesEqual(observed, encoded)) return;
+      if (observed === undefined && previous === undefined) {
+        throw credentialFailure(
+          "credential_backend_failure",
+          "The secure credential replacement was not committed.",
+          { retryable: true, safeDetails: { replacementOutcome: "not_committed" } },
+        );
+      }
+      if (observed !== undefined && previous !== undefined) {
+        let decoded: DecodedEnvelope | undefined;
+        try {
+          decoded = decodeEnvelope(observed, bindingDigest(binding));
+          if (sameEnvelope(decoded, previous)) {
+            throw credentialFailure(
+              "credential_backend_failure",
+              "The secure credential replacement was not committed.",
+              { retryable: true, safeDetails: { replacementOutcome: "not_committed" } },
+            );
+          }
+        } catch (error) {
+          if (error instanceof CredentialBoundaryError && error.code === "credential_backend_failure") throw error;
+        } finally {
+          decoded?.payload.fill(0);
+        }
+      }
+    } catch (error) {
+      if (error instanceof CredentialBoundaryError && error.code === "credential_backend_failure") throw error;
+    } finally {
+      observed?.fill(0);
+    }
+    throw credentialFailure(
+      "credential_backend_failure",
+      "The secure credential replacement outcome is unknown and requires reconciliation.",
+      { safeDetails: { replacementOutcome: "ambiguous" } },
+    );
   }
 
   async #exclusive<T>(target: string, operation: () => Promise<T>): Promise<T> {
@@ -330,7 +397,7 @@ export class CredentialVault {
     return {
       backendId: this.#backend.backendId,
       backendStatus: "verified",
-      state: expiresAt !== undefined && expiresAt <= this.#clock() ? "expired" : "present",
+      state: expiresAt !== undefined && expiresAt <= this.#now() ? "expired" : "present",
       bindingDigest: bindingDigest(binding),
       revision,
       ...(expiresAt !== undefined && { expiresAt }),
@@ -344,6 +411,19 @@ export class CredentialVault {
       state: "unavailable",
       bindingDigest: bindingDigest(binding),
     };
+  }
+
+  #now(): number {
+    const now = this.#clock();
+    if (!Number.isSafeInteger(now) || now < 0 || (this.#lastObservedNow !== undefined && now < this.#lastObservedNow)) {
+      throw credentialFailure(
+        "credential_backend_unverified",
+        "The credential boundary clock is not trustworthy.",
+        { safeDetails: { clockTrusted: false } },
+      );
+    }
+    this.#lastObservedNow = now;
+    return now;
   }
 }
 
@@ -494,6 +574,28 @@ function parseHeader(value: unknown): EnvelopeHeader {
 function safeHexEqual(left: string, right: string): boolean {
   if (!/^[a-f0-9]{64}$/u.test(left) || !/^[a-f0-9]{64}$/u.test(right)) return false;
   return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  return left.byteLength === right.byteLength && timingSafeEqual(left, right);
+}
+
+function sameEnvelope(left: DecodedEnvelope, right: DecodedEnvelope): boolean {
+  return left.header.version === right.header.version &&
+    left.header.bindingDigest === right.header.bindingDigest &&
+    left.header.revision === right.header.revision &&
+    left.header.storedAt === right.header.storedAt &&
+    left.header.expiresAt === right.header.expiresAt &&
+    left.header.payloadLength === right.header.payloadLength &&
+    left.header.payloadSha256 === right.header.payloadSha256 &&
+    bytesEqual(left.payload, right.payload);
+}
+
+function safeRevisionIncrement(revision: number): number {
+  if (!Number.isSafeInteger(revision) || revision < 0 || revision >= Number.MAX_SAFE_INTEGER) {
+    throw credentialFailure("credential_corrupt", "Credential revision cannot be advanced safely.");
+  }
+  return revision + 1;
 }
 
 function validEvidence(

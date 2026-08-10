@@ -10,7 +10,7 @@ const args = parseArgs(process.argv.slice(2));
 const envelope = await readJson(args.get("envelope") ?? "release-artifacts/release-envelope.json");
 const expectedVersion = args.get("version");
 invariant(envelope.version === expectedVersion, "Post-publication version mismatch");
-const receipt = await withOwnedTempDirectory("runa-registry-verify-", async (destination) => {
+const receipt = await withOwnedTempDirectory("cuna-registry-verify-", async (destination) => {
   await execute("npm", [
     "pack",
     `${envelope.packageName}@${envelope.version}`,

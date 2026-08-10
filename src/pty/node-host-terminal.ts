@@ -5,9 +5,16 @@ import { HostTerminalLease } from "../terminal/mode.js";
 import type { ForegroundTerminalHost } from "../terminal/foreground.js";
 import { runtimeFailure } from "../runtime/errors.js";
 
-const ENTER_ALTERNATE_SCREEN = "\u001b[?1049h\u001b[?2004h\u001b[H";
+const ENABLE_LOCAL_BRACKETED_PASTE = "\u001b[?2004h";
+const ENTER_ALTERNATE_SCREEN = `\u001b[?1049h${ENABLE_LOCAL_BRACKETED_PASTE}\u001b[H`;
 const LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
-const RESET_REMOTE_MODES = "\u001b[?1000l\u001b[?1002l\u001b[?1003l\u001b[?1006l\u001b[?2004l\u001b[?25h";
+const RESET_REMOTE_MODES = [
+  "\u001b[?1000l\u001b[?1002l\u001b[?1003l\u001b[?1004l\u001b[?1006l",
+  "\u001b[?2004l\u001b[?2026l",
+  "\u001b[?1l\u001b[?6l\u001b[4l\u001b[20l\u001b>",
+  "\u001b[?1049l\u001b[?1047l\u001b[?47l",
+  "\u001b[r\u001b[0m\u001b[?25h",
+].join("");
 const HOST_WRITE_TIMEOUT_MS = 5_000;
 const ACTIVE_HOST_INPUTS = new WeakSet<object>();
 
@@ -76,8 +83,22 @@ export function createNodeForegroundTerminalHost(input: {
       assertInteractive(stdin, stdout);
       return Object.freeze({ columns: stdout.columns, rows: stdout.rows });
     },
-    async acquire(): Promise<HostTerminalLease> {
-      return await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout, writeTimeoutMs }));
+    async acquire(mode = "rich"): Promise<HostTerminalLease> {
+      const adapter = createNodeHostTerminalAdapter({ stdin, stdout, writeTimeoutMs });
+      if (mode === "rich") return await HostTerminalLease.acquire(adapter);
+      if (mode !== "plain") throw new RangeError("Host terminal mode must be rich or plain.");
+      return await HostTerminalLease.acquire({
+        enterRawMode: () => adapter.enterRawMode(),
+        // Passthrough yields the current screen to the remote program. It must
+        // not claim alternate-screen ownership or paint trusted chrome.
+        enterAlternateScreen: async () => {
+          assertInteractive(stdin, stdout);
+          await writeWithBackpressure(stdout, new TextEncoder().encode(ENABLE_LOCAL_BRACKETED_PASTE), writeTimeoutMs);
+        },
+        disableRemoteModes: () => adapter.disableRemoteModes(),
+        leaveAlternateScreen: () => undefined,
+        leaveRawMode: () => adapter.leaveRawMode(),
+      });
     },
     async write(bytes: Uint8Array): Promise<void> {
       assertInteractive(stdin, stdout);

@@ -4,14 +4,14 @@ const PUBLIC_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SAFE_CODE = /^[a-z][a-z0-9_.-]{0,127}$/u;
 // C0/C1 controls and Unicode format controls can mutate terminal state, forge
 // rows, reverse text direction, or hide content. They are never valid in a
-// Runa display name, state label, or workspace path.
+// Cuna display name, state label, or workspace path.
 const UNSAFE_DISPLAY_CHARACTER = /[\p{Cc}\p{Cf}]/u;
 const IDEMPOTENCY_KEY = /^[!-~]{8,128}$/u;
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 export function assertPublicId(value: string, label: string): string {
   if (!PUBLIC_ID.test(value)) {
-    throw usageError(`Invalid ${label}.`, `${label} must be an opaque public Runa identifier.`);
+    throw usageError(`Invalid ${label}.`, `${label} must be an opaque public Cuna identifier.`);
   }
   return value;
 }
@@ -22,7 +22,7 @@ export function encodePublicId(value: string, label: string): string {
 
 export function assertCanonicalUuid(value: string, label: string): string {
   if (!CANONICAL_UUID.test(value)) {
-    throw usageError(`Invalid ${label}.`, `${label} must be a canonical lowercase Runa UUID.`);
+    throw usageError(`Invalid ${label}.`, `${label} must be a canonical lowercase Cuna UUID.`);
   }
   return value;
 }

@@ -4,12 +4,14 @@ import test from "node:test";
 import {
   CREDENTIAL_BACKEND_PROTOCOL,
   CredentialVault,
+  SecretMaterial,
 } from "../dist/credentials/index.js";
 import {
   createHumanAuthService,
   decodeCliAuthBootstrap,
   decodeCliContinuationIssued,
   decodeCliContinuationStatus,
+  decodeCliSignupCapability,
   decodeCliTokenSet,
   decodeRevocation,
   RunaError,
@@ -24,13 +26,15 @@ const AT = `runa_at_${"a".repeat(43)}`;
 const AT_2 = `runa_at_${"b".repeat(43)}`;
 const RT = `runa_rt_${"r".repeat(43)}`;
 const RT_2 = `runa_rt_${"s".repeat(43)}`;
+const AT_3 = `runa_at_${"d".repeat(43)}`;
+const RT_3 = `runa_rt_${"t".repeat(43)}`;
 const STATE = "x".repeat(43);
 
 const config = Object.freeze({
   platformKind: "linux",
   profile: "default",
   profileSource: "default",
-  baseUrl: "https://api.runacode.io",
+  baseUrl: "https://api.getcuna.com",
   baseUrlSource: "default",
   configFile: "/config.json",
   developmentProfile: false,
@@ -94,7 +98,15 @@ function fakeClient(overrides = {}) {
         pollLimit: 3,
         accessTokenTtlSeconds: 600,
         refreshFamilyTtlSeconds: 2592000,
-        browserOrigin: "https://app.runacode.io",
+        browserOrigin: "https://app.getcuna.com",
+      };
+    },
+    async signupCapability() {
+      calls.push(["signupCapability"]);
+      return {
+        enabled: true,
+        enrollment: "waitlist_only",
+        identityMethods: ["email_password", "oauth"],
       };
     },
     async createContinuation(input) {
@@ -102,7 +114,7 @@ function fakeClient(overrides = {}) {
       return {
         id: UUID_A,
         continuationSecret: CT,
-        browserUrl: `https://app.runacode.io/cli/continue#continuation=${UUID_A}&nonce=runa_cb_${"n".repeat(43)}&state=${input.state}`,
+        browserUrl: `https://app.getcuna.com/cli/continue#continuation=${UUID_A}&nonce=runa_cb_${"n".repeat(43)}&state=${input.state}`,
         browserNonce: `runa_cb_${"n".repeat(43)}`,
         expiresAt: "2026-08-08T00:10:00.000Z",
         pollAfterMs: 2000,
@@ -134,7 +146,8 @@ function fakeClient(overrides = {}) {
 
 function fixture(overrides = {}) {
   const backend = overrides.backend ?? new MemoryBackend();
-  const vault = new CredentialVault({ backend, clock: () => NOW, platform: "linux" });
+  const clock = overrides.clock ?? (() => NOW);
+  const vault = new CredentialVault({ backend, clock, platform: "linux" });
   const client = overrides.client ?? fakeClient();
   const opened = [];
   const service = createHumanAuthService({
@@ -142,7 +155,7 @@ function fixture(overrides = {}) {
     client,
     vault,
     browser: { async open(url) { opened.push(url); } },
-    clock: () => NOW,
+    clock,
     sleep: overrides.sleep ?? (async () => undefined),
     random: (size) => new Uint8Array(size).fill(7),
     uuid: () => UUID_A,
@@ -162,6 +175,105 @@ test("login uses polling-only PKCE, opens the exact issued URL, and persists no 
   const protectedBytes = Buffer.concat([...subject.backend.values.values()].map((value) => Buffer.from(value))).toString("utf8");
   assert.equal(protectedBytes.includes(AT), false);
   assert.equal(protectedBytes.includes("code_verifier"), false);
+});
+
+test("waitlist-only signup stores a restricted session and permits one pinned admission transition", async () => {
+  const waitlisted = Object.freeze({
+    requiredTermsVersion: "2026-08",
+    identity: "active",
+    admission: "waitlisted",
+    workspace: Object.freeze({ state: "unavailable" }),
+    waitlistPosition: 9,
+  });
+  const signupClient = fakeClient({
+    async continuation(input) {
+      this.calls.push(["poll", input]);
+      return {
+        id: UUID_A,
+        phase: "completed",
+        expiresAt: "2026-08-08T00:10:00.000Z",
+        context: waitlisted,
+        requiredTermsVersion: "2026-08",
+      };
+    },
+    async exchange(input) {
+      this.calls.push(["exchange", input]);
+      return tokenSet({ context: waitlisted });
+    },
+  });
+  const signedUp = fixture({ client: signupClient });
+  const result = await signedUp.service.signup();
+  assert.equal(result.context.admission, "waitlisted");
+  assert.equal(
+    signupClient.calls.find(([name]) => name === "create")[1].intentClass,
+    "signup",
+  );
+  assert.equal(signupClient.calls.some(([name]) => name === "signupCapability"), true);
+
+  const admittedContext = Object.freeze({
+    ...waitlisted,
+    admission: "admitted",
+    workspace: Object.freeze({ state: "assigned", id: UUID_C }),
+    waitlistPosition: undefined,
+  });
+  const admittedClient = fakeClient({
+    async refresh(input) {
+      this.calls.push(["refresh", input]);
+      return tokenSet({
+        accessToken: AT_2,
+        refreshToken: RT_2,
+        context: admittedContext,
+      });
+    },
+  });
+  const admitted = fixture({ backend: signedUp.backend, client: admittedClient });
+  assert.equal(await admitted.service.acquireAccessToken(), AT_2);
+
+  const substitutedClient = fakeClient({
+    async refresh(input) {
+      this.calls.push(["refresh", input]);
+      return tokenSet({
+        accessToken: AT_3,
+        refreshToken: RT_3,
+        context: {
+          ...admittedContext,
+          workspace: { state: "assigned", id: UUID_B },
+        },
+      });
+    },
+  });
+  const substituted = fixture({
+    backend: signedUp.backend,
+    client: substitutedClient,
+  });
+  await assert.rejects(
+    substituted.service.acquireAccessToken(),
+    (error) => error.code === "runa.auth.reauthentication_required",
+  );
+  assert.equal(signedUp.backend.values.size, 0);
+});
+
+test("signup capability is closed and never fabricates providers while disabled", () => {
+  assert.deepEqual(
+    decodeCliSignupCapability({
+      enabled: false,
+      enrollment: "waitlist_only",
+      identity_methods: [],
+      reason_code: "remote_signup_abuse_controls_unverified",
+    }).identityMethods,
+    [],
+  );
+  assert.throws(() => decodeCliSignupCapability({
+    enabled: false,
+    enrollment: "waitlist_only",
+    identity_methods: ["email_password", "oauth"],
+    reason_code: "remote_signup_abuse_controls_unverified",
+  }));
+  assert.throws(() => decodeCliSignupCapability({
+    enabled: true,
+    enrollment: "waitlist_only",
+    identity_methods: ["email_password", "invented"],
+  }));
 });
 
 test("a second login fails before creating a new continuation or orphaning the old family", async () => {
@@ -253,6 +365,34 @@ test("refresh races coalesce, rotate the vault once, and keep access tokens memo
   assert.equal(Buffer.concat([...original.backend.values.values()].map((value) => Buffer.from(value))).toString("utf8").includes(AT_2), false);
 });
 
+test("one cancelled refresh waiter neither aborts nor poisons the shared credential rotation", async () => {
+  const original = fixture();
+  await original.service.login();
+  let releaseRefresh;
+  let refreshEntered;
+  const entered = new Promise((resolve) => { refreshEntered = resolve; });
+  const client = fakeClient({
+    async refresh(input) {
+      this.calls.push(["refresh", input]);
+      refreshEntered();
+      await new Promise((resolve) => { releaseRefresh = resolve; });
+      return tokenSet({ accessToken: AT_2, refreshToken: RT_2 });
+    },
+  });
+  const subject = fixture({ backend: original.backend, client });
+  const controller = new AbortController();
+  const cancelled = subject.service.acquireAccessToken(controller.signal);
+  await entered;
+  const surviving = subject.service.acquireAccessToken();
+  controller.abort(new Error("caller no longer needs the token"));
+  await assert.rejects(cancelled, (error) => error.code === "runa.auth.cancelled");
+  releaseRefresh();
+  assert.equal(await surviving, AT_2);
+  const refreshes = client.calls.filter(([name]) => name === "refresh");
+  assert.equal(refreshes.length, 1);
+  assert.equal(Object.hasOwn(refreshes[0][1], "signal"), false, "caller cancellation cannot own shared refresh authority");
+});
+
 test("authoritative refresh rejection deletes the family while unknown failure preserves it", async () => {
   const first = fixture();
   await first.service.login();
@@ -317,11 +457,60 @@ test("logout is server-first and deletes local state only after exact revoked tr
   assert.equal(original.backend.values.size, 0);
 });
 
+test("access-token cache is byte-backed and zeroized on logout while the HTTP string boundary remains explicit", { concurrency: false }, async () => {
+  const created = [];
+  const originalFromUtf8 = SecretMaterial.fromUtf8;
+  SecretMaterial.fromUtf8 = function capture(value) {
+    const material = originalFromUtf8.call(this, value);
+    if (value === AT) created.push(material);
+    return material;
+  };
+  try {
+    const subject = fixture();
+    await subject.service.login();
+    assert.equal(created.length, 1, "the long-lived access cache is owned byte-backed material");
+    await subject.service.logout();
+    assert.equal(created[0].disposed, true, "logout deterministically wipes the owned access-token bytes");
+    const logoutCall = subject.client.calls.find(([name]) => name === "logout");
+    assert.equal(typeof logoutCall[1], "string", "the managed HTTP client contract still requires an unavoidable transient string");
+  } finally {
+    SecretMaterial.fromUtf8 = originalFromUtf8;
+  }
+});
+
+test("human authentication rejects clock rollback and tokens that expire during a slow refresh", async () => {
+  let now = NOW;
+  const rollback = fixture({ clock: () => now });
+  await rollback.service.login();
+  now = NOW - 1;
+  await assert.rejects(
+    rollback.service.acquireAccessToken(),
+    (error) => error.code === "runa.auth.clock_untrusted",
+  );
+
+  const original = fixture();
+  await original.service.login();
+  let slowNow = NOW;
+  const slowClient = fakeClient({
+    async refresh(input) {
+      this.calls.push(["refresh", input]);
+      slowNow = Date.parse("2026-08-08T00:10:00.000Z");
+      return tokenSet({ accessToken: AT_2, refreshToken: RT_2 });
+    },
+  });
+  const slow = fixture({ backend: original.backend, client: slowClient, clock: () => slowNow });
+  await assert.rejects(
+    slow.service.acquireAccessToken(),
+    (error) => error.code === "runa.auth.reauthentication_required",
+  );
+  assert.equal(original.backend.values.size, 0, "an already-expired rotated family is removed rather than cached");
+});
+
 test("exact decoders reject widened, mismatched, and malformed auth responses", () => {
   const bootstrap = {
     enabled: true, completion_mode: "poll", pkce_method: "S256", continuation_ttl_seconds: 600,
     poll_after_ms: 2000, poll_limit: 10, access_token_ttl_seconds: 600,
-    refresh_family_ttl_seconds: 2592000, browser_origin: "https://app.runacode.io",
+    refresh_family_ttl_seconds: 2592000, browser_origin: "https://app.getcuna.com",
   };
   assert.equal(decodeCliAuthBootstrap(bootstrap).pollLimit, 10);
   assert.throws(() => decodeCliAuthBootstrap({ ...bootstrap, future_field: true }));
@@ -329,12 +518,18 @@ test("exact decoders reject widened, mismatched, and malformed auth responses", 
 
   const issued = {
     id: UUID_A, continuation_secret: CT,
-    browser_url: `https://app.runacode.io/cli/continue#continuation=${UUID_A}&nonce=runa_cb_${"n".repeat(43)}&state=${STATE}`,
+    browser_url: `https://app.getcuna.com/cli/continue#continuation=${UUID_A}&nonce=runa_cb_${"n".repeat(43)}&state=${STATE}`,
     expires_at: "2026-08-08T00:10:00.000Z", poll_after_ms: 2000, completion_mode: "poll",
   };
-  assert.equal(decodeCliContinuationIssued(issued, { browserOrigin: "https://app.runacode.io", state: STATE }).id, UUID_A);
+  assert.equal(decodeCliContinuationIssued(issued, { browserOrigin: "https://app.getcuna.com", state: STATE }).id, UUID_A);
+  const cunaIssued = {
+    ...issued,
+    continuation_secret: `cuna_ct_${"c".repeat(43)}`,
+    browser_url: `https://app.getcuna.com/cli/continue#continuation=${UUID_A}&nonce=cuna_cb_${"n".repeat(43)}&state=${STATE}`,
+  };
+  assert.equal(decodeCliContinuationIssued(cunaIssued, { browserOrigin: "https://app.getcuna.com", state: STATE }).browserNonce.startsWith("cuna_cb_"), true);
   assert.throws(() => decodeCliContinuationIssued({ ...issued, browser_url: issued.browser_url.replace(UUID_A, UUID_B) }, {
-    browserOrigin: "https://app.runacode.io", state: STATE,
+    browserOrigin: "https://app.getcuna.com", state: STATE,
   }));
   assert.throws(() => decodeCliContinuationStatus({
     id: UUID_B,
@@ -343,6 +538,21 @@ test("exact decoders reject widened, mismatched, and malformed auth responses", 
     required_terms_version: "2026-08",
   }, UUID_A));
   assert.throws(() => decodeCliTokenSet({ access_token: AT }));
+  assert.equal(decodeCliTokenSet({
+    access_token: `cuna_at_${"a".repeat(43)}`,
+    refresh_token: `cuna_rt_${"r".repeat(43)}`,
+    token_type: "Bearer",
+    expires_in: 600,
+    access_expires_at: "2026-08-08T00:10:00.000Z",
+    refresh_expires_at: "2026-09-07T00:00:00.000Z",
+    session_id: UUID_B,
+    context: {
+      required_terms_version: "2026-08",
+      identity: "active",
+      admission: "admitted",
+      workspace: { state: "assigned", id: UUID_C },
+    },
+  }).accessToken.startsWith("cuna_at_"), true);
   assert.equal(decodeRevocation({ revoked: true }), true);
   assert.throws(() => decodeRevocation({ revoked: false }));
   assert.throws(() => decodeRevocation({ revoked: true, ambiguous: true }));

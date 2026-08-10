@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-export const PACKAGE_NAME = "@runa_laboratories/cli";
-export const REPOSITORY = "Runa-Laboratories/runa-cli";
+export const PACKAGE_NAME = "@cuna_labs/cli";
+export const REPOSITORY = "Cuna-Labs/cuna-cli";
 export const REGISTRY = "https://registry.npmjs.org";
 
 const SHA256 = /^[0-9a-f]{64}$/;

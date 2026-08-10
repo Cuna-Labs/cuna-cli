@@ -28,10 +28,10 @@ const candidate = Object.freeze({
 function lease() {
   return {
     schemaVersion: 1,
-    predicateType: "https://runacode.io/attestations/runa-cli-release-approval/v1",
+    predicateType: "https://getcuna.com/attestations/cuna-cli-release-approval/v1",
     decision: "READY",
-    package: { name: "@runa_laboratories/cli", version: "0.1.0" },
-    source: { repository: "Runa-Laboratories/runa-cli", commit: "a".repeat(40), ref: "refs/heads/main" },
+    package: { name: "@cuna_labs/cli", version: "0.1.0" },
+    source: { repository: "Cuna-Labs/cuna-cli", commit: "a".repeat(40), ref: "refs/heads/main" },
     candidate: { ...candidate },
     receiptCohort: {
       sha256: "7".repeat(64),
@@ -41,7 +41,7 @@ function lease() {
       runAttempt: 1,
     },
     contractAuthority: {
-      producerRepository: "Runa-Laboratories/infra",
+      producerRepository: "Cuna-Labs/infra",
       sourceCommit: "b".repeat(40),
       contractSha256: "9".repeat(64),
       approvalAttestationSha256: "c".repeat(64),
@@ -58,7 +58,7 @@ function lease() {
     recovery: { planSha256: "d".repeat(64), strategy: "halt-and-fixed-forward" },
     issuedAt: new Date(now - 1_000).toISOString(),
     expiresAt: new Date(now + RELEASE_APPROVAL_MAXIMUM_LEASE_MS - 1_000).toISOString(),
-    nonce: `runa_release_${"n".repeat(32)}`,
+    nonce: `cuna_release_${"n".repeat(32)}`,
     conditions: [],
   };
 }
@@ -101,7 +101,7 @@ test("release approval lease rejects substitution, expiry, excessive duration, a
     ["contract", (subject) => { subject.contractAuthority.contractSha256 = "e".repeat(64); }, /contract authority differs/u],
     ["review attempt", (subject) => { subject.review.runAttempt = 2; }, /review identity differs/u],
     ["recovery", (subject) => { subject.recovery.planSha256 = "e".repeat(64); }, /recovery identity differs/u],
-    ["nonce", (subject) => { subject.nonce = `runa_release_${"x".repeat(32)}`; }, /nonce differs/u],
+    ["nonce", (subject) => { subject.nonce = `cuna_release_${"x".repeat(32)}`; }, /nonce differs/u],
   ];
   for (const [label, mutate, pattern] of substitutions) {
     const subject = lease();
@@ -159,7 +159,7 @@ test("release decision conditions and reviewer identity are internally consisten
 });
 
 test("CLI semantic verifier never claims cryptographic release authorization", async () => {
-  const root = await resources.createTempDirectory("runa-release-lease-");
+  const root = await resources.createTempDirectory("cuna-release-lease-");
   await mkdir(root, { recursive: true });
   const actualNow = Date.now();
   const subject = lease();

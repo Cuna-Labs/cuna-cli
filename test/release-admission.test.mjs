@@ -16,7 +16,7 @@ const resources = new TestResourceLedger();
 test.after(() => resources.cleanup());
 
 async function createAdmissionFixture() {
-  const root = await resources.createTempDirectory("runa-admission-test-");
+  const root = await resources.createTempDirectory("cuna-admission-test-");
   const evidence = path.join(root, "release-artifacts");
   const receipts = path.join(root, "receipts");
   const observationReceipts = path.join(root, "observation-receipts");
@@ -25,7 +25,7 @@ async function createAdmissionFixture() {
   await mkdir(observationReceipts, { recursive: true });
   const version = "1.2.3-preview.1";
   const sourceCommit = "a".repeat(40);
-  const tarballFile = `runa_laboratories-cli-${version}.tgz`;
+  const tarballFile = `cuna_labs-cli-${version}.tgz`;
   await writeFile(path.join(evidence, tarballFile), "candidate bytes\n");
   await cp(path.join(repositoryRoot, "packaging", "support-policy.json"), path.join(evidence, "support-policy.json"));
   const policy = JSON.parse(await readFile(path.join(evidence, "support-policy.json"), "utf8"));
@@ -33,7 +33,7 @@ async function createAdmissionFixture() {
     bomFormat: "CycloneDX",
     specVersion: "1.6",
     version: 1,
-    metadata: { component: { type: "application", name: "@runa_laboratories/cli", version, purl: `pkg:npm/%40runa_laboratories/cli@${version}` } },
+    metadata: { component: { type: "application", name: "@cuna_labs/cli", version, purl: `pkg:npm/%40cuna_labs/cli@${version}` } },
   };
   await writeFile(path.join(evidence, "sbom.cdx.json"), `${JSON.stringify(sbom)}\n`);
   const releaseInputs = syntheticReleaseInputs({ version, sourceCommit });
@@ -43,7 +43,7 @@ async function createAdmissionFixture() {
     sourceCommit,
     tarball: {
       file: tarballFile,
-      url: `https://registry.npmjs.org/@runa_laboratories/cli/-/cli-${version}.tgz`,
+      url: `https://registry.npmjs.org/@cuna_labs/cli/-/cli-${version}.tgz`,
       sha256: await sha256File(path.join(evidence, tarballFile)),
       size: (await readFile(path.join(evidence, tarballFile))).length,
     },
@@ -75,6 +75,7 @@ async function createAdmissionFixture() {
   }
   const requiredEntry = policy.ciMatrix.find((entry) => entry.claim !== "observation-only");
   const observationEntry = policy.ciMatrix.find((entry) => entry.claim === "observation-only");
+  const observationEntries = policy.ciMatrix.filter((entry) => entry.claim === "observation-only");
   assert.ok(requiredEntry, "fixture requires a release-admissible platform entry");
   assert.ok(observationEntry, "fixture requires an observation-only platform entry");
   return {
@@ -86,6 +87,7 @@ async function createAdmissionFixture() {
     observationReceipt: path.join(observationReceipts, `${observationEntry.id}.json`),
     requiredEntry,
     observationEntry,
+    observationEntries,
   };
 }
 
@@ -128,7 +130,7 @@ test("TC-053-12 complete platform receipts are never elevated to release authori
   assert.ok(admission.limitations.includes("NO_AUTHENTICATED_RECEIPT_OBSERVER"));
 });
 
-test("TC-053-13 observation-only receipts are optional and never authorize unsupported architecture", async () => {
+test("TC-053-12 observation-only receipts are optional and never authorize unsupported architecture", async () => {
   const fixture = await createAdmissionFixture();
   await rm(fixture.observationReceipt);
   await assert.doesNotReject(verifyAdmission(fixture));
@@ -138,13 +140,13 @@ test("TC-053-13 observation-only receipts are optional and never authorize unsup
   assert.ok(!admission.platformReceipts.includes(fixture.observationEntry.id));
 });
 
-test("TC-053-14 observation-only evidence cannot replace a required distribution receipt", async () => {
+test("TC-053-12 observation-only evidence cannot replace a required distribution receipt", async () => {
   const fixture = await createAdmissionFixture();
   await rm(fixture.firstReceipt);
   await assert.rejects(verifyAdmission(fixture), /Missing release-admissible platform receipts/);
 });
 
-test("TC-053-15 supplied observation-only evidence is identity-checked only in the non-authorizing lateral summary", async () => {
+test("TC-053-09 supplied observation-only evidence is identity-checked only in the non-authorizing lateral summary", async () => {
   const fixture = await createAdmissionFixture();
   const receipt = JSON.parse(await readFile(fixture.observationReceipt, "utf8"));
   receipt.architecture = "x64";
@@ -153,41 +155,48 @@ test("TC-053-15 supplied observation-only evidence is identity-checked only in t
   const summary = JSON.parse(await readFile(path.join(fixture.root, "observation-summary.json"), "utf8"));
   assert.equal(summary.admissionImpact, "NONE");
   assert.equal(summary.releaseEligible, false);
-  assert.deepEqual(summary.verifiedObservationIds, []);
+  assert.deepEqual(
+    summary.verifiedObservationIds,
+    fixture.observationEntries.map((entry) => entry.id).filter((id) => id !== fixture.observationEntry.id).sort(),
+  );
   assert.equal(summary.rejected[0].reasonCode, "RECEIPT_VALIDATION_FAILED");
   assert.match(summary.rejected[0].message, /architecture mismatch/);
 });
 
-test("TC-053-15 a valid observation is retained without influencing admission", async () => {
+test("TC-053-12 a valid observation is retained without influencing admission", async () => {
   const fixture = await createAdmissionFixture();
   await assert.doesNotReject(summarizeObservations(fixture));
   const summary = JSON.parse(await readFile(path.join(fixture.root, "observation-summary.json"), "utf8"));
-  assert.deepEqual(summary.expectedObservationIds, [fixture.observationEntry.id]);
-  assert.deepEqual(summary.verifiedObservationIds, [fixture.observationEntry.id]);
+  const expectedIds = fixture.observationEntries.map((entry) => entry.id).sort();
+  assert.deepEqual(summary.expectedObservationIds, expectedIds);
+  assert.deepEqual(summary.verifiedObservationIds, expectedIds);
   assert.deepEqual(summary.missingObservationIds, []);
   assert.deepEqual(summary.rejected, []);
   assert.equal(summary.admissionImpact, "NONE");
   assert.equal(summary.releaseEligible, false);
 });
 
-test("TC-053-15 missing observation evidence remains descriptive and non-blocking", async () => {
+test("TC-053-12 missing observation evidence remains descriptive and non-blocking", async () => {
   const fixture = await createAdmissionFixture();
   await rm(fixture.observationReceipt);
   await assert.doesNotReject(summarizeObservations(fixture));
   const summary = JSON.parse(await readFile(path.join(fixture.root, "observation-summary.json"), "utf8"));
   assert.deepEqual(summary.missingObservationIds, [fixture.observationEntry.id]);
-  assert.deepEqual(summary.verifiedObservationIds, []);
+  assert.deepEqual(
+    summary.verifiedObservationIds,
+    fixture.observationEntries.map((entry) => entry.id).filter((id) => id !== fixture.observationEntry.id).sort(),
+  );
   assert.equal(summary.admissionImpact, "NONE");
   assert.equal(summary.releaseEligible, false);
 });
 
-test("TC-053-15 observation receipts are rejected if injected into admission", async () => {
+test("TC-053-12 observation receipts are rejected if injected into admission", async () => {
   const fixture = await createAdmissionFixture();
   await cp(fixture.observationReceipt, path.join(fixture.receipts, `${fixture.observationEntry.id}.json`));
   await assert.rejects(verifyAdmission(fixture), /Observation-only receipts must be summarized outside admission/);
 });
 
-test("TC-053-16 an unlisted architecture receipt cannot widen platform admission", async () => {
+test("TC-053-09 an unlisted architecture receipt cannot widen platform admission", async () => {
   const fixture = await createAdmissionFixture();
   const receipt = JSON.parse(await readFile(fixture.observationReceipt, "utf8"));
   receipt.platform = "linux";

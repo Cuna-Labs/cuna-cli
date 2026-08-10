@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 
+import type { NativeBrowserProcessBridge } from "../credentials/native-process-bridge.js";
+
 export interface BrowserOpener {
   open(url: string): Promise<void>;
 }
@@ -26,11 +28,18 @@ export function resolveBrowserCommand(
 export function createBrowserOpener(
   platform: NodeJS.Platform = process.platform,
   environment: NodeJS.ProcessEnv = process.env,
+  nativeBridge?: NativeBrowserProcessBridge,
 ): BrowserOpener {
   return Object.freeze({
     open(url: string): Promise<void> {
       const parsed = new URL(url);
       if (parsed.protocol !== "https:") throw new TypeError("Browser continuation URL must use HTTPS.");
+      if (platform === "win32" && nativeBridge !== undefined) {
+        if (nativeBridge.platform !== "win32") {
+          throw new Error("The native browser bridge platform binding does not match this runtime.");
+        }
+        return nativeBridge.open(url);
+      }
       const command = resolveBrowserCommand(platform, url, environment);
       return new Promise((resolve, reject) => {
         const child = spawn(command.executable, [...command.args], {

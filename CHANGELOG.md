@@ -14,8 +14,8 @@ follow [Semantic Versioning](https://semver.org/).
 
 ### Security
 
-- Exact Runa API-origin validation, bounded responses, redacted errors,
+- Exact Cuna API-origin validation, bounded responses, redacted errors,
   capability-gated mutations, SHA-pinned GitHub Actions, and OIDC-only preview
   publication.
 
-[Unreleased]: https://github.com/Runa-Laboratories/runa-cli/commits/main
+[Unreleased]: https://github.com/Cuna-Labs/cuna-cli/commits/main

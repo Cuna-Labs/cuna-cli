@@ -1,6 +1,6 @@
 # Distribution projections
 
-npm is the canonical first-GA publication for Runa CLI. Every other surface in
+npm is the canonical first-GA publication for Cuna CLI. Every other surface in
 this directory is a projection of the exact candidate npm tarball; no projection
 may rebuild, patch, re-bundle, or independently version the CLI.
 
@@ -8,11 +8,11 @@ may rebuild, patch, re-bundle, or independently version the CLI.
 
 | Surface | Intended command | Current repository status |
 | --- | --- | --- |
-| npm | `npm install -g @runa_laboratories/cli` | Workflow scaffold only; no live package is asserted. |
-| Bun | `bun add --global @runa_laboratories/cli` | Compatibility projection; no independent publication. |
-| curl | `curl -fsSL https://runacode.io/install \| sh` | Release-bound template only; endpoint availability is not asserted. |
-| Homebrew | `brew install Runa-Laboratories/tap/runa` | Formula template only; tap availability is not asserted. |
-| paru/AUR | `paru -S runa-cli-bin` | PKGBUILD template only; AUR package availability is not asserted. |
+| npm | `npm install -g @cuna_labs/cli` | Workflow scaffold only; no live package is asserted. |
+| Bun | `bun add --global @cuna_labs/cli` | Compatibility projection for Linux x64 and Intel macOS x64; Windows x64 is release-blocked. |
+| curl | `curl -fsSL https://getcuna.com/install \| sh` | Release-bound template only; endpoint availability is not asserted. |
+| Homebrew | `brew install Cuna-Labs/tap/cuna` | Formula template only; tap availability is not asserted. |
+| paru/AUR | `paru -S cuna-cli-bin` | PKGBUILD template only; AUR package availability is not asserted. |
 
 ## Release envelope and distribution manifest
 
@@ -66,9 +66,35 @@ The generated bundle contains five independently hashed surfaces:
   staged/active runtime identity, atomically activates the new version, retains
   the previous version for recovery, and provides an ownership-bounded
   `--uninstall` operation;
-- `homebrew/runa.rb`, digest-pinned to the same npm tarball;
+- `homebrew/cuna.rb`, digest-pinned to the same npm tarball;
 - `aur/PKGBUILD`, digest-pinned, offline after source acquisition, and free of
   lifecycle scripts.
+
+## Bun on Windows
+
+Windows remains Tier-1 through the canonical npm channel. Bun 1.3.14 was
+reproduced against the exact local candidate in an isolated Windows prefix:
+global install and the public shim succeeded, while `bun remove --global`
+reported success, removed the package record and package directory, and left
+the generated `cuna.exe` and `cuna.bunx` files byte-identical in Bun's global
+bin directory.
+
+The behavior follows Bun's pinned removal source, which scans the global bin
+directory but handles only symbolic links. Bun's Windows shim cleanup primitive
+does remove `.exe` and `.bunx` files, but that primitive is not reached by the
+global removal path in the verified source revision. See Bun's
+[`updatePackageJSONAndInstall.zig`](https://github.com/oven-sh/bun/blob/bun-v1.3.14/src/install/PackageManager/updatePackageJSONAndInstall.zig#L398-L448)
+and [`bin.zig`](https://github.com/oven-sh/bun/blob/bun-v1.3.14/src/install/bin.zig#L510-L523)
+at commit `0d9b296af33f2b851fcbf4df3e9ec89751734ba4`.
+
+Cuna will not add lifecycle scripts or delete files owned by Bun. The policy
+therefore excludes `win32-x64` from Bun's supported receipt cells, records the
+defect as `BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS`, rejects any Bun Windows
+receipt, and directs Windows users to
+`npm install -g @cuna_labs/cli`. Windows may re-enter the Bun channel
+only after a supported Bun release proves isolated global install, public-shim
+execution, global uninstall, and zero remaining package-managed paths on every
+admitted Windows Node lane.
 
 The release workflow generates projections from the candidate envelope into an
 ephemeral artifact. Templates intentionally contain `@@...@@` markers and are
@@ -81,13 +107,14 @@ not executable release installers. Generated files are accepted for review only 
 5. installed-artifact self-tests pass on the declared platform matrix.
 
 `distribution-receipt.schema.json` defines pre-publication typed observations
-for an installed channel. The verifier requires 19 fresh receipts: every
+for an installed channel. The verifier requires 17 fresh receipts: every
 required channel/platform pair on the Node lines selected by that channel.
-npm, Bun, and curl cover 22.17.1 and 24.4.1; Homebrew and AUR cover 22.17.1
+npm and curl cover 22.17.1 and 24.4.1 on every supported platform; Bun covers
+those Node lines only on Linux x64 and Intel macOS x64. Homebrew and AUR cover 22.17.1
 because their public projections pin Node 22 providers.
 Receipt identity includes the Node version. Each receipt binds one immutable
 workflow-run cohort, the stable test ID, package-manager name and version,
-exact candidate invocation, isolated environment policy, public `runa` shim
+exact candidate invocation, isolated environment policy, public `cuna` shim
 resolution, and raw install, self-test, version, provenance, uninstall, and
 recovery observations by digest. Protocol claims must equal the exact support
 policy range. A `policy-approved-real-host` is accepted only when its complete
@@ -102,6 +129,21 @@ authentication remains `UNVERIFIED`, distribution and release remain
 `BLOCKED`, and `releaseEligible` remains `false`. Independent causal
 observation authority plus replay/lease enforcement are explicit unresolved
 release blockers.
+
+The root npm tarball is intentionally architecture-neutral JavaScript. That
+check does not prohibit the product's required native credential and browser
+bridges: Windows and macOS bridges must be separately named, signed,
+platform-scoped artifacts with their own provenance, installation receipts,
+revocation path, and admission authority. Until those artifacts exist and pass
+their platform gates, `SIGNED_PLATFORM_CREDENTIAL_BROWSER_BRIDGES_MISSING`
+remains a mandatory release blocker; arm64 observations are non-authorizing.
+
+Windows native credential and browser operations also remain unavailable for
+release until a native authority owns the `CreateProcessW` process handle from
+creation through loaded-image verification and protected-stdin handoff. A PID,
+an executable-path recheck, or a second helper process cannot prove this
+process-instance identity. The mandatory blocker is
+`WINDOWS_OWNED_PROCESS_HANDLE_IDENTITY_AUTHORITY_MISSING`.
 
 ```bash
 node scripts/verify-distribution-receipts.mjs \

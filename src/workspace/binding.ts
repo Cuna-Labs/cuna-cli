@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { lstat, realpath } from "node:fs/promises";
 import { posix, resolve } from "node:path";
 
 import { assertPublicId } from "../core/validation.js";
+import { captureCanonicalWorkspaceRoot } from "./binding-path.js";
 import { assertReadableSchema, type DurableSchemaEnvelope } from "./schema.js";
 import { workspaceError } from "./errors.js";
+
+export * from "./binding-path.js";
+export * from "./binding-store.js";
 
 export interface WorkspaceBinding extends DurableSchemaEnvelope {
   readonly bindingId: string;
@@ -29,15 +32,7 @@ export interface BindingExpectations {
 }
 
 export async function canonicalizeWorkspaceRoot(path: string): Promise<string> {
-  if (path.includes("\0") || /^(?:\\\\[.?]\\|\/dev\/)/u.test(path)) {
-    throw workspaceError("root_unsafe", "The workspace root is unsafe.", "policy", "device_path");
-  }
-  const lexical = resolve(path);
-  const metadata = await lstat(lexical);
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw workspaceError("root_unsafe", "The workspace root must be a physical directory.", "policy", "unsafe_type");
-  }
-  return realpath(lexical);
+  return (await captureCanonicalWorkspaceRoot(path)).path;
 }
 
 export async function createWorkspaceBinding(input: {
@@ -125,4 +120,3 @@ export function relocateWorkspaceBinding(
     generation: binding.generation + 1,
   });
 }
-

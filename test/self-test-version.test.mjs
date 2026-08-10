@@ -65,7 +65,7 @@ test("self-test fails closed without the explicit offline mode", async () => {
   assert.equal(record.error.code, "runa.usage.invalid");
 });
 
-test("runtime support rejects untested Node and architecture claims", () => {
+test("runtime support admits the architecture-neutral x64 and arm64 package", () => {
   assert.equal(isSupportedNodeVersion("22.17.0"), false);
   assert.equal(isSupportedNodeVersion("22.17.1"), true);
   assert.equal(isSupportedNodeVersion("23.9.0"), false);
@@ -75,10 +75,14 @@ test("runtime support rejects untested Node and architecture claims", () => {
   assert.equal(isSupportedNodeVersion("not-semver"), false);
   assert.deepEqual(
     evaluateRuntimeSupport({ nodeVersion: "24.4.1", platform: "darwin", architecture: "arm64" }),
-    { nodeRuntime: true, platform: true, architecture: false },
+    { nodeRuntime: true, platform: true, architecture: true },
   );
   assert.deepEqual(
     evaluateRuntimeSupport({ nodeVersion: "24.4.1", platform: "freebsd", architecture: "x64" }),
     { nodeRuntime: true, platform: false, architecture: true },
+  );
+  assert.deepEqual(
+    evaluateRuntimeSupport({ nodeVersion: "24.4.1", platform: "linux", architecture: "arm" }),
+    { nodeRuntime: true, platform: true, architecture: false },
   );
 });

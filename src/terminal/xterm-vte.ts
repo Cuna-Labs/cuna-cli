@@ -169,7 +169,7 @@ export class XtermViewportAdapter {
       throw error;
     }
     for (const identifier of CONTAINED_OSC_IDENTIFIERS) {
-      // Runa renders cells only. Consuming non-cell metadata prevents remote
+      // Cuna renders cells only. Consuming non-cell metadata prevents remote
       // title, hyperlink, and clipboard state from entering trusted host UI or
       // being retained in the headless VTE link service.
       this.#terminal.parser.registerOscHandler(identifier, () => true);

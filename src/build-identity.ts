@@ -43,7 +43,7 @@ export interface PackageBuildManifestEntry {
 
 export interface PackageBuildManifest {
   readonly schemaVersion: 1;
-  readonly algorithm: "runa-package-payload-v1";
+  readonly algorithm: "cuna-package-payload-v1";
   readonly fileCount: number;
   readonly files: readonly PackageBuildManifestEntry[];
   readonly sha256: string;
@@ -70,7 +70,7 @@ export function packageBuildManifest(): Promise<PackageBuildManifest> {
     }
     return Object.freeze({
       schemaVersion: 1 as const,
-      algorithm: "runa-package-payload-v1" as const,
+      algorithm: "cuna-package-payload-v1" as const,
       fileCount: entries.length,
       files: Object.freeze(entries),
       sha256: hash.digest("hex"),

@@ -23,7 +23,7 @@ invariant(manifest.releaseEnvelope.sha256 === await sha256File(envelopeFile), "D
 const commands = candidateInvocations(envelope.version, channelDefinitions);
 const npm = await readFile(path.join(distributionsRoot, channelDefinitions.npm.projectionFile), "utf8");
 const expectedNpm = [
-  "# Generated from a candidate-bound Runa CLI release envelope. Do not edit.",
+  "# Generated from a candidate-bound Cuna CLI release envelope. Do not edit.",
   `public_command=${channelDefinitions.npm.publicCommand}`,
   `candidate_invocation=${commands.npm}`,
   `package=${envelope.packageName}`,
@@ -39,7 +39,7 @@ invariant(npm === expectedNpm, "npm projection content differs from the determin
 
 const bun = await readFile(path.join(distributionsRoot, channelDefinitions.bun.projectionFile), "utf8");
 const expectedBun = [
-  "# Generated from a candidate-bound Runa CLI release envelope. Do not edit.",
+  "# Generated from a candidate-bound Cuna CLI release envelope. Do not edit.",
   `public_command=${channelDefinitions.bun.publicCommand}`,
   `candidate_invocation=${commands.bun}`,
   `package=${envelope.packageName}`,
@@ -49,6 +49,14 @@ const expectedBun = [
   "installer_of_record=bun",
   "artifact_channel=npm",
   "availability=PROJECTED_NOT_PUBLISHED",
+  `supported_platforms=${channelDefinitions.bun.platforms.join(",")}`,
+  `blocked_platforms=${channelDefinitions.bun.blockedPlatforms.map(({ platform }) => platform).join(",")}`,
+  `windows_availability=${channelDefinitions.bun.blockedPlatforms[0].availability}`,
+  `windows_block_reason=${channelDefinitions.bun.blockedPlatforms[0].reasonCode}`,
+  `verified_affected_bun_versions=${channelDefinitions.bun.blockedPlatforms[0].verifiedAffectedVersions.join(",")}`,
+  `upstream_source=${channelDefinitions.bun.blockedPlatforms[0].upstreamRepository}@${channelDefinitions.bun.blockedPlatforms[0].upstreamCommit}`,
+  `windows_fallback_command=${channelDefinitions.npm.publicCommand}`,
+  `windows_readmission_gate=${channelDefinitions.bun.blockedPlatforms[0].readmissionGate}`,
   "",
 ].join("\n");
 invariant(bun === expectedBun, "Bun projection content differs from the deterministic policy projection");
@@ -69,14 +77,14 @@ invariant(install.startsWith("#!/bin/sh\nset -eu\n"), "curl bootstrap does not f
 invariant(install.includes("--proto '=https' --tlsv1.2 --fail --location --show-error"), "curl bootstrap does not constrain transport");
 invariant(install.indexOf("sha256sum --check") < install.indexOf("npm install --global"), "curl bootstrap mutates before digest verification");
 invariant(install.match(/npm install --global --ignore-scripts/g)?.length === 1, "curl bootstrap must perform one lifecycle-script-free versioned install");
-invariant(!/npm install --global[^\n]*"\$tarball"\n(?:runa|\$PATH)/u.test(install), "curl bootstrap contains a non-versioned global activation");
+invariant(!/npm install --global[^\n]*"\$tarball"\n(?:cuna|\$PATH)/u.test(install), "curl bootstrap contains a non-versioned global activation");
 invariant(install.includes('mv "$staging" "$version_dir"'), "curl bootstrap does not publish a verified immutable version directory");
 invariant(
   install.match(/mv -f "\$launcher_tmp" "\$launcher"/gu)?.length === 2,
-  "curl bootstrap does not atomically activate and restore a Runa-owned launcher",
+  "curl bootstrap does not atomically activate and restore a Cuna-owned launcher",
 );
 invariant(install.includes("previous launcher was restored") && install.includes("previous_target"), "curl bootstrap does not preserve or restore N-1");
-invariant(install.includes("runa-cli-installer-v1") && install.includes("Refusing to replace a non-Runa launcher"), "curl bootstrap does not enforce path ownership");
+invariant(install.includes("cuna-cli-installer-v1") && install.includes("Refusing to replace a non-Cuna launcher"), "curl bootstrap does not enforce path ownership");
 invariant(install.includes("--uninstall") && install.includes("user configuration was preserved"), "curl bootstrap does not provide bounded uninstall semantics");
 invariant(install.includes("EXPECTED_PAYLOAD_SHA256") && install.includes('data.artifactChannel !== "npm"'), "curl bootstrap does not bind runtime payload and artifact-channel identity");
 

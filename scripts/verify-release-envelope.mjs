@@ -8,24 +8,24 @@ import { withOwnedTempDirectory } from "./lib/owned-temp.mjs";
 const args = parseArgs(process.argv.slice(2));
 
 if (args.get("self-test") === "true") {
-  await withOwnedTempDirectory("runa-envelope-test-", async (root) => {
+  await withOwnedTempDirectory("cuna-envelope-test-", async (root) => {
     await mkdir(root, { recursive: true });
-    await writeFile(path.join(root, "runa.tgz"), "candidate");
+    await writeFile(path.join(root, "cuna.tgz"), "candidate");
     await writeFile(path.join(root, "sbom.json"), "{}");
     await writeFile(path.join(root, "support.json"), "{}");
     const releaseInputs = syntheticReleaseInputs({ version: "1.2.3-test.1", sourceCommit: "a".repeat(40) });
     await writeFile(path.join(root, "release-inputs.json"), `${JSON.stringify(releaseInputs)}\n`);
     const envelope = {
     schemaVersion: 2,
-    packageName: "@runa_laboratories/cli",
+    packageName: "@cuna_labs/cli",
     version: "1.2.3-test.1",
     sourceCommit: "a".repeat(40),
-    repository: "Runa-Laboratories/runa-cli",
+    repository: "Cuna-Labs/cuna-cli",
     registry: "https://registry.npmjs.org",
     tarball: {
-      file: "runa.tgz",
-      url: "https://registry.npmjs.org/@runa_laboratories/cli/-/cli-1.2.3-test.1.tgz",
-      sha256: await sha256File(path.join(root, "runa.tgz")),
+      file: "cuna.tgz",
+      url: "https://registry.npmjs.org/@cuna_labs/cli/-/cli-1.2.3-test.1.tgz",
+      sha256: await sha256File(path.join(root, "cuna.tgz")),
       size: 9,
     },
     sbom: { file: "sbom.json", sha256: await sha256File(path.join(root, "sbom.json")) },
@@ -41,9 +41,9 @@ if (args.get("self-test") === "true") {
     builder: { workflow: ".github/workflows/ci.yml", runId: "1", runAttempt: "1" },
     };
     await verifyEnvelopeFiles(envelope, root);
-    await writeFile(path.join(root, "runa.tgz"), "substituted");
+    await writeFile(path.join(root, "cuna.tgz"), "substituted");
     await expectRejected(() => verifyEnvelopeFiles(envelope, root), "substituted tarball was accepted");
-    await writeFile(path.join(root, "runa.tgz"), "candidate");
+    await writeFile(path.join(root, "cuna.tgz"), "candidate");
     await writeFile(path.join(root, "release-inputs.json"), `${JSON.stringify({ ...releaseInputs, sourceCommit: "b".repeat(40) })}\n`);
     await expectRejected(() => verifyEnvelopeFiles(envelope, root), "substituted release inputs were accepted");
     const fabricatedApproval = structuredClone(envelope);

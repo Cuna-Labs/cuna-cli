@@ -36,3 +36,20 @@ test("installed process entrypoint translates SIGTERM and also cleans up after f
   assert.equal(host.listenerCount("SIGINT"), 0);
   assert.equal(host.listenerCount("SIGTERM"), 0);
 });
+
+test("installed process entrypoint translates SIGHUP into cleanup cancellation and removes every signal listener", async () => {
+  const host = new EventEmitter();
+  const exit = await runProcessCli([], {
+    host,
+    run: async (_argv, dependencies) => {
+      host.emit("SIGHUP");
+      assert.equal(dependencies.signal.aborted, true);
+      assert.match(dependencies.signal.reason?.message ?? "", /SIGHUP/u);
+      return 0;
+    },
+  });
+  assert.equal(exit, 0);
+  assert.equal(host.listenerCount("SIGINT"), 0);
+  assert.equal(host.listenerCount("SIGTERM"), 0);
+  assert.equal(host.listenerCount("SIGHUP"), 0);
+});

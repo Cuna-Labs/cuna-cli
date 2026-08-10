@@ -32,14 +32,14 @@ function clone(value) {
 }
 
 async function createFixture() {
-  const root = await resources.createTempDirectory("runa-support-policy-authority-");
+  const root = await resources.createTempDirectory("cuna-support-policy-authority-");
   const evidence = path.join(root, "evidence");
   const distributions = path.join(root, "distributions");
   await mkdir(evidence, { recursive: true });
 
   const version = "1.2.3-preview.1";
   const sourceCommit = "a".repeat(40);
-  const tarballFile = "runa_laboratories-cli-1.2.3-preview.1.tgz";
+  const tarballFile = "cuna_labs-cli-1.2.3-preview.1.tgz";
   await writeFile(path.join(evidence, tarballFile), "immutable candidate bytes\n");
   const sbom = {
     bomFormat: "CycloneDX",
@@ -48,10 +48,10 @@ async function createFixture() {
     metadata: {
       component: {
         type: "application",
-        name: "@runa_laboratories/cli",
+        name: "@cuna_labs/cli",
         version,
-        purl: `pkg:npm/%40runa_laboratories/cli@${version}`,
-        "bom-ref": `@runa_laboratories/cli@${version}`,
+        purl: `pkg:npm/%40cuna_labs/cli@${version}`,
+        "bom-ref": `@cuna_labs/cli@${version}`,
       },
     },
     components: [],
@@ -69,7 +69,7 @@ async function createFixture() {
     sourceCommit,
     tarball: {
       file: tarballFile,
-      url: `https://registry.npmjs.org/@runa_laboratories/cli/-/cli-${version}.tgz`,
+      url: `https://registry.npmjs.org/@cuna_labs/cli/-/cli-${version}.tgz`,
       sha256: await sha256File(path.join(evidence, tarballFile)),
       size: (await readFile(path.join(evidence, tarballFile))).length,
     },
@@ -118,6 +118,35 @@ test("support policy is the sole ordered authority for every approved distributi
   assert.equal(definitions.bun.artifactChannel, "npm");
   assert.equal(definitions.bun.installerOfRecord, "bun");
   assert.notEqual(definitions.bun.artifactChannel, definitions.bun.installerOfRecord);
+  assert.deepEqual(definitions.bun.platforms, ["linux-x64", "darwin-x64"]);
+  assert.equal(definitions.bun.blockedPlatforms.length, 1);
+  assert.equal(definitions.bun.blockedPlatforms[0].platform, "win32-x64");
+  assert.equal(definitions.bun.blockedPlatforms[0].reasonCode, "BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS");
+  assert.equal(definitions.bun.blockedPlatforms[0].fallbackChannel, "npm");
+  assert.ok(definitions.npm.platforms.includes("win32-x64"));
+});
+
+test("Bun Windows stays explicitly blocked until clean package-manager cleanup is re-proven", () => {
+  const missingBlock = clone(sourcePolicy);
+  missingBlock.channels.bun.blockedPlatforms = [];
+  assert.throws(
+    () => validateSupportPolicy(missingBlock),
+    /Bun Windows block differs from the verified upstream defect and re-admission gate/,
+  );
+
+  const ambiguous = clone(sourcePolicy);
+  ambiguous.channels.bun.platforms.push("win32-x64");
+  assert.throws(
+    () => validateSupportPolicy(ambiguous),
+    /cannot be both supported and blocked/,
+  );
+
+  const unsafeFallback = clone(sourcePolicy);
+  unsafeFallback.channels.bun.blockedPlatforms[0].fallbackChannel = "curl";
+  assert.throws(
+    () => validateSupportPolicy(unsafeFallback),
+    /blocked platform fallback does not support win32-x64/,
+  );
 });
 
 test("an independent policy mutation is rejected unless the release envelope is rebound", async () => {
@@ -155,10 +184,10 @@ test("missing and unknown channel identities are rejected", () => {
 
 test("unsupported architecture and channel platform claims are rejected", () => {
   const architecture = clone(sourcePolicy);
-  architecture.architectures = ["x64", "arm64"];
+  architecture.architectures = ["x64"];
   assert.throws(
     () => validateSupportPolicy(architecture),
-    /architecture claim differs from the admitted x64 set/,
+    /package architecture claim differs from the architecture-neutral runtime closure/,
   );
 
   const platform = clone(sourcePolicy);
@@ -175,6 +204,21 @@ test("every mandatory platform covers every declared Node line", () => {
   assert.throws(
     () => validateSupportPolicy(missingDarwinNode),
     /lacks mandatory darwin-x64 coverage for Node 22\.17\.1/,
+  );
+});
+
+test("every Tier-1 platform observes arm64 on every declared Node line without widening admission", () => {
+  const missingObservation = clone(sourcePolicy);
+  missingObservation.ciMatrix = missingObservation.ciMatrix.filter(
+    (entry) => entry.id !== "windows-11-node24-arm64-observation",
+  );
+  assert.throws(
+    () => validateSupportPolicy(missingObservation),
+    /lacks non-authorizing win32-arm64 observation for Node 24\.4\.1/u,
+  );
+  assert.deepEqual(
+    validateSupportPolicy(sourcePolicy),
+    ["darwin-x64", "linux-x64", "win32-x64"],
   );
 });
 
@@ -248,6 +292,11 @@ test("a manifest cannot drift from its bound policy role, availability, installe
       name: "candidate artifact digest",
       mutate(candidate) { candidate.channels.find(({ id }) => id === "bun").artifactSha256 = "f".repeat(64); },
       expected: /bun does not bind the candidate tarball/,
+    },
+    {
+      name: "blocked platform",
+      mutate(candidate) { candidate.channels.find(({ id }) => id === "bun").blockedPlatforms[0].fallbackChannel = "curl"; },
+      expected: /bun blocked-platform claim mismatch/,
     },
   ];
 

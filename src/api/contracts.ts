@@ -33,7 +33,7 @@ export interface Capability {
 }
 
 export interface CapabilitySnapshot {
-  readonly schemaVersion: string;
+  readonly schemaVersion: "1.0";
   readonly subjectScope: CapabilityScope;
   readonly subjectId?: string;
   readonly observedAt: string;
@@ -80,8 +80,10 @@ export function decodeCapabilitySnapshot(value: unknown): CapabilitySnapshot {
   if (!SCOPE.has(rawScope)) throw new TypeError("Malformed capability scope");
   if (!Array.isArray(value.capabilities)) throw new TypeError("Malformed capabilities");
   const subjectId = optionalString(value, "subject_id");
+  const schemaVersion = requiredString(value, "schema_version");
+  if (schemaVersion !== "1.0") throw new TypeError("Unsupported capability schema version");
   const snapshot = Object.freeze({
-    schemaVersion: requiredString(value, "schema_version"),
+    schemaVersion,
     subjectScope: rawScope as CapabilityScope,
     ...(subjectId === undefined ? {} : { subjectId }),
     observedAt: requiredString(value, "observed_at"),
@@ -109,6 +111,40 @@ export interface Machine {
 export interface MachinePage {
   readonly items: readonly Machine[];
   readonly nextCursor?: string;
+}
+
+export type MachineCreateRequestState =
+  | "prepared"
+  | "in_progress"
+  | "unknown"
+  | "provider_succeeded"
+  | "settled"
+  | "terminal_failed";
+
+export interface MachineCreateRequest {
+  readonly id: string;
+  readonly machineId: string;
+  readonly state: MachineCreateRequestState;
+  readonly retryable: boolean;
+  readonly action: "retry_create" | "reconcile" | "wait" | "none";
+  readonly updatedAt: string;
+}
+
+export interface WorkspaceBindingAuthority {
+  readonly bindingId: string;
+  readonly workspaceId: string;
+  readonly projectId: string;
+  readonly localInstanceId: string;
+  readonly machineId: string;
+  readonly remoteRoot: string;
+  readonly exclusionPolicyDigest: string;
+  readonly activeGeneration: number;
+  readonly activeManifestRoot: string;
+  readonly bindingEpoch: number;
+  readonly minimumReader: number;
+  readonly minimumWriter: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 function decodeMachine(value: unknown): Machine {
@@ -145,23 +181,105 @@ export function decodeMachineItem(value: unknown): Machine {
   return decodeMachine(value);
 }
 
+export function decodeMachineCreateRequest(value: unknown): MachineCreateRequest {
+  if (!isObject(value)) throw new TypeError("Malformed machine create request");
+  exactKeys(value, ["id", "machine_id", "state", "retryable", "action", "updated_at"]);
+  const state = requiredString(value, "state") as MachineCreateRequestState;
+  const action = requiredString(value, "action") as MachineCreateRequest["action"];
+  const updatedAt = requiredString(value, "updated_at");
+  if (
+    !new Set<MachineCreateRequestState>([
+      "prepared", "in_progress", "unknown", "provider_succeeded", "settled", "terminal_failed",
+    ]).has(state) ||
+    !new Set<MachineCreateRequest["action"]>(["retry_create", "reconcile", "wait", "none"]).has(action) ||
+    typeof value.retryable !== "boolean" ||
+    !Number.isFinite(Date.parse(updatedAt))
+  ) {
+    throw new TypeError("Malformed machine create request");
+  }
+  return Object.freeze({
+    id: canonicalUuid(value, "id"),
+    machineId: canonicalUuid(value, "machine_id"),
+    state,
+    retryable: value.retryable,
+    action,
+    updatedAt,
+  });
+}
+
+export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindingAuthority {
+  if (!isObject(value)) throw new TypeError("Malformed workspace binding authority");
+  exactKeys(value, [
+    "binding_id", "workspace_id", "project_id", "local_instance_id", "machine_id",
+    "remote_root", "exclusion_policy_digest", "active_generation", "active_manifest_root",
+    "binding_epoch", "minimum_reader", "minimum_writer", "created_at", "updated_at",
+  ]);
+  const bindingId = canonicalUuid(value, "binding_id");
+  const projectId = canonicalUuid(value, "project_id");
+  const exclusionPolicyDigest = requiredString(value, "exclusion_policy_digest");
+  const activeManifestRoot = requiredString(value, "active_manifest_root");
+  const remoteRoot = requiredString(value, "remote_root");
+  const createdAt = requiredString(value, "created_at");
+  const updatedAt = requiredString(value, "updated_at");
+  const activeGeneration = optionalNumber(value, "active_generation");
+  const bindingEpoch = optionalNumber(value, "binding_epoch");
+  const minimumReader = optionalNumber(value, "minimum_reader");
+  const minimumWriter = optionalNumber(value, "minimum_writer");
+  if (
+    remoteRoot !== `/workspace/projects/${projectId}` ||
+    !/^[0-9a-f]{64}$/u.test(exclusionPolicyDigest) ||
+    !/^[0-9a-f]{64}$/u.test(activeManifestRoot) ||
+    !Number.isSafeInteger(activeGeneration) || Number(activeGeneration) < 0 ||
+    !Number.isSafeInteger(bindingEpoch) || Number(bindingEpoch) < 1 ||
+    !Number.isSafeInteger(minimumReader) || Number(minimumReader) < 1 ||
+    !Number.isSafeInteger(minimumWriter) || Number(minimumWriter) < 1 ||
+    !Number.isFinite(Date.parse(createdAt)) || !Number.isFinite(Date.parse(updatedAt))
+  ) {
+    throw new TypeError("Malformed workspace binding authority");
+  }
+  return Object.freeze({
+    bindingId,
+    workspaceId: canonicalUuid(value, "workspace_id"),
+    projectId,
+    localInstanceId: canonicalUuid(value, "local_instance_id"),
+    machineId: canonicalUuid(value, "machine_id"),
+    remoteRoot,
+    exclusionPolicyDigest,
+    activeGeneration: Number(activeGeneration),
+    activeManifestRoot,
+    bindingEpoch: Number(bindingEpoch),
+    minimumReader: Number(minimumReader),
+    minimumWriter: Number(minimumWriter),
+    createdAt,
+    updatedAt,
+  });
+}
+
 export interface RunaIdentity {
   readonly id: string;
   readonly email: string;
   readonly workspaceAssigned: boolean;
+  readonly workspaceId?: string;
+  readonly workspaceUsage?: {
+    readonly estimatedSpendUsd: number;
+    readonly estimatedRemainingUsd: number;
+    readonly note: string;
+  };
+  readonly waitlistPosition?: number;
 }
 
 export function decodeRunaIdentity(value: unknown): RunaIdentity {
-  if (!isObject(value) || !isObject(value.workspace)) throw new TypeError("Malformed Runa identity");
+  if (!isObject(value) || !isObject(value.workspace)) throw new TypeError("Malformed Cuna identity");
   if (Object.keys(value).some((key) => key !== "id" && key !== "email" && key !== "workspace")) {
-    throw new TypeError("Malformed Runa identity");
+    throw new TypeError("Malformed Cuna identity");
   }
   const assigned = value.workspace.assigned;
-  if (typeof assigned !== "boolean") throw new TypeError("Malformed Runa workspace identity");
+  if (typeof assigned !== "boolean") throw new TypeError("Malformed Cuna workspace identity");
   const workspaceKeys = Object.keys(value.workspace);
   if (assigned) {
     if (
-      workspaceKeys.some((key) => key !== "assigned" && key !== "usage") ||
+      workspaceKeys.some((key) => key !== "assigned" && key !== "id" && key !== "usage") ||
+      typeof value.workspace.id !== "string" ||
       !isObject(value.workspace.usage) ||
       Object.keys(value.workspace.usage).some(
         (key) => key !== "est_spend_usd" && key !== "est_remaining_usd" && key !== "note",
@@ -172,24 +290,46 @@ export function decodeRunaIdentity(value: unknown): RunaIdentity {
       !Number.isFinite(value.workspace.usage.est_remaining_usd) ||
       typeof value.workspace.usage.note !== "string"
     ) {
-      throw new TypeError("Malformed Runa workspace identity");
+      throw new TypeError("Malformed Cuna workspace identity");
     }
   } else if (
     workspaceKeys.some((key) => key !== "assigned" && key !== "waitlist_position") ||
     !Number.isSafeInteger(value.workspace.waitlist_position) ||
     Number(value.workspace.waitlist_position) < 0
   ) {
-    throw new TypeError("Malformed Runa workspace identity");
+    throw new TypeError("Malformed Cuna workspace identity");
   }
   return Object.freeze({
     id: canonicalUuid(value, "id"),
     email: requiredString(value, "email"),
     workspaceAssigned: assigned,
+    ...(assigned
+      ? {
+          workspaceId: canonicalUuid(value.workspace, "id"),
+          workspaceUsage: Object.freeze({
+            estimatedSpendUsd: Number((value.workspace.usage as Record<string, unknown>).est_spend_usd),
+            estimatedRemainingUsd: Number((value.workspace.usage as Record<string, unknown>).est_remaining_usd),
+            note: String((value.workspace.usage as Record<string, unknown>).note),
+          }),
+        }
+      : { waitlistPosition: Number(value.workspace.waitlist_position) }),
   });
 }
 
 export type AgentKind = "claude-code" | "codex" | "openclaw";
 export type AgentAuthMode = "interactive_login" | "credential_binding";
+export type AgentSessionAuthState =
+  | "login_required"
+  | "authenticated"
+  | "configured"
+  | "unavailable";
+export type AgentSessionAuthEvidenceClass =
+  | "provider_cli_login_status"
+  | "credential_binding_authority"
+  | "insufficient";
+export const AGENT_SESSION_AUTH_ADAPTER_VERSION = "runa.agent-auth.v1" as const;
+export const AGENT_SESSION_AUTH_MAX_TTL_MS = 30_000;
+export const AGENT_SESSION_AUTH_MAX_FUTURE_SKEW_MS = 5_000;
 export type AgentSessionDesiredState = "running" | "terminated";
 export type AgentSessionRequestState =
   | "launch_pending"
@@ -210,6 +350,13 @@ export type AgentSessionProcessState =
 export interface AgentSession {
   readonly id: string;
   readonly machineId: string;
+  /**
+   * Immutable workspace authority selected when the AgentSession was created.
+   * Both fields are absent only for legacy rows created before workspace-bound
+   * AgentSession creation became mandatory.
+   */
+  readonly workspaceBindingId?: string;
+  readonly workspaceGeneration?: number;
   readonly name: string;
   readonly agent: AgentKind;
   readonly cwd: string;
@@ -219,6 +366,7 @@ export interface AgentSession {
   readonly processState: AgentSessionProcessState;
   readonly processEpoch?: string;
   readonly runtimeObservedAt?: string;
+  readonly runtimeExpiresAt?: string;
   readonly terminationRequestedAt?: string;
   readonly rowVersion: number;
   readonly createdAt: string;
@@ -230,6 +378,31 @@ export interface AgentSessionPage {
   readonly nextCursor?: string;
 }
 
+export interface AgentSessionAuth {
+  readonly observationId: string;
+  readonly agentSessionId: string;
+  readonly processEpoch: string | null;
+  readonly authMode: AgentAuthMode;
+  readonly agentVersion: string;
+  readonly adapterVersion: string;
+  readonly evidenceClass: AgentSessionAuthEvidenceClass;
+  readonly observedAt: string;
+  readonly validUntil: string;
+  readonly state: AgentSessionAuthState;
+}
+
+export interface AgentSessionAuthLogout {
+  readonly observationId: string;
+  readonly agentSessionId: string;
+  readonly processEpoch: string;
+  readonly authMode: "interactive_login";
+  readonly agent: "claude-code" | "codex";
+  readonly agentVersion: string;
+  readonly adapterVersion: "runa.agent-auth.v1";
+  readonly observedAt: string;
+  readonly outcome: "logout_confirmed";
+}
+
 const AGENTS = new Set<AgentKind>(["claude-code", "codex", "openclaw"]);
 const AUTH_MODES = new Set<AgentAuthMode>(["interactive_login", "credential_binding"]);
 const DESIRED_STATES = new Set<AgentSessionDesiredState>(["running", "terminated"]);
@@ -239,6 +412,13 @@ const REQUEST_STATES = new Set<AgentSessionRequestState>([
 const PROCESS_STATES = new Set<AgentSessionProcessState>([
   "unknown", "starting", "ready", "running", "exited", "failed", "terminating", "terminated",
 ]);
+const AGENT_AUTH_STATES = new Set<AgentSessionAuthState>([
+  "login_required", "authenticated", "configured", "unavailable",
+]);
+const AGENT_AUTH_EVIDENCE_CLASSES = new Set<AgentSessionAuthEvidenceClass>([
+  "provider_cli_login_status", "credential_binding_authority", "insufficient",
+]);
+const AGENT_AUTH_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+$/u;
 
 function enumField<T extends string>(value: Record<string, unknown>, key: string, allowed: ReadonlySet<T>): T {
   const decoded = requiredString(value, key);
@@ -248,6 +428,29 @@ function enumField<T extends string>(value: Record<string, unknown>, key: string
 
 function decodeAgentSession(value: unknown): AgentSession {
   if (!isObject(value)) throw new TypeError("Malformed agent session");
+  const allowed = new Set([
+    "id",
+    "machine_id",
+    "workspace_binding_id",
+    "workspace_generation",
+    "name",
+    "agent",
+    "cwd",
+    "auth_mode",
+    "desired_state",
+    "request_state",
+    "process_state",
+    "process_epoch",
+    "runtime_observed_at",
+    "runtime_expires_at",
+    "termination_requested_at",
+    "row_version",
+    "created_at",
+    "updated_at",
+  ]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) {
+    throw new TypeError("Malformed agent session fields");
+  }
   const agent = enumField(value, "agent", AGENTS);
   const authMode = enumField(value, "auth_mode", AUTH_MODES);
   const desiredState = enumField(value, "desired_state", DESIRED_STATES);
@@ -255,7 +458,22 @@ function decodeAgentSession(value: unknown): AgentSession {
   const processState = enumField(value, "process_state", PROCESS_STATES);
   const processEpoch = optionalString(value, "process_epoch");
   const runtimeObservedAt = optionalString(value, "runtime_observed_at");
+  const runtimeExpiresAt = optionalString(value, "runtime_expires_at");
   const terminationRequestedAt = optionalString(value, "termination_requested_at");
+  const workspaceBindingId = optionalString(value, "workspace_binding_id");
+  const workspaceGeneration = optionalNumber(value, "workspace_generation");
+  if ((workspaceBindingId === undefined) !== (workspaceGeneration === undefined)) {
+    throw new TypeError("Malformed AgentSession workspace binding");
+  }
+  if (
+    workspaceBindingId !== undefined &&
+    (!UUID.test(workspaceBindingId) ||
+      !Number.isSafeInteger(workspaceGeneration) ||
+      workspaceGeneration === undefined ||
+      workspaceGeneration < 1)
+  ) {
+    throw new TypeError("Malformed AgentSession workspace binding");
+  }
   const rowVersion = optionalNumber(value, "row_version");
   if (rowVersion === undefined || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
     throw new TypeError("Malformed field: row_version");
@@ -263,6 +481,9 @@ function decodeAgentSession(value: unknown): AgentSession {
   return Object.freeze({
     id: canonicalUuid(value, "id"),
     machineId: canonicalUuid(value, "machine_id"),
+    ...(workspaceBindingId === undefined
+      ? {}
+      : { workspaceBindingId, workspaceGeneration: workspaceGeneration as number }),
     name: requiredDisplayString(value, "name"),
     agent,
     cwd: requiredDisplayString(value, "cwd"),
@@ -276,6 +497,7 @@ function decodeAgentSession(value: unknown): AgentSession {
         ? { processEpoch }
         : (() => { throw new TypeError("Malformed field: process_epoch"); })()),
     ...(runtimeObservedAt === undefined ? {} : { runtimeObservedAt }),
+    ...(runtimeExpiresAt === undefined ? {} : { runtimeExpiresAt }),
     ...(terminationRequestedAt === undefined ? {} : { terminationRequestedAt }),
     rowVersion,
     createdAt: requiredString(value, "created_at"),
@@ -295,6 +517,110 @@ export function decodeAgentSessionPage(value: unknown): AgentSessionPage {
 
 export function decodeAgentSessionItem(value: unknown): AgentSession {
   return decodeAgentSession(value);
+}
+
+export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
+  if (!isObject(value)) throw new TypeError("Malformed AgentSession authentication evidence");
+  const allowed = new Set([
+    "observation_id",
+    "agent_session_id",
+    "process_epoch",
+    "auth_mode",
+    "agent_version",
+    "adapter_version",
+    "evidence_class",
+    "observed_at",
+    "valid_until",
+    "state",
+  ]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) {
+    throw new TypeError("Malformed AgentSession authentication fields");
+  }
+  const processEpoch = value.process_epoch;
+  if (processEpoch !== null && (typeof processEpoch !== "string" || !UUID.test(processEpoch))) {
+    throw new TypeError("Malformed field: process_epoch");
+  }
+  const observedAt = requiredString(value, "observed_at");
+  const validUntil = requiredString(value, "valid_until");
+  const observedTime = Date.parse(observedAt);
+  const validUntilTime = Date.parse(validUntil);
+  if (
+    !Number.isFinite(observedTime) ||
+    !Number.isFinite(validUntilTime) ||
+    validUntilTime < observedTime ||
+    validUntilTime - observedTime > AGENT_SESSION_AUTH_MAX_TTL_MS
+  ) {
+    throw new TypeError("Malformed AgentSession authentication freshness");
+  }
+  const authMode = enumField(value, "auth_mode", AUTH_MODES);
+  const agentVersion = requiredDisplayString(value, "agent_version");
+  const adapterVersion = requiredDisplayString(value, "adapter_version");
+  if (adapterVersion !== AGENT_SESSION_AUTH_ADAPTER_VERSION) {
+    throw new TypeError("Unsupported AgentSession authentication adapter");
+  }
+  const evidenceClass = enumField(value, "evidence_class", AGENT_AUTH_EVIDENCE_CLASSES);
+  const state = enumField(value, "state", AGENT_AUTH_STATES);
+  const positiveInteractive = state === "authenticated" || state === "login_required";
+  const configured = state === "configured";
+  const unavailable = state === "unavailable";
+  if (
+    (!unavailable && processEpoch === null) ||
+    (!unavailable && validUntilTime === observedTime) ||
+    (!unavailable && !AGENT_AUTH_VERSION.test(agentVersion)) ||
+    (positiveInteractive &&
+      (authMode !== "interactive_login" || evidenceClass !== "provider_cli_login_status")) ||
+    (configured &&
+      (authMode !== "credential_binding" || evidenceClass !== "credential_binding_authority")) ||
+    (unavailable !== (evidenceClass === "insufficient")) ||
+    (unavailable && validUntilTime !== observedTime) ||
+    (agentVersion === "unavailable" && !unavailable)
+  ) {
+    throw new TypeError("Contradictory AgentSession authentication evidence");
+  }
+  return Object.freeze({
+    observationId: canonicalUuid(value, "observation_id"),
+    agentSessionId: canonicalUuid(value, "agent_session_id"),
+    processEpoch,
+    authMode,
+    agentVersion,
+    adapterVersion,
+    evidenceClass,
+    observedAt,
+    validUntil,
+    state,
+  });
+}
+
+export function decodeAgentSessionAuthLogout(value: unknown): AgentSessionAuthLogout {
+  if (!isObject(value)) throw new TypeError("Malformed AgentSession sign-out confirmation");
+  const allowed = new Set([
+    "observation_id", "agent_session_id", "process_epoch", "auth_mode", "agent",
+    "agent_version", "adapter_version", "observed_at", "outcome",
+  ]);
+  if (
+    Object.keys(value).some((key) => !allowed.has(key)) ||
+    value.auth_mode !== "interactive_login" ||
+    (value.agent !== "claude-code" && value.agent !== "codex") ||
+    typeof value.agent_version !== "string" ||
+    !AGENT_AUTH_VERSION.test(value.agent_version) ||
+    value.adapter_version !== AGENT_SESSION_AUTH_ADAPTER_VERSION ||
+    typeof value.observed_at !== "string" ||
+    !Number.isFinite(Date.parse(value.observed_at)) ||
+    value.outcome !== "logout_confirmed"
+  ) {
+    throw new TypeError("Malformed AgentSession sign-out confirmation fields");
+  }
+  return Object.freeze({
+    observationId: canonicalUuid(value, "observation_id"),
+    agentSessionId: canonicalUuid(value, "agent_session_id"),
+    processEpoch: canonicalUuid(value, "process_epoch"),
+    authMode: "interactive_login" as const,
+    agent: value.agent,
+    agentVersion: value.agent_version,
+    adapterVersion: AGENT_SESSION_AUTH_ADAPTER_VERSION,
+    observedAt: value.observed_at,
+    outcome: "logout_confirmed" as const,
+  });
 }
 
 export const TERMINAL_PROTOCOL = "runa.terminal.v1" as const;
@@ -378,7 +704,7 @@ export function decodeTerminalConnectionGrant(value: unknown): TerminalConnectio
   if (
     protocol !== TERMINAL_PROTOCOL ||
     !/^runa_tc_[A-Za-z0-9_-]{43}$/u.test(connectToken) ||
-    connectUrl !== `wss://api.runacode.io/v1/terminal-connections/${terminalSessionId}/stream` ||
+    connectUrl !== `wss://api.getcuna.com/v1/terminal-connections/${terminalSessionId}/stream` ||
     !Number.isFinite(Date.parse(expiresAt)) ||
     value.capabilities.length !== TERMINAL_CAPABILITY_NAMES.size
   ) {
@@ -402,4 +728,190 @@ export function decodeTerminalConnectionGrant(value: unknown): TerminalConnectio
     capabilities,
     expiresAt,
   });
+}
+
+export interface AuditRecord {
+  readonly id: string;
+  readonly machineId: string;
+  readonly kind: string;
+  readonly summary: string;
+  readonly detail: JsonValue;
+  readonly createdAt: string;
+}
+
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonArray
+  | JsonObject;
+
+export interface JsonArray extends ReadonlyArray<JsonValue> {}
+
+export interface JsonObject {
+  readonly [key: string]: JsonValue;
+}
+
+export interface CredentialRuleTarget {
+  readonly kind: "header" | "query";
+  readonly name: string;
+  readonly format: string;
+}
+
+export interface CredentialRule {
+  readonly id: string;
+  readonly host: string;
+  readonly path: string;
+  readonly credential: string;
+  readonly target: CredentialRuleTarget;
+  readonly cacheTtlSeconds: number;
+}
+
+export interface ApiKeyMetadata {
+  readonly id: string;
+  readonly name: string;
+  readonly prefix: string;
+  readonly lastFour: string;
+  readonly createdAt: string;
+  readonly expiresAt: string | null;
+  readonly lastUsedAt: string | null;
+  readonly revokedAt: string | null;
+}
+
+const FORBIDDEN_PUBLIC_VALUE = /(?:(?:cuna|runa)_(?:sk|at|rt|ct|tc)_[A-Za-z0-9_-]{8,}|\p{Cc}|\p{Cf})/u;
+
+function exactKeys(value: Record<string, unknown>, required: readonly string[]): void {
+  const actual = Object.keys(value).sort();
+  const expected = [...required].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    throw new TypeError("Malformed public response shape");
+  }
+}
+
+function safePublicString(value: unknown, label: string, maximum = 4096): string {
+  if (
+    typeof value !== "string" ||
+    value.length > maximum ||
+    FORBIDDEN_PUBLIC_VALUE.test(value)
+  ) {
+    throw new TypeError(`Malformed field: ${label}`);
+  }
+  return value;
+}
+
+function decodeJsonValue(value: unknown, depth = 0): JsonValue {
+  if (depth > 12) throw new TypeError("Public JSON detail is too deeply nested");
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("Malformed public JSON number");
+    return value;
+  }
+  if (typeof value === "string") return safePublicString(value, "detail", 16_384);
+  if (Array.isArray(value)) {
+    if (value.length > 1024) throw new TypeError("Public JSON array is too large");
+    return Object.freeze(value.map((item) => decodeJsonValue(item, depth + 1)));
+  }
+  if (!isObject(value) || Object.keys(value).length > 1024) {
+    throw new TypeError("Malformed public JSON object");
+  }
+  const decoded: Record<string, JsonValue> = {};
+  for (const [key, item] of Object.entries(value)) {
+    const safeKey = safePublicString(key, "detail key", 256);
+    decoded[safeKey] = decodeJsonValue(item, depth + 1);
+  }
+  return Object.freeze(decoded);
+}
+
+function decodeAuditRecord(value: unknown): AuditRecord {
+  if (!isObject(value)) throw new TypeError("Malformed audit record");
+  exactKeys(value, ["id", "session_id", "kind", "summary", "detail", "created_at"]);
+  const createdAt = safePublicString(value.created_at, "created_at", 64);
+  if (!Number.isFinite(Date.parse(createdAt))) throw new TypeError("Malformed field: created_at");
+  return Object.freeze({
+    id: canonicalUuid(value, "id"),
+    machineId: canonicalUuid(value, "session_id"),
+    kind: safePublicString(value.kind, "kind", 128),
+    summary: safePublicString(value.summary, "summary", 2048),
+    detail: decodeJsonValue(value.detail),
+    createdAt,
+  });
+}
+
+export function decodeAuditRecords(value: unknown): readonly AuditRecord[] {
+  if (!Array.isArray(value) || value.length > 200) throw new TypeError("Malformed audit record list");
+  return Object.freeze(value.map(decodeAuditRecord));
+}
+
+function decodeCredentialRule(value: unknown): CredentialRule {
+  if (!isObject(value) || !isObject(value.target)) throw new TypeError("Malformed authorization rule");
+  exactKeys(value, ["id", "host", "path", "credential", "target", "cache_ttl_secs"]);
+  const targetKeys = Object.keys(value.target);
+  const isHeader = targetKeys.length === 2 && targetKeys.includes("header") && targetKeys.includes("format");
+  const isQuery = targetKeys.length === 2 && targetKeys.includes("param") && targetKeys.includes("format");
+  if (isHeader === isQuery) throw new TypeError("Malformed authorization target");
+  const cacheTtlSeconds = value.cache_ttl_secs;
+  if (!Number.isSafeInteger(cacheTtlSeconds) || Number(cacheTtlSeconds) < 0 || Number(cacheTtlSeconds) > 86_400) {
+    throw new TypeError("Malformed authorization cache TTL");
+  }
+  return Object.freeze({
+    id: safePublicString(value.id, "id", 256),
+    host: safePublicString(value.host, "host", 2048),
+    path: safePublicString(value.path, "path", 2048),
+    credential: safePublicString(value.credential, "credential", 64),
+    target: Object.freeze({
+      kind: isHeader ? "header" : "query",
+      name: safePublicString(isHeader ? value.target.header : value.target.param, "target name", 256),
+      format: safePublicString(value.target.format, "target format", 4096),
+    }),
+    cacheTtlSeconds: Number(cacheTtlSeconds),
+  });
+}
+
+export function decodeCredentialRules(value: unknown): readonly CredentialRule[] {
+  if (!Array.isArray(value) || value.length > 1024) throw new TypeError("Malformed authorization rule list");
+  return Object.freeze(value.map(decodeCredentialRule));
+}
+
+function optionalTimestamp(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  const decoded = safePublicString(value, label, 64);
+  if (!Number.isFinite(Date.parse(decoded))) throw new TypeError(`Malformed field: ${label}`);
+  return decoded;
+}
+
+function decodeApiKeyMetadata(value: unknown): ApiKeyMetadata {
+  if (!isObject(value)) throw new TypeError("Malformed API key metadata");
+  exactKeys(value, [
+    "id", "name", "prefix", "last_four", "created_at", "expires_at", "last_used_at", "revoked_at",
+  ]);
+  const prefix = safePublicString(value.prefix, "prefix", 32);
+  const lastFour = safePublicString(value.last_four, "last_four", 4);
+  if (!/^cuna_sk_[A-Za-z0-9_-]{0,12}$/u.test(prefix) || !/^[A-Za-z0-9_-]{4}$/u.test(lastFour)) {
+    throw new TypeError("Malformed API key display metadata");
+  }
+  const createdAt = optionalTimestamp(value.created_at, "created_at");
+  if (createdAt === null) throw new TypeError("Malformed field: created_at");
+  return Object.freeze({
+    id: canonicalUuid(value, "id"),
+    name: safePublicString(value.name, "name", 80),
+    prefix,
+    lastFour,
+    createdAt,
+    expiresAt: optionalTimestamp(value.expires_at, "expires_at"),
+    lastUsedAt: optionalTimestamp(value.last_used_at, "last_used_at"),
+    revokedAt: optionalTimestamp(value.revoked_at, "revoked_at"),
+  });
+}
+
+export function decodeApiKeyList(value: unknown): readonly ApiKeyMetadata[] {
+  if (!Array.isArray(value) || value.length > 100) throw new TypeError("Malformed API key list");
+  return Object.freeze(value.map(decodeApiKeyMetadata));
+}
+
+export function decodeOk(value: unknown): true {
+  if (!isObject(value)) throw new TypeError("Malformed acknowledgement");
+  exactKeys(value, ["ok"]);
+  if (value.ok !== true) throw new TypeError("Malformed acknowledgement");
+  return true;
 }

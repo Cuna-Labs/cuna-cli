@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { PACKAGE_NAME, REPOSITORY, invariant, parseArgs, readJson, sha256File } from "./lib/release-evidence.mjs";
-import { assertInstalledProductAbsent, invokeInstalledRuna, runNpm } from "./lib/installed-candidate-probe.mjs";
+import { assertInstalledProductAbsent, invokeInstalledCuna, runNpm } from "./lib/installed-candidate-probe.mjs";
 import { validateCycloneDxSbom, validateSupportPolicy } from "./release-distribution-lib.mjs";
 
 const execute = promisify(execFile);
@@ -15,7 +15,7 @@ const outputRoot = path.resolve(repositoryRoot, args.get("output") ?? "evidence/
 const packageJson = await readJson(path.join(repositoryRoot, "package.json"));
 invariant(packageJson.name === PACKAGE_NAME, "Unexpected package identity");
 
-const temporaryRoot = await mkdtemp(path.join(tmpdir(), "runa-local-artifact-"));
+const temporaryRoot = await mkdtemp(path.join(tmpdir(), "cuna-local-artifact-"));
 try {
   const sourceCommit = (await execute("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, windowsHide: true, timeout: 10_000 })).stdout.trim();
   invariant(/^[0-9a-f]{40}$/.test(sourceCommit), "Local source commit is not immutable");
@@ -69,8 +69,8 @@ try {
     timeout: 180_000,
     maxBuffer: 8 * 1024 * 1024,
   });
-  const selfTestResult = await invokeInstalledRuna(installPrefix, ["self-test", "--offline", "--json"], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
-  const versionResult = await invokeInstalledRuna(installPrefix, ["version", "--json"], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+  const selfTestResult = await invokeInstalledCuna(installPrefix, ["self-test", "--offline", "--json"], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+  const versionResult = await invokeInstalledCuna(installPrefix, ["version", "--json"], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
   const selfTest = JSON.parse(selfTestResult.stdout);
   const version = JSON.parse(versionResult.stdout);
   invariant(selfTest?.data?.ok === true, "Local installed-artifact self-test failed");

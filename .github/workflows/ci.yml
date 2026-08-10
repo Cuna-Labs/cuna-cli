@@ -57,9 +57,88 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  native-source-gates:
+    name: native-source-${{ matrix.id }}
+    needs: public-controls
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64
+            runner: ubuntu-24.04
+          - id: windows-x64
+            runner: windows-2025
+          - id: macos-x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install the exact native toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+      - run: cargo +1.97.1 fmt --all -- --check
+        working-directory: native
+      - run: cargo +1.97.1 check --workspace --all-targets --locked
+        working-directory: native
+      - run: cargo +1.97.1 test --workspace --locked
+        working-directory: native
+      - run: cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings
+        working-directory: native
+
+  native-evidence-gates:
+    name: native-evidence-windows-x64
+    needs: native-source-gates
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Install the exact native toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build the local non-release native artifact
+        run: cargo +1.97.1 build --workspace --release --locked
+        working-directory: native
+      - name: Capture Authenticode, version-resource, digest, and ACL observations
+        shell: pwsh
+        run: >-
+          ./scripts/capture-native-windows-identity.ps1
+          -Executable native/target/release/runa-native-bridge.exe
+          -Output evidence/native-identity.json
+      - name: Generate content-addressed native SBOM and provenance evidence
+        run: >-
+          node scripts/generate-native-release-evidence.mjs
+          --binary native/target/release/runa-native-bridge.exe
+          --identity evidence/native-identity.json
+          --output evidence/native-local
+      - name: Verify local evidence remains explicitly non-admissible
+        run: node scripts/verify-native-release-evidence.mjs --evidence evidence/native-local
+      - name: Prove production admission rejects the unsigned local artifact
+        shell: pwsh
+        run: |
+          $output = & node scripts/verify-native-release-evidence.mjs --evidence evidence/native-local --require-production true --publisher-fingerprint AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 2>&1
+          if ($LASTEXITCODE -eq 0) { throw 'Unsigned local native evidence was admitted.' }
+          if (($output -join "`n") -notmatch 'Unsigned/local manifest is not production-admissible') {
+            throw 'Native production negative control failed for an unrelated reason.'
+          }
+          exit 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: local-native-nonrelease-evidence
+          path: evidence/native-local/
+          if-no-files-found: error
+          retention-days: 7
+
   candidate:
     name: immutable-candidate
-    needs: source-gates
+    needs: [source-gates, native-source-gates, native-evidence-gates]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
@@ -130,7 +209,7 @@ jobs:
         shell: bash
         run: |
           sh -n release-artifacts/distributions/curl/install.sh
-          ruby -c release-artifacts/distributions/homebrew/runa.rb
+          ruby -c release-artifacts/distributions/homebrew/cuna.rb
           bash -n release-artifacts/distributions/aur/PKGBUILD
       - name: Export exact support matrix
         id: matrix

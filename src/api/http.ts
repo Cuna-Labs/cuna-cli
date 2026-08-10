@@ -2,24 +2,37 @@ import { EXIT_CODES, RunaError } from "../core/errors.js";
 import { isObject, safeReasonCode } from "../core/validation.js";
 import { CLI_VERSION } from "../version.js";
 
-const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const PROBLEM_CODE = /^[a-z][a-z0-9_]{2,63}$/u;
-const PROBLEM_TYPE = /^https:\/\/api\.runacode\.io\/problems\/[a-z][a-z0-9_]{2,63}$/u;
+const PROBLEM_TYPE = /^https:\/\/api\.getcuna\.com\/problems\/[a-z][a-z0-9_]{2,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PROBLEM_ACTIONS = new Set(["retry", "sign_in", "open_web", "contact_support", "none"]);
+const WORKSPACE_SYNC_CAPABILITIES = Object.freeze([
+  "atomic_generation_commit",
+  "bounded_manifest_pages",
+  "content_digest_verification",
+  "explicit_reconciliation",
+  "ordered_generation_changes",
+  "policy_bound_admission",
+] as const);
+const NO_WORKSPACE_SYNC_CAPABILITIES = Object.freeze([] as const);
 
 interface ProblemMetadata {
   readonly code: string;
   readonly requestId: string;
   readonly retryable: boolean;
+  readonly selectedProtocol?: 1 | 2 | null;
+  readonly capabilities?: typeof WORKSPACE_SYNC_CAPABILITIES | typeof NO_WORKSPACE_SYNC_CAPABILITIES;
 }
 
 export interface HttpRequest {
-  readonly method: "GET" | "POST" | "PATCH" | "DELETE";
+  readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   readonly path: string;
   readonly query?: Readonly<Record<string, string | undefined>>;
   readonly body?: unknown;
+  readonly contentType?: "application/json; charset=utf-8" | "application/octet-stream";
   readonly idempotencyKey?: string;
+  readonly machineCreateRequestId?: string;
   readonly continuationSecret?: string;
   readonly signal?: AbortSignal;
 }
@@ -30,6 +43,9 @@ export interface HttpTransport {
 
 function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata | undefined {
   if (!isObject(body)) return undefined;
+  if (Object.hasOwn(body, "selected_protocol") || Object.hasOwn(body, "capabilities")) {
+    return workspaceSyncProblemMetadata(body, expectedStatus);
+  }
   const required = new Set(["type", "title", "status", "code", "request_id", "retryable"]);
   const optional = new Set(["detail", "action"]);
   const keys = Object.keys(body);
@@ -56,6 +72,50 @@ function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata
   });
 }
 
+function workspaceSyncProblemMetadata(
+  body: Record<string, unknown>,
+  expectedStatus: number,
+): ProblemMetadata | undefined {
+  const required = new Set([
+    "type", "title", "status", "code", "request_id", "retryable", "action",
+    "selected_protocol", "capabilities", "detail",
+  ]);
+  const keys = Object.keys(body);
+  const selectedProtocol = body.selected_protocol;
+  const capabilities = body.capabilities;
+  const hasSelectedProtocol = selectedProtocol === 1 || selectedProtocol === 2;
+  if (
+    keys.length !== required.size ||
+    [...required].some((key) => !Object.hasOwn(body, key)) ||
+    typeof body.code !== "string" ||
+    !/^workspace_sync_[a-z0-9_]{2,48}$/u.test(body.code) ||
+    body.type !== `https://api.getcuna.com/problems/${body.code}` ||
+    typeof body.title !== "string" || body.title.length < 1 || body.title.length > 120 ||
+    !Number.isSafeInteger(body.status) || body.status !== expectedStatus ||
+    typeof body.request_id !== "string" || !UUID.test(body.request_id) ||
+    typeof body.retryable !== "boolean" ||
+    (body.action !== "retry" && body.action !== "none") ||
+    typeof body.detail !== "string" || body.detail.length < 1 || body.detail.length > 500 ||
+    (!hasSelectedProtocol && selectedProtocol !== null) ||
+    !Array.isArray(capabilities) ||
+    (selectedProtocol === null
+      ? capabilities.length !== 0
+      : capabilities.length !== WORKSPACE_SYNC_CAPABILITIES.length ||
+        capabilities.some((value, index) => value !== WORKSPACE_SYNC_CAPABILITIES[index]))
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    code: body.code,
+    requestId: body.request_id,
+    retryable: body.retryable,
+    selectedProtocol: selectedProtocol as 1 | 2 | null,
+    capabilities: selectedProtocol === null
+      ? NO_WORKSPACE_SYNC_CAPABILITIES
+      : WORKSPACE_SYNC_CAPABILITIES,
+  });
+}
+
 function apiError(
   status: number,
   requestId: string | undefined,
@@ -70,17 +130,23 @@ function apiError(
     http_status: status,
     ...(effectiveRequestId === undefined ? {} : { request_id: effectiveRequestId }),
     ...(reason === undefined ? {} : { reason }),
+    ...(problem?.selectedProtocol === undefined
+      ? {}
+      : { selected_protocol: problem.selectedProtocol }),
+    ...(problem?.capabilities === undefined
+      ? {}
+      : { capabilities: problem.capabilities }),
   };
   if (status === 401) {
     return new RunaError({
       code: "runa.auth.rejected",
-      message: "Runa rejected the current credential.",
+      message: "Cuna rejected the current credential.",
       exitCode: EXIT_CODES.auth,
       hint: credentialKind === "interactive"
-        ? "Run `runa login` to reauthenticate this interactive session."
+        ? "Run `cuna login` to reauthenticate this interactive session."
         : credentialKind === "api_key"
-          ? "Replace RUNA_API_KEY with a valid automation credential."
-          : "Run `runa login` or provide the required request authority.",
+          ? "Replace CUNA_API_KEY with a valid automation credential."
+          : "Run `cuna login` or provide the required request authority.",
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
@@ -88,7 +154,7 @@ function apiError(
   if (status === 403) {
     return new RunaError({
       code: "runa.policy.denied",
-      message: "Runa denied this operation.",
+      message: "Cuna denied this operation.",
       exitCode: EXIT_CODES.policy,
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
@@ -97,7 +163,7 @@ function apiError(
   if (status === 409) {
     return new RunaError({
       code: "runa.remote.conflict",
-      message: "Runa could not apply the operation because current state conflicts with it.",
+      message: "Cuna could not apply the operation because current state conflicts with it.",
       exitCode: EXIT_CODES.conflict,
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
@@ -106,7 +172,7 @@ function apiError(
   if (status === 429 || status >= 500) {
     return new RunaError({
       code: status === 429 ? "runa.network.rate_limited" : "runa.network.service_unavailable",
-      message: status === 429 ? "Runa is rate limiting this request." : "The Runa service is temporarily unavailable.",
+      message: status === 429 ? "Cuna is rate limiting this request." : "The Cuna service is temporarily unavailable.",
       exitCode: EXIT_CODES.network,
       retryable: problem?.retryable ?? true,
       details,
@@ -114,7 +180,7 @@ function apiError(
   }
   return new RunaError({
     code: status === 404 ? "runa.remote.not_found" : "runa.remote.rejected",
-    message: status === 404 ? "The requested Runa resource or operation was not found." : "Runa rejected the request.",
+    message: status === 404 ? "The requested Cuna resource or operation was not found." : "Cuna rejected the request.",
     exitCode: EXIT_CODES.remote,
     ...(problem === undefined ? {} : { retryable: problem.retryable }),
     details,
@@ -126,7 +192,7 @@ async function readLimited(response: Response): Promise<Uint8Array> {
   if (declared !== null && Number(declared) > MAX_RESPONSE_BYTES) {
     throw new RunaError({
       code: "runa.remote.response_too_large",
-      message: "Runa returned an oversized response.",
+      message: "Cuna returned an oversized response.",
       exitCode: EXIT_CODES.remote,
     });
   }
@@ -143,7 +209,7 @@ async function readLimited(response: Response): Promise<Uint8Array> {
         await reader.cancel();
         throw new RunaError({
           code: "runa.remote.response_too_large",
-          message: "Runa returned an oversized response.",
+          message: "Cuna returned an oversized response.",
           exitCode: EXIT_CODES.remote,
         });
       }
@@ -166,7 +232,7 @@ function parseJson(bytes: Uint8Array): unknown {
   } catch (cause) {
     throw new RunaError({
       code: "runa.remote.malformed_response",
-      message: "Runa returned a malformed response.",
+      message: "Cuna returned a malformed response.",
       exitCode: EXIT_CODES.remote,
       cause,
     });
@@ -199,7 +265,7 @@ export function createHttpTransport(input: {
       : "anonymous" as const;
   if (
     credential !== undefined &&
-    !/^runa_(?:sk_[A-Za-z0-9_-]{16,256}|at_[A-Za-z0-9_-]{43})$/u.test(credential)
+    !/^(?:cuna|runa)_(?:sk_[A-Za-z0-9_-]{16,256}|at_[A-Za-z0-9_-]{43})$/u.test(credential)
   ) {
     throw new TypeError("HTTP transport credential is invalid.");
   }
@@ -210,7 +276,7 @@ export function createHttpTransport(input: {
       if (request.signal?.aborted === true) {
         throw new RunaError({
           code: "runa.network.cancelled",
-          message: "The Runa request was cancelled.",
+          message: "The Cuna request was cancelled.",
           exitCode: EXIT_CODES.network,
           retryable: false,
           cause: request.signal.reason,
@@ -219,17 +285,27 @@ export function createHttpTransport(input: {
       if (!request.path.startsWith("/v1/") || request.path.includes("..") || request.path.includes("?")) {
         throw new RunaError({
           code: "runa.internal.invalid_api_path",
-          message: "Runa refused an invalid API operation.",
+          message: "Cuna refused an invalid API operation.",
           exitCode: EXIT_CODES.internal,
         });
       }
       if (
         request.continuationSecret !== undefined &&
-        !/^runa_ct_[A-Za-z0-9_-]{43}$/u.test(request.continuationSecret)
+        !/^(?:cuna|runa)_ct_[A-Za-z0-9_-]{43}$/u.test(request.continuationSecret)
       ) {
         throw new RunaError({
           code: "runa.internal.invalid_continuation_secret",
-          message: "Runa refused an invalid continuation credential.",
+          message: "Cuna refused an invalid continuation credential.",
+          exitCode: EXIT_CODES.internal,
+        });
+      }
+      if (
+        request.machineCreateRequestId !== undefined &&
+        !UUID.test(request.machineCreateRequestId)
+      ) {
+        throw new RunaError({
+          code: "runa.internal.invalid_machine_create_request_id",
+          message: "Cuna refused an invalid machine-create request identity.",
           exitCode: EXIT_CODES.internal,
         });
       }
@@ -237,7 +313,7 @@ export function createHttpTransport(input: {
       if (target.origin !== input.baseUrl || target.pathname !== request.path) {
         throw new RunaError({
           code: "runa.internal.invalid_api_origin",
-          message: "Runa refused an invalid API origin.",
+          message: "Cuna refused an invalid API origin.",
           exitCode: EXIT_CODES.internal,
         });
       }
@@ -248,31 +324,69 @@ export function createHttpTransport(input: {
       const timeout = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), timeoutMs);
       const onAbort = () => controller.abort(request.signal?.reason);
       request.signal?.addEventListener("abort", onAbort, { once: true });
-      let body: string | undefined;
+      let body: BodyInit | undefined;
+      let contentType: HttpRequest["contentType"] | undefined;
+      let contentLength: number | undefined;
       if (request.body !== undefined) {
-        try {
-          body = JSON.stringify(request.body);
-        } catch (cause) {
-          throw new RunaError({
-            code: "runa.usage.invalid_body",
-            message: "The request body cannot be encoded.",
-            exitCode: EXIT_CODES.usage,
-            cause,
-          });
+        if (request.body instanceof Uint8Array) {
+          if (request.contentType !== "application/octet-stream") {
+            throw new RunaError({
+              code: "runa.usage.invalid_body",
+              message: "Binary request bodies require application/octet-stream.",
+              exitCode: EXIT_CODES.usage,
+            });
+          }
+          const binary = new Uint8Array(request.body.byteLength);
+          binary.set(request.body);
+          body = binary.buffer;
+          contentType = request.contentType;
+          contentLength = request.body.byteLength;
+        } else {
+          if (
+            request.contentType !== undefined &&
+            request.contentType !== "application/json; charset=utf-8"
+          ) {
+            throw new RunaError({
+              code: "runa.usage.invalid_body",
+              message: "Structured request bodies require JSON content type.",
+              exitCode: EXIT_CODES.usage,
+            });
+          }
+          try {
+            body = JSON.stringify(request.body);
+            contentType = "application/json; charset=utf-8";
+          } catch (cause) {
+            throw new RunaError({
+              code: "runa.usage.invalid_body",
+              message: "The request body cannot be encoded.",
+              exitCode: EXIT_CODES.usage,
+              cause,
+            });
+          }
         }
+      } else if (request.contentType !== undefined) {
+        throw new RunaError({
+          code: "runa.usage.invalid_body",
+          message: "A request content type requires a request body.",
+          exitCode: EXIT_CODES.usage,
+        });
       }
       try {
         const response = await fetcher(target, {
           method: request.method,
           headers: {
-            Accept: "application/json",
+            Accept: "application/json, application/problem+json",
             ...(credential === undefined ? {} : { Authorization: `Bearer ${credential}` }),
-            "User-Agent": `runa-cli/${CLI_VERSION}`,
-            ...(body === undefined ? {} : { "Content-Type": "application/json; charset=utf-8" }),
+            "User-Agent": `cuna-cli/${CLI_VERSION}`,
+            ...(contentType === undefined ? {} : { "Content-Type": contentType }),
+            ...(contentLength === undefined ? {} : { "Content-Length": String(contentLength) }),
             ...(request.idempotencyKey === undefined ? {} : { "Idempotency-Key": request.idempotencyKey }),
+            ...(request.machineCreateRequestId === undefined
+              ? {}
+              : { "X-Cuna-Machine-Create-Request-Id": request.machineCreateRequestId }),
             ...(request.continuationSecret === undefined
               ? {}
-              : { "X-Runa-Continuation": request.continuationSecret }),
+              : { "X-Cuna-Continuation": request.continuationSecret }),
           },
           ...(body === undefined ? {} : { body }),
           signal: controller.signal,
@@ -290,7 +404,7 @@ export function createHttpTransport(input: {
           const cancelledByCaller = request.signal?.aborted ?? false;
           throw new RunaError({
             code: cancelledByCaller ? "runa.network.cancelled" : "runa.network.timeout",
-            message: cancelledByCaller ? "The Runa request was cancelled." : "The Runa request timed out.",
+            message: cancelledByCaller ? "The Cuna request was cancelled." : "The Cuna request timed out.",
             exitCode: EXIT_CODES.network,
             retryable: !cancelledByCaller && isRetryableAfterUnknownDispatch(request),
             cause: error,
@@ -298,7 +412,7 @@ export function createHttpTransport(input: {
         }
         throw new RunaError({
           code: "runa.network.failed",
-          message: "The Runa request failed before an authoritative result was received.",
+          message: "The Cuna request failed before an authoritative result was received.",
           exitCode: EXIT_CODES.network,
           retryable: isRetryableAfterUnknownDispatch(request),
           cause: error,

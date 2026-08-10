@@ -39,5 +39,5 @@ test("owned temp scope is removed after primary and cleanup-hook failures", asyn
 });
 
 test("owned temp scope rejects ambiguous ownership prefixes", async () => {
-  await assert.rejects(withOwnedTempDirectory("generic-", async () => undefined), /Runa-owned/u);
+  await assert.rejects(withOwnedTempDirectory("generic-", async () => undefined), /Cuna-owned/u);
 });

@@ -58,7 +58,7 @@ export function createLinuxSecretServiceBackend(input: {
         cwd: "/",
         args: [
           "store",
-          "--label=Runa CLI credential",
+          "--label=Cuna CLI credential",
           "application",
           "runa-cli",
           "credential-key",

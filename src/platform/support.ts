@@ -5,7 +5,7 @@ export interface RuntimeSupport {
 }
 
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(["win32", "darwin", "linux"]);
-const SUPPORTED_ARCHITECTURES = new Set<NodeJS.Architecture>(["x64"]);
+const SUPPORTED_ARCHITECTURES = new Set<NodeJS.Architecture>(["x64", "arm64"]);
 
 export function evaluateRuntimeSupport(input: {
   readonly nodeVersion: string;

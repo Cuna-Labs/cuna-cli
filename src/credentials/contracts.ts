@@ -59,7 +59,7 @@ export type CredentialRefreshResult =
   | { readonly status: "rejected" };
 
 export interface NativeCredentialBridge {
-  readonly platform: "darwin";
+  readonly platform: "win32" | "darwin";
   readonly backendId: string;
   readonly transportSecurity: "native_memory_only";
   read(target: string): Promise<Uint8Array | undefined>;

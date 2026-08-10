@@ -24,12 +24,12 @@ const resources = new TestResourceLedger();
 test.after(() => resources.cleanup());
 
 async function createFixture() {
-  const root = await resources.createTempDirectory("runa-distribution-test-");
+  const root = await resources.createTempDirectory("cuna-distribution-test-");
   const evidence = path.join(root, "evidence");
   const distributions = path.join(root, "distributions");
   await mkdir(evidence, { recursive: true });
   const version = "1.2.3-preview.1";
-  const tarballFile = "runa_laboratories-cli-1.2.3-preview.1.tgz";
+  const tarballFile = "cuna_labs-cli-1.2.3-preview.1.tgz";
   await writeFile(path.join(evidence, tarballFile), "immutable candidate bytes\n");
   const sbom = {
     bomFormat: "CycloneDX",
@@ -39,10 +39,10 @@ async function createFixture() {
     metadata: {
       component: {
         type: "application",
-        name: "@runa_laboratories/cli",
+        name: "@cuna_labs/cli",
         version,
-        purl: `pkg:npm/%40runa_laboratories/cli@${version}`,
-        "bom-ref": `@runa_laboratories/cli@${version}`,
+        purl: `pkg:npm/%40cuna_labs/cli@${version}`,
+        "bom-ref": `@cuna_labs/cli@${version}`,
       },
     },
     components: [],
@@ -56,7 +56,7 @@ async function createFixture() {
     sourceCommit: "a".repeat(40),
     tarball: {
       file: tarballFile,
-      url: `https://registry.npmjs.org/@runa_laboratories/cli/-/cli-${version}.tgz`,
+      url: `https://registry.npmjs.org/@cuna_labs/cli/-/cli-${version}.tgz`,
       sha256: await sha256File(path.join(evidence, tarballFile)),
       size: (await readFile(path.join(evidence, tarballFile))).length,
     },
@@ -114,6 +114,14 @@ test("all approved channels are deterministic projections of one blocked local c
   assert.equal(verified.status, "DISTRIBUTION_PROJECTIONS_VERIFIED");
   assert.equal(verified.decision, "BLOCKED");
   assert.ok(verified.channels.every((channel) => channel.availability === "PROJECTED_NOT_PUBLISHED"));
+  assert.ok(verified.blockers.includes("BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS"));
+  assert.ok(verified.blockers.includes("WINDOWS_OWNED_PROCESS_HANDLE_IDENTITY_AUTHORITY_MISSING"));
+
+  const bunProjection = await readFile(path.join(fixture.distributions, "bun", "install-command.txt"), "utf8");
+  assert.match(bunProjection, /^supported_platforms=linux-x64,darwin-x64$/mu);
+  assert.match(bunProjection, /^blocked_platforms=win32-x64$/mu);
+  assert.match(bunProjection, /^windows_block_reason=BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS$/mu);
+  assert.match(bunProjection, /^windows_fallback_command=npm install -g @cuna_labs\/cli$/mu);
 
   const secondOutput = path.join(fixture.root, "second-distributions");
   await project(fixture, secondOutput);
@@ -163,7 +171,7 @@ test("SBOM display metadata cannot substitute a different package identity", asy
   const fixture = await createFixture();
   const sbomFile = path.join(fixture.evidence, fixture.envelope.sbom.file);
   const sbom = JSON.parse(await readFile(sbomFile, "utf8"));
-  sbom.metadata.component.name = "@runa_laboratories/cli";
+  sbom.metadata.component.name = "@cuna_labs/cli";
   sbom.metadata.component.purl = `pkg:npm/other-package@${fixture.envelope.version}`;
   await writeFile(sbomFile, `${JSON.stringify(sbom)}\n`);
   fixture.envelope.sbom.sha256 = await sha256File(sbomFile);
@@ -258,7 +266,7 @@ async function createReceiptSet(fixture) {
         protocolRange: { minimum: "1", maximum: "1" },
       };
       const execution = {
-        stableTestId: "TC-053-DISTRIBUTION-CHANNEL-TRANSACTION-V1",
+        stableTestId: "CUNA-DISTRIBUTION-CHANNEL-TRANSACTION-V1",
         packageManager: {
           name: channel.installerOfRecord,
           version: packageManagerVersions[channel.installerOfRecord],
@@ -271,11 +279,11 @@ async function createReceiptSet(fixture) {
           environmentId: id,
         },
         publicShimResolution: {
-          command: "runa",
+          command: "cuna",
           resolutionMethod: "shell-path",
           resolvedPath: platform === "win32"
-            ? `C:\\runa-receipt-fixture\\${id}\\bin\\runa.cmd`
-            : `/tmp/runa-receipt-fixture/${id}/bin/runa`,
+            ? `C:\\cuna-receipt-fixture\\${id}\\bin\\cuna.cmd`
+            : `/tmp/cuna-receipt-fixture/${id}/bin/cuna`,
           internalModuleBypass: false,
         },
       };
@@ -376,7 +384,7 @@ async function createReceiptSet(fixture) {
       const runnerImage = matrixEntry.runner;
       const statement = {
         schemaVersion: 1,
-        predicateType: "https://runacode.io/attestations/runa-cli-distribution-observation/v1",
+        predicateType: "https://getcuna.com/attestations/cuna-cli-distribution-observation/v1",
         issuer: {
           provider: "github-actions",
           repository: manifest.candidate.repository,
@@ -508,9 +516,10 @@ test("typed self-authored receipts prove internal consistency but not observatio
   assert.equal(result.distributionGate, "BLOCKED");
   assert.equal(result.releaseDecision, "BLOCKED");
   assert.equal(result.releaseEligible, false);
-  assert.equal(result.receipts.length, 19);
+  assert.equal(result.receipts.length, 17);
   assert.ok(result.receipts.includes("npm-linux-x64-node22.17.1"));
   assert.ok(result.receipts.includes("npm-linux-x64-node24.4.1"));
+  assert.ok(!result.receipts.some((id) => id.startsWith("bun-win32-x64-")));
   assert.equal(result.derivedChecks["npm-linux-x64-node22.17.1"].evidenceClass, "SELF_AUTHORED_TYPED_CLAIM");
   assert.ok(result.residualBlockers.includes("RECEIPT_REPLAY_LEASE_AUTHORITY_NOT_PRESENT"));
   assert.equal(result.installedBuildDigest, fixture.envelope.identities.payloadSha256);
@@ -520,12 +529,23 @@ test("receipt verification detects cross-installer build drift", async () => {
   const fixture = await createFixture();
   await project(fixture);
   const receipts = await createReceiptSet(fixture);
-  const file = path.join(receipts, "bun-win32-x64-node22.17.1.json");
+  const file = path.join(receipts, "bun-linux-x64-node22.17.1.json");
   const receipt = JSON.parse(await readFile(file, "utf8"));
   receipt.attestation.statement.runtimeIdentity.buildDigest = "f".repeat(64);
   rebindReceipt(receipt);
   await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
   await assert.rejects(verifyReceipts(fixture, receipts), /Installed build digest differs from the candidate payload identity/);
+});
+
+test("receipt verification rejects a Bun Windows receipt while the package-manager defect is blocked", async () => {
+  const fixture = await createFixture();
+  await project(fixture);
+  const receipts = await createReceiptSet(fixture);
+  await writeFile(path.join(receipts, "bun-win32-x64-node22.17.1.json"), "{}\n");
+  await assert.rejects(
+    verifyReceipts(fixture, receipts),
+    /Distribution receipt set differs from policy/,
+  );
 });
 
 test("receipt verification rejects a Node runtime outside the bound support policy", async () => {
@@ -579,8 +599,8 @@ test("issuer substitution fails even when the attacker recomputes content-addres
   const receipts = await createReceiptSet(fixture);
   const file = path.join(receipts, "npm-linux-x64-node22.17.1.json");
   const receipt = JSON.parse(await readFile(file, "utf8"));
-  receipt.attestation.statement.issuer.repository = "attacker/runa-cli";
-  receipt.attestation.statement.issuer.workflowRef = "attacker/runa-cli/.github/workflows/release.yml@refs/heads/main";
+  receipt.attestation.statement.issuer.repository = "attacker/cuna-cli";
+  receipt.attestation.statement.issuer.workflowRef = "attacker/cuna-cli/.github/workflows/release.yml@refs/heads/main";
   rebindReceipt(receipt);
   await writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
   await assert.rejects(verifyReceipts(fixture, receipts), /issuer repository substitution detected/);
@@ -734,7 +754,7 @@ test("execution claims must bind package manager, candidate invocation, environm
     [(execution) => { execution.candidateInvocation = "npm install -g attacker"; }, /candidate invocation differs/],
     [(execution) => { execution.environmentPolicy.environmentId = "npm-linux-x64-node24.4.1"; }, /environment identity differs/],
     [(execution) => { execution.publicShimResolution.internalModuleBypass = true; }, /internal-module bypass/],
-    [(execution) => { execution.publicShimResolution.resolvedPath = "/tmp/runa/dist/bin/runa.js"; }, /did not resolve the public runa shim/],
+    [(execution) => { execution.publicShimResolution.resolvedPath = "/tmp/cuna/dist/bin/cuna.js"; }, /did not resolve the public cuna shim/],
   ];
   for (const [mutate, expected] of mutations) {
     const fixture = await createFixture();
@@ -772,7 +792,7 @@ test("receipt verification rejects evidence beyond the bounded future skew", asy
 });
 
 test("TC-053-04/08/12 actual local artifact uses its public shim, cleans up, and cannot authorize release", async () => {
-  const root = await resources.createTempDirectory("runa-local-evidence-test-");
+  const root = await resources.createTempDirectory("cuna-local-evidence-test-");
   const output = path.join(root, "local-evidence");
   const generated = JSON.parse((await execute(node, [
     "scripts/release-local-artifact-evidence.mjs",

@@ -13,7 +13,7 @@ const resources = new TestResourceLedger();
 test.after(() => resources.cleanup());
 
 async function fixture() {
-  const root = await resources.createTempDirectory("runa-ci-contract-");
+  const root = await resources.createTempDirectory("cuna-ci-contract-");
   await mkdir(path.join(root, ".github", "workflows"), { recursive: true });
   await mkdir(path.join(root, "packaging"), { recursive: true });
   await cp(path.join(repositoryRoot, "package.json"), path.join(root, "package.json"));
@@ -128,6 +128,44 @@ test("CI contract rejects a declared Node line omitted from the full behavioral 
   await assert.rejects(verify(root), /Every declared tested Node line/);
 });
 
+test("CI contract rejects candidate generation that bypasses every mandatory native gate", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "ci.yml");
+  const original = await readFile(workflow, "utf8");
+  const content = original.replace(
+    "needs: [source-gates, native-source-gates, native-evidence-gates]",
+    "needs: source-gates",
+  );
+  assert.notEqual(content, original, "negative control must mutate the candidate dependency edge");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /Node, native source, and native evidence gates/);
+});
+
+test("CI contract rejects candidate generation that bypasses native admission evidence", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "ci.yml");
+  const original = await readFile(workflow, "utf8");
+  const content = original.replace(
+    "needs: [source-gates, native-source-gates, native-evidence-gates]",
+    "needs: [source-gates, native-source-gates]",
+  );
+  assert.notEqual(content, original, "negative control must remove only native evidence authority");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /Node, native source, and native evidence gates/);
+});
+
+test("CI contract rejects an incomplete native quality gate", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "ci.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace(
+      "cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings",
+      "cargo +1.97.1 check --workspace --locked",
+    );
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /Native source gate is missing/);
+});
+
 test("CI contract rejects an observation summary that can block the release DAG", async () => {
   const root = await fixture();
   const workflow = path.join(root, ".github", "workflows", "ci.yml");
@@ -178,4 +216,23 @@ test("CI contract rejects repository-only attestation verification", async () =>
     .replace('\n          --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"', "");
   await writeFile(workflow, content);
   await assert.rejects(verify(root), /bind the exact signer workflow/u);
+});
+
+test("CI contract rejects an unsigned or semantically unbound release approval lease", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("node scripts/verify-release-approval-lease.mjs", "node scripts/verify-release-envelope.mjs")
+    .replace('--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-review.yml"', "--repo-only");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /semantically bind the approval lease/u);
+});
+
+test("CI contract rejects removal of the one-use nonce publication fence", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("RELEASE_APPROVAL_NONCE_CONSUMPTION_AUTHORITY_NOT_CONFIGURED", "release approval reviewed");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /remain fail-closed before npm publish/u);
 });

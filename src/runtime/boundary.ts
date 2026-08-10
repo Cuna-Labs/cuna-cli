@@ -28,6 +28,7 @@ import {
   type RemoteAgentSessionEvidence,
   type TerminalConnectionGrant,
   type TerminalConnectionCapability,
+  type TerminalAttachmentAdmission,
   type TerminalConnector,
   type TerminalControlPlane,
   type TerminalWireConnection,
@@ -50,6 +51,21 @@ export interface RuntimeStartupEvidence {
   readonly source: string;
   readonly observedAt: number;
   readonly expiresAt: number;
+}
+
+export type RuntimeBoundaryMode = "daemon" | "foreground";
+
+export type ForegroundRuntimeLifecycleState =
+  | "absent"
+  | "ready"
+  | "quiescing"
+  | "stopped"
+  | "cleanup_failed";
+
+export interface ForegroundRuntimeLifecycleSnapshot {
+  readonly state: ForegroundRuntimeLifecycleState;
+  readonly reason: string;
+  readonly updatedAt: number;
 }
 
 export interface RuntimeTerminalSnapshot {
@@ -92,6 +108,7 @@ export interface RuntimeSyncHandle {
 }
 
 export interface RuntimeBoundaryOptions {
+  readonly mode?: RuntimeBoundaryMode;
   readonly controlPlane: TerminalControlPlane;
   readonly terminalConnector: TerminalConnector;
   readonly allowedRunaOrigins: readonly string[];
@@ -148,6 +165,7 @@ export class RunaRuntimeBoundary {
   readonly #clock: () => number;
   readonly #idempotencyKey: () => string;
   readonly #daemon: DaemonLifecycle;
+  readonly #mode: RuntimeBoundaryMode;
   readonly #views = new LocalClientViewRegistry();
   readonly #syncRegistry = new SyncSupervisorRegistry();
   readonly #terminals = new Map<string, TerminalEntry>();
@@ -155,31 +173,41 @@ export class RunaRuntimeBoundary {
   readonly #pendingAgentSessions = new Set<string>();
   readonly #pendingAttaches = new Map<string, {
     readonly abort: AbortController;
-    readonly completion: Promise<void>;
-    readonly settle: () => void;
+    readonly completion: Promise<unknown | undefined>;
+    readonly settle: (failure?: unknown) => void;
     readonly removeInputAbort: () => void;
   }>();
   readonly #pendingReconnects = new Map<string, {
     readonly abort: AbortController;
-    readonly completion: Promise<void>;
-    readonly settle: () => void;
+    readonly completion: Promise<unknown | undefined>;
+    readonly settle: (failure?: unknown) => void;
     readonly removeInputAbort: () => void;
   }>();
+  readonly #pendingSyncOpens = new Map<string, Promise<unknown | undefined>>();
   readonly #syncHandles = new Map<string, RuntimeSyncHandle>();
   #activeTabId: string | undefined;
   #startupEvidenceExpiresAt = 0;
+  #foreground: ForegroundRuntimeLifecycleSnapshot;
   #closed = false;
+  #shutdownComplete = false;
+  #shutdownFlight: Promise<void> | undefined;
 
   constructor(options: RuntimeBoundaryOptions) {
     assertIdentifier(options.terminalCapabilityId, "terminal capability ID");
     assertIdentifier(options.clientInstanceId, "client instance ID");
     if (options.allowedRunaOrigins.length === 0) {
-      throw runtimeFailure("grant_invalid", "At least one exact Runa HTTPS origin is required.");
+      throw runtimeFailure("grant_invalid", "At least one exact Cuna HTTPS origin is required.");
     }
     this.#options = Object.freeze({ ...options, allowedRunaOrigins: Object.freeze([...options.allowedRunaOrigins]) });
     this.#clock = options.clock ?? Date.now;
     this.#idempotencyKey = options.idempotencyKey ?? randomUUID;
+    const mode = options.mode ?? "daemon";
+    if (mode !== "daemon" && mode !== "foreground") {
+      throw new RangeError("Runtime boundary mode must be daemon or foreground.");
+    }
+    this.#mode = mode;
     this.#daemon = new DaemonLifecycle(this.#clock());
+    this.#foreground = Object.freeze({ state: "absent", reason: "not_started", updatedAt: this.#clock() });
   }
 
   get daemon(): DaemonLifecycleSnapshot {
@@ -190,8 +218,19 @@ export class RunaRuntimeBoundary {
     return this.#activeTabId;
   }
 
+  get mode(): RuntimeBoundaryMode {
+    return this.#mode;
+  }
+
+  get foreground(): ForegroundRuntimeLifecycleSnapshot {
+    return this.#foreground;
+  }
+
   start(evidence: RuntimeStartupEvidence): DaemonLifecycleSnapshot {
     this.#assertOpen();
+    if (this.#mode !== "daemon") {
+      throw runtimeFailure("session_conflict", "Foreground runtime mode cannot claim daemon readiness.");
+    }
     if (this.#daemon.snapshot().state !== "absent" && this.#daemon.snapshot().state !== "stopped") {
       throw runtimeFailure("session_conflict", "The local runtime is already started.");
     }
@@ -215,11 +254,28 @@ export class RunaRuntimeBoundary {
     return this.#daemon.transition("ready", "local_runtime_verified", this.#clock());
   }
 
+  startForeground(): ForegroundRuntimeLifecycleSnapshot {
+    this.#assertOpen();
+    if (this.#mode !== "foreground") {
+      throw runtimeFailure("session_conflict", "Daemon runtime mode cannot claim foreground readiness.");
+    }
+    if (this.#foreground.state !== "absent") {
+      throw runtimeFailure("session_conflict", "The foreground runtime is already started.");
+    }
+    this.#foreground = Object.freeze({
+      state: "ready",
+      reason: "foreground_process_owns_runtime",
+      updatedAt: this.#clock(),
+    });
+    return this.#foreground;
+  }
+
   async attach(input: {
     readonly tabId: string;
     readonly agentSessionId: string;
     readonly columns: number;
     readonly rows: number;
+    readonly expectedAdmission?: TerminalAttachmentAdmission;
     readonly signal?: AbortSignal;
   }): Promise<RuntimeTerminalSnapshot> {
     this.#assertReady();
@@ -248,8 +304,8 @@ export class RunaRuntimeBoundary {
         removeInputAbort = () => input.signal?.removeEventListener("abort", forwardAbort);
       }
     }
-    let settleAttach = (): void => undefined;
-    const attachCompletion = new Promise<void>((resolve) => { settleAttach = resolve; });
+    let settleAttach = (_failure?: unknown): void => undefined;
+    const attachCompletion = new Promise<unknown | undefined>((resolve) => { settleAttach = resolve; });
     this.#pendingAttaches.set(input.tabId, {
       abort: attachAbort,
       completion: attachCompletion,
@@ -258,12 +314,23 @@ export class RunaRuntimeBoundary {
     });
     let connection: TerminalWireConnection | undefined;
     let entry: TerminalEntry | undefined;
+    let completionFailure: unknown | undefined;
     try {
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
-      const admitted = await this.#admitRemoteTerminal(input.agentSessionId);
+      const admitted = await this.#admitRemoteTerminal(input.agentSessionId, attachAbort.signal);
+      if (input.expectedAdmission !== undefined) {
+        this.#assertAttachmentAdmissionContinuity(input.expectedAdmission, admitted, "preflight");
+      }
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
-      const grant = await this.#createGrant(admitted.observation, admitted.capability, undefined);
+      const grant = await this.#createGrant(admitted.observation, admitted.capability, undefined, undefined, attachAbort.signal);
+      this.#assertOpen();
+      throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
+      const revalidated = await this.#admitRemoteTerminal(input.agentSessionId, attachAbort.signal);
+      this.#assertAttachmentAdmissionContinuity(admitted, revalidated, "post_grant");
+      if (input.expectedAdmission !== undefined) {
+        this.#assertAttachmentAdmissionContinuity(input.expectedAdmission, revalidated, "preflight");
+      }
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
       connection = await this.#options.terminalConnector.connect({
@@ -275,12 +342,12 @@ export class RunaRuntimeBoundary {
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
       if (connection.connectionId !== grant.terminalSessionId) {
-        throw runtimeFailure("grant_scope_mismatch", "The terminal transport accepted a different Runa terminal session.");
+        throw runtimeFailure("grant_scope_mismatch", "The terminal transport accepted a different Cuna terminal session.");
       }
       entry = {
         tabId: input.tabId,
         viewId: `pending:${grant.terminalSessionId}`,
-        observation: admitted.observation,
+        observation: revalidated.observation,
         state: "attaching",
         connection,
         decoder: new TerminalFrameDecoder(),
@@ -312,10 +379,10 @@ export class RunaRuntimeBoundary {
       this.#views.open({
         viewId: entry.viewId,
         binding: {
-          userId: admitted.observation.userId,
-          machineId: admitted.observation.machineId,
-          agentSessionId: admitted.observation.agentSessionId,
-          processEpoch: admitted.observation.processEpoch,
+          userId: revalidated.observation.userId,
+          machineId: revalidated.observation.machineId,
+          agentSessionId: revalidated.observation.agentSessionId,
+          processEpoch: revalidated.observation.processEpoch,
           fencingGeneration: ready.payload.fencingGeneration,
         },
         state: "active",
@@ -335,6 +402,7 @@ export class RunaRuntimeBoundary {
       entry.pump = this.#pump(entry, connection, entry.connectionRevision, iterator);
       return snapshot(entry, this.#heartbeatTimeoutMs());
     } catch (error) {
+      let reportedError: unknown = error;
       if (entry !== undefined && !this.#closed && entry.state !== "closed" && entry.state !== "detached") {
         entry.state = "failed";
         entry.outputContinuity = "unknown";
@@ -344,12 +412,17 @@ export class RunaRuntimeBoundary {
         if (this.#activeTabId === entry.tabId) this.#activeTabId = this.#nextActiveTab(entry.tabId);
         this.#terminals.delete(input.tabId);
       }
-      if (connection !== undefined) await connection.close({ code: 1008, reason: "runa_attach_rejected" }).catch(() => undefined);
-      throw error;
+      if (connection !== undefined) {
+        try { await connection.close({ code: 1008, reason: "runa_attach_rejected" }); } catch (cleanupError) {
+          completionFailure = cleanupError;
+          reportedError = new AggregateError([error, cleanupError], "Terminal attachment failed and its transport cleanup was incomplete.");
+        }
+      }
+      throw reportedError;
     } finally {
       const pending = this.#pendingAttaches.get(input.tabId);
       pending?.removeInputAbort();
-      pending?.settle();
+      pending?.settle(completionFailure);
       this.#pendingAttaches.delete(input.tabId);
       this.#pendingTerminalTabs.delete(input.tabId);
       this.#pendingAgentSessions.delete(input.agentSessionId);
@@ -373,9 +446,16 @@ export class RunaRuntimeBoundary {
     return snapshot(entry, this.#heartbeatTimeoutMs());
   }
 
-  async sendInput(bytes: Uint8Array, tabId = this.#activeTabId): Promise<void> {
+  async sendInput(
+    bytes: Uint8Array,
+    tabId = this.#activeTabId,
+    expectedBinding?: RuntimeTerminalResponse["binding"],
+  ): Promise<void> {
     this.#assertReady();
     const entry = this.#requireActiveTerminal(tabId);
+    if (expectedBinding !== undefined && !sameEntryBinding(entry, expectedBinding)) {
+      throw runtimeFailure("grant_scope_mismatch", "Terminal input targets a replaced attachment generation.");
+    }
     await this.#sendTerminalBytes(entry, bytes);
   }
 
@@ -502,8 +582,8 @@ export class RunaRuntimeBoundary {
         removeInputAbort = () => input.signal?.removeEventListener("abort", forwardAbort);
       }
     }
-    let settleReconnect = (): void => undefined;
-    const reconnectCompletion = new Promise<void>((resolve) => { settleReconnect = resolve; });
+    let settleReconnect = (_failure?: unknown): void => undefined;
+    const reconnectCompletion = new Promise<unknown | undefined>((resolve) => { settleReconnect = resolve; });
     this.#pendingReconnects.set(input.tabId, {
       abort: reconnectAbort,
       completion: reconnectCompletion,
@@ -512,9 +592,10 @@ export class RunaRuntimeBoundary {
     });
     entry.reconnectIdempotencyKey ??= this.#idempotencyKey();
     let connection: TerminalWireConnection | undefined;
+    let completionFailure: unknown | undefined;
     try {
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
-      const admitted = await this.#admitRemoteTerminal(entry.observation.agentSessionId);
+      const admitted = await this.#admitRemoteTerminal(entry.observation.agentSessionId, reconnectAbort.signal);
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
       if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
         throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded during admission.");
@@ -531,14 +612,27 @@ export class RunaRuntimeBoundary {
         this.#publish(entry);
         throw runtimeFailure("session_discontinuous", "The remote AgentSession authority changed; this terminal cannot be resumed.");
       }
-      await entry.connection.close({ code: 1001, reason: "runa_reconnect" }).catch(() => undefined);
+      await entry.connection.close({ code: 1001, reason: "runa_reconnect" });
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
       const grant = await this.#createGrant(
         admitted.observation,
         admitted.capability,
         entry.resumeHandle,
         entry.reconnectIdempotencyKey,
+        reconnectAbort.signal,
       );
+      throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
+      const revalidated = await this.#admitRemoteTerminal(entry.observation.agentSessionId, reconnectAbort.signal);
+      this.#assertAttachmentAdmissionContinuity(admitted, revalidated, "post_grant");
+      try {
+        this.#assertObservationContinuity(entry.observation, revalidated.observation, "reconnect");
+      } catch (error) {
+        entry.state = "failed";
+        entry.outputContinuity = "incomplete";
+        entry.reason = "session_authority_changed";
+        this.#publish(entry);
+        throw error;
+      }
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
       if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
         throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded before transport creation.");
@@ -551,14 +645,14 @@ export class RunaRuntimeBoundary {
       });
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
       if (connection.connectionId !== grant.terminalSessionId) {
-        throw runtimeFailure("grant_scope_mismatch", "The terminal transport accepted a different Runa terminal session.");
+        throw runtimeFailure("grant_scope_mismatch", "The terminal transport accepted a different Cuna terminal session.");
       }
       const iterator = connection.receive()[Symbol.asyncIterator]();
       const previousViewId = entry.viewId;
       const nextDecoder = new TerminalFrameDecoder();
       const candidate: TerminalEntry = {
         ...entry,
-        observation: admitted.observation,
+        observation: revalidated.observation,
         connection,
         decoder: nextDecoder,
         capabilities: grant.capabilities,
@@ -589,10 +683,10 @@ export class RunaRuntimeBoundary {
       this.#views.open({
         viewId: nextViewId,
         binding: {
-          userId: admitted.observation.userId,
-          machineId: admitted.observation.machineId,
-          agentSessionId: admitted.observation.agentSessionId,
-          processEpoch: admitted.observation.processEpoch,
+          userId: revalidated.observation.userId,
+          machineId: revalidated.observation.machineId,
+          agentSessionId: revalidated.observation.agentSessionId,
+          processEpoch: revalidated.observation.processEpoch,
           fencingGeneration: ready.payload.fencingGeneration,
         },
         state: "active",
@@ -601,7 +695,7 @@ export class RunaRuntimeBoundary {
       });
       entry.connection = connection;
       this.#clearHeartbeatWatchdog(entry);
-      entry.observation = admitted.observation;
+      entry.observation = revalidated.observation;
       entry.decoder = nextDecoder;
       entry.fencingGeneration = ready.payload.fencingGeneration;
       entry.capabilities = grant.capabilities;
@@ -622,8 +716,12 @@ export class RunaRuntimeBoundary {
       entry.pump = this.#pump(entry, connection, reconnectRevision, iterator);
       return snapshot(entry, this.#heartbeatTimeoutMs());
     } catch (error) {
+      let reportedError: unknown = error;
       if (connection !== undefined) {
-        await connection.close({ code: 1008, reason: "runa_resume_rejected" }).catch(() => undefined);
+        try { await connection.close({ code: 1008, reason: "runa_resume_rejected" }); } catch (cleanupError) {
+          completionFailure = cleanupError;
+          reportedError = new AggregateError([error, cleanupError], "Terminal reconnection failed and its replacement transport cleanup was incomplete.");
+        }
       }
       if (
         entry.connectionRevision === reconnectRevision &&
@@ -631,14 +729,14 @@ export class RunaRuntimeBoundary {
       ) {
         entry.state = "interrupted";
         entry.outputContinuity = "unknown";
-        entry.reason = safeReason(error);
+        entry.reason = safeReason(reportedError);
         this.#publish(entry);
       }
-      throw error;
+      throw reportedError;
     } finally {
       const pending = this.#pendingReconnects.get(input.tabId);
       pending?.removeInputAbort();
-      pending?.settle();
+      pending?.settle(completionFailure);
       this.#pendingReconnects.delete(input.tabId);
     }
   }
@@ -681,36 +779,44 @@ export class RunaRuntimeBoundary {
     readonly ownerId: string;
     readonly leaseMs?: number;
   }): Promise<RuntimeSyncHandle> {
+    if (this.#mode !== "daemon") {
+      throw runtimeFailure("capability_unsupported", "Foreground runtime mode cannot own workspace synchronization.");
+    }
     this.#assertReady();
-    if (this.#syncHandles.has(input.configuration.bindingId)) {
+    if (this.#syncHandles.has(input.configuration.bindingId) || this.#pendingSyncOpens.has(input.configuration.bindingId)) {
       throw runtimeFailure("session_conflict", "This runtime already owns the workspace sync binding.");
     }
-    const journal = await DurableSyncJournal.open({
-      directory: input.journalDirectory,
-      bindingId: input.configuration.bindingId,
-      bindingGeneration: input.configuration.bindingGeneration,
-      ownerId: input.ownerId,
-      ...(input.leaseMs === undefined ? {} : { leaseMs: input.leaseMs }),
-      now: this.#clock(),
-      clock: this.#clock,
-    });
+    let settleOpen = (_failure?: unknown): void => undefined;
+    const openCompletion = new Promise<unknown | undefined>((resolve) => { settleOpen = resolve; });
+    this.#pendingSyncOpens.set(input.configuration.bindingId, openCompletion);
+    let journal: DurableSyncJournal | undefined;
+    let completionFailure: unknown | undefined;
     try {
+      journal = await DurableSyncJournal.open({
+        directory: input.journalDirectory,
+        bindingId: input.configuration.bindingId,
+        bindingGeneration: input.configuration.bindingGeneration,
+        ownerId: input.ownerId,
+        ...(input.leaseMs === undefined ? {} : { leaseMs: input.leaseMs }),
+        clock: this.#clock,
+      });
       this.#assertOpen();
       if (this.#syncHandles.has(input.configuration.bindingId)) {
         throw runtimeFailure("session_conflict", "This runtime already owns the workspace sync binding.");
       }
+      const openedJournal = journal;
       const { supervisor } = this.#syncRegistry.connect(input.configuration, this.#clock);
       supervisor.beginReconciliation("runtime_start_requires_authoritative_manifest");
       let closed = false;
       let closing: Promise<void> | undefined;
       const handle: RuntimeSyncHandle = Object.freeze({
         bindingId: input.configuration.bindingId,
-        fence: journal.fence,
+        fence: openedJournal.fence,
         supervisor,
         close: async (): Promise<void> => {
           if (closed) return;
           closing ??= (async () => {
-            await journal.close();
+            await openedJournal.close();
             this.#syncRegistry.release(input.configuration.bindingId, supervisor);
             this.#syncHandles.delete(input.configuration.bindingId);
             closed = true;
@@ -725,14 +831,43 @@ export class RunaRuntimeBoundary {
       this.#syncHandles.set(input.configuration.bindingId, handle);
       return handle;
     } catch (error) {
-      await journal.close().catch(() => undefined);
+      if (journal !== undefined) {
+        try {
+          await journal.close();
+        } catch (cleanupError) {
+          completionFailure = new AggregateError([error, cleanupError], "The sync journal failed to close after an open failure.");
+          throw completionFailure;
+        }
+      }
       throw error;
+    } finally {
+      settleOpen(completionFailure);
+      this.#pendingSyncOpens.delete(input.configuration.bindingId);
     }
   }
 
   async shutdown(): Promise<void> {
-    if (this.#closed) return;
+    if (this.#shutdownComplete) return;
+    if (this.#shutdownFlight !== undefined) return await this.#shutdownFlight;
     this.#closed = true;
+    const attempt = this.#performShutdown();
+    this.#shutdownFlight = attempt;
+    try {
+      await attempt;
+      this.#shutdownComplete = true;
+    } finally {
+      if (this.#shutdownFlight === attempt) this.#shutdownFlight = undefined;
+    }
+  }
+
+  async #performShutdown(): Promise<void> {
+    if (this.#mode === "foreground" && this.#foreground.state === "ready") {
+      this.#foreground = Object.freeze({
+        state: "quiescing",
+        reason: "foreground_runtime_shutdown",
+        updatedAt: this.#clock(),
+      });
+    }
     const state = this.#daemon.snapshot().state;
     if (state === "ready" || state === "degraded" || state === "reconciling") {
       this.#daemon.transition("quiescing", "runtime_shutdown", this.#clock());
@@ -740,13 +875,14 @@ export class RunaRuntimeBoundary {
     const failures: unknown[] = [];
     const pendingAttaches = [...this.#pendingAttaches.values()];
     const pendingReconnects = [...this.#pendingReconnects.values()];
+    const pendingSyncOpens = [...this.#pendingSyncOpens.values()];
     for (const pending of pendingAttaches) {
       pending.abort.abort(runtimeFailure("terminal_disconnected", "The terminal runtime was shut down."));
     }
     for (const pending of pendingReconnects) {
       pending.abort.abort(runtimeFailure("terminal_disconnected", "The terminal runtime was shut down."));
     }
-    for (const entry of this.#terminals.values()) {
+    for (const [tabId, entry] of this.#terminals) {
       entry.connectionRevision += 1;
       entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The terminal runtime was shut down."));
       this.#clearHeartbeatWatchdog(entry);
@@ -756,24 +892,40 @@ export class RunaRuntimeBoundary {
         await entry.connection.close({ code: 1000, reason: "runa_shutdown" });
         await sendDrain;
         if (pumpDrain !== undefined) await withOutputDeadline(pumpDrain, this.#options.outputDeliveryTimeoutMs ?? 5_000);
-      } catch (error) { failures.push(error); }
+      } catch (error) {
+        failures.push(error);
+        entry.state = "failed";
+        entry.reason = "runtime_shutdown_cleanup_failed";
+        this.#publish(entry);
+        continue;
+      }
       entry.state = "closed";
       entry.reason = "runtime_shutdown";
       try { this.#views.detach(entry.viewId); } catch { /* the view may already be detached */ }
       this.#publish(entry);
+      this.#terminals.delete(tabId);
     }
-    this.#terminals.clear();
-    this.#activeTabId = undefined;
+    this.#activeTabId = this.#terminals.size === 0 ? undefined : this.#nextActiveTab("");
     for (const pending of pendingAttaches) {
       try {
-        await withOutputDeadline(pending.completion, this.#options.readyTimeoutMs ?? 10_000);
+        const failure = await withOutputDeadline(pending.completion, this.#options.readyTimeoutMs ?? 10_000);
+        if (failure !== undefined) failures.push(failure);
       } catch (error) {
         failures.push(error);
       }
     }
     for (const pending of pendingReconnects) {
       try {
-        await withOutputDeadline(pending.completion, this.#options.readyTimeoutMs ?? 10_000);
+        const failure = await withOutputDeadline(pending.completion, this.#options.readyTimeoutMs ?? 10_000);
+        if (failure !== undefined) failures.push(failure);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    for (const pending of pendingSyncOpens) {
+      try {
+        const failure = await withOutputDeadline(pending, this.#options.readyTimeoutMs ?? 10_000);
+        if (failure !== undefined) failures.push(failure);
       } catch (error) {
         failures.push(error);
       }
@@ -781,18 +933,30 @@ export class RunaRuntimeBoundary {
     for (const handle of this.#syncHandles.values()) {
       try { await handle.close(); } catch (error) { failures.push(error); }
     }
-    const after = this.#daemon.snapshot().state;
-    if (after === "quiescing" || after === "recovery_required" || after === "starting") {
-      this.#daemon.transition("stopped", failures.length === 0 ? "runtime_stopped" : "runtime_stopped_with_cleanup_failure", this.#clock());
+    if (this.#mode === "foreground") {
+      this.#foreground = Object.freeze({
+        state: failures.length === 0 ? "stopped" : "cleanup_failed",
+        reason: failures.length === 0 ? "foreground_runtime_stopped" : "foreground_runtime_cleanup_failed",
+        updatedAt: this.#clock(),
+      });
+    } else {
+      const after = this.#daemon.snapshot().state;
+      if (failures.length === 0) {
+        if (after === "quiescing" || after === "recovery_required" || after === "starting") {
+          this.#daemon.transition("stopped", "runtime_stopped", this.#clock());
+        }
+      } else if (after === "quiescing" || after === "starting") {
+        this.#daemon.transition("recovery_required", "runtime_shutdown_cleanup_failed", this.#clock());
+      }
     }
-    if (failures.length > 0) throw new AggregateError(failures, "The Runa runtime stopped with cleanup failures.");
+    if (failures.length > 0) throw new AggregateError(failures, "The Cuna runtime stopped with cleanup failures.");
   }
 
-  async #admitRemoteTerminal(agentSessionId: string): Promise<{
+  async #admitRemoteTerminal(agentSessionId: string, signal?: AbortSignal): Promise<{
     readonly capability: ReturnType<typeof admitCapability>;
     readonly observation: RemoteAgentSessionEvidence;
   }> {
-    const snapshot = await this.#options.controlPlane.discoverCapabilities("agent_session", agentSessionId);
+    const snapshot = await this.#options.controlPlane.discoverCapabilities("agent_session", agentSessionId, signal);
     const capability = admitCapability(snapshot, {
       id: this.#options.terminalCapabilityId,
       scope: "agent_session",
@@ -801,11 +965,61 @@ export class RunaRuntimeBoundary {
       interaction: "native",
     }, this.#clock());
     const observation = assertRemoteAgentSessionEvidence({
-      evidence: await this.#options.controlPlane.observeAgentSession(agentSessionId),
+      evidence: await this.#options.controlPlane.observeAgentSession(agentSessionId, signal),
       expectedAgentSessionId: agentSessionId,
       now: this.#clock(),
     });
     return Object.freeze({ capability, observation });
+  }
+
+  #assertAttachmentAdmissionContinuity(
+    expected: TerminalAttachmentAdmission,
+    actual: TerminalAttachmentAdmission,
+    phase: "preflight" | "post_grant",
+  ): void {
+    this.#assertObservationContinuity(expected.observation, actual.observation, phase);
+    const now = this.#clock();
+    if (
+      expected.capability.capabilityId !== actual.capability.capabilityId ||
+      expected.capability.scope !== actual.capability.scope ||
+      expected.capability.subjectId !== actual.capability.subjectId
+    ) {
+      throw runtimeFailure(
+        "capability_scope_mismatch",
+        `Terminal capability scope changed during ${phase === "preflight" ? "preflight" : "post-grant"} admission.`,
+      );
+    }
+    if (expected.capability.expiresAt <= now || actual.capability.expiresAt <= now) {
+      throw runtimeFailure(
+        "capability_snapshot_expired",
+        `Terminal capability authority expired during ${phase === "preflight" ? "preflight" : "post-grant"} admission.`,
+      );
+    }
+    if (expected.capability.snapshotEtag !== actual.capability.snapshotEtag) {
+      throw runtimeFailure(
+        "capability_unknown",
+        `Terminal capability authority changed during ${phase === "preflight" ? "preflight" : "post-grant"} admission.`,
+      );
+    }
+  }
+
+  #assertObservationContinuity(
+    expected: RemoteAgentSessionEvidence,
+    actual: RemoteAgentSessionEvidence,
+    phase: "preflight" | "post_grant" | "reconnect",
+  ): void {
+    if (
+      expected.authority !== actual.authority ||
+      expected.userId !== actual.userId ||
+      expected.machineId !== actual.machineId ||
+      expected.agentSessionId !== actual.agentSessionId ||
+      expected.processEpoch !== actual.processEpoch
+    ) {
+      throw runtimeFailure(
+        "session_discontinuous",
+        `The AgentSession machine or process generation changed during ${phase === "post_grant" ? "post-grant" : phase} admission.`,
+      );
+    }
   }
 
   async #createGrant(
@@ -813,6 +1027,7 @@ export class RunaRuntimeBoundary {
     capability: ReturnType<typeof admitCapability>,
     resumeHandle: string | undefined,
     idempotencyKey = this.#idempotencyKey(),
+    signal?: AbortSignal,
   ): Promise<TerminalConnectionGrant> {
     const grant = await this.#options.controlPlane.createTerminalConnection({
       agentSessionId: observation.agentSessionId,
@@ -821,6 +1036,7 @@ export class RunaRuntimeBoundary {
       idempotencyKey,
       capabilityEvidence: capability,
       ...(resumeHandle === undefined ? {} : { resumeHandle }),
+      ...(signal === undefined ? {} : { signal }),
     });
     return validateTerminalGrant({
       grant,
@@ -871,7 +1087,7 @@ export class RunaRuntimeBoundary {
   #requireGrantCapability(entry: TerminalEntry, name: TerminalConnectionCapability["name"]): void {
     const matches = entry.capabilities.filter((capability) => capability.name === name);
     if (matches.length !== 1 || matches[0]?.availability === "unknown") {
-      throw runtimeFailure("capability_unknown", `Runa cannot prove terminal capability ${name}.`);
+      throw runtimeFailure("capability_unknown", `Cuna cannot prove terminal capability ${name}.`);
     }
     if (matches[0]?.availability !== "supported") {
       throw runtimeFailure("capability_unsupported", `Terminal capability ${name} is unsupported.`);
@@ -1015,7 +1231,7 @@ export class RunaRuntimeBoundary {
 
   #remoteTerminalError(frame: TerminalFrame): RuntimeBoundaryError {
     const payload = decodeTerminalControl(frame);
-    return runtimeFailure("terminal_protocol_error", "The Runa terminal gateway rejected the connection.", {
+    return runtimeFailure("terminal_protocol_error", "The Cuna terminal gateway rejected the connection.", {
       retryable: payload.retryable === true,
       safeDetails: { reason: typeof payload.code === "string" ? payload.code : "terminal_error" },
     });
@@ -1109,6 +1325,12 @@ export class RunaRuntimeBoundary {
 
   #assertReady(): void {
     this.#assertOpen();
+    if (this.#mode === "foreground") {
+      if (this.#foreground.state !== "ready") {
+        throw runtimeFailure("remote_state_unproven", "The foreground runtime is not ready in this process.");
+      }
+      return;
+    }
     if (
       this.#daemon.snapshot().state === "ready" &&
       this.#startupEvidenceExpiresAt <= this.#clock()
@@ -1122,10 +1344,10 @@ export class RunaRuntimeBoundary {
   }
 }
 
-async function withOutputDeadline(operation: Promise<void>, timeoutMs: number): Promise<void> {
+async function withOutputDeadline<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
   let timeout: NodeJS.Timeout | undefined;
   try {
-    await Promise.race([
+    return await Promise.race([
       operation,
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(
@@ -1159,6 +1381,14 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000): RuntimeTer
     heartbeatExpiresAt: entry.lastHeartbeatAt + heartbeatTimeoutMs,
     ...(entry.reason === undefined ? {} : { reason: entry.reason }),
   });
+}
+
+function sameEntryBinding(entry: TerminalEntry, binding: RuntimeTerminalResponse["binding"]): boolean {
+  return entry.observation.userId === binding.userId &&
+    entry.observation.machineId === binding.machineId &&
+    entry.observation.agentSessionId === binding.agentSessionId &&
+    entry.observation.processEpoch === binding.processEpoch &&
+    entry.fencingGeneration === binding.fencingGeneration;
 }
 
 async function nextWithTimeout(

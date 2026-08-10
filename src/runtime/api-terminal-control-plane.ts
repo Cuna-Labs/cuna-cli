@@ -6,7 +6,8 @@ import type {
   TerminalControlPlane,
 } from "./terminal-transport.js";
 
-const SUPERVISOR_FRESHNESS_MS = 45_000;
+const MAX_SUPERVISOR_LEASE_MS = 60_000;
+const MAX_FUTURE_SKEW_MS = 5_000;
 
 export function createApiTerminalControlPlane(input: {
   readonly client: RunaApiClient;
@@ -14,18 +15,19 @@ export function createApiTerminalControlPlane(input: {
 }): TerminalControlPlane {
   const clock = input.clock ?? Date.now;
   return Object.freeze({
-    discoverCapabilities: (scope: "agent_session", resourceId: string) =>
-      input.client.discoverCapabilities(scope, resourceId),
+    discoverCapabilities: (scope: "agent_session", resourceId: string, signal?: AbortSignal) =>
+      input.client.discoverCapabilities(scope, resourceId, signal),
 
-    async observeAgentSession(agentSessionId: string): Promise<RemoteAgentSessionEvidence> {
+    async observeAgentSession(agentSessionId: string, signal?: AbortSignal): Promise<RemoteAgentSessionEvidence> {
       const [identity, session] = await Promise.all([
-        input.client.getIdentity(),
-        input.client.getAgentSession(agentSessionId),
+        input.client.getIdentity(signal),
+        input.client.getAgentSession(agentSessionId, signal),
       ]);
       if (
         !identity.workspaceAssigned ||
         session.processEpoch === undefined ||
         session.runtimeObservedAt === undefined ||
+        session.runtimeExpiresAt === undefined ||
         (session.processState !== "ready" && session.processState !== "running")
       ) {
         throw runtimeFailure(
@@ -33,11 +35,20 @@ export function createApiTerminalControlPlane(input: {
           "The AgentSession is not freshly proven ready for terminal attachment.",
         );
       }
+      const now = clock();
       const observedAt = Date.parse(session.runtimeObservedAt);
-      if (!Number.isFinite(observedAt) || observedAt > clock() + 5_000) {
+      const expiresAt = Date.parse(session.runtimeExpiresAt);
+      if (
+        !Number.isFinite(observedAt) ||
+        !Number.isFinite(expiresAt) ||
+        observedAt > now + MAX_FUTURE_SKEW_MS ||
+        expiresAt <= observedAt ||
+        expiresAt - observedAt > MAX_SUPERVISOR_LEASE_MS ||
+        expiresAt <= now
+      ) {
         throw runtimeFailure(
           "remote_state_unproven",
-          "The AgentSession supervisor observation is malformed or future-dated.",
+          "The AgentSession supervisor observation has invalid or expired lease authority.",
         );
       }
       return Object.freeze({
@@ -48,7 +59,7 @@ export function createApiTerminalControlPlane(input: {
         processEpoch: session.processEpoch,
         state: session.processState,
         observedAt: session.runtimeObservedAt,
-        expiresAt: new Date(observedAt + SUPERVISOR_FRESHNESS_MS).toISOString(),
+        expiresAt: session.runtimeExpiresAt,
         evidenceRevision: `agent-session-row:${session.rowVersion}`,
       });
     },
@@ -76,6 +87,7 @@ export function createApiTerminalControlPlane(input: {
             : { resumeHandle: request.resumeHandle }),
         },
         request.idempotencyKey,
+        request.signal,
       );
     },
   });

@@ -53,7 +53,7 @@ outputs.set(
   await writeExclusive(
     channelDefinitions.npm.projectionFile,
     [
-      "# Generated from a candidate-bound Runa CLI release envelope. Do not edit.",
+      "# Generated from a candidate-bound Cuna CLI release envelope. Do not edit.",
       `public_command=${channelDefinitions.npm.publicCommand}`,
       `candidate_invocation=${commands.npm}`,
       `package=${envelope.packageName}`,
@@ -72,7 +72,7 @@ outputs.set(
   await writeExclusive(
     channelDefinitions.bun.projectionFile,
     [
-      "# Generated from a candidate-bound Runa CLI release envelope. Do not edit.",
+      "# Generated from a candidate-bound Cuna CLI release envelope. Do not edit.",
       `public_command=${channelDefinitions.bun.publicCommand}`,
       `candidate_invocation=${commands.bun}`,
       `package=${envelope.packageName}`,
@@ -82,6 +82,14 @@ outputs.set(
       "installer_of_record=bun",
       "artifact_channel=npm",
       "availability=PROJECTED_NOT_PUBLISHED",
+      `supported_platforms=${channelDefinitions.bun.platforms.join(",")}`,
+      `blocked_platforms=${channelDefinitions.bun.blockedPlatforms.map(({ platform }) => platform).join(",")}`,
+      `windows_availability=${channelDefinitions.bun.blockedPlatforms[0].availability}`,
+      `windows_block_reason=${channelDefinitions.bun.blockedPlatforms[0].reasonCode}`,
+      `verified_affected_bun_versions=${channelDefinitions.bun.blockedPlatforms[0].verifiedAffectedVersions.join(",")}`,
+      `upstream_source=${channelDefinitions.bun.blockedPlatforms[0].upstreamRepository}@${channelDefinitions.bun.blockedPlatforms[0].upstreamCommit}`,
+      `windows_fallback_command=${channelDefinitions.npm.publicCommand}`,
+      `windows_readmission_gate=${channelDefinitions.bun.blockedPlatforms[0].readmissionGate}`,
       "",
     ].join("\n"),
   ),
@@ -92,7 +100,7 @@ outputs.set(
 );
 outputs.set(
   channelDefinitions.homebrew.projectionFile,
-  await render("packaging/templates/homebrew/runa.rb.template", channelDefinitions.homebrew.projectionFile),
+  await render("packaging/templates/homebrew/cuna.rb.template", channelDefinitions.homebrew.projectionFile),
 );
 outputs.set(
   channelDefinitions.aur.projectionFile,
@@ -140,6 +148,10 @@ const manifest = {
       installerOfRecord: definition.installerOfRecord,
       runtimeDependency: definition.runtimeDependency,
       platforms: [...definition.platforms],
+      blockedPlatforms: definition.blockedPlatforms.map((blocked) => ({
+        ...blocked,
+        verifiedAffectedVersions: [...blocked.verifiedAffectedVersions],
+      })),
       publicCommand: definition.publicCommand,
       candidateInvocation: commands[id],
       artifactSha256: envelope.tarball.sha256,
@@ -160,6 +172,9 @@ const manifest = {
     decision: "BLOCKED",
     blockers: [
       "PUBLISHED_NPM_TARBALL_AND_PROVENANCE_NOT_VERIFIED",
+      "SIGNED_PLATFORM_CREDENTIAL_BROWSER_BRIDGES_MISSING",
+      "WINDOWS_OWNED_PROCESS_HANDLE_IDENTITY_AUTHORITY_MISSING",
+      "BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS",
       "CHANNEL_INSTALL_RECEIPTS_MISSING",
       "ROLLBACK_OR_FIXED_FORWARD_REHEARSAL_MISSING",
       "OBSERVATION_THRESHOLDS_AND_TELEMETRY_MISSING",

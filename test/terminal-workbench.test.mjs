@@ -62,7 +62,7 @@ function tabs() {
   ];
 }
 
-test("rich workbench keeps a persistent orange Runa appbar above the selected isolated viewport", () => {
+test("rich workbench keeps a persistent orange Cuna appbar above the selected isolated viewport", () => {
   const frame = renderWorkbenchFrame({
     columns: 80,
     rows: 24,

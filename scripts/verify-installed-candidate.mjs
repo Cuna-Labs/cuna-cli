@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { invariant, parseArgs, readJson, sha256File, verifyEnvelopeFiles } from "./lib/release-evidence.mjs";
-import { assertInstalledProductAbsent, invokeInstalledRuna, runNpm } from "./lib/installed-candidate-probe.mjs";
+import { assertInstalledProductAbsent, invokeInstalledCuna, runNpm } from "./lib/installed-candidate-probe.mjs";
 import { withOwnedTempDirectory } from "./lib/owned-temp.mjs";
 
 const args = parseArgs(process.argv.slice(2));
@@ -12,7 +12,7 @@ await verifyEnvelopeFiles(envelope, root);
 
 let installed = false;
 let installedPrefix;
-const verification = await withOwnedTempDirectory("runa-cli-install-", async (ownedRoot) => {
+const verification = await withOwnedTempDirectory("cuna-cli-install-", async (ownedRoot) => {
   const prefix = path.join(ownedRoot, "installed prefix (x86) á");
   installedPrefix = prefix;
   await mkdir(prefix, { recursive: false });
@@ -24,8 +24,8 @@ const verification = await withOwnedTempDirectory("runa-cli-install-", async (ow
     maxBuffer: 8 * 1024 * 1024,
   });
   installed = true;
-  const selfTest = await invokeInstalledRuna(prefix, ["self-test", "--offline", "--json"], { timeout: 30_000 });
-  const version = await invokeInstalledRuna(prefix, ["version", "--json"], { timeout: 30_000 });
+  const selfTest = await invokeInstalledCuna(prefix, ["self-test", "--offline", "--json"], { timeout: 30_000 });
+  const version = await invokeInstalledCuna(prefix, ["version", "--json"], { timeout: 30_000 });
   const selfTestJson = JSON.parse(selfTest.stdout);
   const versionJson = JSON.parse(version.stdout);
   invariant(selfTestJson.schema_version === "1" && selfTestJson.type === "result" && selfTestJson.command === "self-test", "Self-test envelope is invalid");
