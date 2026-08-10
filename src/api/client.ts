@@ -4,6 +4,7 @@ import {
   assertIdempotencyKey,
   assertSafeDisplayText,
   encodeCanonicalUuid,
+  encodeMachineId,
 } from "../core/validation.js";
 import {
   decodeAuditRecords,
@@ -40,7 +41,7 @@ import {
   type WorkspaceBindingAuthority,
 } from "./contracts.js";
 import type { HttpTransport } from "./http.js";
-import { classifyCapabilitySnapshot } from "./capability-evidence.js";
+import { classifyCapabilitySnapshot, isPermanentSnapshotFault } from "./capability-evidence.js";
 
 export interface MachineCreateInput {
   readonly name: string;
@@ -337,7 +338,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return decode(decodeMachinePage, await transport.request({ method: "GET", path: "/v1/sessions", ...(signal === undefined ? {} : { signal }) }));
     },
     async getMachine(id, signal) {
-      const safeId = encodeCanonicalUuid(id, "machine ID");
+      const safeId = encodeMachineId(id);
       const machine = decode(
         decodeMachineItem,
         await transport.request({
@@ -355,7 +356,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return decode(decodeAuditRecords, await transport.request({ method: "GET", path: "/v1/records" }));
     },
     async listAuthorizations(machineId) {
-      const safeId = encodeCanonicalUuid(machineId, "machine ID");
+      const safeId = encodeMachineId(machineId);
       return decode(
         decodeCredentialRules,
         await transport.request({ method: "GET", path: `/v1/sessions/${safeId}/authorizations` }),
@@ -415,7 +416,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return request;
     },
     async transitionMachine(id, action, signal) {
-      const safeId = encodeCanonicalUuid(id, "machine ID");
+      const safeId = encodeMachineId(id);
       const raw = await transport.request({
         method: "POST",
         path: `/v1/sessions/${safeId}/${action}`,
@@ -426,7 +427,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return machine;
     },
     async deleteMachine(id) {
-      const safeId = encodeCanonicalUuid(id, "machine ID");
+      const safeId = encodeMachineId(id);
       return transport.request({ method: "DELETE", path: `/v1/sessions/${safeId}` });
     },
     async createWorkspaceBinding(input, idempotencyKey, signal) {
@@ -493,7 +494,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return authority;
     },
     async listAgentSessions(machineId, options = {}, signal) {
-      const safeId = encodeCanonicalUuid(machineId, "machine ID");
+      const safeId = encodeMachineId(machineId);
       const query = validatePageOptions(options);
       const raw = await transport.request({
         method: "GET",
@@ -506,7 +507,7 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       return page;
     },
     async createAgentSession(machineId, input, idempotencyKey, signal) {
-      const safeId = encodeCanonicalUuid(machineId, "machine ID");
+      const safeId = encodeMachineId(machineId);
       validateAgentSessionCreate(input);
       const raw = await transport.request({
         method: "POST",
@@ -671,8 +672,12 @@ export function decideCapability(
   now = Date.now(),
   allowedInteractions: readonly import("./contracts.js").CapabilityInteraction[] = ["native"],
 ): CapabilityDecision {
-  if (classifyCapabilitySnapshot(snapshot, now) !== "valid") {
-    return Object.freeze({ status: "unknown", capabilityId, reason: "snapshot_expired" });
+  // The classifier's own verdict, verbatim. Collapsing all five outcomes into
+  // "snapshot_expired" told a user whose server sent an unsupported schema or an
+  // over-long TTL to retry a request that can only ever produce the same answer.
+  const validity = classifyCapabilitySnapshot(snapshot, now);
+  if (validity !== "valid") {
+    return Object.freeze({ status: "unknown", capabilityId, reason: validity });
   }
   const matches = snapshot.capabilities.filter((capability) => capability.id === capabilityId);
   if (matches.length !== 1) {
@@ -748,7 +753,10 @@ export async function requireCapability(input: {
     message: `Cuna cannot currently authorize the ${input.capabilityId} capability.`,
     exitCode:
       decision.status === "temporarily_unavailable" ? EXIT_CODES.network : EXIT_CODES.unsupported,
-    retryable: decision.status === "temporarily_unavailable",
+    retryable: decision.status === "temporarily_unavailable" && !isPermanentSnapshotFault(decision.reason),
+    hint: isPermanentSnapshotFault(decision.reason)
+      ? "The server sent capability evidence this CLI cannot accept. Retrying cannot help; update the Cuna server contract or this CLI."
+      : "Run `cuna capabilities` to inspect current server support.",
     details: {
       capability_id: input.capabilityId,
       availability: decision.status,

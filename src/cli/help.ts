@@ -31,6 +31,7 @@ Available now:
   agent-sessions terminate ID          Terminate when server-advertised
   config get                           Show effective, redacted configuration
   self-test --offline                  Verify the installed CLI without network access
+  doctor                               Report platform, runtime, and credential-vault state
 
 Capability-gated foreground preview:
   connect SESSION_ID [SESSION_ID...]   Attach 1-4 exact cloud sessions in this terminal
@@ -75,7 +76,7 @@ Global options:
   --config-file PATH  Select the user configuration file
   --timeout-ms N      Bound each API request (100..120000)
   --no-color          Disable color (output is color-independent by default)
-  --help              Show help
+  --help              Show help (add it after any command for that command's help)
   --version           Show the CLI version
 
 Authentication:

@@ -5,6 +5,10 @@ import test from "node:test";
 import { EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
 
 const API_KEY = "cuna_sk_abcdefghijklmnop";
+// A machine ID in the one shape the product accepts. This fixture used to be
+// "m_1", which the command layer waved through and the transport would have
+// rejected -- so the test asserted a success the real client cannot produce.
+const MACHINE_ID = "33333333-3333-4333-8333-333333333333";
 const future = "2026-08-08T00:00:30.000Z";
 const FOREGROUND_SESSION_A = "11111111-1111-4111-8111-111111111111";
 const FOREGROUND_SESSION_B = "22222222-2222-4222-8222-222222222222";
@@ -607,12 +611,12 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
     },
     async transitionMachine(id, action) {
       transitions += 1;
-      assert.equal(id, "m_1");
+      assert.equal(id, MACHINE_ID);
       assert.equal(action, "pause");
       return { id, name: "dev", state: "paused" };
     },
   });
-  const exit = await runCli(["machines", "pause", "m_1", "--yes"], {
+  const exit = await runCli(["machines", "pause", MACHINE_ID, "--yes"], {
     streams: streams.streams,
     platform,
     env: { CUNA_API_KEY: API_KEY },
@@ -621,7 +625,7 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
   });
   assert.equal(exit, EXIT_CODES.success);
   assert.equal(transitions, 1);
-  assert.deepEqual(discoveries, [{ scope: "machine", resourceId: "m_1" }]);
+  assert.deepEqual(discoveries, [{ scope: "machine", resourceId: MACHINE_ID }]);
   assert.equal(JSON.parse(streams.stdout()).data.state, "paused");
 });
 

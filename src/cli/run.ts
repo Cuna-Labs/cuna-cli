@@ -10,6 +10,7 @@ import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-i
 import { resolveConfig, type EffectiveConfig } from "../config/config.js";
 import { executeCommand, preflightInvocation } from "../commands/commands.js";
 import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
+import { integerArgument } from "../core/validation.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { resolvePlatformAuthority, type ResolvedPlatformAuthority } from "../credentials/platform.js";
 import { CredentialVault } from "../credentials/vault.js";
@@ -32,6 +33,7 @@ import {
   type ForegroundSessionRunner,
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
+import { commandHelp, helpTopicName } from "./command-help.js";
 import { ROOT_HELP } from "./help.js";
 import { createOutputWriter, type CliStreams } from "./output.js";
 import { booleanOption, parseArgv, stringOption } from "./parser.js";
@@ -86,15 +88,26 @@ function defaultStreams(): CliStreams {
 
 function parseTimeout(raw: string | undefined): number {
   if (raw === undefined) return 15_000;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < 100 || value > 120_000) {
-    throw new Error("timeout-invalid");
-  }
-  return value;
+  return integerArgument(raw, "timeout-ms", 100, 120_000);
 }
 
+/**
+ * The `command` field of every output record, including error records.
+ *
+ * This used to be "the first argv token that does not start with `-`", which is
+ * an option VALUE whenever a global option precedes the command:
+ * `cuna --config-file /home/me/.cuna/config.toml machines list` reported the
+ * command as `/home/me/.cuna/config.toml`, putting an absolute filesystem path
+ * into a JSON record and into whatever consumes it. The parser already knows
+ * which token is the command, so ask it; if the argv is too malformed to parse,
+ * there is no command to name.
+ */
 function commandLabel(argv: readonly string[]): string {
-  return argv.find((item) => !item.startsWith("-")) ?? "root";
+  try {
+    return parseArgv(argv).command ?? "root";
+  } catch {
+    return "root";
+  }
 }
 
 function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>> {
@@ -196,24 +209,39 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }
       return EXIT_CODES.success;
     }
+    // Help is answered before the root-option allowlist below. That allowlist
+    // exists to reject `cuna --profile x` with no command, but it ran first and
+    // so also rejected `cuna --help --profile x`: asking for help was refused
+    // because of the very option the user wanted help about. `--json` and
+    // `--no-color` happened to be on the allowlist and worked, which is what
+    // made the behaviour look arbitrary rather than wrong.
+    if (parsed.command === "help" || booleanOption(parsed, "help")) {
+      rejectUnknownOptions(parsed, ["help"]);
+      if (parsed.command === "help" && parsed.operands.length !== 0) throw usageError("help accepts no operands.");
+      const topic = parsed.command === "help" || parsed.command === undefined
+        ? undefined
+        : parsed.command;
+      const help = commandHelp(topic, parsed.operands);
+      if (writer.structured) {
+        writer.success(
+          "help",
+          {
+            version: CLI_VERSION,
+            output_schema_version: OUTPUT_SCHEMA_VERSION,
+            ...(topic === undefined ? {} : { topic: helpTopicName(topic, parsed.operands) }),
+            help,
+          },
+          help,
+        );
+      } else {
+        writer.text(help);
+      }
+      return EXIT_CODES.success;
+    }
     if (parsed.command === undefined) {
       const allowedRootOptions = new Set(["help", "version", "json", "no-color"]);
       const invalidRootOption = Object.keys(parsed.options).find((name) => !allowedRootOptions.has(name));
       if (invalidRootOption !== undefined) throw usageError(`Option --${invalidRootOption} requires a command.`);
-    }
-    if (parsed.command === "help" || booleanOption(parsed, "help")) {
-      rejectUnknownOptions(parsed, ["help"]);
-      if (parsed.command === "help" && parsed.operands.length !== 0) throw usageError("help accepts no operands.");
-      if (writer.structured) {
-        writer.success(
-          "help",
-          { version: CLI_VERSION, output_schema_version: OUTPUT_SCHEMA_VERSION, help: ROOT_HELP },
-          ROOT_HELP,
-        );
-      } else {
-        writer.text(ROOT_HELP);
-      }
-      return EXIT_CODES.success;
     }
     if (parsed.command === undefined) {
       if (writer.structured) {

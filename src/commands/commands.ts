@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   requireCapability,
   type MachineCreateInput,
@@ -13,7 +15,14 @@ import type {
 import type { EffectiveConfig } from "../config/config.js";
 import { DEFAULT_BASE_URL, publicConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError, unsupportedError, usageError } from "../core/errors.js";
-import { assertCanonicalUuid, assertIdempotencyKey, assertPublicId, assertSafeDisplayText } from "../core/validation.js";
+import {
+  assertCanonicalUuid,
+  assertIdempotencyKey,
+  assertMachineId,
+  assertPublicId,
+  assertSafeDisplayText,
+  integerArgument,
+} from "../core/validation.js";
 import { preflightAgentJourneyInvocation } from "../journey/intent.js";
 import { INITIAL_RUNTIME_GATES, type RuntimeFeatureGate } from "../runtime/contracts.js";
 import { evaluateRuntimeSupport } from "../platform/support.js";
@@ -64,11 +73,7 @@ function integerOption(
 ): number | undefined {
   const raw = stringOption(parsed, name);
   if (raw === undefined) return undefined;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < minimum || value > maximum) {
-    throw usageError(`Option --${name} must be an integer from ${minimum} through ${maximum}.`);
-  }
-  return value;
+  return integerArgument(raw, name, minimum, maximum);
 }
 
 function agentOption(parsed: ParsedInvocation, required: boolean): AgentKind | undefined {
@@ -93,15 +98,19 @@ function requireConfirmation(parsed: ParsedInvocation, command: string): void {
   });
 }
 
+/**
+ * The reconciliation key for one create operation.
+ *
+ * Demanding this from the user made every `machines create` fail until they
+ * discovered a flag whose purpose only matters when a create outcome is
+ * uncertain — and the layer below already defaulted it, so the requirement
+ * bought nothing. It is now generated per invocation and the flag remains as an
+ * override, which is the case that actually needs a caller-known value: reusing
+ * the same key to reconcile a create whose result was never observed.
+ */
 function idempotencyKey(parsed: ParsedInvocation): string {
   const value = stringOption(parsed, "idempotency-key");
-  if (value === undefined) {
-    throw usageError(
-      "Option --idempotency-key is required for create operations.",
-      "Reuse the same opaque key when reconciling an uncertain result.",
-    );
-  }
-  return assertIdempotencyKey(value);
+  return value === undefined ? randomUUID() : assertIdempotencyKey(value);
 }
 
 function machineRecord(machine: Machine): Readonly<Record<string, unknown>> {
@@ -340,7 +349,7 @@ function preflightMachines(parsed: ParsedInvocation): void {
     rejectUnknownOptions(parsed, ["yes"]);
     if (parsed.operands.length !== 2) throw usageError(`machines ${action} requires exactly one machine ID.`);
     requireConfirmation(parsed, `machines.${action}`);
-    assertPublicId(requireOperand(parsed.operands, 1, "machine ID"), "machine ID");
+    assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
     return;
   }
   throw usageError(`Unknown machines action ${action}.`);
@@ -351,7 +360,7 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
   if (action === "list") {
     rejectUnknownOptions(parsed, ["machine", "limit", "cursor"]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions list accepts no operands.");
-    assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
+    assertMachineId(stringOption(parsed, "machine") ?? "");
     integerOption(parsed, "limit", 1, 100);
     const cursor = stringOption(parsed, "cursor");
     if (cursor !== undefined && (cursor.length > 512 || /[\p{Cc}\p{Cf}]/u.test(cursor))) {
@@ -372,7 +381,7 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
     ]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions create accepts no operands.");
     requireConfirmation(parsed, "agent-sessions.create");
-    assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
+    assertMachineId(stringOption(parsed, "machine") ?? "");
     assertCanonicalUuid(
       stringOption(parsed, "workspace-binding-id") ?? "",
       "workspace binding ID",
@@ -835,7 +844,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     rejectUnknownOptions(parsed, ["yes"]);
     if (parsed.operands.length !== 2) throw usageError(`machines ${action} requires exactly one machine ID.`);
     requireConfirmation(parsed, `machines.${action}`);
-    const id = assertPublicId(requireOperand(parsed.operands, 1, "machine ID"), "machine ID");
+    const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
     // The public capability registry deliberately groups the four reversible
     // lifecycle transitions under one semantic authority. The operation path
     // still binds the exact action; discovery must not invent per-action IDs
@@ -852,7 +861,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     rejectUnknownOptions(parsed, ["yes"]);
     if (parsed.operands.length !== 2) throw usageError("machines delete requires exactly one machine ID.");
     requireConfirmation(parsed, "machines.delete");
-    const id = assertPublicId(requireOperand(parsed.operands, 1, "machine ID"), "machine ID");
+    const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
     await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.delete", now });
     await client.deleteMachine(id);
     return Object.freeze({ command: "machines.delete", data: { id, acknowledged: true }, human: `Delete acknowledged for ${id}.` });
@@ -867,7 +876,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
   if (action === "list") {
     rejectUnknownOptions(parsed, ["machine", "limit", "cursor"]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions list accepts no operands.");
-    const machineId = assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
+    const machineId = assertMachineId(stringOption(parsed, "machine") ?? "");
     const limit = integerOption(parsed, "limit", 1, 100);
     const cursor = stringOption(parsed, "cursor");
     const page = await client.listAgentSessions(machineId, {
@@ -897,7 +906,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     ]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions create accepts no operands.");
     requireConfirmation(parsed, "agent-sessions.create");
-    const machineId = assertPublicId(stringOption(parsed, "machine") ?? "", "machine ID");
+    const machineId = assertMachineId(stringOption(parsed, "machine") ?? "");
     const workspaceBindingId = assertCanonicalUuid(
       stringOption(parsed, "workspace-binding-id") ?? "",
       "workspace binding ID",

@@ -12,6 +12,26 @@ export type CapabilitySnapshotValidity =
   | "excessive_ttl"
   | "expired";
 
+/**
+ * The snapshot faults no amount of retrying can clear.
+ *
+ * A snapshot whose schema this build does not know, whose freshness fields are
+ * inconsistent, or whose TTL exceeds the contract maximum is a server-contract
+ * fault: the same request produces the same snapshot. `expired` and
+ * `future_observation` are the two that a later attempt (or a corrected clock)
+ * can resolve. Every one of the five used to be reported as `snapshot_expired`,
+ * which told the user to retry three faults that can never succeed.
+ */
+export const PERMANENT_SNAPSHOT_FAULTS: readonly CapabilitySnapshotValidity[] = Object.freeze([
+  "unsupported_schema",
+  "malformed_freshness",
+  "excessive_ttl",
+]);
+
+export function isPermanentSnapshotFault(reason: string | undefined): boolean {
+  return reason !== undefined && (PERMANENT_SNAPSHOT_FAULTS as readonly string[]).includes(reason);
+}
+
 export function classifyCapabilitySnapshot(
   snapshot: CapabilitySnapshot,
   now = Date.now(),

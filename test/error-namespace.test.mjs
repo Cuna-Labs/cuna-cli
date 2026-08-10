@@ -18,6 +18,19 @@ import { CunaError, ERROR_NAMESPACE, EXIT_CODES, RunaError } from "../dist/index
  * repository has closed four times. Each is listed with the peer that pins it.
  * Adding a line is a deliberate act; growing this list by accident is what this
  * test prevents.
+ *
+ * KNOWN BLIND SPOT, measured: this file asserts the ABSENCE of `runa.`, so it
+ * says nothing about whether any particular `cuna.*` code is the code the
+ * product actually emits. A mutation audit renamed all 50 codes that no test
+ * names — 64 literal sites — and the suite stayed green at 534/534. Renaming the
+ * 39 codes that ARE named gave 51 failures. So this test protects the namespace
+ * and nothing protects most of the codes inside it.
+ *
+ * `test/cli-surface-regressions.test.mjs` closes the two worst gaps: the
+ * template mint sites at `cli/run.ts` that build `cuna.runtime.*` (22 codes) and
+ * `cuna.auth.credential_*` (12 codes) from a boundary error, which had every
+ * bare code asserted somewhere and the prefixed form asserted nowhere — the
+ * exact two lines the namespace rename touched.
  */
 const WIRE_IDENTIFIERS = Object.freeze([
   // Terminal WebSocket subprotocol. Pinned by infra `edge/src/terminal-connections.ts`

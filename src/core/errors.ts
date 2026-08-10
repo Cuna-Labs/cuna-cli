@@ -16,17 +16,28 @@ export type SafeErrorScalar = string | number | boolean | null;
 export type SafeErrorDetails = Readonly<Record<string, SafeErrorScalar | readonly SafeErrorScalar[]>>;
 
 /**
- * The single namespace every error code this CLI emits is minted under.
+ * The namespace every error code this CLI emits is minted under.
  *
  * Codes reach the user twice — as `error.code` in `--json` records and as
  * `Error [code]:` on a terminal — so the namespace is product surface, not an
- * internal tag. It lives here as one constant so a rename is one edit rather
- * than the ninety-one scattered literals it used to be.
+ * internal tag.
  *
- * This is NOT the wire namespace. Protocol identifiers the service mints and
- * compares by exact equality (`runa.terminal.v1`, `runa.agent-auth.v1`, the
- * `runa.auth.<token>` WebSocket subprotocol) are not error codes and are not
- * derived from this constant.
+ * WHAT THIS CONSTANT IS NOT: it is not the thing codes are built from. Measured
+ * — the only references to `ERROR_NAMESPACE` in the tree are this declaration
+ * and its re-export from `src/index.ts`. Not one error code is derived from it.
+ * The literals are still written out by hand at roughly 145 sites, so a rename
+ * is still a mass edit and the guard against a half-finished one is
+ * `test/error-namespace.test.mjs`, which greps for the absence of `runa.` — not
+ * this constant.
+ *
+ * An earlier version of this comment claimed the opposite ("a rename is one
+ * edit rather than the ninety-one scattered literals it used to be"). It was
+ * wrong, and it is the kind of wrong that stops the next reader from adding the
+ * guard that is actually missing.
+ *
+ * This is also NOT the wire namespace. Protocol identifiers the service mints
+ * and compares by exact equality (`runa.terminal.v1`, `runa.agent-auth.v1`, the
+ * `runa.auth.<token>` WebSocket subprotocol) are not error codes.
  */
 export const ERROR_NAMESPACE = "cuna" as const;
 
