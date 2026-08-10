@@ -1,5 +1,10 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
-import { isAccessToken, isContinuationSecret, isRefreshToken } from "../core/namespace.js";
+import {
+  isAccessToken,
+  isBrowserCallbackNonce,
+  isContinuationSecret,
+  isRefreshToken,
+} from "../core/namespace.js";
 import { isObject } from "../core/validation.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -237,7 +242,7 @@ export function decodeCliContinuationIssued(
     return malformed("browser_binding_mismatch");
   }
   const browserNonce = fragment.get("nonce");
-  if (browserNonce === null || !/^(?:cuna|runa)_cb_[A-Za-z0-9_-]{43}$/u.test(browserNonce)) {
+  if (browserNonce === null || !isBrowserCallbackNonce(browserNonce)) {
     return malformed("invalid_browser_nonce");
   }
   return Object.freeze({

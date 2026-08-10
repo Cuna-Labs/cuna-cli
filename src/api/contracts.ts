@@ -1,4 +1,5 @@
 import {
+  containsCredentialValue,
   isApiKeyDisplayPrefix,
   isTerminalConnectToken,
   isTerminalStreamUrl,
@@ -784,7 +785,13 @@ export interface ApiKeyMetadata {
   readonly revokedAt: string | null;
 }
 
-const FORBIDDEN_PUBLIC_VALUE = /(?:(?:cuna|runa)_(?:sk|at|rt|ct|tc)_[A-Za-z0-9_-]{8,}|\p{Cc}|\p{Cf})/u;
+/**
+ * Control and format characters may never reach the operator's terminal. The
+ * credential half of this guard is NOT written here: it comes from
+ * `containsCredentialValue`, the one authority, because the copy that used to
+ * live on this line knew only five of the eight minted families.
+ */
+const FORBIDDEN_PUBLIC_CHARACTER = /[\p{Cc}\p{Cf}]/u;
 
 function exactKeys(value: Record<string, unknown>, required: readonly string[]): void {
   const actual = Object.keys(value).sort();
@@ -798,7 +805,8 @@ function safePublicString(value: unknown, label: string, maximum = 4096): string
   if (
     typeof value !== "string" ||
     value.length > maximum ||
-    FORBIDDEN_PUBLIC_VALUE.test(value)
+    FORBIDDEN_PUBLIC_CHARACTER.test(value) ||
+    containsCredentialValue(value)
   ) {
     throw new TypeError(`Malformed field: ${label}`);
   }

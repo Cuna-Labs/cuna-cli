@@ -76,6 +76,7 @@ const CREDENTIAL_GRAMMAR = Object.freeze({
   refreshToken: Object.freeze({ infix: "rt", suffix: OPAQUE_SECRET }),
   continuation: Object.freeze({ infix: "ct", suffix: OPAQUE_SECRET }),
   terminalConnect: Object.freeze({ infix: "tc", suffix: OPAQUE_SECRET }),
+  browserCallbackNonce: Object.freeze({ infix: "cb", suffix: OPAQUE_SECRET }),
 }) satisfies Readonly<Record<string, { readonly infix: CredentialFamilyInfix; readonly suffix: string }>>;
 
 export type CredentialFamily = keyof typeof CREDENTIAL_GRAMMAR;
@@ -103,6 +104,7 @@ const ACCESS_TOKEN = credentialPattern("accessToken");
 const REFRESH_TOKEN = credentialPattern("refreshToken");
 const CONTINUATION_SECRET = credentialPattern("continuation");
 const TERMINAL_CONNECT_TOKEN = credentialPattern("terminalConnect");
+const BROWSER_CALLBACK_NONCE = credentialPattern("browserCallbackNonce");
 
 /**
  * The non-secret display prefix stored on an API key row and returned by
@@ -146,6 +148,36 @@ export function isContinuationSecret(value: string): boolean {
 /** A one-use terminal connection token. */
 export function isTerminalConnectToken(value: string): boolean {
   return TERMINAL_CONNECT_TOKEN.test(value);
+}
+
+/** The nonce the browser carries back from a human sign-in handoff. */
+export function isBrowserCallbackNonce(value: string): boolean {
+  return BROWSER_CALLBACK_NONCE.test(value);
+}
+
+/**
+ * Unanchored source matching a complete credential value of ANY brand and ANY
+ * family, with the shortest suffix a leaked secret could plausibly carry.
+ *
+ * This is the denylist half of the authority. It exists because the public
+ * response decoder previously carried its own hand-written copy of the family
+ * list that had gone stale at five of eight families — it did not know `se`,
+ * `sc` or `cb`, so an audit summary containing a live `runa_sc_…` supervisor
+ * bearer decoded cleanly and was printed to the operator's terminal and, under
+ * `--json`, into CI logs. A denylist assembled anywhere but here is the same
+ * bug waiting for the next family.
+ */
+export const CREDENTIAL_VALUE_SOURCE = `${CREDENTIAL_OPENING_SOURCE}_[A-Za-z0-9_-]{8,}`;
+
+const CREDENTIAL_VALUE = new RegExp(CREDENTIAL_VALUE_SOURCE, "u");
+
+/**
+ * Whether `value` contains a credential of any brand and any family, anywhere
+ * inside it. Use this — never a local regex — before printing, forwarding or
+ * persisting a string the service controls.
+ */
+export function containsCredentialValue(value: string): boolean {
+  return CREDENTIAL_VALUE.test(value);
 }
 
 function escapeRegExp(value: string): string {

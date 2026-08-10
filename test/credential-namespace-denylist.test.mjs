@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CREDENTIAL_BRANDS, CREDENTIAL_FAMILY_INFIXES } from "../dist/index.js";
+import {
+  CREDENTIAL_BRANDS,
+  CREDENTIAL_FAMILY_INFIXES,
+  decodeAuditRecords,
+  isBrowserCallbackNonce,
+} from "../dist/index.js";
 import { detectHighConfidenceSecret } from "../dist/workspace/index.js";
 
 /**
@@ -65,6 +70,81 @@ test("the workspace secret detector blocks every brand and family it must", () =
         `${label} embedded`,
       );
     }
+  }
+});
+
+/**
+ * The second denylist over the same namespace. `safePublicString` guards what
+ * the CLI prints to the operator's terminal and, under `--json`, into CI logs
+ * and shell history; `decodeAuditRecords` is its widest sink, because the
+ * service controls `summary` (2048 chars) and every string nested in `detail`
+ * (16384 chars).
+ *
+ * This guard used to carry its own hand-written family list that stopped at
+ * five of eight — it did not know `se`, `sc` or `cb` — while the workspace
+ * detector above knew all eight. Two detectors over one namespace, and the
+ * weaker one guarded the terminal. `sc` is not hypothetical: the edge matches
+ * `^Bearer (runa_sc_…)$` on the production wire today.
+ *
+ * The guard also had zero coverage: it was invariant under deletion. These
+ * cases fire on any narrowing of the authority without being edited.
+ */
+function auditRecord(overrides) {
+  return {
+    id: "11111111-1111-4111-8111-111111111111",
+    session_id: "22222222-2222-4222-8222-222222222222",
+    kind: "agent.start",
+    summary: "started",
+    detail: { note: "clean" },
+    created_at: "2026-08-10T00:00:00Z",
+    ...overrides,
+  };
+}
+
+test("an audit record carrying no credential still decodes", () => {
+  const [decoded] = decodeAuditRecords([auditRecord({})]);
+  assert.equal(decoded.summary, "started");
+  assert.equal(decoded.detail.note, "clean");
+});
+
+test("no credential brand or family can reach stdout through an audit record", () => {
+  const brands = new Set([...REQUIRED_CREDENTIAL_BRANDS, ...CREDENTIAL_BRANDS]);
+  const infixes = new Set([...REQUIRED_CREDENTIAL_FAMILY_INFIXES, ...CREDENTIAL_FAMILY_INFIXES]);
+  for (const brand of brands) {
+    for (const infix of infixes) {
+      const credential = `${brand}_${infix}_${OPAQUE_SUFFIX}`;
+      // Every field the service controls, including nested detail strings and
+      // object keys — each one is printed verbatim in human and JSON output.
+      const sinks = [
+        { summary: `authenticated with ${credential}` },
+        { kind: credential },
+        { detail: { authorization: `Bearer ${credential}` } },
+        { detail: { [credential]: "value" } },
+        { detail: { nested: [{ deeper: credential }] } },
+      ];
+      for (const [index, overrides] of sinks.entries()) {
+        assert.throws(
+          () => decodeAuditRecords([auditRecord(overrides)]),
+          TypeError,
+          `${brand}_${infix}_ sink ${index} leaked to stdout`,
+        );
+      }
+    }
+  }
+});
+
+test("the browser callback nonce is validated by the authority, in both brands", () => {
+  for (const brand of REQUIRED_CREDENTIAL_BRANDS) {
+    assert.equal(isBrowserCallbackNonce(`${brand}_cb_${OPAQUE_SUFFIX}`), true, brand);
+  }
+  for (const rejected of [
+    `cuna_cb_${"A".repeat(42)}`, // one character short of the minted suffix
+    `cuna_cb_${"A".repeat(44)}`, // one character long
+    `cuna_ct_${OPAQUE_SUFFIX}`, // a different family must not authenticate as cb
+    `nope_cb_${OPAQUE_SUFFIX}`, // an unminted brand
+    `prefix_cuna_cb_${OPAQUE_SUFFIX}`, // must stay anchored
+  ]) {
+    assert.equal(isBrowserCallbackNonce(rejected), false, rejected);
   }
 });
 
