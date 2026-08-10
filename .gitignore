@@ -82,3 +82,7 @@ tmp/
 /internal/
 /plans/
 /reviews/
+
+# Cross-chat coordination mailbox — local only, never published
+_buzon/
+buzon/
