@@ -63,13 +63,20 @@ export function runtimeFeatureGates(input: {
     Object.freeze({ feature: "daemon", implementation: "unsupported", reason: "daemon_runtime_unavailable" }),
     Object.freeze({
       feature: "terminal_workspace",
-      implementation: "unsupported",
-      reason: "terminal_workspace_unavailable",
+      implementation: "available",
+      // This is deliberately a local-build claim. Every attach still requires
+      // fresh producer capability, AgentSession identity, runtime-state and
+      // one-use grant evidence before the terminal takes ownership.
+      reason: "foreground_exact_session_composed_live_producer_required",
     }),
     Object.freeze({
       feature: "workspace_sync",
-      implementation: "unsupported",
-      reason: "workspace_sync_protocol_unavailable",
+      implementation: "available",
+      // The shipped journey composes the authoritative initial commit and the
+      // sole-writer continuous supervisor. A producer that does not serve the
+      // protocol still fails the invocation closed; doctor does not pretend to
+      // have probed a remote deployment.
+      reason: "initial_and_continuous_sync_composed_live_producer_required",
     }),
     Object.freeze({
       feature: "browser_auth",

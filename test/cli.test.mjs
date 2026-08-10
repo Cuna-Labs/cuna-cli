@@ -1128,6 +1128,32 @@ test("doctor never advertises interactive browser auth without a verified platfo
   }
 });
 
+test("doctor reports the composed journey locally without claiming live producer evidence", async () => {
+  const streams = memoryStreams();
+  const exit = await runCli(["doctor"], {
+    streams: streams.streams,
+    platform: { ...platform, kind: "windows" },
+    env: {},
+  });
+  assert.equal(exit, EXIT_CODES.success);
+  const features = JSON.parse(streams.stdout()).data.runtime_features;
+  assert.deepEqual(
+    features.filter((item) => item.feature === "terminal_workspace" || item.feature === "workspace_sync"),
+    [
+      {
+        feature: "terminal_workspace",
+        implementation: "available",
+        reason: "foreground_exact_session_composed_live_producer_required",
+      },
+      {
+        feature: "workspace_sync",
+        implementation: "available",
+        reason: "initial_and_continuous_sync_composed_live_producer_required",
+      },
+    ],
+  );
+});
+
 test("package and runtime versions remain identical", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const streams = memoryStreams();

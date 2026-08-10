@@ -35,10 +35,10 @@ const EXIT_CODES_SECTION = exitCodeHelpSection();
  *     `createProductionNativeAuthBridges` fails closed before any package
  *     resolution. That is what makes `login`/`signup` unusable, and it is a
  *     property of the release, not of an operating system.
- *   - `runtime/contracts.ts` returns `workspace_sync` and `terminal_workspace`
- *     as `unsupported` UNCONDITIONALLY — no runtime input can change them — so
- *     the journey commands and foreground attach cannot work in this build on
- *     any platform.
+ *   - the automatic journey and exact foreground attach are composed by
+ *     `runCli` before the generic command dispatcher. Their local
+ *     implementation is present, while each invocation still fails closed
+ *     unless the live producer proves the required capabilities and state.
  *
  * What is NOT claimed here: that sign-in fails on every operating system.
  * `credentials/linux-secret-service.ts` exists and the vault verdict is a
@@ -71,14 +71,16 @@ Works with an automation credential:
   records list          List redacted account activity records
   capabilities          Inspect what this deployment actually serves
   api-keys list         List API-key metadata without secret values
+  claude [PATH]         Synchronize, select or create, and attach Claude Code
+  codex [PATH]          Synchronize, select or create, and attach Codex
+  openclaw [PATH]       Synchronize, select or create, and attach OpenClaw
+  connect SESSION_ID    Attach one exact AgentSession in this terminal
 
 Not available in this build:
   signup, login, logout    Interactive sign-in requires the signed native
                            authentication package, which this build does not
                            include. Use ${PRIMARY_API_KEY_NAME} instead.
-  claude, codex, openclaw  The local-to-cloud journey requires workspace
-  connect, attach          synchronization and foreground terminal support,
-                           both unsupported in this build.
+  background daemon, local companion
   Run \`cuna doctor\` to see what this platform and build actually provide.
 
 More:

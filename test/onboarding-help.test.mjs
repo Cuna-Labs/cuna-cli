@@ -143,21 +143,27 @@ test("--all on a command topic is refused rather than silently ignored", async (
 /* S-7: the short help must not promise what this build cannot do              */
 /* -------------------------------------------------------------------------- */
 
-test("the short help does not present sign-in or the journey as available", () => {
+test("the short help presents the composed journey but not unavailable interactive sign-in", () => {
   const available = SHORT_HELP.slice(
     SHORT_HELP.indexOf("Works with no network:"),
     SHORT_HELP.indexOf("Not available in this build:"),
   );
   assert.ok(available.length > 0);
-  for (const command of ["login", "signup", "logout", "claude", "codex", "openclaw", "connect"]) {
+  for (const command of ["login", "signup", "logout"]) {
     assert.ok(
       !new RegExp(`^\\s{2}${command}\\b`, "mu").test(available),
       `${command} must not be listed as available`,
     );
   }
+  for (const command of ["claude", "codex", "openclaw", "connect"]) {
+    assert.ok(new RegExp(`^\\s{2}${command}\\b`, "mu").test(available), `${command} must be listed as available`);
+  }
   const unavailable = SHORT_HELP.slice(SHORT_HELP.indexOf("Not available in this build:"));
-  for (const command of ["signup", "login", "logout", "claude", "codex", "openclaw", "connect"]) {
+  for (const command of ["signup", "login", "logout"]) {
     assert.ok(unavailable.includes(command), `${command} must be marked unavailable`);
+  }
+  for (const command of ["claude", "codex", "openclaw", "connect"]) {
+    assert.ok(!unavailable.includes(command), `${command} must not be marked unavailable`);
   }
 });
 
@@ -169,8 +175,8 @@ test("the unavailability the short help claims is the unavailability this build 
   // `createProductionNativeAuthBridges` fails closed before package resolution.
   assert.equal(NATIVE_PLATFORM_RELEASE_INDEX.length, 0);
 
-  // The journey and foreground attach: these two gates are unconditional in
-  // `runtimeFeatureGates` — no runtime input can turn them on.
+  // The journey and foreground attach are local composition claims. Remote
+  // capability and resource authority are re-proven per invocation.
   for (const platformName of ["windows", "macos", "linux"]) {
     for (const credentialBackendStatus of ["verified", "unavailable", "unknown"]) {
       const gates = runtimeFeatureGates({ platform: platformName, credentialBackendStatus });
@@ -178,7 +184,7 @@ test("the unavailability the short help claims is the unavailability this build 
         const gate = gates.find((candidate) => candidate.feature === feature);
         assert.equal(
           gate?.implementation,
-          "unsupported",
+          "available",
           `${feature} on ${platformName}/${credentialBackendStatus}`,
         );
       }

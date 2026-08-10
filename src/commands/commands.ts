@@ -704,8 +704,14 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     case "claude":
     case "codex":
     case "openclaw":
-    case "shell":
     case "connect":
+      // Public process dispatch is owned by runCli, which composes exact attach
+      // and the automatic journey before this generic command dispatcher. A
+      // direct executeCommand call has no TTY, sync lifecycle or credential
+      // composition authority, so it must fail closed without claiming that
+      // the shipped runtime itself is absent.
+      throw unsupportedError("terminal workspace", "run_cli_composition_required");
+    case "shell":
       throw unsupportedError("terminal workspace", "terminal_runtime_unavailable");
     case "sync":
       throw unsupportedError("workspace synchronization", "workspace_sync_runtime_unavailable");
@@ -1034,7 +1040,9 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     });
   }
   if (action === "attach") {
-    throw unsupportedError("AgentSession attach", "terminal_runtime_missing");
+    // See the root command arm above: runCli intercepts this public path after
+    // exact identity and TTY admission. The generic dispatcher cannot attach.
+    throw unsupportedError("AgentSession attach", "run_cli_composition_required");
   }
   throw usageError(`Unknown agent-sessions action ${action}.`);
 }
