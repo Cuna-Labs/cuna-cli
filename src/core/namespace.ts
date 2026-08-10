@@ -34,7 +34,13 @@ export type CredentialBrand = (typeof CREDENTIAL_BRANDS)[number];
  * denylist and must recognize all of them.
  */
 export const CREDENTIAL_FAMILY_INFIXES = Object.freeze([
-  "sk", "at", "rt", "ct", "tc", "se", "sc",
+  // sk secret key · at access token · rt refresh token · ct continuation
+  // tc terminal connect · se/sc session credentials · cb browser callback nonce
+  //
+  // `cb` was absent while the service minted `cuna_cb_…` for every human
+  // sign-in, so the workspace secret detector uploaded it instead of blocking
+  // it — exactly the failure this module's header warns about.
+  "sk", "at", "rt", "ct", "tc", "se", "sc", "cb",
 ] as const);
 
 export type CredentialFamilyInfix = (typeof CREDENTIAL_FAMILY_INFIXES)[number];
