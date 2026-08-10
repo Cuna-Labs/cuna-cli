@@ -121,12 +121,30 @@ function workspaceSyncProblemMetadata(
   });
 }
 
-function apiError(
-  status: number,
-  requestId: string | undefined,
-  body: unknown,
-  credentialKind: "api_key" | "interactive" | "anonymous",
-): CunaError {
+/**
+ * Build the error for a non-2xx response.
+ *
+ * `body` is the decoded response body, or `undefined` when the body was not
+ * JSON at all. The distinction is load-bearing: a status this API produced
+ * always carries a JSON object (a Problem document, or at minimum
+ * `{"error":"…"}`), because the request asks for exactly
+ * `application/json, application/problem+json`. A non-JSON body at an error
+ * status therefore came from a layer in front of the API that has no route for
+ * this path — measured: `GET https://api.getcuna.com/v1/capabilities` answers
+ * `404` with `content-type: text/plain` and the body `404 Not Found`, while
+ * `GET /v1/me` answers `401` with `application/json`.
+ */
+function apiError(input: {
+  readonly status: number;
+  readonly requestId: string | undefined;
+  readonly body: unknown;
+  readonly apiEncodedBody: boolean;
+  readonly credentialKind: "api_key" | "interactive" | "anonymous";
+  readonly method: HttpRequest["method"];
+  readonly path: string;
+  readonly origin: string;
+}): CunaError {
+  const { status, requestId, body, credentialKind } = input;
   const problem = problemMetadata(body, status);
   const reason = problem?.code ??
     (isObject(body) ? safeReasonCode(body.code) ?? safeReasonCode(body.error) : undefined);
@@ -183,6 +201,27 @@ function apiError(
       details,
     });
   }
+  if (status === 404 && !input.apiEncodedBody) {
+    // Reporting this as `cuna.remote.malformed_response` — which is what
+    // happened while the body was parsed before the status was read — names the
+    // layer that noticed the failure instead of the layer that caused it. The
+    // response is not malformed; this deployment does not implement the
+    // operation. Production serves 26 of the 57 operations this build knows, so
+    // this is the majority answer today, not an edge case.
+    return new CunaError({
+      code: "cuna.remote.operation_not_served",
+      message: `The Cuna API at ${input.origin} does not serve ${input.method} ${input.path}.`,
+      exitCode: EXIT_CODES.unsupported,
+      hint: "The deployed Cuna API does not implement this operation. Run `cuna version --json` and contact Cuna support with that record if it should be available.",
+      details: {
+        http_status: status,
+        ...(requestId === undefined ? {} : { request_id: requestId }),
+        method: input.method,
+        path: input.path,
+        api_origin: input.origin,
+      },
+    });
+  }
   return new CunaError({
     code: status === 404 ? "cuna.remote.not_found" : "cuna.remote.rejected",
     message: status === 404 ? "The requested Cuna resource or operation was not found." : "Cuna rejected the request.",
@@ -230,18 +269,31 @@ async function readLimited(response: Response): Promise<Uint8Array> {
   return result;
 }
 
-function parseJson(bytes: Uint8Array): unknown {
-  if (bytes.byteLength === 0) return null;
+type JsonDecoding =
+  | { readonly decoded: true; readonly value: unknown }
+  | { readonly decoded: false; readonly cause: unknown };
+
+function decodeJson(bytes: Uint8Array): JsonDecoding {
+  if (bytes.byteLength === 0) return { decoded: true, value: null };
   try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+    return {
+      decoded: true,
+      value: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown,
+    };
   } catch (cause) {
-    throw new CunaError({
-      code: "cuna.remote.malformed_response",
-      message: "Cuna returned a malformed response.",
-      exitCode: EXIT_CODES.remote,
-      cause,
-    });
+    return { decoded: false, cause };
   }
+}
+
+function parseJson(bytes: Uint8Array): unknown {
+  const result = decodeJson(bytes);
+  if (result.decoded) return result.value;
+  throw new CunaError({
+    code: "cuna.remote.malformed_response",
+    message: "Cuna returned a malformed response.",
+    exitCode: EXIT_CODES.remote,
+    cause: result.cause,
+  });
 }
 
 function isRetryableAfterUnknownDispatch(request: HttpRequest): boolean {
@@ -402,11 +454,25 @@ export function createHttpTransport(input: {
           redirect: "error",
         });
         const bytes = await readLimited(response);
-        const parsed = parseJson(bytes);
         if (!response.ok) {
-          throw apiError(response.status, response.headers.get("x-request-id") ?? undefined, parsed, credentialKind);
+          // The status is read BEFORE the body is required to parse. Parsing
+          // first made every unparseable error body — a proxy's plain-text 404,
+          // an HTML 502, a gateway's 503 page — surface as
+          // `cuna.remote.malformed_response`, discarding the one fact the
+          // client already held authoritatively: the status.
+          const decoded = decodeJson(bytes);
+          throw apiError({
+            status: response.status,
+            requestId: response.headers.get("x-request-id") ?? undefined,
+            body: decoded.decoded ? decoded.value : undefined,
+            apiEncodedBody: decoded.decoded && isObject(decoded.value),
+            credentialKind,
+            method: request.method,
+            path: request.path,
+            origin: input.baseUrl,
+          });
         }
-        return parsed;
+        return parseJson(bytes);
       } catch (error) {
         if (error instanceof CunaError) throw error;
         if (controller.signal.aborted) {

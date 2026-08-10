@@ -56,6 +56,28 @@ export interface HumanAuthService {
 type Sleep = (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 type RandomSource = (size: number) => Uint8Array;
 
+/**
+ * The one credential path that still works when interactive sign-in cannot
+ * start at all.
+ *
+ * `CUNA_API_KEY` never touches the operating-system credential vault:
+ * `cli/run.ts` selects automation mode from it and hands the key straight to
+ * the HTTP transport. Measured on this host — the vault reports an unverified
+ * backend, so `cuna login` can never succeed, while a `CUNA_API_KEY` request
+ * reaches production and is answered on its merits. Without this sentence the
+ * user is told what is broken and nothing about what works.
+ *
+ * The text promises COMMANDS, not sign-in, deliberately: `login`, `logout`,
+ * `whoami`, `signup` and `access` reject with `cuna.auth.mode_conflict` while
+ * `CUNA_API_KEY` is set, so a hint promising that this makes sign-in work would
+ * be the same class of lie in the other direction.
+ *
+ * This lives in one place because it is one fact. Copying the sentence to each
+ * mint site is how the two spellings of a namespace drift apart.
+ */
+const AUTOMATION_CREDENTIAL_HINT =
+  "Set CUNA_API_KEY to a Cuna automation credential to run commands without interactive sign-in.";
+
 function authError(code: string, message: string, options: {
   readonly retryable?: boolean;
   readonly hint?: string;
@@ -338,6 +360,7 @@ export function createHumanAuthService(input: {
       throw authError(
         "cuna.auth.vault_unavailable",
         "Interactive sign-in requires the verified operating-system credential vault.",
+        { hint: AUTOMATION_CREDENTIAL_HINT },
       );
     }
     if (vaultStatus.state === "present") {
@@ -356,7 +379,11 @@ export function createHumanAuthService(input: {
     }
     const bootstrap = await input.client.bootstrap(request.signal);
     if (!bootstrap.enabled || bootstrap.browserOrigin === null) {
-      throw authError("cuna.auth.unavailable", "Interactive Cuna sign-in is not enabled for this environment.");
+      throw authError(
+        "cuna.auth.unavailable",
+        "Interactive Cuna sign-in is not enabled for this environment.",
+        { hint: AUTOMATION_CREDENTIAL_HINT },
+      );
     }
     if (intentClass === "signup") {
       const signup = await input.client.signupCapability(request.signal);

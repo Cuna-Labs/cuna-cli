@@ -557,3 +557,63 @@ test("exact decoders reject widened, mismatched, and malformed auth responses", 
   assert.throws(() => decodeRevocation({ revoked: false }));
   assert.throws(() => decodeRevocation({ revoked: true, ambiguous: true }));
 });
+
+// Measured on this host, 2026-08-10: the signed native credential package is
+// unadmitted, so the vault backend never probes `verified` and `cuna login`
+// can never succeed here. It exited 3 with no hint at all — a dead end, while
+// `CUNA_API_KEY` reached production in the same session and was answered on its
+// merits. The error must name the path that works.
+test("an unusable credential vault names the credential path that still works", async () => {
+  class UnavailableBackend extends MemoryBackend {
+    async probe() {
+      return {
+        protocol: CREDENTIAL_BACKEND_PROTOCOL,
+        backendId: this.backendId,
+        platform: this.platform,
+        status: "unavailable",
+        observedAt: NOW,
+        expiresAt: NOW + 60_000,
+        source: "live_round_trip",
+      };
+    }
+  }
+  const subject = fixture({ backend: new UnavailableBackend() });
+  await assert.rejects(
+    subject.service.login(),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.auth.vault_unavailable" &&
+      error.exitCode === 3 &&
+      error.hint === "Set CUNA_API_KEY to a Cuna automation credential to run commands without interactive sign-in.",
+  );
+  // The alternative is named before any network effect is attempted.
+  assert.deepEqual(subject.client.calls, []);
+});
+
+// The same fact, the same sentence, at the other site where interactive
+// sign-in cannot start: a deployment that does not enable it.
+test("a deployment with interactive sign-in disabled names the same alternative", async () => {
+  const subject = fixture({
+    client: fakeClient({
+      async bootstrap() {
+        this.calls.push(["bootstrap"]);
+        return {
+          enabled: false,
+          completionMode: "poll",
+          pkceMethod: "S256",
+          continuationTtlSeconds: 600,
+          pollAfterMs: 2000,
+          pollLimit: 3,
+          accessTokenTtlSeconds: 600,
+          refreshFamilyTtlSeconds: 2592000,
+          browserOrigin: null,
+        };
+      },
+    }),
+  });
+  await assert.rejects(
+    subject.service.login(),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.auth.unavailable" &&
+      error.hint === "Set CUNA_API_KEY to a Cuna automation credential to run commands without interactive sign-in.",
+  );
+});

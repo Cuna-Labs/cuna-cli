@@ -714,7 +714,14 @@ export async function requireCapability(input: {
   try {
     snapshot = await input.client.discoverCapabilities(input.scope, input.resourceId, input.signal);
   } catch (error) {
-    if (error instanceof CunaError && error.code === "cuna.remote.not_found") {
+    // `cuna.remote.operation_not_served` is the code a deployment without the
+    // route now produces. Before the transport read the status before the body,
+    // that case arrived as `cuna.remote.malformed_response` and this branch was
+    // unreachable against the one deployment that exists.
+    if (
+      error instanceof CunaError &&
+      (error.code === "cuna.remote.not_found" || error.code === "cuna.remote.operation_not_served")
+    ) {
       throw new CunaError({
         code: "cuna.capability.discovery_unavailable",
         message: "This Cuna deployment does not expose capability discovery.",

@@ -18,6 +18,7 @@ import {
   decodeRunaIdentity,
   decodeTerminalConnectionGrant,
   decideCapability,
+  requireCapability,
   CunaError,
 } from "../dist/index.js";
 
@@ -1039,4 +1040,114 @@ test("invalid public IDs never reach transport (property-style adversarial corpu
     await assert.rejects(client.getAgentSession(candidate), CunaError);
   }
   assert.equal(calls, 0);
+});
+
+// Measured against production on 2026-08-10: `GET /v1/capabilities` and
+// `GET /v1/machines` answer `404` with `content-type: text/plain` and the body
+// `404 Not Found`, while `GET /v1/me` answers `401` with
+// `application/json`. Production serves 26 of the 57 operations this build
+// knows, so the unparseable error body is the majority answer, not an edge
+// case.
+//
+// The transport used to parse the body BEFORE reading the status, so every one
+// of those answers surfaced as `cuna.remote.malformed_response` — the vocabulary
+// of the layer that noticed the failure, not the layer that caused it. The
+// status is authoritative and already in hand; it is now read first.
+test("an error status survives a body the client cannot parse", async () => {
+  const transport = (status, body, contentType = "text/plain; charset=UTF-8") => createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: `cuna_sk_${"a".repeat(43)}`,
+    fetch: async () => new Response(body, { status, headers: { "content-type": contentType } }),
+  });
+
+  // The exact production answer for an operation this deployment does not serve.
+  await assert.rejects(
+    transport(404, "404 Not Found").request({ method: "GET", path: "/v1/capabilities" }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.remote.operation_not_served" &&
+      error.exitCode === 8 &&
+      error.message === "The Cuna API at https://api.getcuna.com does not serve GET /v1/capabilities." &&
+      typeof error.hint === "string" && error.hint.length > 0 &&
+      error.details?.http_status === 404 &&
+      error.details?.method === "GET" &&
+      error.details?.path === "/v1/capabilities" &&
+      error.details?.api_origin === "https://api.getcuna.com",
+  );
+
+  // The same fix, one central place, for every other unparseable error body.
+  // A gateway HTML page must not become "malformed response" either.
+  await assert.rejects(
+    transport(503, "<html><body>502 Bad Gateway</body></html>", "text/html").request({
+      method: "GET",
+      path: "/v1/machines",
+    }),
+    (error) => error instanceof CunaError && error.code === "cuna.network.service_unavailable",
+  );
+  await assert.rejects(
+    transport(401, "Unauthorized").request({ method: "GET", path: "/v1/machines" }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.auth.rejected" &&
+      error.hint === "Replace CUNA_API_KEY with a valid automation credential.",
+  );
+  await assert.rejects(
+    transport(403, "Forbidden").request({ method: "GET", path: "/v1/machines" }),
+    (error) => error instanceof CunaError && error.code === "cuna.policy.denied",
+  );
+
+  // A 404 the API itself minted still means "this resource is absent". The
+  // discriminator is a JSON object body, which only the API's own error handler
+  // produces: the request asks for exactly
+  // `application/json, application/problem+json`.
+  await assert.rejects(
+    createHttpTransport({
+      baseUrl: "https://api.getcuna.com",
+      apiKey: `cuna_sk_${"a".repeat(43)}`,
+      fetch: async () => new Response(JSON.stringify({ error: "not_found" }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      }),
+    }).request({ method: "GET", path: "/v1/machines/22222222-2222-4222-8222-222222222222" }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.remote.not_found" &&
+      error.exitCode === 7,
+  );
+
+  // An empty-bodied 404 is not an API answer either — no route wrote it.
+  await assert.rejects(
+    transport(404, "").request({ method: "GET", path: "/v1/machines" }),
+    (error) => error instanceof CunaError && error.code === "cuna.remote.operation_not_served",
+  );
+
+  // A SUCCESS body that is not JSON is still a malformed response. The fix
+  // narrows that code to the one case it describes; it does not delete it.
+  await assert.rejects(
+    transport(200, "not json").request({ method: "GET", path: "/v1/machines" }),
+    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
+  );
+});
+
+// `requireCapability` already converted a not-found capability-discovery route
+// into `cuna.capability.discovery_unavailable`, and the branch was unreachable
+// against the only deployment that exists: the plain-text 404 arrived as
+// `cuna.remote.malformed_response`, which it does not catch.
+test("a deployment without capability discovery is named as such before any mutation", async () => {
+  let discoveries = 0;
+  const client = createRunaApiClient(createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: `cuna_sk_${"a".repeat(43)}`,
+    fetch: async () => {
+      discoveries += 1;
+      return new Response("404 Not Found", {
+        status: 404,
+        headers: { "content-type": "text/plain; charset=UTF-8" },
+      });
+    },
+  }));
+  await assert.rejects(
+    requireCapability({ client, scope: "account", capabilityId: "machines.create" }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.capability.discovery_unavailable" &&
+      error.exitCode === 8,
+  );
+  assert.equal(discoveries, 1);
 });

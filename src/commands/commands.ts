@@ -721,11 +721,17 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       });
       const buildDigest = await packageBuildDigest();
       const virtualTerminal = await verifyVirtualTerminalInterop();
+      // `canonical_api_origin` used to live in `checks` as
+      // `config.baseUrl === DEFAULT_BASE_URL || config.developmentProfile`.
+      // That condition cannot be false: `normalizeBaseUrl` (config/config.ts)
+      // returns `DEFAULT_BASE_URL` or throws unless a development profile is
+      // active, so the check restated its own precondition. It is now reported
+      // as what it always was — a configuration fact, not an integrity gate —
+      // and `apiOriginIsCanonical` can and does read `false`.
       const checks = Object.freeze({
         node_runtime: runtimeSupport.nodeRuntime,
         supported_platform: runtimeSupport.platform,
         supported_architecture: runtimeSupport.architecture,
-        canonical_api_origin: config.baseUrl === DEFAULT_BASE_URL || config.developmentProfile,
         package_identity: /^[0-9a-f]{64}$/u.test(buildDigest),
         virtual_terminal: virtualTerminal,
         network_requests: 0,
@@ -734,10 +740,24 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       const data = Object.freeze({
         ok,
         mode: "offline",
+        // `ok` answers one question: is the installed artifact intact and
+        // admissible on this host? It said nothing about the six runtime
+        // feature gates `doctor` reports, every one of which is currently
+        // `unsupported` — so "Offline self-test passed." read as a verdict on
+        // the product while covering only the installation.
+        scope: "installation_integrity",
+        notChecked: Object.freeze([
+          "runtime_features",
+          "server_contract",
+          "credential_state",
+        ]),
         version: CLI_VERSION,
         buildDigest,
         platform: process.platform,
         architecture: process.arch,
+        apiOrigin: config.baseUrl,
+        apiOriginSource: config.baseUrlSource,
+        apiOriginIsCanonical: config.baseUrl === DEFAULT_BASE_URL,
         updateChannel: ARTIFACT_CHANNEL,
         artifactChannel: ARTIFACT_CHANNEL,
         protocolRange: PROTOCOL_RANGE,
@@ -756,7 +776,11 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
           },
         });
       }
-      return Object.freeze({ command: "self-test", data, human: "Offline self-test passed." });
+      return Object.freeze({
+        command: "self-test",
+        data,
+        human: "Offline self-test passed: installation integrity only. It does not check runtime feature availability — run `cuna doctor` for that.",
+      });
     }
     default:
       throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run `cuna --help`.");
