@@ -1,10 +1,15 @@
 import { EXIT_CODES, RunaError } from "../core/errors.js";
+import {
+  isContinuationSecret,
+  isProblemType,
+  isProblemTypeForCode,
+  isTransportCredential,
+} from "../core/namespace.js";
 import { isObject, safeReasonCode } from "../core/validation.js";
 import { CLI_VERSION } from "../version.js";
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const PROBLEM_CODE = /^[a-z][a-z0-9_]{2,63}$/u;
-const PROBLEM_TYPE = /^https:\/\/api\.getcuna\.com\/problems\/[a-z][a-z0-9_]{2,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PROBLEM_ACTIONS = new Set(["retry", "sign_in", "open_web", "contact_support", "none"]);
 const WORKSPACE_SYNC_CAPABILITIES = Object.freeze([
@@ -52,7 +57,7 @@ function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata
   if (
     [...required].some((key) => !Object.hasOwn(body, key)) ||
     keys.some((key) => !required.has(key) && !optional.has(key)) ||
-    typeof body.type !== "string" || !PROBLEM_TYPE.test(body.type) ||
+    typeof body.type !== "string" || !isProblemType(body.type) ||
     typeof body.title !== "string" || body.title.length < 1 || body.title.length > 120 ||
     !Number.isSafeInteger(body.status) || body.status !== expectedStatus ||
     typeof body.code !== "string" || !PROBLEM_CODE.test(body.code) ||
@@ -89,7 +94,7 @@ function workspaceSyncProblemMetadata(
     [...required].some((key) => !Object.hasOwn(body, key)) ||
     typeof body.code !== "string" ||
     !/^workspace_sync_[a-z0-9_]{2,48}$/u.test(body.code) ||
-    body.type !== `https://api.getcuna.com/problems/${body.code}` ||
+    typeof body.type !== "string" || !isProblemTypeForCode(body.type, body.code) ||
     typeof body.title !== "string" || body.title.length < 1 || body.title.length > 120 ||
     !Number.isSafeInteger(body.status) || body.status !== expectedStatus ||
     typeof body.request_id !== "string" || !UUID.test(body.request_id) ||
@@ -263,10 +268,7 @@ export function createHttpTransport(input: {
     : input.bearerToken !== undefined
       ? "interactive" as const
       : "anonymous" as const;
-  if (
-    credential !== undefined &&
-    !/^(?:cuna|runa)_(?:sk_[A-Za-z0-9_-]{16,256}|at_[A-Za-z0-9_-]{43})$/u.test(credential)
-  ) {
+  if (credential !== undefined && !isTransportCredential(credential)) {
     throw new TypeError("HTTP transport credential is invalid.");
   }
   const fetcher = input.fetch ?? globalThis.fetch;
@@ -291,7 +293,7 @@ export function createHttpTransport(input: {
       }
       if (
         request.continuationSecret !== undefined &&
-        !/^(?:cuna|runa)_ct_[A-Za-z0-9_-]{43}$/u.test(request.continuationSecret)
+        !isContinuationSecret(request.continuationSecret)
       ) {
         throw new RunaError({
           code: "runa.internal.invalid_continuation_secret",

@@ -1,6 +1,7 @@
 import { posix, win32 } from "node:path";
 
 import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { isSecretApiKey } from "../core/namespace.js";
 import { isObject } from "../core/validation.js";
 import type { PlatformAdapter } from "../platform/adapter.js";
 
@@ -187,7 +188,7 @@ export async function resolveConfig(input: {
   }
 
   const apiKey = env.CUNA_API_KEY;
-  if (apiKey !== undefined && !/^cuna_sk_[A-Za-z0-9_-]{16,256}$/u.test(apiKey)) {
+  if (apiKey !== undefined && !isSecretApiKey(apiKey)) {
     throw configError("invalid_api_key", "environment");
   }
   return Object.freeze({

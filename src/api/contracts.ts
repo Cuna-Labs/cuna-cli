@@ -1,4 +1,9 @@
 import {
+  isApiKeyDisplayPrefix,
+  isTerminalConnectToken,
+  isTerminalStreamUrl,
+} from "../core/namespace.js";
+import {
   isObject,
   optionalDisplayString,
   optionalNumber,
@@ -703,8 +708,8 @@ export function decodeTerminalConnectionGrant(value: unknown): TerminalConnectio
   const expiresAt = requiredString(value, "expires_at");
   if (
     protocol !== TERMINAL_PROTOCOL ||
-    !/^runa_tc_[A-Za-z0-9_-]{43}$/u.test(connectToken) ||
-    connectUrl !== `wss://api.getcuna.com/v1/terminal-connections/${terminalSessionId}/stream` ||
+    !isTerminalConnectToken(connectToken) ||
+    !isTerminalStreamUrl(connectUrl, terminalSessionId) ||
     !Number.isFinite(Date.parse(expiresAt)) ||
     value.capabilities.length !== TERMINAL_CAPABILITY_NAMES.size
   ) {
@@ -887,7 +892,7 @@ function decodeApiKeyMetadata(value: unknown): ApiKeyMetadata {
   ]);
   const prefix = safePublicString(value.prefix, "prefix", 32);
   const lastFour = safePublicString(value.last_four, "last_four", 4);
-  if (!/^cuna_sk_[A-Za-z0-9_-]{0,12}$/u.test(prefix) || !/^[A-Za-z0-9_-]{4}$/u.test(lastFour)) {
+  if (!isApiKeyDisplayPrefix(prefix) || !/^[A-Za-z0-9_-]{4}$/u.test(lastFour)) {
     throw new TypeError("Malformed API key display metadata");
   }
   const createdAt = optionalTimestamp(value.created_at, "created_at");
