@@ -14,13 +14,15 @@ test.after(() => resources.cleanup());
 
 async function fixture() {
   const root = await resources.createTempDirectory("cuna-ci-contract-");
-  await mkdir(path.join(root, ".github", "workflows"), { recursive: true });
   await mkdir(path.join(root, "packaging"), { recursive: true });
   await cp(path.join(repositoryRoot, "package.json"), path.join(root, "package.json"));
   await cp(path.join(repositoryRoot, "package-lock.json"), path.join(root, "package-lock.json"));
   await cp(path.join(repositoryRoot, "packaging", "support-policy.json"), path.join(root, "packaging", "support-policy.json"));
-  await cp(path.join(repositoryRoot, ".github", "workflows", "ci.yml"), path.join(root, ".github", "workflows", "ci.yml"));
-  await cp(path.join(repositoryRoot, ".github", "workflows", "release.yml"), path.join(root, ".github", "workflows", "release.yml"));
+  // The whole of `.github`, not a hand-listed pair of workflows: the required
+  // status checks are spread across ci.yml and dependency-review.yml, so a
+  // fixture that copies only some workflows cannot tell "this check has no
+  // emitter" from "this fixture omitted the emitter".
+  await cp(path.join(repositoryRoot, ".github"), path.join(root, ".github"), { recursive: true });
   return root;
 }
 
@@ -235,4 +237,55 @@ test("CI contract rejects removal of the one-use nonce publication fence", async
     .replace("RELEASE_APPROVAL_NONCE_CONSUMPTION_AUTHORITY_NOT_CONFIGURED", "release approval reviewed");
   await writeFile(workflow, content);
   await assert.rejects(verify(root), /remain fail-closed before npm publish/u);
+});
+
+/**
+ * The branch ruleset requires five status checks and nothing in the tree could
+ * read that list, so `source-quality-gates` was required while only the matrix
+ * name `source-quality-node-${{ matrix.node }}` existed. A required check that
+ * is never reported does not fail a pull request -- it never arrives -- so with
+ * no bypass actors every pull request blocked forever, invisibly to lint,
+ * typecheck and this suite.
+ */
+test("CI contract rejects a required status check that no job emits", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "ci.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("    name: source-quality-gates\n", "    name: source-quality-node-summary\n");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /"source-quality-gates" is emitted by no pull_request workflow job/);
+});
+
+test("CI contract rejects a required check emitted only by a matrix-expanded name", async () => {
+  const root = await fixture();
+  const contract = path.join(root, ".github", "required-status-checks.json");
+  const parsed = JSON.parse(await readFile(contract, "utf8"));
+  // `native-source-${{ matrix.id }}` can never equal a fixed check name.
+  parsed.requiredStatusChecks = [...parsed.requiredStatusChecks, "native-source-linux-x64"];
+  await writeFile(contract, JSON.stringify(parsed, null, 2));
+  await assert.rejects(verify(root), /"native-source-linux-x64" is emitted by no pull_request workflow job/);
+});
+
+test("CI contract rejects a required check whose workflow never runs on a pull request", async () => {
+  const root = await fixture();
+  const contract = path.join(root, ".github", "required-status-checks.json");
+  const parsed = JSON.parse(await readFile(contract, "utf8"));
+  // distribution-projection-proof.yml is workflow_dispatch only, so this job
+  // reports on no pull request and a ruleset requiring it would never be
+  // satisfied. (codeql.yml is NOT such a case -- it does declare pull_request.)
+  parsed.requiredStatusChecks = [...parsed.requiredStatusChecks, "deterministic-projections-not-publication"];
+  await writeFile(contract, JSON.stringify(parsed, null, 2));
+  await assert.rejects(
+    verify(root),
+    /"deterministic-projections-not-publication" is emitted by no pull_request workflow job/,
+  );
+});
+
+test("CI contract rejects a summary gate that cannot observe a failed matrix", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "ci.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("    name: source-quality-gates\n    if: always()\n", "    name: source-quality-gates\n    if: success()\n");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /must report even when a gate lane fails/);
 });

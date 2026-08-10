@@ -11,7 +11,7 @@ import { resolveConfig, type EffectiveConfig } from "../config/config.js";
 import { executeCommand, preflightInvocation } from "../commands/commands.js";
 import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
-import { createPlatformCredentialBackend } from "../credentials/platform.js";
+import { resolvePlatformAuthority, type ResolvedPlatformAuthority } from "../credentials/platform.js";
 import { CredentialVault } from "../credentials/vault.js";
 import {
   conservativeFilesystemCapabilities,
@@ -273,8 +273,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(configFile === undefined ? {} : { configFile }),
       },
     });
+    // One resolution of the signed native authority per process, shared by the
+    // credential vault and the Windows browser opener. Both used to construct
+    // their own unwired defaults, so neither ever saw a native bridge.
+    let platformAuthority: ResolvedPlatformAuthority | undefined;
+    const getPlatformAuthority = async (): Promise<ResolvedPlatformAuthority> => {
+      platformAuthority ??= await resolvePlatformAuthority({
+        platform: nodePlatform(platform.kind),
+        ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
+      });
+      return platformAuthority;
+    };
+
     let humanAuth = dependencies.humanAuth;
-    const getHumanAuth = (): HumanAuthService => {
+    const getHumanAuth = async (): Promise<HumanAuthService> => {
       if (humanAuth !== undefined) return humanAuth;
       const transportOptions = {
         baseUrl: config.baseUrl,
@@ -285,14 +297,21 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         anonymous: createHttpTransport(transportOptions),
         authenticated: (accessToken) => createHttpTransport({ ...transportOptions, bearerToken: accessToken }),
       });
+      const authority = dependencies.credentialVault !== undefined && dependencies.browser !== undefined
+        ? undefined
+        : await getPlatformAuthority();
       humanAuth = createHumanAuthService({
         config,
         client: humanClient,
         vault: dependencies.credentialVault ?? new CredentialVault({
-          backend: createPlatformCredentialBackend(),
+          backend: authority!.credentials,
           ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
         }),
-        browser: dependencies.browser ?? createBrowserOpener(),
+        browser: dependencies.browser ?? createBrowserOpener(
+          nodePlatform(platform.kind),
+          effectiveEnvironment,
+          ...(authority?.browserBridge === undefined ? [] : [authority.browserBridge]),
+        ),
         ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
       });
       return humanAuth;
@@ -322,7 +341,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         });
       }
       if (parsed.command === "signup") {
-        const result = await getHumanAuth().signup(
+        const result = await (await getHumanAuth()).signup(
           dependencies.signal === undefined ? {} : { signal: dependencies.signal },
         );
         const data = humanResult(result);
@@ -334,13 +353,13 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
             : `Cuna completed signup for profile ${result.profile}.`,
         );
       } else if (parsed.command === "login") {
-        const result = await getHumanAuth().login(
+        const result = await (await getHumanAuth()).login(
           dependencies.signal === undefined ? {} : { signal: dependencies.signal },
         );
         const data = humanResult(result);
         writer.success("login", data, `Signed in to Cuna profile ${result.profile}.`);
       } else if (parsed.command === "whoami" || parsed.command === "access") {
-        const result = await getHumanAuth().whoami(dependencies.signal);
+        const result = await (await getHumanAuth()).whoami(dependencies.signal);
         const data = humanResult(result);
         writer.success(
           parsed.command === "access" ? "access.status" : "whoami",
@@ -348,7 +367,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           `${result.context.identity}\t${result.context.admission}\t${result.context.workspace.state}`,
         );
       } else {
-        const result = await getHumanAuth().logout(dependencies.signal);
+        const result = await (await getHumanAuth()).logout(dependencies.signal);
         writer.success("logout", result, "Signed out of Cuna on this device.");
       }
       return EXIT_CODES.success;
@@ -357,7 +376,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     let bearerToken: string | undefined;
     let credentialMode: "automation" | "interactive" | undefined = config.apiKey === undefined ? undefined : "automation";
     if (config.apiKey === undefined && needsRemoteCredential(parsed.command, foreground) && dependencies.clientFactory === undefined) {
-      bearerToken = await getHumanAuth().acquireAccessToken(dependencies.signal);
+      bearerToken = await (await getHumanAuth()).acquireAccessToken(dependencies.signal);
       credentialMode = "interactive";
     }
     const httpTransport = dependencies.clientFactory === undefined ? createHttpTransport({
@@ -476,16 +495,22 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     }
     let runtimeFeatures = dependencies.runtimeFeatures;
     if (parsed.command === "doctor" && runtimeFeatures === undefined) {
-      const backend = createPlatformCredentialBackend({
-        platform: platform.kind === "windows" ? "win32" : platform.kind === "macos" ? "darwin" : "linux",
-      });
+      const backend = (await getPlatformAuthority()).credentials;
       let credentialBackendStatus: "verified" | "unavailable" | "unknown" = "unknown";
+      let credentialBackendReason: string | undefined;
       try {
-        credentialBackendStatus = (await backend.probe()).status;
+        const evidence = await backend.probe();
+        credentialBackendStatus = evidence.status;
+        credentialBackendReason = evidence.reason;
       } catch {
         credentialBackendStatus = "unavailable";
       }
-      runtimeFeatures = runtimeFeatureGates({ platform: platform.kind, credentialBackendStatus });
+      runtimeFeatures = runtimeFeatureGates({
+        platform: platform.kind,
+        credentialBackendStatus,
+        credentialBackendId: backend.backendId,
+        ...(credentialBackendReason === undefined ? {} : { credentialBackendReason }),
+      });
     }
     const result = await executeCommand({
       parsed,
@@ -504,6 +529,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           message: unknownError.message,
           exitCode: EXIT_CODES.auth,
           retryable: unknownError.retryable,
+          // `RuntimeBoundaryError` already forwards its safe details; this arm
+          // dropped them, so the credential backend's reason died here even
+          // when the vault had populated it.
+          ...(unknownError.safeDetails === undefined ? {} : { details: unknownError.safeDetails }),
+          cause: unknownError,
         })
       : unknownError instanceof RuntimeBoundaryError
         ? runtimeError(unknownError)

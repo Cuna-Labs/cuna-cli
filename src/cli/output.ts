@@ -1,6 +1,7 @@
 import type { Writable } from "node:stream";
 
-import type { CunaError } from "../core/errors.js";
+import type { CunaError, SafeErrorScalar } from "../core/errors.js";
+import { containsCredentialValue } from "../core/namespace.js";
 import { OUTPUT_SCHEMA_VERSION } from "../version.js";
 
 export interface CliStreams {
@@ -54,6 +55,24 @@ function sanitizeSingleLineHumanOutput(value: string): string {
   return sanitizeHumanTerminalOutput(value).replaceAll("\n", "\\n").replaceAll("\t", "\\t");
 }
 
+/**
+ * Render one `details` entry for a human terminal.
+ *
+ * `details` distinguishes failures that otherwise print identically: thirteen
+ * distinct configuration faults share one message, and an HTTP 403 carries the
+ * `request_id` support asks for. JSON mode has always emitted it; human mode
+ * dropped it entirely, so the operator saw the same unactionable sentence.
+ *
+ * Values here originate partly from the service, so this is a print sink for
+ * service-controlled bytes and is held to the same rule as every other one.
+ */
+function renderErrorDetail(value: SafeErrorScalar | readonly SafeErrorScalar[]): string {
+  const rendered = Array.isArray(value)
+    ? value.map((item) => String(item)).join(", ")
+    : String(value as SafeErrorScalar);
+  return containsCredentialValue(rendered) ? "[redacted credential]" : rendered;
+}
+
 export function createOutputWriter(input: {
   readonly streams: CliStreams;
   readonly json: boolean;
@@ -90,6 +109,9 @@ export function createOutputWriter(input: {
         );
       } else {
         writeLine(input.streams.stderr, sanitizeSingleLineHumanOutput(`Error [${error.code}]: ${error.message}`));
+        for (const [key, value] of Object.entries(error.details ?? {})) {
+          writeLine(input.streams.stderr, sanitizeSingleLineHumanOutput(`  ${key}: ${renderErrorDetail(value)}`));
+        }
         if (error.hint !== undefined) {
           writeLine(input.streams.stderr, sanitizeSingleLineHumanOutput(`Next: ${error.hint}`));
         }

@@ -15,6 +15,7 @@ import {
   createSecureProcessRunner,
   createUnavailableCredentialBackend,
   createPlatformCredentialBackend,
+  resolvePlatformAuthority,
   credentialTarget,
 } from "../dist/credentials/index.js";
 
@@ -523,4 +524,92 @@ test("macOS adapter refuses argv-based Keychain fallback when no native bridge e
     backend.replace("target", new TextEncoder().encode("never-on-security-dash-w")),
     (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unavailable",
   );
+});
+
+/**
+ * `createProductionNativeAuthBridges` existed and was correct, but nothing in
+ * `src/` ever called it -- every caller was under `test/`. The synchronous
+ * `createPlatformCredentialBackend` cannot load a signed package, so on Windows
+ * and macOS it returned an unavailable backend unconditionally, and every
+ * authenticated command (including `cuna claude`) failed before reaching the
+ * vault. These cases pin the wiring itself: that a resolved bridge is actually
+ * installed into the backend, and that a refused one fails closed while
+ * carrying the admission error's own message forward.
+ *
+ * Today the release index is empty and the platform packages are unpublished,
+ * so the real resolver always refuses. Injecting the resolver is what makes the
+ * success path observable at all -- without it the wiring would be untestable
+ * until the packages ship, which is how it stayed unwired.
+ */
+function stubCredentialBridge(platform) {
+  const stored = new Map();
+  return Object.freeze({
+    platform,
+    backendId: `${platform}-stub-vault`,
+    transportSecurity: "native_memory_only",
+    read: async (target) => stored.get(target),
+    replace: async (target, value) => void stored.set(target, Uint8Array.from(value)),
+    delete: async (target) => (stored.delete(target) ? "deleted" : "absent"),
+  });
+}
+
+test("a resolved native bridge is installed into the platform credential backend", async () => {
+  for (const platform of ["win32", "darwin"]) {
+    const authority = await resolvePlatformAuthority({
+      platform,
+      nativeBridges: async () => ({
+        platform,
+        architecture: "x64",
+        packageName: "@cuna_labs/cli-native-win32-x64",
+        packageVersion: "0.0.0",
+        credentialBridge: stubCredentialBridge(platform),
+        browserBridge: Object.freeze({ platform, open: async () => {} }),
+      }),
+    });
+    assert.equal(authority.credentials.backendId, `${platform}-stub-vault`, platform);
+    // A live round trip through the bridge, not merely a constructed object:
+    // the previous behaviour also produced a backend, just a dead one.
+    const evidence = await authority.credentials.probe();
+    assert.equal(evidence.status, "verified", `${platform} probe`);
+    assert.equal(evidence.source, "native_bridge_round_trip", `${platform} source`);
+    assert.notEqual(authority.browserBridge, undefined, `${platform} browser bridge`);
+  }
+});
+
+test("a refused native authority fails closed and carries its reason", async () => {
+  const authority = await resolvePlatformAuthority({
+    platform: "win32",
+    nativeBridges: async () => {
+      throw new CredentialBoundaryError({
+        code: "credential_backend_unverified",
+        message: "The installed native authentication package identity does not match this release.",
+      });
+    },
+  });
+  assert.equal(authority.browserBridge, undefined);
+  const evidence = await authority.credentials.probe();
+  assert.equal(evidence.status, "unavailable");
+  // The distinguishing fact: which admission check refused, not just "no vault".
+  assert.equal(
+    evidence.reason,
+    "The installed native authentication package identity does not match this release.",
+  );
+  await assert.rejects(
+    authority.credentials.read("target"),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unavailable",
+  );
+});
+
+test("Linux resolves its own adapter without consulting the native package", async () => {
+  let consulted = false;
+  const authority = await resolvePlatformAuthority({
+    platform: "linux",
+    nativeBridges: async () => {
+      consulted = true;
+      return undefined;
+    },
+  });
+  assert.equal(consulted, false);
+  assert.equal(authority.browserBridge, undefined);
+  assert.equal(authority.credentials.platform, "linux");
 });

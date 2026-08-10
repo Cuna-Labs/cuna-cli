@@ -319,7 +319,15 @@ export class CredentialVault {
       throw credentialFailure(
         evidence.status === "unavailable" ? "credential_backend_unavailable" : "credential_backend_unverified",
         "The secure credential store lacks current platform-bound evidence.",
-        { safeDetails: { backendId: this.#backend.backendId, status: evidence.status } },
+        {
+          safeDetails: {
+            backendId: this.#backend.backendId,
+            status: evidence.status,
+            // The backend states WHY it is unavailable and this frame used to
+            // drop it, so every cause printed the same unactionable sentence.
+            ...(evidence.reason === undefined ? {} : { reason: evidence.reason }),
+          },
+        },
       );
     }
   }
