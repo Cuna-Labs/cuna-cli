@@ -309,7 +309,6 @@ async function withConversionDeadline<T>(operation: Promise<T>, timeoutMs: numbe
           "terminal_protocol_error",
           "The terminal message conversion exceeded its bounded deadline.",
         )), timeoutMs);
-        timeout.unref();
       }),
     ]);
   } finally {

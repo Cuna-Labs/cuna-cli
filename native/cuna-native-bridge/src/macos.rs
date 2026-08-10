@@ -23,7 +23,6 @@ const ERR_SEC_USER_CANCELED: OsStatus = -128;
 const ERR_SEC_AUTH_FAILED: OsStatus = -25_293;
 const ERR_SEC_DUPLICATE_ITEM: OsStatus = -25_299;
 const ERR_SEC_ITEM_NOT_FOUND: OsStatus = -25_300;
-const ERR_SEC_INTERACTION_NOT_ALLOWED: OsStatus = -25_308;
 const ERR_SEC_DECODE: OsStatus = -26_275;
 
 #[repr(C)]

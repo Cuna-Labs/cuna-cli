@@ -154,7 +154,7 @@ impl Response {
         }
     }
 
-    #[cfg(any(windows, target_os = "macos", test))]
+    #[cfg(any(windows, target_os = "macos"))]
     pub const fn protected(payload: Vec<u8>) -> Self {
         Self {
             status: Status::Ok,
