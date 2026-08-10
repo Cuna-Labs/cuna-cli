@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
+import { TestResourceLedger } from "./support/test-resource-ledger.mjs";
 
 import { decodeTerminalControl, decodeTerminalFrame, encodeTerminalControl, encodeTerminalFrame, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
 import { requireVerifiedPtyAdapter } from "../dist/pty/evidence-gate.js";
@@ -16,6 +16,26 @@ import { createUnavailableTerminalControlPlane, validateTerminalGrant } from "..
 const NOW = 1_800_000_000_000;
 const CAPABILITY_ID = "terminal_connections.create";
 const API_ORIGIN = "https://api.getcuna.com";
+
+/**
+ * Temporary trees go through the owned-temp authority, never a bare
+ * `rm(recursive)`.
+ *
+ * On Windows, unlinking a file whose handle is still open leaves a
+ * delete-pending entry: it disappears from `readdir` but keeps the parent
+ * directory un-removable, so `rmdir` fails ENOTEMPTY on a directory that reads
+ * as empty. The two journal tests below used a bare `rm` and failed that way
+ * roughly one run in four under parallel load -- measured here as
+ * `code=ENOTEMPTY remaining=[] recoveredAfterMs=2`. Because `prepack` is
+ * `typecheck && test`, that made `npm pack` and `npm publish` fail at random
+ * from a Windows machine.
+ *
+ * `removeOwnedTempDirectory` already retries (maxRetries 3, retryDelay 100) and
+ * seven other test files in this repository already pass the same options
+ * inline. These two sites were the only ones that did not.
+ */
+const resources = new TestResourceLedger();
+test.after(() => resources.cleanup());
 
 function capabilitySnapshot(agentSessionId, overrides = {}) {
   return {
@@ -458,7 +478,7 @@ test("shutdown retains failed terminal cleanup authority and retries it to compl
 });
 
 test("shutdown fences an in-flight sync open and waits until its lease is released", async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "runa-runtime-sync-shutdown-"));
+  const directory = await resources.createTempDirectory("runa-runtime-sync-shutdown-");
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);
   const journalDirectory = path.join(directory, "journal");
@@ -476,8 +496,10 @@ test("shutdown fences an in-flight sync open and waits until its lease is releas
   const stopping = runtime.shutdown();
   await assert.rejects(opening, (error) => error instanceof RuntimeBoundaryError && error.code === "runtime_closed");
   await stopping;
+  // The lease assertion above is the actual subject of this test. Removing the
+  // tree is teardown, and on Windows it must go through the owned-temp
+  // authority: see the note on `resources` at the top of this file.
   await assert.rejects(access(path.join(journalDirectory, "writer.lease")), (error) => error.code === "ENOENT");
-  await rm(directory, { recursive: true, force: true });
 });
 
 test("TC-055-13 concurrent attach reserves both tab and AgentSession identities before awaiting", async () => {
@@ -1308,7 +1330,7 @@ test("Node process adapter executes argv without a shell and excludes credential
 });
 
 test("runtime sync boundary acquires one durable journal writer and begins in reconciliation", async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "runa-runtime-sync-"));
+  const directory = await resources.createTempDirectory("runa-runtime-sync-");
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);
   try {
@@ -1338,7 +1360,6 @@ test("runtime sync boundary acquires one durable journal writer and begins in re
     await handle.close();
   } finally {
     await runtime.shutdown();
-    await rm(directory, { recursive: true, force: true });
   }
 });
 
