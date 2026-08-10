@@ -98,7 +98,7 @@ test("TC-048-14 fresh verification rejects post-discovery substitution", async (
     runtimePlatform: "win32",
     runtimeArchitecture: "x64",
   });
-  await writeFile(path.join(fixture.root, "runa-native-bridge.exe"), "substituted");
+  await writeFile(path.join(fixture.root, "cuna-native-bridge.exe"), "substituted");
   await assert.rejects(admitted.verifier.verify(admitted.descriptor), isUnverified);
 });
 
@@ -130,27 +130,27 @@ test("TC-048-15 signer and protected-location observations are mandatory", async
 });
 
 async function createFixture() {
-  const root = path.normalize(await mkdtemp(path.join(tmpdir(), "runa-native-admission-")));
+  const root = path.normalize(await mkdtemp(path.join(tmpdir(), "cuna-native-admission-")));
   const binary = Buffer.from("unit-test-only-native-binary", "utf8");
   const binarySha256 = sha256(binary);
   const sbom = {
     spdxVersion: "SPDX-2.3",
     dataLicense: "CC0-1.0",
-    packages: [{ name: "runa-native-bridge", versionInfo: "0.1.0" }],
+    packages: [{ name: "cuna-native-bridge", versionInfo: "0.1.0" }],
   };
   const sbomBytes = jsonBytes(sbom);
   const sbomSha256 = sha256(sbomBytes);
   const provenance = {
-    schema: "runa.native-bridge-provenance.v1",
+    schema: "cuna.native-bridge-provenance.v1",
     releaseEligible: true,
-    subject: { file: "runa-native-bridge.exe", sha256: binarySha256 },
+    subject: { file: "cuna-native-bridge.exe", sha256: binarySha256 },
     build: {
       packageVersion: "0.1.0",
       nativeVersion: "0.1.0",
       platform: "win32",
       architecture: "x64",
     },
-    sbom: { file: "runa-native-bridge.spdx.json", sha256: sbomSha256 },
+    sbom: { file: "cuna-native-bridge.spdx.json", sha256: sbomSha256 },
     signature: {
       status: "verified",
       kind: "authenticode",
@@ -159,38 +159,38 @@ async function createFixture() {
   };
   const provenanceBytes = jsonBytes(provenance);
   const manifest = {
-    schema: "runa.native-bridge-manifest.v1",
+    schema: "cuna.native-bridge-manifest.v1",
     releaseStatus: "production-signed",
-    protocol: "runa.native-bridge.v1",
+    protocol: "cuna.native-bridge.v1",
     platform: "win32",
     architecture: "x64",
     packageVersion: "0.1.0",
     nativeVersion: "0.1.0",
     fileVersion: "0.1.0.0",
-    executableFile: "runa-native-bridge.exe",
+    executableFile: "cuna-native-bridge.exe",
     maximumCredentialBytes: 2_560,
     binarySha256,
-    sbom: { file: "runa-native-bridge.spdx.json", sha256: sbomSha256 },
-    provenance: { file: "runa-native-bridge.provenance.json", sha256: sha256(provenanceBytes) },
+    sbom: { file: "cuna-native-bridge.spdx.json", sha256: sbomSha256 },
+    provenance: { file: "cuna-native-bridge.provenance.json", sha256: sha256(provenanceBytes) },
     signature: { kind: "authenticode", publisherCertificateFingerprint: fingerprint },
   };
   const manifestBytes = jsonBytes(manifest);
   await Promise.all([
-    writeFile(path.join(root, "runa-native-bridge.exe"), binary),
-    writeFile(path.join(root, "runa-native-bridge.spdx.json"), sbomBytes),
-    writeFile(path.join(root, "runa-native-bridge.provenance.json"), provenanceBytes),
-    writeFile(path.join(root, "runa-native-bridge.manifest.json"), manifestBytes),
+    writeFile(path.join(root, "cuna-native-bridge.exe"), binary),
+    writeFile(path.join(root, "cuna-native-bridge.spdx.json"), sbomBytes),
+    writeFile(path.join(root, "cuna-native-bridge.provenance.json"), provenanceBytes),
+    writeFile(path.join(root, "cuna-native-bridge.manifest.json"), manifestBytes),
   ]);
   return {
     root,
     binarySha256,
     trust: {
-      schema: "runa.native-bridge-trust.v1",
+      schema: "cuna.native-bridge-trust.v1",
       installRoot: root,
       manifestSha256: sha256(manifestBytes),
       platform: "win32",
       architecture: "x64",
-      protocol: "runa.native-bridge.v1",
+      protocol: "cuna.native-bridge.v1",
       packageVersion: "0.1.0",
       nativeVersion: "0.1.0",
       fileVersion: "0.1.0.0",

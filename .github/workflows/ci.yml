@@ -110,12 +110,12 @@ jobs:
         shell: pwsh
         run: >-
           ./scripts/capture-native-windows-identity.ps1
-          -Executable native/target/release/runa-native-bridge.exe
+          -Executable native/target/release/cuna-native-bridge.exe
           -Output evidence/native-identity.json
       - name: Generate content-addressed native SBOM and provenance evidence
         run: >-
           node scripts/generate-native-release-evidence.mjs
-          --binary native/target/release/runa-native-bridge.exe
+          --binary native/target/release/cuna-native-bridge.exe
           --identity evidence/native-identity.json
           --output evidence/native-local
       - name: Verify local evidence remains explicitly non-admissible

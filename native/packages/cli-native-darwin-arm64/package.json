@@ -11,10 +11,10 @@
   ],
   "files": [
     "cuna-native-authority.node",
-    "runa-native-bridge",
-    "runa-native-bridge.manifest.json",
-    "runa-native-bridge.spdx.json",
-    "runa-native-bridge.provenance.json"
+    "cuna-native-bridge",
+    "cuna-native-bridge.manifest.json",
+    "cuna-native-bridge.spdx.json",
+    "cuna-native-bridge.provenance.json"
   ],
   "exports": {
     "./package.json": "./package.json"

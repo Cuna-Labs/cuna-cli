@@ -61,11 +61,6 @@
   "dependencies": {
     "@xterm/headless": "6.0.0"
   },
-  "optionalDependencies": {
-    "@cuna_labs/cli-native-darwin-arm64": "0.1.0",
-    "@cuna_labs/cli-native-darwin-x64": "0.1.0",
-    "@cuna_labs/cli-native-win32-x64": "0.1.0"
-  },
   "bundleDependencies": [
     "@xterm/headless"
   ]

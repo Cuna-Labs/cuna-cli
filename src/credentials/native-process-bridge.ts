@@ -22,7 +22,7 @@ const VERSION = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-
 const operation = Object.freeze({ read: 2, replace: 3, delete: 4, openBrowser: 5 } as const);
 
 export interface NativeBridgeDescriptor {
-  readonly protocol: "runa.native-bridge.v1";
+  readonly protocol: "cuna.native-bridge.v1";
   readonly platform: "win32" | "darwin";
   readonly architecture: "x64" | "arm64";
   readonly packageVersion: string;
@@ -437,7 +437,7 @@ function validateDescriptor(
 ): void {
   const pathAuthority = descriptor.platform === "win32" ? win32 : posix;
   if (
-    descriptor.protocol !== "runa.native-bridge.v1" ||
+    descriptor.protocol !== "cuna.native-bridge.v1" ||
     descriptor.platform !== runtimePlatform ||
     descriptor.architecture !== runtimeArchitecture ||
     !VERSION.test(descriptor.packageVersion) ||

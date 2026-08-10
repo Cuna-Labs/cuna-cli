@@ -31,9 +31,9 @@ test("Linux does not load a foreign native package", async () => {
 
 test("platform packages are exact, script-free, and contain only their own executable name", async () => {
   const fixtures = [
-    ["cli-native-win32-x64", "win32", "x64", "runa-native-bridge.exe"],
-    ["cli-native-darwin-x64", "darwin", "x64", "runa-native-bridge"],
-    ["cli-native-darwin-arm64", "darwin", "arm64", "runa-native-bridge"],
+    ["cli-native-win32-x64", "win32", "x64", "cuna-native-bridge.exe"],
+    ["cli-native-darwin-x64", "darwin", "x64", "cuna-native-bridge"],
+    ["cli-native-darwin-arm64", "darwin", "arm64", "cuna-native-bridge"],
   ];
   for (const [directory, platform, architecture, executable] of fixtures) {
     const manifest = JSON.parse(await readFile(
@@ -44,18 +44,32 @@ test("platform packages are exact, script-free, and contain only their own execu
     assert.deepEqual(manifest.cpu, [architecture]);
     assert.equal(Object.hasOwn(manifest, "scripts"), false);
     assert.equal(manifest.files.includes(executable), true);
-    assert.equal(manifest.files.includes(platform === "win32" ? "runa-native-bridge" : "runa-native-bridge.exe"), false);
+    assert.equal(manifest.files.includes(platform === "win32" ? "cuna-native-bridge" : "cuna-native-bridge.exe"), false);
     assert.deepEqual(manifest.exports, { "./package.json": "./package.json" });
   }
 });
 
-test("the public package selects every platform package as an exact optional dependency", async () => {
+test("the public package never selects an unpublished platform package it cannot install", async () => {
   const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
-  assert.deepEqual(manifest.optionalDependencies, {
-    "@cuna_labs/cli-native-darwin-arm64": "0.1.0",
-    "@cuna_labs/cli-native-darwin-x64": "0.1.0",
-    "@cuna_labs/cli-native-win32-x64": "0.1.0",
-  });
+  assert.equal(Object.hasOwn(manifest, "optionalDependencies"), false);
   assert.deepEqual(manifest.files, ["dist", "README.md", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]);
   assert.deepEqual(manifest.bin, { cuna: "./dist/bin/cuna.js" });
+});
+
+test("the lock file resolves every declared dependency so a clean install cannot fail", async () => {
+  const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+  const lock = JSON.parse(await readFile(path.join(root, "package-lock.json"), "utf8"));
+  const declared = [
+    ...Object.keys(manifest.dependencies ?? {}),
+    ...Object.keys(manifest.optionalDependencies ?? {}),
+    ...Object.keys(manifest.devDependencies ?? {}),
+  ];
+  for (const name of declared) {
+    assert.equal(
+      Object.hasOwn(lock.packages, `node_modules/${name}`),
+      true,
+      `${name} is declared but absent from package-lock.json`,
+    );
+  }
+  assert.deepEqual(lock.packages[""].optionalDependencies, undefined);
 });

@@ -99,12 +99,12 @@ export async function createProductionNativeAuthBridges(input: {
   const signatureAuthority = createSignatureAuthority(addon);
   const authority = createOwnedExchangeAuthority(addon, platform);
   const trust: NativeBridgeTrustPolicy = Object.freeze({
-    schema: "runa.native-bridge-trust.v1",
+    schema: "cuna.native-bridge-trust.v1",
     installRoot: normalize(packageRoot),
     manifestSha256: entry.manifestSha256,
     platform,
     architecture,
-    protocol: "runa.native-bridge.v1",
+    protocol: "cuna.native-bridge.v1",
     packageVersion: entry.packageVersion,
     nativeVersion: entry.nativeVersion,
     fileVersion: entry.fileVersion,
@@ -225,10 +225,10 @@ function validatePackageJson(bytes: Uint8Array, entry: NativePlatformReleaseEntr
 function platformPackageFiles(platform: "win32" | "darwin"): readonly string[] {
   return [
     "cuna-native-authority.node",
-    platform === "win32" ? "runa-native-bridge.exe" : "runa-native-bridge",
-    "runa-native-bridge.manifest.json",
-    "runa-native-bridge.spdx.json",
-    "runa-native-bridge.provenance.json",
+    platform === "win32" ? "cuna-native-bridge.exe" : "cuna-native-bridge",
+    "cuna-native-bridge.manifest.json",
+    "cuna-native-bridge.spdx.json",
+    "cuna-native-bridge.provenance.json",
   ];
 }
 

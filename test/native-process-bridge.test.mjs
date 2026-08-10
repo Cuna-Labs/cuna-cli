@@ -12,15 +12,15 @@ import {
 import { createBrowserOpener } from "../dist/index.js";
 
 const descriptor = Object.freeze({
-  protocol: "runa.native-bridge.v1",
+  protocol: "cuna.native-bridge.v1",
   platform: "win32",
   architecture: "x64",
   packageVersion: "0.1.0",
   nativeVersion: "0.1.0",
   fileVersion: "0.1.0.0",
-  executable: "C:\\Program Files\\Runa\\runa-native-bridge.exe",
-  workingDirectory: "C:\\Program Files\\Runa",
-  manifestPath: "C:\\Program Files\\Runa\\runa-native-bridge.manifest.json",
+  executable: "C:\\Program Files\\Cuna\\cuna-native-bridge.exe",
+  workingDirectory: "C:\\Program Files\\Cuna",
+  manifestPath: "C:\\Program Files\\Cuna\\cuna-native-bridge.manifest.json",
   maximumCredentialBytes: 2_560,
   binarySha256: "a".repeat(64),
   manifestSha256: "b".repeat(64),
@@ -338,7 +338,7 @@ test("native credential operations reject targets outside the exact Runa namespa
 });
 
 test("TC-048-12 closed native statuses distinguish absence and corruption", async () => {
-  const replies = [response(1), response(1, Uint8Array.from([9])), Buffer.from("not-a-runa-response")];
+  const replies = [response(1), response(1, Uint8Array.from([9])), Buffer.from("not-a-cuna-response")];
   const bridge = createNativeCredentialProcessBridge({
     descriptor,
     runtimePlatform: "win32",

@@ -17,10 +17,10 @@ import {
 } from "./native-process-bridge.js";
 import type { SecureProcessRunner } from "./process-runner.js";
 
-const MANIFEST_FILE = "runa-native-bridge.manifest.json";
-const MANIFEST_SCHEMA = "runa.native-bridge-manifest.v1";
-const PROVENANCE_SCHEMA = "runa.native-bridge-provenance.v1";
-const TRUST_SCHEMA = "runa.native-bridge-trust.v1";
+const MANIFEST_FILE = "cuna-native-bridge.manifest.json";
+const MANIFEST_SCHEMA = "cuna.native-bridge-manifest.v1";
+const PROVENANCE_SCHEMA = "cuna.native-bridge-provenance.v1";
+const TRUST_SCHEMA = "cuna.native-bridge-trust.v1";
 const MAXIMUM_MANIFEST_BYTES = 64 * 1024;
 const MAXIMUM_EVIDENCE_BYTES = 4 * 1024 * 1024;
 const MAXIMUM_BINARY_BYTES = 32 * 1024 * 1024;
@@ -40,7 +40,7 @@ export interface NativeBridgeTrustPolicy {
   readonly manifestSha256: string;
   readonly platform: SupportedPlatform;
   readonly architecture: SupportedArchitecture;
-  readonly protocol: "runa.native-bridge.v1";
+  readonly protocol: "cuna.native-bridge.v1";
   readonly packageVersion: string;
   readonly nativeVersion: string;
   readonly fileVersion: string;
@@ -76,7 +76,7 @@ export interface AdmittedNativeBridge {
 interface NativeBridgeManifest {
   readonly schema: typeof MANIFEST_SCHEMA;
   readonly releaseStatus: "production-signed";
-  readonly protocol: "runa.native-bridge.v1";
+  readonly protocol: "cuna.native-bridge.v1";
   readonly platform: SupportedPlatform;
   readonly architecture: SupportedArchitecture;
   readonly packageVersion: string;
@@ -268,7 +268,7 @@ function validateTrust(
     !pathAuthority.isAbsolute(trust.installRoot) ||
     pathAuthority.normalize(trust.installRoot) !== trust.installRoot ||
     trust.installRoot.includes("\0") ||
-    trust.protocol !== "runa.native-bridge.v1" ||
+    trust.protocol !== "cuna.native-bridge.v1" ||
     !VERSION.test(trust.packageVersion) ||
     !VERSION.test(trust.nativeVersion) ||
     !FILE_VERSION.test(trust.fileVersion) ||
@@ -312,10 +312,10 @@ function parseManifest(bytes: Uint8Array, trust: NativeBridgeTrustPolicy): Nativ
     value.maximumCredentialBytes !== 2_560 ||
     typeof value.binarySha256 !== "string" || !SHA256.test(value.binarySha256) ||
     typeof sbom.file !== "string" || !SAFE_FILE.test(sbom.file) ||
-    sbom.file !== "runa-native-bridge.spdx.json" ||
+    sbom.file !== "cuna-native-bridge.spdx.json" ||
     typeof sbom.sha256 !== "string" || !SHA256.test(sbom.sha256) ||
     typeof provenance.file !== "string" || !SAFE_FILE.test(provenance.file) ||
-    provenance.file !== "runa-native-bridge.provenance.json" ||
+    provenance.file !== "cuna-native-bridge.provenance.json" ||
     typeof provenance.sha256 !== "string" || !SHA256.test(provenance.sha256) ||
     signature.kind !== trust.signature.kind ||
     signature.publisherCertificateFingerprint !== trust.signature.publisherCertificateFingerprint
@@ -334,7 +334,7 @@ function verifySbom(bytes: Uint8Array, manifest: NativeBridgeManifest): void {
     throw unverified();
   }
   if (!Array.isArray(value.packages) || !value.packages.some((entry) =>
-    isRecord(entry) && entry.name === "runa-native-bridge" && entry.versionInfo === manifest.nativeVersion
+    isRecord(entry) && entry.name === "cuna-native-bridge" && entry.versionInfo === manifest.nativeVersion
   )) throw unverified();
 }
 
@@ -463,7 +463,7 @@ function sameDescriptor(left: NativeBridgeDescriptor, right: NativeBridgeDescrip
 }
 
 function expectedExecutableFile(platform: SupportedPlatform): string {
-  return platform === "win32" ? "runa-native-bridge.exe" : "runa-native-bridge";
+  return platform === "win32" ? "cuna-native-bridge.exe" : "cuna-native-bridge";
 }
 
 function expectedSignatureKind(platform: SupportedPlatform): SignatureKind {

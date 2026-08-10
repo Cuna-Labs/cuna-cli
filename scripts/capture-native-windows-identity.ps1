@@ -40,7 +40,7 @@ foreach ($rule in $acl.Access) {
 }
 
 $receipt = [ordered]@{
-  schema = 'runa.native-windows-identity.v1'
+  schema = 'cuna.native-windows-identity.v1'
   executable = $resolvedExecutable
   binarySha256 = $hash.Hash.ToLowerInvariant()
   signature = [ordered]@{

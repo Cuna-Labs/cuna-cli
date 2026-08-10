@@ -162,7 +162,7 @@ fn open_browser(payload: &[u8]) -> Response {
     }
     let mut operation = wide("open");
     let mut url = wide(url);
-    // SAFETY: both strings are NUL-terminated and live through the call. Runa invokes no
+    // SAFETY: both strings are NUL-terminated and live through the call. Cuna invokes no
     // intermediary executable here; downstream OS/browser telemetry remains an external
     // admission obligation and is not proven by this call succeeding.
     let result = unsafe {
