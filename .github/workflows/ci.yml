@@ -57,6 +57,32 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  # The branch ruleset requires a check literally named `source-quality-gates`.
+  # `source-gates` is a matrix, so it can only ever emit
+  # `source-quality-node-<version>` -- one check per Node line, and no check
+  # under the required name. With zero bypass actors that made every pull
+  # request unmergeable. This job is the single stable name the ruleset can
+  # name; it carries no gate logic of its own and exists only to collapse the
+  # matrix result. `if: always()` is required so the job still reports when a
+  # lane fails, and any result other than `success` -- including `skipped`,
+  # which is what a failure in `public-controls` produces -- fails it.
+  source-quality-gates:
+    name: source-quality-gates
+    if: always()
+    needs: source-gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every Node source-quality lane to have succeeded
+        env:
+          SOURCE_GATES_RESULT: ${{ needs.source-gates.result }}
+        run: |
+          echo "source-gates aggregate result: ${SOURCE_GATES_RESULT}"
+          if [ "${SOURCE_GATES_RESULT}" != "success" ]; then
+            echo "::error::source-quality gates did not succeed (${SOURCE_GATES_RESULT})."
+            exit 1
+          fi
+
   native-source-gates:
     name: native-source-${{ matrix.id }}
     needs: public-controls

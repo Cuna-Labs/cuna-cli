@@ -1,4 +1,4 @@
-import { access, readFile } from "node:fs/promises";
+import { access, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { invariant, parseArgs, readJson } from "./lib/release-evidence.mjs";
@@ -162,6 +162,73 @@ invariant(approvalAttestationAt > approvalSemanticAt, "Release approval attestat
 invariant(
   approvalNonceBlockAt > approvalAttestationAt && npmPublishAt > approvalNonceBlockAt,
   "Publication must remain fail-closed before npm publish until one-use nonce consumption is configured",
+);
+
+// Every status check the branch ruleset requires must actually be emitted by a
+// job, under exactly that name, in a workflow that runs on pull_request. A
+// required check that nothing emits is never reported, so with no bypass actors
+// the pull request waits forever -- the merge is blocked by a check that cannot
+// arrive rather than by one that failed. That is invisible to lint, typecheck
+// and the test suite, and it is how `source-quality-gates` came to be required
+// while only `source-quality-node-${{ matrix.node }}` existed.
+const checkContract = await readJson(path.join(root, ".github", "required-status-checks.json"));
+invariant(
+  Array.isArray(checkContract.requiredStatusChecks) && checkContract.requiredStatusChecks.length > 0,
+  "Required status check contract is empty or malformed",
+);
+const workflowDirectory = path.join(root, ".github", "workflows");
+const workflowFiles = (await readdir(workflowDirectory))
+  .filter((entry) => entry.endsWith(".yml") || entry.endsWith(".yaml"))
+  .sort();
+// A job name carrying a ${{ }} expression is expanded per matrix entry and can
+// therefore never equal a fixed required-check name -- exactly the mistake this
+// block exists to catch -- so such names are not counted as emitters.
+const pullRequestCheckNames = new Map();
+for (const file of workflowFiles) {
+  const definition = parseYaml(await readFile(path.join(workflowDirectory, file), "utf8"), {
+    prettyErrors: true,
+    uniqueKeys: true,
+  });
+  if (!definition || typeof definition !== "object" || Array.isArray(definition)) continue;
+  const triggers = definition.on;
+  const runsOnPullRequest = triggers === "pull_request" ||
+    (Array.isArray(triggers) && triggers.includes("pull_request")) ||
+    (triggers !== null && typeof triggers === "object" && !Array.isArray(triggers) &&
+      Object.hasOwn(triggers, "pull_request"));
+  if (!runsOnPullRequest) continue;
+  for (const [jobId, job] of Object.entries(definition.jobs ?? {})) {
+    if (!job || typeof job !== "object" || Array.isArray(job)) continue;
+    const checkName = typeof job.name === "string" ? job.name : jobId;
+    if (checkName.includes("${{")) continue;
+    pullRequestCheckNames.set(checkName, [...(pullRequestCheckNames.get(checkName) ?? []), `${file}:${jobId}`]);
+  }
+}
+for (const required of checkContract.requiredStatusChecks) {
+  const emitters = pullRequestCheckNames.get(required) ?? [];
+  invariant(
+    emitters.length === 1,
+    emitters.length === 0
+      ? `Required status check "${required}" is emitted by no pull_request workflow job; every pull request would block forever waiting for it`
+      : `Required status check "${required}" is emitted by ${emitters.length} jobs (${emitters.join(", ")}); the reported result would be ambiguous`,
+  );
+}
+// The summary check must aggregate the matrix rather than pass independently of
+// it: it has to observe the matrix result and it has to report even when the
+// matrix fails, or it would report success while the gates were red.
+const summary = jobs["source-quality-gates"];
+invariant(summary && typeof summary === "object", "CI workflow job is missing: source-quality-gates");
+invariant(summary.if === "always()", "The source-quality-gates summary must report even when a gate lane fails");
+invariant(
+  JSON.stringify(needsList(summary)) === JSON.stringify(["source-gates"]),
+  "The source-quality-gates summary must aggregate exactly the source-gates matrix",
+);
+const summaryText = summary.steps
+  .flatMap((step) => [step?.run, ...Object.values(step?.env ?? {})])
+  .filter((value) => typeof value === "string")
+  .join("\n");
+invariant(
+  summaryText.includes("needs.source-gates.result") && summaryText.includes('!= "success"'),
+  "The source-quality-gates summary must fail on any source-gates result other than success",
 );
 
 process.stdout.write(`${JSON.stringify({ status: "verified", package: packageJson.name, version: packageJson.version })}\n`);
