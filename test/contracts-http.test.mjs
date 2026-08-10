@@ -259,7 +259,11 @@ test("API-key display metadata decodes every brand the key store has ever stored
     last_used_at: null,
     revoked_at: null,
   };
-  for (const brand of CREDENTIAL_BRANDS) {
+  // Literal floor: a loop over CREDENTIAL_BRANDS alone stays green when the
+  // list shrinks, which is the exact failure being regressed against.
+  assert.ok(CREDENTIAL_BRANDS.includes("cuna"));
+  assert.ok(CREDENTIAL_BRANDS.includes("runa"));
+  for (const brand of new Set(["cuna", "runa", ...CREDENTIAL_BRANDS])) {
     const prefix = `${brand}_sk_`;
     assert.equal(
       decodeApiKeyList([{ ...metadata, prefix }])[0].prefix,
@@ -672,8 +676,15 @@ test("terminal grant decoder is closed, complete, and secret-url separated", () 
 // with no window: `cuna terminal` is a hard failure, not a degraded path.
 test("terminal grant decoder admits every minted connect origin and token brand", () => {
   const terminalSessionId = "55555555-5555-4555-8555-555555555555";
-  for (const origin of API_WEBSOCKET_ORIGINS) {
-    for (const brand of CREDENTIAL_BRANDS) {
+  // Literal floor: production mints the grant under whichever API host is
+  // deployed, and the token brand is on the "free to rename" list. Neither
+  // list may shrink, and a loop over them alone would not notice.
+  assert.ok(API_WEBSOCKET_ORIGINS.includes("wss://api.getcuna.com"));
+  assert.ok(API_WEBSOCKET_ORIGINS.includes("wss://api.runacode.io"));
+  for (const origin of new Set([
+    "wss://api.getcuna.com", "wss://api.runacode.io", ...API_WEBSOCKET_ORIGINS,
+  ])) {
+    for (const brand of new Set(["cuna", "runa", ...CREDENTIAL_BRANDS])) {
       const grant = terminalGrant({
         connect_url: `${origin}/v1/terminal-connections/${terminalSessionId}/stream`,
         connect_token: `${brand}_tc_${"A".repeat(43)}`,
@@ -893,7 +904,9 @@ test("HTTP errors preserve retryability only from a closed canonical Problem", a
     }),
   });
 
-  for (const origin of API_ORIGINS) {
+  for (const origin of new Set([
+    "https://api.getcuna.com", "https://api.runacode.io", ...API_ORIGINS,
+  ])) {
     await assert.rejects(
       makeTransport(origin, 503, false).request({ method: "GET", path: "/v1/capabilities" }),
       (error) => error instanceof RunaError &&
@@ -965,7 +978,13 @@ test("workspace sync Problems preserve only the negotiated protocol and canonica
   });
 
   // Both minted Problem-URI origins decode into the same closed metadata.
-  for (const origin of API_ORIGINS) {
+  // Literal floor, so shrinking API_ORIGINS fails here instead of running
+  // one case fewer. Production mints `api.runacode.io` today.
+  assert.ok(API_ORIGINS.includes("https://api.getcuna.com"));
+  assert.ok(API_ORIGINS.includes("https://api.runacode.io"));
+  for (const origin of new Set([
+    "https://api.getcuna.com", "https://api.runacode.io", ...API_ORIGINS,
+  ])) {
     await assert.rejects(
       makeTransport(426, {}, origin).request({ method: "POST", path: "/v1/workspaces/w_1/sync-sessions" }),
       (error) => error instanceof RunaError &&

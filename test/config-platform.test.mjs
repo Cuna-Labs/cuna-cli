@@ -45,7 +45,12 @@ test("configuration defaults to the canonical production origin and never persis
 // mints before a single request left the process — the CLI was unusable with a
 // valid credential. Every brand the product has ever issued must resolve.
 test("CUNA_API_KEY admits every credential brand the service has issued", async () => {
-  for (const brand of CREDENTIAL_BRANDS) {
+  // Literal floor. A loop over CREDENTIAL_BRANDS alone cannot detect its own
+  // subject shrinking: drop a brand and the loop just runs one case fewer,
+  // still green. These two names are live credentials and may never be dropped.
+  assert.ok(CREDENTIAL_BRANDS.includes("cuna"));
+  assert.ok(CREDENTIAL_BRANDS.includes("runa"));
+  for (const brand of new Set(["cuna", "runa", ...CREDENTIAL_BRANDS])) {
     const apiKey = `${brand}_sk_${"a".repeat(43)}`;
     const config = await resolveConfig({
       platform: fakePlatform(),
