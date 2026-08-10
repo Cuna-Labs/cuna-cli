@@ -128,6 +128,48 @@ local view, and `Ctrl+] Ctrl+]` sends a literal prefix to the cloud session.
 These keys are ignored as Cuna commands inside bracketed paste. Ordinary
 `Ctrl+C` and `Ctrl+Z` continue to the selected cloud session.
 
+## Exit codes
+
+The exit code is the entire contract for a caller that is not a human, and this
+build is used almost exclusively that way. `3`, `7` and `8` all mean "the command
+did not do what you asked" and each demands a different response: replace the
+credential, treat the answer as untrustworthy, or stop asking this deployment for
+this operation. Reading them as one undifferentiated failure loses that.
+
+The table is projected from the `EXIT_CODES` map in `src/core/errors.ts`; the
+descriptions live beside it in `src/core/exit-codes.ts`, and
+`test/exit-code-contract.test.mjs` pins every number against a literal so a code
+cannot change meaning without a named test failing.
+
+<!-- BEGIN GENERATED: exit-codes -->
+| Exit code | Name | Meaning | One reachable path |
+| --- | --- | --- | --- |
+| `0` | `success` | The command completed and the record it printed is authoritative. | `cuna self-test --offline` verifies the installed artifact without a network request and returns. |
+| `2` | `usage` | The invocation or the resolved configuration is invalid. | `cuna nonsense` fails the command preflight with `cuna.usage.invalid`. Nothing is sent to the server. |
+| `3` | `auth` | No usable credential, a rejected credential, or an auth-mode conflict. | `cuna whoami` while `CUNA_API_KEY` is set mints `cuna.auth.mode_conflict`. A credential the server refuses arrives as `cuna.auth.rejected` from HTTP 401. |
+| `4` | `policy` | Understood and refused by policy, including a required confirmation. | `cuna machines delete ID` without `--yes` mints `cuna.confirmation.required`. A server refusal arrives as `cuna.policy.denied` from HTTP 403. |
+| `5` | `network` | No authoritative answer arrived: timeout, cancellation, 429, or 5xx. | a request exceeding `--timeout-ms` mints `cuna.network.timeout`. HTTP 429 and 5xx arrive as `cuna.network.rate_limited` and `cuna.network.service_unavailable`. |
+| `6` | `conflict` | Current state contradicts the change; repeating it unchanged repeats this. | HTTP 409 mints `cuna.remote.conflict`. A foreground attach to a session already held mints `cuna.runtime.session_conflict`. |
+| `7` | `remote` | The server answered, but not in a way the published contract allows. | `cuna account show` against a deployment whose body fails contract decoding mints `cuna.remote.malformed_response`. A 404 that does carry a JSON body is an absent resource and lands here as `cuna.remote.not_found`. |
+| `8` | `unsupported` | This deployment does not serve or does not advertise the capability. | `cuna records list` against a deployment with no route for it mints `cuna.remote.operation_not_served`: HTTP 404 whose body is not JSON, which only a layer in front of the API writes. |
+| `70` | `internal` | The CLI itself failed; no server outcome is implied. | any throw that is not a `CunaError` reaching the top of `runCli` is normalized to `cuna.internal.unexpected`. |
+<!-- END GENERATED: exit-codes -->
+
+Three properties a script may rely on:
+
+- **The set is closed.** `runCli` returns the `ExitCode` union and catches every
+  error before returning; anything that is not already a `CunaError` is
+  normalized to `internal` first. A status outside this table did not come from
+  the CLI's own handler.
+- **`5` never proves the request was not applied.** A timeout or transport
+  failure cannot establish whether a mutation reached the authority, so the CLI
+  fails closed and does not retry a mutation on its own. Reconcile before
+  repeating one.
+- **`8` is not a transient condition.** It reports the deployed server contract,
+  not load. Retrying the same call against the same deployment returns `8` again.
+
+Every code is also listed under `Exit codes:` in `cuna --help`.
+
 ## Configuration and authentication
 
 Configuration precedence is flag, environment, selected user profile, then the

@@ -112,6 +112,13 @@ export {
   type SafeErrorDetails,
 } from "./core/errors.js";
 export {
+  DOCUMENTED_EXIT_CODES,
+  exitCodeHelpSection,
+  exitCodeMarkdownTable,
+  type DocumentedExitCode,
+  type ExitCodeName,
+} from "./core/exit-codes.js";
+export {
   API_ORIGINS,
   API_WEBSOCKET_ORIGINS,
   CREDENTIAL_BRANDS,

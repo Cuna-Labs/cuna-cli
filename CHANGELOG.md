@@ -40,9 +40,29 @@ follow [Semantic Versioning](https://semver.org/).
 - A configuration error raised by the environment now names the variable at
   fault in its `hint` and in `details.variable`, instead of telling every
   caller to correct the selected user profile.
+- **An operation the deployed API does not serve now exits `8`, not `7`.** An
+  HTTP 404 whose body is not a JSON object is written by a layer in front of the
+  API, which has no route for the path; the transport used to decode the body
+  before reading the status, so that answer surfaced as
+  `cuna.remote.malformed_response` and exited `7`. It is now
+  `cuna.remote.operation_not_served` and exits `8`. Production serves 26 of the
+  57 operations this build knows, so this is the majority answer today and not
+  an edge case. **A consumer that branches on `7` for an unserved operation is
+  broken by this and must accept `8`.** The neighbouring case is unchanged: a
+  404 that does carry a JSON body is an absent resource, stays
+  `cuna.remote.not_found`, and still exits `7`.
 
 ### Added
 
+- The exit-code contract is documented. `README.md` gained an **Exit codes**
+  section listing all nine codes the program can return — `0`, `2`, `3`, `4`,
+  `5`, `6`, `7`, `8` and `70` — with one reachable path each, and
+  `cuna --help` gained an `Exit codes:` section listing the same set. Both are
+  projected from the `EXIT_CODES` map rather than transcribed beside it, so
+  neither can describe a build that no longer exists.
+  `test/exit-code-contract.test.mjs` pins every number against a hand-written
+  literal and exercises one reachable path per code, which is what makes a move
+  like the `7` to `8` above impossible to land unrecorded.
 - Established the initial public CLI architecture and release controls.
 - Initial fail-closed TypeScript CLI, public API client, cross-platform adapters,
   offline installed-artifact identity, and release-admission scaffolding.

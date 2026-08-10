@@ -1,3 +1,4 @@
+import { exitCodeHelpSection } from "../core/exit-codes.js";
 import { brandedEnvironmentNames } from "../core/namespace.js";
 
 // Help is the only place most users learn a variable name, so it is derived
@@ -5,6 +6,12 @@ import { brandedEnvironmentNames } from "../core/namespace.js";
 // stale exactly when the accepted set changes, which is the one moment it must
 // not.
 const API_KEY_NAMES = brandedEnvironmentNames("API_KEY").join(" or ");
+
+// Same reason, one layer up: the exit code is the entire contract for a caller
+// that is not a human, so the list below is projected from `EXIT_CODES` rather
+// than typed out beside it. A hand-written copy here would have kept printing
+// `7` for an unserved operation after that case moved to `8`.
+const EXIT_CODES_SECTION = exitCodeHelpSection();
 
 export const ROOT_HELP = `Cuna CLI
 
@@ -86,6 +93,11 @@ Global options:
   --no-color          Disable color (output is color-independent by default)
   --help              Show help (add it after any command for that command's help)
   --version           Show the CLI version
+
+Exit codes:
+${EXIT_CODES_SECTION}
+  This is the complete set this build can return. One reachable path per code is
+  documented under "Exit codes" in the README.
 
 Authentication:
   Use cuna signup for waitlist-only enrollment. It never assigns compute or starts billing.
