@@ -10,6 +10,11 @@ import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-i
 import { assertApiKeyUsable, resolveConfig, type EffectiveConfig } from "../config/config.js";
 import { executeCommand, preflightInvocation } from "../commands/commands.js";
 import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
+import {
+  CONSOLE_ORIGIN,
+  INTERNAL_DEFECT_HINT,
+  automationCredentialHint,
+} from "../core/product-web.js";
 import { integerArgument } from "../core/validation.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { resolvePlatformAuthority, type ResolvedPlatformAuthority } from "../credentials/platform.js";
@@ -34,7 +39,7 @@ import {
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
 import { commandHelp, helpTopicName } from "./command-help.js";
-import { ROOT_HELP } from "./help.js";
+import { FULL_HELP, ROOT_HELP } from "./help.js";
 import { createOutputWriter, type CliStreams } from "./output.js";
 import { booleanOption, parseArgv, stringOption } from "./parser.js";
 import { rejectUnknownOptions } from "./parser.js";
@@ -241,19 +246,31 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // `--no-color` happened to be on the allowlist and worked, which is what
     // made the behaviour look arbitrary rather than wrong.
     if (parsed.command === "help" || booleanOption(parsed, "help")) {
-      rejectUnknownOptions(parsed, ["help"]);
+      rejectUnknownOptions(parsed, ["help", "all"]);
       if (parsed.command === "help" && parsed.operands.length !== 0) throw usageError("help accepts no operands.");
       const topic = parsed.command === "help" || parsed.command === undefined
         ? undefined
         : parsed.command;
-      const help = commandHelp(topic, parsed.operands);
+      // `--all` widens the ROOT topic only. On a command topic the per-command
+      // help is already the complete surface for that command, so there is
+      // nothing to widen and the flag would promise something it cannot do.
+      const wantsFullSurface = booleanOption(parsed, "all");
+      if (wantsFullSurface && topic !== undefined) {
+        throw usageError(
+          "Option --all applies to `cuna help`, not to one command's help.",
+          `Run \`cuna ${topic} --help\` for this command, or \`cuna help --all\` for the complete surface.`,
+        );
+      }
+      const help = wantsFullSurface ? FULL_HELP : commandHelp(topic, parsed.operands);
       if (writer.structured) {
         writer.success(
           "help",
           {
             version: CLI_VERSION,
             output_schema_version: OUTPUT_SCHEMA_VERSION,
-            ...(topic === undefined ? {} : { topic: helpTopicName(topic, parsed.operands) }),
+            ...(topic === undefined
+              ? (wantsFullSurface ? { topic: "all" } : {})
+              : { topic: helpTopicName(topic, parsed.operands) }),
             help,
           },
           help,
@@ -451,6 +468,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           code: "cuna.auth.required",
           message: "The automatic Cuna journey requires authenticated account authority.",
           exitCode: EXIT_CODES.auth,
+          hint: `Run \`cuna login\` for interactive use, or use an automation credential. ${automationCredentialHint()}`,
         });
       }
       let effects: AgentJourneyEffects;
@@ -465,6 +483,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           code: "cuna.journey.workspace_identity_unavailable",
           message: "The signed-in account has no assigned workspace authority.",
           exitCode: EXIT_CODES.auth,
+          hint: `Run \`cuna workspace show\` to see the current assignment or waitlist position. Workspace assignment happens at ${CONSOLE_ORIGIN}, not from the CLI.`,
         });
       }
       const journeyScope = Object.freeze({ userId: identity.id, workspaceId });
@@ -483,6 +502,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
             code: "cuna.journey.workspace_transport_unavailable",
             message: "The injected API client did not provide authenticated workspace-sync transport authority.",
             exitCode: EXIT_CODES.unsupported,
+            hint: INTERNAL_DEFECT_HINT,
           });
         }
         const workspace = createWorkspaceJourneyEffects({

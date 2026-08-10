@@ -119,6 +119,15 @@ export {
   type ExitCodeName,
 } from "./core/exit-codes.js";
 export {
+  API_KEYS_URL,
+  CONSOLE_ORIGIN,
+  INTERNAL_DEFECT_HINT,
+  OFF_CONTRACT_RESPONSE_HINT,
+  SUPPORT_URL,
+  automationCredentialHint,
+} from "./core/product-web.js";
+export { ContractViolation, contractViolation } from "./core/validation.js";
+export {
   API_ORIGINS,
   API_WEBSOCKET_ORIGINS,
   CREDENTIAL_BRANDS,

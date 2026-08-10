@@ -583,7 +583,11 @@ test("an unusable credential vault names the credential path that still works", 
     (error) => error instanceof CunaError &&
       error.code === "cuna.auth.vault_unavailable" &&
       error.exitCode === 3 &&
-      error.hint === "Set CUNA_API_KEY to a Cuna automation credential to run commands without interactive sign-in.",
+      typeof error.hint === "string" &&
+      // Naming the variable is not enough, and that was the whole defect: the
+      // user was told to set CUNA_API_KEY and never told where a key comes from.
+      error.hint.includes("CUNA_API_KEY") &&
+      error.hint.includes("https://app.getcuna.com/api-keys"),
   );
   // The alternative is named before any network effect is attempted.
   assert.deepEqual(subject.client.calls, []);
@@ -614,6 +618,8 @@ test("a deployment with interactive sign-in disabled names the same alternative"
     subject.service.login(),
     (error) => error instanceof CunaError &&
       error.code === "cuna.auth.unavailable" &&
-      error.hint === "Set CUNA_API_KEY to a Cuna automation credential to run commands without interactive sign-in.",
+      typeof error.hint === "string" &&
+      error.hint.includes("CUNA_API_KEY") &&
+      error.hint.includes("https://app.getcuna.com/api-keys"),
   );
 });

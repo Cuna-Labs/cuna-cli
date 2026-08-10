@@ -15,6 +15,7 @@ import type {
 import type { EffectiveConfig } from "../config/config.js";
 import { DEFAULT_BASE_URL, environmentCredentialState, publicConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError, unsupportedError, usageError } from "../core/errors.js";
+import { OFF_CONTRACT_RESPONSE_HINT, SUPPORT_URL, automationCredentialHint } from "../core/product-web.js";
 import {
   assertCanonicalUuid,
   assertIdempotencyKey,
@@ -55,7 +56,7 @@ function requireCredential(context: CommandContext): void {
     code: "cuna.auth.required",
     message: "This command requires a Cuna credential.",
     exitCode: EXIT_CODES.auth,
-    hint: "Run `cuna login` for interactive use or set CUNA_API_KEY for explicit automation.",
+    hint: `Run \`cuna login\` for interactive use, or use an automation credential. ${automationCredentialHint()}`,
   });
 }
 
@@ -662,6 +663,20 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
           code: "cuna.remote.malformed_response",
           message: "Cuna returned a provider sign-out receipt for another AgentSession authority.",
           exitCode: EXIT_CODES.remote,
+          hint: OFF_CONTRACT_RESPONSE_HINT,
+          details: {
+            operation: "POST /v1/agent-sessions/{id}/agent-auth/logout",
+            // The first field that disagreed, not all four: a list of every
+            // compared field says nothing about which one was wrong.
+            field: receipt.agentSessionId !== session.id
+              ? "agent_session_id"
+              : receipt.processEpoch !== session.processEpoch
+                ? "process_epoch"
+                : receipt.authMode !== session.authMode
+                  ? "auth_mode"
+                  : "agent",
+            predicate: "matches_requested_resource",
+          },
         });
       }
       return Object.freeze({
@@ -772,6 +787,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       if (!ok) {
         throw new CunaError({
           code: "cuna.self_test.failed",
+      hint: `The installed CLI does not match its own build record. Reinstall with \`npm install -g @cuna_labs/cli\`, and report it at ${SUPPORT_URL} if it recurs.`,
           message: "The installed Cuna CLI failed an offline integrity check.",
           exitCode: EXIT_CODES.internal,
           details: {

@@ -39,6 +39,7 @@ export function resolvePlatformKind(platform: NodeJS.Platform): PlatformKind {
   if (platform === "linux") return "linux";
   throw new CunaError({
     code: "cuna.platform.unsupported",
+    hint: "Run `cuna doctor` to see which runtime features this platform provides.",
     message: `The ${platform} operating system is not supported.`,
     exitCode: EXIT_CODES.unsupported,
     details: { platform },

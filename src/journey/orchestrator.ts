@@ -373,6 +373,8 @@ export async function orchestrateAgentJourney(input: {
         code: "cuna.journey.machine_not_ready",
         message: "The selected machine did not reach authoritative running state.",
         exitCode: EXIT_CODES.remote,
+        hint: "Run `cuna machines list` to see its current state, then start it before attaching.",
+        details: { machine_id: machine.id, observed_state: machine.state },
       });
     }
 

@@ -1,3 +1,5 @@
+import { SUPPORT_URL } from "./product-web.js";
+
 export const EXIT_CODES = Object.freeze({
   success: 0,
   usage: 2,
@@ -101,7 +103,7 @@ export function normalizeError(error: unknown): CunaError {
     code: "cuna.internal.unexpected",
     message: "Cuna could not complete the command because of an internal failure.",
     exitCode: EXIT_CODES.internal,
-    hint: "Retry once. If the problem persists, run `cuna doctor --json` and contact Cuna support.",
+    hint: `Retry once. If the problem persists, run \`cuna doctor --json\` and report it at ${SUPPORT_URL}.`,
     cause: error,
   });
 }

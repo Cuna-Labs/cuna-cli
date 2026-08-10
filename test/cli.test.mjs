@@ -77,8 +77,17 @@ test("non-TTY help and version are versioned JSON records", async () => {
   const helpRecord = JSON.parse(help.stdout());
   assert.equal(helpRecord.schema_version, "1");
   assert.equal(helpRecord.type, "result");
-  assert.match(helpRecord.data.help, /Automatic local-to-cloud journey:/u);
-  assert.match(helpRecord.data.help, /Use --agent-session SESSION_ID to bypass reconciliation/u);
+  // `cuna --help` is now the SHORT orientation. Both sentences below still
+  // exist verbatim — they were relocated to `cuna help --all`, not removed —
+  // and the two assertions that follow prove exactly that: absent from the
+  // short help, present in the full one.
+  assert.doesNotMatch(helpRecord.data.help, /Automatic local-to-cloud journey:/u);
+  assert.match(helpRecord.data.help, /cuna help --all/u);
+  const all = memoryStreams();
+  assert.equal(await runCli(["help", "--all"], { streams: all.streams }), EXIT_CODES.success);
+  const allRecord = JSON.parse(all.stdout());
+  assert.match(allRecord.data.help, /Automatic local-to-cloud journey:/u);
+  assert.match(allRecord.data.help, /Use --agent-session SESSION_ID to bypass reconciliation/u);
   const version = memoryStreams();
   assert.equal(await runCli(["--version"], { streams: version.streams }), EXIT_CODES.success);
   assert.equal(JSON.parse(version.stdout()).data.version, "0.1.0");

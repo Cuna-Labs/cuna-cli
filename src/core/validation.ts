@@ -115,24 +115,95 @@ export function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/**
+ * A response that did not match the published contract, carrying WHICH part.
+ *
+ * WHY THIS TYPE EXISTS. Every decoder in `api/contracts.ts` already knew the
+ * exact predicate that failed and threw a bare `TypeError` whose message the
+ * client then discarded, so `cuna.remote.malformed_response` reached the user as
+ * one unactionable sentence — "Cuna returned a response that does not match the
+ * public contract." — with no `details` and no `hint`. Finding out that
+ * production omits `workspace.id` required isolating `decodeRunaIdentity` in a
+ * throwaway script. That is a diagnosis a user cannot perform and the CLI did
+ * not need to lose: the information existed at the throw site and died one
+ * `catch` later.
+ *
+ * WHAT MAY BE CARRIED, AND WHAT MAY NOT. `field` and `predicate` are NAMES and
+ * SHAPES. A response body may hold an API key, an email address, or a workspace
+ * path, so no value from the payload is ever placed on this error — not the
+ * offending value, not a truncation of it, not its length. `field` is the key
+ * path the CLI itself asked for and `predicate` is a fixed token chosen from
+ * this source tree. Both are safe to print and safe to log.
+ *
+ * `field` is the NARROWEST KNOWN location, not necessarily a leaf. A compound
+ * check that spans a subtree reports the subtree, because claiming a leaf it did
+ * not test would be a more precise answer than the code actually has.
+ */
+export class ContractViolation extends TypeError {
+  /** Narrowest known location, e.g. `workspace.id` or `capabilities[3].id`. */
+  readonly field: string | undefined;
+  /** Stable token naming the rule that failed, e.g. `required_string`. */
+  readonly predicate: string;
+
+  constructor(predicate: string, field?: string) {
+    super(field === undefined
+      ? `Contract violation: ${predicate}`
+      : `Contract violation: ${predicate} at ${field}`);
+    this.name = "ContractViolation";
+    this.predicate = predicate;
+    this.field = field;
+  }
+}
+
+/** Mint a contract violation. `field` is omitted when the check spans no one key. */
+export function contractViolation(predicate: string, field?: string): ContractViolation {
+  return field === undefined ? new ContractViolation(predicate) : new ContractViolation(predicate, field);
+}
+
+/**
+ * Run a nested decode, reporting any violation under `prefix`.
+ *
+ * Without this, `decodeRunaIdentity` reported `id` for a violation inside
+ * `workspace`, which names a key that also exists at the root — the one reading
+ * that would send a user to the wrong field.
+ */
+export function underField<T>(prefix: string, run: () => T): T {
+  try {
+    return run();
+  } catch (error) {
+    if (error instanceof ContractViolation) {
+      throw contractViolation(
+        error.predicate,
+        error.field === undefined ? prefix : `${prefix}.${error.field}`,
+      );
+    }
+    throw error;
+  }
+}
+
+/** The same, for one element of a decoded array. */
+export function underIndex<T>(prefix: string, index: number, run: () => T): T {
+  return underField(`${prefix}[${index}]`, run);
+}
+
 export function requiredString(source: Record<string, unknown>, key: string): string {
   const value = source[key];
   if (typeof value !== "string" || value.length === 0) {
-    throw new TypeError(`Malformed field: ${key}`);
+    throw contractViolation("required_non_empty_string", key);
   }
   return value;
 }
 
 export function requiredDisplayString(source: Record<string, unknown>, key: string): string {
   const value = requiredString(source, key);
-  if (UNSAFE_DISPLAY_CHARACTER.test(value)) throw new TypeError(`Malformed field: ${key}`);
+  if (UNSAFE_DISPLAY_CHARACTER.test(value)) throw contractViolation("no_control_characters", key);
   return value;
 }
 
 export function optionalDisplayString(source: Record<string, unknown>, key: string): string | undefined {
   const value = optionalString(source, key);
   if (value !== undefined && UNSAFE_DISPLAY_CHARACTER.test(value)) {
-    throw new TypeError(`Malformed field: ${key}`);
+    throw contractViolation("no_control_characters", key);
   }
   return value;
 }
@@ -140,7 +211,7 @@ export function optionalDisplayString(source: Record<string, unknown>, key: stri
 export function optionalString(source: Record<string, unknown>, key: string): string | undefined {
   const value = source[key];
   if (value === undefined || value === null) return undefined;
-  if (typeof value !== "string") throw new TypeError(`Malformed field: ${key}`);
+  if (typeof value !== "string") throw contractViolation("string_when_present", key);
   return value;
 }
 
@@ -148,7 +219,7 @@ export function optionalNumber(source: Record<string, unknown>, key: string): nu
   const value = source[key];
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new TypeError(`Malformed field: ${key}`);
+    throw contractViolation("finite_number_when_present", key);
   }
   return value;
 }

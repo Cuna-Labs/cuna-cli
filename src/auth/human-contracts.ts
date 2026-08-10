@@ -1,4 +1,5 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { OFF_CONTRACT_RESPONSE_HINT } from "../core/product-web.js";
 import {
   isAccessToken,
   isBrowserCallbackNonce,
@@ -82,7 +83,12 @@ function malformed(reason: string): never {
     code: "cuna.remote.malformed_response",
     message: "Cuna returned a response that does not match the CLI authentication contract.",
     exitCode: EXIT_CODES.remote,
-    details: { reason },
+    hint: OFF_CONTRACT_RESPONSE_HINT,
+    // `operation` is absent on purpose: this decoder is reached from several
+    // sign-in exchanges and does not receive the request, so naming one would
+    // be a guess. `reason` is the predicate under the same key the API path
+    // uses, so both halves of this error class read alike.
+    details: { predicate: reason },
   });
 }
 

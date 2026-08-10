@@ -5,12 +5,14 @@ import {
   isTerminalStreamUrl,
 } from "../core/namespace.js";
 import {
+  contractViolation,
   isObject,
   optionalDisplayString,
   optionalNumber,
   optionalString,
   requiredDisplayString,
   requiredString,
+  underField,
 } from "../core/validation.js";
 
 export type CapabilityAvailability =
@@ -55,13 +57,13 @@ const SCOPE = new Set(["account", "machine", "agent_session"]);
 
 function stringArray(value: unknown, key: string): readonly string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-    throw new TypeError(`Malformed field: ${key}`);
+    throw contractViolation("array_of_strings", key);
   }
   return Object.freeze([...value] as string[]);
 }
 
 function decodeCapability(value: unknown): Capability {
-  if (!isObject(value)) throw new TypeError("Malformed capability");
+  if (!isObject(value)) throw contractViolation("object");
   const id = requiredString(value, "id");
   const rawAvailability = requiredString(value, "availability");
   const rawInteraction = requiredString(value, "interaction");
@@ -81,13 +83,13 @@ function decodeCapability(value: unknown): Capability {
 }
 
 export function decodeCapabilitySnapshot(value: unknown): CapabilitySnapshot {
-  if (!isObject(value)) throw new TypeError("Malformed capability snapshot");
+  if (!isObject(value)) throw contractViolation("object");
   const rawScope = requiredString(value, "subject_scope");
-  if (!SCOPE.has(rawScope)) throw new TypeError("Malformed capability scope");
-  if (!Array.isArray(value.capabilities)) throw new TypeError("Malformed capabilities");
+  if (!SCOPE.has(rawScope)) throw contractViolation("known_subject_scope", "subject_scope");
+  if (!Array.isArray(value.capabilities)) throw contractViolation("array", "capabilities");
   const subjectId = optionalString(value, "subject_id");
   const schemaVersion = requiredString(value, "schema_version");
-  if (schemaVersion !== "1.0") throw new TypeError("Unsupported capability schema version");
+  if (schemaVersion !== "1.0") throw contractViolation("supported_schema_version", "schema_version");
   const snapshot = Object.freeze({
     schemaVersion,
     subjectScope: rawScope as CapabilityScope,
@@ -95,10 +97,18 @@ export function decodeCapabilitySnapshot(value: unknown): CapabilitySnapshot {
     observedAt: requiredString(value, "observed_at"),
     expiresAt: requiredString(value, "expires_at"),
     etag: requiredString(value, "etag"),
-    capabilities: Object.freeze(value.capabilities.map(decodeCapability)),
+    capabilities: Object.freeze(
+      value.capabilities.map((item, index) =>
+        underField(`capabilities[${index}]`, () => decodeCapability(item))),
+    ),
   });
-  if (!Number.isFinite(Date.parse(snapshot.observedAt)) || !Number.isFinite(Date.parse(snapshot.expiresAt))) {
-    throw new TypeError("Malformed capability time");
+  // Split from one compound check into two, because they name different fields.
+  // Reported together, a stale `expires_at` sent the reader to `observed_at`.
+  if (!Number.isFinite(Date.parse(snapshot.observedAt))) {
+    throw contractViolation("parsable_timestamp", "observed_at");
+  }
+  if (!Number.isFinite(Date.parse(snapshot.expiresAt))) {
+    throw contractViolation("parsable_timestamp", "expires_at");
   }
   return snapshot;
 }
@@ -154,7 +164,7 @@ export interface WorkspaceBindingAuthority {
 }
 
 function decodeMachine(value: unknown): Machine {
-  if (!isObject(value)) throw new TypeError("Malformed machine");
+  if (!isObject(value)) throw contractViolation("object");
   const state = optionalDisplayString(value, "state") ?? optionalDisplayString(value, "status") ?? "unknown";
   const memoryMiB = optionalNumber(value, "memory_mib");
   const vcpus = optionalNumber(value, "vcpus");
@@ -174,11 +184,17 @@ function decodeMachine(value: unknown): Machine {
 }
 
 export function decodeMachinePage(value: unknown): MachinePage {
-  if (Array.isArray(value)) return Object.freeze({ items: Object.freeze(value.map(decodeMachine)) });
-  if (!isObject(value) || !Array.isArray(value.items)) throw new TypeError("Malformed machine page");
+  if (Array.isArray(value)) {
+    return Object.freeze({
+      items: Object.freeze(value.map((item, index) =>
+        underField(`[${index}]`, () => decodeMachine(item)))),
+    });
+  }
+  if (!isObject(value) || !Array.isArray(value.items)) throw contractViolation("object_with_items_array");
   const nextCursor = optionalString(value, "next_cursor");
   return Object.freeze({
-    items: Object.freeze(value.items.map(decodeMachine)),
+    items: Object.freeze(value.items.map((item, index) =>
+      underField(`items[${index}]`, () => decodeMachine(item)))),
     ...(nextCursor === undefined ? {} : { nextCursor }),
   });
 }
@@ -188,21 +204,21 @@ export function decodeMachineItem(value: unknown): Machine {
 }
 
 export function decodeMachineCreateRequest(value: unknown): MachineCreateRequest {
-  if (!isObject(value)) throw new TypeError("Malformed machine create request");
+  if (!isObject(value)) throw contractViolation("object");
   exactKeys(value, ["id", "machine_id", "state", "retryable", "action", "updated_at"]);
   const state = requiredString(value, "state") as MachineCreateRequestState;
   const action = requiredString(value, "action") as MachineCreateRequest["action"];
   const updatedAt = requiredString(value, "updated_at");
-  if (
-    !new Set<MachineCreateRequestState>([
-      "prepared", "in_progress", "unknown", "provider_succeeded", "settled", "terminal_failed",
-    ]).has(state) ||
-    !new Set<MachineCreateRequest["action"]>(["retry_create", "reconcile", "wait", "none"]).has(action) ||
-    typeof value.retryable !== "boolean" ||
-    !Number.isFinite(Date.parse(updatedAt))
-  ) {
-    throw new TypeError("Malformed machine create request");
+  if (!new Set<MachineCreateRequestState>([
+    "prepared", "in_progress", "unknown", "provider_succeeded", "settled", "terminal_failed",
+  ]).has(state)) {
+    throw contractViolation("known_enum_value", "state");
   }
+  if (!new Set<MachineCreateRequest["action"]>(["retry_create", "reconcile", "wait", "none"]).has(action)) {
+    throw contractViolation("known_enum_value", "action");
+  }
+  if (typeof value.retryable !== "boolean") throw contractViolation("boolean", "retryable");
+  if (!Number.isFinite(Date.parse(updatedAt))) throw contractViolation("parsable_timestamp", "updated_at");
   return Object.freeze({
     id: canonicalUuid(value, "id"),
     machineId: canonicalUuid(value, "machine_id"),
@@ -214,7 +230,7 @@ export function decodeMachineCreateRequest(value: unknown): MachineCreateRequest
 }
 
 export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindingAuthority {
-  if (!isObject(value)) throw new TypeError("Malformed workspace binding authority");
+  if (!isObject(value)) throw contractViolation("object");
   exactKeys(value, [
     "binding_id", "workspace_id", "project_id", "local_instance_id", "machine_id",
     "remote_root", "exclusion_policy_digest", "active_generation", "active_manifest_root",
@@ -231,18 +247,29 @@ export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindin
   const bindingEpoch = optionalNumber(value, "binding_epoch");
   const minimumReader = optionalNumber(value, "minimum_reader");
   const minimumWriter = optionalNumber(value, "minimum_writer");
-  if (
-    remoteRoot !== `/workspace/projects/${projectId}` ||
-    !/^[0-9a-f]{64}$/u.test(exclusionPolicyDigest) ||
-    !/^[0-9a-f]{64}$/u.test(activeManifestRoot) ||
-    !Number.isSafeInteger(activeGeneration) || Number(activeGeneration) < 0 ||
-    !Number.isSafeInteger(bindingEpoch) || Number(bindingEpoch) < 1 ||
-    !Number.isSafeInteger(minimumReader) || Number(minimumReader) < 1 ||
-    !Number.isSafeInteger(minimumWriter) || Number(minimumWriter) < 1 ||
-    !Number.isFinite(Date.parse(createdAt)) || !Number.isFinite(Date.parse(updatedAt))
-  ) {
-    throw new TypeError("Malformed workspace binding authority");
+  if (remoteRoot !== `/workspace/projects/${projectId}`) {
+    throw contractViolation("remote_root_derives_from_project_id", "remote_root");
   }
+  if (!/^[0-9a-f]{64}$/u.test(exclusionPolicyDigest)) {
+    throw contractViolation("sha256_digest", "exclusion_policy_digest");
+  }
+  if (!/^[0-9a-f]{64}$/u.test(activeManifestRoot)) {
+    throw contractViolation("sha256_digest", "active_manifest_root");
+  }
+  if (!Number.isSafeInteger(activeGeneration) || Number(activeGeneration) < 0) {
+    throw contractViolation("safe_non_negative_integer", "active_generation");
+  }
+  if (!Number.isSafeInteger(bindingEpoch) || Number(bindingEpoch) < 1) {
+    throw contractViolation("safe_positive_integer", "binding_epoch");
+  }
+  if (!Number.isSafeInteger(minimumReader) || Number(minimumReader) < 1) {
+    throw contractViolation("safe_positive_integer", "minimum_reader");
+  }
+  if (!Number.isSafeInteger(minimumWriter) || Number(minimumWriter) < 1) {
+    throw contractViolation("safe_positive_integer", "minimum_writer");
+  }
+  if (!Number.isFinite(Date.parse(createdAt))) throw contractViolation("parsable_timestamp", "created_at");
+  if (!Number.isFinite(Date.parse(updatedAt))) throw contractViolation("parsable_timestamp", "updated_at");
   return Object.freeze({
     bindingId,
     workspaceId: canonicalUuid(value, "workspace_id"),
@@ -274,36 +301,70 @@ export interface RunaIdentity {
   readonly waitlistPosition?: number;
 }
 
+/**
+ * Decode `/v1/me`.
+ *
+ * THE COMPOUND CHECKS BELOW WERE SPLIT DELIBERATELY, and the accept/reject
+ * boundary is unchanged: exactly the same bodies are accepted and rejected as
+ * before. What changed is that a rejection now names ONE field.
+ *
+ * This is the decoder that motivated the whole change. Production omits
+ * `workspace.id` while its own published OpenAPI marks it required when
+ * `assigned` is true, so this function is the single most likely source of
+ * `cuna.remote.malformed_response` in the field — and it used to answer with
+ * "Malformed Cuna workspace identity" for any of TEN different faults. The one
+ * fact the user needed was already computed here and thrown away.
+ */
 export function decodeRunaIdentity(value: unknown): RunaIdentity {
-  if (!isObject(value) || !isObject(value.workspace)) throw new TypeError("Malformed Cuna identity");
+  if (!isObject(value)) throw contractViolation("object");
+  if (!isObject(value.workspace)) throw contractViolation("object", "workspace");
   if (Object.keys(value).some((key) => key !== "id" && key !== "email" && key !== "workspace")) {
-    throw new TypeError("Malformed Cuna identity");
+    throw contractViolation("no_unknown_fields");
   }
   const assigned = value.workspace.assigned;
-  if (typeof assigned !== "boolean") throw new TypeError("Malformed Cuna workspace identity");
+  if (typeof assigned !== "boolean") throw contractViolation("boolean", "workspace.assigned");
   const workspaceKeys = Object.keys(value.workspace);
   if (assigned) {
-    if (
-      workspaceKeys.some((key) => key !== "assigned" && key !== "id" && key !== "usage") ||
-      typeof value.workspace.id !== "string" ||
-      !isObject(value.workspace.usage) ||
-      Object.keys(value.workspace.usage).some(
-        (key) => key !== "est_spend_usd" && key !== "est_remaining_usd" && key !== "note",
-      ) ||
-      typeof value.workspace.usage.est_spend_usd !== "number" ||
-      !Number.isFinite(value.workspace.usage.est_spend_usd) ||
-      typeof value.workspace.usage.est_remaining_usd !== "number" ||
-      !Number.isFinite(value.workspace.usage.est_remaining_usd) ||
-      typeof value.workspace.usage.note !== "string"
-    ) {
-      throw new TypeError("Malformed Cuna workspace identity");
+    if (workspaceKeys.some((key) => key !== "assigned" && key !== "id" && key !== "usage")) {
+      throw contractViolation("no_unknown_fields", "workspace");
     }
-  } else if (
-    workspaceKeys.some((key) => key !== "assigned" && key !== "waitlist_position") ||
-    !Number.isSafeInteger(value.workspace.waitlist_position) ||
-    Number(value.workspace.waitlist_position) < 0
-  ) {
-    throw new TypeError("Malformed Cuna workspace identity");
+    // The measured production defect lands exactly here.
+    if (typeof value.workspace.id !== "string") {
+      throw contractViolation("required_when_workspace_assigned", "workspace.id");
+    }
+    if (!isObject(value.workspace.usage)) {
+      throw contractViolation("required_when_workspace_assigned", "workspace.usage");
+    }
+    if (Object.keys(value.workspace.usage).some(
+      (key) => key !== "est_spend_usd" && key !== "est_remaining_usd" && key !== "note",
+    )) {
+      throw contractViolation("no_unknown_fields", "workspace.usage");
+    }
+    if (
+      typeof value.workspace.usage.est_spend_usd !== "number" ||
+      !Number.isFinite(value.workspace.usage.est_spend_usd)
+    ) {
+      throw contractViolation("finite_number", "workspace.usage.est_spend_usd");
+    }
+    if (
+      typeof value.workspace.usage.est_remaining_usd !== "number" ||
+      !Number.isFinite(value.workspace.usage.est_remaining_usd)
+    ) {
+      throw contractViolation("finite_number", "workspace.usage.est_remaining_usd");
+    }
+    if (typeof value.workspace.usage.note !== "string") {
+      throw contractViolation("string", "workspace.usage.note");
+    }
+  } else {
+    if (workspaceKeys.some((key) => key !== "assigned" && key !== "waitlist_position")) {
+      throw contractViolation("no_unknown_fields", "workspace");
+    }
+    if (
+      !Number.isSafeInteger(value.workspace.waitlist_position) ||
+      Number(value.workspace.waitlist_position) < 0
+    ) {
+      throw contractViolation("safe_non_negative_integer", "workspace.waitlist_position");
+    }
   }
   return Object.freeze({
     id: canonicalUuid(value, "id"),
@@ -311,7 +372,7 @@ export function decodeRunaIdentity(value: unknown): RunaIdentity {
     workspaceAssigned: assigned,
     ...(assigned
       ? {
-          workspaceId: canonicalUuid(value.workspace, "id"),
+          workspaceId: underField("workspace", () => canonicalUuid(value.workspace as Record<string, unknown>, "id")),
           workspaceUsage: Object.freeze({
             estimatedSpendUsd: Number((value.workspace.usage as Record<string, unknown>).est_spend_usd),
             estimatedRemainingUsd: Number((value.workspace.usage as Record<string, unknown>).est_remaining_usd),
@@ -428,12 +489,12 @@ const AGENT_AUTH_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+$/u;
 
 function enumField<T extends string>(value: Record<string, unknown>, key: string, allowed: ReadonlySet<T>): T {
   const decoded = requiredString(value, key);
-  if (!allowed.has(decoded as T)) throw new TypeError(`Malformed field: ${key}`);
+  if (!allowed.has(decoded as T)) throw contractViolation("known_enum_value", key);
   return decoded as T;
 }
 
 function decodeAgentSession(value: unknown): AgentSession {
-  if (!isObject(value)) throw new TypeError("Malformed agent session");
+  if (!isObject(value)) throw contractViolation("object");
   const allowed = new Set([
     "id",
     "machine_id",
@@ -455,7 +516,7 @@ function decodeAgentSession(value: unknown): AgentSession {
     "updated_at",
   ]);
   if (Object.keys(value).some((key) => !allowed.has(key))) {
-    throw new TypeError("Malformed agent session fields");
+    throw contractViolation("no_unknown_fields");
   }
   const agent = enumField(value, "agent", AGENTS);
   const authMode = enumField(value, "auth_mode", AUTH_MODES);
@@ -469,7 +530,7 @@ function decodeAgentSession(value: unknown): AgentSession {
   const workspaceBindingId = optionalString(value, "workspace_binding_id");
   const workspaceGeneration = optionalNumber(value, "workspace_generation");
   if ((workspaceBindingId === undefined) !== (workspaceGeneration === undefined)) {
-    throw new TypeError("Malformed AgentSession workspace binding");
+    throw contractViolation("binding_id_and_generation_present_together");
   }
   if (
     workspaceBindingId !== undefined &&
@@ -478,11 +539,11 @@ function decodeAgentSession(value: unknown): AgentSession {
       workspaceGeneration === undefined ||
       workspaceGeneration < 1)
   ) {
-    throw new TypeError("Malformed AgentSession workspace binding");
+    throw contractViolation("workspace_binding_identity_shape");
   }
   const rowVersion = optionalNumber(value, "row_version");
   if (rowVersion === undefined || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
-    throw new TypeError("Malformed field: row_version");
+    throw contractViolation("safe_non_negative_integer", "row_version");
   }
   return Object.freeze({
     id: canonicalUuid(value, "id"),
@@ -501,7 +562,7 @@ function decodeAgentSession(value: unknown): AgentSession {
       ? {}
       : UUID.test(processEpoch)
         ? { processEpoch }
-        : (() => { throw new TypeError("Malformed field: process_epoch"); })()),
+        : (() => { throw contractViolation("canonical_uuid", "process_epoch"); })()),
     ...(runtimeObservedAt === undefined ? {} : { runtimeObservedAt }),
     ...(runtimeExpiresAt === undefined ? {} : { runtimeExpiresAt }),
     ...(terminationRequestedAt === undefined ? {} : { terminationRequestedAt }),
@@ -512,11 +573,17 @@ function decodeAgentSession(value: unknown): AgentSession {
 }
 
 export function decodeAgentSessionPage(value: unknown): AgentSessionPage {
-  if (Array.isArray(value)) return Object.freeze({ items: Object.freeze(value.map(decodeAgentSession)) });
-  if (!isObject(value) || !Array.isArray(value.items)) throw new TypeError("Malformed agent-session page");
+  if (Array.isArray(value)) {
+    return Object.freeze({
+      items: Object.freeze(value.map((item, index) =>
+        underField(`[${index}]`, () => decodeAgentSession(item)))),
+    });
+  }
+  if (!isObject(value) || !Array.isArray(value.items)) throw contractViolation("object_with_items_array");
   const nextCursor = optionalString(value, "next_cursor");
   return Object.freeze({
-    items: Object.freeze(value.items.map(decodeAgentSession)),
+    items: Object.freeze(value.items.map((item, index) =>
+      underField(`items[${index}]`, () => decodeAgentSession(item)))),
     ...(nextCursor === undefined ? {} : { nextCursor }),
   });
 }
@@ -526,7 +593,7 @@ export function decodeAgentSessionItem(value: unknown): AgentSession {
 }
 
 export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
-  if (!isObject(value)) throw new TypeError("Malformed AgentSession authentication evidence");
+  if (!isObject(value)) throw contractViolation("object");
   const allowed = new Set([
     "observation_id",
     "agent_session_id",
@@ -540,11 +607,11 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
     "state",
   ]);
   if (Object.keys(value).some((key) => !allowed.has(key))) {
-    throw new TypeError("Malformed AgentSession authentication fields");
+    throw contractViolation("no_unknown_fields");
   }
   const processEpoch = value.process_epoch;
   if (processEpoch !== null && (typeof processEpoch !== "string" || !UUID.test(processEpoch))) {
-    throw new TypeError("Malformed field: process_epoch");
+    throw contractViolation("canonical_uuid_or_null", "process_epoch");
   }
   const observedAt = requiredString(value, "observed_at");
   const validUntil = requiredString(value, "valid_until");
@@ -556,13 +623,13 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
     validUntilTime < observedTime ||
     validUntilTime - observedTime > AGENT_SESSION_AUTH_MAX_TTL_MS
   ) {
-    throw new TypeError("Malformed AgentSession authentication freshness");
+    throw contractViolation("bounded_observation_freshness");
   }
   const authMode = enumField(value, "auth_mode", AUTH_MODES);
   const agentVersion = requiredDisplayString(value, "agent_version");
   const adapterVersion = requiredDisplayString(value, "adapter_version");
   if (adapterVersion !== AGENT_SESSION_AUTH_ADAPTER_VERSION) {
-    throw new TypeError("Unsupported AgentSession authentication adapter");
+    throw contractViolation("supported_adapter_version", "adapter_version");
   }
   const evidenceClass = enumField(value, "evidence_class", AGENT_AUTH_EVIDENCE_CLASSES);
   const state = enumField(value, "state", AGENT_AUTH_STATES);
@@ -581,7 +648,7 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
     (unavailable && validUntilTime !== observedTime) ||
     (agentVersion === "unavailable" && !unavailable)
   ) {
-    throw new TypeError("Contradictory AgentSession authentication evidence");
+    throw contractViolation("self_consistent_authentication_evidence");
   }
   return Object.freeze({
     observationId: canonicalUuid(value, "observation_id"),
@@ -598,7 +665,7 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
 }
 
 export function decodeAgentSessionAuthLogout(value: unknown): AgentSessionAuthLogout {
-  if (!isObject(value)) throw new TypeError("Malformed AgentSession sign-out confirmation");
+  if (!isObject(value)) throw contractViolation("object");
   const allowed = new Set([
     "observation_id", "agent_session_id", "process_epoch", "auth_mode", "agent",
     "agent_version", "adapter_version", "observed_at", "outcome",
@@ -614,7 +681,7 @@ export function decodeAgentSessionAuthLogout(value: unknown): AgentSessionAuthLo
     !Number.isFinite(Date.parse(value.observed_at)) ||
     value.outcome !== "logout_confirmed"
   ) {
-    throw new TypeError("Malformed AgentSession sign-out confirmation fields");
+    throw contractViolation("sign_out_confirmation_shape");
   }
   return Object.freeze({
     observationId: canonicalUuid(value, "observation_id"),
@@ -669,12 +736,12 @@ const TERMINAL_CAPABILITY_AVAILABILITY = new Set<TerminalCapabilityAvailability>
 
 function canonicalUuid(value: Record<string, unknown>, key: string): string {
   const decoded = requiredString(value, key);
-  if (!UUID.test(decoded)) throw new TypeError(`Malformed field: ${key}`);
+  if (!UUID.test(decoded)) throw contractViolation("canonical_uuid", key);
   return decoded;
 }
 
 function decodeTerminalCapability(value: unknown): TerminalConnectionCapability {
-  if (!isObject(value)) throw new TypeError("Malformed terminal capability");
+  if (!isObject(value)) throw contractViolation("object");
   const name = requiredString(value, "name") as TerminalCapabilityName;
   const availability = requiredString(value, "availability") as TerminalCapabilityAvailability;
   if (
@@ -682,13 +749,13 @@ function decodeTerminalCapability(value: unknown): TerminalConnectionCapability 
     !TERMINAL_CAPABILITY_AVAILABILITY.has(availability) ||
     Object.keys(value).some((key) => key !== "name" && key !== "availability")
   ) {
-    throw new TypeError("Malformed terminal capability");
+    throw contractViolation("terminal_capability_shape");
   }
   return Object.freeze({ name, availability });
 }
 
 export function decodeTerminalConnectionGrant(value: unknown): TerminalConnectionGrant {
-  if (!isObject(value)) throw new TypeError("Malformed terminal connection grant");
+  if (!isObject(value)) throw contractViolation("object");
   const allowed = new Set([
     "terminal_session_id",
     "resume_handle",
@@ -699,7 +766,7 @@ export function decodeTerminalConnectionGrant(value: unknown): TerminalConnectio
     "expires_at",
   ]);
   if (Object.keys(value).some((key) => !allowed.has(key)) || !Array.isArray(value.capabilities)) {
-    throw new TypeError("Malformed terminal connection grant");
+    throw contractViolation("no_unknown_fields");
   }
   const terminalSessionId = canonicalUuid(value, "terminal_session_id");
   const resumeHandle = canonicalUuid(value, "resume_handle");
@@ -714,16 +781,17 @@ export function decodeTerminalConnectionGrant(value: unknown): TerminalConnectio
     !Number.isFinite(Date.parse(expiresAt)) ||
     value.capabilities.length !== TERMINAL_CAPABILITY_NAMES.size
   ) {
-    throw new TypeError("Malformed terminal connection grant");
+    throw contractViolation("terminal_grant_shape");
   }
-  const capabilities = Object.freeze(value.capabilities.map(decodeTerminalCapability));
+  const capabilities = Object.freeze(value.capabilities.map((item, index) =>
+    underField(`capabilities[${index}]`, () => decodeTerminalCapability(item))));
   if (
     new Set(capabilities.map((capability) => capability.name)).size !== TERMINAL_CAPABILITY_NAMES.size ||
     [...TERMINAL_CAPABILITY_NAMES].some(
       (name) => capabilities.filter((capability) => capability.name === name).length !== 1,
     )
   ) {
-    throw new TypeError("Malformed terminal capabilities");
+    throw contractViolation("exactly_one_of_each_terminal_capability", "capabilities");
   }
   return Object.freeze({
     terminalSessionId,
@@ -797,7 +865,7 @@ function exactKeys(value: Record<string, unknown>, required: readonly string[]):
   const actual = Object.keys(value).sort();
   const expected = [...required].sort();
   if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-    throw new TypeError("Malformed public response shape");
+    throw contractViolation("exact_key_set");
   }
 }
 
@@ -808,25 +876,25 @@ function safePublicString(value: unknown, label: string, maximum = 4096): string
     FORBIDDEN_PUBLIC_CHARACTER.test(value) ||
     containsCredentialValue(value)
   ) {
-    throw new TypeError(`Malformed field: ${label}`);
+    throw contractViolation("safe_public_string", label);
   }
   return value;
 }
 
 function decodeJsonValue(value: unknown, depth = 0): JsonValue {
-  if (depth > 12) throw new TypeError("Public JSON detail is too deeply nested");
+  if (depth > 12) throw contractViolation("bounded_nesting_depth");
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new TypeError("Malformed public JSON number");
+    if (!Number.isFinite(value)) throw contractViolation("finite_number");
     return value;
   }
   if (typeof value === "string") return safePublicString(value, "detail", 16_384);
   if (Array.isArray(value)) {
-    if (value.length > 1024) throw new TypeError("Public JSON array is too large");
+    if (value.length > 1024) throw contractViolation("bounded_array_length");
     return Object.freeze(value.map((item) => decodeJsonValue(item, depth + 1)));
   }
   if (!isObject(value) || Object.keys(value).length > 1024) {
-    throw new TypeError("Malformed public JSON object");
+    throw contractViolation("bounded_object_size");
   }
   const decoded: Record<string, JsonValue> = {};
   for (const [key, item] of Object.entries(value)) {
@@ -837,10 +905,10 @@ function decodeJsonValue(value: unknown, depth = 0): JsonValue {
 }
 
 function decodeAuditRecord(value: unknown): AuditRecord {
-  if (!isObject(value)) throw new TypeError("Malformed audit record");
+  if (!isObject(value)) throw contractViolation("object");
   exactKeys(value, ["id", "session_id", "kind", "summary", "detail", "created_at"]);
   const createdAt = safePublicString(value.created_at, "created_at", 64);
-  if (!Number.isFinite(Date.parse(createdAt))) throw new TypeError("Malformed field: created_at");
+  if (!Number.isFinite(Date.parse(createdAt))) throw contractViolation("parsable_timestamp", "created_at");
   return Object.freeze({
     id: canonicalUuid(value, "id"),
     machineId: canonicalUuid(value, "session_id"),
@@ -852,20 +920,21 @@ function decodeAuditRecord(value: unknown): AuditRecord {
 }
 
 export function decodeAuditRecords(value: unknown): readonly AuditRecord[] {
-  if (!Array.isArray(value) || value.length > 200) throw new TypeError("Malformed audit record list");
-  return Object.freeze(value.map(decodeAuditRecord));
+  if (!Array.isArray(value) || value.length > 200) throw contractViolation("bounded_array_length");
+  return Object.freeze(value.map((item, index) =>
+    underField(`[${index}]`, () => decodeAuditRecord(item))));
 }
 
 function decodeCredentialRule(value: unknown): CredentialRule {
-  if (!isObject(value) || !isObject(value.target)) throw new TypeError("Malformed authorization rule");
+  if (!isObject(value) || !isObject(value.target)) throw contractViolation("object_with_target_object");
   exactKeys(value, ["id", "host", "path", "credential", "target", "cache_ttl_secs"]);
   const targetKeys = Object.keys(value.target);
   const isHeader = targetKeys.length === 2 && targetKeys.includes("header") && targetKeys.includes("format");
   const isQuery = targetKeys.length === 2 && targetKeys.includes("param") && targetKeys.includes("format");
-  if (isHeader === isQuery) throw new TypeError("Malformed authorization target");
+  if (isHeader === isQuery) throw contractViolation("exactly_one_target_kind", "target");
   const cacheTtlSeconds = value.cache_ttl_secs;
   if (!Number.isSafeInteger(cacheTtlSeconds) || Number(cacheTtlSeconds) < 0 || Number(cacheTtlSeconds) > 86_400) {
-    throw new TypeError("Malformed authorization cache TTL");
+    throw contractViolation("bounded_cache_ttl_seconds", "cache_ttl_secs");
   }
   return Object.freeze({
     id: safePublicString(value.id, "id", 256),
@@ -882,29 +951,30 @@ function decodeCredentialRule(value: unknown): CredentialRule {
 }
 
 export function decodeCredentialRules(value: unknown): readonly CredentialRule[] {
-  if (!Array.isArray(value) || value.length > 1024) throw new TypeError("Malformed authorization rule list");
-  return Object.freeze(value.map(decodeCredentialRule));
+  if (!Array.isArray(value) || value.length > 1024) throw contractViolation("bounded_array_length");
+  return Object.freeze(value.map((item, index) =>
+    underField(`[${index}]`, () => decodeCredentialRule(item))));
 }
 
 function optionalTimestamp(value: unknown, label: string): string | null {
   if (value === null) return null;
   const decoded = safePublicString(value, label, 64);
-  if (!Number.isFinite(Date.parse(decoded))) throw new TypeError(`Malformed field: ${label}`);
+  if (!Number.isFinite(Date.parse(decoded))) throw contractViolation("parsable_timestamp", label);
   return decoded;
 }
 
 function decodeApiKeyMetadata(value: unknown): ApiKeyMetadata {
-  if (!isObject(value)) throw new TypeError("Malformed API key metadata");
+  if (!isObject(value)) throw contractViolation("object");
   exactKeys(value, [
     "id", "name", "prefix", "last_four", "created_at", "expires_at", "last_used_at", "revoked_at",
   ]);
   const prefix = safePublicString(value.prefix, "prefix", 32);
   const lastFour = safePublicString(value.last_four, "last_four", 4);
   if (!isApiKeyDisplayPrefix(prefix) || !/^[A-Za-z0-9_-]{4}$/u.test(lastFour)) {
-    throw new TypeError("Malformed API key display metadata");
+    throw contractViolation("api_key_display_metadata");
   }
   const createdAt = optionalTimestamp(value.created_at, "created_at");
-  if (createdAt === null) throw new TypeError("Malformed field: created_at");
+  if (createdAt === null) throw contractViolation("parsable_timestamp", "created_at");
   return Object.freeze({
     id: canonicalUuid(value, "id"),
     name: safePublicString(value.name, "name", 80),
@@ -918,13 +988,14 @@ function decodeApiKeyMetadata(value: unknown): ApiKeyMetadata {
 }
 
 export function decodeApiKeyList(value: unknown): readonly ApiKeyMetadata[] {
-  if (!Array.isArray(value) || value.length > 100) throw new TypeError("Malformed API key list");
-  return Object.freeze(value.map(decodeApiKeyMetadata));
+  if (!Array.isArray(value) || value.length > 100) throw contractViolation("bounded_array_length");
+  return Object.freeze(value.map((item, index) =>
+    underField(`[${index}]`, () => decodeApiKeyMetadata(item))));
 }
 
 export function decodeOk(value: unknown): true {
-  if (!isObject(value)) throw new TypeError("Malformed acknowledgement");
+  if (!isObject(value)) throw contractViolation("object");
   exactKeys(value, ["ok"]);
-  if (value.ok !== true) throw new TypeError("Malformed acknowledgement");
+  if (value.ok !== true) throw contractViolation("acknowledgement_is_true", "ok");
   return true;
 }

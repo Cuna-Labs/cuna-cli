@@ -133,9 +133,19 @@ test("the README publishes the generated table and it is current", async () => {
   }
 });
 
-test("cuna --help publishes every exit code", async () => {
+// The exit-code table moved out of the bare help and into `cuna help --all`,
+// because 23 of the bare help's 105 lines were this table and a newcomer met it
+// before the first usable command. The guarantee is unchanged and is asserted
+// in two halves: the complete table is still published, and the short help
+// still names the route to it. Relocating content without keeping a route to it
+// would be a deletion.
+test("cuna help --all publishes every exit code", async () => {
+  const short = memoryStreams();
+  assert.equal(await runCli(["--help", "--json"], { streams: short.streams, platform }), 0);
+  assert.match(JSON.parse(short.stdout()).data.help, /cuna help --all/u);
+
   const streams = memoryStreams();
-  const exit = await runCli(["--help", "--json"], { streams: streams.streams, platform });
+  const exit = await runCli(["help", "--all", "--json"], { streams: streams.streams, platform });
   assert.equal(exit, 0);
   const help = JSON.parse(streams.stdout()).data.help;
   assert.match(help, /^Exit codes:$/mu);
@@ -143,7 +153,7 @@ test("cuna --help publishes every exit code", async () => {
     assert.match(
       help,
       new RegExp(`^\\s*${code}\\s+${name}\\s+\\S`, "mu"),
-      `cuna --help must list exit code ${code} as ${name}`,
+      `cuna help --all must list exit code ${code} as ${name}`,
     );
   }
 });

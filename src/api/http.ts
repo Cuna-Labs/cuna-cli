@@ -1,5 +1,11 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import {
+  INTERNAL_DEFECT_HINT,
+  OFF_CONTRACT_RESPONSE_HINT,
+  SUPPORT_URL,
+  automationCredentialHint,
+} from "../core/product-web.js";
+import {
   isContinuationSecret,
   isProblemType,
   isProblemTypeForCode,
@@ -9,6 +15,10 @@ import { isObject, safeReasonCode } from "../core/validation.js";
 import { CLI_VERSION } from "../version.js";
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+// A 16 MiB body is never a legitimate answer on this contract, so the remedy is
+// to narrow the request rather than to retry it.
+const OVERSIZED_RESPONSE_HINT =
+  "Narrow the request with --limit or a cursor. Retrying unchanged returns the same oversized body.";
 const PROBLEM_CODE = /^[a-z][a-z0-9_]{2,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PROBLEM_ACTIONS = new Set(["retry", "sign_in", "open_web", "contact_support", "none"]);
@@ -165,11 +175,14 @@ function apiError(input: {
       code: "cuna.auth.rejected",
       message: "Cuna rejected the current credential.",
       exitCode: EXIT_CODES.auth,
+      // The api_key arm used to say "Replace CUNA_API_KEY with a valid
+      // automation credential" and name no source, which is the same dead end
+      // the sign-in path had. It now shares the one sentence that does.
       hint: credentialKind === "interactive"
         ? "Run `cuna login` to reauthenticate this interactive session."
         : credentialKind === "api_key"
-          ? "Replace CUNA_API_KEY with a valid automation credential."
-          : "Run `cuna login` or provide the required request authority.",
+          ? `The current automation credential was refused. ${automationCredentialHint()}`
+          : `Run \`cuna login\`, or provide an automation credential. ${automationCredentialHint()}`,
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
@@ -179,6 +192,7 @@ function apiError(input: {
       code: "cuna.policy.denied",
       message: "Cuna denied this operation.",
       exitCode: EXIT_CODES.policy,
+      hint: "The credential authenticated but is not permitted to do this. Retrying will not change the outcome.",
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
@@ -188,6 +202,7 @@ function apiError(input: {
       code: "cuna.remote.conflict",
       message: "Cuna could not apply the operation because current state conflicts with it.",
       exitCode: EXIT_CODES.conflict,
+      hint: "Re-read the resource and decide again from its current state. Repeating this request unchanged repeats this answer.",
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
@@ -197,6 +212,9 @@ function apiError(input: {
       code: status === 429 ? "cuna.network.rate_limited" : "cuna.network.service_unavailable",
       message: status === 429 ? "Cuna is rate limiting this request." : "The Cuna service is temporarily unavailable.",
       exitCode: EXIT_CODES.network,
+      hint: status === 429
+        ? "Wait before retrying. No change was applied by this request."
+        : "No authoritative answer was received. Retry a read; do not assume a write was applied.",
       retryable: problem?.retryable ?? true,
       details,
     });
@@ -212,7 +230,7 @@ function apiError(input: {
       code: "cuna.remote.operation_not_served",
       message: `The Cuna API at ${input.origin} does not serve ${input.method} ${input.path}.`,
       exitCode: EXIT_CODES.unsupported,
-      hint: "The deployed Cuna API does not implement this operation. Run `cuna version --json` and contact Cuna support with that record if it should be available.",
+      hint: `The deployed Cuna API does not implement this operation. Run \`cuna version --json\` and report it with that record at ${SUPPORT_URL} if it should be available.`,
       details: {
         http_status: status,
         ...(requestId === undefined ? {} : { request_id: requestId }),
@@ -226,6 +244,9 @@ function apiError(input: {
     code: status === 404 ? "cuna.remote.not_found" : "cuna.remote.rejected",
     message: status === 404 ? "The requested Cuna resource or operation was not found." : "Cuna rejected the request.",
     exitCode: EXIT_CODES.remote,
+    hint: status === 404
+      ? "The identifier does not name a resource this account can see. Re-list to get a current one."
+      : OFF_CONTRACT_RESPONSE_HINT,
     ...(problem === undefined ? {} : { retryable: problem.retryable }),
     details,
   });
@@ -238,6 +259,8 @@ async function readLimited(response: Response): Promise<Uint8Array> {
       code: "cuna.remote.response_too_large",
       message: "Cuna returned an oversized response.",
       exitCode: EXIT_CODES.remote,
+      hint: OVERSIZED_RESPONSE_HINT,
+      details: { predicate: "response_within_size_limit", limit_bytes: MAX_RESPONSE_BYTES },
     });
   }
   if (response.body === null) return new Uint8Array();
@@ -255,6 +278,8 @@ async function readLimited(response: Response): Promise<Uint8Array> {
           code: "cuna.remote.response_too_large",
           message: "Cuna returned an oversized response.",
           exitCode: EXIT_CODES.remote,
+          hint: OVERSIZED_RESPONSE_HINT,
+          details: { predicate: "response_within_size_limit", limit_bytes: MAX_RESPONSE_BYTES },
         });
       }
       chunks.push(value);
@@ -285,13 +310,30 @@ function decodeJson(bytes: Uint8Array): JsonDecoding {
   }
 }
 
-function parseJson(bytes: Uint8Array): unknown {
+/**
+ * Decode a 2xx body, or fail naming the operation whose body would not parse.
+ *
+ * This is the other half of `cuna.remote.malformed_response`: not "the shape is
+ * wrong" but "these bytes are not JSON at all". The two are worth telling apart
+ * — a `predicate` of `response_body_is_json` points at a proxy or a truncated
+ * transfer, while a field-level predicate points at the API itself — so the
+ * detail says which, using the same key names the decode path uses.
+ */
+function parseJson(bytes: Uint8Array, request: Pick<HttpRequest, "method" | "path">): unknown {
   const result = decodeJson(bytes);
   if (result.decoded) return result.value;
   throw new CunaError({
     code: "cuna.remote.malformed_response",
-    message: "Cuna returned a malformed response.",
+    message: "Cuna returned a response body that is not valid JSON.",
     exitCode: EXIT_CODES.remote,
+    hint: OFF_CONTRACT_RESPONSE_HINT,
+    details: {
+      operation: `${request.method} ${request.path}`,
+      predicate: "response_body_is_json",
+      // A byte count is a property of the transfer, not of the payload's
+      // contents, so it discloses nothing a proxy log would not already show.
+      response_bytes: bytes.byteLength,
+    },
     cause: result.cause,
   });
 }
@@ -332,6 +374,7 @@ export function createHttpTransport(input: {
           code: "cuna.network.cancelled",
           message: "The Cuna request was cancelled.",
           exitCode: EXIT_CODES.network,
+          hint: "The request was cancelled before dispatch, so nothing was sent.",
           retryable: false,
           cause: request.signal.reason,
         });
@@ -341,6 +384,7 @@ export function createHttpTransport(input: {
           code: "cuna.internal.invalid_api_path",
           message: "Cuna refused an invalid API operation.",
           exitCode: EXIT_CODES.internal,
+          hint: INTERNAL_DEFECT_HINT,
         });
       }
       if (
@@ -351,6 +395,7 @@ export function createHttpTransport(input: {
           code: "cuna.internal.invalid_continuation_secret",
           message: "Cuna refused an invalid continuation credential.",
           exitCode: EXIT_CODES.internal,
+          hint: INTERNAL_DEFECT_HINT,
         });
       }
       if (
@@ -361,6 +406,7 @@ export function createHttpTransport(input: {
           code: "cuna.internal.invalid_machine_create_request_id",
           message: "Cuna refused an invalid machine-create request identity.",
           exitCode: EXIT_CODES.internal,
+          hint: INTERNAL_DEFECT_HINT,
         });
       }
       const target = new URL(request.path, `${input.baseUrl}/`);
@@ -369,6 +415,7 @@ export function createHttpTransport(input: {
           code: "cuna.internal.invalid_api_origin",
           message: "Cuna refused an invalid API origin.",
           exitCode: EXIT_CODES.internal,
+          hint: INTERNAL_DEFECT_HINT,
         });
       }
       for (const [key, value] of Object.entries(request.query ?? {})) {
@@ -388,6 +435,7 @@ export function createHttpTransport(input: {
               code: "cuna.usage.invalid_body",
               message: "Binary request bodies require application/octet-stream.",
               exitCode: EXIT_CODES.usage,
+              hint: INTERNAL_DEFECT_HINT,
             });
           }
           const binary = new Uint8Array(request.body.byteLength);
@@ -404,6 +452,7 @@ export function createHttpTransport(input: {
               code: "cuna.usage.invalid_body",
               message: "Structured request bodies require JSON content type.",
               exitCode: EXIT_CODES.usage,
+              hint: INTERNAL_DEFECT_HINT,
             });
           }
           try {
@@ -414,6 +463,7 @@ export function createHttpTransport(input: {
               code: "cuna.usage.invalid_body",
               message: "The request body cannot be encoded.",
               exitCode: EXIT_CODES.usage,
+              hint: INTERNAL_DEFECT_HINT,
               cause,
             });
           }
@@ -423,6 +473,7 @@ export function createHttpTransport(input: {
           code: "cuna.usage.invalid_body",
           message: "A request content type requires a request body.",
           exitCode: EXIT_CODES.usage,
+          hint: INTERNAL_DEFECT_HINT,
         });
       }
       try {
@@ -472,7 +523,7 @@ export function createHttpTransport(input: {
             origin: input.baseUrl,
           });
         }
-        return parseJson(bytes);
+        return parseJson(bytes, request);
       } catch (error) {
         if (error instanceof CunaError) throw error;
         if (controller.signal.aborted) {
@@ -481,6 +532,9 @@ export function createHttpTransport(input: {
             code: cancelledByCaller ? "cuna.network.cancelled" : "cuna.network.timeout",
             message: cancelledByCaller ? "The Cuna request was cancelled." : "The Cuna request timed out.",
             exitCode: EXIT_CODES.network,
+            hint: cancelledByCaller
+              ? "No authoritative answer was received, so a mutating request may still have been applied."
+              : "Raise --timeout-ms, or check connectivity to the API origin. A mutating request may still have been applied.",
             retryable: !cancelledByCaller && isRetryableAfterUnknownDispatch(request),
             cause: error,
           });
@@ -489,6 +543,7 @@ export function createHttpTransport(input: {
           code: "cuna.network.failed",
           message: "The Cuna request failed before an authoritative result was received.",
           exitCode: EXIT_CODES.network,
+          hint: "Check connectivity to the API origin shown by `cuna config get`. A mutating request may still have been applied.",
           retryable: isRetryableAfterUnknownDispatch(request),
           cause: error,
         });

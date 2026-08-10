@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import type { EffectiveConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { automationCredentialHint } from "../core/product-web.js";
 import { isRefreshToken } from "../core/namespace.js";
 import type { CredentialBinding } from "../credentials/contracts.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
@@ -76,7 +77,7 @@ type RandomSource = (size: number) => Uint8Array;
  * mint site is how the two spellings of a namespace drift apart.
  */
 const AUTOMATION_CREDENTIAL_HINT =
-  "Set CUNA_API_KEY to a Cuna automation credential to run commands without interactive sign-in.";
+  `Sign-in is unavailable here, so use an automation credential instead. ${automationCredentialHint()}`;
 
 function authError(code: string, message: string, options: {
   readonly retryable?: boolean;

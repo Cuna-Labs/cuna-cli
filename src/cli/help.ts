@@ -1,11 +1,13 @@
 import { exitCodeHelpSection } from "../core/exit-codes.js";
 import { brandedEnvironmentNames } from "../core/namespace.js";
+import { API_KEYS_URL } from "../core/product-web.js";
 
 // Help is the only place most users learn a variable name, so it is derived
 // from the same authority the resolver reads. A hand-written name here would go
 // stale exactly when the accepted set changes, which is the one moment it must
 // not.
 const API_KEY_NAMES = brandedEnvironmentNames("API_KEY").join(" or ");
+const PRIMARY_API_KEY_NAME = brandedEnvironmentNames("API_KEY")[0];
 
 // Same reason, one layer up: the exit code is the entire contract for a caller
 // that is not a human, so the list below is projected from `EXIT_CODES` rather
@@ -13,7 +15,78 @@ const API_KEY_NAMES = brandedEnvironmentNames("API_KEY").join(" or ");
 // `7` for an unserved operation after that case moved to `8`.
 const EXIT_CODES_SECTION = exitCodeHelpSection();
 
-export const ROOT_HELP = `Cuna CLI
+/**
+ * What a newcomer sees from bare `cuna` and from `cuna --help`.
+ *
+ * WHY THIS EXISTS. The full surface below is 105 lines, 23 of them an exit-code
+ * table, and the first usable command appears on line 9. Measured on the same
+ * build: the whole of `cuna --help` contained ZERO `http(s)://` matches, so a
+ * user who could not sign in — which is everyone on this build, see below — had
+ * no next step of any kind.
+ *
+ * NOTHING WAS DELETED. Every line that used to be here is still in `FULL_HELP`,
+ * reachable as `cuna help --all`, and `cuna <command> --help` is untouched.
+ *
+ * THE UNAVAILABILITY CLAIMS BELOW ARE MEASURED FROM THIS TREE, not guessed, and
+ * they are deliberately stated as properties of the BUILD rather than of a
+ * platform:
+ *
+ *   - `credentials/native-platform-release-index.ts` ships an EMPTY index, so
+ *     `createProductionNativeAuthBridges` fails closed before any package
+ *     resolution. That is what makes `login`/`signup` unusable, and it is a
+ *     property of the release, not of an operating system.
+ *   - `runtime/contracts.ts` returns `workspace_sync` and `terminal_workspace`
+ *     as `unsupported` UNCONDITIONALLY — no runtime input can change them — so
+ *     the journey commands and foreground attach cannot work in this build on
+ *     any platform.
+ *
+ * What is NOT claimed here: that sign-in fails on every operating system.
+ * `credentials/linux-secret-service.ts` exists and the vault verdict is a
+ * runtime fact, so this text points at `cuna doctor`, which measures it, rather
+ * than asserting a platform list a static string cannot know.
+ */
+export const SHORT_HELP = `Cuna CLI
+
+Run cloud development agents from your local command line.
+
+Usage:
+  cuna <command> [options]
+
+First run:
+  1. Create an automation credential at ${API_KEYS_URL}
+  2. Set ${PRIMARY_API_KEY_NAME} to that credential
+  3. Run \`cuna account show\`
+
+Works with no network:
+  doctor                Report platform, runtime, and credential-vault state
+  version               Show the CLI version, build digest, and protocol range
+  config get            Show effective, redacted configuration
+  self-test --offline   Verify the installed CLI without network access
+
+Works with an automation credential:
+  account show          Show the public account identity
+  workspace show        Show assignment or waitlist state
+  usage show            Show authoritative workspace estimates
+  machines list         List owned Cuna machines
+  records list          List redacted account activity records
+  capabilities          Inspect what this deployment actually serves
+  api-keys list         List API-key metadata without secret values
+
+Not available in this build:
+  signup, login, logout    Interactive sign-in requires the signed native
+                           authentication package, which this build does not
+                           include. Use ${PRIMARY_API_KEY_NAME} instead.
+  claude, codex, openclaw  The local-to-cloud journey requires workspace
+  connect, attach          synchronization and foreground terminal support,
+                           both unsupported in this build.
+  Run \`cuna doctor\` to see what this platform and build actually provide.
+
+More:
+  cuna help --all          Every command, option, and exit code
+  cuna <command> --help    Help for one command
+`;
+
+export const FULL_HELP = `Cuna CLI
 
 Run cloud development agents from your local command line through public Cuna contracts.
 
@@ -100,9 +173,12 @@ ${EXIT_CODES_SECTION}
   documented under "Exit codes" in the README.
 
 Authentication:
+  Create an automation credential at ${API_KEYS_URL}.
   Use cuna signup for waitlist-only enrollment. It never assigns compute or starts billing.
   Use cuna login for a browser-assisted interactive session. The CLI uses polling;
   it does not open a local callback listener. Refresh credentials remain in the OS vault.
+  Both require the signed native authentication package, which this build does not
+  include; run cuna doctor to confirm what this platform provides.
   ${API_KEY_NAMES} selects explicit automation mode and never falls
   back to browser login. Both spellings are accepted and both admit every key brand the
   service has issued; the first one that is SET wins, even when its value is unusable.
@@ -110,3 +186,10 @@ Authentication:
 Canonical install:
   npm install -g @cuna_labs/cli
 `;
+
+/**
+ * The root topic. Bare \`cuna\` and \`cuna --help\` answer with the short
+ * orientation; \`cuna help --all\` and \`cuna --help --all\` answer with the
+ * complete surface. Per-command help is unaffected.
+ */
+export const ROOT_HELP = SHORT_HELP;

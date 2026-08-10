@@ -1,8 +1,11 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { OFF_CONTRACT_RESPONSE_HINT } from "../core/product-web.js";
 import {
+  ContractViolation,
   assertCanonicalUuid,
   assertIdempotencyKey,
   assertSafeDisplayText,
+  contractViolation,
   encodeCanonicalUuid,
   encodeMachineId,
 } from "../core/validation.js";
@@ -40,7 +43,7 @@ import {
   type TerminalConnectionGrant,
   type WorkspaceBindingAuthority,
 } from "./contracts.js";
-import type { HttpTransport } from "./http.js";
+import type { HttpRequest, HttpTransport } from "./http.js";
 import { classifyCapabilitySnapshot, isPermanentSnapshotFault } from "./capability-evidence.js";
 
 export interface MachineCreateInput {
@@ -141,21 +144,52 @@ export interface RunaApiClient {
   ): Promise<TerminalConnectionGrant>;
 }
 
-function malformed(cause: unknown): CunaError {
+/**
+ * `${method} ${path}` for the request that produced a body.
+ *
+ * Derived from the request object that was actually dispatched, never written
+ * beside it, so the operation the error names and the operation the transport
+ * sent cannot disagree. The path may carry identifiers, but only ones the caller
+ * supplied in this same invocation — no response value ever reaches here.
+ */
+function operationLabel(request: Pick<HttpRequest, "method" | "path">): string {
+  return `${request.method} ${request.path}`;
+}
+
+/**
+ * Build the malformed-response error, preserving what the decoder knew.
+ *
+ * WHAT `details` MAY CARRY. `operation`, `field` and `predicate` — a request
+ * label the CLI built, a key path the CLI asked for, and a token from this
+ * source tree. No response value, no fragment of one, and not its length: a
+ * `/v1/me` body holds an email address and an `/v1/api-keys` body holds key
+ * metadata, so echoing "what we got" would turn a diagnostic into a disclosure.
+ * That is why the decoders report a PREDICATE and not a comparison.
+ */
+function malformed(cause: unknown, operation: string): CunaError {
+  const violation = cause instanceof ContractViolation ? cause : undefined;
   return new CunaError({
     code: "cuna.remote.malformed_response",
     message: "Cuna returned a response that does not match the public contract.",
     exitCode: EXIT_CODES.remote,
+    hint: OFF_CONTRACT_RESPONSE_HINT,
+    details: {
+      operation,
+      ...(violation?.field === undefined ? {} : { field: violation.field }),
+      // A non-`ContractViolation` cause is a decoder that has not been converted
+      // or a genuine bug; it is reported as such rather than guessed at.
+      predicate: violation?.predicate ?? "contract_decode_failed",
+    },
     cause,
   });
 }
 
-function decode<T>(decoder: (value: unknown) => T, value: unknown): T {
+function decode<T>(decoder: (value: unknown) => T, value: unknown, operation: string): T {
   try {
     return decoder(value);
   } catch (error) {
     if (error instanceof CunaError) throw error;
-    throw malformed(error);
+    throw malformed(error, operation);
   }
 }
 
@@ -167,16 +201,22 @@ function assertAgentSessionBinding(
     readonly workspaceBindingId?: string;
     readonly workspaceGeneration?: number;
   },
+  operation: string,
 ): AgentSession {
-  if (
-    (expected.id !== undefined && session.id !== expected.id) ||
-    (expected.machineId !== undefined && session.machineId !== expected.machineId) ||
-    (expected.workspaceBindingId !== undefined &&
-      session.workspaceBindingId !== expected.workspaceBindingId) ||
-    (expected.workspaceGeneration !== undefined &&
-      session.workspaceGeneration !== expected.workspaceGeneration)
-  ) {
-    throw malformed(new TypeError("AgentSession response authority does not match the requested resource."));
+  const mismatch =
+    expected.id !== undefined && session.id !== expected.id
+      ? "id"
+      : expected.machineId !== undefined && session.machineId !== expected.machineId
+        ? "machine_id"
+        : expected.workspaceBindingId !== undefined &&
+            session.workspaceBindingId !== expected.workspaceBindingId
+          ? "workspace_binding_id"
+          : expected.workspaceGeneration !== undefined &&
+              session.workspaceGeneration !== expected.workspaceGeneration
+            ? "workspace_generation"
+            : undefined;
+  if (mismatch !== undefined) {
+    throw malformed(contractViolation("matches_requested_resource", mismatch), operation);
   }
   return session;
 }
@@ -318,56 +358,71 @@ function workspaceBindingIdentityMatches(
 }
 
 export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
+  /**
+   * Dispatch one request and decode its body under that request's identity.
+   *
+   * Every decode in this client goes through here, so an off-contract body can
+   * no longer produce an error that fails to say which operation produced it.
+   * Passing the operation as a second literal beside each call was the obvious
+   * alternative and was rejected: it is a second authority for a fact the
+   * request object already holds, and it would drift on the first path edit.
+   */
+  async function fetchDecoded<T>(request: HttpRequest, decoder: (value: unknown) => T): Promise<T> {
+    return decode(decoder, await transport.request(request), operationLabel(request));
+  }
   const client: RunaApiClient = {
     async getIdentity(signal) {
-      return decode(
+      return fetchDecoded(
+        { method: "GET", path: "/v1/me", ...(signal === undefined ? {} : { signal }) },
         decodeRunaIdentity,
-        await transport.request({ method: "GET", path: "/v1/me", ...(signal === undefined ? {} : { signal }) }),
       );
     },
     async discoverCapabilities(scope, resourceId, signal) {
-      const raw = await transport.request({
-        method: "GET",
-        path: "/v1/capabilities",
-        query: { scope, resource_id: resourceId },
-        ...(signal === undefined ? {} : { signal }),
-      });
-      return decode(decodeCapabilitySnapshot, raw);
+      return fetchDecoded(
+        {
+          method: "GET",
+          path: "/v1/capabilities",
+          query: { scope, resource_id: resourceId },
+          ...(signal === undefined ? {} : { signal }),
+        },
+        decodeCapabilitySnapshot,
+      );
     },
     async listMachines(signal) {
-      return decode(decodeMachinePage, await transport.request({ method: "GET", path: "/v1/sessions", ...(signal === undefined ? {} : { signal }) }));
+      return fetchDecoded(
+        { method: "GET", path: "/v1/sessions", ...(signal === undefined ? {} : { signal }) },
+        decodeMachinePage,
+      );
     },
     async getMachine(id, signal) {
       const safeId = encodeMachineId(id);
-      const machine = decode(
-        decodeMachineItem,
-        await transport.request({
-          method: "GET",
-          path: `/v1/sessions/${safeId}`,
-          ...(signal === undefined ? {} : { signal }),
-        }),
-      );
+      const request: HttpRequest = {
+        method: "GET",
+        path: `/v1/sessions/${safeId}`,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const machine = await fetchDecoded(request, decodeMachineItem);
       if (machine.id !== id) {
-        throw malformed(new TypeError("Machine response authority does not match the requested resource."));
+        throw malformed(contractViolation("matches_requested_resource", "id"), operationLabel(request));
       }
       return machine;
     },
     async listRecords() {
-      return decode(decodeAuditRecords, await transport.request({ method: "GET", path: "/v1/records" }));
+      return fetchDecoded({ method: "GET", path: "/v1/records" }, decodeAuditRecords);
     },
     async listAuthorizations(machineId) {
       const safeId = encodeMachineId(machineId);
-      return decode(
+      return fetchDecoded(
+        { method: "GET", path: `/v1/sessions/${safeId}/authorizations` },
         decodeCredentialRules,
-        await transport.request({ method: "GET", path: `/v1/sessions/${safeId}/authorizations` }),
       );
     },
     async listApiKeys() {
-      return decode(decodeApiKeyList, await transport.request({ method: "GET", path: "/v1/api-keys" }));
+      return fetchDecoded({ method: "GET", path: "/v1/api-keys" }, decodeApiKeyList);
     },
     async revokeApiKey(id) {
       const safeId = encodeCanonicalUuid(id, "API key ID");
-      return decode(decodeOk, await transport.request({ method: "DELETE", path: `/v1/api-keys/${safeId}` }));
+      return fetchDecoded({ method: "DELETE", path: `/v1/api-keys/${safeId}` }, decodeOk);
     },
     async createMachine(input, idempotencyKey, requestId, signal) {
       validateMachineCreate(input, idempotencyKey);
@@ -379,51 +434,55 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
         ...(input.memoryMiB === undefined ? {} : { memory_mib: input.memoryMiB }),
         ...(input.background === undefined ? {} : { background: input.background }),
       };
-      const raw = await transport.request({
-        method: "POST",
-        path: "/v1/sessions",
-        body,
-        idempotencyKey,
-        ...(requestId === undefined ? {} : { machineCreateRequestId: requestId }),
-        ...(signal === undefined ? {} : { signal }),
-      });
-      return decode(decodeMachineItem, raw);
+      return fetchDecoded(
+        {
+          method: "POST",
+          path: "/v1/sessions",
+          body,
+          idempotencyKey,
+          ...(requestId === undefined ? {} : { machineCreateRequestId: requestId }),
+          ...(signal === undefined ? {} : { signal }),
+        },
+        decodeMachineItem,
+      );
     },
     async getMachineCreateRequest(id, signal) {
       const safeId = encodeCanonicalUuid(id, "machine create request ID");
-      const request = decode(
-        decodeMachineCreateRequest,
-        await transport.request({
-          method: "GET",
-          path: `/v1/machine-creates/${safeId}`,
-          ...(signal === undefined ? {} : { signal }),
-        }),
-      );
-      if (request.id !== id) throw malformed(new TypeError("Machine create request authority mismatch."));
+      const httpRequest: HttpRequest = {
+        method: "GET",
+        path: `/v1/machine-creates/${safeId}`,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const request = await fetchDecoded(httpRequest, decodeMachineCreateRequest);
+      if (request.id !== id) {
+        throw malformed(contractViolation("matches_requested_resource", "id"), operationLabel(httpRequest));
+      }
       return request;
     },
     async reconcileMachineCreateRequest(id, signal) {
       const safeId = encodeCanonicalUuid(id, "machine create request ID");
-      const request = decode(
-        decodeMachineCreateRequest,
-        await transport.request({
-          method: "POST",
-          path: `/v1/machine-creates/${safeId}/reconcile`,
-          ...(signal === undefined ? {} : { signal }),
-        }),
-      );
-      if (request.id !== id) throw malformed(new TypeError("Machine create request authority mismatch."));
+      const httpRequest: HttpRequest = {
+        method: "POST",
+        path: `/v1/machine-creates/${safeId}/reconcile`,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const request = await fetchDecoded(httpRequest, decodeMachineCreateRequest);
+      if (request.id !== id) {
+        throw malformed(contractViolation("matches_requested_resource", "id"), operationLabel(httpRequest));
+      }
       return request;
     },
     async transitionMachine(id, action, signal) {
       const safeId = encodeMachineId(id);
-      const raw = await transport.request({
+      const request: HttpRequest = {
         method: "POST",
         path: `/v1/sessions/${safeId}/${action}`,
         ...(signal === undefined ? {} : { signal }),
-      });
-      const machine = decode(decodeMachineItem, raw);
-      if (machine.id !== id) throw malformed(new TypeError("Machine response authority does not match the requested resource."));
+      };
+      const machine = await fetchDecoded(request, decodeMachineItem);
+      if (machine.id !== id) {
+        throw malformed(contractViolation("matches_requested_resource", "id"), operationLabel(request));
+      }
       return machine;
     },
     async deleteMachine(id) {
@@ -448,68 +507,72 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
       if (new Set(prefixes).size !== prefixes.length) {
         throw new CunaError({ code: "cuna.usage.invalid", message: "Workspace excluded prefixes must be unique.", exitCode: EXIT_CODES.usage });
       }
-      const authority = decode(
-        decodeWorkspaceBindingAuthority,
-        await transport.request({
-          method: "POST",
-          path: "/v1/workspace-bindings",
-          idempotencyKey,
-          body: {
-            workspace_id: input.workspaceId,
-            project_id: input.projectId,
-            local_instance_id: input.localInstanceId,
-            machine_id: input.machineId,
-            exclusion_policy_digest: input.exclusionPolicyDigest,
-            excluded_prefixes: prefixes,
-          },
-          ...(signal === undefined ? {} : { signal }),
-        }),
-      );
+      const request: HttpRequest = {
+        method: "POST",
+        path: "/v1/workspace-bindings",
+        idempotencyKey,
+        body: {
+          workspace_id: input.workspaceId,
+          project_id: input.projectId,
+          local_instance_id: input.localInstanceId,
+          machine_id: input.machineId,
+          exclusion_policy_digest: input.exclusionPolicyDigest,
+          excluded_prefixes: prefixes,
+        },
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const authority = await fetchDecoded(request, decodeWorkspaceBindingAuthority);
       if (!workspaceBindingIdentityMatches(authority, input)) {
-        throw malformed(new TypeError("Workspace binding response authority mismatch."));
+        throw malformed(
+          contractViolation("matches_requested_resource", "workspace_id"),
+          operationLabel(request),
+        );
       }
       return authority;
     },
     async getWorkspaceBinding(bindingId, identity, signal) {
       const safeId = encodeCanonicalUuid(bindingId, "workspace binding ID");
       validateWorkspaceBindingIdentity(identity);
-      const authority = decode(
-        decodeWorkspaceBindingAuthority,
-        await transport.request({
-          method: "GET",
-          path: `/v1/workspace-bindings/${safeId}`,
-          query: {
-            workspace_id: identity.workspaceId,
-            project_id: identity.projectId,
-            local_instance_id: identity.localInstanceId,
-            machine_id: identity.machineId,
-            exclusion_policy_digest: identity.exclusionPolicyDigest,
-          },
-          ...(signal === undefined ? {} : { signal }),
-        }),
-      );
-      if (authority.bindingId !== bindingId || !workspaceBindingIdentityMatches(authority, identity)) {
-        throw malformed(new TypeError("Workspace binding response authority mismatch."));
+      const request: HttpRequest = {
+        method: "GET",
+        path: `/v1/workspace-bindings/${safeId}`,
+        query: {
+          workspace_id: identity.workspaceId,
+          project_id: identity.projectId,
+          local_instance_id: identity.localInstanceId,
+          machine_id: identity.machineId,
+          exclusion_policy_digest: identity.exclusionPolicyDigest,
+        },
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const authority = await fetchDecoded(request, decodeWorkspaceBindingAuthority);
+      if (authority.bindingId !== bindingId) {
+        throw malformed(contractViolation("matches_requested_resource", "binding_id"), operationLabel(request));
+      }
+      if (!workspaceBindingIdentityMatches(authority, identity)) {
+        throw malformed(contractViolation("matches_requested_resource", "workspace_id"), operationLabel(request));
       }
       return authority;
     },
     async listAgentSessions(machineId, options = {}, signal) {
       const safeId = encodeMachineId(machineId);
       const query = validatePageOptions(options);
-      const raw = await transport.request({
+      const request: HttpRequest = {
         method: "GET",
         path: `/v1/sessions/${safeId}/agent-sessions`,
         query,
         ...(signal === undefined ? {} : { signal }),
-      });
-      const page = decode(decodeAgentSessionPage, raw);
-      for (const session of page.items) assertAgentSessionBinding(session, { machineId });
+      };
+      const page = await fetchDecoded(request, decodeAgentSessionPage);
+      for (const session of page.items) {
+        assertAgentSessionBinding(session, { machineId }, operationLabel(request));
+      }
       return page;
     },
     async createAgentSession(machineId, input, idempotencyKey, signal) {
       const safeId = encodeMachineId(machineId);
       validateAgentSessionCreate(input);
-      const raw = await transport.request({
+      const request: HttpRequest = {
         method: "POST",
         path: `/v1/sessions/${safeId}/agent-sessions`,
         body: {
@@ -525,68 +588,79 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
         },
         idempotencyKey,
         ...(signal === undefined ? {} : { signal }),
-      });
-      return assertAgentSessionBinding(decode(decodeAgentSessionItem, raw), {
-        machineId,
-        workspaceBindingId: input.workspaceBindingId,
-        workspaceGeneration: input.workspaceGeneration,
-      });
+      };
+      return assertAgentSessionBinding(
+        await fetchDecoded(request, decodeAgentSessionItem),
+        {
+          machineId,
+          workspaceBindingId: input.workspaceBindingId,
+          workspaceGeneration: input.workspaceGeneration,
+        },
+        operationLabel(request),
+      );
     },
     async inspectAgentSessionCreate(idempotencyKey, signal) {
       assertIdempotencyKey(idempotencyKey);
-      return decode(
-        decodeAgentSessionItem,
-        await transport.request({
+      return fetchDecoded(
+        {
           method: "GET",
           path: "/v1/agent-session-creates",
           idempotencyKey,
           ...(signal === undefined ? {} : { signal }),
-        }),
+        },
+        decodeAgentSessionItem,
       );
     },
     async getAgentSession(id, signal) {
       const safeId = encodeCanonicalUuid(id, "AgentSession ID");
+      const request: HttpRequest = {
+        method: "GET",
+        path: `/v1/agent-sessions/${safeId}`,
+        ...(signal === undefined ? {} : { signal }),
+      };
       return assertAgentSessionBinding(
-        decode(
-          decodeAgentSessionItem,
-          await transport.request({
-            method: "GET",
-            path: `/v1/agent-sessions/${safeId}`,
-            ...(signal === undefined ? {} : { signal }),
-          }),
-        ),
+        await fetchDecoded(request, decodeAgentSessionItem),
         { id },
+        operationLabel(request),
       );
     },
     async getAgentSessionAuth(id, signal) {
       const safeId = encodeCanonicalUuid(id, "AgentSession ID");
-      const status = decode(
-        decodeAgentSessionAuth,
-        await transport.request({
-          method: "GET",
-          path: `/v1/agent-sessions/${safeId}/agent-auth`,
-          ...(signal === undefined ? {} : { signal }),
-        }),
-      );
+      const request: HttpRequest = {
+        method: "GET",
+        path: `/v1/agent-sessions/${safeId}/agent-auth`,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const status = await fetchDecoded(request, decodeAgentSessionAuth);
       if (status.agentSessionId !== id) {
-        throw malformed(new TypeError("AgentSession authentication authority targets another resource."));
+        throw malformed(
+          contractViolation("matches_requested_resource", "agent_session_id"),
+          operationLabel(request),
+        );
       }
       return status;
     },
     async logoutAgentSessionAuth(id, expectedProcessEpoch, signal) {
       const safeId = encodeCanonicalUuid(id, "AgentSession ID");
       const safeEpoch = assertCanonicalUuid(expectedProcessEpoch, "AgentSession process epoch");
-      const result = decode(
-        decodeAgentSessionAuthLogout,
-        await transport.request({
-          method: "POST",
-          path: `/v1/agent-sessions/${safeId}/agent-auth/logout`,
-          body: { process_epoch: safeEpoch },
-          ...(signal === undefined ? {} : { signal }),
-        }),
-      );
-      if (result.agentSessionId !== id || result.processEpoch !== expectedProcessEpoch) {
-        throw malformed(new TypeError("AgentSession sign-out confirmation targets another resource."));
+      const request: HttpRequest = {
+        method: "POST",
+        path: `/v1/agent-sessions/${safeId}/agent-auth/logout`,
+        body: { process_epoch: safeEpoch },
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const result = await fetchDecoded(request, decodeAgentSessionAuthLogout);
+      if (result.agentSessionId !== id) {
+        throw malformed(
+          contractViolation("matches_requested_resource", "agent_session_id"),
+          operationLabel(request),
+        );
+      }
+      if (result.processEpoch !== expectedProcessEpoch) {
+        throw malformed(
+          contractViolation("matches_requested_resource", "process_epoch"),
+          operationLabel(request),
+        );
       }
       return result;
     },
@@ -599,26 +673,27 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
           exitCode: EXIT_CODES.usage,
         });
       }
+      const request: HttpRequest = {
+        method: "PATCH",
+        path: `/v1/agent-sessions/${safeId}`,
+        body: { name },
+      };
       return assertAgentSessionBinding(
-        decode(
-          decodeAgentSessionItem,
-          await transport.request({
-            method: "PATCH",
-            path: `/v1/agent-sessions/${safeId}`,
-            body: { name },
-          }),
-        ),
+        await fetchDecoded(request, decodeAgentSessionItem),
         { id },
+        operationLabel(request),
       );
     },
     async terminateAgentSession(id) {
       const safeId = encodeCanonicalUuid(id, "AgentSession ID");
+      const request: HttpRequest = {
+        method: "POST",
+        path: `/v1/agent-sessions/${safeId}/terminate`,
+      };
       return assertAgentSessionBinding(
-        decode(
-          decodeAgentSessionItem,
-          await transport.request({ method: "POST", path: `/v1/agent-sessions/${safeId}/terminate` }),
-        ),
+        await fetchDecoded(request, decodeAgentSessionItem),
         { id },
+        operationLabel(request),
       );
     },
     async createTerminalConnection(agentSessionId, input, idempotencyKey, signal) {
@@ -643,9 +718,8 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
           exitCode: EXIT_CODES.usage,
         });
       }
-      return decode(
-        decodeTerminalConnectionGrant,
-        await transport.request({
+      return fetchDecoded(
+        {
           method: "POST",
           path: `/v1/agent-sessions/${safeId}/terminal-connections`,
           body: {
@@ -655,7 +729,8 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
           },
           idempotencyKey,
           ...(signal === undefined ? {} : { signal }),
-        }),
+        },
+        decodeTerminalConnectionGrant,
       );
     },
   };
@@ -741,6 +816,7 @@ export async function requireCapability(input: {
       code: "cuna.capability.unknown",
       message: `Cuna cannot currently authorize the ${input.capabilityId} capability.`,
       exitCode: EXIT_CODES.unsupported,
+      hint: "The capability snapshot describes a different subject than the one requested. Nothing was attempted; run `cuna capabilities` to see what this deployment advertises.",
       details: {
         capability_id: input.capabilityId,
         availability: "unknown",

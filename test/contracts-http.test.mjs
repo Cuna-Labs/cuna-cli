@@ -19,6 +19,7 @@ import {
   decodeTerminalConnectionGrant,
   decideCapability,
   requireCapability,
+  ContractViolation,
   CunaError,
 } from "../dist/index.js";
 
@@ -78,7 +79,9 @@ test("future-dated and inverted capability evidence is unknown", () => {
 test("unknown capability schema and excessive lease duration cannot authorize", () => {
   assert.throws(
     () => decodeCapabilitySnapshot({ ...snapshot([capability()]), schema_version: "2.0" }),
-    /schema version/u,
+    // The predicate token and the field, not prose: this is what now reaches the
+    // user as `details.predicate` / `details.field`.
+    /supported_schema_version at schema_version/u,
   );
   const excessive = decodeCapabilitySnapshot({
     ...snapshot([capability()]),
@@ -133,6 +136,10 @@ test("Cuna identity decoder is closed and preserves only public account authorit
     },
     tenant_id: "forbidden",
   }));
+  // This is the exact body production serves today: `workspace.id` omitted while
+  // `assigned` is true. It must be rejected, and the rejection must NAME the
+  // field — the old message said "Malformed Cuna workspace identity" for any of
+  // ten different faults, and finding which one required a throwaway script.
   assert.throws(() => decodeRunaIdentity({
     id: "11111111-1111-4111-8111-111111111111",
     email: "developer@example.test",
@@ -140,7 +147,23 @@ test("Cuna identity decoder is closed and preserves only public account authorit
       assigned: true,
       usage: { est_spend_usd: 1, est_remaining_usd: 49, note: "estimate" },
     },
-  }), /workspace identity/u);
+  }), (error) => error instanceof ContractViolation &&
+    error.field === "workspace.id" &&
+    error.predicate === "required_when_workspace_assigned");
+
+  // A sibling fault under the same subtree must name a DIFFERENT field. Without
+  // this row, one hard-coded `field` would satisfy the assertion above.
+  assert.throws(() => decodeRunaIdentity({
+    id: "11111111-1111-4111-8111-111111111111",
+    email: "developer@example.test",
+    workspace: {
+      assigned: true,
+      id: "22222222-2222-4222-8222-222222222222",
+      usage: { est_spend_usd: 1, est_remaining_usd: 49, note: 7 },
+    },
+  }), (error) => error instanceof ContractViolation &&
+    error.field === "workspace.usage.note" &&
+    error.predicate === "string");
 });
 
 test("TC-037-09 records and authorization decoders reject secret and terminal-control disclosure", () => {
@@ -1087,7 +1110,12 @@ test("an error status survives a body the client cannot parse", async () => {
     transport(401, "Unauthorized").request({ method: "GET", path: "/v1/machines" }),
     (error) => error instanceof CunaError &&
       error.code === "cuna.auth.rejected" &&
-      error.hint === "Replace CUNA_API_KEY with a valid automation credential.",
+      // The hint must say where a replacement credential COMES FROM. The old
+      // sentence named the variable and no source, which is a dead end for
+      // anyone who has not already seen the console.
+      typeof error.hint === "string" &&
+      error.hint.includes("https://app.getcuna.com/api-keys") &&
+      error.hint.includes("CUNA_API_KEY"),
   );
   await assert.rejects(
     transport(403, "Forbidden").request({ method: "GET", path: "/v1/machines" }),
@@ -1122,7 +1150,13 @@ test("an error status survives a body the client cannot parse", async () => {
   // narrows that code to the one case it describes; it does not delete it.
   await assert.rejects(
     transport(200, "not json").request({ method: "GET", path: "/v1/machines" }),
-    (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.remote.malformed_response" &&
+      // It must say WHICH operation and WHAT rule failed, and it must not be
+      // silent about what to do next.
+      error.details?.operation === "GET /v1/machines" &&
+      error.details?.predicate === "response_body_is_json" &&
+      typeof error.hint === "string" && error.hint.length > 0,
   );
 });
 
