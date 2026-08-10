@@ -93,11 +93,14 @@ export { runCli, memoryStreams, type RunCliDependencies } from "./cli/run.js";
 export { parseArgv, type ParsedInvocation } from "./cli/parser.js";
 export {
   DEFAULT_BASE_URL,
+  assertApiKeyUsable,
+  environmentCredentialState,
   publicConfig,
   resolveConfig,
   type ConfigOverrides,
   type ConfigSource,
   type EffectiveConfig,
+  type EnvironmentCredentialState,
 } from "./config/config.js";
 export {
   ERROR_NAMESPACE,
@@ -116,6 +119,7 @@ export {
   CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR,
   CREDENTIAL_OPENING_SOURCE,
   CREDENTIAL_VALUE_SOURCE,
+  brandedEnvironmentNames,
   containsCredentialValue,
   credentialFamilyValidator,
   isAccessToken,
@@ -129,7 +133,9 @@ export {
   isTerminalConnectToken,
   isTerminalStreamUrl,
   isTransportCredential,
+  readBrandedEnvironment,
   type ApiOrigin,
+  type BrandedEnvironmentValue,
   type CredentialBrand,
   type CredentialFamily,
   type CredentialFamilyInfix,

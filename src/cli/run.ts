@@ -7,7 +7,7 @@ import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
-import { resolveConfig, type EffectiveConfig } from "../config/config.js";
+import { assertApiKeyUsable, resolveConfig, type EffectiveConfig } from "../config/config.js";
 import { executeCommand, preflightInvocation } from "../commands/commands.js";
 import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
 import { integerArgument } from "../core/validation.js";
@@ -131,6 +131,31 @@ function needsRemoteCredential(command: string | undefined, foreground: Foregrou
     command === "records" || command === "authorizations" || command === "api-keys" ||
     command === "account" || command === "workspace" || command === "usage" ||
     command === "claude" || command === "codex" || command === "openclaw" || foreground !== undefined;
+}
+
+function managesInteractiveSession(command: string | undefined): boolean {
+  return command === "signup" || command === "login" || command === "logout" ||
+    command === "whoami" || command === "access";
+}
+
+/**
+ * Whether this invocation selects a credential authority — either by presenting
+ * a credential to the API, or because the presence of an automation credential
+ * changes what the command does.
+ *
+ * This is the blast radius of a broken environment credential. Everything
+ * outside it — `doctor`, `self-test --offline`, `config get`, `version`,
+ * `help`, and the fail-closed reserved commands — reads no credential, so an
+ * unusable one must not stop it. It used to, because the refusal lived inside
+ * `resolveConfig`, which runs before dispatch: a failed
+ * `export CUNA_API_KEY=$(fetch-secret)` disabled the two commands whose entire
+ * purpose is diagnosing a broken environment.
+ */
+function usesCredentialAuthority(
+  command: string | undefined,
+  foreground: ForegroundSelection | undefined,
+): boolean {
+  return managesInteractiveSession(command) || needsRemoteCredential(command, foreground);
 }
 
 interface ForegroundSelection {
@@ -301,6 +326,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(configFile === undefined ? {} : { configFile }),
       },
     });
+    // Fail closed before any authority is selected, and only for a command that
+    // selects one. Empty or malformed still never means absent: an unusable
+    // `*_API_KEY` refuses the command rather than silently demoting automation
+    // mode to an interactive browser sign-in.
+    if (usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
     // One resolution of the signed native authority per process, shared by the
     // credential vault and the Windows browser opener. Both used to construct
     // their own unwired defaults, so neither ever saw a native bridge.
@@ -363,9 +393,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       if (config.apiKey !== undefined) {
         throw new CunaError({
           code: "cuna.auth.mode_conflict",
-          message: "Interactive authentication is disabled while CUNA_API_KEY selects automation mode.",
+          message: `Interactive authentication is disabled while ${config.apiKeyVariable ?? "CUNA_API_KEY"} selects automation mode.`,
           exitCode: EXIT_CODES.auth,
-          hint: "Unset CUNA_API_KEY before managing the interactive session.",
+          hint: `Unset ${config.apiKeyVariable ?? "CUNA_API_KEY"} before managing the interactive session.`,
         });
       }
       if (parsed.command === "signup") {

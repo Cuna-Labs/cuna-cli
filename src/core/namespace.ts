@@ -8,10 +8,11 @@
  * `runa_sk_` API key, throw on every stored key row, and silently discard every
  * Problem document minted at `api.runacode.io`.
  *
- * Every accepted brand, credential family and service origin is therefore
- * enumerated here exactly once, and every call site tests through a predicate
- * exported from this module. Widening the product's acceptance is a one-line
- * edit in this file; a one-sided edit somewhere else is no longer expressible.
+ * Every accepted brand, credential family, service origin and configuration
+ * environment-variable name is therefore enumerated here exactly once, and
+ * every call site tests through a predicate exported from this module. Widening
+ * the product's acceptance is a one-line edit in this file; a one-sided edit
+ * somewhere else is no longer expressible.
  *
  * These lists may only ever GROW. Removing a brand, a family infix, or an
  * origin silently rejects credentials and documents that are still live in
@@ -27,6 +28,54 @@
 export const CREDENTIAL_BRANDS = Object.freeze(["cuna", "runa"] as const);
 
 export type CredentialBrand = (typeof CREDENTIAL_BRANDS)[number];
+
+/**
+ * The environment-variable names the CLI reads for one configuration suffix,
+ * in acceptance precedence: the current mint first, every earlier brand after.
+ *
+ * WHY THIS LIVES HERE. Until now this module's header was aspirational: it
+ * claimed to be the authority on "every namespace this CLI accepts" while
+ * `config/config.ts` read `CUNA_API_KEY` and nothing else. The rename replaced
+ * four `RUNA_*` reads instead of adding to them, so `isSecretApiKey` above went
+ * on accepting a `runa_sk_` key that its holder could no longer present under
+ * the variable name they already export. Accept-here/accept-there, one brand
+ * apart — the same defect this module exists to make inexpressible, in the
+ * repository that owns the fix.
+ *
+ * PRECEDENCE IS BY PRESENCE, NOT BY VALIDITY. The first name that is set wins
+ * even when its value is empty or malformed. A present-but-invalid canonical
+ * value must never fall through to the legacy one: falling through would let a
+ * failed `export CUNA_API_KEY=$(fetch-secret)` silently authenticate as
+ * whatever stale `RUNA_API_KEY` is still exported in that shell. Both SDKs
+ * resolve these names the same way.
+ */
+export function brandedEnvironmentNames(suffix: string): readonly string[] {
+  return Object.freeze(CREDENTIAL_BRANDS.map((brand) => `${brand.toUpperCase()}_${suffix}`));
+}
+
+/** One environment read, carrying the name that actually supplied the value. */
+export interface BrandedEnvironmentValue {
+  readonly name: string;
+  readonly value: string;
+}
+
+/**
+ * The value of `suffix` under the highest-precedence brand that sets it, with
+ * the variable name that supplied it. The name is returned rather than
+ * discarded so a diagnostic can tell the user which of the accepted spellings
+ * it actually read — with two live names, "correct your configuration" without
+ * a name is not actionable.
+ */
+export function readBrandedEnvironment(
+  environment: Readonly<Record<string, string | undefined>>,
+  suffix: string,
+): BrandedEnvironmentValue | undefined {
+  for (const name of brandedEnvironmentNames(suffix)) {
+    const value = environment[name];
+    if (value !== undefined) return Object.freeze({ name, value });
+  }
+  return undefined;
+}
 
 /**
  * Every credential family infix the product has ever issued. Families without a

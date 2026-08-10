@@ -135,8 +135,21 @@ canonical default. Production requests use exactly `https://api.getcuna.com`.
 Custom origins require an explicit development profile; repository content is
 never a configuration authority.
 
+Every configuration environment variable is accepted under both `CUNA_` and
+`RUNA_`, because keys issued under the earlier brand were never revoked and
+their holders still export the earlier names: `CUNA_API_KEY` / `RUNA_API_KEY`,
+`CUNA_BASE_URL` / `RUNA_BASE_URL`, `CUNA_PROFILE` / `RUNA_PROFILE`, and
+`CUNA_CONFIG_FILE` / `RUNA_CONFIG_FILE`. `CUNA_` is canonical and wins whenever
+it is set — including when it is set to an empty or malformed value, which
+fails the command rather than falling back to the other spelling. Prefer the
+`CUNA_` names in new automation. `CUNA_TERMINAL_MODE` is accepted under that one
+name only; it postdates the rename and no earlier spelling was ever shipped.
+
 `CUNA_API_KEY` is the only explicit automation credential environment variable
-accepted by this pre-GA CLI. It is never persisted automatically. Interactive
+accepted by this pre-GA CLI. It is never persisted automatically. An automation
+credential that is set but unusable is refused rather than ignored, and it is
+refused only for commands that select a credential authority — `doctor`,
+`self-test --offline` and `config get` still run and report it. Interactive
 `cuna login` uses the browser
 continuation contract without a local HTTP listener. Its renewable credential
 and binding metadata are stored only in the operating-system vault; access

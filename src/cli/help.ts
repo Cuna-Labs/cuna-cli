@@ -1,3 +1,11 @@
+import { brandedEnvironmentNames } from "../core/namespace.js";
+
+// Help is the only place most users learn a variable name, so it is derived
+// from the same authority the resolver reads. A hand-written name here would go
+// stale exactly when the accepted set changes, which is the one moment it must
+// not.
+const API_KEY_NAMES = brandedEnvironmentNames("API_KEY").join(" or ");
+
 export const ROOT_HELP = `Cuna CLI
 
 Run cloud development agents from your local command line through public Cuna contracts.
@@ -83,7 +91,9 @@ Authentication:
   Use cuna signup for waitlist-only enrollment. It never assigns compute or starts billing.
   Use cuna login for a browser-assisted interactive session. The CLI uses polling;
   it does not open a local callback listener. Refresh credentials remain in the OS vault.
-  CUNA_API_KEY selects explicit automation mode and never falls back to browser login.
+  ${API_KEY_NAMES} selects explicit automation mode and never falls
+  back to browser login. Both spellings are accepted and both admit every key brand the
+  service has issued; the first one that is SET wins, even when its value is unusable.
 
 Canonical install:
   npm install -g @cuna_labs/cli

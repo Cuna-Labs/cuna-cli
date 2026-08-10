@@ -13,7 +13,7 @@ import type {
   Machine,
 } from "../api/contracts.js";
 import type { EffectiveConfig } from "../config/config.js";
-import { DEFAULT_BASE_URL, publicConfig } from "../config/config.js";
+import { DEFAULT_BASE_URL, environmentCredentialState, publicConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError, unsupportedError, usageError } from "../core/errors.js";
 import {
   assertCanonicalUuid,
@@ -698,9 +698,15 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       throw unsupportedError("local companion", "local_companion_unavailable");
     case "doctor": {
       rejectUnknownOptions(parsed, []);
+      // `doctor` reads no credential, so an unusable one must not stop it —
+      // that is the whole reason the refusal moved out of `resolveConfig`. It
+      // reports the state instead, because a diagnostic that survives a broken
+      // environment and then says nothing about it is no better than dying.
       const data = Object.freeze({
         platform: process.platform,
         node: process.version,
+        environment_credential: environmentCredentialState(config),
+        environment_credential_variable: config.apiKeyVariable ?? null,
         runtime_features: context.runtimeFeatures ?? INITIAL_RUNTIME_GATES,
       });
       return Object.freeze({ command: "doctor", data, human: JSON.stringify(data, null, 2) });
