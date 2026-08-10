@@ -152,6 +152,46 @@ test("admitted high-confidence secrets are blocked without exposing their value"
   );
 });
 
+// The rename moved the minted namespace to cuna_* while the detector still only
+// matched runa_*. `\bsk_` cannot rescue it: the character before `sk` is `_`,
+// which is a word character, so no boundary exists. Every admitted credential
+// namespace gets its own case here so a one-sided rename fails loudly.
+for (const prefix of [
+  "cuna_sk_",
+  "runa_sk_",
+  "cuna_at_",
+  "runa_at_",
+  "cuna_rt_",
+  "cuna_ct_",
+  "cuna_tc_",
+]) {
+  test(`workspace sync refuses to upload a ${prefix} credential`, async (t) => {
+    const root = await temporaryDirectory(t);
+    const material = `${prefix}${"a".repeat(43)}`;
+    await writeFile(join(root, "config.env"), `CUNA_API_KEY=${material}\n`);
+    const policy = compileExclusionPolicy([], linuxCapabilities);
+    await assert.rejects(
+      createWorkspaceManifest({ root, policy, capabilities: linuxCapabilities }),
+      (error) =>
+        error.code === "runa.workspace.secret_blocked" &&
+        !error.message.includes(material),
+      `${prefix} must be detected as a service token and must never be uploaded`,
+    );
+  });
+}
+
+test("the secret detector does not fire on ordinary prefixed identifiers", async (t) => {
+  const root = await temporaryDirectory(t);
+  await writeFile(join(root, "notes.txt"), "tuna_sky_is_not_a_credential_value_here\n");
+  const policy = compileExclusionPolicy([], linuxCapabilities);
+  const manifest = await createWorkspaceManifest({
+    root,
+    policy,
+    capabilities: linuxCapabilities,
+  });
+  assert.deepEqual(manifest.entries.map((entry) => entry.path), ["notes.txt"]);
+});
+
 test("symlink and junction escape is rejected before outside content is read", async (t) => {
   const parent = await temporaryDirectory(t);
   const root = join(parent, "root");

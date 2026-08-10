@@ -115,12 +115,21 @@ export function compileExclusionPolicy(
   });
 }
 
+/**
+ * Every credential namespace the product issues, in both brands. `\b` is unusable
+ * as the leading guard because `_` is a word character, so `\bsk_` never matches
+ * inside `cuna_sk_…`; an explicit non-identifier boundary is required. Legacy
+ * `runa_*` values stay detected: they remain valid credentials.
+ */
+const SERVICE_TOKEN =
+  /(?:^|[^A-Za-z0-9_-])(?:(?:cuna|runa)_(?:sk|at|rt|ct|tc|se|sc)|sk)_[A-Za-z0-9_-]{20,}/u;
+
 export function detectHighConfidenceSecret(content: Uint8Array): string | undefined {
   if (content.byteLength > 2 * 1024 * 1024 || content.includes(0)) return undefined;
   const text = Buffer.from(content).toString("utf8");
   if (/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/u.test(text)) return "private_key";
   if (/\bAKIA[0-9A-Z]{16}\b/u.test(text)) return "cloud_access_key";
-  if (/\b(?:runa|sk)_[A-Za-z0-9_-]{20,}\b/u.test(text)) return "service_token";
+  if (SERVICE_TOKEN.test(text)) return "service_token";
   return undefined;
 }
 
