@@ -288,11 +288,16 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           .inspectAgentSessionCreate(`${ledger.idempotencyKey}-agent`, signal)
           .catch(() => undefined);
       }
-      if (ledger.createdMachineId === undefined) {
+      // An absent request identity proves no create was dispatched, so there is
+      // nothing to reconcile. It used to be present unconditionally, which made
+      // every cancelled journey that merely SELECTED a machine query a request
+      // identity the producer had never been told about.
+      if (ledger.createdMachineId === undefined && ledger.machineCreateRequestId !== undefined) {
+        const requestId = ledger.machineCreateRequestId;
         try {
-          let request = await input.client.getMachineCreateRequest(ledger.machineCreateRequestId, signal);
+          let request = await input.client.getMachineCreateRequest(requestId, signal);
           if (request.state === "unknown" || request.action === "reconcile") {
-            request = await input.client.reconcileMachineCreateRequest(ledger.machineCreateRequestId, signal);
+            request = await input.client.reconcileMachineCreateRequest(requestId, signal);
           }
           if (request.state === "settled" || request.state === "provider_succeeded") {
             await input.client.getMachine(request.machineId, signal);

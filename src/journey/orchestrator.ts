@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { AgentAuthMode, AgentKind } from "../api/contracts.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { deriveMachineCreateIdentity } from "./derived-identity.js";
 import type { ReconciledAgentJourneyIntent } from "./intent.js";
 import {
   planAgentSessionSelection,
@@ -39,9 +40,28 @@ export interface JourneyAgentSession {
   readonly machineId: string;
 }
 
+/**
+ * The account authority one journey runs under.
+ *
+ * It is required rather than optional because it enters the machine-create
+ * request identity, and an absent-means-random fallback would restore the
+ * unreconcilable create silently, on exactly the path that has no test.
+ */
+export interface AgentJourneyScope {
+  /** The authenticated principal, from the producer's identity authority. */
+  readonly userId: string;
+  /** The workspace that principal creates machines inside. */
+  readonly workspaceId: string;
+}
+
 export interface JourneyResourceLedger {
   readonly idempotencyKey: string;
-  readonly machineCreateRequestId: string;
+  /**
+   * Present once a machine create has been dispatched, and only then. Before
+   * that there is no producer-side request to reconcile, and claiming one made
+   * cancellation query a request identity that was never sent.
+   */
+  readonly machineCreateRequestId?: string;
   readonly createdMachineId?: string;
   readonly createdAgentSessionId?: string;
   readonly synchronizedBindingId?: string;
@@ -53,7 +73,15 @@ export interface AgentJourneyEffects {
     readonly localPath: string;
     readonly syncMode: ReconciledAgentJourneyIntent["syncMode"];
     readonly signal: AbortSignal;
-  }): Promise<Readonly<{ readonly projectMachineId?: string }>>;
+  }): Promise<Readonly<{
+    /**
+     * The project root, canonicalized by the workspace authority. It is the
+     * project half of the machine-create request identity, so it is returned
+     * by the layer that already computes it rather than recomputed.
+     */
+    readonly canonicalLocalRoot: string;
+    readonly projectMachineId?: string;
+  }>>;
   observeMachines(input: {
     readonly requestedAgent: AgentKind;
     readonly signal: AbortSignal;
@@ -122,7 +150,7 @@ export interface AgentJourneyResult {
 
 interface MutableLedger {
   idempotencyKey: string;
-  machineCreateRequestId: string;
+  machineCreateRequestId?: string;
   createdMachineId?: string;
   createdAgentSessionId?: string;
   synchronizedBindingId?: string;
@@ -132,7 +160,9 @@ interface MutableLedger {
 function frozenLedger(ledger: MutableLedger): JourneyResourceLedger {
   return Object.freeze({
     idempotencyKey: ledger.idempotencyKey,
-    machineCreateRequestId: ledger.machineCreateRequestId,
+    ...(ledger.machineCreateRequestId === undefined
+      ? {}
+      : { machineCreateRequestId: ledger.machineCreateRequestId }),
     ...(ledger.createdMachineId === undefined ? {} : { createdMachineId: ledger.createdMachineId }),
     ...(ledger.createdAgentSessionId === undefined
       ? {}
@@ -187,8 +217,13 @@ function unreconcilableCreate(cause: unknown): CunaError {
     message: "Cuna cannot prove whether the machine-create request committed.",
     exitCode: EXIT_CODES.remote,
     retryable: false,
-    hint: "Do not retry with a new key. The producer must expose the create request identity or lookup-by-idempotency-key authority.",
-    details: { missing_contract: "machine_create_request_identity" },
+    // This hint used to read "the producer must expose the create request
+    // identity". It already did; the client was throwing the key away by
+    // minting it from randomness. The identity is now derived from the
+    // invocation, so repeating the SAME command is the recovery: it re-derives
+    // the same request identity and reconciles instead of creating a sibling.
+    hint: "Repeat this exact command to reconcile the same create request. Run `cuna machines list` first if you want to see the outcome before retrying.",
+    details: { unproven_outcome: "machine_create_request" },
     cause,
   });
 }
@@ -233,6 +268,7 @@ async function boundary<T>(input: {
 export async function orchestrateAgentJourney(input: {
   readonly intent: ReconciledAgentJourneyIntent;
   readonly effects: AgentJourneyEffects;
+  readonly scope: AgentJourneyScope;
   readonly signal?: AbortSignal;
   readonly idempotencyKey?: string;
 }): Promise<AgentJourneyResult> {
@@ -240,8 +276,12 @@ export async function orchestrateAgentJourney(input: {
   const signal = input.signal ?? controller?.signal;
   if (signal === undefined) throw new TypeError("Missing journey cancellation authority.");
   const ledger: MutableLedger = {
+    // Scoped to this process on purpose. It keys the AgentSession create, whose
+    // canonical intent includes the workspace generation the sync is about to
+    // advance, so a value derived before that generation exists would replay
+    // the wrong child. The machine create, whose canonical intent IS known up
+    // front, gets a derived identity instead — see below.
     idempotencyKey: input.idempotencyKey ?? `cuna-journey-${randomUUID()}`,
-    machineCreateRequestId: randomUUID(),
   };
   try {
     const localPath = input.intent.localPath ?? process.cwd();
@@ -274,15 +314,32 @@ export async function orchestrateAgentJourney(input: {
     if (machinePlan.kind === "select" && machinePlan.target === "machine") {
       machine = { id: machinePlan.machineId, state: machinePlan.machine.state };
     } else if (machinePlan.kind === "create-required" && machinePlan.target === "machine") {
+      // Derived, not minted. A re-run of this exact invocation re-derives this
+      // identity and finds its own previous attempt; a random one is lost with
+      // the process that held it, and the orphan it leaves behind bills with
+      // nothing able to name it.
+      const createIdentity = deriveMachineCreateIdentity({
+        userId: input.scope.userId,
+        workspaceId: input.scope.workspaceId,
+        canonicalLocalRoot: workspaceInspection.canonicalLocalRoot,
+        agent: input.intent.agent,
+        machine: input.intent.machine,
+      });
+      const requestId = createIdentity.requestId;
       try {
         machine = await boundary({
           phase: "create-machine", signal, effects: input.effects, ledger,
-          action: () => input.effects.createMachine({
-            requestedAgent: input.intent.agent,
-            idempotencyKey: ledger.idempotencyKey,
-            requestId: ledger.machineCreateRequestId,
-            signal,
-          }),
+          action: () => {
+            // Recorded before dispatch: from here on an interrupted journey has
+            // a request identity to reconcile against.
+            ledger.machineCreateRequestId = requestId;
+            return input.effects.createMachine({
+              requestedAgent: input.intent.agent,
+              idempotencyKey: createIdentity.idempotencyKey,
+              requestId,
+              signal,
+            });
+          },
         });
         ledger.createdMachineId = machine.id;
       } catch (createError) {
@@ -290,7 +347,7 @@ export async function orchestrateAgentJourney(input: {
         const reconciled = await boundary({
           phase: "reconcile-machine-create", signal, effects: input.effects, ledger,
           action: () => input.effects.reconcileMachineCreate({
-            requestId: ledger.machineCreateRequestId,
+            requestId,
             cause: createError,
             signal,
           }),

@@ -7,6 +7,11 @@ const MACHINE = "10000000-0000-4000-8000-000000000001";
 const MACHINE_2 = "10000000-0000-4000-8000-000000000002";
 const BINDING = "20000000-0000-4000-8000-000000000001";
 const SESSION = "30000000-0000-4000-8000-000000000001";
+// The account authority the machine-create request identity is derived from.
+const SCOPE = Object.freeze({
+  userId: "40000000-0000-4000-8000-000000000001",
+  workspaceId: "50000000-0000-4000-8000-000000000001",
+});
 
 function intent(overrides = {}) {
   return {
@@ -42,7 +47,7 @@ function effects(overrides = {}) {
   const calls = [];
   const value = {
     calls,
-    async inspectWorkspace() { calls.push("inspect-workspace"); return {}; },
+    async inspectWorkspace() { calls.push("inspect-workspace"); return { canonicalLocalRoot: "C:\\work" }; },
     async observeMachines() { calls.push("observe-machines"); return [machine()]; },
     async createMachine(input) { calls.push(["create-machine", input]); return { id: MACHINE, state: "creating" }; },
     async reconcileMachineCreate(input) { calls.push(["reconcile-create", input]); return { id: MACHINE, state: "creating" }; },
@@ -63,7 +68,7 @@ function effects(overrides = {}) {
 
 test("automatic journey composes selection, sync, AgentSession creation and exact attach", async () => {
   const fx = effects();
-  const result = await orchestrateAgentJourney({ intent: intent(), effects: fx, idempotencyKey: "cuna-journey-test-0001" });
+  const result = await orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE, idempotencyKey: "cuna-journey-test-0001" });
   assert.deepEqual(result, {
     machineId: MACHINE,
     agentSessionId: SESSION,
@@ -81,7 +86,7 @@ test("ambiguous machine authority performs no mutation", async () => {
     async observeMachines() { fx.calls.push("observe-machines"); return [machine(), machine({ id: MACHINE_2, name: "other" })]; },
   });
   await assert.rejects(
-    orchestrateAgentJourney({ intent: intent(), effects: fx }),
+    orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE }),
     (error) => error.code === "cuna.journey.ambiguous" && error.details.candidates.length === 2,
   );
   assert.deepEqual(fx.calls, ["inspect-workspace", "observe-machines"]);
@@ -99,7 +104,7 @@ test("unknown create outcome reconciles with the exact caller-known request ID",
       return { id: MACHINE, state: "creating" };
     },
   });
-  await orchestrateAgentJourney({ intent: intent(), effects: fx });
+  await orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE });
   assert.match(createRequestId, /^[0-9a-f-]{36}$/u);
   assert.equal(reconciledRequestId, createRequestId);
   assert.equal(fx.calls.filter((call) => call === "reconciled").length, 1);
@@ -113,7 +118,7 @@ test("unreconcilable create outcome fails closed without duplicate creation", as
     async reconcileMachineCreate() { return "unreconcilable"; },
   });
   await assert.rejects(
-    orchestrateAgentJourney({ intent: intent(), effects: fx }),
+    orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE }),
     (error) => error.code === "cuna.journey.machine_create_outcome_unreconcilable" && error.retryable === false,
   );
   assert.equal(creates, 1);
@@ -127,7 +132,7 @@ test("exhausted AgentSession create recovery fails closed before attach", async 
     async attach() { attaches += 1; },
   });
   await assert.rejects(
-    orchestrateAgentJourney({ intent: intent(), effects: fx }),
+    orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE }),
     (error) => error.code === "cuna.journey.agent_session_create_outcome_unreconcilable" &&
       error.details.recovery === "exhausted",
   );
@@ -155,7 +160,7 @@ test("cancellation at every effect boundary stops downstream work and reconciles
       },
     });
     await assert.rejects(
-      orchestrateAgentJourney({ intent: intent(), effects: fx, signal: controller.signal }),
+      orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE, signal: controller.signal }),
       (error) => error.code === "cuna.journey.cancelled",
     );
     assert.equal(reconciliations, 1, phase);

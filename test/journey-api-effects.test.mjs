@@ -49,7 +49,7 @@ function capability() {
 function effects(client) {
   return createApiAgentJourneyEffects({
     client,
-    async inspectWorkspace() { return {}; },
+    async inspectWorkspace() { return { canonicalLocalRoot: "C:\\work\\project" }; },
     async synchronizeWorkspace() { throw new Error("unused"); },
     async attach() { throw new Error("unused"); },
     async authorizeMachineCreate() { return false; },

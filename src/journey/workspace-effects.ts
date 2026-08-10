@@ -13,6 +13,7 @@ import {
 } from "../sync/workspace-sync-product-service.js";
 import { loadWorkspaceBindingIntent, persistWorkspaceBinding, workspaceBindingCompareAndSwap, type LoadedWorkspaceBinding } from "../workspace/binding-store.js";
 import type { FilesystemCapabilities } from "../workspace/paths.js";
+import { stableUuid } from "./derived-identity.js";
 import type { AgentJourneyEffects } from "./orchestrator.js";
 
 export interface WorkspaceJourneyEffectsInput {
@@ -31,14 +32,6 @@ function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.con
 
 function bindingKey(workspaceId: string, userId: string, canonicalRoot: string): string {
   return createHash("sha256").update(`${workspaceId}\0${userId}\0${canonicalRoot}`, "utf8").digest("hex");
-}
-
-function stableUuid(domain: string, value: string): string {
-  const bytes = createHash("sha256").update(`${domain}\0${value}`, "utf8").digest().subarray(0, 16);
-  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
-  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
-  const hex = bytes.toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 /** Local binding facts are only hints until the complete tuple is re-read from the API. */
@@ -85,9 +78,14 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
     },
     async inspectWorkspace({ localPath }) {
       const inspected = await inspect(localPath);
-      return inspected.local === undefined
-        ? Object.freeze({})
-        : Object.freeze({ projectMachineId: inspected.local.record.machineId });
+      // The canonical root leaves this layer because the machine-create request
+      // identity is derived from it. Recomputing it in the orchestrator would
+      // make two answers to "which project is this", and the create identity
+      // and the binding identity would drift apart under symlinks or case.
+      return Object.freeze({
+        canonicalLocalRoot: inspected.policy.canonicalRoot,
+        ...(inspected.local === undefined ? {} : { projectMachineId: inspected.local.record.machineId }),
+      });
     },
     async synchronizeWorkspace({ machineId, localPath, syncMode, signal }) {
       const inspected = await inspect(localPath);

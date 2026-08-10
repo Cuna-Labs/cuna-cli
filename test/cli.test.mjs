@@ -836,7 +836,7 @@ test("valid automatic agent intents execute the effects-fenced journey and exact
       clientFactory: () => fakeClient(),
       automaticJourneyEffectsFactory: () => ({
         onPhase(phase) { phases.push(phase); },
-        async inspectWorkspace() { return {}; },
+        async inspectWorkspace() { return { canonicalLocalRoot: "C:\\work\\project" }; },
         async observeMachines() {
           return [{ id: FOREGROUND_SESSION_A, name: "review", agent: "unknown", requestedAgentSupport: "supported", state: "running", ownership: "owned", freshness: "fresh", recency: "recent", resources: {}, costStatus: "known" }];
         },

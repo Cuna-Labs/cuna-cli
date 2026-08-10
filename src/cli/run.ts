@@ -455,6 +455,19 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }
       let effects: AgentJourneyEffects;
       let stopJourneyWorkspace: (() => Promise<void>) | undefined;
+      // Read before the effects branch, not inside it: the principal and the
+      // workspace are half of the machine-create request identity, so every
+      // journey needs them, including the one built from injected effects.
+      const identity = await client.getIdentity(dependencies.signal);
+      const workspaceId = identity.workspaceId;
+      if (workspaceId === undefined) {
+        throw new CunaError({
+          code: "cuna.journey.workspace_identity_unavailable",
+          message: "The signed-in account has no assigned workspace authority.",
+          exitCode: EXIT_CODES.auth,
+        });
+      }
+      const journeyScope = Object.freeze({ userId: identity.id, workspaceId });
       if (dependencies.automaticJourneyEffectsFactory !== undefined) {
         effects = dependencies.automaticJourneyEffectsFactory({
           client,
@@ -470,15 +483,6 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
             code: "cuna.journey.workspace_transport_unavailable",
             message: "The injected API client did not provide authenticated workspace-sync transport authority.",
             exitCode: EXIT_CODES.unsupported,
-          });
-        }
-        const identity = await client.getIdentity(dependencies.signal);
-        const workspaceId = identity.workspaceId;
-        if (workspaceId === undefined) {
-          throw new CunaError({
-            code: "cuna.journey.workspace_identity_unavailable",
-            message: "The signed-in account has no assigned workspace authority.",
-            exitCode: EXIT_CODES.auth,
           });
         }
         const workspace = createWorkspaceJourneyEffects({
@@ -527,6 +531,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         await orchestrateAgentJourney({
           intent: journeyIntent,
           effects,
+          scope: journeyScope,
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
         });
       } finally {
