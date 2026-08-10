@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import {
   CREDENTIAL_BACKEND_PROTOCOL,
@@ -435,8 +435,60 @@ export class CredentialVault {
   }
 }
 
+/**
+ * The single mint for the credential namespace. Every target this product hands
+ * to a backend -- real or probe -- is produced here.
+ *
+ * The acceptors keep their own independent copies of the predicate on purpose:
+ * `CREDENTIAL_TARGET` in `native-process-bridge.ts`, and
+ * `valid_credential_target` in the Rust bridge's `protocol.rs`. Independent
+ * acceptance is defence in depth and must stay that way. What must never
+ * happen again is a second *mint*: `native-bridge-backend.ts` spelled its own
+ * probe target as `runa-cli:probe:<32 hex>`, which no acceptor in either
+ * language admits, so the liveness probe threw `credential_binding_invalid` on
+ * its very first call and every interactive sign-in resolved to
+ * `cuna.auth.vault_unavailable` -- on a bridge that was working perfectly.
+ * Mint through this function or the value is not a credential target.
+ */
 export function credentialTarget(binding: CredentialBinding): string {
   return `runa-cli:v1:${bindingDigest(normalizeBinding(binding))}`;
+}
+
+/**
+ * The reserved binding a backend liveness probe writes, reads back and deletes.
+ *
+ * The probe must be indistinguishable from a real target to an *acceptor* and
+ * distinguishable from a real credential to the *store*. Both hold because the
+ * target is a SHA-256 over the length-prefixed 4-tuple, which is injective: two
+ * targets are equal only if the tuples are equal or SHA-256 collides. The
+ * probe's `workspaceId` carries 256 bits of fresh CSPRNG entropy, so colliding
+ * with a genuine binding requires a caller to supply the exact nonce drawn
+ * microseconds earlier. The probe therefore cannot read, overwrite or delete a
+ * stored credential, and every probe uses a target no probe has used before.
+ */
+const PROBE_BINDING_NAMESPACE = "cuna.credential-backend-probe.v1";
+const PROBE_BINDING_KIND = "credential-backend-liveness-probe";
+const PROBE_NONCE_BYTES = 32;
+
+export function probeCredentialTarget(nonce: Uint8Array = randomBytes(PROBE_NONCE_BYTES)): string {
+  if (nonce.byteLength !== PROBE_NONCE_BYTES) {
+    throw credentialFailure(
+      "credential_binding_invalid",
+      "A credential probe target is bound to exactly 256 bits of fresh entropy.",
+    );
+  }
+  return credentialTarget({
+    profileId: PROBE_BINDING_NAMESPACE,
+    accountId: PROBE_BINDING_NAMESPACE,
+    workspaceId: `${PROBE_BINDING_NAMESPACE}:${hexadecimal(nonce)}`,
+    kind: PROBE_BINDING_KIND,
+  });
+}
+
+function hexadecimal(bytes: Uint8Array): string {
+  let result = "";
+  for (const byte of bytes) result += byte.toString(16).padStart(2, "0");
+  return result;
 }
 
 export function bindingDigest(binding: CredentialBinding): string {

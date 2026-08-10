@@ -7,6 +7,7 @@ import {
   type SecureCredentialBackend,
 } from "./contracts.js";
 import { createUnavailableCredentialBackend } from "./unavailable-backend.js";
+import { probeCredentialTarget } from "./vault.js";
 
 export function createNativeBridgeBackend(input: {
   readonly platform: "win32" | "darwin";
@@ -38,7 +39,8 @@ export function createNativeBridgeBackend(input: {
     probe: async () => {
       const now = clock();
       if (cachedEvidence !== undefined && cachedEvidence.expiresAt > now) return cachedEvidence;
-      const target = `runa-cli:probe:${randomBytes(16).toString("hex")}`;
+      // Minted by the credential namespace's own authority, never spelled here.
+      const target = probeCredentialTarget();
       const sentinel = randomBytes(32);
       let cleanupProven = false;
       let observed: Uint8Array | undefined;
