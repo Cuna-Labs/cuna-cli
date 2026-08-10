@@ -3,6 +3,7 @@ import type {
   TerminalCapabilityName,
   TerminalConnectionGrant,
 } from "../api/contracts.js";
+import { isTerminalConnectToken } from "../core/namespace.js";
 import { TERMINAL_PROTOCOL, type TerminalReadyPayload } from "../terminal/codec.js";
 
 import type { CapabilityAdmission } from "./capability-gate.js";
@@ -129,7 +130,7 @@ export function validateTerminalGrant(input: {
     grant.protocol !== TERMINAL_PROTOCOL ||
     !canonicalUuid(grant.terminalSessionId) ||
     !canonicalUuid(grant.resumeHandle) ||
-    !/^runa_tc_[A-Za-z0-9_-]{43}$/u.test(grant.connectToken) ||
+    !isTerminalConnectToken(grant.connectToken) ||
     !Number.isFinite(expiresAt) ||
     expiresAt <= now ||
     expiresAt - now > 60_000

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CREDENTIAL_BRANDS,
   DEFAULT_BASE_URL,
   resolveConfig,
   resolvePlatformPaths,
@@ -37,6 +38,30 @@ test("configuration defaults to the canonical production origin and never persis
   const config = await resolveConfig({ platform: fakePlatform(), env: { CUNA_API_KEY: "cuna_sk_abcdefghijklmnop" } });
   assert.equal(config.baseUrl, DEFAULT_BASE_URL);
   assert.equal(config.apiKeySource, "environment");
+});
+
+// The key store still issues and holds `runa_sk_` keys, and no issued key was
+// ever revoked. A single-brand pin here rejected every key the service actually
+// mints before a single request left the process — the CLI was unusable with a
+// valid credential. Every brand the product has ever issued must resolve.
+test("CUNA_API_KEY admits every credential brand the service has issued", async () => {
+  for (const brand of CREDENTIAL_BRANDS) {
+    const apiKey = `${brand}_sk_${"a".repeat(43)}`;
+    const config = await resolveConfig({
+      platform: fakePlatform(),
+      env: { CUNA_API_KEY: apiKey },
+    });
+    assert.equal(config.apiKey, apiKey, apiKey);
+    assert.equal(config.apiKeySource, "environment", apiKey);
+  }
+  await assert.rejects(
+    resolveConfig({ platform: fakePlatform(), env: { CUNA_API_KEY: `evil_sk_${"a".repeat(43)}` } }),
+    (error) => error instanceof RunaError && error.details?.reason === "invalid_api_key",
+  );
+  await assert.rejects(
+    resolveConfig({ platform: fakePlatform(), env: { CUNA_API_KEY: "cuna_sk_short" } }),
+    (error) => error instanceof RunaError && error.details?.reason === "invalid_api_key",
+  );
 });
 
 test("only Cuna environment names configure the pre-GA CLI", async () => {

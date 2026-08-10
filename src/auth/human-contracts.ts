@@ -1,4 +1,5 @@
 import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { isAccessToken, isContinuationSecret, isRefreshToken } from "../core/namespace.js";
 import { isObject } from "../core/validation.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -221,7 +222,7 @@ export function decodeCliContinuationIssued(
   if (record.completion_mode !== "poll") return malformed("invalid_completion_mode");
   const id = uuid(record.id, "invalid_continuation_id");
   const continuationSecret = typeof record.continuation_secret === "string" &&
-    /^(?:cuna|runa)_ct_[A-Za-z0-9_-]{43}$/u.test(record.continuation_secret)
+    isContinuationSecret(record.continuation_secret)
     ? record.continuation_secret
     : malformed("invalid_continuation_secret");
   const browserUrl = typeof record.browser_url === "string" ? record.browser_url : malformed("invalid_browser_url");
@@ -276,9 +277,9 @@ export function decodeCliTokenSet(value: unknown): CliTokenSet {
     "refresh_expires_at", "session_id", "context",
   ]);
   if (record.token_type !== "Bearer" || record.expires_in !== 600) return malformed("invalid_token_type_or_ttl");
-  const accessToken = typeof record.access_token === "string" && /^(?:cuna|runa)_at_[A-Za-z0-9_-]{43}$/u.test(record.access_token)
+  const accessToken = typeof record.access_token === "string" && isAccessToken(record.access_token)
     ? record.access_token : malformed("invalid_access_token");
-  const refreshToken = typeof record.refresh_token === "string" && /^(?:cuna|runa)_rt_[A-Za-z0-9_-]{43}$/u.test(record.refresh_token)
+  const refreshToken = typeof record.refresh_token === "string" && isRefreshToken(record.refresh_token)
     ? record.refresh_token : malformed("invalid_refresh_token");
   const accessExpiresAt = date(record.access_expires_at, "invalid_access_expiry");
   const refreshExpiresAt = date(record.refresh_expires_at, "invalid_refresh_expiry");

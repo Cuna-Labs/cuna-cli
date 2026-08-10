@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  API_ORIGINS,
+  API_WEBSOCKET_ORIGINS,
+  CREDENTIAL_BRANDS,
   createHttpTransport,
   createRunaApiClient,
   decodeApiKeyList,
@@ -240,6 +243,37 @@ test("TC-037-05 API-key metadata is closed and never accepts a plaintext secret"
   assert.equal(decodeApiKeyList([metadata])[0].name, "automation");
   assert.throws(() => decodeApiKeyList([{ ...metadata, key: "cuna_sk_abcdefghijklmnopqrstuvwxyz" }]));
   assert.throws(() => decodeApiKeyList([{ ...metadata, last_four: "too-long" }]));
+});
+
+// `display_prefix` is read straight from the key row. Every row created before
+// the rename carries `runa_sk_`, so a single-brand pin here made `key list`
+// raise on every existing key instead of listing it.
+test("API-key display metadata decodes every brand the key store has ever stored", () => {
+  const metadata = {
+    id: "11111111-1111-4111-8111-111111111111",
+    name: "automation",
+    prefix: "cuna_sk_abcd",
+    last_four: "WXYZ",
+    created_at: "2026-08-08T00:00:00.000Z",
+    expires_at: null,
+    last_used_at: null,
+    revoked_at: null,
+  };
+  for (const brand of CREDENTIAL_BRANDS) {
+    const prefix = `${brand}_sk_`;
+    assert.equal(
+      decodeApiKeyList([{ ...metadata, prefix }])[0].prefix,
+      prefix,
+      prefix,
+    );
+    assert.equal(
+      decodeApiKeyList([{ ...metadata, prefix: `${prefix}abcd` }])[0].prefix,
+      `${prefix}abcd`,
+      `${prefix}abcd`,
+    );
+  }
+  assert.throws(() => decodeApiKeyList([{ ...metadata, prefix: "evil_sk_abcd" }]));
+  assert.throws(() => decodeApiKeyList([{ ...metadata, prefix: "cuna_at_abcd" }]));
 });
 
 test("TC-037-03 API-key list and revoke use exact public routes and closed acknowledgement", async () => {
@@ -633,6 +667,33 @@ test("terminal grant decoder is closed, complete, and secret-url separated", () 
   })));
 });
 
+// The grant is minted by whichever API host is deployed and the token brand is
+// on the "free to rename" list. Pinning either to one brand breaks the terminal
+// with no window: `cuna terminal` is a hard failure, not a degraded path.
+test("terminal grant decoder admits every minted connect origin and token brand", () => {
+  const terminalSessionId = "55555555-5555-4555-8555-555555555555";
+  for (const origin of API_WEBSOCKET_ORIGINS) {
+    for (const brand of CREDENTIAL_BRANDS) {
+      const grant = terminalGrant({
+        connect_url: `${origin}/v1/terminal-connections/${terminalSessionId}/stream`,
+        connect_token: `${brand}_tc_${"A".repeat(43)}`,
+      });
+      const decoded = decodeTerminalConnectionGrant(grant);
+      assert.equal(decoded.connectUrl, grant.connect_url, grant.connect_url);
+      assert.equal(decoded.connectToken, grant.connect_token, grant.connect_token);
+    }
+  }
+  assert.throws(() => decodeTerminalConnectionGrant(terminalGrant({
+    connect_url: `wss://api.evil.test/v1/terminal-connections/${terminalSessionId}/stream`,
+  })));
+  assert.throws(() => decodeTerminalConnectionGrant(terminalGrant({
+    connect_token: `evil_tc_${"A".repeat(43)}`,
+  })));
+  assert.throws(() => decodeTerminalConnectionGrant(terminalGrant({
+    connect_url: `${API_WEBSOCKET_ORIGINS[0]}/v1/terminal-connections/66666666-6666-4666-8666-666666666666/stream`,
+  })));
+});
+
 test("terminal grant client sends exact idempotent intent and rejects unsafe inputs before transport", async () => {
   const requests = [];
   const client = createRunaApiClient({
@@ -725,21 +786,27 @@ test("HTTP transport binds origin, authorization, idempotency, and public path",
   assert.equal(observed.init.headers.Accept, "application/json, application/problem+json");
 });
 
-test("Cuna transport emits only the canonical pre-GA authority names", async () => {
+// The continuation secret must reach whichever API is actually live. The
+// deployed API reads only `X-Runa-Continuation`; the renamed API reads either.
+// Asserting a single spelling — which this test previously did, by requiring
+// `X-Runa-Continuation` to be absent — pins the CLI to one side and silently
+// drops the secret from every human login exchange against the other.
+test("Cuna transport carries the continuation secret under every spelling the API reads", async () => {
   const observations = [];
   const fetch = async (url, init) => {
     observations.push({ url: url.toString(), headers: init.headers });
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   };
+  const secret = `cuna_ct_${"c".repeat(43)}`;
   await createHttpTransport({
     baseUrl: "https://api.getcuna.com",
     apiKey: "cuna_sk_abcdefghijklmnop",
     fetch,
-  }).request({ method: "GET", path: "/v1/sessions", continuationSecret: `cuna_ct_${"c".repeat(43)}` });
+  }).request({ method: "GET", path: "/v1/sessions", continuationSecret: secret });
   assert.equal(observations[0].url, "https://api.getcuna.com/v1/sessions");
   assert.equal(observations[0].headers["User-Agent"].startsWith("cuna-cli/"), true);
-  assert.equal(observations[0].headers["X-Cuna-Continuation"].startsWith("cuna_ct_"), true);
-  assert.equal(observations[0].headers["X-Runa-Continuation"], undefined);
+  assert.equal(observations[0].headers["X-Cuna-Continuation"], secret);
+  assert.equal(observations[0].headers["X-Runa-Continuation"], secret);
   assert.equal(observations.length, 1);
 });
 
@@ -802,12 +869,18 @@ test("HTTP errors expose only stable safe metadata", async () => {
   );
 });
 
+// Every origin the service has ever minted Problem documents under decodes. A
+// one-sided pin here is silent: `problemMetadata` returns undefined on a miss,
+// so `code`, `request_id` and `retryable` vanish from every server error and
+// retry degrades with no signal.
 test("HTTP errors preserve retryability only from a closed canonical Problem", async () => {
+  assert.ok(API_ORIGINS.includes("https://api.getcuna.com"));
+  assert.ok(API_ORIGINS.includes("https://api.runacode.io"));
   const requestId = "66666666-6666-4666-8666-666666666666";
-  const makeTransport = (status, retryable, overrides = {}) => createHttpTransport({
+  const makeTransport = (origin, status, retryable, overrides = {}) => createHttpTransport({
     baseUrl: "https://api.getcuna.com",
     fetch: async () => new Response(JSON.stringify({
-      type: "https://api.getcuna.com/problems/request_failed",
+      type: `${origin}/problems/request_failed`,
       title: "Request failed",
       status,
       code: "request_failed",
@@ -820,25 +893,38 @@ test("HTTP errors preserve retryability only from a closed canonical Problem", a
     }),
   });
 
+  for (const origin of API_ORIGINS) {
+    await assert.rejects(
+      makeTransport(origin, 503, false).request({ method: "GET", path: "/v1/capabilities" }),
+      (error) => error instanceof RunaError &&
+        error.code === "runa.network.service_unavailable" &&
+        error.retryable === false &&
+        error.details?.reason === "request_failed" &&
+        error.details?.request_id === requestId,
+      origin,
+    );
+    await assert.rejects(
+      makeTransport(origin, 400, true).request({ method: "GET", path: "/v1/capabilities" }),
+      (error) => error instanceof RunaError &&
+        error.code === "runa.remote.rejected" &&
+        error.retryable === true,
+      origin,
+    );
+    await assert.rejects(
+      makeTransport(origin, 503, false, { provider: "forbidden" }).request({
+        method: "GET",
+        path: "/v1/capabilities",
+      }),
+      (error) => error instanceof RunaError &&
+        error.retryable === true &&
+        error.details?.request_id === "untrusted-header",
+      origin,
+    );
+  }
+
+  // A Problem minted under an origin the service never issues stays undecoded.
   await assert.rejects(
-    makeTransport(503, false).request({ method: "GET", path: "/v1/capabilities" }),
-    (error) => error instanceof RunaError &&
-      error.code === "runa.network.service_unavailable" &&
-      error.retryable === false &&
-      error.details?.reason === "request_failed" &&
-      error.details?.request_id === requestId,
-  );
-  await assert.rejects(
-    makeTransport(400, true).request({ method: "GET", path: "/v1/capabilities" }),
-    (error) => error instanceof RunaError &&
-      error.code === "runa.remote.rejected" &&
-      error.retryable === true,
-  );
-  await assert.rejects(
-    makeTransport(503, false, { provider: "forbidden" }).request({
-      method: "GET",
-      path: "/v1/capabilities",
-    }),
+    makeTransport("https://api.evil.test", 503, false).request({ method: "GET", path: "/v1/capabilities" }),
     (error) => error instanceof RunaError &&
       error.retryable === true &&
       error.details?.request_id === "untrusted-header",
@@ -855,10 +941,10 @@ test("workspace sync Problems preserve only the negotiated protocol and canonica
     "ordered_generation_changes",
     "policy_bound_admission",
   ];
-  const makeTransport = (status, overrides = {}) => createHttpTransport({
+  const makeTransport = (status, overrides = {}, origin = "https://api.getcuna.com") => createHttpTransport({
     baseUrl: "https://api.getcuna.com",
     fetch: async () => new Response(JSON.stringify({
-      type: "https://api.getcuna.com/problems/workspace_sync_protocol_incompatible",
+      type: `${origin}/problems/workspace_sync_protocol_incompatible`,
       title: "Workspace sync protocol incompatible",
       status,
       code: "workspace_sync_protocol_incompatible",
@@ -878,15 +964,26 @@ test("workspace sync Problems preserve only the negotiated protocol and canonica
     }),
   });
 
+  // Both minted Problem-URI origins decode into the same closed metadata.
+  for (const origin of API_ORIGINS) {
+    await assert.rejects(
+      makeTransport(426, {}, origin).request({ method: "POST", path: "/v1/workspaces/w_1/sync-sessions" }),
+      (error) => error instanceof RunaError &&
+        error.code === "runa.remote.rejected" &&
+        error.retryable === false &&
+        error.details?.reason === "workspace_sync_protocol_incompatible" &&
+        error.details?.selected_protocol === 2 &&
+        JSON.stringify(error.details?.capabilities) === JSON.stringify(capabilities) &&
+        error.details?.request_id === requestId,
+      origin,
+    );
+  }
+  // An origin the service never mints stays undecoded.
   await assert.rejects(
-    makeTransport(426).request({ method: "POST", path: "/v1/workspaces/w_1/sync-sessions" }),
+    makeTransport(426, {}, "https://api.evil.test").request({ method: "POST", path: "/v1/workspaces/w_1/sync-sessions" }),
     (error) => error instanceof RunaError &&
-      error.code === "runa.remote.rejected" &&
-      error.retryable === false &&
-      error.details?.reason === "workspace_sync_protocol_incompatible" &&
-      error.details?.selected_protocol === 2 &&
-      JSON.stringify(error.details?.capabilities) === JSON.stringify(capabilities) &&
-      error.details?.request_id === requestId,
+      error.details?.selected_protocol === undefined &&
+      error.details?.capabilities === undefined,
   );
   await assert.rejects(
     makeTransport(503).request({ method: "GET", path: "/v1/workspaces/w_1/sync-sessions/a_1/changes" }),

@@ -101,6 +101,27 @@ export {
 } from "./config/config.js";
 export { EXIT_CODES, RunaError, type ExitCode, type SafeErrorDetails } from "./core/errors.js";
 export {
+  API_ORIGINS,
+  API_WEBSOCKET_ORIGINS,
+  CREDENTIAL_BRANDS,
+  CREDENTIAL_FAMILY_INFIXES,
+  CREDENTIAL_OPENING_SOURCE,
+  isAccessToken,
+  isApiKeyDisplayPrefix,
+  isContinuationSecret,
+  isProblemType,
+  isProblemTypeForCode,
+  isRefreshToken,
+  isSecretApiKey,
+  isTerminalConnectToken,
+  isTerminalStreamUrl,
+  isTransportCredential,
+  type ApiOrigin,
+  type CredentialBrand,
+  type CredentialFamily,
+  type CredentialFamilyInfix,
+} from "./core/namespace.js";
+export {
   createPlatformAdapter,
   resolvePlatformKind,
   resolvePlatformPaths,

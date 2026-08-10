@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import type { EffectiveConfig } from "../config/config.js";
 import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { isRefreshToken } from "../core/namespace.js";
 import type { CredentialBinding } from "../credentials/contracts.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { SecretMaterial } from "../credentials/secret-material.js";
@@ -122,7 +123,7 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
   if (
     (!legacy && record.version !== 2) ||
     record.base_url !== config.baseUrl || record.profile !== config.profile ||
-    typeof record.refresh_token !== "string" || !/^(?:cuna|runa)_rt_[A-Za-z0-9_-]{43}$/u.test(record.refresh_token) ||
+    typeof record.refresh_token !== "string" || !isRefreshToken(record.refresh_token) ||
     typeof record.refresh_expires_at !== "string" || Number.isNaN(Date.parse(record.refresh_expires_at)) ||
     new Date(record.refresh_expires_at).toISOString() !== record.refresh_expires_at ||
     typeof record.client_instance_id !== "string" || typeof record.session_id !== "string" ||

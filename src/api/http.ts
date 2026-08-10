@@ -386,9 +386,16 @@ export function createHttpTransport(input: {
             ...(request.machineCreateRequestId === undefined
               ? {}
               : { "X-Cuna-Machine-Create-Request-Id": request.machineCreateRequestId }),
+            // Both spellings, always. The deployed API reads only
+            // `X-Runa-Continuation`; the renamed API reads either. Sending one
+            // name pins the CLI to whichever side happens to be live, and a
+            // dropped continuation header fails every human login exchange.
             ...(request.continuationSecret === undefined
               ? {}
-              : { "X-Cuna-Continuation": request.continuationSecret }),
+              : {
+                "X-Cuna-Continuation": request.continuationSecret,
+                "X-Runa-Continuation": request.continuationSecret,
+              }),
           },
           ...(body === undefined ? {} : { body }),
           signal: controller.signal,

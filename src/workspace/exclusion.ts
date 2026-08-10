@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { CREDENTIAL_OPENING_SOURCE } from "../core/namespace.js";
 import { normalizeWirePath, type FilesystemCapabilities } from "./paths.js";
 import { workspaceError } from "./errors.js";
 
@@ -116,13 +117,17 @@ export function compileExclusionPolicy(
 }
 
 /**
- * Every credential namespace the product issues, in both brands. `\b` is unusable
- * as the leading guard because `_` is a word character, so `\bsk_` never matches
- * inside `cuna_sk_…`; an explicit non-identifier boundary is required. Legacy
- * `runa_*` values stay detected: they remain valid credentials.
+ * Every credential namespace the product issues, in every brand, taken from the
+ * one authority in `core/namespace.ts` so this denylist can never fall behind
+ * the validators. `\b` is unusable as the leading guard because `_` is a word
+ * character, so `\bsk_` never matches inside `cuna_sk_…`; an explicit
+ * non-identifier boundary is required. Legacy `runa_*` values stay detected:
+ * they remain valid credentials.
  */
-const SERVICE_TOKEN =
-  /(?:^|[^A-Za-z0-9_-])(?:(?:cuna|runa)_(?:sk|at|rt|ct|tc|se|sc)|sk)_[A-Za-z0-9_-]{20,}/u;
+const SERVICE_TOKEN = new RegExp(
+  `(?:^|[^A-Za-z0-9_-])(?:${CREDENTIAL_OPENING_SOURCE}|sk)_[A-Za-z0-9_-]{20,}`,
+  "u",
+);
 
 export function detectHighConfidenceSecret(content: Uint8Array): string | undefined {
   if (content.byteLength > 2 * 1024 * 1024 || content.includes(0)) return undefined;
