@@ -1,5 +1,5 @@
 [workspace]
-members = ["runa-native-bridge"]
+members = ["cuna-native-bridge"]
 resolver = "3"
 
 [workspace.package]

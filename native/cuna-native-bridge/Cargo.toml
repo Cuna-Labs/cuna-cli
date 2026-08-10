@@ -1,7 +1,7 @@
 [package]
-name = "runa-native-bridge"
+name = "cuna-native-bridge"
 version = "0.1.0"
-description = "Runa native credential and browser bridge"
+description = "Cuna native credential and browser bridge"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -33,11 +33,11 @@ nursery = "deny"
 cargo = "deny"
 
 [package.metadata.winresource]
-CompanyName = "Runa Laboratories"
-FileDescription = "Runa Native Credential and Browser Bridge"
+CompanyName = "Cuna Labs"
+FileDescription = "Cuna Native Credential and Browser Bridge"
 FileVersion = "0.1.0.0"
-InternalName = "runa-native-bridge"
-LegalCopyright = "Copyright 2026 Runa Laboratories"
-OriginalFilename = "runa-native-bridge.exe"
-ProductName = "Runa CLI"
+InternalName = "cuna-native-bridge"
+LegalCopyright = "Copyright 2026 Cuna Labs"
+OriginalFilename = "cuna-native-bridge.exe"
+ProductName = "Cuna CLI"
 ProductVersion = "0.1.0.0"
