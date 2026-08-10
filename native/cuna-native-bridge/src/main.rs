@@ -52,6 +52,7 @@ fn execute() -> Response {
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn dispatch(request: &Request) -> Response {
     #[cfg(windows)]
     {
@@ -62,10 +63,10 @@ fn dispatch(request: &Request) -> Response {
     {
         macos::dispatch(request)
     }
+}
 
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        let _ = request;
-        Response::empty(Status::Unavailable)
-    }
+#[cfg(not(any(windows, target_os = "macos")))]
+const fn dispatch(request: &Request) -> Response {
+    let _ = request;
+    Response::empty(Status::Unavailable)
 }

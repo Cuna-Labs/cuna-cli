@@ -135,6 +135,11 @@ pub enum Status {
     InternalError = 7,
 }
 
+// Linux compiles the protocol for source-quality verification but intentionally has no
+// credential backend to construct every platform response.
+#[cfg(not(any(windows, target_os = "macos")))]
+const _: [Status; 4] = [Status::Ok, Status::Absent, Status::Denied, Status::Corrupt];
+
 #[derive(Debug)]
 pub struct Response {
     status: Status,
@@ -149,6 +154,7 @@ impl Response {
         }
     }
 
+    #[cfg(any(windows, target_os = "macos", test))]
     pub const fn protected(payload: Vec<u8>) -> Self {
         Self {
             status: Status::Ok,

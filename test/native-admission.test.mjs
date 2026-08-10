@@ -12,8 +12,12 @@ import {
 } from "../dist/credentials/index.js";
 
 const fingerprint = "C".repeat(64);
+// This fixture deliberately models Authenticode and a Windows-normalized install root.
+// The macOS bridge has its own native source lane; a Windows trust artifact must never be
+// reinterpreted through POSIX path semantics on another host.
+const nativeAdmissionTest = process.platform === "win32" ? test : test.skip;
 
-test("TC-048-14 discovery binds manifest, binary, SBOM, provenance, version, platform, architecture, and signature", async (context) => {
+nativeAdmissionTest("TC-048-14 discovery binds manifest, binary, SBOM, provenance, version, platform, architecture, and signature", async (context) => {
   const fixture = await createFixture();
   context.after(async () => rm(fixture.root, { recursive: true, force: true }));
   const signatureAuthority = {
@@ -37,7 +41,7 @@ test("TC-048-14 discovery binds manifest, binary, SBOM, provenance, version, pla
   await admitted.verifier.verify(admitted.descriptor);
 });
 
-test("TC-048-05 unsigned discovery fails closed before producing a descriptor", async (context) => {
+nativeAdmissionTest("TC-048-05 unsigned discovery fails closed before producing a descriptor", async (context) => {
   const fixture = await createFixture();
   context.after(async () => rm(fixture.root, { recursive: true, force: true }));
   await assert.rejects(
@@ -50,7 +54,7 @@ test("TC-048-05 unsigned discovery fails closed before producing a descriptor", 
   );
 });
 
-test("TC-048-14 a signed path without an OS child-image authority remains unavailable", async (context) => {
+nativeAdmissionTest("TC-048-14 a signed path without an OS child-image authority remains unavailable", async (context) => {
   const fixture = await createFixture();
   context.after(async () => rm(fixture.root, { recursive: true, force: true }));
   let runnerCalls = 0;
@@ -79,7 +83,7 @@ test("TC-048-14 a signed path without an OS child-image authority remains unavai
   assert.equal(runnerCalls, 0);
 });
 
-test("TC-048-14 fresh verification rejects post-discovery substitution", async (context) => {
+nativeAdmissionTest("TC-048-14 fresh verification rejects post-discovery substitution", async (context) => {
   const fixture = await createFixture();
   context.after(async () => rm(fixture.root, { recursive: true, force: true }));
   const signatureAuthority = {
@@ -102,7 +106,7 @@ test("TC-048-14 fresh verification rejects post-discovery substitution", async (
   await assert.rejects(admitted.verifier.verify(admitted.descriptor), isUnverified);
 });
 
-test("TC-048-15 signer and protected-location observations are mandatory", async (context) => {
+nativeAdmissionTest("TC-048-15 signer and protected-location observations are mandatory", async (context) => {
   const fixture = await createFixture();
   context.after(async () => rm(fixture.root, { recursive: true, force: true }));
   for (const observation of [

@@ -8,6 +8,15 @@ const TERMINAL_ID = "55555555-5555-4555-8555-555555555555";
 const URL = `wss://api.getcuna.com/v1/terminal-connections/${TERMINAL_ID}/stream`;
 const TOKEN = `runa_tc_${"A".repeat(43)}`;
 
+function closeEvent(code, reason) {
+  const event = new Event("close");
+  Object.defineProperties(event, {
+    code: { value: code, enumerable: true },
+    reason: { value: reason, enumerable: true },
+  });
+  return event;
+}
+
 class FakeWebSocket extends EventTarget {
   static OPEN = 1;
   static instances = [];
@@ -36,7 +45,7 @@ class FakeWebSocket extends EventTarget {
   close(code, reason) {
     this.closeCalls.push({ code, reason });
     this.readyState = 3;
-    this.dispatchEvent(new CloseEvent("close", { code, reason }));
+    this.dispatchEvent(closeEvent(code, reason));
   }
 }
 
@@ -161,7 +170,7 @@ test("remote close drains an already-delivered asynchronous Blob before ending t
   Object.defineProperty(finalBlob, "arrayBuffer", { value: () => new Promise((resolve) => { resolveBlob = resolve; }) });
   const iterator = connection.receive()[Symbol.asyncIterator]();
   socket.dispatchEvent(new MessageEvent("message", { data: finalBlob }));
-  socket.dispatchEvent(new CloseEvent("close", { code: 1000, reason: "remote_complete" }));
+  socket.dispatchEvent(closeEvent(1000, "remote_complete"));
   let settled = false;
   const finalFrame = iterator.next().then((value) => { settled = true; return value; });
   await new Promise((resolve) => setImmediate(resolve));
@@ -217,6 +226,6 @@ test("TC-055-16 receive overflow and stalled Blob conversion fail immediately an
   const blob = new Blob([Uint8Array.of(1)]);
   Object.defineProperty(blob, "arrayBuffer", { value: () => new Promise(() => undefined) });
   stalledSocket.dispatchEvent(new MessageEvent("message", { data: blob }));
-  stalledSocket.dispatchEvent(new CloseEvent("close", { code: 1000, reason: "remote_complete" }));
+  stalledSocket.dispatchEvent(closeEvent(1000, "remote_complete"));
   await assert.rejects(stalled.receive()[Symbol.asyncIterator]().next(), /conversion exceeded/u);
 });

@@ -282,13 +282,10 @@ fn delete_once(target: &str) -> Result<(), Status> {
         return Err(status_from_os(status));
     }
     // A successful delete is acknowledged only after an independent absence observation.
-    match read_bytes(target)? {
-        None => Ok(()),
-        Some(mut unexpected) => {
-            unexpected.zeroize();
-            Err(Status::Unavailable)
-        }
-    }
+    read_bytes(target)?.map_or(Ok(()), |mut unexpected| {
+        unexpected.zeroize();
+        Err(Status::Unavailable)
+    })
 }
 
 fn open_browser(payload: &[u8]) -> Response {
@@ -335,11 +332,10 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-fn status_from_os(status: OsStatus) -> Status {
+const fn status_from_os(status: OsStatus) -> Status {
     match status {
         ERR_SEC_ITEM_NOT_FOUND => Status::Absent,
         ERR_SEC_AUTH_FAILED | ERR_SEC_USER_CANCELED => Status::Denied,
-        ERR_SEC_INTERACTION_NOT_ALLOWED => Status::Unavailable,
         ERR_SEC_DECODE => Status::Corrupt,
         ERR_SEC_PARAM => Status::InvalidRequest,
         _ => Status::Unavailable,
