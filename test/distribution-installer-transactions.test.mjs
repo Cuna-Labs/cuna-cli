@@ -918,7 +918,38 @@ pass uninstall-preserves-user-state
 `;
 }
 
-function runProcess(command, args, input, timeoutMs = 45_000) {
+/**
+ * WSL2 stops its utility VM after roughly a minute of idle, and no other test
+ * in this suite touches WSL, so this test almost always pays a cold boot.
+ * Measured on this host: cold boot 3.8-6.0 s on an idle machine, warm probe
+ * 0.29 s, harness 16.3 s.
+ *
+ * The previous budgets were 20 s (probe), 45 s (harness) and a 60 s test
+ * timeout, which produced two distinct defects.
+ *
+ * First, 20 + 45 = 65 > 60. Both inner budgets could be respected while the
+ * outer timeout still failed the test, so the arithmetic -- not the machine --
+ * made a false red reachable.
+ *
+ * Second, and worse: a probe that merely ran slowly was reported as
+ * `WSL POSIX shell is unavailable`, so the test skipped and the suite stayed
+ * green while every assertion below silently did not run. Slowness and absence
+ * are different conditions; collapsing them into one outcome turns a loaded
+ * machine into missing coverage that nothing reports.
+ *
+ * So: budgets wide enough that only a genuinely broken shell exceeds them, one
+ * retry so the first attempt pays the cold boot and the second meets a warm VM,
+ * an outer timeout strictly greater than the sum of the inner ones, and a
+ * timeout that fails loudly instead of skipping quietly. Absence still skips --
+ * a host without WSL cannot run this and should say so.
+ */
+const PROBE_BUDGET_MS = 60_000;
+const PROBE_ATTEMPTS = 2;
+const HARNESS_BUDGET_MS = 180_000;
+const SHELL_TEST_TIMEOUT_MS = PROBE_BUDGET_MS * PROBE_ATTEMPTS + HARNESS_BUDGET_MS + 30_000;
+const HARNESS_TIMEOUT_CODE = "posix_harness_timeout";
+
+function runProcess(command, args, input, timeoutMs = HARNESS_BUDGET_MS) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: repositoryRoot,
@@ -933,7 +964,10 @@ function runProcess(command, args, input, timeoutMs = 45_000) {
     const maximumOutputBytes = 4 * 1024 * 1024;
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      finish(new Error(`POSIX harness exceeded its ${timeoutMs}ms budget`));
+      const timeout = new Error(`POSIX harness exceeded its ${timeoutMs}ms budget`);
+      // Classified so the caller can tell a slow shell from an absent one.
+      timeout.code = HARNESS_TIMEOUT_CODE;
+      finish(timeout);
     }, timeoutMs);
 
     function finish(error, result) {
@@ -963,43 +997,74 @@ function runProcess(command, args, input, timeoutMs = 45_000) {
   });
 }
 
-async function selectShell() {
-  if (process.platform === "win32") {
+/**
+ * Resolves a probe into exactly one of four conditions, so that no two of them
+ * can be mistaken for each other downstream:
+ *
+ *   ready    -- the shell answered with its marker
+ *   absent   -- the interpreter could not be spawned at all (no WSL installed)
+ *   timedOut -- the interpreter exists but never answered inside its budget
+ *   failed   -- the interpreter answered, but not with the expected marker
+ */
+async function probeShell(command, args, input, marker) {
+  let lastTimeout;
+  for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt += 1) {
     try {
-      const probe = await runProcess(
-        "wsl.exe",
-        ["--exec", "sh", "-s"],
-        "command -v sh >/dev/null 2>&1 || exit 127\nprintf 'WSL_POSIX_READY\\n'\n",
-        20_000,
-      );
-      if (probe.code === 0 && probe.stdout.includes("WSL_POSIX_READY")) {
-        return { command: "wsl.exe", args: ["--exec", "sh", "-s"], identity: "WSL POSIX sh" };
-      }
-      return { unavailable: `WSL exists but its POSIX shell probe failed: ${probe.stderr || probe.stdout || `exit ${probe.code}`}` };
+      const probe = await runProcess(command, args, input, PROBE_BUDGET_MS);
+      if (probe.code === 0 && probe.stdout.includes(marker)) return { ready: true };
+      return { failed: probe.stderr || probe.stdout || `exit ${probe.code}` };
     } catch (error) {
-      return { unavailable: `WSL POSIX shell is unavailable: ${error.message}` };
+      if (error?.code === HARNESS_TIMEOUT_CODE) {
+        lastTimeout = error;
+        continue;
+      }
+      return { absent: error.message };
     }
   }
-
-  try {
-    const probe = await runProcess("/bin/sh", ["-s"], "printf 'NATIVE_POSIX_READY\\n'\n", 10_000);
-    if (probe.code === 0 && probe.stdout.includes("NATIVE_POSIX_READY")) {
-      return { command: "/bin/sh", args: ["-s"], identity: "native /bin/sh" };
-    }
-    return { unavailable: `native POSIX shell probe failed: ${probe.stderr || probe.stdout || `exit ${probe.code}`}` };
-  } catch (error) {
-    return { unavailable: `native POSIX shell is unavailable: ${error.message}` };
-  }
+  return { timedOut: lastTimeout.message };
 }
 
-test("curl installer preserves atomicity, ownership, idempotency, and recovery in a real POSIX shell", { timeout: 60_000 }, async (t) => {
+async function selectShell() {
+  if (process.platform === "win32") {
+    const probe = await probeShell(
+      "wsl.exe",
+      ["--exec", "sh", "-s"],
+      "command -v sh >/dev/null 2>&1 || exit 127\nprintf 'WSL_POSIX_READY\\n'\n",
+      "WSL_POSIX_READY",
+    );
+    if (probe.ready) return { command: "wsl.exe", args: ["--exec", "sh", "-s"], identity: "WSL POSIX sh" };
+    if (probe.absent) return { unavailable: `WSL is not installed on this host: ${probe.absent}` };
+    if (probe.timedOut) {
+      return {
+        unusable: `WSL is installed but presented no POSIX shell within ${PROBE_BUDGET_MS} ms across ${PROBE_ATTEMPTS} attempts, so installer atomicity went unverified: ${probe.timedOut}`,
+      };
+    }
+    return { unavailable: `WSL exists but its POSIX shell probe failed: ${probe.failed}` };
+  }
+
+  const probe = await probeShell("/bin/sh", ["-s"], "printf 'NATIVE_POSIX_READY\\n'\n", "NATIVE_POSIX_READY");
+  if (probe.ready) return { command: "/bin/sh", args: ["-s"], identity: "native /bin/sh" };
+  if (probe.absent) return { unavailable: `native POSIX shell is not installed on this host: ${probe.absent}` };
+  if (probe.timedOut) {
+    return {
+      unusable: `native /bin/sh did not answer within ${PROBE_BUDGET_MS} ms across ${PROBE_ATTEMPTS} attempts, so installer atomicity went unverified: ${probe.timedOut}`,
+    };
+  }
+  return { unavailable: `native POSIX shell probe failed: ${probe.failed}` };
+}
+
+test("curl installer preserves atomicity, ownership, idempotency, and recovery in a real POSIX shell", { timeout: SHELL_TEST_TIMEOUT_MS }, async (t) => {
   const shell = await selectShell();
+  // A host with no POSIX shell genuinely cannot run this. A host whose shell
+  // exists but never answered is a silent hole in the installer's coverage, and
+  // must be reported as a failure rather than absorbed as a skip.
+  if (shell.unusable) assert.fail(shell.unusable);
   if (shell.unavailable) {
     t.skip(shell.unavailable);
     return;
   }
 
-  const result = await runProcess(shell.command, shell.args, buildHarness(), 45_000);
+  const result = await runProcess(shell.command, shell.args, buildHarness(), HARNESS_BUDGET_MS);
   assert.equal(
     result.code,
     0,

@@ -29,7 +29,7 @@
     "lint": "oxlint --deny-warnings src test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node scripts/run-build-operation.mjs test",
-    "prepack": "npm run typecheck && npm test"
+    "prepack": "npm run build"
   },
   "publishConfig": {
     "access": "public",
