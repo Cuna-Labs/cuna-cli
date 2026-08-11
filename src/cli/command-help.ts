@@ -35,16 +35,16 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "Create a waitlist-only Cuna account through the browser. Never assigns compute\nand never starts billing. Accepts no operands and no command options.",
   ),
   login: topic(
-    "Usage:\n  cuna login",
-    "Sign in through the Cuna browser continuation. Polling only; no local callback\nlistener is opened. Accepts no operands and no command options.",
+    "Usage:\n  cuna login [--session-only]",
+    "Sign in through the Cuna browser continuation. Polling only; no local callback\nlistener is opened. Use --session-only for an explicit encrypted local preview\nsession when the native vault is unavailable. Repeat --session-only for later\npreview commands and logout; preview storage is not GA.",
   ),
   logout: topic(
-    "Usage:\n  cuna logout",
-    "Revoke the interactive token family server-first. Accepts no operands and no\ncommand options.",
+    "Usage:\n  cuna logout [--session-only]",
+    "Revoke the interactive token family server-first. Add --session-only when\nusing the encrypted preview session. Accepts no operands otherwise.",
   ),
   whoami: topic(
-    "Usage:\n  cuna whoami",
-    "Show authoritative interactive account context. Accepts no operands and no\ncommand options.",
+    "Usage:\n  cuna whoami [--session-only]",
+    "Show authoritative interactive account context. Add --session-only when\nusing the encrypted preview session. Accepts no operands otherwise.",
   ),
   access: topic(
     "Usage:\n  cuna access status",

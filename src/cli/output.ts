@@ -9,6 +9,8 @@ export interface CliStreams {
   readonly stderr: Writable;
   readonly stdoutIsTTY: boolean;
   readonly stdinIsTTY: boolean;
+  /** Optional because injected test streams predate the preview link gate. */
+  readonly stderrIsTTY?: boolean;
 }
 
 export interface OutputWriter {

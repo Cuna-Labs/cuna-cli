@@ -3,7 +3,7 @@ import { createInterface } from "node:readline/promises";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
 import { createHttpTransport, type HttpRequest } from "../api/http.js";
-import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
+import { createBrowserOpener, createManualBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
@@ -19,6 +19,7 @@ import { integerArgument } from "../core/validation.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { resolvePlatformAuthority, type ResolvedPlatformAuthority } from "../credentials/platform.js";
 import { CredentialVault } from "../credentials/vault.js";
+import { LocalSessionPreviewBackend, localSessionPreviewPath } from "../credentials/local-session-preview.js";
 import {
   conservativeFilesystemCapabilities,
   createApiAgentJourneyEffects,
@@ -67,6 +68,8 @@ export interface RunCliDependencies {
     readonly signal?: AbortSignal;
   }) => AgentJourneyEffects;
   readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw", signal: AbortSignal) => Promise<boolean>;
+  /** Test-only injection; production uses CUNA_SESSION_PASSPHRASE. */
+  readonly sessionPassphrase?: string;
 }
 
 async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw", signal: AbortSignal): Promise<boolean> {
@@ -88,6 +91,7 @@ function defaultStreams(): CliStreams {
     stderr: process.stderr,
     stdoutIsTTY: process.stdout.isTTY === true,
     stdinIsTTY: process.stdin.isTTY === true,
+    stderrIsTTY: process.stderr.isTTY === true,
   });
 }
 
@@ -126,6 +130,7 @@ function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>>
       state: result.context.workspace.state,
       ...(result.context.workspace.id === undefined ? {} : { id: result.context.workspace.id }),
     },
+    ...(result.storageMode === undefined ? {} : { storage_mode: result.storageMode }),
     ...(result.context.waitlistPosition === undefined ? {} : { waitlist_position: result.context.waitlistPosition }),
   });
 }
@@ -190,6 +195,22 @@ function foregroundSelection(parsed: ParsedInvocation): ForegroundSelection | un
 
 function nodePlatform(kind: PlatformAdapter["kind"]): NodeJS.Platform {
   return kind === "windows" ? "win32" : kind === "macos" ? "darwin" : "linux";
+}
+
+function previewSessionPassphrase(
+  environment: NodeJS.ProcessEnv,
+  injected: string | undefined,
+): string {
+  const passphrase = injected ?? environment.CUNA_SESSION_PASSPHRASE;
+  if (passphrase === undefined || passphrase.length === 0) {
+    throw new CunaError({
+      code: "cuna.auth.preview_passphrase_required",
+      message: "Preview authentication stores an encrypted local session and requires CUNA_SESSION_PASSPHRASE.",
+      exitCode: EXIT_CODES.auth,
+      hint: "Set a passphrase of at least 12 characters, then retry with --session-only. This is preview storage, not a native vault.",
+    });
+  }
+  return passphrase;
 }
 
 function runtimeError(error: RuntimeBoundaryError): CunaError {
@@ -301,6 +322,22 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       : undefined;
 
     const foreground = foregroundSelection(parsed);
+    const sessionOnly = booleanOption(parsed, "session-only");
+    if (sessionOnly && !usesCredentialAuthority(parsed.command, foreground)) {
+      throw usageError("Option --session-only applies only to authenticated commands.");
+    }
+    if (
+      sessionOnly &&
+      (writer.structured || !streams.stdinIsTTY || !streams.stdoutIsTTY || streams.stderrIsTTY !== true) &&
+      dependencies.humanAuth === undefined &&
+      dependencies.browser === undefined &&
+      (parsed.command === "login" || parsed.command === "signup")
+    ) {
+      throw usageError(
+        "Preview browser authentication requires an interactive terminal and does not support JSON or redirected output.",
+        "Run `cuna login --session-only` directly in a TTY; the one-time link is printed only to the terminal.",
+      );
+    }
     if ((foreground !== undefined || journeyIntent?.target === "reconcile") &&
       (writer.structured || !streams.stdinIsTTY || !streams.stdoutIsTTY)) {
       throw usageError(
@@ -348,6 +385,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // `*_API_KEY` refuses the command rather than silently demoting automation
     // mode to an interactive browser sign-in.
     if (usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
+    if (sessionOnly && config.apiKey !== undefined) {
+      throw new CunaError({
+        code: "cuna.auth.mode_conflict",
+        message: `--session-only cannot be combined with ${config.apiKeyVariable ?? "CUNA_API_KEY"}.`,
+        exitCode: EXIT_CODES.auth,
+        hint: "Unset the automation credential before starting the encrypted preview session.",
+      });
+    }
     // One resolution of the signed native authority per process, shared by the
     // credential vault and the Windows browser opener. Both used to construct
     // their own unwired defaults, so neither ever saw a native bridge.
@@ -372,21 +417,39 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         anonymous: createHttpTransport(transportOptions),
         authenticated: (accessToken) => createHttpTransport({ ...transportOptions, bearerToken: accessToken }),
       });
-      const authority = dependencies.credentialVault !== undefined && dependencies.browser !== undefined
+      const authority = sessionOnly
+        ? undefined
+        : dependencies.credentialVault !== undefined && dependencies.browser !== undefined
         ? undefined
         : await getPlatformAuthority();
+      const previewPassphrase = sessionOnly
+        ? previewSessionPassphrase(effectiveEnvironment, dependencies.sessionPassphrase)
+        : undefined;
+      const previewBackend = sessionOnly && dependencies.credentialVault === undefined
+        ? new LocalSessionPreviewBackend({
+            filePath: localSessionPreviewPath(platform.paths.configDirectory, config.profile),
+            passphrase: previewPassphrase!,
+            platform: nodePlatform(platform.kind),
+            ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
+          })
+        : undefined;
       humanAuth = createHumanAuthService({
         config,
         client: humanClient,
         vault: dependencies.credentialVault ?? new CredentialVault({
-          backend: authority!.credentials,
+          backend: previewBackend ?? authority!.credentials,
+          platform: nodePlatform(platform.kind),
           ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
+          ...(sessionOnly ? { allowPreviewBackend: true } : {}),
         }),
-        browser: dependencies.browser ?? createBrowserOpener(
-          nodePlatform(platform.kind),
-          effectiveEnvironment,
-          ...(authority?.browserBridge === undefined ? [] : [authority.browserBridge]),
-        ),
+        browser: dependencies.browser ?? (sessionOnly
+          ? createManualBrowserOpener((message) => { streams.stderr.write(message); })
+          : createBrowserOpener(
+              nodePlatform(platform.kind),
+              effectiveEnvironment,
+              ...(authority?.browserBridge === undefined ? [] : [authority.browserBridge]),
+            )),
+        ...(sessionOnly ? { allowPreviewStorage: true } : {}),
         ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
       });
       return humanAuth;
@@ -399,7 +462,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       parsed.command === "whoami" ||
       parsed.command === "access"
     ) {
-      rejectUnknownOptions(parsed, []);
+      rejectUnknownOptions(parsed, ["session-only"]);
       if (parsed.command === "access") {
         if (parsed.operands.length !== 1 || parsed.operands[0] !== "status") {
           throw usageError("access requires the status action.");
@@ -431,8 +494,17 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const result = await (await getHumanAuth()).login(
           dependencies.signal === undefined ? {} : { signal: dependencies.signal },
         );
-        const data = humanResult(result);
-        writer.success("login", data, `Signed in to Cuna profile ${result.profile}.`);
+        const data = Object.freeze({
+          ...humanResult(result),
+          ...(sessionOnly ? { storage_mode: "preview" as const } : {}),
+        });
+        writer.success(
+          "login",
+          data,
+          sessionOnly
+            ? `Signed in to Cuna profile ${result.profile} using an encrypted preview session (no native vault).`
+            : `Signed in to Cuna profile ${result.profile}.`,
+        );
       } else if (parsed.command === "whoami" || parsed.command === "access") {
         const result = await (await getHumanAuth()).whoami(dependencies.signal);
         const data = humanResult(result);
@@ -583,7 +655,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       let credentialBackendReason: string | undefined;
       try {
         const evidence = await backend.probe();
-        credentialBackendStatus = evidence.status;
+        credentialBackendStatus = evidence.status === "preview" ? "unavailable" : evidence.status;
         credentialBackendReason = evidence.reason;
       } catch {
         credentialBackendStatus = "unavailable";
@@ -629,6 +701,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
 export function memoryStreams(input?: {
   readonly stdoutIsTTY?: boolean;
   readonly stdinIsTTY?: boolean;
+  readonly stderrIsTTY?: boolean;
 }): { readonly streams: CliStreams; readonly stdout: () => string; readonly stderr: () => string } {
   let stdout = "";
   let stderr = "";
@@ -640,6 +713,7 @@ export function memoryStreams(input?: {
       stderr: stderrStream,
       stdoutIsTTY: input?.stdoutIsTTY ?? false,
       stdinIsTTY: input?.stdinIsTTY ?? false,
+      stderrIsTTY: input?.stderrIsTTY ?? input?.stdoutIsTTY ?? false,
     }),
     stdout: () => stdout,
     stderr: () => stderr,

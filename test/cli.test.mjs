@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
@@ -399,6 +401,160 @@ test("explicit signup, login, whoami, access status, and logout dispatch only to
   assert.deepEqual(calls, ["signup", "login", "whoami", "whoami", "logout"]);
 });
 
+test("--session-only is explicit, labels preview storage, and is forwarded to remote auth without native authority", async () => {
+  const result = {
+    profile: "default",
+    sessionId: "00000000-0000-0000-0000-000000000002",
+    context: {
+      requiredTermsVersion: "2026-08",
+      identity: "active",
+      admission: "admitted",
+      workspace: { state: "assigned", id: "00000000-0000-0000-0000-000000000003" },
+    },
+  };
+  let loginRequest;
+  const humanAuth = {
+    async login(request) { loginRequest = request; return result; },
+    async signup() { throw new Error("unexpected"); },
+    async acquireAccessToken() { return `runa_at_${"a".repeat(43)}`; },
+    async whoami() { throw new Error("unexpected"); },
+    async logout() { throw new Error("unexpected"); },
+  };
+  const loginStreams = memoryStreams();
+  assert.equal(
+    await runCli(["login", "--session-only"], { streams: loginStreams.streams, platform, env: {}, humanAuth }),
+    EXIT_CODES.success,
+  );
+  assert.deepEqual(loginRequest, {});
+  assert.equal(JSON.parse(loginStreams.stdout()).data.storage_mode, "preview");
+
+  let observedAuthorization;
+  const commandStreams = memoryStreams();
+  assert.equal(
+    await runCli(["machines", "list", "--session-only"], {
+      streams: commandStreams.streams,
+      platform,
+      env: {},
+      humanAuth,
+      fetch: async (_url, init) => {
+        observedAuthorization = init.headers.Authorization;
+        return new Response(JSON.stringify([]), { status: 200 });
+      },
+    }),
+    EXIT_CODES.success,
+  );
+  assert.equal(observedAuthorization, `Bearer runa_at_${"a".repeat(43)}`);
+});
+
+test("preview login never prints a capability-bearing browser URL to JSON or redirected output", async () => {
+  const streams = memoryStreams();
+  const exit = await runCli(["login", "--session-only", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
+  });
+  assert.equal(exit, EXIT_CODES.usage);
+  assert.equal(streams.stdout().includes("app.getcuna.com"), false);
+  assert.equal(streams.stderr().includes("app.getcuna.com"), false);
+});
+
+test("preview login refuses a redirected stderr before creating a browser continuation", async () => {
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: false });
+  const exit = await runCli(["login", "--session-only"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
+  });
+  assert.equal(exit, EXIT_CODES.usage);
+  assert.doesNotMatch(streams.stdout(), /app\.getcuna\.com/u);
+  assert.doesNotMatch(streams.stderr(), /app\.getcuna\.com/u);
+});
+
+test("production preview path uses encrypted backend without resolving native authority", async () => {
+  const configDirectory = await mkdtemp(join(tmpdir(), "cuna-cli-preview-"));
+  const continuationId = "123e4567-e89b-12d3-a456-426614174000";
+  const sessionId = "123e4567-e89b-12d3-a456-426614174001";
+  const browserNonce = `cuna_cb_${"n".repeat(43)}`;
+  const context = {
+    required_terms_version: "2026-08",
+    identity: "active",
+    admission: "admitted",
+    workspace: { state: "assigned", id: "22222222-2222-4222-8222-222222222222" },
+  };
+  let browserUrl;
+  const fetch = async (url, init = {}) => {
+    const requestUrl = new URL(url);
+    if (requestUrl.pathname === "/v1/cli-auth/bootstrap") {
+      return new Response(JSON.stringify({
+        enabled: true,
+        completion_mode: "poll",
+        pkce_method: "S256",
+        continuation_ttl_seconds: 600,
+        poll_after_ms: 2000,
+        poll_limit: 1,
+        access_token_ttl_seconds: 600,
+        refresh_family_ttl_seconds: 2592000,
+        browser_origin: "https://app.getcuna.com",
+      }), { status: 200 });
+    }
+    if (requestUrl.pathname === "/v1/cli-auth/continuations" && init.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      browserUrl = `https://app.getcuna.com/cli/continue#continuation=${continuationId}&nonce=${browserNonce}&state=${body.state}`;
+      return new Response(JSON.stringify({
+        id: continuationId,
+        continuation_secret: `cuna_ct_${"s".repeat(43)}`,
+        browser_url: browserUrl,
+        expires_at: "2030-01-01T00:00:00.000Z",
+        poll_after_ms: 2000,
+        completion_mode: "poll",
+      }), { status: 200 });
+    }
+    if (requestUrl.pathname === `/v1/cli-auth/continuations/${continuationId}`) {
+      return new Response(JSON.stringify({
+        id: continuationId,
+        phase: "completed",
+        expires_at: "2030-01-01T00:00:00.000Z",
+        required_terms_version: "2026-08",
+        context,
+      }), { status: 200 });
+    }
+    if (requestUrl.pathname === `/v1/cli-auth/continuations/${continuationId}/exchange`) {
+      return new Response(JSON.stringify({
+        access_token: `cuna_at_${"a".repeat(43)}`,
+        refresh_token: `cuna_rt_${"r".repeat(43)}`,
+        token_type: "Bearer",
+        expires_in: 600,
+        access_expires_at: "2030-01-01T00:10:00.000Z",
+        refresh_expires_at: "2030-02-01T00:00:00.000Z",
+        session_id: sessionId,
+        context,
+      }), { status: 200 });
+    }
+    throw new Error(`unexpected preview auth request: ${requestUrl.pathname}`);
+  };
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  try {
+    const exit = await runCli(["login", "--session-only"], {
+      streams: streams.streams,
+      platform: {
+        ...platform,
+        paths: { ...platform.paths, configDirectory },
+      },
+      env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
+      fetch,
+      browser: { async open(url) { browserUrl = url; } },
+    });
+    assert.equal(exit, EXIT_CODES.success, streams.stderr());
+    assert.match(browserUrl, /^https:\/\/app\.getcuna\.com\/cli\/continue#/u);
+    const files = await readdir(configDirectory);
+    assert.equal(files.length, 1);
+    const stored = await readFile(join(configDirectory, files[0]), "utf8");
+    assert.doesNotMatch(stored, /cuna_(?:at|rt)_/u);
+  } finally {
+    await rm(configDirectory, { recursive: true, force: true });
+  }
+});
+
 test("access status rejects alternate actions before configuration or authentication effects", async () => {
   for (const argv of [["access"], ["access", "ready"], ["access", "status", "extra"]]) {
     let effects = 0;
@@ -432,6 +588,17 @@ test("CUNA_API_KEY automation mode never falls back to or mutates interactive au
   assert.equal(exit, EXIT_CODES.auth);
   assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.auth.mode_conflict");
   assert.equal(calls, 0);
+});
+
+test("session-only cannot be overridden by a valid automation API key", async () => {
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", "list", "--session-only"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY, CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
+  });
+  assert.equal(exit, EXIT_CODES.auth);
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.auth.mode_conflict");
 });
 
 test("interactive bearer authenticates cloud commands without exposing or persisting the access token", async () => {

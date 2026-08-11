@@ -44,6 +44,7 @@ export interface HumanAuthResult {
   readonly profile: string;
   readonly sessionId: string;
   readonly context: CliIdentityContext;
+  readonly storageMode?: "native" | "preview";
 }
 
 export interface HumanAuthService {
@@ -286,6 +287,8 @@ export function createHumanAuthService(input: {
   readonly sleep?: Sleep;
   readonly random?: RandomSource;
   readonly uuid?: () => string;
+  /** Explicit preview-only local session storage. Normal auth remains native-only. */
+  readonly allowPreviewStorage?: boolean;
 }): HumanAuthService {
   const clock = input.clock ?? Date.now;
   const random = input.random ?? randomBytes;
@@ -357,25 +360,41 @@ export function createHumanAuthService(input: {
     const intentClass = request.intentClass ?? "login";
     assertNotCancelled(request.signal);
     const vaultStatus = await input.vault.status(credentialBinding);
-    if (vaultStatus.backendStatus !== "verified") {
+    const previewStorage = input.allowPreviewStorage === true && vaultStatus.backendStatus === "preview";
+    if (vaultStatus.backendStatus !== "verified" && !previewStorage) {
       throw authError(
         "cuna.auth.vault_unavailable",
-        "Interactive sign-in requires the verified operating-system credential vault.",
-        { hint: AUTOMATION_CREDENTIAL_HINT },
+        input.allowPreviewStorage === true
+          ? "The encrypted preview session store is unavailable or cannot be verified."
+          : "Interactive sign-in requires the verified operating-system credential vault.",
+        {
+          hint: input.allowPreviewStorage === true
+            ? "Set CUNA_SESSION_PASSPHRASE to a 12-character-or-longer passphrase and retry `cuna login --session-only`."
+            : AUTOMATION_CREDENTIAL_HINT,
+        },
       );
     }
     if (vaultStatus.state === "present") {
       throw authError(
         "cuna.auth.already_signed_in",
         "This Cuna profile already has an interactive session.",
-        { hint: "Run `cuna logout` before signing in again." },
+        {
+          hint: previewStorage
+            ? "Run `cuna logout --session-only` before signing in again."
+            : "Run `cuna logout` before signing in again.",
+        },
       );
     }
     if (vaultStatus.state === "corrupt") {
+      const corruptHint = previewStorage
+        ? "Remove the encrypted preview session file and retry with a new CUNA_SESSION_PASSPHRASE."
+        : "Remove the damaged credential through the operating-system credential manager.";
       throw authError(
         "cuna.auth.session_corrupt",
-        "The protected Cuna session is corrupt and cannot be replaced implicitly.",
-        { hint: "Remove the damaged credential through the operating-system credential manager." },
+        previewStorage
+          ? "The encrypted preview Cuna session is corrupt and cannot be replaced implicitly."
+          : "The protected Cuna session is corrupt and cannot be replaced implicitly.",
+        { hint: corruptHint },
       );
     }
     const bootstrap = await input.client.bootstrap(request.signal);
@@ -477,7 +496,12 @@ export function createHumanAuthService(input: {
             });
           } finally { material.dispose(); }
           cacheAccessToken(tokens.accessToken, Date.parse(tokens.accessExpiresAt));
-          return Object.freeze({ profile: stored.profile, sessionId: stored.sessionId, context: stored.context });
+          return Object.freeze({
+            profile: stored.profile,
+            sessionId: stored.sessionId,
+            context: stored.context,
+            storageMode: previewStorage ? "preview" as const : "native" as const,
+          });
         } catch (error) {
           try { await input.client.logout(tokens.accessToken); } catch { /* family remains server-expiring */ }
           throw error;
@@ -588,11 +612,20 @@ export function createHumanAuthService(input: {
   async function whoami(signal?: AbortSignal): Promise<HumanAuthResult> {
     const token = await acquireAccessToken(signal);
     const context = await input.client.context(token, signal);
+    const storageStatus = await input.vault.status(credentialBinding);
+    if (storageStatus.backendStatus !== "verified" && storageStatus.backendStatus !== "preview") {
+      throw authError("cuna.auth.required", "No interactive Cuna session is stored.");
+    }
     const snapshot = await input.vault.load(credentialBinding);
     if (snapshot === undefined) throw authError("cuna.auth.required", "No interactive Cuna session is stored.");
     try {
       const stored = snapshot.material.withBytes((bytes) => decodeStored(bytes, input.config));
-      return Object.freeze({ profile: stored.profile, sessionId: stored.sessionId, context });
+      return Object.freeze({
+        profile: stored.profile,
+        sessionId: stored.sessionId,
+        context,
+        storageMode: storageStatus.backendStatus === "preview" ? "preview" as const : "native" as const,
+      });
     } finally { snapshot.material.dispose(); }
   }
 

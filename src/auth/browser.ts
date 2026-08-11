@@ -13,6 +13,21 @@ export interface BrowserCommand {
   readonly cwd: string;
 }
 
+/**
+ * Preview-only opener: print the one-time browser link instead of invoking an
+ * unadmitted native launcher. The fragment is short-lived and PKCE-bound; it
+ * is intentionally never emitted in structured JSON or automation output.
+ */
+export function createManualBrowserOpener(write: (message: string) => void): BrowserOpener {
+  return Object.freeze({
+    open(url: string): Promise<void> {
+      assertHttpsBrowserUrl(url);
+      write(`Open this one-time Cuna sign-in link in your browser:\n${url}\n`);
+      return Promise.resolve();
+    },
+  });
+}
+
 export function resolveBrowserCommand(
   platform: NodeJS.Platform,
   url: string,

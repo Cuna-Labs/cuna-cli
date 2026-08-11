@@ -46,6 +46,7 @@ export class CredentialVault {
   readonly #backend: SecureCredentialBackend;
   readonly #clock: () => number;
   readonly #platform: NodeJS.Platform;
+  readonly #allowPreviewBackend: boolean;
   readonly #queues = new Map<string, Promise<void>>();
   readonly #refreshes = new Map<string, RefreshFlight>();
   readonly #revoked = new Set<string>();
@@ -55,10 +56,12 @@ export class CredentialVault {
     readonly backend: SecureCredentialBackend;
     readonly clock?: () => number;
     readonly platform?: NodeJS.Platform;
+    readonly allowPreviewBackend?: boolean;
   }) {
     this.#backend = input.backend;
     this.#clock = input.clock ?? Date.now;
     this.#platform = input.platform ?? process.platform;
+    this.#allowPreviewBackend = input.allowPreviewBackend ?? false;
   }
 
   async load(binding: CredentialBinding): Promise<CredentialSnapshot | undefined> {
@@ -167,7 +170,7 @@ export class CredentialVault {
       this.#revoked.add(target);
       return {
         backendId: this.#backend.backendId,
-        backendStatus: "verified",
+        backendStatus: this.#allowPreviewBackend ? "preview" : "verified",
         state: "revoked",
         bindingDigest: bindingDigest(normalized),
       };
@@ -186,13 +189,13 @@ export class CredentialVault {
     } catch {
       return this.#unavailableStatus(normalized);
     }
-    if (!validEvidence(evidence, this.#backend, this.#platform, observedNow)) {
+    if (!validEvidence(evidence, this.#backend, this.#platform, observedNow, this.#allowPreviewBackend)) {
       return this.#unavailableStatus(normalized);
     }
     if (this.#revoked.has(target)) {
       return {
         backendId: this.#backend.backendId,
-        backendStatus: "verified",
+        backendStatus: evidence.status,
         state: "revoked",
         bindingDigest: bindingDigest(normalized),
       };
@@ -201,7 +204,7 @@ export class CredentialVault {
     if (encoded === undefined) {
       return {
         backendId: this.#backend.backendId,
-        backendStatus: "verified",
+        backendStatus: evidence.status,
         state: "absent",
         bindingDigest: bindingDigest(normalized),
       };
@@ -213,12 +216,13 @@ export class CredentialVault {
         normalized,
         decoded.header.revision,
         decoded.header.expiresAt ?? undefined,
+        evidence.status === "preview" ? "preview" : "verified",
       );
     } catch (error) {
       if (error instanceof CredentialBoundaryError && error.code === "credential_corrupt") {
         return {
           backendId: this.#backend.backendId,
-          backendStatus: "verified",
+          backendStatus: evidence.status === "preview" ? "preview" : "verified",
           state: "corrupt",
           bindingDigest: bindingDigest(normalized),
         };
@@ -315,7 +319,7 @@ export class CredentialVault {
         { cause },
       );
     }
-    if (!validEvidence(evidence, this.#backend, this.#platform, this.#now())) {
+    if (!validEvidence(evidence, this.#backend, this.#platform, this.#now(), this.#allowPreviewBackend)) {
       throw credentialFailure(
         evidence.status === "unavailable" ? "credential_backend_unavailable" : "credential_backend_unverified",
         "The secure credential store lacks current platform-bound evidence.",
@@ -401,10 +405,15 @@ export class CredentialVault {
     }
   }
 
-  #presentStatus(binding: CredentialBinding, revision: number, expiresAt: number | undefined): CredentialStatus {
+  #presentStatus(
+    binding: CredentialBinding,
+    revision: number,
+    expiresAt: number | undefined,
+    backendStatus: "verified" | "preview" = this.#allowPreviewBackend ? "preview" : "verified",
+  ): CredentialStatus {
     return {
       backendId: this.#backend.backendId,
-      backendStatus: "verified",
+      backendStatus,
       state: expiresAt !== undefined && expiresAt <= this.#now() ? "expired" : "present",
       bindingDigest: bindingDigest(binding),
       revision,
@@ -663,13 +672,17 @@ function validEvidence(
   backend: SecureCredentialBackend,
   platform: NodeJS.Platform,
   now: number,
+  allowPreviewBackend: boolean,
 ): boolean {
+  const verifiedEvidence = evidence.status === "verified" &&
+    (evidence.source === "live_round_trip" || evidence.source === "native_bridge_round_trip");
+  const previewEvidence = allowPreviewBackend && evidence.status === "preview" &&
+    evidence.source === "local_file_preview" && evidence.reason === undefined;
   return evidence.protocol === CREDENTIAL_BACKEND_PROTOCOL &&
-    evidence.status === "verified" &&
+    (verifiedEvidence || previewEvidence) &&
     evidence.backendId === backend.backendId &&
     evidence.platform === backend.platform &&
     evidence.platform === platform &&
-    (evidence.source === "live_round_trip" || evidence.source === "native_bridge_round_trip") &&
     Number.isSafeInteger(evidence.observedAt) &&
     Number.isSafeInteger(evidence.expiresAt) &&
     evidence.observedAt <= now &&
