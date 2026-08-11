@@ -8,7 +8,7 @@ const COMMIT = /^[0-9a-f]{40}$/u;
 const POSITIVE_INTEGER = /^[1-9][0-9]*$/u;
 const LOGIN = /^[A-Za-z0-9-]{1,39}$/u;
 const TAG_OBJECT = /^[0-9a-f]{40}$/u;
-const REQUIRED_RULES = Object.freeze(["deletion", "non_fast_forward"]);
+const REQUIRED_RULES = Object.freeze(["deletion", "non_fast_forward", "update"]);
 const TAG_REF_PREFIX = "refs/tags/cuna-release-approval-consumption/";
 const TAG_NAME_PREFIX = "cuna-release-approval-consumption/";
 const MAXIMUM_RESPONSE_BYTES = 1_048_576;
@@ -99,11 +99,19 @@ function requiredReviewerRule(environment) {
 }
 
 export function validateConsumptionAuthority({ declaration, environment, branchPolicies, ruleset, context }) {
-  exactKeys(declaration, ["schemaVersion", "status", "repository", "environment", "protectedRef", "rulesetName", "tagRefPrefix", "requiredRules", "requireNoBypassActors", "requireAdminBypassDisabled", "requirePreventSelfReview"], "release consumption authority declaration");
+  exactKeys(declaration, ["schemaVersion", "status", "repository", "environment", "protectedRef", "requiredReviewer", "rulesetName", "rulesetId", "tagRefPrefix", "requiredRules", "requireNoBypassActors", "requireAdminBypassDisabled", "requirePreventSelfReview"], "release consumption authority declaration");
   invariant(declaration.schemaVersion === 1, "Unsupported release consumption authority declaration");
   invariant(declaration.status === "CONFIGURED", "Release approval consumption authority remains unconfigured");
   invariant(declaration.repository === context.repository && declaration.environment === context.environment, "Release consumption declaration scope differs");
   invariant(declaration.protectedRef === "main" && declaration.rulesetName === "Protect Cuna release approval consumptions", "Release consumption declaration identity differs");
+  invariant(Number.isSafeInteger(declaration.rulesetId) && declaration.rulesetId > 0, "Release consumption ruleset ID is invalid");
+  exactKeys(declaration.requiredReviewer, ["type", "id", "login"], "required release reviewer");
+  invariant(
+    declaration.requiredReviewer.type === "User" &&
+      Number.isSafeInteger(declaration.requiredReviewer.id) && declaration.requiredReviewer.id > 0 &&
+      LOGIN.test(declaration.requiredReviewer.login),
+    "Required release reviewer identity is invalid",
+  );
   invariant(declaration.tagRefPrefix === TAG_REF_PREFIX, "Release consumption tag namespace differs");
   invariant(JSON.stringify(declaration.requiredRules) === JSON.stringify(REQUIRED_RULES), "Release consumption rule contract differs");
   invariant(declaration.requireNoBypassActors === true && declaration.requireAdminBypassDisabled === true && declaration.requirePreventSelfReview === true, "Release consumption authority weakens mandatory controls");
@@ -111,18 +119,35 @@ export function validateConsumptionAuthority({ declaration, environment, branchP
   invariant(environment.name === declaration.environment && environment.can_admins_bypass === false, "Release environment permits administrator bypass");
   const reviewerRule = requiredReviewerRule(environment);
   invariant(reviewerRule?.prevent_self_review === true, "Release environment does not prevent self-review");
-  const reviewerIds = (reviewerRule.reviewers ?? []).map((entry) => String(entry?.reviewer?.id ?? ""));
-  invariant(reviewerIds.some((id) => POSITIVE_INTEGER.test(id) && id !== context.actorId), "Release environment has no independent reviewer");
-  invariant(Array.isArray(branchPolicies) && branchPolicies.some((policy) => policy?.type === "branch" && policy?.name === declaration.protectedRef), "Release environment is not restricted to protected main");
+  const reviewers = reviewerRule?.reviewers ?? [];
+  invariant(reviewers.length === 1, "Release environment reviewer set differs");
+  const reviewer = reviewers[0];
+  invariant(
+    reviewer?.type === declaration.requiredReviewer.type &&
+      reviewer?.reviewer?.id === declaration.requiredReviewer.id &&
+      reviewer?.reviewer?.login === declaration.requiredReviewer.login &&
+      String(reviewer.reviewer.id) !== context.actorId,
+    "Release environment required reviewer differs or is not independent",
+  );
+  invariant(
+    environment.deployment_branch_policy?.protected_branches === false &&
+      environment.deployment_branch_policy?.custom_branch_policies === true,
+    "Release environment branch-policy mode differs",
+  );
+  invariant(
+    Array.isArray(branchPolicies) && branchPolicies.length === 1 &&
+      branchPolicies[0]?.type === "branch" && branchPolicies[0]?.name === declaration.protectedRef,
+    "Release environment is not restricted exactly to protected main",
+  );
 
-  invariant(ruleset.name === declaration.rulesetName && ruleset.target === "tag" && ruleset.enforcement === "active", "Release consumption ruleset is not active");
+  invariant(ruleset.id === declaration.rulesetId && ruleset.name === declaration.rulesetName && ruleset.target === "tag" && ruleset.enforcement === "active", "Release consumption ruleset is not active or has a different identity");
   invariant(ruleset.source_type === "Repository" && ruleset.source === context.repository, "Release consumption ruleset authority differs");
   invariant(Array.isArray(ruleset.bypass_actors) && ruleset.bypass_actors.length === 0 && ruleset.current_user_can_bypass === "never", "Release consumption ruleset permits bypass");
   invariant(JSON.stringify(ruleset.conditions?.ref_name?.exclude ?? []) === "[]", "Release consumption ruleset excludes protected tags");
   invariant(JSON.stringify(ruleset.conditions?.ref_name?.include ?? []) === JSON.stringify([`${TAG_REF_PREFIX}*`]), "Release consumption ruleset scope differs");
   const ruleTypes = (ruleset.rules ?? []).map((rule) => rule?.type).filter(Boolean).sort();
-  invariant(REQUIRED_RULES.every((required) => ruleTypes.includes(required)), "Release consumption ruleset does not prevent deletion and rewrite");
-  return { reviewerIds };
+  invariant(JSON.stringify(ruleTypes) === JSON.stringify([...REQUIRED_RULES].sort()), "Release consumption ruleset does not exactly prevent deletion and rewrite");
+  return { reviewerIds: [String(reviewer.reviewer.id)] };
 }
 
 async function responseJson(response, label) {
@@ -156,19 +181,26 @@ async function request(fetchImpl, url, token, options, expected, label) {
   return responseJson(response, label);
 }
 
-export async function reserveReleaseApprovalConsumption({ declaration, consumption, token, fetchImpl = fetch, apiRoot = "https://api.github.com" }) {
+export async function verifyReleaseApprovalConsumptionAuthority({ declaration, context, token, fetchImpl = fetch, apiRoot = "https://api.github.com" }) {
   invariant(typeof token === "string" && token.length >= 20 && !/\s/u.test(token), "A non-empty GitHub authority token is required");
   invariant(declaration?.status === "CONFIGURED", "Release approval consumption authority remains unconfigured");
-  const context = validateReleaseContext(consumption.context);
+  validateReleaseContext(context);
   const repositoryPath = encodeURI(context.repository);
   const environment = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/environments/${context.environment}`, token, { method: "GET" }, 200, "release environment lookup");
   const policyPage = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/environments/${context.environment}/deployment-branch-policies`, token, { method: "GET" }, 200, "release branch-policy lookup");
   const rulesetSummaries = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/rulesets`, token, { method: "GET" }, 200, "release ruleset lookup");
   invariant(Array.isArray(rulesetSummaries), "Release ruleset response is invalid");
-  const summary = rulesetSummaries.find((value) => value?.name === declaration.rulesetName && value?.target === "tag" && value?.enforcement === "active");
-  invariant(Number.isSafeInteger(summary?.id) && summary.id > 0, "Release consumption ruleset is absent");
-  const ruleset = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/rulesets/${summary.id}`, token, { method: "GET" }, 200, "release ruleset detail lookup");
-  validateConsumptionAuthority({ declaration, environment, branchPolicies: policyPage.branch_policies, ruleset, context });
+  const summary = rulesetSummaries.find((value) => value?.id === declaration.rulesetId && value?.name === declaration.rulesetName && value?.target === "tag" && value?.enforcement === "active");
+  invariant(summary?.id === declaration.rulesetId, "Release consumption ruleset is absent or substituted");
+  const ruleset = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/rulesets/${declaration.rulesetId}`, token, { method: "GET" }, 200, "release ruleset detail lookup");
+  return validateConsumptionAuthority({ declaration, environment, branchPolicies: policyPage.branch_policies, ruleset, context });
+}
+
+export async function reserveReleaseApprovalConsumption({ declaration, consumption, token, fetchImpl = fetch, apiRoot = "https://api.github.com" }) {
+  const context = validateReleaseContext(consumption.context);
+  const repositoryPath = encodeURI(context.repository);
+  const observeAuthority = () => verifyReleaseApprovalConsumptionAuthority({ declaration, context, token, fetchImpl, apiRoot });
+  await observeAuthority();
 
   const taggerDate = consumption.reservation.reservedAt;
   const tagObject = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/git/tags`, token, {
@@ -182,6 +214,10 @@ export async function reserveReleaseApprovalConsumption({ declaration, consumpti
     }),
   }, 201, "release consumption tag creation");
   invariant(TAG_OBJECT.test(tagObject.sha ?? ""), "Release consumption tag object identity is invalid");
+  // Re-read the external controls immediately before the only globally visible
+  // state transition. The first read proves intent; this read closes the window
+  // in which a reviewer, environment policy, or ruleset could be weakened.
+  await observeAuthority();
   const created = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/git/refs`, token, {
     method: "POST",
     body: JSON.stringify({ ref: consumption.ref, sha: tagObject.sha }),
@@ -190,6 +226,17 @@ export async function reserveReleaseApprovalConsumption({ declaration, consumpti
   const encodedRef = consumption.ref.replace(/^refs\//u, "").split("/").map(encodeURIComponent).join("/");
   const observed = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/git/ref/${encodedRef}`, token, { method: "GET" }, 200, "release consumption readback");
   invariant(observed.ref === consumption.ref && observed.object?.sha === tagObject.sha, "Release consumption durable state differs");
+  const observedTag = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/git/tags/${tagObject.sha}`, token, { method: "GET" }, 200, "release consumption tag readback");
+  invariant(
+    observedTag.sha === tagObject.sha && observedTag.tag === consumption.tagName &&
+      observedTag.object?.type === "commit" && observedTag.object?.sha === context.sourceCommit &&
+      observedTag.message === consumption.reservationBytes.toString("utf8") &&
+      observedTag.tagger?.name === "Cuna Release Authority" &&
+      observedTag.tagger?.email === "release-authority@getcuna.com" &&
+      observedTag.tagger?.date === taggerDate,
+    "Release consumption annotated-tag evidence differs",
+  );
+  await observeAuthority();
   return {
     schemaVersion: 1,
     status: "CONSUMED",
@@ -199,6 +246,58 @@ export async function reserveReleaseApprovalConsumption({ declaration, consumpti
     leaseSha256: consumption.reservation.leaseSha256,
     expectationSha256: consumption.reservation.expectationSha256,
     releaseRun: consumption.reservation.releaseRun,
+  };
+}
+
+export async function verifyReservedReleaseApprovalConsumption({
+  declaration,
+  lease,
+  expectation,
+  leaseBytes,
+  expectationBytes,
+  context,
+  token,
+  now = Date.now(),
+  fetchImpl = fetch,
+  apiRoot = "https://api.github.com",
+}) {
+  const current = buildReleaseApprovalConsumption({ lease, expectation, leaseBytes, expectationBytes, context, now });
+  await verifyReleaseApprovalConsumptionAuthority({ declaration, context, token, fetchImpl, apiRoot });
+  const repositoryPath = encodeURI(context.repository);
+  const encodedRef = current.ref.replace(/^refs\//u, "").split("/").map(encodeURIComponent).join("/");
+  const observedRef = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/git/ref/${encodedRef}`, token, { method: "GET" }, 200, "release consumption readback");
+  invariant(observedRef.ref === current.ref && TAG_OBJECT.test(observedRef.object?.sha ?? ""), "Release consumption ref identity differs");
+  const observedTag = await request(fetchImpl, `${apiRoot}/repos/${repositoryPath}/git/tags/${observedRef.object.sha}`, token, { method: "GET" }, 200, "release consumption tag readback");
+  let observedReservation;
+  try {
+    observedReservation = JSON.parse(observedTag.message);
+  } catch {
+    throw new Error("Release consumption annotated-tag evidence is not JSON");
+  }
+  const reservedAt = Date.parse(observedReservation?.reservedAt);
+  invariant(Number.isSafeInteger(reservedAt) && new Date(reservedAt).toISOString() === observedReservation.reservedAt, "Release consumption reservation time is invalid");
+  const exact = buildReleaseApprovalConsumption({ lease, expectation, leaseBytes, expectationBytes, context, now: reservedAt });
+  invariant(
+    exact.ref === current.ref && exact.tagName === current.tagName &&
+      observedTag.sha === observedRef.object.sha && observedTag.tag === exact.tagName &&
+      observedTag.object?.type === "commit" && observedTag.object?.sha === context.sourceCommit &&
+      observedTag.message === exact.reservationBytes.toString("utf8") &&
+      observedTag.tagger?.name === "Cuna Release Authority" &&
+      observedTag.tagger?.email === "release-authority@getcuna.com" &&
+      observedTag.tagger?.date === exact.reservation.reservedAt,
+    "Release consumption annotated-tag evidence differs",
+  );
+  await verifyReleaseApprovalConsumptionAuthority({ declaration, context, token, fetchImpl, apiRoot });
+  return {
+    schemaVersion: 1,
+    status: "CONSUMPTION_STILL_VALID",
+    ref: exact.ref,
+    tagObjectSha: observedTag.sha,
+    nonceSha256: exact.reservation.nonceSha256,
+    leaseSha256: exact.reservation.leaseSha256,
+    expectationSha256: exact.reservation.expectationSha256,
+    releaseRun: exact.reservation.releaseRun,
+    verifiedAt: new Date(now).toISOString(),
   };
 }
 

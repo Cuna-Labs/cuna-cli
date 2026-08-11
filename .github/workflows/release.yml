@@ -49,6 +49,11 @@ jobs:
     name: immutable-preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    environment: npm
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
     outputs:
       source_commit: ${{ steps.validate.outputs.source_commit }}
       version: ${{ steps.validate.outputs.version }}
@@ -183,11 +188,20 @@ jobs:
           gh attestation verify admitted/approval/release-approval-lease.json
           --repo "$GITHUB_REPOSITORY"
           --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-review.yml"
-      - name: Block publication until one-use approval nonce consumption is configured
+      - name: Atomically consume the one-use approval nonce
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_SOURCE_COMMIT: ${{ inputs.source_commit }}
         shell: bash
         run: |
-          echo "::error title=Release approval authority unavailable::RELEASE_APPROVAL_NONCE_CONSUMPTION_AUTHORITY_NOT_CONFIGURED"
-          exit 1
+          cp packaging/release-approval-consumption-authority.json admitted/approval/release-approval-consumption-authority.json
+          node scripts/consume-release-approval-nonce.mjs \
+            --root admitted/approval \
+            --lease release-approval-lease.json \
+            --expectation release-approval-expectation.json \
+            --authority release-approval-consumption-authority.json \
+            > admitted/approval/release-approval-consumption.json
+          node -e 'const r=require("./admitted/approval/release-approval-consumption.json"); if(r.status!=="CONSUMED") process.exit(1)'
       - name: Require exact registry version to be absent
         env:
           VERSION: ${{ inputs.version }}
@@ -201,6 +215,7 @@ jobs:
     environment: npm
     permissions:
       actions: read
+      attestations: read
       contents: read
       id-token: write
     steps:
@@ -220,16 +235,21 @@ jobs:
           github-token: ${{ github.token }}
           path: admitted
       - run: node scripts/verify-release-envelope.mjs --root admitted/release-artifacts
-      - name: Publish exact admitted bytes with short-lived OIDC identity
-        shell: bash
-        run: |
-          TARBALL_FILE="$(node -p "require('./admitted/release-artifacts/release-envelope.json').tarball.file")"
-          [[ "$TARBALL_FILE" =~ ^[A-Za-z0-9._-]+\.tgz$ ]]
-          npm publish "admitted/release-artifacts/$TARBALL_FILE" \
-            --provenance \
-            --access public \
-            --registry https://registry.npmjs.org/ \
-            --tag preview
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-approval-lease
+          run-id: ${{ inputs.approval_run_id }}
+          github-token: ${{ github.token }}
+          path: admitted/approval
+      - name: Revalidate fresh approval and publish exact admitted bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          APPROVAL_LEASE_SHA256: ${{ inputs.approval_lease_sha256 }}
+          APPROVAL_EXPECTATION_SHA256: ${{ inputs.approval_expectation_sha256 }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: node scripts/publish-npm-preview.mjs
       - name: Verify downloaded registry bytes and preview tag
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
