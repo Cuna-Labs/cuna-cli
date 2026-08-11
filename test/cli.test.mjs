@@ -401,7 +401,7 @@ test("explicit signup, login, whoami, access status, and logout dispatch only to
   assert.deepEqual(calls, ["signup", "login", "whoami", "whoami", "logout"]);
 });
 
-test("--session-only is explicit, labels preview storage, and is forwarded to remote auth without native authority", async () => {
+test("login defaults to encrypted preview storage and authenticated commands reuse it without a mode flag", async () => {
   const result = {
     profile: "default",
     sessionId: "00000000-0000-0000-0000-000000000002",
@@ -422,7 +422,7 @@ test("--session-only is explicit, labels preview storage, and is forwarded to re
   };
   const loginStreams = memoryStreams();
   assert.equal(
-    await runCli(["login", "--session-only"], { streams: loginStreams.streams, platform, env: {}, humanAuth }),
+    await runCli(["login"], { streams: loginStreams.streams, platform, env: {}, humanAuth }),
     EXIT_CODES.success,
   );
   assert.deepEqual(loginRequest, {});
@@ -431,7 +431,7 @@ test("--session-only is explicit, labels preview storage, and is forwarded to re
   let observedAuthorization;
   const commandStreams = memoryStreams();
   assert.equal(
-    await runCli(["machines", "list", "--session-only"], {
+    await runCli(["machines", "list"], {
       streams: commandStreams.streams,
       platform,
       env: {},
@@ -448,7 +448,7 @@ test("--session-only is explicit, labels preview storage, and is forwarded to re
 
 test("preview login never prints a capability-bearing browser URL to JSON or redirected output", async () => {
   const streams = memoryStreams();
-  const exit = await runCli(["login", "--session-only", "--json"], {
+  const exit = await runCli(["login", "--json"], {
     streams: streams.streams,
     platform,
     env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
@@ -461,7 +461,7 @@ test("preview login never prints a capability-bearing browser URL to JSON or red
 
 test("preview login refuses a redirected stderr before creating a browser continuation", async () => {
   const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: false });
-  const exit = await runCli(["login", "--session-only"], {
+  const exit = await runCli(["login"], {
     streams: streams.streams,
     platform,
     env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
@@ -477,6 +477,8 @@ test("production preview path uses encrypted backend without resolving native au
   const continuationId = "123e4567-e89b-12d3-a456-426614174000";
   const sessionId = "123e4567-e89b-12d3-a456-426614174001";
   const browserNonce = `cuna_cb_${"n".repeat(43)}`;
+  let observedAuthorization;
+  let refreshCount = 0;
   const context = {
     required_terms_version: "2026-08",
     identity: "active",
@@ -532,11 +534,36 @@ test("production preview path uses encrypted backend without resolving native au
         context,
       }), { status: 200 });
     }
+    if (requestUrl.pathname === "/v1/cli-auth/refresh") {
+      const accessSuffix = String.fromCharCode("b".charCodeAt(0) + refreshCount);
+      const refreshSuffix = String.fromCharCode("u".charCodeAt(0) + refreshCount);
+      refreshCount += 1;
+      return new Response(JSON.stringify({
+        access_token: `cuna_at_${accessSuffix.repeat(43)}`,
+        refresh_token: `cuna_rt_${refreshSuffix.repeat(43)}`,
+        token_type: "Bearer",
+        expires_in: 600,
+        access_expires_at: "2030-01-01T00:20:00.000Z",
+        refresh_expires_at: "2030-03-01T00:00:00.000Z",
+        session_id: sessionId,
+        context,
+      }), { status: 200 });
+    }
+    if (requestUrl.pathname === "/v1/sessions") {
+      observedAuthorization = init.headers?.Authorization;
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (requestUrl.pathname === "/v1/cli-auth/context") {
+      return new Response(JSON.stringify(context), { status: 200 });
+    }
+    if (requestUrl.pathname === "/v1/cli-auth/logout") {
+      return new Response(JSON.stringify({ revoked: true }), { status: 200 });
+    }
     throw new Error(`unexpected preview auth request: ${requestUrl.pathname}`);
   };
   const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
   try {
-    const exit = await runCli(["login", "--session-only"], {
+    const exit = await runCli(["login"], {
       streams: streams.streams,
       platform: {
         ...platform,
@@ -552,6 +579,44 @@ test("production preview path uses encrypted backend without resolving native au
     assert.equal(files.length, 1);
     const stored = await readFile(join(configDirectory, files[0]), "utf8");
     assert.doesNotMatch(stored, /cuna_(?:at|rt)_/u);
+
+    const laterStreams = memoryStreams();
+    const laterExit = await runCli(["machines", "list"], {
+      streams: laterStreams.streams,
+      platform: {
+        ...platform,
+        paths: { ...platform.paths, configDirectory },
+      },
+      env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
+      fetch,
+    });
+    assert.equal(laterExit, EXIT_CODES.success, laterStreams.stderr());
+    assert.equal(observedAuthorization, `Bearer cuna_at_${"b".repeat(43)}`);
+
+    const whoamiStreams = memoryStreams();
+    const whoamiExit = await runCli(["whoami"], {
+      streams: whoamiStreams.streams,
+      platform: {
+        ...platform,
+        paths: { ...platform.paths, configDirectory },
+      },
+      env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
+      fetch,
+    });
+    assert.equal(whoamiExit, EXIT_CODES.success, whoamiStreams.stderr());
+
+    const logoutStreams = memoryStreams();
+    const logoutExit = await runCli(["logout"], {
+      streams: logoutStreams.streams,
+      platform: {
+        ...platform,
+        paths: { ...platform.paths, configDirectory },
+      },
+      env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
+      fetch,
+    });
+    assert.equal(logoutExit, EXIT_CODES.success, logoutStreams.stderr());
+    assert.equal((await readdir(configDirectory)).length, 0);
   } finally {
     await rm(configDirectory, { recursive: true, force: true });
   }

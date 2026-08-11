@@ -59,15 +59,15 @@ type Sleep = (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 type RandomSource = (size: number) => Uint8Array;
 
 /**
- * The one credential path that still works when interactive sign-in cannot
- * start at all.
+ * The automation-only hint used when a command has no admitted interactive
+ * session. Browser-link login itself uses the encrypted preview backend in
+ * this build; this message must not imply that an API key is a login fallback.
  *
- * `CUNA_API_KEY` never touches the operating-system credential vault:
+ * `CUNA_API_KEY` never touches either local session store:
  * `cli/run.ts` selects automation mode from it and hands the key straight to
  * the HTTP transport. Measured on this host — the vault reports an unverified
- * backend, so `cuna login` can never succeed, while a `CUNA_API_KEY` request
- * reaches production and is answered on its merits. Without this sentence the
- * user is told what is broken and nothing about what works.
+ * backend, so an explicit automation credential remains separate from the
+ * browser-link preview session and never changes the user's login mode.
  *
  * The text promises COMMANDS, not sign-in, deliberately: `login`, `logout`,
  * `whoami`, `signup` and `access` reject with `cuna.auth.mode_conflict` while
@@ -369,7 +369,7 @@ export function createHumanAuthService(input: {
           : "Interactive sign-in requires the verified operating-system credential vault.",
         {
           hint: input.allowPreviewStorage === true
-            ? "Set CUNA_SESSION_PASSPHRASE to a 12-character-or-longer passphrase and retry `cuna login --session-only`."
+            ? "Set CUNA_SESSION_PASSPHRASE to a 12-character-or-longer passphrase and retry `cuna login`."
             : AUTOMATION_CREDENTIAL_HINT,
         },
       );
@@ -380,7 +380,7 @@ export function createHumanAuthService(input: {
         "This Cuna profile already has an interactive session.",
         {
           hint: previewStorage
-            ? "Run `cuna logout --session-only` before signing in again."
+            ? "Run `cuna logout` before signing in again."
             : "Run `cuna logout` before signing in again.",
         },
       );

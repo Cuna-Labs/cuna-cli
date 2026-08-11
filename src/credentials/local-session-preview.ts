@@ -374,6 +374,27 @@ export function localSessionPreviewPath(configDirectory: string, profile = "defa
   return resolve(configDirectory, `session-preview-${profileDigest}.json`);
 }
 
+/**
+ * Returns whether a preview record path is occupied.  This is only a mode
+ * selector: the backend still re-checks the path, permissions, identity and
+ * authenticated bytes before accepting anything.  In particular, an unsafe
+ * existing path is reported as present so callers cannot silently fall back
+ * to native credentials after a path attack or corruption.
+ */
+export async function previewSessionFileExists(filePath: string): Promise<boolean> {
+  try {
+    await lstat(resolve(filePath));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+    throw credentialFailure(
+      "credential_backend_unverified",
+      "The encrypted preview session path cannot be inspected safely.",
+      { cause: error },
+    );
+  }
+}
+
 function hasForbiddenControl(value: string): boolean {
   for (const character of value) {
     const codePoint = character.codePointAt(0) ?? 0;

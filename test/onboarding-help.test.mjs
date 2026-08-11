@@ -143,7 +143,7 @@ test("--all on a command topic is refused rather than silently ignored", async (
 /* S-7: the short help must not promise what this build cannot do              */
 /* -------------------------------------------------------------------------- */
 
-test("the short help presents the composed journey but not unavailable interactive sign-in", () => {
+test("the short help presents the composed journey and distinguishes preview sign-in from native storage", () => {
   const available = SHORT_HELP.slice(
     SHORT_HELP.indexOf("Works with no network:"),
     SHORT_HELP.indexOf("Not available in this build:"),
@@ -159,9 +159,9 @@ test("the short help presents the composed journey but not unavailable interacti
     assert.ok(new RegExp(`^\\s{2}${command}\\b`, "mu").test(available), `${command} must be listed as available`);
   }
   const unavailable = SHORT_HELP.slice(SHORT_HELP.indexOf("Not available in this build:"));
-  for (const command of ["signup", "login", "logout"]) {
-    assert.ok(unavailable.includes(command), `${command} must be marked unavailable`);
-  }
+  assert.ok(unavailable.includes("native credential vault"), unavailable);
+  assert.ok(unavailable.includes("cuna login"), unavailable);
+  assert.ok(unavailable.includes("encrypted browser-link"), unavailable);
   for (const command of ["claude", "codex", "openclaw", "connect"]) {
     assert.ok(!unavailable.includes(command), `${command} must not be marked unavailable`);
   }

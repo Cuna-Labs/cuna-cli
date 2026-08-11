@@ -32,19 +32,19 @@ function topic(usage: string, body: string): string {
 const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   signup: topic(
     "Usage:\n  cuna signup",
-    "Create a waitlist-only Cuna account through the browser. Never assigns compute\nand never starts billing. Accepts no operands and no command options.",
+    "Create a waitlist-only Cuna account through the browser. Set\nCUNA_SESSION_PASSPHRASE first; the resulting session is encrypted locally.\nNever assigns compute and never starts billing. Accepts no operands and no\ncommand options.",
   ),
   login: topic(
-    "Usage:\n  cuna login [--session-only]",
-    "Sign in through the Cuna browser continuation. Polling only; no local callback\nlistener is opened. Use --session-only for an explicit encrypted local preview\nsession when the native vault is unavailable. Repeat --session-only for later\npreview commands and logout; preview storage is not GA.",
+    "Usage:\n  CUNA_SESSION_PASSPHRASE=... cuna login [--session-only]",
+    "Sign in through the Cuna browser continuation. Polling only; no local callback\nlistener is opened. Encrypted profile-scoped preview storage is the default in\nthis build; later authenticated commands reuse it until expiry or cuna logout.\n--session-only remains an explicit compatibility spelling and is not required.\nPreview storage is not a native vault or a GA readiness claim.",
   ),
   logout: topic(
     "Usage:\n  cuna logout [--session-only]",
-    "Revoke the interactive token family server-first. Add --session-only when\nusing the encrypted preview session. Accepts no operands otherwise.",
+    "Revoke the interactive token family server-first. If the profile has an\nencrypted preview session, it is selected automatically; --session-only is\naccepted for compatibility but is not required. Accepts no operands otherwise.",
   ),
   whoami: topic(
     "Usage:\n  cuna whoami [--session-only]",
-    "Show authoritative interactive account context. Add --session-only when\nusing the encrypted preview session. Accepts no operands otherwise.",
+    "Show authoritative interactive account context. An encrypted preview session\nis selected automatically after cuna login; --session-only is accepted for\ncompatibility but is not required. Accepts no operands otherwise.",
   ),
   access: topic(
     "Usage:\n  cuna access status",

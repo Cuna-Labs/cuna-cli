@@ -188,11 +188,15 @@ accepted by this pre-GA CLI. It is never persisted automatically. An automation
 credential that is set but unusable is refused rather than ignored, and it is
 refused only for commands that select a credential authority — `doctor`,
 `self-test --offline` and `config get` still run and report it. Interactive
-`cuna login` uses the browser
-continuation contract without a local HTTP listener. Its renewable credential
-and binding metadata are stored only in the operating-system vault; access
-tokens remain process-memory-only. The automation and interactive credential
-authorities never fall back to each other.
+`cuna login` uses the browser continuation contract without a local HTTP
+listener. In this build it is the default interactive flow: set
+`CUNA_SESSION_PASSPHRASE`, open the one-time browser link, and the renewable
+session is stored in an encrypted, profile-scoped preview file. Later
+authenticated commands reuse that encrypted session until it expires or
+`cuna logout` removes it; no `--session-only` repetition is required. This
+preview backend is intentionally not an operating-system vault and is not a GA
+readiness claim. The automation and interactive credential authorities never
+fall back to each other.
 
 Never place API keys in command-line arguments, repository files, issue reports,
 terminal captures, or diagnostics.

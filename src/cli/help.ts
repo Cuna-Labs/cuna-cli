@@ -77,10 +77,10 @@ Works with an automation credential:
   connect SESSION_ID    Attach one exact AgentSession in this terminal
 
 Not available in this build:
-  signup, login, logout    Normal interactive sign-in requires the signed native
-                           authentication package, which this build does not
-                           include. Preview owners may use \`login --session-only\`
-                           with an encrypted local session and a passphrase.
+  native credential vault  Native OS credential storage is not admitted in this
+                           build. \`cuna login\` uses the encrypted browser-link
+                           preview session instead; it is profile-scoped and
+                           remains available until expiry or \`cuna logout\`.
   background daemon, local companion
   Run \`cuna doctor\` to see what this platform and build actually provide.
 
@@ -98,10 +98,12 @@ Usage:
 
 Available now:
   signup                               Create a waitlist-only Cuna account in the browser
-  login [--session-only]               Sign in through the Cuna browser continuation
-  whoami [--session-only]              Show authoritative interactive account context
+  login [--session-only]               Sign in through the Cuna browser continuation;
+                                       encrypted local storage is the default
+  whoami [--session-only]              Show account context; reuse the encrypted session
   access status                        Show identity, admission, and workspace separately
-  logout [--session-only]              Revoke the interactive token family server-first
+  logout [--session-only]              Revoke the interactive token family server-first;
+                                       reuse the encrypted session automatically
   capabilities                         Inspect current server capability truth
   machines list                        List owned Cuna machines
   machines create [options]            Create a machine when server-advertised
@@ -179,12 +181,12 @@ Authentication:
   Create an automation credential at ${API_KEYS_URL}.
   Use cuna signup for waitlist-only enrollment. It never assigns compute or starts billing.
   Use cuna login for a browser-assisted interactive session. The CLI uses polling;
-  it does not open a local callback listener. Normal refresh credentials require
-  the signed native authentication package. For preview validation only, use
-  \`CUNA_SESSION_PASSPHRASE=... cuna login --session-only\`; the CLI prints a
-  one-time browser link and stores only an encrypted profile-scoped preview session. Use
-  \`--session-only\` on each later command (including whoami/logout); it is not
-  a native vault and is not a GA readiness claim.
+  it does not open a local callback listener. In this build the one-time browser
+  link is the default login flow and the resulting refresh session is stored only
+  in an encrypted, profile-scoped preview file. Set CUNA_SESSION_PASSPHRASE before
+  login; later authenticated commands automatically reuse that session until it
+  expires or you run cuna logout. \`--session-only\` remains accepted for explicit
+  compatibility but is not required. This is not a native vault or a GA readiness claim.
   ${API_KEY_NAMES} selects explicit automation mode and never falls
   back to browser login. Both spellings are accepted and both admit every key brand the
   service has issued; the first one that is SET wins, even when its value is unusable.
