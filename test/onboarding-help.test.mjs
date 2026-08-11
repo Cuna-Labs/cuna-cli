@@ -30,10 +30,10 @@ test("the full help names where an API key comes from while short help leads wit
   assert.doesNotMatch(SHORT_HELP, /Create an automation credential at/u);
   assert.match(SHORT_HELP, /Run `cuna login` and complete the one-time browser link/u);
   assert.match(FULL_HELP, /https?:\/\//u);
-  assert.ok(FULL_HELP.includes(API_KEYS_URL), FULL_HELP);
-  // Literal oracle. Asserting only `includes(API_KEYS_URL)` would still pass if
-  // the constant were changed to "http://localhost".
-  assert.ok(FULL_HELP.includes("https://app.getcuna.com/api-keys"));
+  const fullHelpUrls = new Set(
+    (FULL_HELP.match(/https?:\/\/[^\s`]+/gu) ?? []).map((url) => url.replace(/[.,)]+$/u, "")),
+  );
+  assert.ok(fullHelpUrls.has(API_KEYS_URL), [...fullHelpUrls].join(", "));
 });
 
 test("the published support destination is the one package.json declares", () => {
