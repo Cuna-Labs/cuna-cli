@@ -7,7 +7,6 @@ import { API_KEYS_URL } from "../core/product-web.js";
 // stale exactly when the accepted set changes, which is the one moment it must
 // not.
 const API_KEY_NAMES = brandedEnvironmentNames("API_KEY").join(" or ");
-const PRIMARY_API_KEY_NAME = brandedEnvironmentNames("API_KEY")[0];
 
 // Same reason, one layer up: the exit code is the entire contract for a caller
 // that is not a human, so the list below is projected from `EXIT_CODES` rather
@@ -54,9 +53,9 @@ Usage:
   cuna <command> [options]
 
 First run:
-  1. Create an automation credential at ${API_KEYS_URL}
-  2. Set ${PRIMARY_API_KEY_NAME} to that credential
-  3. Run \`cuna account show\`
+  1. Set CUNA_SESSION_PASSPHRASE to a passphrase (it is never stored)
+  2. Run \`cuna login\` and complete the one-time browser link
+  3. Continue with \`cuna whoami\` or \`cuna machines list\` without repeating a mode flag
 
 Works with no network:
   doctor                Report platform, runtime, and credential-vault state

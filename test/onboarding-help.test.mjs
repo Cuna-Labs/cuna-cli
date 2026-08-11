@@ -22,15 +22,18 @@ async function helpFor(argv) {
 /* S-4: there was not one URL anywhere in the CLI                              */
 /* -------------------------------------------------------------------------- */
 
-test("the help names where an API key comes from", () => {
-  // Measured before this change: `cuna --help` contained ZERO matches for
-  // `https?://`. The sign-in path dead-ended and the automation path named a
-  // variable with no source.
-  assert.match(SHORT_HELP, /https?:\/\//u);
-  assert.ok(SHORT_HELP.includes(API_KEYS_URL), SHORT_HELP);
+test("the full help names where an API key comes from while short help leads with browser login", () => {
+  // Bare help must lead a new user through the default browser-link flow and
+  // must not expose an automation URL as the first-run path. The full help
+  // still documents the explicit automation mode and its source.
+  assert.doesNotMatch(SHORT_HELP, /https?:\/\//u);
+  assert.doesNotMatch(SHORT_HELP, /Create an automation credential at/u);
+  assert.match(SHORT_HELP, /Run `cuna login` and complete the one-time browser link/u);
+  assert.match(FULL_HELP, /https?:\/\//u);
+  assert.ok(FULL_HELP.includes(API_KEYS_URL), FULL_HELP);
   // Literal oracle. Asserting only `includes(API_KEYS_URL)` would still pass if
   // the constant were changed to "http://localhost".
-  assert.ok(SHORT_HELP.includes("https://app.getcuna.com/api-keys"));
+  assert.ok(FULL_HELP.includes("https://app.getcuna.com/api-keys"));
 });
 
 test("the published support destination is the one package.json declares", () => {

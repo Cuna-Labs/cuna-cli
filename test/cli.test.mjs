@@ -85,6 +85,8 @@ test("non-TTY help and version are versioned JSON records", async () => {
   // short help, present in the full one.
   assert.doesNotMatch(helpRecord.data.help, /Automatic local-to-cloud journey:/u);
   assert.match(helpRecord.data.help, /cuna help --all/u);
+  assert.match(helpRecord.data.help, /Run `cuna login` and complete the one-time browser link/u);
+  assert.doesNotMatch(helpRecord.data.help, /Create an automation credential at/u);
   const all = memoryStreams();
   assert.equal(await runCli(["help", "--all"], { streams: all.streams }), EXIT_CODES.success);
   const allRecord = JSON.parse(all.stdout());
