@@ -179,17 +179,19 @@ export class LocalSessionPreviewBackend implements SecureCredentialBackend {
   }
 
   async #readSafeFile(): Promise<Uint8Array> {
-    await this.#assertSafeFile();
+    await this.#assertSafeDirectory();
     const directoryIdentity = await this.#directoryIdentity();
     const flags = fileConstants.O_RDONLY | (fileConstants.O_NOFOLLOW ?? 0);
-    const before = await lstat(this.#filePath);
     const handle = await open(this.#filePath, flags);
     try {
       const metadata = await handle.stat();
+      const pathMetadata = await lstat(this.#filePath);
       if (
         !metadata.isFile() || metadata.size > MAX_FILE_BYTES ||
-        metadata.size !== before.size || metadata.mtimeMs !== before.mtimeMs ||
-        (before.ino !== 0 && metadata.ino !== 0 && before.ino !== metadata.ino)
+        (process.platform !== "win32" && (metadata.mode & 0o077) !== 0) ||
+        !pathMetadata.isFile() ||
+        metadata.size !== pathMetadata.size || metadata.mtimeMs !== pathMetadata.mtimeMs ||
+        (pathMetadata.ino !== 0 && metadata.ino !== 0 && pathMetadata.ino !== metadata.ino)
       ) throw new Error("preview session file changed while opening");
       const bytes = new Uint8Array(await handle.readFile());
       await this.#assertDirectoryIdentity(directoryIdentity);
