@@ -1,4 +1,4 @@
-import type { RunaApiClient } from "../api/client.js";
+import type { CunaApiClient } from "../api/client.js";
 
 import { runtimeFailure } from "./errors.js";
 import type {
@@ -10,7 +10,7 @@ const MAX_SUPERVISOR_LEASE_MS = 60_000;
 const MAX_FUTURE_SKEW_MS = 5_000;
 
 export function createApiTerminalControlPlane(input: {
-  readonly client: RunaApiClient;
+  readonly client: CunaApiClient;
   readonly clock?: () => number;
 }): TerminalControlPlane {
   const clock = input.clock ?? Date.now;

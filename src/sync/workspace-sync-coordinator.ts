@@ -553,7 +553,7 @@ function chunkLengths(page: { readonly entries: readonly { readonly chunks: read
 }
 
 function stableKey(domain: string, value: unknown): string {
-  return `runa-sync-${domain}-${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+  return `cuna-sync-${domain}-${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
 
 function sameIntent(checkpoint: WorkspaceSyncCheckpoint, identity: Omit<WorkspaceSyncCheckpoint, "schema_version" | "phase" | "sync_id" | "selected_protocol" | "committed_generation" | "updated_at">): boolean {

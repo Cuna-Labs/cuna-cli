@@ -149,6 +149,9 @@ test("foreground coordinator owns host restoration and renders isolated cloud ta
   assert.equal(host.acquired, 1);
   assert.equal(calls.attach.length, 2);
   assert.equal(calls.attach[0].rows, 22);
+  const attachingFrame = decoder.decode(host.writes[0]);
+  assert.match(attachingFrame, /CUNA  ATTACHING 2 EXACT AGENTSESSIONS/u);
+  assert.doesNotMatch(attachingFrame, /\bRUNA\b/u);
   assert.match(decoder.decode(host.writes.at(-1)), /48;2;235;86;37m/);
 
   await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("cloud output")));

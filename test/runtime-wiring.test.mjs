@@ -9,7 +9,7 @@ import { requireVerifiedPtyAdapter } from "../dist/pty/evidence-gate.js";
 import { createNodeProcessAdapter } from "../dist/pty/node-process.js";
 import { createApiTerminalControlPlane } from "../dist/runtime/api-terminal-control-plane.js";
 import { admitCapability } from "../dist/runtime/capability-gate.js";
-import { RunaRuntimeBoundary } from "../dist/runtime/boundary.js";
+import { CunaRuntimeBoundary } from "../dist/runtime/boundary.js";
 import { RuntimeBoundaryError } from "../dist/runtime/errors.js";
 import { createUnavailableTerminalControlPlane, validateTerminalGrant } from "../dist/runtime/terminal-transport.js";
 
@@ -196,10 +196,10 @@ class FakeTerminalSystem {
 function createRuntime(system, extra = {}) {
   const states = [];
   const outputs = [];
-  const runtime = new RunaRuntimeBoundary({
+  const runtime = new CunaRuntimeBoundary({
     controlPlane: system.controlPlane,
     terminalConnector: system.connector,
-    allowedRunaOrigins: [API_ORIGIN],
+    allowedCunaOrigins: [API_ORIGIN],
     terminalCapabilityId: CAPABILITY_ID,
     clientInstanceId: "client-1",
     clock: () => NOW,
@@ -224,11 +224,11 @@ function createRuntime(system, extra = {}) {
 
 test("TC-055-12 foreground readiness remains distinct from daemon and cannot authorize sync", async () => {
   const system = new FakeTerminalSystem();
-  const runtime = new RunaRuntimeBoundary({
+  const runtime = new CunaRuntimeBoundary({
     mode: "foreground",
     controlPlane: system.controlPlane,
     terminalConnector: system.connector,
-    allowedRunaOrigins: [API_ORIGIN],
+    allowedCunaOrigins: [API_ORIGIN],
     terminalCapabilityId: CAPABILITY_ID,
     clientInstanceId: "foreground-client",
     clock: () => NOW,
@@ -326,7 +326,7 @@ test("terminal grants reject non-Runa origins, query secrets, and incomplete cap
   };
   assert.equal(validateTerminalGrant({
     grant: valid,
-    allowedRunaOrigins: [API_ORIGIN],
+    allowedCunaOrigins: [API_ORIGIN],
     requiredCapabilities: ["acknowledgement", "heartbeat"],
     now: NOW,
   }), valid);
@@ -338,7 +338,7 @@ test("terminal grants reject non-Runa origins, query secrets, and incomplete cap
     assert.throws(
       () => validateTerminalGrant({
         grant,
-        allowedRunaOrigins: [API_ORIGIN],
+        allowedCunaOrigins: [API_ORIGIN],
         requiredCapabilities: ["acknowledgement", "heartbeat"],
         now: NOW,
       }),
@@ -478,7 +478,7 @@ test("shutdown retains failed terminal cleanup authority and retries it to compl
 });
 
 test("shutdown fences an in-flight sync open and waits until its lease is released", async () => {
-  const directory = await resources.createTempDirectory("runa-runtime-sync-shutdown-");
+  const directory = await resources.createTempDirectory("cuna-runtime-sync-shutdown-");
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);
   const journalDirectory = path.join(directory, "journal");
@@ -1330,7 +1330,7 @@ test("Node process adapter executes argv without a shell and excludes credential
 });
 
 test("runtime sync boundary acquires one durable journal writer and begins in reconciliation", async () => {
-  const directory = await resources.createTempDirectory("runa-runtime-sync-");
+  const directory = await resources.createTempDirectory("cuna-runtime-sync-");
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);
   try {
@@ -1365,10 +1365,10 @@ test("runtime sync boundary acquires one durable journal writer and begins in re
 
 test("runtime startup rejects unverified local endpoint evidence", () => {
   const system = new FakeTerminalSystem();
-  const runtime = new RunaRuntimeBoundary({
+  const runtime = new CunaRuntimeBoundary({
     controlPlane: system.controlPlane,
     terminalConnector: system.connector,
-    allowedRunaOrigins: [API_ORIGIN],
+    allowedCunaOrigins: [API_ORIGIN],
     terminalCapabilityId: CAPABILITY_ID,
     clientInstanceId: "client-1",
     clock: () => NOW,
@@ -1389,10 +1389,10 @@ test("runtime startup rejects unverified local endpoint evidence", () => {
 test("runtime startup evidence expiry revokes readiness before later mutations", async () => {
   const system = new FakeTerminalSystem();
   let now = NOW;
-  const runtime = new RunaRuntimeBoundary({
+  const runtime = new CunaRuntimeBoundary({
     controlPlane: system.controlPlane,
     terminalConnector: system.connector,
-    allowedRunaOrigins: [API_ORIGIN],
+    allowedCunaOrigins: [API_ORIGIN],
     terminalCapabilityId: CAPABILITY_ID,
     clientInstanceId: "client-1",
     clock: () => now,

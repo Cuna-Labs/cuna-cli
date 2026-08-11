@@ -1,7 +1,7 @@
 import { Writable } from "node:stream";
 import { createInterface } from "node:readline/promises";
 
-import { createRunaApiClient, type RunaApiClient } from "../api/client.js";
+import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
 import { createHttpTransport, type HttpRequest } from "../api/http.js";
 import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
@@ -51,7 +51,7 @@ export interface RunCliDependencies {
   readonly streams?: CliStreams;
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
-  readonly clientFactory?: (config: EffectiveConfig, timeoutMs: number) => RunaApiClient;
+  readonly clientFactory?: (config: EffectiveConfig, timeoutMs: number) => CunaApiClient;
   readonly humanAuth?: HumanAuthService;
   readonly credentialVault?: CredentialVault;
   readonly browser?: BrowserOpener;
@@ -59,7 +59,7 @@ export interface RunCliDependencies {
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
   readonly foregroundTerminalRunner?: ForegroundSessionRunner;
   readonly automaticJourneyEffectsFactory?: (input: {
-    readonly client: RunaApiClient;
+    readonly client: CunaApiClient;
     readonly intent: ReconciledAgentJourneyIntent;
     readonly config: EffectiveConfig;
     readonly platform: PlatformAdapter;
@@ -461,7 +461,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       timeoutMs,
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     }) : undefined;
-    const client = dependencies.clientFactory?.(config, timeoutMs) ?? createRunaApiClient(httpTransport!);
+    const client = dependencies.clientFactory?.(config, timeoutMs) ?? createCunaApiClient(httpTransport!);
     if (journeyIntent?.target === "reconcile") {
       if (credentialMode === undefined) {
         throw new CunaError({

@@ -1,6 +1,7 @@
 {
   "name": "@cuna_labs/cli-native-darwin-x64",
   "version": "0.1.0",
+  "private": true,
   "description": "Signed native authentication artifacts for Cuna CLI on macOS x64.",
   "license": "Apache-2.0",
   "os": [

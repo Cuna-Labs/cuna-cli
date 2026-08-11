@@ -667,7 +667,7 @@ export class ForegroundTerminalCoordinator {
     dimensions: { readonly columns: number; readonly rows: number },
   ): Promise<void> {
     const color = this.#options.color ?? true;
-    const top = padTrustedLine(` RUNA  ATTACHING ${count} EXACT AGENTSESSION${count === 1 ? "" : "S"}`, dimensions.columns);
+    const top = padTrustedLine(` CUNA  ATTACHING ${count} EXACT AGENTSESSION${count === 1 ? "" : "S"}`, dimensions.columns);
     const detail = padTrustedLine(" Authorizing the requested cloud terminals. No action is required.", dimensions.columns);
     const text = [
       "\u001b[?25l\u001b[H\u001b[2J",

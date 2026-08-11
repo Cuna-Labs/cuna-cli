@@ -7,8 +7,8 @@ import {
   CunaError,
   SUPPORT_URL,
   createHttpTransport,
-  createRunaApiClient,
-  decodeRunaIdentity,
+  createCunaApiClient,
+  decodeCunaIdentity,
   memoryStreams,
   runCli,
 } from "../dist/index.js";
@@ -52,7 +52,7 @@ function productionIdentityBody() {
 }
 
 function clientReturning(body, status = 200) {
-  return createRunaApiClient(createHttpTransport({
+  return createCunaApiClient(createHttpTransport({
     baseUrl: "https://api.getcuna.com",
     apiKey: API_KEY,
     fetch: async () => new Response(JSON.stringify(body), {
@@ -272,7 +272,7 @@ test("every error class that reaches a user through the transport carries a hint
 
 test("a contract violation carries its field and predicate, and nesting narrows the path", () => {
   assert.throws(
-    () => decodeRunaIdentity(productionIdentityBody()),
+    () => decodeCunaIdentity(productionIdentityBody()),
     (error) => error instanceof ContractViolation &&
       error.field === "workspace.id" &&
       error.predicate === "required_when_workspace_assigned" &&

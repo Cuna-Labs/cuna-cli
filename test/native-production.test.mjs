@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
@@ -42,10 +42,29 @@ test("platform packages are exact, script-free, and contain only their own execu
     ));
     assert.deepEqual(manifest.os, [platform]);
     assert.deepEqual(manifest.cpu, [architecture]);
+    assert.equal(manifest.private, true, "source-only native package must reject accidental publication");
     assert.equal(Object.hasOwn(manifest, "scripts"), false);
     assert.equal(manifest.files.includes(executable), true);
     assert.equal(manifest.files.includes(platform === "win32" ? "cuna-native-bridge" : "cuna-native-bridge.exe"), false);
     assert.deepEqual(manifest.exports, { "./package.json": "./package.json" });
+  }
+});
+
+test("source-only native package manifests cannot be mistaken for release artifacts", async () => {
+  for (const directory of [
+    "cli-native-win32-x64",
+    "cli-native-darwin-x64",
+    "cli-native-darwin-arm64",
+  ]) {
+    const packageRoot = path.join(root, "native", "packages", directory);
+    const manifest = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
+    for (const file of manifest.files) {
+      await assert.rejects(
+        access(path.join(packageRoot, file)),
+        (error) => error?.code === "ENOENT",
+        `${directory}/${file} must be absent until a release builder creates admitted bytes`,
+      );
+    }
   }
 });
 

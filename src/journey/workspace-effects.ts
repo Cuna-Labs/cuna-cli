@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { RunaApiClient } from "../api/client.js";
+import type { CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import type { ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.js";
 import {
@@ -17,7 +17,7 @@ import { stableUuid } from "./derived-identity.js";
 import type { AgentJourneyEffects } from "./orchestrator.js";
 
 export interface WorkspaceJourneyEffectsInput {
-  readonly client: RunaApiClient;
+  readonly client: CunaApiClient;
   readonly transport: AuthenticatedWorkspaceSyncTransport;
   readonly profileId: string;
   readonly userId: string;

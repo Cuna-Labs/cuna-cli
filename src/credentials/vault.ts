@@ -11,7 +11,7 @@ import {
 import { CredentialBoundaryError, credentialFailure } from "./errors.js";
 import { SecretMaterial } from "./secret-material.js";
 
-const ENVELOPE_MAGIC = new TextEncoder().encode("RUNACRED");
+const ENVELOPE_MAGIC = new TextEncoder().encode("CUNACRED");
 const ENVELOPE_VERSION = 1;
 const MAXIMUM_ENVELOPE_BYTES = 96 * 1024;
 const MAXIMUM_HEADER_BYTES = 8 * 1024;
@@ -444,14 +444,14 @@ export class CredentialVault {
  * `valid_credential_target` in the Rust bridge's `protocol.rs`. Independent
  * acceptance is defence in depth and must stay that way. What must never
  * happen again is a second *mint*: `native-bridge-backend.ts` spelled its own
- * probe target as `runa-cli:probe:<32 hex>`, which no acceptor in either
+ * probe target as `cuna-cli:probe:<32 hex>`, which no acceptor in either
  * language admits, so the liveness probe threw `credential_binding_invalid` on
  * its very first call and every interactive sign-in resolved to
  * `cuna.auth.vault_unavailable` -- on a bridge that was working perfectly.
  * Mint through this function or the value is not a credential target.
  */
 export function credentialTarget(binding: CredentialBinding): string {
-  return `runa-cli:v1:${bindingDigest(normalizeBinding(binding))}`;
+  return `cuna-cli:v1:${bindingDigest(normalizeBinding(binding))}`;
 }
 
 /**

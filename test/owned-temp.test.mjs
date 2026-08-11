@@ -16,7 +16,7 @@ async function isAbsent(candidate) {
 
 test("owned temp scope is removed after successful work", async () => {
   let observedRoot;
-  const result = await withOwnedTempDirectory("runa-owned-temp-test-", async (root) => {
+  const result = await withOwnedTempDirectory("cuna-owned-temp-test-", async (root) => {
     observedRoot = root;
     return "complete";
   });
@@ -27,7 +27,7 @@ test("owned temp scope is removed after successful work", async () => {
 test("owned temp scope is removed after primary and cleanup-hook failures", async () => {
   let observedRoot;
   await assert.rejects(
-    withOwnedTempDirectory("runa-owned-temp-test-", async (root) => {
+    withOwnedTempDirectory("cuna-owned-temp-test-", async (root) => {
       observedRoot = root;
       throw new Error("primary failure");
     }, {

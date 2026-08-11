@@ -149,7 +149,7 @@ test("product service applies project exclusions and returns only committed rece
   const excludedSecret = "DO_NOT_TRANSMIT_THIS_SECRET_92834";
   await mkdir(join(root, "private"));
   await writeFile(join(root, ".gitignore"), "ignored.txt\n");
-  await writeFile(join(root, ".runaignore"), "private/**\n");
+  await writeFile(join(root, ".cunaignore"), "private/**\n");
   await writeFile(join(root, "keep.txt"), "hello from runa\n");
   await writeFile(join(root, "ignored.txt"), excludedSecret);
   await writeFile(join(root, "private", "secret.txt"), excludedSecret);
@@ -193,29 +193,24 @@ test("product service applies project exclusions and returns only committed rece
   assert.equal(JSON.parse(checkpoint).phase, "committed");
 });
 
-test("project exclusions are honoured under both the .cunaignore and .runaignore names", async (t) => {
+test("project exclusions are honoured under the Cuna policy name", async (t) => {
   const excludedSecret = "DO_NOT_TRANSMIT_THIS_SECRET_92834";
-  const digests = [];
-  for (const exclusionFile of [".cunaignore", ".runaignore"]) {
-    const root = await temporaryDirectory(t, "cuna-exclusion-root-");
-    const checkpointRoot = await temporaryDirectory(t, "cuna-exclusion-state-");
-    await mkdir(join(root, "private"));
-    await writeFile(join(root, exclusionFile), "private/**\n");
-    await writeFile(join(root, "keep.txt"), "hello from cuna\n");
-    await writeFile(join(root, "private", "secret.txt"), excludedSecret);
-    const authority = new RecordingAuthority();
+  const root = await temporaryDirectory(t, "cuna-exclusion-root-");
+  const checkpointRoot = await temporaryDirectory(t, "cuna-exclusion-state-");
+  await mkdir(join(root, "private"));
+  await writeFile(join(root, ".cunaignore"), "private/**\n");
+  await writeFile(join(root, "keep.txt"), "hello from cuna\n");
+  await writeFile(join(root, "private", "secret.txt"), excludedSecret);
+  const authority = new RecordingAuthority();
 
-    const receipt = await synchronizeLocalWorkspace(productInput(root, checkpointRoot, authority));
+  const receipt = await synchronizeLocalWorkspace(productInput(root, checkpointRoot, authority));
 
-    assert.equal(receipt.phase, "committed");
-    assert.equal(receipt.files, 2);
-    assert.equal(receipt.bytes, Buffer.byteLength("private/**\nhello from cuna\n"));
-    const serializedRequests = JSON.stringify(authority.requests);
-    assert.equal(serializedRequests.includes(excludedSecret), false);
-    assert.equal(serializedRequests.includes("private/secret.txt"), false);
-    digests.push(receipt.exclusion_policy_digest);
-  }
-  assert.equal(digests[0], digests[1]);
+  assert.equal(receipt.phase, "committed");
+  assert.equal(receipt.files, 2);
+  assert.equal(receipt.bytes, Buffer.byteLength("private/**\nhello from cuna\n"));
+  const serializedRequests = JSON.stringify(authority.requests);
+  assert.equal(serializedRequests.includes(excludedSecret), false);
+  assert.equal(serializedRequests.includes("private/secret.txt"), false);
 });
 
 test("continuous product lifecycle starts only from the durable initial commit and uploads a later local edit", async (t) => {
@@ -327,12 +322,12 @@ test("unsafe policy input is not followed or decoded and cannot leak external co
   const external = join(await temporaryDirectory(t, "runa-product-external-"), "external-policy");
   await writeFile(external, "SENSITIVE_EXTERNAL_POLICY_CONTENT\n");
   try {
-    await symlink(external, join(root, ".runaignore"), "file");
+    await symlink(external, join(root, ".cunaignore"), "file");
   } catch (error) {
     if (error.code === "EPERM" || error.code === "EACCES") {
       // Windows often requires an elevated token to create symlinks. Invalid
       // UTF-8 still proves that unsafe policy bytes fail before any dispatch.
-      await writeFile(join(root, ".runaignore"), new Uint8Array([0xff, 0xfe, 0xfd]));
+      await writeFile(join(root, ".cunaignore"), new Uint8Array([0xff, 0xfe, 0xfd]));
     } else {
       throw error;
     }

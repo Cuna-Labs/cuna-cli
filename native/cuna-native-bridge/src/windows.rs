@@ -154,12 +154,12 @@ fn delete(target: &str) -> Response {
 }
 
 fn open_browser(payload: &[u8]) -> Response {
+    if !valid_https_url(payload) {
+        return Response::empty(Status::InvalidRequest);
+    }
     let Ok(url) = std::str::from_utf8(payload) else {
         return Response::empty(Status::InvalidRequest);
     };
-    if !url.starts_with("https://") || url.contains('\0') || url.len() > 8_192 {
-        return Response::empty(Status::InvalidRequest);
-    }
     let mut operation = wide("open");
     let mut url = wide(url);
     // SAFETY: both strings are NUL-terminated and live through the call. Cuna invokes no
@@ -182,6 +182,15 @@ fn open_browser(payload: &[u8]) -> Response {
     } else {
         Response::empty(Status::Unavailable)
     }
+}
+
+fn valid_https_url(payload: &[u8]) -> bool {
+    payload.len() <= 8_192
+        && payload.starts_with(b"https://")
+        && std::str::from_utf8(payload).is_ok()
+        && !payload
+            .iter()
+            .any(|byte| *byte == 0 || byte.is_ascii_control())
 }
 
 fn status_from_last_error() -> Status {
@@ -240,5 +249,15 @@ mod tests {
         assert!(requires_child_process_mitigation(Operation::Replace));
         assert!(requires_child_process_mitigation(Operation::Delete));
         assert!(!requires_child_process_mitigation(Operation::OpenBrowser));
+    }
+
+    #[test]
+    fn browser_validation_rejects_non_https_and_control_bytes() {
+        assert!(valid_https_url(
+            b"https://app.getcuna.com/cli/continue?nonce=one"
+        ));
+        assert!(!valid_https_url(b"http://app.getcuna.com/cli/continue"));
+        assert!(!valid_https_url(b"https://app.getcuna.com/cli/continue\n"));
+        assert!(!valid_https_url(b"https://app.getcuna.com/cli/\xff"));
     }
 }

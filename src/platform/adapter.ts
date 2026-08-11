@@ -11,8 +11,6 @@ export interface PlatformPaths {
   readonly configDirectory: string;
   readonly stateDirectory: string;
   readonly runtimeDirectory: string;
-  /** Read-only upgrade fallback. New state is always written beneath Cuna paths. */
-  readonly legacyConfigDirectory?: string;
 }
 
 export interface SafeFileSnapshot {
@@ -55,7 +53,6 @@ export function resolvePlatformPaths(input: PlatformEnvironment): PlatformPaths 
       configDirectory: win32.join(appData, "Cuna"),
       stateDirectory: win32.join(localAppData, "Cuna", "State"),
       runtimeDirectory: win32.join(localAppData, "Cuna", "Runtime"),
-      legacyConfigDirectory: win32.join(appData, "Runa"),
     });
   }
   if (kind === "macos") {
@@ -63,7 +60,6 @@ export function resolvePlatformPaths(input: PlatformEnvironment): PlatformPaths 
       configDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Cuna"),
       stateDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Cuna", "State"),
       runtimeDirectory: posix.join(input.env.TMPDIR ?? "/tmp", `cuna-${input.userId ?? "user"}`),
-      legacyConfigDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Runa"),
     });
   }
   const configRoot = input.env.XDG_CONFIG_HOME ?? posix.join(input.homeDirectory, ".config");
@@ -73,7 +69,6 @@ export function resolvePlatformPaths(input: PlatformEnvironment): PlatformPaths 
     configDirectory: posix.join(configRoot, "cuna"),
     stateDirectory: posix.join(stateRoot, "cuna"),
     runtimeDirectory: posix.join(runtimeRoot, "cuna"),
-    legacyConfigDirectory: posix.join(configRoot, "runa"),
   });
 }
 

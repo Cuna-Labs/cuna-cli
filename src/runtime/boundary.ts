@@ -111,7 +111,7 @@ export interface RuntimeBoundaryOptions {
   readonly mode?: RuntimeBoundaryMode;
   readonly controlPlane: TerminalControlPlane;
   readonly terminalConnector: TerminalConnector;
-  readonly allowedRunaOrigins: readonly string[];
+  readonly allowedCunaOrigins: readonly string[];
   readonly terminalCapabilityId: string;
   readonly clientInstanceId: string;
   readonly clock?: () => number;
@@ -160,7 +160,7 @@ interface TerminalEntry {
   reconnectIdempotencyKey?: string;
 }
 
-export class RunaRuntimeBoundary {
+export class CunaRuntimeBoundary {
   readonly #options: RuntimeBoundaryOptions;
   readonly #clock: () => number;
   readonly #idempotencyKey: () => string;
@@ -195,10 +195,10 @@ export class RunaRuntimeBoundary {
   constructor(options: RuntimeBoundaryOptions) {
     assertIdentifier(options.terminalCapabilityId, "terminal capability ID");
     assertIdentifier(options.clientInstanceId, "client instance ID");
-    if (options.allowedRunaOrigins.length === 0) {
+    if (options.allowedCunaOrigins.length === 0) {
       throw runtimeFailure("grant_invalid", "At least one exact Cuna HTTPS origin is required.");
     }
-    this.#options = Object.freeze({ ...options, allowedRunaOrigins: Object.freeze([...options.allowedRunaOrigins]) });
+    this.#options = Object.freeze({ ...options, allowedCunaOrigins: Object.freeze([...options.allowedCunaOrigins]) });
     this.#clock = options.clock ?? Date.now;
     this.#idempotencyKey = options.idempotencyKey ?? randomUUID;
     const mode = options.mode ?? "daemon";
@@ -1040,7 +1040,7 @@ export class RunaRuntimeBoundary {
     });
     return validateTerminalGrant({
       grant,
-      allowedRunaOrigins: this.#options.allowedRunaOrigins,
+      allowedCunaOrigins: this.#options.allowedCunaOrigins,
       requiredCapabilities: resumeHandle === undefined
         ? ["acknowledgement", "heartbeat"]
         : ["acknowledgement", "heartbeat", "resume"],

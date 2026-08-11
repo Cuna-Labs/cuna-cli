@@ -191,7 +191,7 @@ function storedFromTokens(
 
 function stableRefreshIdempotency(session: StoredHumanSession): string {
   const digest = createHash("sha256")
-    .update("runa-cli-refresh-v1\0", "utf8")
+    .update("cuna-cli-refresh-v1\0", "utf8")
     .update(session.refreshToken, "utf8")
     .update("\0", "utf8")
     .update(session.clientInstanceId, "ascii")

@@ -4,7 +4,8 @@ import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { CunaError, ERROR_NAMESPACE, EXIT_CODES, RunaError } from "../dist/index.js";
+import { CunaError, ERROR_NAMESPACE, EXIT_CODES } from "../dist/index.js";
+import { DEPLOYED_WIRE_COMPATIBILITY } from "../dist/core/deployed-wire-compatibility.js";
 
 /**
  * Every error code this CLI prints is minted from ninety-odd separate string
@@ -13,7 +14,7 @@ import { CunaError, ERROR_NAMESPACE, EXIT_CODES, RunaError } from "../dist/index
  * on a terminal; a stray `runa.*` literal is product surface, not a typo.
  *
  * `runa.` is NOT forbidden outright: the identifiers below are minted by the
- * service or already written to disk and are compared by exact equality, so
+ * deployed services and are compared by exact equality, so
  * renaming them here and nowhere else is the mint-here/accept-there defect this
  * repository has closed four times. Each is listed with the peer that pins it.
  * Adding a line is a deliberate act; growing this list by accident is what this
@@ -40,13 +41,13 @@ const WIRE_IDENTIFIERS = Object.freeze([
   "runa.agent-auth.v1",
   // Bearer-in-subprotocol prefix. Pinned by infra `edge/src/terminal-gateway.ts`,
   // which accepts this prefix and no other.
-  "runa.auth.${request.token}",
-  // Durable on-disk binding record discriminator. Pinned by every workspace
-  // binding already written to a user's disk.
-  "runa.workspace-binding.v2",
+  "runa.auth.",
 ]);
 
 const SOURCE_ROOT = fileURLToPath(new URL("../src", import.meta.url));
+const SCRIPTS_ROOT = fileURLToPath(new URL("../scripts", import.meta.url));
+const COMPATIBILITY_FILE = "core/deployed-wire-compatibility.ts";
+const EARLIER_BRAND_LITERAL = /(?:^|[^a-z])runa(?:code)?(?:[^a-z]|$)/iu;
 
 function isCommentLine(line) {
   const trimmed = line.trimStart();
@@ -58,7 +59,7 @@ async function sourceFiles(directory) {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) found.push(...await sourceFiles(path));
-    else if (extname(path) === ".ts") found.push(path);
+    else if ([".ts", ".mjs", ".js"].includes(extname(path))) found.push(path);
   }
   return found;
 }
@@ -83,9 +84,44 @@ test("no shipped source mints an error code outside the current namespace", asyn
   );
 });
 
-test("the deprecated error alias stays importable and identical", () => {
-  assert.equal(RunaError, CunaError);
+test("the deployed wire compatibility authority has an exact closed schema and value set", () => {
+  assert.deepEqual(DEPLOYED_WIRE_COMPATIBILITY, {
+    terminalProtocol: "runa.terminal.v1",
+    agentSessionAuthAdapterVersion: "runa.agent-auth.v1",
+    websocketAuthPrefix: "runa.auth.",
+    continuationHeader: "X-Runa-Continuation",
+    credentialBrand: "runa",
+    apiOrigin: "https://api.runacode.io",
+  });
+});
 
+test("earlier-brand runtime literals exist only in the exact deployed wire authority", async () => {
+  const unexplained = [];
+  for (const [root, label] of [[SOURCE_ROOT, "src"], [SCRIPTS_ROOT, "scripts"]]) {
+    for (const path of await sourceFiles(root)) {
+      const relative = path.slice(root.length + 1).replaceAll("\\", "/");
+      const lines = (await readFile(path, "utf8")).split(/\r?\n/u);
+      for (const [index, line] of lines.entries()) {
+        if (isCommentLine(line)) continue;
+        let unclassified = line;
+        if (label === "src" && relative === COMPATIBILITY_FILE) {
+          for (const value of Object.values(DEPLOYED_WIRE_COMPATIBILITY)) {
+            unclassified = unclassified.replaceAll(JSON.stringify(value), "");
+          }
+        }
+        if (!EARLIER_BRAND_LITERAL.test(unclassified)) continue;
+        unexplained.push(`${label}/${relative}:${index + 1}: ${line.trim()}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    unexplained,
+    [],
+    `Earlier-brand runtime literals must be classified as deployed wire compatibility.\n${unexplained.join("\n")}`,
+  );
+});
+
+test("the public error class is Cuna-only", () => {
   const error = new CunaError({
     code: `${ERROR_NAMESPACE}.usage.invalid`,
     message: "namespace probe",

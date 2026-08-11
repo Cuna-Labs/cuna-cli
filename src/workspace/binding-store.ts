@@ -27,9 +27,9 @@ import {
 import { workspaceError } from "./errors.js";
 import type { DurableSchemaEnvelope } from "./schema.js";
 
-const METADATA_DIRECTORY = ".runa";
+const METADATA_DIRECTORY = ".cuna";
 const BINDING_FILE = "workspace.json";
-const RECORD_TYPE = "runa.workspace-binding.v2";
+const RECORD_TYPE = "cuna.workspace-binding.v2";
 const MAXIMUM_RECORD_BYTES = 65_536;
 const DIGEST = /^[a-f0-9]{64}$/u;
 const PROFILE_CONTROL = /[\p{Cc}\p{Cf}]/u;
@@ -680,14 +680,14 @@ async function acquireBindingWriterLock(
 
 async function bindingLockEndpoint(identity: CanonicalWorkspaceRootIdentity): Promise<string> {
   const digest = createHash("sha256")
-    .update("runa-workspace-binding-lock-v1\0")
+    .update("cuna-workspace-binding-lock-v1\0")
     .update(JSON.stringify(identity))
     .digest("hex");
-  if (process.platform === "win32") return `\\\\.\\pipe\\runa-workspace-binding-${digest}`;
+  if (process.platform === "win32") return `\\\\.\\pipe\\cuna-workspace-binding-${digest}`;
   const base = await realpath(tmpdir());
   const uid = process.getuid?.();
   if (uid === undefined) throw unsafeStore("lock_identity_unavailable");
-  const directory = join(base, `.runa-${uid}`);
+  const directory = join(base, `.cuna-${uid}`);
   try {
     await mkdir(directory, { mode: 0o700 });
   } catch (error) {
@@ -770,7 +770,7 @@ function noFollowFlag(): number {
 
 function digestRecord(record: Omit<WorkspaceBindingRecord, "integrityDigest">): string {
   return createHash("sha256")
-    .update("runa-workspace-binding-record-v2\0")
+    .update("cuna-workspace-binding-record-v2\0")
     .update(JSON.stringify(record))
     .digest("hex");
 }

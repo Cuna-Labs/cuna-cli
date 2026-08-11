@@ -1,5 +1,6 @@
 import { posix, win32 } from "node:path";
 
+import { isBoundedHttpsBrowserUrl } from "../core/browser-url.js";
 import type { NativeCredentialBridge } from "./contracts.js";
 import { credentialFailure } from "./errors.js";
 import {
@@ -9,13 +10,13 @@ import {
   type SecureStdinAdmissionLease,
 } from "./process-runner.js";
 
-const REQUEST_MAGIC = Buffer.from("RUNANV01", "ascii");
-const RESPONSE_MAGIC = Buffer.from("RUNANR01", "ascii");
+const REQUEST_MAGIC = Buffer.from("CUNANV01", "ascii");
+const RESPONSE_MAGIC = Buffer.from("CUNANR01", "ascii");
 const RESPONSE_HEADER_BYTES = 13;
 const MAXIMUM_TARGET_BYTES = 512;
 const MAXIMUM_PAYLOAD_BYTES = 8 * 1024;
 const SHA256 = /^[0-9a-f]{64}$/u;
-const CREDENTIAL_TARGET = /^runa-cli:v1:[0-9a-f]{64}$/u;
+const CREDENTIAL_TARGET = /^cuna-cli:v1:[0-9a-f]{64}$/u;
 const FINGERPRINT = /^[0-9A-F]{40,128}$/u;
 const VERSION = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$/u;
 
@@ -191,8 +192,7 @@ export function createNativeBrowserProcessBridge(input: {
   return Object.freeze({
     platform: input.descriptor.platform,
     open: async (url: string) => {
-      const parsed = new URL(url);
-      if (parsed.protocol !== "https:" || url.includes("\0")) {
+      if (!isBoundedHttpsBrowserUrl(url)) {
         throw new TypeError("Browser continuation URL must use HTTPS.");
       }
       const payload = Buffer.from(url, "utf8");
@@ -287,8 +287,7 @@ export function createNativeBrowserOwnedProcessBridge(input: {
   return Object.freeze({
     platform: input.descriptor.platform,
     open: async (url: string) => {
-      const parsed = new URL(url);
-      if (parsed.protocol !== "https:" || url.includes("\0")) {
+      if (!isBoundedHttpsBrowserUrl(url)) {
         throw new TypeError("Browser continuation URL must use HTTPS.");
       }
       const payload = Buffer.from(url, "utf8");

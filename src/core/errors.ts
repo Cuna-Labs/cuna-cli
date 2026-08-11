@@ -69,15 +69,6 @@ export class CunaError extends Error {
   }
 }
 
-/**
- * @deprecated Renamed to `CunaError`. Retained for one release so an internal
- * import that was missed fails loudly at review time rather than silently at
- * runtime; remove after the first published release.
- */
-export const RunaError = CunaError;
-/** @deprecated Renamed to `CunaError`. */
-export type RunaError = CunaError;
-
 export function usageError(message: string, hint?: string): CunaError {
   return new CunaError({
     code: "cuna.usage.invalid",

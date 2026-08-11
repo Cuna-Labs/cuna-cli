@@ -32,7 +32,7 @@ const descriptor = Object.freeze({
   }),
 });
 
-const credentialTarget = `runa-cli:v1:${"a".repeat(64)}`;
+const credentialTarget = `cuna-cli:v1:${"a".repeat(64)}`;
 
 function childObservation(child, overrides = {}) {
   return {
@@ -64,7 +64,7 @@ function ownedObservation(overrides = {}) {
 
 function response(status, payload = new Uint8Array()) {
   const result = Buffer.alloc(13 + payload.byteLength);
-  result.write("RUNANR01", 0, "ascii");
+  result.write("CUNANR01", 0, "ascii");
   result[8] = status;
   result.writeUInt32BE(payload.byteLength, 9);
   result.set(payload, 13);
@@ -79,7 +79,7 @@ test("TC-048-04/14 production exchange delegates process creation and protected 
     exchange: async (input) => {
       capturedRequest = input.request;
       assert.equal(Object.hasOwn(input, "pid"), false);
-      assert.equal(Buffer.from(input.request.subarray(0, 8)).toString("ascii"), "RUNANV01");
+      assert.equal(Buffer.from(input.request.subarray(0, 8)).toString("ascii"), "CUNANV01");
       return {
         exitCode: 0,
         signal: null,
@@ -177,7 +177,7 @@ test("TC-048-04/14 native bridge verifies every invocation and keeps protected b
       lease.release();
       assert.deepEqual(request.args, []);
       assert.deepEqual(request.environment, {});
-      assert.equal(Buffer.from(request.stdin.subarray(0, 8)).toString("ascii"), "RUNANV01");
+      assert.equal(Buffer.from(request.stdin.subarray(0, 8)).toString("ascii"), "CUNANV01");
       capturedInput = request.stdin;
       capturedOutput = response(0);
       return { exitCode: 0, signal: null, stdout: capturedOutput, stderrPresent: false, stdinAdmissionConfirmed: true };
@@ -307,7 +307,7 @@ test("TC-048-11 Windows capacity is explicit and rejects 0 or 2,561 bytes before
   assert.equal(runnerCalls, 3);
 });
 
-test("native credential operations reject targets outside the exact Runa namespace before native effects", async () => {
+test("native credential operations reject targets outside the exact Cuna namespace before native effects", async () => {
   let verifierCalls = 0;
   let runnerCalls = 0;
   const bridge = createNativeCredentialProcessBridge({
@@ -324,9 +324,10 @@ test("native credential operations reject targets outside the exact Runa namespa
 
   for (const target of [
     "arbitrary-credential",
-    "runa-cli:v1:short",
-    `runa-cli:v1:${"A".repeat(64)}`,
-    `runa-cli:v2:${"a".repeat(64)}`,
+    "cuna-cli:v1:short",
+    `cuna-cli:v1:${"A".repeat(64)}`,
+    `cuna-cli:v2:${"a".repeat(64)}`,
+    `runa-cli:v1:${"a".repeat(64)}`,
   ]) {
     await assert.rejects(
       bridge.read(target),
@@ -424,6 +425,32 @@ test("TC-048-18/20 Windows browser handoff uses only the freshly verified native
   assert.equal(verifierCalls, 2);
   assert.ok(capturedInput.every((value) => value === 0));
   assert.ok(capturedOutput.every((value) => value === 0));
+});
+
+test("TC-048-18 native browser bridges reject control-bearing and oversized URLs before authority effects", async () => {
+  let exchangeCalls = 0;
+  const bridge = createNativeBrowserOwnedProcessBridge({
+    descriptor,
+    runtimePlatform: "win32",
+    runtimeArchitecture: "x64",
+    verifier: { verify: async () => assert.fail("verifier must not run") },
+    authority: {
+      platform: "win32",
+      authorityKind: "windows-owned-process-spawn",
+      exchange: async () => {
+        exchangeCalls += 1;
+        return assert.fail("authority must not run");
+      },
+    },
+  });
+  for (const url of [
+    "http://app.getcuna.com/cli/continue",
+    "https://app.getcuna.com/cli/continue\n",
+    `https://app.getcuna.com/cli/continue?state=${"a".repeat(8_192)}`,
+  ]) {
+    await assert.rejects(bridge.open(url), /HTTPS/u);
+  }
+  assert.equal(exchangeCalls, 0);
 });
 
 test("TC-048-14 swap-for-spawn and restore-before-check is denied by loaded-image identity", async () => {

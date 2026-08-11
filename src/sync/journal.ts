@@ -563,7 +563,7 @@ function noFollowFlag(): number {
 async function acquireWriterAuthority(directory: string): Promise<WriterAuthority> {
   const canonicalIdentity = process.platform === "win32" ? directory.toLowerCase() : directory;
   const digest = createHash("sha256")
-    .update("runa-journal-authority-v2\0")
+    .update("cuna-journal-authority-v2\0")
     .update(canonicalIdentity)
     .digest("hex");
   // Windows reserves dynamic TCP port ranges for system services. Deriving a
@@ -571,7 +571,7 @@ async function acquireWriterAuthority(directory: string): Promise<WriterAuthorit
   // no peer owns the journal. A named pipe is kernel-owned, directory-scoped,
   // and released automatically when the process exits.
   const endpoint = process.platform === "win32"
-    ? `\\\\.\\pipe\\runa-workspace-journal-${digest}`
+    ? `\\\\.\\pipe\\cuna-workspace-journal-${digest}`
     : Object.freeze({
       host: "127.0.0.1" as const,
       port: 20_000 + Number.parseInt(digest.slice(0, 4), 16) % 40_000,
@@ -664,7 +664,7 @@ function recoveryAction(state: JournalOperationState): "send" | "query_outcome" 
 
 function hashIntent(intent: JournalIntent): string {
   return createHash("sha256")
-    .update("runa-journal-intent-v2\0")
+    .update("cuna-journal-intent-v2\0")
     .update(JSON.stringify({
       baseGeneration: intent.baseGeneration,
       byteLength: intent.byteLength,
@@ -695,7 +695,7 @@ function validRecordShape(record: JournalRecord): boolean {
 
 function hashRecord(body: Omit<JournalRecord, "checksum">): string {
   return createHash("sha256")
-    .update("runa-journal-record-v2\0")
+    .update("cuna-journal-record-v2\0")
     .update(JSON.stringify(body))
     .digest("hex");
 }

@@ -223,7 +223,7 @@ test("TC-040-05 watcher overflow and sequence gaps require authoritative full re
   const configuration = { bindingId: "binding", bindingGeneration: 1, canonicalRoot: "/workspace", policyDigest: "policy", epoch: "epoch" };
   const now = Date.parse("2026-08-09T00:00:30.000Z");
   const receipt = {
-    authority: "runa_workspace_service",
+    authority: "cuna_workspace_service",
     bindingId: "binding",
     bindingGeneration: 1,
     epoch: "epoch",
@@ -283,7 +283,7 @@ test("TC-040-07 progress uses measured milestones and cannot claim readiness wit
     (error) => error.code === "cuna.workspace.progress_unproven",
   );
   const admitted = progressFromReceipt({
-    authority: "runa_workspace_service",
+    authority: "cuna_workspace_service",
     stage: "committed",
     observedEntries: 10,
     observedBytes: 100,

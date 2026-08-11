@@ -60,7 +60,7 @@ export function createNativeBridgeBackend(input: {
           observedAt: now,
           expiresAt: now + 60_000,
           source: verified ? "native_bridge_round_trip" : "probe_failed",
-          ...(!verified && { reason: "The native Keychain round trip did not preserve the sentinel." }),
+          ...(!verified && { reason: "The native credential-store round trip did not preserve the sentinel." }),
         };
       } catch {
         cachedEvidence = {
@@ -71,7 +71,7 @@ export function createNativeBridgeBackend(input: {
           observedAt: now,
           expiresAt: now + 5_000,
           source: "probe_failed",
-          reason: "The native Keychain bridge failed its live round trip.",
+          reason: "The native credential-store bridge failed its live round trip.",
         };
       } finally {
         observed?.fill(0);

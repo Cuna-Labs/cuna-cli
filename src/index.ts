@@ -1,12 +1,12 @@
 export {
-  createRunaApiClient,
+  createCunaApiClient,
   decideCapability,
   requireCapability,
   type AgentSessionCreateInput,
   type PageOptions,
   type CapabilityDecision,
   type MachineCreateInput,
-  type RunaApiClient,
+  type CunaApiClient,
   type TerminalConnectionCreateInput,
 } from "./api/client.js";
 export {
@@ -21,7 +21,7 @@ export {
   decodeOk,
   decodeMachineItem,
   decodeMachinePage,
-  decodeRunaIdentity,
+  decodeCunaIdentity,
   decodeTerminalConnectionGrant,
   type AgentKind,
   type AgentAuthMode,
@@ -46,7 +46,7 @@ export {
   type Machine,
   type MachinePage,
   type MutationClass,
-  type RunaIdentity,
+  type CunaIdentity,
   TERMINAL_PROTOCOL,
   type TerminalCapabilityAvailability,
   type TerminalCapabilityName,
@@ -106,8 +106,6 @@ export {
   ERROR_NAMESPACE,
   EXIT_CODES,
   CunaError,
-  /** @deprecated Renamed to `CunaError`; removed after the first published release. */
-  RunaError,
   type ExitCode,
   type SafeErrorDetails,
 } from "./core/errors.js";

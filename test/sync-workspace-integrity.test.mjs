@@ -121,8 +121,8 @@ test("case and Unicode normalization collisions quarantine before materializatio
 
 test("exclusion policy runs before content reads and never opens immutable secret paths", async (t) => {
   const root = await temporaryDirectory(t);
-  await mkdir(join(root, ".runa"));
-  await writeFile(join(root, ".runa", "workspace.json"), "private metadata");
+  await mkdir(join(root, ".cuna"));
+  await writeFile(join(root, ".cuna", "workspace.json"), "private metadata");
   await writeFile(join(root, ".env"), "SECRET=should-not-be-read");
   await mkdir(join(root, "dist"));
   await writeFile(join(root, "dist", "generated.js"), "generated");
@@ -624,7 +624,7 @@ test("supervisor clients share one owner, overflow reconciles, and only a fresh 
   supervisor.watcherOverflow();
   assert.deepEqual(supervisor.snapshot, { state: "reconciling", dirty: true, incrementalApplyPaused: true, reason: "watcher_overflow" });
   supervisor.confirmConvergence({
-    authority: "runa_workspace_service",
+    authority: "cuna_workspace_service",
     bindingId: "b",
     bindingGeneration: 1,
     epoch: "e",
@@ -644,7 +644,7 @@ test("expired convergence evidence cannot remain publicly converged", () => {
   let now = Date.parse("2026-08-08T00:01:00.000Z");
   const supervisor = new LocalSyncSupervisor(config, { clock: () => now });
   supervisor.confirmConvergence({
-    authority: "runa_workspace_service",
+    authority: "cuna_workspace_service",
     bindingId: "b",
     bindingGeneration: 1,
     epoch: "e",

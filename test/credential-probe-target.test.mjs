@@ -15,9 +15,9 @@ import {
 /**
  * `cuna login` could not succeed on Windows or macOS even with a flawless
  * native bridge installed. The credential namespace was minted in two places
- * and accepted in a third: `vault.ts` minted `runa-cli:v1:<64 hex>`,
+ * and accepted in a third: `vault.ts` minted `cuna-cli:v1:<64 hex>`,
  * `native-bridge-backend.ts` minted its liveness probe as
- * `runa-cli:probe:<32 hex>`, and both the TypeScript acceptor
+ * `cuna-cli:probe:<32 hex>`, and both the TypeScript acceptor
  * (`native-process-bridge.ts`) and the independent Rust acceptor
  * (`native/cuna-native-bridge/src/protocol.rs`) admitted only the first shape.
  * The probe's very first `replace` threw `credential_binding_invalid`, the
@@ -42,10 +42,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const NOW = 1_800_000_000_000;
 
 /** Oracle 1: the shape, spelled out. Never derived from the code under test. */
-const LITERAL_CREDENTIAL_TARGET = /^runa-cli:v1:[0-9a-f]{64}$/u;
+const LITERAL_CREDENTIAL_TARGET = /^cuna-cli:v1:[0-9a-f]{64}$/u;
 
 /** The shape the defect minted, kept literal as the standing negative control. */
-const DEFECTIVE_PROBE_TARGET = `runa-cli:probe:${"3f".repeat(16)}`;
+const DEFECTIVE_PROBE_TARGET = `cuna-cli:probe:${"3f".repeat(16)}`;
 
 /** The reserved probe binding, transcribed. Pins the probe to the real mint. */
 const PROBE_NAMESPACE = "cuna.credential-backend-probe.v1";
@@ -81,7 +81,7 @@ const descriptor = Object.freeze({
 
 function successResponse() {
   const result = Buffer.alloc(13);
-  result.write("RUNANR01", 0, "ascii");
+  result.write("CUNANR01", 0, "ascii");
   result[8] = 0;
   result.writeUInt32BE(0, 9);
   return result;

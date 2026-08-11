@@ -119,7 +119,7 @@ export function assertRemoteAgentSessionEvidence(input: {
 
 export function validateTerminalGrant(input: {
   readonly grant: TerminalConnectionGrant;
-  readonly allowedRunaOrigins: readonly string[];
+  readonly allowedCunaOrigins: readonly string[];
   readonly requiredCapabilities?: readonly TerminalCapabilityName[];
   readonly now?: number;
 }): TerminalConnectionGrant {
@@ -170,7 +170,7 @@ export function validateTerminalGrant(input: {
     url.hash !== "" ||
     url.pathname.includes("..") ||
     url.pathname !== `/v1/terminal-connections/${grant.terminalSessionId}/stream` ||
-    !input.allowedRunaOrigins.some((origin) => toWebSocketOrigin(origin) === url.origin)
+    !input.allowedCunaOrigins.some((origin) => toWebSocketOrigin(origin) === url.origin)
   ) {
     throw runtimeFailure("grant_invalid", "The terminal connection URL is not an allowlisted Cuna origin.");
   }

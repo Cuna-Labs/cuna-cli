@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   requireCapability,
   type MachineCreateInput,
-  type RunaApiClient,
+  type CunaApiClient,
 } from "../api/client.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import type {
@@ -44,7 +44,7 @@ export interface CommandResult {
 export interface CommandContext {
   readonly parsed: ParsedInvocation;
   readonly config: EffectiveConfig;
-  readonly client: RunaApiClient;
+  readonly client: CunaApiClient;
   readonly now: number;
   readonly credentialMode?: "automation" | "interactive";
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];

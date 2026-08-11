@@ -1,6 +1,7 @@
 import { TextDecoder, TextEncoder } from "node:util";
+import { DEPLOYED_WIRE_COMPATIBILITY } from "../core/deployed-wire-compatibility.js";
 
-export const TERMINAL_PROTOCOL = "runa.terminal.v1" as const;
+export const TERMINAL_PROTOCOL = DEPLOYED_WIRE_COMPATIBILITY.terminalProtocol;
 export const TERMINAL_PROTOCOL_VERSION = 1 as const;
 export const MAX_TERMINAL_FRAME_BYTES = 1024 * 1024;
 export const MAX_TERMINAL_BUFFER_BYTES = MAX_TERMINAL_FRAME_BYTES * 2;

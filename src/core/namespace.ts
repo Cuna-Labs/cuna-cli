@@ -1,3 +1,5 @@
+import { DEPLOYED_WIRE_COMPATIBILITY } from "./deployed-wire-compatibility.js";
+
 /**
  * The single authority on every namespace this CLI accepts.
  *
@@ -25,32 +27,17 @@
  * mint; `runa` predates the rename and remains valid indefinitely because keys
  * issued under it were never revoked.
  */
-export const CREDENTIAL_BRANDS = Object.freeze(["cuna", "runa"] as const);
+export const CREDENTIAL_BRANDS = Object.freeze(["cuna", DEPLOYED_WIRE_COMPATIBILITY.credentialBrand] as const);
 
 export type CredentialBrand = (typeof CREDENTIAL_BRANDS)[number];
 
 /**
- * The environment-variable names the CLI reads for one configuration suffix,
- * in acceptance precedence: the current mint first, every earlier brand after.
- *
- * WHY THIS LIVES HERE. Until now this module's header was aspirational: it
- * claimed to be the authority on "every namespace this CLI accepts" while
- * `config/config.ts` read `CUNA_API_KEY` and nothing else. The rename replaced
- * four `RUNA_*` reads instead of adding to them, so `isSecretApiKey` above went
- * on accepting a `runa_sk_` key that its holder could no longer present under
- * the variable name they already export. Accept-here/accept-there, one brand
- * apart — the same defect this module exists to make inexpressible, in the
- * repository that owns the fix.
- *
- * PRECEDENCE IS BY PRESENCE, NOT BY VALIDITY. The first name that is set wins
- * even when its value is empty or malformed. A present-but-invalid canonical
- * value must never fall through to the legacy one: falling through would let a
- * failed `export CUNA_API_KEY=$(fetch-secret)` silently authenticate as
- * whatever stale `RUNA_API_KEY` is still exported in that shell. Both SDKs
- * resolve these names the same way.
+ * Configuration environment variables are Cuna-only. Earlier-brand credential
+ * bytes remain accepted through the deployed wire authority, but no earlier
+ * environment-variable name was ever published.
  */
 export function brandedEnvironmentNames(suffix: string): readonly string[] {
-  return Object.freeze(CREDENTIAL_BRANDS.map((brand) => `${brand.toUpperCase()}_${suffix}`));
+  return Object.freeze([`CUNA_${suffix}`]);
 }
 
 /** One environment read, carrying the name that actually supplied the value. */
@@ -108,7 +95,7 @@ export type CredentialFamilyInfix = (typeof CREDENTIAL_FAMILY_INFIXES)[number];
  */
 export const API_ORIGINS = Object.freeze([
   "https://api.getcuna.com",
-  "https://api.runacode.io",
+  DEPLOYED_WIRE_COMPATIBILITY.apiOrigin,
 ] as const);
 
 export type ApiOrigin = (typeof API_ORIGINS)[number];

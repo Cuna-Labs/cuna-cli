@@ -24,7 +24,7 @@ const BINDING = Object.freeze({
   profileId: "développement",
   accountId: "account-1",
   workspaceId: "workspace-1",
-  kind: "runa-refresh-token",
+  kind: "cuna-refresh-token",
 });
 
 class MemorySecureBackend {
@@ -389,7 +389,7 @@ test("secure process timeout waits for confirmed child closure before rejecting"
 });
 
 test("post-spawn loaded-image rejection kills the identified child before protected stdin is released", async (context) => {
-  const root = await mkdtemp(path.join(tmpdir(), "runa-stdin-admission-"));
+  const root = await mkdtemp(path.join(tmpdir(), "cuna-stdin-admission-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const marker = path.join(root, "stdin-observed.txt");
   const runner = createSecureProcessRunner();
@@ -487,6 +487,8 @@ test("Linux Secret Service adapter transports protected values only through stdi
   for (const call of calls) {
     const publicTransport = JSON.stringify({ args: call.args, environment: call.environment });
     assert.doesNotMatch(publicTransport, /linux-secret-sentinel/u);
+    assert.equal(call.args.includes("cuna-cli"), true, "every Secret Service operation uses the Cuna application namespace");
+    assert.equal(call.args.includes("runa-cli"), false, "the unreleased Runa namespace must not be written");
   }
   assert.match(new TextDecoder().decode(calls[0].stdin), /linux-secret-sentinel/u, "protected value is confined to stdin");
   observed.fill(0);

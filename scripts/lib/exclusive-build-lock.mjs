@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { resolve } from "node:path";
 
-const PROTOCOL = "RUNA_EXCLUSIVE_BUILD_V1";
+const PROTOCOL = "CUNA_EXCLUSIVE_BUILD_V1";
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 
@@ -33,7 +33,7 @@ export function buildLockIdentity(repositoryRoot, platform = process.platform) {
 
 export function buildLockEndpoint(repositoryRoot, platform = process.platform) {
   const identity = buildLockIdentity(repositoryRoot, platform);
-  if (platform === "win32") return `\\\\.\\pipe\\runa-cli-build-${identity}`;
+  if (platform === "win32") return `\\\\.\\pipe\\cuna-cli-build-${identity}`;
   // Loopback sockets are kernel-owned and disappear on process death. A full
   // identity handshake turns the small deterministic port space into a
   // fail-closed collision, never an excuse to steal or delete another lock.

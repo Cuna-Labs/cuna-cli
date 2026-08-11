@@ -4,19 +4,7 @@ import { dirname, join, normalize } from "node:path";
 import { lstat, open, realpath } from "node:fs/promises";
 
 import { credentialFailure } from "./errors.js";
-import {
-  createAdmittedNativeBrowserOwnedBridge,
-  createAdmittedNativeCredentialOwnedBridge,
-  type NativeBridgeSignatureAuthority,
-  type NativeBridgeSignatureObservation,
-  type NativeBridgeTrustPolicy,
-} from "./native-admission.js";
-import {
-  type NativeBridgeDescriptor,
-  type NativeBrowserProcessBridge,
-  type NativeOwnedBridgeExchangeAuthority,
-  type NativeOwnedBridgeExchangeResult,
-} from "./native-process-bridge.js";
+import type { NativeBrowserProcessBridge } from "./native-process-bridge.js";
 import {
   NATIVE_PLATFORM_RELEASE_INDEX,
   type NativePlatformReleaseEntry,
@@ -27,20 +15,6 @@ const SHA256 = /^[0-9a-f]{64}$/u;
 const MAXIMUM_PACKAGE_JSON_BYTES = 16 * 1024;
 const MAXIMUM_AUTHORITY_ADDON_BYTES = 32 * 1024 * 1024;
 const PACKAGE_KEYS = ["name", "version", "description", "license", "os", "cpu", "files", "exports"] as const;
-
-interface NativeAuthorityAddon {
-  verifySignature(input: {
-    readonly executable: string;
-    readonly platform: "win32" | "darwin";
-    readonly architecture: "x64" | "arm64";
-  }): NativeBridgeSignatureObservation;
-  exchange(input: {
-    readonly expected: NativeBridgeDescriptor;
-    readonly request: Uint8Array;
-    readonly timeoutMs: number;
-    readonly maximumOutputBytes: number;
-  }): NativeOwnedBridgeExchangeResult;
-}
 
 export interface ProductionNativeAuthBridges {
   readonly platform: "win32" | "darwin";
@@ -92,43 +66,14 @@ export async function createProductionNativeAuthBridges(input: {
     packageJsonBytes.fill(0);
   }
 
-  // Loading occurs only after the main package's immutable release index has
-  // independently bound the addon's exact bytes. The addon is not allowed to
-  // choose or self-describe its own identity.
-  const addon = loadAuthorityAddon(addonPath);
-  const signatureAuthority = createSignatureAuthority(addon);
-  const authority = createOwnedExchangeAuthority(addon, platform);
-  const trust: NativeBridgeTrustPolicy = Object.freeze({
-    schema: "cuna.native-bridge-trust.v1",
-    installRoot: normalize(packageRoot),
-    manifestSha256: entry.manifestSha256,
-    platform,
-    architecture,
-    protocol: "cuna.native-bridge.v1",
-    packageVersion: entry.packageVersion,
-    nativeVersion: entry.nativeVersion,
-    fileVersion: entry.fileVersion,
-    signature: entry.signature,
-  });
-  const common = {
-    trust,
-    signatureAuthority,
-    authority,
-    runtimePlatform: platform,
-    runtimeArchitecture: architecture,
-  } as const;
-  const [credentialBridge, browserBridge] = await Promise.all([
-    createAdmittedNativeCredentialOwnedBridge(common),
-    createAdmittedNativeBrowserOwnedBridge(common),
-  ]);
-  return Object.freeze({
-    platform,
-    architecture,
-    packageName: entry.packageName,
-    packageVersion: entry.packageVersion,
-    credentialBridge,
-    browserBridge,
-  });
+  // A hash followed by `require(addonPath)` is not one atomic authority decision on Windows or
+  // macOS: a writable package root can substitute the addon between admission and LoadLibrary,
+  // and a malicious addon cannot be trusted to attest itself. Keep production unavailable until
+  // an admitted signed loader owns the file handle and proves the loaded module identity (or the
+  // process authority is embedded in the already admitted native bridge).
+  throw unavailable(
+    "The signed native module loader authority is not admitted for this release.",
+  );
 }
 
 function resolvePlatformPackage(packageName: NativePlatformReleaseEntry["packageName"]): string {
@@ -137,55 +82,6 @@ function resolvePlatformPackage(packageName: NativePlatformReleaseEntry["package
   } catch {
     throw unavailable("The required signed native authentication package is not installed.");
   }
-}
-
-function loadAuthorityAddon(file: string): NativeAuthorityAddon {
-  let value: unknown;
-  try {
-    value = createRequire(import.meta.url)(file);
-  } catch {
-    throw unavailable("The admitted native authentication authority could not be loaded.");
-  }
-  if (!isRecord(value) || typeof value.verifySignature !== "function" ||
-      typeof value.exchange !== "function") {
-    throw unavailable("The native authentication authority protocol is incompatible.");
-  }
-  return value as unknown as NativeAuthorityAddon;
-}
-
-function createSignatureAuthority(addon: NativeAuthorityAddon): NativeBridgeSignatureAuthority {
-  return Object.freeze({
-    verify: async (input: Parameters<NativeBridgeSignatureAuthority["verify"]>[0]) => {
-      let observation: NativeBridgeSignatureObservation;
-      try {
-        observation = addon.verifySignature(input);
-      } catch {
-        throw unavailable("The operating system could not verify the native bridge signature.");
-      }
-      return observation;
-    },
-  });
-}
-
-function createOwnedExchangeAuthority(
-  addon: NativeAuthorityAddon,
-  platform: "win32" | "darwin",
-): NativeOwnedBridgeExchangeAuthority {
-  return Object.freeze({
-    platform,
-    authorityKind: platform === "win32" ? "windows-owned-process-spawn" : "darwin-owned-process-spawn",
-    exchange: async (
-      input: Parameters<NativeOwnedBridgeExchangeAuthority["exchange"]>[0],
-    ): Promise<NativeOwnedBridgeExchangeResult> => {
-      let result: NativeOwnedBridgeExchangeResult;
-      try {
-        result = addon.exchange(input);
-      } catch {
-        throw unavailable("The native authority could not complete an owned-process exchange.");
-      }
-      return result;
-    },
-  });
 }
 
 function validateReleaseEntry(

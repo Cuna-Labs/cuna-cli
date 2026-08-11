@@ -6,7 +6,7 @@ import {
   type AgentSession,
   type AgentSessionAuth,
 } from "../api/contracts.js";
-import type { RunaApiClient } from "../api/client.js";
+import type { CunaApiClient } from "../api/client.js";
 import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import {
   ForegroundTerminalCoordinator,
@@ -22,7 +22,7 @@ import {
 } from "../terminal/passthrough.js";
 
 import { createApiTerminalControlPlane } from "./api-terminal-control-plane.js";
-import { RunaRuntimeBoundary } from "./boundary.js";
+import { CunaRuntimeBoundary } from "./boundary.js";
 import { admitCapability } from "./capability-gate.js";
 import { runtimeFailure } from "./errors.js";
 import { createNodeWebSocketConnector } from "./node-websocket-connector.js";
@@ -35,7 +35,7 @@ import {
 const TERMINAL_CAPABILITY_ID = "terminal_connections.create";
 
 export interface ForegroundSessionRunnerInput {
-  readonly client: RunaApiClient;
+  readonly client: CunaApiClient;
   readonly baseUrl: string;
   readonly agentSessionIds: readonly string[];
   readonly expectedAgentKinds?: readonly AgentSession["agent"][];
@@ -191,11 +191,11 @@ export async function runNodeForegroundSessions(
           : { resizeCoalesceMs: dependencies.coordinatorOptions.resizeCoalesceMs }),
       });
   const callbacks = coordinator.runtimeCallbacks();
-  const runtime = new RunaRuntimeBoundary({
+  const runtime = new CunaRuntimeBoundary({
     mode: "foreground",
     controlPlane,
     terminalConnector: dependencies.terminalConnector ?? createNodeWebSocketConnector(),
-    allowedRunaOrigins: [allowedOrigin],
+    allowedCunaOrigins: [allowedOrigin],
     terminalCapabilityId: TERMINAL_CAPABILITY_ID,
     clientInstanceId: dependencies.clientInstanceId?.() ?? `cli:${randomUUID()}`,
     clock,
@@ -318,7 +318,7 @@ function admitSessionIdentity(
 }
 
 async function observeProviderAuthentication(input: Readonly<{
-  client: RunaApiClient;
+  client: CunaApiClient;
   session: AgentSession;
   observation: ReturnType<typeof assertRemoteAgentSessionEvidence>;
   now: () => number;

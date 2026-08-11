@@ -203,14 +203,6 @@ export async function resolveConfig(input: {
   const preferredConfigFile = joinPath(input.platform.paths.configDirectory, "config.json");
   let configFile = explicitConfigFile ?? preferredConfigFile;
   let file = await input.platform.readSafeConfig(configFile, MAX_CONFIG_BYTES);
-  if (!file.exists && explicitConfigFile === undefined && input.platform.paths.legacyConfigDirectory !== undefined) {
-    const legacyConfigFile = joinPath(input.platform.paths.legacyConfigDirectory, "config.json");
-    const legacyFile = await input.platform.readSafeConfig(legacyConfigFile, MAX_CONFIG_BYTES);
-    if (legacyFile.exists) {
-      configFile = legacyConfigFile;
-      file = legacyFile;
-    }
-  }
   const userConfig: UserConfig = file.exists
     ? parseUserConfig(file.text ?? "")
     : Object.freeze({ profiles: Object.freeze({}) });

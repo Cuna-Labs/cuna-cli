@@ -222,7 +222,7 @@ async function hashStableFile(
     const opened = await handle.stat({ bigint: true });
     if (!sameIdentity(before, opened)) throw unstableFailure();
     beforeContentRead?.(wirePath);
-    const contentHash = createHash("sha256").update("runa-content-v1\0");
+    const contentHash = createHash("sha256").update("cuna-content-v1\0");
     const chunks: ContentChunk[] = [];
     let byteLength = 0;
     let overlap = Buffer.alloc(0);

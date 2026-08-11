@@ -38,7 +38,7 @@ const filesystem = Object.freeze({
 });
 
 async function temporaryDirectory(t) {
-  const directory = await mkdtemp(join(tmpdir(), "runa-workspace-loop-"));
+  const directory = await mkdtemp(join(tmpdir(), "cuna-workspace-loop-"));
   t.after(() => rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 }));
   return directory;
 }

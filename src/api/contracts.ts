@@ -4,6 +4,7 @@ import {
   isTerminalConnectToken,
   isTerminalStreamUrl,
 } from "../core/namespace.js";
+import { DEPLOYED_WIRE_COMPATIBILITY } from "../core/deployed-wire-compatibility.js";
 import {
   contractViolation,
   isObject,
@@ -288,7 +289,7 @@ export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindin
   });
 }
 
-export interface RunaIdentity {
+export interface CunaIdentity {
   readonly id: string;
   readonly email: string;
   readonly workspaceAssigned: boolean;
@@ -315,7 +316,7 @@ export interface RunaIdentity {
  * "Malformed Cuna workspace identity" for any of TEN different faults. The one
  * fact the user needed was already computed here and thrown away.
  */
-export function decodeRunaIdentity(value: unknown): RunaIdentity {
+export function decodeCunaIdentity(value: unknown): CunaIdentity {
   if (!isObject(value)) throw contractViolation("object");
   if (!isObject(value.workspace)) throw contractViolation("object", "workspace");
   if (Object.keys(value).some((key) => key !== "id" && key !== "email" && key !== "workspace")) {
@@ -394,7 +395,7 @@ export type AgentSessionAuthEvidenceClass =
   | "provider_cli_login_status"
   | "credential_binding_authority"
   | "insufficient";
-export const AGENT_SESSION_AUTH_ADAPTER_VERSION = "runa.agent-auth.v1" as const;
+export const AGENT_SESSION_AUTH_ADAPTER_VERSION = DEPLOYED_WIRE_COMPATIBILITY.agentSessionAuthAdapterVersion;
 export const AGENT_SESSION_AUTH_MAX_TTL_MS = 30_000;
 export const AGENT_SESSION_AUTH_MAX_FUTURE_SKEW_MS = 5_000;
 export type AgentSessionDesiredState = "running" | "terminated";
@@ -465,7 +466,7 @@ export interface AgentSessionAuthLogout {
   readonly authMode: "interactive_login";
   readonly agent: "claude-code" | "codex";
   readonly agentVersion: string;
-  readonly adapterVersion: "runa.agent-auth.v1";
+  readonly adapterVersion: typeof AGENT_SESSION_AUTH_ADAPTER_VERSION;
   readonly observedAt: string;
   readonly outcome: "logout_confirmed";
 }
@@ -696,7 +697,7 @@ export function decodeAgentSessionAuthLogout(value: unknown): AgentSessionAuthLo
   });
 }
 
-export const TERMINAL_PROTOCOL = "runa.terminal.v1" as const;
+export const TERMINAL_PROTOCOL = DEPLOYED_WIRE_COMPATIBILITY.terminalProtocol;
 export type TerminalCapabilityName =
   | "acknowledgement"
   | "heartbeat"

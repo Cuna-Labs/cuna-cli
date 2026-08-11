@@ -1,4 +1,5 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { DEPLOYED_WIRE_COMPATIBILITY } from "../core/deployed-wire-compatibility.js";
 import {
   INTERNAL_DEFECT_HINT,
   OFF_CONTRACT_RESPONSE_HINT,
@@ -497,7 +498,7 @@ export function createHttpTransport(input: {
               ? {}
               : {
                 "X-Cuna-Continuation": request.continuationSecret,
-                "X-Runa-Continuation": request.continuationSecret,
+                [DEPLOYED_WIRE_COMPATIBILITY.continuationHeader]: request.continuationSecret,
               }),
           },
           ...(body === undefined ? {} : { body }),

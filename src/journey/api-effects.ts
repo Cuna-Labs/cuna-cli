@@ -1,5 +1,5 @@
 import type { AgentSession, Machine } from "../api/contracts.js";
-import { decideCapability, requireCapability, type RunaApiClient } from "../api/client.js";
+import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import type { MachineSelectionState } from "./selection.js";
 import type {
@@ -12,7 +12,7 @@ const MACHINE_POLL_LIMIT = 60;
 const CHILD_POLL_LIMIT = 90;
 
 export interface ApiAgentJourneyEffectsInput {
-  readonly client: RunaApiClient;
+  readonly client: CunaApiClient;
   readonly inspectWorkspace: AgentJourneyEffects["inspectWorkspace"];
   readonly synchronizeWorkspace: AgentJourneyEffects["synchronizeWorkspace"];
   readonly attach: AgentJourneyEffects["attach"];

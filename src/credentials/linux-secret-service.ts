@@ -26,7 +26,7 @@ export function createLinuxSecretServiceBackend(input: {
     const result = await runner.run({
       executable,
       cwd: "/",
-      args: ["lookup", "application", "runa-cli", "credential-key", target],
+      args: ["lookup", "application", "cuna-cli", "credential-key", target],
       environment,
       maximumOutputBytes: MAXIMUM_VALUE_BYTES,
     });
@@ -60,7 +60,7 @@ export function createLinuxSecretServiceBackend(input: {
           "store",
           "--label=Cuna CLI credential",
           "application",
-          "runa-cli",
+          "cuna-cli",
           "credential-key",
           target,
         ],
@@ -88,7 +88,7 @@ export function createLinuxSecretServiceBackend(input: {
     const result = await runner.run({
       executable,
       cwd: "/",
-      args: ["clear", "application", "runa-cli", "credential-key", target],
+      args: ["clear", "application", "cuna-cli", "credential-key", target],
       environment,
       maximumOutputBytes: 4_096,
     });
@@ -110,7 +110,7 @@ export function createLinuxSecretServiceBackend(input: {
       const now = clock();
       if (cachedEvidence !== undefined && cachedEvidence.expiresAt > now) return cachedEvidence;
       const target = `probe-${randomBytes(16).toString("hex")}`;
-      const sentinel = new TextEncoder().encode(`runa-probe-${randomBytes(24).toString("base64url")}`);
+      const sentinel = new TextEncoder().encode(`cuna-probe-${randomBytes(24).toString("base64url")}`);
       try {
         await replace(target, sentinel);
         const observed = await read(target);

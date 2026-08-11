@@ -86,7 +86,7 @@ export function compileExclusionPolicy(
     source,
   }));
   const digest = createHash("sha256")
-    .update("runa-exclusion-policy-v1\0")
+    .update("cuna-exclusion-policy-v1\0")
     .update(JSON.stringify(canonicalRules))
     .digest("hex");
   return Object.freeze({
@@ -146,7 +146,7 @@ function immutableDecision(
     return Object.freeze({ excluded: true, immutable: true, reason: "immutable_special_file" });
   }
   const components = wirePath.toLocaleLowerCase("en-US").split("/");
-  if (components.includes(".runa")) {
+  if (components.includes(".cuna")) {
     return Object.freeze({ excluded: true, immutable: true, reason: "immutable_metadata" });
   }
   if (

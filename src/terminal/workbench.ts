@@ -2,8 +2,8 @@ import type { AppbarModel, TruthProjection } from "./appbar.js";
 import type { ViewportSnapshot } from "./viewport.js";
 
 const ESC = "\u001b[";
-const RUNA_ORANGE = "48;2;235;86;37";
-const RUNA_ORANGE_DARK = "48;2;121;48;25";
+const CUNA_ORANGE = "48;2;235;86;37";
+const CUNA_ORANGE_DARK = "48;2;121;48;25";
 const WHITE = "38;2;255;255;255";
 const MUTED = "38;2;224;210;203";
 const GRAPHEME_SEGMENTER = new Intl.Segmenter("en", { granularity: "grapheme" });
@@ -64,11 +64,11 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
       ]
     : [input.notice === undefined
         ? renderCompact(input.tabs, input.activeTabId, input.appbar, input.columns)
-        : truncate(` RUNA  ${safeText(input.notice)}`, input.columns)];
+        : truncate(` CUNA  ${safeText(input.notice)}`, input.columns)];
   const color = input.color !== false;
   let text = `${ESC}?25l${ESC}H`;
   for (let index = 0; index < lines.length; index += 1) {
-    const background = index === 0 ? RUNA_ORANGE : RUNA_ORANGE_DARK;
+    const background = index === 0 ? CUNA_ORANGE : CUNA_ORANGE_DARK;
     text += `${ESC}${index + 1};1H${color ? `${ESC}${background}m${ESC}${index === 0 ? WHITE : MUTED}m` : ""}`;
     text += padLine(lines[index] ?? "", input.columns);
     if (color) text += `${ESC}0m`;
@@ -94,7 +94,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
 }
 
 function renderTabs(tabs: readonly WorkbenchTab[], activeTabId: string, columns: number): string {
-  const parts = [" RUNA"];
+  const parts = [" CUNA"];
   for (let index = 0; index < tabs.length; index += 1) {
     const tab = tabs[index];
     if (tab === undefined) continue;
@@ -126,7 +126,7 @@ function renderCompact(
 ): string {
   const active = tabs.find((tab) => tab.id === activeTabId);
   const identity = active === undefined ? "session" : `${agentLabel(active.agent)} ${safeText(active.label)}`;
-  return truncate(` RUNA  ${identity}  \u00b7  ${projection("terminal", model.attachment)}  \u00b7  ${projection("auth", model.providerAuthentication)}`, columns);
+  return truncate(` CUNA  ${identity}  \u00b7  ${projection("terminal", model.attachment)}  \u00b7  ${projection("auth", model.providerAuthentication)}`, columns);
 }
 
 function projection(label: string, value: TruthProjection<string>): string {

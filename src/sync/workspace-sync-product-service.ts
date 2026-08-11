@@ -373,16 +373,11 @@ async function assertSafeDerivedCheckpoint(directory: string, workspaceRoot: str
 }
 
 /**
- * The product exclusion file is read under both brands and reported under one.
- * `.cunaignore` is the current name; `.runaignore` predates the rename and is
- * still honoured so a workspace written before it does not silently start
- * uploading the paths it excludes. Acceptance may only ever widen: never drop
- * `.runaignore`, and never report `runaignore` — the label reaches the user in
- * `cuna.workspace.policy_invalid` details.
+ * `.cunaignore` is the only local exclusion authority. No earlier durable
+ * workspace-policy name was published.
  */
 async function readProjectExclusionPolicy(root: string): Promise<readonly ExclusionRuleSource[]> {
-  const current = await readPolicyFile(join(root, ".cunaignore"));
-  const text = current.length > 0 ? current : await readPolicyFile(join(root, ".runaignore"));
+  const text = await readPolicyFile(join(root, ".cunaignore"));
   return Object.freeze([
     Object.freeze({ source: "gitignore" as const, text: await readPolicyFile(join(root, ".gitignore")) }),
     Object.freeze({ source: "cunaignore" as const, text }),
@@ -408,7 +403,7 @@ async function readPolicyFile(path: string): Promise<string> {
 
 function bindingDigest(workspaceId: string, workspaceBindingId: string, machineId: string): string {
   return `binding-${createHash("sha256")
-    .update("runa-workspace-sync-binding-v2\0")
+    .update("cuna-workspace-sync-binding-v2\0")
     .update(workspaceId)
     .update("\0")
     .update(workspaceBindingId)

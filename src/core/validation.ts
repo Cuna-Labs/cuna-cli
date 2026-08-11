@@ -123,7 +123,7 @@ export function isObject(value: unknown): value is Record<string, unknown> {
  * client then discarded, so `cuna.remote.malformed_response` reached the user as
  * one unactionable sentence — "Cuna returned a response that does not match the
  * public contract." — with no `details` and no `hint`. Finding out that
- * production omits `workspace.id` required isolating `decodeRunaIdentity` in a
+ * production omits `workspace.id` required isolating `decodeCunaIdentity` in a
  * throwaway script. That is a diagnosis a user cannot perform and the CLI did
  * not need to lose: the information existed at the throw site and died one
  * `catch` later.
@@ -163,7 +163,7 @@ export function contractViolation(predicate: string, field?: string): ContractVi
 /**
  * Run a nested decode, reporting any violation under `prefix`.
  *
- * Without this, `decodeRunaIdentity` reported `id` for a violation inside
+ * Without this, `decodeCunaIdentity` reported `id` for a violation inside
  * `workspace`, which names a key that also exists at the root — the one reading
  * that would send a user to the wrong field.
  */

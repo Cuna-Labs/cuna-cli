@@ -22,7 +22,7 @@ import {
   decodeMachineCreateRequest,
   decodeMachinePage,
   decodeOk,
-  decodeRunaIdentity,
+  decodeCunaIdentity,
   decodeTerminalConnectionGrant,
   decodeWorkspaceBindingAuthority,
   type AgentKind,
@@ -39,7 +39,8 @@ import {
   type Machine,
   type MachineCreateRequest,
   type MachinePage,
-  type RunaIdentity,
+  type CunaIdentity,
+  TERMINAL_PROTOCOL,
   type TerminalConnectionGrant,
   type WorkspaceBindingAuthority,
 } from "./contracts.js";
@@ -82,13 +83,13 @@ export interface PageOptions {
 }
 
 export interface TerminalConnectionCreateInput {
-  readonly protocol: "runa.terminal.v1";
+  readonly protocol: typeof TERMINAL_PROTOCOL;
   readonly clientInstanceId: string;
   readonly resumeHandle?: string;
 }
 
-export interface RunaApiClient {
-  getIdentity(signal?: AbortSignal): Promise<RunaIdentity>;
+export interface CunaApiClient {
+  getIdentity(signal?: AbortSignal): Promise<CunaIdentity>;
   discoverCapabilities(scope: CapabilityScope, resourceId?: string, signal?: AbortSignal): Promise<CapabilitySnapshot>;
   listMachines(signal?: AbortSignal): Promise<MachinePage>;
   getMachine(id: string, signal?: AbortSignal): Promise<Machine>;
@@ -357,7 +358,7 @@ function workspaceBindingIdentityMatches(
     actual.exclusionPolicyDigest === expected.exclusionPolicyDigest;
 }
 
-export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
+export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
   /**
    * Dispatch one request and decode its body under that request's identity.
    *
@@ -370,11 +371,11 @@ export function createRunaApiClient(transport: HttpTransport): RunaApiClient {
   async function fetchDecoded<T>(request: HttpRequest, decoder: (value: unknown) => T): Promise<T> {
     return decode(decoder, await transport.request(request), operationLabel(request));
   }
-  const client: RunaApiClient = {
+  const client: CunaApiClient = {
     async getIdentity(signal) {
       return fetchDecoded(
         { method: "GET", path: "/v1/me", ...(signal === undefined ? {} : { signal }) },
-        decodeRunaIdentity,
+        decodeCunaIdentity,
       );
     },
     async discoverCapabilities(scope, resourceId, signal) {
@@ -777,7 +778,7 @@ export function decideCapability(
 }
 
 export async function requireCapability(input: {
-  readonly client: RunaApiClient;
+  readonly client: CunaApiClient;
   readonly scope: CapabilityScope;
   readonly resourceId?: string;
   readonly capabilityId: string;

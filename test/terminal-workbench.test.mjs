@@ -73,7 +73,8 @@ test("rich workbench keeps a persistent orange Cuna appbar above the selected is
   assert.equal(frame.appbarRows, 2);
   assert.equal(frame.viewportRows, 22);
   assert.match(frame.text, /48;2;235;86;37m/);
-  assert.match(frame.text, /RUNA.*Claude primary.*\[2:Codex review\]/s);
+  assert.match(frame.text, /CUNA.*Claude primary.*\[2:Codex review\]/s);
+  assert.doesNotMatch(frame.text, /\bRUNA\b/u);
   assert.match(frame.text, /auth authenticated/);
   assert.match(frame.text, /3;1H.*codex viewport/s);
   assert.doesNotMatch(frame.text, /claude viewport/);
@@ -163,7 +164,23 @@ test("small admitted terminals collapse to one truthful appbar row without fabri
   assert.equal(frame.appbarRows, 1);
   assert.equal(frame.viewportRows, 2);
   assert.doesNotMatch(frame.text, /48;2;/);
-  assert.match(frame.text, /RUNA  Claude primary/);
+  assert.match(frame.text, /CUNA  Claude primary/);
+  assert.doesNotMatch(frame.text, /\bRUNA\b/u);
+});
+
+test("compact notices keep the Cuna brand while sanitizing untrusted text", () => {
+  const frame = renderWorkbenchFrame({
+    columns: 40,
+    rows: 2,
+    activeTabId: "tab-claude",
+    tabs: tabs(),
+    appbar: model(),
+    notice: "Preparing\u001b[2J workspace",
+    color: false,
+  });
+  assert.match(frame.text, /CUNA  Preparing\[2J workspace/u);
+  assert.doesNotMatch(frame.text, /\bRUNA\b/u);
+  assert.equal(frame.text.includes("\u001b[2J workspace"), false);
 });
 
 test("workbench restores the selected remote cursor below the appbar without forcing visibility", () => {

@@ -1,4 +1,5 @@
 import { runtimeFailure } from "./errors.js";
+import { DEPLOYED_WIRE_COMPATIBILITY } from "../core/deployed-wire-compatibility.js";
 import type {
   TerminalConnector,
   TerminalWireConnection,
@@ -133,7 +134,7 @@ export function createNodeWebSocketConnector(input: {
         throw runtimeFailure("terminal_disconnected", "Terminal attachment was cancelled before network dispatch.");
       }
       const connectionId = terminalSessionId(request.url);
-      const authProtocol = `runa.auth.${request.token}`;
+      const authProtocol = `${DEPLOYED_WIRE_COMPATIBILITY.websocketAuthPrefix}${request.token}`;
       let socket: WebSocket;
       try {
         socket = new WebSocketAuthority(request.url, [request.protocol, authProtocol]);

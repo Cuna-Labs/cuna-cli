@@ -23,7 +23,6 @@ function fakePlatform(text) {
       configDirectory: "/home/test/.config/cuna",
       stateDirectory: "/home/test/.local/state/cuna",
       runtimeDirectory: "/run/user/1000/cuna",
-      legacyConfigDirectory: "/home/test/.config/runa",
     },
     async readSafeConfig() {
       return text === undefined ? { exists: false } : { exists: true, text };
@@ -36,7 +35,6 @@ test("platform paths are explicit for all three Tier-1 families", () => {
   const mac = resolvePlatformPaths({ platform: "darwin", env: { TMPDIR: "/tmp/u" }, homeDirectory: "/Users/u", userId: 501 });
   const linux = resolvePlatformPaths({ platform: "linux", env: { XDG_CONFIG_HOME: "/cfg", XDG_STATE_HOME: "/state", XDG_RUNTIME_DIR: "/run" }, homeDirectory: "/home/u", userId: 1000 });
   assert.equal(win.configDirectory, "C:\\A\\Cuna");
-  assert.equal(win.legacyConfigDirectory, "C:\\A\\Runa");
   assert.equal(mac.configDirectory, "/Users/u/Library/Application Support/Cuna");
   assert.equal(linux.runtimeDirectory, "/run/cuna");
 });
@@ -85,23 +83,18 @@ test("CUNA_API_KEY admits every credential brand the service has issued", async 
 // exporting `RUNA_API_KEY` authenticated through both SDKs and was refused here
 // with exit 2. The old test was not weakened to pass; it was asserting the
 // wrong thing, and the behaviour it pinned is the one being removed.
-test("every configuration name is accepted under every brand the product has minted", async () => {
-  // Literal floor, for the same reason as the credential test above: a loop
-  // over the brand authority alone cannot detect its own subject shrinking.
-  // These are the two live spellings and neither may ever be dropped.
-  assert.deepEqual(brandedEnvironmentNames("API_KEY"), ["CUNA_API_KEY", "RUNA_API_KEY"]);
-  assert.deepEqual(brandedEnvironmentNames("BASE_URL"), ["CUNA_BASE_URL", "RUNA_BASE_URL"]);
-  assert.deepEqual(brandedEnvironmentNames("PROFILE"), ["CUNA_PROFILE", "RUNA_PROFILE"]);
-  assert.deepEqual(brandedEnvironmentNames("CONFIG_FILE"), ["CUNA_CONFIG_FILE", "RUNA_CONFIG_FILE"]);
+test("configuration names are Cuna-only while deployed credential bytes remain compatible", async () => {
+  assert.deepEqual(brandedEnvironmentNames("API_KEY"), ["CUNA_API_KEY"]);
+  assert.deepEqual(brandedEnvironmentNames("BASE_URL"), ["CUNA_BASE_URL"]);
+  assert.deepEqual(brandedEnvironmentNames("PROFILE"), ["CUNA_PROFILE"]);
+  assert.deepEqual(brandedEnvironmentNames("CONFIG_FILE"), ["CUNA_CONFIG_FILE"]);
 
   const profileText = JSON.stringify({
     schema_version: 1,
     profiles: { dev: { development: true } },
   });
-  // Parametrized over the brand authority, never over the resolver's own list:
-  // if the resolver narrows, the brand list still names the case it dropped.
   for (const brand of new Set(["cuna", "runa", ...CREDENTIAL_BRANDS])) {
-    const prefix = brand.toUpperCase();
+    const prefix = "CUNA";
     const apiKey = `${brand}_sk_${"a".repeat(43)}`;
 
     const credential = await resolveConfig({
@@ -129,9 +122,12 @@ test("every configuration name is accepted under every brand the product has min
   }
 });
 
-test("the canonical spelling wins by being set, and never falls back when it is unusable", async () => {
+test("unpublished legacy configuration aliases are ignored and cannot become fallback authority", async () => {
   const canonical = `cuna_sk_${"a".repeat(43)}`;
   const legacy = `runa_sk_${"b".repeat(43)}`;
+  const legacyOnly = await resolveConfig({ platform: fakePlatform(), env: { RUNA_API_KEY: legacy } });
+  assert.equal(legacyOnly.apiKey, undefined);
+  assert.equal(legacyOnly.apiKeyVariable, undefined);
   const both = await resolveConfig({
     platform: fakePlatform(),
     env: { CUNA_API_KEY: canonical, RUNA_API_KEY: legacy },
@@ -182,12 +178,12 @@ test("an environment fault names the variable at fault, not the user profile", a
   // `details.source` said `environment` — the two halves of one error naming
   // different authorities, and the half a human reads naming the one that was
   // not involved. With two accepted spellings that is no longer merely vague.
-  const config = await resolveConfig({ platform: fakePlatform(), env: { RUNA_API_KEY: "" } });
+  const config = await resolveConfig({ platform: fakePlatform(), env: { CUNA_API_KEY: "" } });
   assert.throws(
     () => { assertApiKeyUsable(config); },
     (error) => error instanceof CunaError &&
       error.details.source === "environment" &&
-      error.hint.includes("RUNA_API_KEY") &&
+      error.hint.includes("CUNA_API_KEY") &&
       !error.hint.includes("user profile"),
   );
 });
@@ -237,21 +233,11 @@ test("a broken environment credential stops the commands that use one and only t
 
 test("the redacted configuration never prints a credential value", async () => {
   const apiKey = `runa_sk_${"a".repeat(43)}`;
-  const config = await resolveConfig({ platform: fakePlatform(), env: { RUNA_API_KEY: apiKey } });
+  const config = await resolveConfig({ platform: fakePlatform(), env: { CUNA_API_KEY: apiKey } });
   const redacted = JSON.stringify(publicConfig(config));
   assert.ok(!redacted.includes(apiKey));
   assert.ok(redacted.includes("configured_not_validated"));
-  assert.ok(redacted.includes("RUNA_API_KEY"));
-});
-
-test("an existing legacy config is discovered only when the Cuna config is absent", async () => {
-  const platform = fakePlatform();
-  platform.readSafeConfig = async (path) => path.includes("/.config/runa/")
-    ? { exists: true, text: JSON.stringify({ schema_version: 1, selected_profile: "legacy", profiles: { legacy: { development: false } } }) }
-    : { exists: false };
-  const config = await resolveConfig({ platform, env: {} });
-  assert.equal(config.profile, "legacy");
-  assert.equal(config.configFile, "/home/test/.config/runa/config.json");
+  assert.ok(redacted.includes("CUNA_API_KEY"));
 });
 
 test("flag, environment, profile, default precedence is deterministic", async () => {

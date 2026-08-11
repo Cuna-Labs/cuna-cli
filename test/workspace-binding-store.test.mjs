@@ -90,7 +90,7 @@ test("nearest-marker discovery stays inside an explicit physical boundary", asyn
   await persistWorkspaceBinding({ root: project, binding: draft(), expected: null });
   const marker = await discoverWorkspaceBindingMarker({ startPath: nested, boundaryPath: project });
   assert.equal(marker?.workspaceRoot.path, project);
-  assert.equal(marker?.recordPath, join(project, ".runa", "workspace.json"));
+  assert.equal(marker?.recordPath, join(project, ".cuna", "workspace.json"));
 });
 
 test("a record is returned only when profile, user, workspace, machine, policy, generation, and binding all match", async (t) => {
@@ -177,7 +177,7 @@ test("concurrent creation and update use a kernel writer lock plus revision, gen
 test("corruption, ambiguous fields, copied metadata, and hardlinked metadata fail closed", async (t) => {
   const root = await temporaryDirectory(t);
   const record = await persistWorkspaceBinding({ root, binding: draft(), expected: null });
-  const recordPath = join(root, ".runa", "workspace.json");
+  const recordPath = join(root, ".cuna", "workspace.json");
   const original = await readFile(recordPath, "utf8");
   const source = JSON.parse(original);
   await writeFile(recordPath, JSON.stringify({ ...source, unexpected_authority: true }), { mode: 0o600 });
@@ -188,8 +188,8 @@ test("corruption, ambiguous fields, copied metadata, and hardlinked metadata fai
 
   await writeFile(recordPath, original, { mode: 0o600 });
   const copy = await temporaryDirectory(t);
-  await mkdir(join(copy, ".runa"), { mode: 0o700 });
-  await writeFile(join(copy, ".runa", "workspace.json"), original, { mode: 0o600 });
+  await mkdir(join(copy, ".cuna"), { mode: 0o700 });
+  await writeFile(join(copy, ".cuna", "workspace.json"), original, { mode: 0o600 });
   await assert.rejects(
     loadWorkspaceBinding({ startPath: copy, expected: expectations() }),
     (error) => error.code === "cuna.workspace.identity_unproven",
@@ -233,7 +233,7 @@ test("a physical directory move preserves identity and requires an explicit CAS 
 test("interrupted private temporary records are recovered before the next atomic commit", async (t) => {
   const root = await temporaryDirectory(t);
   const first = await persistWorkspaceBinding({ root, binding: draft(), expected: null });
-  const metadataDirectory = join(root, ".runa");
+  const metadataDirectory = join(root, ".cuna");
   const orphan = join(metadataDirectory, ".workspace.json.999.11111111-1111-4111-8111-111111111111.tmp");
   await writeFile(orphan, "interrupted", { mode: 0o600 });
   if (process.platform !== "win32") await chmod(orphan, 0o600);
@@ -309,10 +309,10 @@ test("symlink or junction roots and marker paths are rejected instead of followe
 
   const separate = await temporaryDirectory(t);
   const linkedRecord = join(separate, "workspace.json");
-  await writeFile(linkedRecord, await readFile(join(physical, ".runa", "workspace.json")), { mode: 0o600 });
-  await unlink(join(physical, ".runa", "workspace.json"));
+  await writeFile(linkedRecord, await readFile(join(physical, ".cuna", "workspace.json")), { mode: 0o600 });
+  await unlink(join(physical, ".cuna", "workspace.json"));
   try {
-    await symlink(linkedRecord, join(physical, ".runa", "workspace.json"), "file");
+    await symlink(linkedRecord, join(physical, ".cuna", "workspace.json"), "file");
   } catch (error) {
     if (process.platform === "win32" && error.code === "EPERM") {
       t.diagnostic("This Windows host permits junctions but not file symlinks; marker-link coverage is exercised on Unix.");
@@ -334,7 +334,7 @@ test("persistence rejects a linked metadata directory without writing into or ch
   await mkdir(outside, { mode: 0o755 });
   if (process.platform !== "win32") await chmod(outside, 0o755);
   try {
-    await symlink(outside, join(root, ".runa"), process.platform === "win32" ? "junction" : "dir");
+    await symlink(outside, join(root, ".cuna"), process.platform === "win32" ? "junction" : "dir");
   } catch (error) {
     if (process.platform === "win32" && error.code === "EPERM") {
       t.skip("This Windows host does not permit junction creation.");
@@ -354,7 +354,7 @@ test("persistence rejects a linked metadata directory without writing into or ch
 test("an incompatible durable record is rejected before any mutation", async (t) => {
   const root = await temporaryDirectory(t);
   const first = await persistWorkspaceBinding({ root, binding: draft(), expected: null });
-  const recordPath = join(root, ".runa", "workspace.json");
+  const recordPath = join(root, ".cuna", "workspace.json");
   const future = { ...JSON.parse(await readFile(recordPath, "utf8")), schemaVersion: 3, minimumReaderVersion: 3 };
   await writeFile(recordPath, JSON.stringify(future), { mode: 0o600 });
   await assert.rejects(
@@ -366,5 +366,5 @@ test("an incompatible durable record is rejected before any mutation", async (t)
     (error) => error.code === "cuna.workspace.binding_corrupt",
   );
   assert.equal(JSON.parse(await readFile(recordPath, "utf8")).schemaVersion, 3);
-  assert.equal(dirname(recordPath), join(root, ".runa"));
+  assert.equal(dirname(recordPath), join(root, ".cuna"));
 });
