@@ -1,0 +1,41 @@
+{
+  "schema": "cuna.windows-native-system-component.v1",
+  "status": "UNCONFIGURED_BLOCKING",
+  "installer": {
+    "kind": "signed-msi",
+    "installerOfRecord": "cuna-windows-system-component",
+    "installRootAuthority": "FOLDERID_ProgramFiles",
+    "relativeRoot": "Cuna\\Native\\<version>\\<architecture>",
+    "ownerAllowlist": [
+      "S-1-5-18",
+      "S-1-5-32-544",
+      "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+    ],
+    "npmGlobalLayoutAdmitted": false,
+    "npmLifecycleInstallationAllowed": false
+  },
+  "bootstrap": {
+    "kind": "signed-native-launcher",
+    "publicExecutable": "cuna",
+    "relativeExecutable": "Cuna\\bin\\cuna.exe",
+    "mustResolveKnownFolderWithoutEnvironment": true,
+    "mustOwnEveryAncestorAndLeafHandle": true,
+    "deniedShareModes": ["write", "delete"],
+    "mustVerifyBeforeSecretHandoff": [
+      "owner",
+      "effective-dacl",
+      "no-reparse-point",
+      "single-hard-link",
+      "volume-id",
+      "file-id",
+      "sha256",
+      "authenticode",
+      "loaded-module-identity"
+    ]
+  },
+  "activation": {
+    "nativeReleaseIndex": "EMPTY_UNTIL_SIGNED_MSI_AND_INSTALLED_ARTIFACT_EVIDENCE",
+    "interactiveAuthentication": "UNAVAILABLE",
+    "unsignedOrUserWritableFallback": false
+  }
+}

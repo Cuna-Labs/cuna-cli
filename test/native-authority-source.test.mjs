@@ -41,6 +41,18 @@ test("Windows authority owns a suspended process and verifies its live identity 
   assert.match(windows, /QueryFullProcessImageNameW/u);
   assert.match(windows, /GetProcessTimes/u);
   assert.match(windows, /WinVerifyTrust/u);
+  assert.match(windows, /SHGetKnownFolderPath/u);
+  assert.match(windows, /FOLDERID_ProgramFiles/u);
+  assert.match(windows, /GetSecurityInfo/u);
+  assert.match(windows, /OWNER_SECURITY_INFORMATION \| DACL_SECURITY_INFORMATION/u);
+  assert.match(windows, /FILE_FLAG_OPEN_REPARSE_POINT/u);
+  assert.match(windows, /information\.nNumberOfLinks != 1/u);
+  assert.match(windows, /GetFinalPathNameByHandleW/u);
+  assert.match(windows, /program_files\.trim_end_matches\(\['\\\\', '\/'\]\)/u);
+  assert.match(windows, /"\{\}\\\\Cuna\\\\"/u);
+  assert.match(windows, /file_sha256_handle\(&admitted_executable\)/u);
+  assert.match(windows, /file_sha256_handle\(&loaded_executable_handle\)/u);
+  assert.match(windows, /location_protected: true/u);
 });
 
 test("macOS authority stays closed while retaining audit-bound owned-exchange prerequisites", async () => {
