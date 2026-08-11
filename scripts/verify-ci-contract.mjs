@@ -33,6 +33,8 @@ await access(path.join(root, "package-lock.json"));
 
 const ci = await readFile(path.join(root, ".github", "workflows", "ci.yml"), "utf8");
 const release = await readFile(path.join(root, ".github", "workflows", "release.yml"), "utf8");
+const approvalConsumption = await readFile(path.join(root, "scripts", "lib", "release-approval-consumption.mjs"), "utf8");
+const approvalConsumptionAuthority = await readJson(path.join(root, "packaging", "release-approval-consumption-authority.json"));
 const workflow = parseYaml(ci, { prettyErrors: true, uniqueKeys: true });
 invariant(workflow && typeof workflow === "object" && !Array.isArray(workflow), "CI workflow must parse as a YAML object");
 const jobs = workflow.jobs;
@@ -162,6 +164,17 @@ invariant(approvalAttestationAt > approvalSemanticAt, "Release approval attestat
 invariant(
   approvalNonceBlockAt > approvalAttestationAt && npmPublishAt > approvalNonceBlockAt,
   "Publication must remain fail-closed before npm publish until one-use nonce consumption is configured",
+);
+invariant(
+  approvalConsumptionAuthority.status === "UNCONFIGURED_BLOCKING",
+  "Source may not claim the external release-approval consumption authority is configured",
+);
+invariant(
+  approvalConsumption.includes('method: "POST"') &&
+    approvalConsumption.includes("Release approval nonce is already consumed") &&
+    approvalConsumption.includes("current_user_can_bypass") &&
+    approvalConsumption.includes("prevent_self_review"),
+  "One-use release approval interface must reserve atomically and verify non-bypassable independent review",
 );
 
 // Every status check the branch ruleset requires must actually be emitted by a

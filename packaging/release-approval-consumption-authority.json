@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "status": "UNCONFIGURED_BLOCKING",
+  "repository": "Cuna-Labs/cuna-cli",
+  "environment": "npm",
+  "protectedRef": "main",
+  "rulesetName": "Protect Cuna release approval consumptions",
+  "tagRefPrefix": "refs/tags/cuna-release-approval-consumption/",
+  "requiredRules": ["deletion", "non_fast_forward"],
+  "requireNoBypassActors": true,
+  "requireAdminBypassDisabled": true,
+  "requirePreventSelfReview": true
+}
