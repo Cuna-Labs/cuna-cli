@@ -454,8 +454,9 @@ test("preview login never prints a capability-bearing browser URL to JSON or red
     env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
   });
   assert.equal(exit, EXIT_CODES.usage);
-  assert.equal(streams.stdout().includes("app.getcuna.com"), false);
-  assert.equal(streams.stderr().includes("app.getcuna.com"), false);
+  const urlCount = (text) => [...text.matchAll(/https?:\/\/[^\s"'`]+/gu)].length;
+  assert.equal(urlCount(streams.stdout()), 0);
+  assert.equal(urlCount(streams.stderr()), 0);
 });
 
 test("preview login refuses a redirected stderr before creating a browser continuation", async () => {
@@ -466,8 +467,9 @@ test("preview login refuses a redirected stderr before creating a browser contin
     env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
   });
   assert.equal(exit, EXIT_CODES.usage);
-  assert.doesNotMatch(streams.stdout(), /app\.getcuna\.com/u);
-  assert.doesNotMatch(streams.stderr(), /app\.getcuna\.com/u);
+  const urlCount = (text) => [...text.matchAll(/https?:\/\/[^\s"'`]+/gu)].length;
+  assert.equal(urlCount(streams.stdout()), 0);
+  assert.equal(urlCount(streams.stderr()), 0);
 });
 
 test("production preview path uses encrypted backend without resolving native authority", async () => {
