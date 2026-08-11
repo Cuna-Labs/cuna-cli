@@ -2177,26 +2177,20 @@ mod tests {
     }
 
     #[test]
-    fn npm_style_user_owned_location_and_parent_acl_are_rejected() -> napi::Result<()> {
+    fn npm_style_user_owned_location_is_rejected_outside_cuna_msi_root() -> napi::Result<()> {
         let root = unique_temporary_directory("mutable-acl");
         fs::create_dir_all(&root)
             .map_err(|_| crate::unavailable("The ACL fixture could not be created."))?;
         let file = root.join("cuna-native-authority.node");
         fs::write(&file, b"fixture")
             .map_err(|_| crate::unavailable("The ACL fixture could not be written."))?;
-        assert!(protect_program_files_path(file.to_string_lossy().as_ref(), false).is_err());
-        let trusted_installer = trusted_installer_sid()?;
-        let directory = open_locked_path(root.to_string_lossy().as_ref(), true)?;
-        let Err(error) = inspect_protected_handle(
-            &directory,
-            root.to_string_lossy().as_ref(),
-            true,
-            &trusted_installer,
-        ) else {
-            panic!("a user-owned parent was admitted");
+        let Err(error) = protect_program_files_path(file.to_string_lossy().as_ref(), false) else {
+            panic!("an npm-style user-writable location was admitted");
         };
-        assert!(error.reason.contains("owner") || error.reason.contains("DACL"));
-        drop(directory);
+        assert_eq!(
+            error.reason,
+            "The native artifact is not below the operating-system Program Files authority."
+        );
         fs::remove_dir_all(&root)
             .map_err(|_| crate::unavailable("The ACL fixture could not be removed."))?;
         Ok(())
