@@ -177,14 +177,15 @@ canonical default. Production requests use exactly `https://api.getcuna.com`.
 Custom origins require an explicit development profile; repository content is
 never a configuration authority.
 
-Every configuration environment variable uses the `CUNA_` prefix. Earlier-brand
-credential bytes may still be accepted while the deployed service completes its
-wire migration, but earlier-brand environment-variable names and local paths
-were never published and are not accepted. A set but empty or malformed Cuna
-value fails instead of falling through to another authority.
+Every canonical configuration environment variable uses the `CUNA_` prefix. The published
+`RUNA_API_KEY` name remains accepted as a deprecated compatibility alias for
+existing automation; migrate new and existing scripts to `CUNA_API_KEY`. When
+both names are present, `CUNA_API_KEY` always wins. An empty or malformed
+canonical value fails instead of falling through to the legacy credential.
+Other earlier-brand environment-variable names and local paths are not accepted.
 
-`CUNA_API_KEY` is the only explicit automation credential environment variable
-accepted by this pre-GA CLI. It is never persisted automatically. An automation
+`CUNA_API_KEY` and its deprecated `RUNA_API_KEY` alias are explicit automation
+credentials and are never persisted automatically. An automation
 credential that is set but unusable is refused rather than ignored, and it is
 refused only for commands that select a credential authority — `doctor`,
 `self-test --offline` and `config get` still run and report it. Interactive

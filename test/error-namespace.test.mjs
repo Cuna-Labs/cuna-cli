@@ -92,6 +92,7 @@ test("the deployed wire compatibility authority has an exact closed schema and v
     continuationHeader: "X-Runa-Continuation",
     credentialBrand: "runa",
     apiOrigin: "https://api.runacode.io",
+    apiKeyEnvironment: "RUNA_API_KEY",
   });
 });
 

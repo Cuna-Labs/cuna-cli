@@ -7,6 +7,7 @@ import {
   EXIT_CODES,
   assertApiKeyUsable,
   brandedEnvironmentNames,
+  createHttpTransport,
   environmentCredentialState,
   memoryStreams,
   publicConfig,
@@ -75,59 +76,74 @@ test("CUNA_API_KEY admits every credential brand the service has issued", async 
   }
 });
 
-// This test replaces one named "only Cuna environment names configure the
-// pre-GA CLI", which asserted that `RUNA_API_KEY` alone yields no credential.
-// That assertion encoded the defect: the rename REPLACED four `RUNA_*` reads
-// instead of adding to them, while `CREDENTIAL_BRANDS` and both SDKs went on
-// accepting the earlier brand. A customer holding a live `runa_sk_` key and
-// exporting `RUNA_API_KEY` authenticated through both SDKs and was refused here
-// with exit 2. The old test was not weakened to pass; it was asserting the
-// wrong thing, and the behaviour it pinned is the one being removed.
-test("configuration names are Cuna-only while deployed credential bytes remain compatible", async () => {
-  assert.deepEqual(brandedEnvironmentNames("API_KEY"), ["CUNA_API_KEY"]);
+test("only the published API-key alias survives the configuration rename", async () => {
+  // Literal floors keep a future contraction from shrinking its own loop.
+  assert.deepEqual(brandedEnvironmentNames("API_KEY"), ["CUNA_API_KEY", "RUNA_API_KEY"]);
   assert.deepEqual(brandedEnvironmentNames("BASE_URL"), ["CUNA_BASE_URL"]);
   assert.deepEqual(brandedEnvironmentNames("PROFILE"), ["CUNA_PROFILE"]);
   assert.deepEqual(brandedEnvironmentNames("CONFIG_FILE"), ["CUNA_CONFIG_FILE"]);
+
+  for (const variable of ["CUNA_API_KEY", "RUNA_API_KEY"]) {
+    for (const brand of new Set(["cuna", "runa", ...CREDENTIAL_BRANDS])) {
+      const apiKey = `${brand}_sk_${"a".repeat(43)}`;
+      const credential = await resolveConfig({
+        platform: fakePlatform(),
+        env: { [variable]: apiKey },
+      });
+      assert.equal(credential.apiKey, apiKey, `${variable}:${brand}`);
+      assert.equal(credential.apiKeySource, "environment", variable);
+      assert.equal(credential.apiKeyVariable, variable, variable);
+    }
+  }
 
   const profileText = JSON.stringify({
     schema_version: 1,
     profiles: { dev: { development: true } },
   });
-  for (const brand of new Set(["cuna", "runa", ...CREDENTIAL_BRANDS])) {
-    const prefix = "CUNA";
-    const apiKey = `${brand}_sk_${"a".repeat(43)}`;
+  const origin = await resolveConfig({
+    platform: fakePlatform(profileText),
+    env: { CUNA_PROFILE: "dev", CUNA_BASE_URL: "https://environment.example" },
+  });
+  assert.equal(origin.profile, "dev");
+  assert.equal(origin.profileSource, "environment");
+  assert.equal(origin.baseUrl, "https://environment.example");
+  assert.equal(origin.baseUrlSource, "environment");
 
-    const credential = await resolveConfig({
-      platform: fakePlatform(),
-      env: { [`${prefix}_API_KEY`]: apiKey },
-    });
-    assert.equal(credential.apiKey, apiKey, `${prefix}_API_KEY`);
-    assert.equal(credential.apiKeySource, "environment", `${prefix}_API_KEY`);
-    assert.equal(credential.apiKeyVariable, `${prefix}_API_KEY`, `${prefix}_API_KEY`);
-
-    const origin = await resolveConfig({
-      platform: fakePlatform(profileText),
-      env: { [`${prefix}_PROFILE`]: "dev", [`${prefix}_BASE_URL`]: "https://environment.example" },
-    });
-    assert.equal(origin.profile, "dev", `${prefix}_PROFILE`);
-    assert.equal(origin.profileSource, "environment", `${prefix}_PROFILE`);
-    assert.equal(origin.baseUrl, "https://environment.example", `${prefix}_BASE_URL`);
-    assert.equal(origin.baseUrlSource, "environment", `${prefix}_BASE_URL`);
-
-    const file = await resolveConfig({
-      platform: fakePlatform(profileText),
-      env: { [`${prefix}_CONFIG_FILE`]: "/explicit/config.json" },
-    });
-    assert.equal(file.configFile, "/explicit/config.json", `${prefix}_CONFIG_FILE`);
-  }
+  const file = await resolveConfig({
+    platform: fakePlatform(profileText),
+    env: { CUNA_CONFIG_FILE: "/explicit/config.json" },
+  });
+  assert.equal(file.configFile, "/explicit/config.json");
 });
 
-test("unpublished legacy configuration aliases are ignored and cannot become fallback authority", async () => {
+test("the legacy alias carries the exact legacy credential to HTTP", async () => {
+  const apiKey = `runa_sk_${"a".repeat(43)}`;
+  const config = await resolveConfig({
+    platform: fakePlatform(),
+    env: { RUNA_API_KEY: apiKey },
+  });
+  let authorization;
+  const transport = createHttpTransport({
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    fetch: async (_url, init) => {
+      authorization = init.headers.Authorization;
+      return new Response("{}", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  await transport.request({ method: "GET", path: "/v1/sessions" });
+  assert.equal(authorization, `Bearer ${apiKey}`);
+});
+
+test("canonical API-key authority wins conflicts without ambiguous fallback", async () => {
   const canonical = `cuna_sk_${"a".repeat(43)}`;
   const legacy = `runa_sk_${"b".repeat(43)}`;
   const legacyOnly = await resolveConfig({ platform: fakePlatform(), env: { RUNA_API_KEY: legacy } });
-  assert.equal(legacyOnly.apiKey, undefined);
-  assert.equal(legacyOnly.apiKeyVariable, undefined);
+  assert.equal(legacyOnly.apiKey, legacy);
+  assert.equal(legacyOnly.apiKeyVariable, "RUNA_API_KEY");
   const both = await resolveConfig({
     platform: fakePlatform(),
     env: { CUNA_API_KEY: canonical, RUNA_API_KEY: legacy },
@@ -147,6 +163,19 @@ test("unpublished legacy configuration aliases are ignored and cannot become fal
   assert.equal(environmentCredentialState(emptyCanonical), "invalid");
   assert.throws(
     () => { assertApiKeyUsable(emptyCanonical); },
+    (error) => error instanceof CunaError &&
+      error.details.reason === "invalid_api_key" &&
+      error.details.variable === "CUNA_API_KEY",
+  );
+
+  const malformedCanonical = await resolveConfig({
+    platform: fakePlatform(),
+    env: { CUNA_API_KEY: "not-a-key", RUNA_API_KEY: legacy },
+  });
+  assert.equal(malformedCanonical.apiKey, undefined);
+  assert.equal(malformedCanonical.apiKeyVariable, "CUNA_API_KEY");
+  assert.throws(
+    () => { assertApiKeyUsable(malformedCanonical); },
     (error) => error instanceof CunaError &&
       error.details.reason === "invalid_api_key" &&
       error.details.variable === "CUNA_API_KEY",
