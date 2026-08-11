@@ -43,11 +43,17 @@ test("Windows authority owns a suspended process and verifies its live identity 
   assert.match(windows, /WinVerifyTrust/u);
 });
 
-test("macOS source remains explicitly unavailable until direct code-sign and audit-token authority exists", async () => {
+test("macOS authority verifies code signing and Gatekeeper directly while process exchange remains closed", async () => {
   const macos = await source("native", "cuna-native-authority", "src", "macos.rs");
-  assert.match(macos, /Security\.framework validation/u);
-  assert.match(macos, /audit-token-bound process instance/u);
-  assert.match(macos, /not available in this source build/u);
+  const staticCode = macos.indexOf("SecStaticCodeCheckValidityWithErrors(");
+  const gatekeeper = macos.indexOf("SecAssessmentCreate(", staticCode);
+  const fingerprint = macos.indexOf("leaf_certificate_fingerprint(&code)", gatekeeper);
+  assert.ok(staticCode >= 0 && gatekeeper > staticCode && fingerprint > gatekeeper);
+  assert.match(macos, /CHECK_ALL_ARCHITECTURES \| CHECK_NESTED_CODE \| STRICT_VALIDATE/u);
+  assert.match(macos, /kSecAssessmentAssessmentVerdict/u);
+  assert.match(macos, /SecCertificateCopyData/u);
+  assert.match(macos, /location_protected: false/u);
+  assert.match(macos, /audit-token-owned process authority is not available/u);
   assert.doesNotMatch(macos, /Command::new\("codesign"\)/u);
 });
 
