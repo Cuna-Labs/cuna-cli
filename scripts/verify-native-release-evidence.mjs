@@ -62,8 +62,8 @@ if (requireProduction) {
   invariant(provenance.admission === "blocked-unsigned-or-local" || provenance.admission === "blocked-no-independent-release-attestation", "Local native evidence is not explicitly blocked");
   invariant(
     Array.isArray(provenance.limitations) &&
-      provenance.limitations.includes("NO_WINDOWS_OWNED_PROCESS_HANDLE_CHILD_IDENTITY_AUTHORITY"),
-    "Local native evidence omitted the Windows process-instance authority blocker",
+      provenance.limitations.includes("NO_WINDOWS_SIGNED_SYSTEM_COMPONENT_LOADER_AUTHORITY"),
+    "Local native evidence omitted the Windows signed system-component loader blocker",
   );
   process.stdout.write(`${JSON.stringify({
     status: "LOCAL_NATIVE_EVIDENCE_VERIFIED_NOT_ADMISSIBLE",

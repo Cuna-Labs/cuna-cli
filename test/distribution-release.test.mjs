@@ -115,7 +115,7 @@ test("all approved channels are deterministic projections of one blocked local c
   assert.equal(verified.decision, "BLOCKED");
   assert.ok(verified.channels.every((channel) => channel.availability === "PROJECTED_NOT_PUBLISHED"));
   assert.ok(verified.blockers.includes("BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS"));
-  assert.ok(verified.blockers.includes("WINDOWS_OWNED_PROCESS_HANDLE_IDENTITY_AUTHORITY_MISSING"));
+  assert.ok(verified.blockers.includes("WINDOWS_SIGNED_SYSTEM_COMPONENT_LOADER_AUTHORITY_MISSING"));
 
   const bunProjection = await readFile(path.join(fixture.distributions, "bun", "install-command.txt"), "utf8");
   assert.match(bunProjection, /^supported_platforms=linux-x64,darwin-x64$/mu);
