@@ -40,11 +40,11 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   ),
   logout: topic(
     "Usage:\n  cuna logout [--session-only]",
-    "Revoke the interactive token family server-first. If the profile has an\nencrypted preview session, it is selected automatically; --session-only is\naccepted for compatibility but is not required. Accepts no operands otherwise.",
+    "Revoke the interactive token family server-first. If the profile has an\nencrypted preview session, it is selected automatically; keep\nCUNA_SESSION_PASSPHRASE set so it can be decrypted. --session-only is accepted\nfor compatibility but is not required. Accepts no operands otherwise.",
   ),
   whoami: topic(
     "Usage:\n  cuna whoami [--session-only]",
-    "Show authoritative interactive account context. An encrypted preview session\nis selected automatically after cuna login; --session-only is accepted for\ncompatibility but is not required. Accepts no operands otherwise.",
+    "Show authoritative interactive account context. An encrypted preview session\nis selected automatically after cuna login; keep CUNA_SESSION_PASSPHRASE set\nso it can be decrypted. --session-only is accepted for compatibility but is not\nrequired. Accepts no operands otherwise.",
   ),
   access: topic(
     "Usage:\n  cuna access status",

@@ -18,7 +18,8 @@ const BOOLEAN_OPTIONS = new Set([
   "new",
   "new-session",
   "offline",
-  // Explicit preview auth: never silently downgrades native credential storage.
+  // Legacy compatibility spelling; preview is selected by login or a stored
+  // preview record, and never by an automation API key.
   "session-only",
   // `cuna help --all`. Absent from this set, the parser reads it as a
   // value option, swallows the next token, and answers "Option --all requires

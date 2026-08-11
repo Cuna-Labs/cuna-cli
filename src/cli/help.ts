@@ -21,8 +21,8 @@ const EXIT_CODES_SECTION = exitCodeHelpSection();
  * WHY THIS EXISTS. The full surface below is 105 lines, 23 of them an exit-code
  * table, and the first usable command appears on line 9. Measured on the same
  * build: the whole of `cuna --help` contained ZERO `http(s)://` matches, so a
- * user who could not sign in — which is everyone on this build, see below — had
- * no next step of any kind.
+ * user who cannot use the native vault still needs a safe browser-link next
+ * step rather than a platform-specific promise.
  *
  * NOTHING WAS DELETED. Every line that used to be here is still in `FULL_HELP`,
  * reachable as `cuna help --all`, and `cuna <command> --help` is untouched.
@@ -33,8 +33,9 @@ const EXIT_CODES_SECTION = exitCodeHelpSection();
  *
  *   - `credentials/native-platform-release-index.ts` ships an EMPTY index, so
  *     `createProductionNativeAuthBridges` fails closed before any package
- *     resolution. That is what makes `login`/`signup` unusable, and it is a
- *     property of the release, not of an operating system.
+ *     resolution. Interactive commands therefore use the encrypted browser-link
+ *     preview backend in this build; native storage remains unavailable, a
+ *     property of the release rather than of an operating system.
  *   - the automatic journey and exact foreground attach are composed by
  *     `runCli` before the generic command dispatcher. Their local
  *     implementation is present, while each invocation still fails closed
@@ -184,8 +185,9 @@ Authentication:
   it does not open a local callback listener. In this build the one-time browser
   link is the default login flow and the resulting refresh session is stored only
   in an encrypted, profile-scoped preview file. Set CUNA_SESSION_PASSPHRASE before
-  login; later authenticated commands automatically reuse that session until it
-  expires or you run cuna logout. \`--session-only\` remains accepted for explicit
+  login; keep CUNA_SESSION_PASSPHRASE set and later authenticated commands
+  automatically reuse that session until it expires or you run cuna logout.
+  \`--session-only\` remains accepted for explicit
   compatibility but is not required. This is not a native vault or a GA readiness claim.
   ${API_KEY_NAMES} selects explicit automation mode and never falls
   back to browser login. Both spellings are accepted and both admit every key brand the
