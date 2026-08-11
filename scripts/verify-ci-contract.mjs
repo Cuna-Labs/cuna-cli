@@ -33,9 +33,15 @@ await access(path.join(root, "package-lock.json"));
 
 const ci = await readFile(path.join(root, ".github", "workflows", "ci.yml"), "utf8");
 const release = await readFile(path.join(root, ".github", "workflows", "release.yml"), "utf8");
+const releaseReview = await readFile(path.join(root, ".github", "workflows", "release-review.yml"), "utf8");
 const approvalConsumption = await readFile(path.join(root, "scripts", "lib", "release-approval-consumption.mjs"), "utf8");
+const npmPreviewPublication = await readFile(path.join(root, "scripts", "publish-npm-preview.mjs"), "utf8");
+const npmPreviewPublicationLibrary = await readFile(path.join(root, "scripts", "lib", "npm-preview-publication.mjs"), "utf8");
 const approvalConsumptionAuthority = await readJson(path.join(root, "packaging", "release-approval-consumption-authority.json"));
+const releaseReviewAuthority = await readJson(path.join(root, "packaging", "release-review-authority.json"));
 const workflow = parseYaml(ci, { prettyErrors: true, uniqueKeys: true });
+const releaseWorkflow = parseYaml(release, { prettyErrors: true, uniqueKeys: true });
+const releaseReviewWorkflow = parseYaml(releaseReview, { prettyErrors: true, uniqueKeys: true });
 invariant(workflow && typeof workflow === "object" && !Array.isArray(workflow), "CI workflow must parse as a YAML object");
 const jobs = workflow.jobs;
 invariant(jobs && typeof jobs === "object" && !Array.isArray(jobs), "CI workflow jobs are missing");
@@ -153,8 +159,8 @@ invariant(
 );
 const approvalSemanticAt = release.indexOf("node scripts/verify-release-approval-lease.mjs");
 const approvalAttestationAt = release.indexOf('--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-review.yml"');
-const approvalNonceBlockAt = release.indexOf("RELEASE_APPROVAL_NONCE_CONSUMPTION_AUTHORITY_NOT_CONFIGURED");
-const npmPublishAt = release.indexOf("npm publish");
+const approvalNonceConsumptionAt = release.indexOf("node scripts/consume-release-approval-nonce.mjs");
+const npmPublishAt = release.indexOf("node scripts/publish-npm-preview.mjs");
 invariant(
   release.includes("completed success ${SOURCE_COMMIT} workflow_dispatch main .github/workflows/release-review.yml"),
   "Release approval must bind the protected release-review workflow identity",
@@ -162,20 +168,130 @@ invariant(
 invariant(approvalSemanticAt >= 0, "Release publication DAG must semantically bind the approval lease");
 invariant(approvalAttestationAt > approvalSemanticAt, "Release approval attestation must follow semantic lease verification");
 invariant(
-  approvalNonceBlockAt > approvalAttestationAt && npmPublishAt > approvalNonceBlockAt,
-  "Publication must remain fail-closed before npm publish until one-use nonce consumption is configured",
+  approvalNonceConsumptionAt > approvalAttestationAt && npmPublishAt > approvalNonceConsumptionAt,
+  "Publication must atomically consume the reviewed one-use nonce before npm publish",
 );
 invariant(
-  approvalConsumptionAuthority.status === "UNCONFIGURED_BLOCKING",
-  "Source may not claim the external release-approval consumption authority is configured",
+  approvalConsumptionAuthority.status === "CONFIGURED" &&
+    approvalConsumptionAuthority.rulesetId === 20698394 &&
+    approvalConsumptionAuthority.rulesetName === "Protect Cuna release approval consumptions" &&
+    approvalConsumptionAuthority.requiredReviewer?.type === "User" &&
+    approvalConsumptionAuthority.requiredReviewer?.id === 67605416 &&
+    approvalConsumptionAuthority.requiredReviewer?.login === "superjava1" &&
+    JSON.stringify(approvalConsumptionAuthority.requiredRules) === JSON.stringify(["deletion", "non_fast_forward", "update"]),
+  "Configured release-approval authority must bind the exact externally observed ruleset and reviewer",
 );
 invariant(
   approvalConsumption.includes('method: "POST"') &&
     approvalConsumption.includes("Release approval nonce is already consumed") &&
     approvalConsumption.includes("current_user_can_bypass") &&
-    approvalConsumption.includes("prevent_self_review"),
-  "One-use release approval interface must reserve atomically and verify non-bypassable independent review",
+    approvalConsumption.includes("prevent_self_review") &&
+    approvalConsumption.includes('"update"') &&
+    approvalConsumption.split("await observeAuthority();").length - 1 >= 3 &&
+    approvalConsumption.includes("git/tags/${tagObject.sha}"),
+  "One-use release approval interface must reserve atomically, revalidate external controls, and read back exact annotated evidence",
 );
+const preflight = releaseWorkflow.jobs?.preflight;
+invariant(preflight?.environment === "npm", "The nonce-writing preflight must be protected by the npm environment");
+invariant(
+  JSON.stringify(preflight.permissions) === JSON.stringify({ actions: "read", attestations: "read", contents: "write" }),
+  "The nonce-writing preflight token must have only actions:read, attestations:read, and contents:write",
+);
+const reviewJob = releaseReviewWorkflow.jobs?.review;
+invariant(reviewJob?.environment === "release-review-npm-preview", "Release review must preserve its separate protected environment identity");
+invariant(
+  JSON.stringify(reviewJob.permissions) === JSON.stringify({ actions: "read", contents: "read" }),
+  "Blocked release review must retain a strictly read-only token",
+);
+const reviewRuns = (reviewJob.steps ?? []).map((step) => step?.run).filter((run) => typeof run === "string").join("\n");
+invariant(
+  reviewRuns.includes("completed success ${SOURCE_COMMIT} push main .github/workflows/ci.yml") &&
+    reviewRuns.includes('gh attestation verify admitted/release-artifacts/*.tgz') &&
+    reviewRuns.includes('--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"'),
+  "Release review does not bind protected-main candidate and exact candidate provenance",
+);
+invariant(
+  releaseReviewAuthority.status === "UNCONFIGURED_BLOCKING" &&
+    releaseReviewAuthority.environment === "release-review-npm-preview" &&
+    releaseReviewAuthority.requiredReviewer?.id === 312749809 &&
+    releaseReviewAuthority.requiredReviewer?.login === "cunitacodeitor" &&
+    releaseReviewAuthority.observedAdminBypass === true &&
+    releaseReviewAuthority.requiredApprovalEvidence === "EXACT_APPROVER_ID_LOGIN_EVENT_AND_RUN_BINDING",
+  "Release-review declaration must preserve its exact observed, separately blocked authority",
+);
+const reviewInputs = Object.keys(releaseReviewWorkflow.on?.workflow_dispatch?.inputs ?? {}).sort();
+invariant(
+  JSON.stringify(reviewInputs) === JSON.stringify(["candidate_envelope_sha256", "candidate_run_id", "candidate_sha256", "source_commit", "version"]),
+  "Blocked release review may accept only candidate identity inputs",
+);
+for (const forbidden of [
+  "build-release-approval-lease",
+  "release-approval-expectation",
+  "release-approval-lease",
+  "approverIdentityClass",
+  "contract_source_commit",
+  "contract_sha256",
+  "contract_approval_attestation_sha256",
+  "receipt_cohort_sha256",
+  "receipt_verification_sha256",
+]) invariant(!releaseReview.includes(forbidden), `Blocked release review contains caller-supplied or apparent minting authority: ${forbidden}`);
+for (const blocker of [
+  "RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED",
+  "ACTUAL_ENVIRONMENT_APPROVAL_EVENT_NOT_OBSERVABLE_BY_WORKFLOW_TOKEN",
+  "CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE",
+  "CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE",
+  "CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED",
+]) invariant(reviewRuns.includes(blocker), `Release review is missing fail-closed blocker: ${blocker}`);
+invariant(
+  reviewRuns.includes("inputs.contractSet?.releaseAuthority !== 'UNRESOLVED_BLOCKING'") &&
+    reviewRuns.trimEnd().endsWith("exit 1"),
+  "Release review must observe the unresolved candidate contract and terminate without minting",
+);
+const publishJob = releaseWorkflow.jobs?.["publish-preview"];
+invariant(
+  publishJob?.permissions?.actions === "read" && publishJob.permissions?.attestations === "read" &&
+    publishJob.permissions?.contents === "read" && publishJob.permissions?.["id-token"] === "write",
+  "Publish job permissions must support only evidence reads and short-lived npm OIDC",
+);
+const publishStepSequence = (publishJob.steps ?? []).map((step) => step?.uses ? `uses:${step.uses}` : `run:${step?.run ?? ""}`);
+invariant(
+  JSON.stringify(publishStepSequence) === JSON.stringify([
+    "uses:actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+    "uses:actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38",
+    "run:npm install --global npm@11.19.0",
+    "uses:actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    "run:node scripts/verify-release-envelope.mjs --root admitted/release-artifacts",
+    "uses:actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    "run:node scripts/publish-npm-preview.mjs",
+    "run:node scripts/verify-postpublish.mjs --envelope admitted/release-artifacts/release-envelope.json --version \"$VERSION\" --tag preview --receipt admitted/evidence/npm-preview-receipt.json",
+    "uses:actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+  ]),
+  "Publish job executable step sequence differs from the reviewed boundary",
+);
+const publishStep = (publishJob.steps ?? []).find((step) => step?.run === "node scripts/publish-npm-preview.mjs");
+invariant(publishStep, "Publish job must invoke the reviewed npm publication orchestrator as one exact command");
+invariant(
+  (publishJob.steps ?? []).filter((step) => typeof step?.run === "string" && step.run.includes("publish-npm-preview.mjs")).length === 1,
+  "Publish workflow must contain exactly one executable publication boundary",
+);
+invariant(
+  publishStep.env?.APPROVAL_LEASE_SHA256 === "${{ inputs.approval_lease_sha256 }}" &&
+    publishStep.env?.APPROVAL_EXPECTATION_SHA256 === "${{ inputs.approval_expectation_sha256 }}" &&
+    publishStep.env?.RELEASE_SOURCE_COMMIT === "${{ inputs.source_commit }}" && publishStep.env?.VERSION === "${{ needs.preflight.outputs.version }}" &&
+    publishStep.env?.GITHUB_TOKEN === "${{ github.token }}" && publishStep.env?.GH_TOKEN === "${{ github.token }}",
+  "Fresh publication approval is not bound to exact dispatch digests, source, and read token",
+);
+invariant(
+  !npmPreviewPublication.includes("shell: true") && !npmPreviewPublication.includes("exec(") &&
+    npmPreviewPublication.includes("executeNpmPreviewPublication({") &&
+    npmPreviewPublication.includes('execute("gh", [') && npmPreviewPublication.includes('execute("npm", [') &&
+    npmPreviewPublication.includes("verifyReservedReleaseApprovalConsumption({") &&
+    npmPreviewPublication.includes('"scripts/verify-registry-version-absent.mjs"'),
+  "Npm publication entrypoint must use argv-only effects behind the reviewed fail-closed orchestrator",
+);
+for (const phase of ["verifyLease", "verifyAttestation", "verifyNonce", "verifyRegistryAbsent", "publish"]) {
+  invariant(npmPreviewPublicationLibrary.includes(`await phases.${phase}()` ) || (phase === "publish" && npmPreviewPublicationLibrary.includes("return phases.publish()")), `Publication orchestrator is missing phase: ${phase}`);
+}
 
 // Every status check the branch ruleset requires must actually be emitted by a
 // job, under exactly that name, in a workflow that runs on pull_request. A

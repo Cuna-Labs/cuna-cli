@@ -20,7 +20,10 @@ async function fixture() {
   await cp(path.join(repositoryRoot, "package-lock.json"), path.join(root, "package-lock.json"));
   await cp(path.join(repositoryRoot, "packaging", "support-policy.json"), path.join(root, "packaging", "support-policy.json"));
   await cp(path.join(repositoryRoot, "packaging", "release-approval-consumption-authority.json"), path.join(root, "packaging", "release-approval-consumption-authority.json"));
+  await cp(path.join(repositoryRoot, "packaging", "release-review-authority.json"), path.join(root, "packaging", "release-review-authority.json"));
   await cp(path.join(repositoryRoot, "scripts", "lib", "release-approval-consumption.mjs"), path.join(root, "scripts", "lib", "release-approval-consumption.mjs"));
+  await cp(path.join(repositoryRoot, "scripts", "lib", "npm-preview-publication.mjs"), path.join(root, "scripts", "lib", "npm-preview-publication.mjs"));
+  await cp(path.join(repositoryRoot, "scripts", "publish-npm-preview.mjs"), path.join(root, "scripts", "publish-npm-preview.mjs"));
   // The whole of `.github`, not a hand-listed pair of workflows: the required
   // status checks are spread across ci.yml and dependency-review.yml, so a
   // fixture that copies only some workflows cannot tell "this check has no
@@ -230,16 +233,133 @@ test("CI contract rejects an unsigned or semantically unbound release approval l
     .replace("node scripts/verify-release-approval-lease.mjs", "node scripts/verify-release-envelope.mjs")
     .replace('--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-review.yml"', "--repo-only");
   await writeFile(workflow, content);
-  await assert.rejects(verify(root), /semantically bind the approval lease/u);
+  await assert.rejects(verify(root), /semantically bind the approval lease|atomically consume the reviewed one-use nonce/u);
 });
 
-test("CI contract rejects removal of the one-use nonce publication fence", async () => {
+test("CI contract rejects removal of the one-use nonce consumption boundary", async () => {
   const root = await fixture();
   const workflow = path.join(root, ".github", "workflows", "release.yml");
   const content = (await readFile(workflow, "utf8"))
-    .replace("RELEASE_APPROVAL_NONCE_CONSUMPTION_AUTHORITY_NOT_CONFIGURED", "release approval reviewed");
+    .replace("node scripts/consume-release-approval-nonce.mjs", "node scripts/verify-release-approval-lease.mjs");
   await writeFile(workflow, content);
-  await assert.rejects(verify(root), /remain fail-closed before npm publish/u);
+  await assert.rejects(verify(root), /atomically consume the reviewed one-use nonce/u);
+});
+
+test("CI contract rejects a nonce consumer with broader or unprotected write authority", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("    environment: npm\n    permissions:\n      actions: read\n      attestations: read\n      contents: write", "    permissions:\n      actions: write\n      contents: write");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /nonce-writing preflight/u);
+});
+
+test("CI contract rejects substituted external ruleset identity", async () => {
+  const root = await fixture();
+  const authority = path.join(root, "packaging", "release-approval-consumption-authority.json");
+  const value = JSON.parse(await readFile(authority, "utf8"));
+  value.rulesetId += 1;
+  await writeFile(authority, `${JSON.stringify(value, null, 2)}\n`);
+  await assert.rejects(verify(root), /exact externally observed ruleset and reviewer/u);
+});
+
+test("CI contract rejects a consumption ruleset declaration that permits ordinary updates", async () => {
+  const root = await fixture();
+  const authority = path.join(root, "packaging", "release-approval-consumption-authority.json");
+  const value = JSON.parse(await readFile(authority, "utf8"));
+  value.requiredRules = value.requiredRules.filter((rule) => rule !== "update");
+  await writeFile(authority, `${JSON.stringify(value, null, 2)}\n`);
+  await assert.rejects(verify(root), /exact externally observed ruleset and reviewer/u);
+});
+
+test("CI contract rejects removal of external authority revalidation", async () => {
+  const root = await fixture();
+  const consumer = path.join(root, "scripts", "lib", "release-approval-consumption.mjs");
+  const content = await readFile(consumer, "utf8");
+  const last = content.lastIndexOf("  await observeAuthority();");
+  await writeFile(consumer, `${content.slice(0, last)}${content.slice(last + "  await observeAuthority();".length)}`);
+  await assert.rejects(verify(root), /revalidate external controls/u);
+});
+
+test("CI contract rejects conflation of release review with the publication environment", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release-review.yml");
+  const content = (await readFile(workflow, "utf8")).replace("    environment: release-review-npm-preview\n", "    environment: npm\n");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /preserve its separate protected environment/u);
+});
+
+test("CI contract rejects caller-supplied contract authority in blocked review", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release-review.yml");
+  const content = (await readFile(workflow, "utf8")).replace(
+    "      candidate_run_id:\n",
+    "      contract_sha256:\n        description: Caller claim\n        required: true\n        type: string\n      candidate_run_id:\n",
+  );
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /only candidate identity inputs|caller-supplied/u);
+});
+
+test("CI contract rejects apparent lease minting without exact approval-event authority", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release-review.yml");
+  const content = (await readFile(workflow, "utf8")).replace(
+    "      - name: Block lease minting until independent authorities exist",
+    "      - run: node scripts/build-release-approval-lease.mjs\n      - name: Block lease minting until independent authorities exist",
+  );
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /apparent minting authority/u);
+});
+
+test("CI contract rejects omission of unresolved contract and semantic observation blockers", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release-review.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE", "observation hashes supplied")
+    .replace("CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED", "contract supplied");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /missing fail-closed blocker/u);
+});
+
+test("CI contract rejects fabricated approver class without an exact approval event", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release-review.yml");
+  const content = `${await readFile(workflow, "utf8")}\n# approverIdentityClass: PROTECTED_ENVIRONMENT_REVIEWER\n`;
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /apparent minting authority/u);
+});
+
+test("CI contract rejects publication without fresh nonce and lease validation in the npm publish step", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release.yml");
+  const content = (await readFile(workflow, "utf8")).replace(
+    "run: node scripts/publish-npm-preview.mjs",
+    "run: true || node scripts/publish-npm-preview.mjs",
+  );
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /executable step sequence differs/u);
+});
+
+test("CI contract rejects a commented-out publication orchestrator", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release.yml");
+  const content = (await readFile(workflow, "utf8")).replace(
+    "run: node scripts/publish-npm-preview.mjs",
+    "run: '# node scripts/publish-npm-preview.mjs'",
+  );
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /executable step sequence differs/u);
+});
+
+test("CI contract rejects a second publication effect outside the reviewed orchestrator", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release.yml");
+  const content = (await readFile(workflow, "utf8")).replace(
+    "      - name: Revalidate fresh approval and publish exact admitted bytes",
+    "      - run: npm publish admitted/release-artifacts/substituted.tgz --provenance --access public --registry https://registry.npmjs.org/ --tag preview\n      - name: Revalidate fresh approval and publish exact admitted bytes",
+  );
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /executable step sequence differs/u);
 });
 
 /**
