@@ -15,9 +15,12 @@ test.after(() => resources.cleanup());
 async function fixture() {
   const root = await resources.createTempDirectory("cuna-ci-contract-");
   await mkdir(path.join(root, "packaging"), { recursive: true });
+  await mkdir(path.join(root, "scripts", "lib"), { recursive: true });
   await cp(path.join(repositoryRoot, "package.json"), path.join(root, "package.json"));
   await cp(path.join(repositoryRoot, "package-lock.json"), path.join(root, "package-lock.json"));
   await cp(path.join(repositoryRoot, "packaging", "support-policy.json"), path.join(root, "packaging", "support-policy.json"));
+  await cp(path.join(repositoryRoot, "packaging", "release-approval-consumption-authority.json"), path.join(root, "packaging", "release-approval-consumption-authority.json"));
+  await cp(path.join(repositoryRoot, "scripts", "lib", "release-approval-consumption.mjs"), path.join(root, "scripts", "lib", "release-approval-consumption.mjs"));
   // The whole of `.github`, not a hand-listed pair of workflows: the required
   // status checks are spread across ci.yml and dependency-review.yml, so a
   // fixture that copies only some workflows cannot tell "this check has no

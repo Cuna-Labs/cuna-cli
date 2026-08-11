@@ -54,7 +54,7 @@ function validateConditions(lease) {
 }
 
 export function validateReleaseApprovalLeaseShape(lease, now = Date.now()) {
-  exactKeys(lease, ["schemaVersion", "predicateType", "decision", "package", "source", "candidate", "receiptCohort", "contractAuthority", "promotion", "review", "recovery", "issuedAt", "expiresAt", "nonce", "conditions"], "release approval lease");
+  exactKeys(lease, ["schemaVersion", "predicateType", "decision", "package", "source", "candidate", "receiptCohort", "contractAuthority", "promotion", "controller", "review", "recovery", "issuedAt", "expiresAt", "nonce", "conditions"], "release approval lease");
   invariant(lease.schemaVersion === 1, "Unsupported release-approval lease schema");
   invariant(lease.predicateType === "https://getcuna.com/attestations/cuna-cli-release-approval/v1", "Release-approval predicate type differs");
   invariant(lease.decision === "READY" || lease.decision === "READY_WITH_CONDITIONS", "Release decision is not authorizing");
@@ -74,6 +74,10 @@ export function validateReleaseApprovalLeaseShape(lease, now = Date.now()) {
   exactKeys(lease.contractAuthority, ["producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"], "lease contract authority");
   exactKeys(lease.promotion, ["registry", "tag", "environment"], "lease promotion");
   invariant(lease.promotion.registry === "https://registry.npmjs.org" && lease.promotion.tag === "preview" && lease.promotion.environment === "npm", "Lease promotion target is invalid");
+  exactKeys(lease.controller, ["actorId", "actorLogin", "identityClass"], "lease controller");
+  invariant(/^[1-9][0-9]*$/u.test(lease.controller.actorId), "Lease controller actor ID is invalid");
+  invariant(/^[A-Za-z0-9-]{1,39}$/u.test(lease.controller.actorLogin), "Lease controller login is invalid");
+  invariant(lease.controller.identityClass === "RELEASE_WORKFLOW_INITIATOR", "Lease controller identity class is invalid");
   exactKeys(lease.review, ["workflow", "runId", "runAttempt", "environment", "approverIdentityClass", "soloOwnerRiskAccepted"], "lease review");
   invariant(lease.review.workflow === ".github/workflows/release-review.yml" && lease.review.environment === "release-review-npm-preview", "Lease review authority differs");
   invariant(/^[1-9][0-9]*$/u.test(lease.review.runId) && Number.isSafeInteger(lease.review.runAttempt) && lease.review.runAttempt > 0, "Lease review workflow identity is invalid");
@@ -109,7 +113,7 @@ export function validateReleaseApprovalLeaseShape(lease, now = Date.now()) {
 export function validateReleaseApprovalLease(lease, input, now = Date.now()) {
   exactKeys(
     input,
-    ["decision", "version", "sourceCommit", "candidate", "tag", "receiptCohort", "contractAuthority", "review", "recovery", "nonce", "conditions"],
+    ["decision", "version", "sourceCommit", "candidate", "tag", "receiptCohort", "contractAuthority", "controller", "review", "recovery", "nonce", "conditions"],
     "release approval verification input",
   );
   validateReleaseApprovalLeaseShape(lease, now);
@@ -118,6 +122,7 @@ export function validateReleaseApprovalLease(lease, input, now = Date.now()) {
   exactKeys(input.receiptCohort, ["sha256", "verificationSha256", "runId", "runAttempt"], "expected receipt cohort");
   exactKeys(input.contractAuthority, ["producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"], "expected contract authority");
   validateContractAuthority({ schemaVersion: 1, authority: "CUNA_CANONICAL_PUBLIC_API_CONTRACT", status: "APPROVED", ...input.contractAuthority });
+  exactKeys(input.controller, ["actorId", "actorLogin", "identityClass"], "expected release controller");
   exactKeys(input.review, ["runId", "runAttempt", "approverIdentityClass", "soloOwnerRiskAccepted"], "expected release review");
   exactKeys(input.recovery, ["planSha256", "strategy"], "expected recovery");
   invariant(lease.decision === input.decision, "Release approval decision differs");
@@ -127,6 +132,7 @@ export function validateReleaseApprovalLease(lease, input, now = Date.now()) {
   invariant(lease.promotion.tag === input.tag, "Release approval promotion tag differs");
   invariant(sameFields(lease.receiptCohort, input.receiptCohort, ["sha256", "verificationSha256", "runId", "runAttempt"]), "Release approval receipt cohort differs");
   invariant(sameFields(lease.contractAuthority, input.contractAuthority, ["producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"]), "Release approval contract authority differs");
+  invariant(sameFields(lease.controller, input.controller, ["actorId", "actorLogin", "identityClass"]), "Release approval controller differs");
   invariant(sameFields(lease.review, input.review, ["runId", "runAttempt", "approverIdentityClass", "soloOwnerRiskAccepted"]), "Release approval review identity differs");
   invariant(sameFields(lease.recovery, input.recovery, ["planSha256", "strategy"]), "Release approval recovery identity differs");
   invariant(lease.nonce === input.nonce, "Release approval nonce differs");

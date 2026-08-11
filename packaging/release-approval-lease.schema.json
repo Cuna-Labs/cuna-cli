@@ -4,7 +4,7 @@
   "title": "Cuna CLI release approval lease predicate",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "predicateType", "decision", "package", "source", "candidate", "receiptCohort", "contractAuthority", "promotion", "review", "recovery", "issuedAt", "expiresAt", "nonce", "conditions"],
+  "required": ["schemaVersion", "predicateType", "decision", "package", "source", "candidate", "receiptCohort", "contractAuthority", "promotion", "controller", "review", "recovery", "issuedAt", "expiresAt", "nonce", "conditions"],
   "properties": {
     "schemaVersion": {"const": 1},
     "predicateType": {"const": "https://getcuna.com/attestations/cuna-cli-release-approval/v1"},
@@ -39,6 +39,16 @@
         "registry": {"const": "https://registry.npmjs.org"},
         "tag": {"const": "preview"},
         "environment": {"const": "npm"}
+      }
+    },
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actorId", "actorLogin", "identityClass"],
+      "properties": {
+        "actorId": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "actorLogin": {"type": "string", "pattern": "^[A-Za-z0-9-]{1,39}$"},
+        "identityClass": {"const": "RELEASE_WORKFLOW_INITIATOR"}
       }
     },
     "review": {

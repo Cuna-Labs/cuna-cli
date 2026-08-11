@@ -47,6 +47,11 @@ function lease() {
       approvalAttestationSha256: "c".repeat(64),
     },
     promotion: { registry: "https://registry.npmjs.org", tag: "preview", environment: "npm" },
+    controller: {
+      actorId: "303",
+      actorLogin: "release-controller",
+      identityClass: "RELEASE_WORKFLOW_INITIATOR",
+    },
     review: {
       workflow: ".github/workflows/release-review.yml",
       runId: "202",
@@ -77,6 +82,7 @@ function expectation(subject = lease()) {
       runAttempt: subject.receiptCohort.runAttempt,
     },
     contractAuthority: { ...subject.contractAuthority },
+    controller: { ...subject.controller },
     review: {
       runId: subject.review.runId,
       runAttempt: subject.review.runAttempt,
@@ -99,6 +105,7 @@ test("release approval lease rejects substitution, expiry, excessive duration, a
     ["candidate", (subject) => { subject.candidate.tarballSha256 = "e".repeat(64); }, /candidate identity differs/u],
     ["receipt cohort", (subject) => { subject.receiptCohort.sha256 = "e".repeat(64); }, /receipt cohort differs/u],
     ["contract", (subject) => { subject.contractAuthority.contractSha256 = "e".repeat(64); }, /contract authority differs/u],
+    ["controller", (subject) => { subject.controller.actorId = "404"; }, /controller differs/u],
     ["review attempt", (subject) => { subject.review.runAttempt = 2; }, /review identity differs/u],
     ["recovery", (subject) => { subject.recovery.planSha256 = "e".repeat(64); }, /recovery identity differs/u],
     ["nonce", (subject) => { subject.nonce = `cuna_release_${"x".repeat(32)}`; }, /nonce differs/u],
