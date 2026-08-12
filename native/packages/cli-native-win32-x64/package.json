@@ -1,0 +1,23 @@
+{
+  "name": "@cuna_labs/cli-native-win32-x64",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Signed native authentication artifacts for Cuna CLI on Windows x64.",
+  "license": "Apache-2.0",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "cuna-native-authority.node",
+    "cuna-native-bridge.exe",
+    "cuna-native-bridge.manifest.json",
+    "cuna-native-bridge.spdx.json",
+    "cuna-native-bridge.provenance.json"
+  ],
+  "exports": {
+    "./package.json": "./package.json"
+  }
+}

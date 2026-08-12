@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { access, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -11,7 +14,8 @@ import {
   createMacOsKeychainBackend,
   createSecureProcessRunner,
   createUnavailableCredentialBackend,
-  createWindowsCredentialManagerBackend,
+  createPlatformCredentialBackend,
+  resolvePlatformAuthority,
   credentialTarget,
 } from "../dist/credentials/index.js";
 
@@ -20,7 +24,7 @@ const BINDING = Object.freeze({
   profileId: "développement",
   accountId: "account-1",
   workspaceId: "workspace-1",
-  kind: "runa-refresh-token",
+  kind: "cuna-refresh-token",
 });
 
 class MemorySecureBackend {
@@ -31,6 +35,8 @@ class MemorySecureBackend {
     this.replaceCalls = 0;
     this.readCalls = 0;
     this.failNextReplace = false;
+    this.commitThenThrowNextReplace = false;
+    this.ambiguousNextReplace = false;
   }
 
   async probe() {
@@ -53,6 +59,16 @@ class MemorySecureBackend {
 
   async replace(target, value) {
     this.replaceCalls += 1;
+    if (this.commitThenThrowNextReplace) {
+      this.commitThenThrowNextReplace = false;
+      this.values.set(target, Uint8Array.from(value));
+      throw new Error("simulated lost replacement acknowledgement");
+    }
+    if (this.ambiguousNextReplace) {
+      this.ambiguousNextReplace = false;
+      this.values.set(target, new TextEncoder().encode("foreign-corrupt-state"));
+      throw new Error("simulated ambiguous replacement");
+    }
     if (this.failNextReplace) {
       this.failNextReplace = false;
       throw new Error("simulated atomic replacement failure");
@@ -138,6 +154,34 @@ test("atomic backend failure preserves the previously valid credential", async (
   replacement.dispose();
 });
 
+test("commit-then-throw replacement is reconciled by read-back and ambiguous state is never retried as failure", async () => {
+  const backend = new MemorySecureBackend();
+  const vault = new CredentialVault({ backend, clock: () => NOW });
+  const first = SecretMaterial.fromUtf8("credential-before-ack-loss");
+  await vault.rotate({ binding: BINDING, material: first });
+  backend.commitThenThrowNextReplace = true;
+  const committed = SecretMaterial.fromUtf8("credential-after-ack-loss");
+  const status = await vault.rotate({ binding: BINDING, material: committed, expectedRevision: 1 });
+  assert.equal(status.revision, 2, "authoritative read-back proves the lost acknowledgement committed");
+  const loaded = await vault.load(BINDING);
+  assert.equal(loaded.revision, 2);
+  assert.equal(utf8(loaded.material), "credential-after-ack-loss");
+  loaded.material.dispose();
+
+  backend.ambiguousNextReplace = true;
+  const ambiguous = SecretMaterial.fromUtf8("credential-with-unknown-outcome");
+  await assert.rejects(
+    vault.rotate({ binding: BINDING, material: ambiguous, expectedRevision: 2 }),
+    (error) => error instanceof CredentialBoundaryError &&
+      error.code === "credential_backend_failure" &&
+      error.retryable === false &&
+      error.safeDetails?.replacementOutcome === "ambiguous",
+  );
+  first.dispose();
+  committed.dispose();
+  ambiguous.dispose();
+});
+
 test("concurrent refreshes coalesce once and produce one atomic revision", async () => {
   const backend = new MemorySecureBackend();
   const vault = new CredentialVault({ backend, clock: () => NOW });
@@ -159,6 +203,41 @@ test("concurrent refreshes coalesce once and produce one atomic revision", async
     assert.equal(utf8(snapshot.material), "refresh-new");
     snapshot.material.dispose();
   }
+  original.dispose();
+});
+
+test("failed refresh replacement wipes every owned copy and preserves the previous revision", { concurrency: false }, async () => {
+  const backend = new MemorySecureBackend();
+  const vault = new CredentialVault({ backend, clock: () => NOW });
+  const original = SecretMaterial.fromUtf8("refresh-before-failure");
+  await vault.rotate({ binding: BINDING, material: original });
+  backend.failNextReplace = true;
+
+  const copied = [];
+  const copyBytes = SecretMaterial.prototype.copyBytes;
+  SecretMaterial.prototype.copyBytes = function captureOwnedCopy() {
+    const bytes = copyBytes.call(this);
+    copied.push(bytes);
+    return bytes;
+  };
+  let candidate;
+  try {
+    await assert.rejects(vault.refresh(BINDING, async () => {
+      candidate = SecretMaterial.fromUtf8("refresh-copy-must-be-wiped");
+      return { status: "rotated", material: candidate, expiresAt: NOW + 60_000 };
+    }));
+  } finally {
+    SecretMaterial.prototype.copyBytes = copyBytes;
+  }
+
+  assert.equal(copied.length, 1);
+  assert.equal(copied[0].every((byte) => byte === 0), true);
+  assert.throws(() => candidate.copyBytes(), (error) =>
+    error instanceof CredentialBoundaryError && error.code === "credential_missing");
+  const loaded = await vault.load(BINDING);
+  assert.equal(loaded.revision, 1);
+  assert.equal(utf8(loaded.material), "refresh-before-failure");
+  loaded.material.dispose();
   original.dispose();
 });
 
@@ -256,15 +335,116 @@ test("self-reported or cross-platform vault evidence cannot authorize credential
   secret.dispose();
 });
 
+test("vault rejects clock rollback and evidence that expires while the native probe is in flight", async () => {
+  const backend = new MemorySecureBackend();
+  let now = NOW;
+  const vault = new CredentialVault({ backend, clock: () => now });
+  assert.equal((await vault.status(BINDING)).state, "absent");
+  now = NOW - 1;
+  assert.equal((await vault.status(BINDING)).state, "unavailable");
+
+  let slowNow = NOW;
+  const slowBackend = new MemorySecureBackend();
+  slowBackend.probe = async () => {
+    const evidence = await MemorySecureBackend.prototype.probe.call(slowBackend);
+    slowNow = NOW + 60_000;
+    return evidence;
+  };
+  const slowVault = new CredentialVault({ backend: slowBackend, clock: () => slowNow });
+  const material = SecretMaterial.fromUtf8("must-not-cross-expired-probe");
+  await assert.rejects(
+    slowVault.rotate({ binding: BINDING, material }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unverified",
+  );
+  assert.equal(slowBackend.replaceCalls, 0);
+  material.dispose();
+});
+
 test("secure process runner kills oversized output without returning it", async () => {
   const runner = createSecureProcessRunner();
   await assert.rejects(
     runner.run({
       executable: process.execPath,
+      cwd: process.cwd(),
       args: ["-e", "process.stdout.write('x'.repeat(4096))"],
       maximumOutputBytes: 32,
     }),
     (error) => error instanceof CredentialBoundaryError && error.code === "credential_output_oversized",
+  );
+});
+
+test("secure process timeout waits for confirmed child closure before rejecting", async () => {
+  const runner = createSecureProcessRunner();
+  const startedAt = Date.now();
+  await assert.rejects(
+    runner.run({
+      executable: process.execPath,
+      cwd: process.cwd(),
+      args: ["-e", "setInterval(() => undefined, 1000)"],
+      timeoutMs: 100,
+    }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_process_timeout",
+  );
+  assert.ok(Date.now() - startedAt >= 90);
+});
+
+test("post-spawn loaded-image rejection kills the identified child before protected stdin is released", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cuna-stdin-admission-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const marker = path.join(root, "stdin-observed.txt");
+  const runner = createSecureProcessRunner();
+  let spawnedPid;
+  await assert.rejects(
+    runner.run({
+      executable: process.execPath,
+      cwd: process.cwd(),
+      args: [
+        "-e",
+        "const fs=require('node:fs');let n=0;process.stdin.on('data',(b)=>n+=b.length);process.stdin.on('end',()=>fs.writeFileSync(process.argv[1],String(n)));",
+        marker,
+      ],
+      stdin: Uint8Array.from([11, 22, 33, 44]),
+      beforeStdin: async (child) => {
+        spawnedPid = child.pid;
+        assert.equal(child.platform, process.platform);
+        throw new Error("loaded image does not match the admitted descriptor");
+      },
+    }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unverified",
+  );
+  await assert.rejects(access(marker), { code: "ENOENT" });
+  assert.ok(Number.isSafeInteger(spawnedPid) && spawnedPid > 0);
+  assert.throws(() => process.kill(spawnedPid, 0), { code: "ESRCH" });
+});
+
+test("secure process runner retains and releases the process-instance lease around protected stdin", async () => {
+  const runner = createSecureProcessRunner();
+  let releaseCalls = 0;
+  const result = await runner.run({
+    executable: process.execPath,
+    cwd: process.cwd(),
+    args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('accepted'))"],
+    stdin: Uint8Array.from([11, 22, 33, 44]),
+    beforeStdin: async () => ({ release: () => { releaseCalls += 1; } }),
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(new TextDecoder().decode(result.stdout), "accepted");
+  assert.equal(result.stdinAdmissionConfirmed, true);
+  assert.equal(releaseCalls, 1);
+  result.stdout.fill(0);
+});
+
+test("secure process runner fails closed when the process-instance lease cannot be released", async () => {
+  const runner = createSecureProcessRunner();
+  await assert.rejects(
+    runner.run({
+      executable: process.execPath,
+      cwd: process.cwd(),
+      args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>process.exit(0))"],
+      stdin: Uint8Array.from([11, 22, 33, 44]),
+      beforeStdin: async () => ({ release: () => { throw new Error("handle release failed"); } }),
+    }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unverified",
   );
 });
 
@@ -307,60 +487,35 @@ test("Linux Secret Service adapter transports protected values only through stdi
   for (const call of calls) {
     const publicTransport = JSON.stringify({ args: call.args, environment: call.environment });
     assert.doesNotMatch(publicTransport, /linux-secret-sentinel/u);
+    assert.equal(call.args.includes("cuna-cli"), true, "every Secret Service operation uses the Cuna application namespace");
+    assert.equal(call.args.includes("runa-cli"), false, "the unreleased Runa namespace must not be written");
   }
   assert.match(new TextDecoder().decode(calls[0].stdin), /linux-secret-sentinel/u, "protected value is confined to stdin");
   observed.fill(0);
   sentinel.fill(0);
 });
 
-test("Windows Credential Manager adapter transports protected values only through stdin", async () => {
-  const calls = [];
-  const values = new Map();
-  const runner = {
-    run: async (request) => {
-      const captured = {
-        ...request,
-        args: [...request.args],
-        environment: { ...request.environment },
-        stdin: Uint8Array.from(request.stdin),
-      };
-      calls.push(captured);
-      const body = JSON.parse(new TextDecoder().decode(request.stdin));
-      let response;
-      if (body.operation === "replace") {
-        values.set(body.target, body.valueBase64);
-        response = { ok: true, status: "replaced" };
-      } else if (body.operation === "read") {
-        response = values.has(body.target)
-          ? { ok: true, status: "present", valueBase64: values.get(body.target) }
-          : { ok: true, status: "absent" };
-      } else {
-        const deleted = values.delete(body.target);
-        response = { ok: true, status: deleted ? "deleted" : "absent" };
-      }
-      return {
-        exitCode: 0,
-        signal: null,
-        stdout: new TextEncoder().encode(JSON.stringify(response)),
-        stderrPresent: false,
-      };
-    },
-  };
-  const backend = createWindowsCredentialManagerBackend({ runner, environment: { SystemRoot: "C:\\Windows" } });
-  const text = "windows-secret-sentinel";
-  const encoded = new TextEncoder().encode(text);
-  await backend.replace("opaque-target", encoded);
-  const observed = await backend.read("opaque-target");
-  assert.equal(new TextDecoder().decode(observed), text);
-  const encodedSecret = Buffer.from(text).toString("base64");
-  for (const call of calls) {
-    const publicTransport = JSON.stringify({ args: call.args, environment: call.environment });
-    assert.doesNotMatch(publicTransport, /windows-secret-sentinel/u);
-    assert.equal(publicTransport.includes(encodedSecret), false, "base64 secret must not enter argv or environment");
-  }
-  assert.equal(new TextDecoder().decode(calls[0].stdin).includes(encodedSecret), true);
-  observed.fill(0);
-  encoded.fill(0);
+test("secure credential helpers require absolute executable and working-directory authority", async () => {
+  const runner = createSecureProcessRunner();
+  await assert.rejects(
+    runner.run({ executable: "powershell.exe", cwd: process.cwd(), args: [] }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_process_failed",
+  );
+  await assert.rejects(
+    runner.run({ executable: process.execPath, cwd: ".", args: [] }),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_process_failed",
+  );
+});
+
+test("Windows fails closed until a signed native vault bridge is available", async () => {
+  const backend = createPlatformCredentialBackend({ platform: "win32", clock: () => NOW });
+  const evidence = await backend.probe();
+  assert.equal(evidence.status, "unavailable");
+  assert.equal(evidence.backendId, "windows-native-vault-required");
+  await assert.rejects(
+    backend.read("opaque-target"),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unavailable",
+  );
 });
 
 test("macOS adapter refuses argv-based Keychain fallback when no native bridge exists", async () => {
@@ -371,4 +526,92 @@ test("macOS adapter refuses argv-based Keychain fallback when no native bridge e
     backend.replace("target", new TextEncoder().encode("never-on-security-dash-w")),
     (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unavailable",
   );
+});
+
+/**
+ * `createProductionNativeAuthBridges` existed and was correct, but nothing in
+ * `src/` ever called it -- every caller was under `test/`. The synchronous
+ * `createPlatformCredentialBackend` cannot load a signed package, so on Windows
+ * and macOS it returned an unavailable backend unconditionally, and every
+ * authenticated command (including `cuna claude`) failed before reaching the
+ * vault. These cases pin the wiring itself: that a resolved bridge is actually
+ * installed into the backend, and that a refused one fails closed while
+ * carrying the admission error's own message forward.
+ *
+ * Today the release index is empty and the platform packages are unpublished,
+ * so the real resolver always refuses. Injecting the resolver is what makes the
+ * success path observable at all -- without it the wiring would be untestable
+ * until the packages ship, which is how it stayed unwired.
+ */
+function stubCredentialBridge(platform) {
+  const stored = new Map();
+  return Object.freeze({
+    platform,
+    backendId: `${platform}-stub-vault`,
+    transportSecurity: "native_memory_only",
+    read: async (target) => stored.get(target),
+    replace: async (target, value) => void stored.set(target, Uint8Array.from(value)),
+    delete: async (target) => (stored.delete(target) ? "deleted" : "absent"),
+  });
+}
+
+test("a resolved native bridge is installed into the platform credential backend", async () => {
+  for (const platform of ["win32", "darwin"]) {
+    const authority = await resolvePlatformAuthority({
+      platform,
+      nativeBridges: async () => ({
+        platform,
+        architecture: "x64",
+        packageName: "@cuna_labs/cli-native-win32-x64",
+        packageVersion: "0.0.0",
+        credentialBridge: stubCredentialBridge(platform),
+        browserBridge: Object.freeze({ platform, open: async () => {} }),
+      }),
+    });
+    assert.equal(authority.credentials.backendId, `${platform}-stub-vault`, platform);
+    // A live round trip through the bridge, not merely a constructed object:
+    // the previous behaviour also produced a backend, just a dead one.
+    const evidence = await authority.credentials.probe();
+    assert.equal(evidence.status, "verified", `${platform} probe`);
+    assert.equal(evidence.source, "native_bridge_round_trip", `${platform} source`);
+    assert.notEqual(authority.browserBridge, undefined, `${platform} browser bridge`);
+  }
+});
+
+test("a refused native authority fails closed and carries its reason", async () => {
+  const authority = await resolvePlatformAuthority({
+    platform: "win32",
+    nativeBridges: async () => {
+      throw new CredentialBoundaryError({
+        code: "credential_backend_unverified",
+        message: "The installed native authentication package identity does not match this release.",
+      });
+    },
+  });
+  assert.equal(authority.browserBridge, undefined);
+  const evidence = await authority.credentials.probe();
+  assert.equal(evidence.status, "unavailable");
+  // The distinguishing fact: which admission check refused, not just "no vault".
+  assert.equal(
+    evidence.reason,
+    "The installed native authentication package identity does not match this release.",
+  );
+  await assert.rejects(
+    authority.credentials.read("target"),
+    (error) => error instanceof CredentialBoundaryError && error.code === "credential_backend_unavailable",
+  );
+});
+
+test("Linux resolves its own adapter without consulting the native package", async () => {
+  let consulted = false;
+  const authority = await resolvePlatformAuthority({
+    platform: "linux",
+    nativeBridges: async () => {
+      consulted = true;
+      return undefined;
+    },
+  });
+  assert.equal(consulted, false);
+  assert.equal(authority.browserBridge, undefined);
+  assert.equal(authority.credentials.platform, "linux");
 });

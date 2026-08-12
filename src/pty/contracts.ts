@@ -1,4 +1,4 @@
-export const LOCAL_PTY_PROTOCOL = "runa.local-pty.v1" as const;
+export const LOCAL_PTY_PROTOCOL = "cuna.local-pty.v1" as const;
 
 export type PtyEvidenceStatus = "verified" | "unverified" | "unavailable";
 

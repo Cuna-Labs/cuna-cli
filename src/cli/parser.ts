@@ -18,6 +18,13 @@ const BOOLEAN_OPTIONS = new Set([
   "new",
   "new-session",
   "offline",
+  // Legacy compatibility spelling; preview is selected by login or a stored
+  // preview record, and never by an automation API key.
+  "session-only",
+  // `cuna help --all`. Absent from this set, the parser reads it as a
+  // value option, swallows the next token, and answers "Option --all requires
+  // a value" — a usage error about a flag that takes none.
+  "all",
 ]);
 
 function optionName(raw: string): string {
@@ -77,7 +84,7 @@ export function booleanOption(parsed: ParsedInvocation, name: string): boolean {
 }
 
 export function rejectUnknownOptions(parsed: ParsedInvocation, allowed: readonly string[]): void {
-  const allow = new Set([...allowed, "json", "no-color", "profile", "base-url", "config-file", "timeout-ms"]);
+  const allow = new Set([...allowed, "json", "no-color", "profile", "base-url", "config-file", "timeout-ms", "session-only"]);
   const unknown = Object.keys(parsed.options).filter((key) => !allow.has(key));
   if (unknown.length > 0) throw usageError(`Unknown option --${unknown[0]}.`);
 }

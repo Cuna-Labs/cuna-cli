@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_XTERM_CELL_EXTENDERS,
   MAX_XTERM_PENDING_WRITE_BYTES,
   ViewportRegistry,
   XtermViewportAdapter,
@@ -57,6 +58,16 @@ test("VTE reports Unicode display-cell width and the remote cursor state", async
   const visible = await viewport.write(encoder.encode("\u001b[?25h"), 2n, 2n);
   assert.equal(visible.modes.cursorVisible, true);
   viewport.dispose();
+});
+
+test("TC-055-16 VTE rejects pathological cell extenders across split output frames", async () => {
+  const { viewport, registry } = adapter();
+  await viewport.write(encoder.encode(`a${"\u0301".repeat(MAX_XTERM_CELL_EXTENDERS - 1)}`), 1n, 1n);
+  await assert.rejects(
+    viewport.write(encoder.encode("\u0301\u0301"), 2n, 2n),
+    /cell complexity limit/u,
+  );
+  assert.equal(registry.list().length, 0, "a pathological cluster quarantines the viewport");
 });
 
 test("remote OSC title, hyperlink, and clipboard controls stay outside trusted host cells", async () => {
@@ -115,13 +126,24 @@ test("alternate screen and bracketed paste remain tab-local VTE modes", async ()
 test("VTE resize updates the isolated viewport and rejects use after disposal", async () => {
   const { viewport, registry } = adapter();
   await viewport.write(encoder.encode("a line wider than twelve"), 1n, 1n);
-  const resized = viewport.resize(12, 4);
+  const resized = await viewport.resize(12, 4);
   assert.equal(resized.columns, 12);
   assert.equal(resized.rows, 4);
   assert.equal(resized.cells.every((line) => [...line].length <= 12), true);
   viewport.dispose();
   assert.equal(registry.list().length, 0);
   await assert.rejects(viewport.write(encoder.encode("late"), 3n, 2n));
+});
+
+test("local VTE resize serializes behind output and preserves remote sequence truth", async () => {
+  const { viewport } = adapter();
+  const written = await viewport.write(encoder.encode("before resize"), 1n, 1n);
+  const resized = await viewport.resize(20, 4);
+  assert.equal(resized.outputSequence, written.outputSequence);
+  assert.equal(resized.replayCursor, written.replayCursor);
+  const after = await viewport.write(encoder.encode(" after"), 2n, 2n);
+  assert.equal(after.outputSequence, 2n);
+  viewport.dispose();
 });
 
 test("VTE rejects unbounded scrollback before allocating a viewport", () => {
@@ -148,6 +170,17 @@ test("VTE enforces one combined viewport and scrollback cell budget", () => {
     scrollback: 10_000,
   }), /memory budget/u);
   assert.equal(registry.list().length, 0);
+});
+
+test("VTE resize rejects host viewport overflow before mutating dimensions or sequence", async () => {
+  const { viewport } = adapter();
+  const before = viewport.snapshot();
+  await assert.rejects(viewport.resize(1_000, 251), /memory budget/u);
+  const after = viewport.snapshot();
+  assert.equal(after.columns, before.columns);
+  assert.equal(after.rows, before.rows);
+  assert.equal(after.outputSequence, before.outputSequence);
+  viewport.dispose();
 });
 
 test("shared workbench budget caps aggregate rich terminal allocation", () => {

@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { createPkceAuthorization, startLoopbackCallback } from "../dist/index.js";
+import { createBrowserOpener, createPkceAuthorization } from "../dist/index.js";
+import { resolveBrowserCommand } from "../dist/auth/browser.js";
 
-test("PKCE material is independent, bounded, and S256-verifiable", () => {
+test("PKCE material is independent, bounded, and S256-verifiable without a callback listener", () => {
   let marker = 0;
   const material = createPkceAuthorization((size) => {
     marker += 1;
@@ -17,60 +18,50 @@ test("PKCE material is independent, bounded, and S256-verifiable", () => {
   assert.match(material.state, /^[A-Za-z0-9_-]{43,}$/u);
 });
 
-test("loopback callback binds a numeric ephemeral address and accepts one matching response", async () => {
-  const state = "s".repeat(43);
-  const listener = await startLoopbackCallback({ expectedState: state, timeoutMs: 1_000 });
-  assert.match(listener.redirectUri, /^http:\/\/127\.0\.0\.1:\d+\/oauth\/callback$/u);
-  const response = await fetch(`${listener.redirectUri}?code=opaque-code&state=${state}`);
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get("cache-control"), "no-store");
-  assert.deepEqual(await listener.completion, { code: "opaque-code" });
-  await assert.rejects(fetch(`${listener.redirectUri}?code=replay&state=${state}`));
+test("browser handoff requires signed native authority on Windows and macOS and pins Linux xdg-open", () => {
+  const url = "https://app.getcuna.com/cli/continue#opaque";
+  assert.throws(
+    () => resolveBrowserCommand("win32", url, { SystemRoot: "C:\\Windows" }),
+    /approved signed native adapter/u,
+  );
+  assert.throws(
+    () => resolveBrowserCommand("darwin", url, {}),
+    /approved signed native adapter/u,
+  );
+  assert.deepEqual(resolveBrowserCommand("linux", url, {}), {
+    executable: "/usr/bin/xdg-open",
+    args: [url],
+    cwd: "/",
+  });
 });
 
-test("wrong state is rejected and closes the listener without retaining a code", async () => {
-  const listener = await startLoopbackCallback({ expectedState: "a".repeat(43), timeoutMs: 1_000 });
-  const completion = listener.completion.catch((error) => error);
-  const response = await fetch(`${listener.redirectUri}?code=secret-code&state=${"b".repeat(43)}`);
-  assert.equal(response.status, 400);
-  const error = await completion;
-  assert.equal(error.code, "runa.auth.state_mismatch");
-  assert.equal(JSON.stringify(error).includes("secret-code"), false);
+test("macOS browser handoff uses only a platform-bound admitted native bridge", async () => {
+  const url = "https://app.getcuna.com/cli/continue#opaque";
+  const opened = [];
+  const native = Object.freeze({
+    platform: "darwin",
+    open: async (value) => { opened.push(value); },
+  });
+  await createBrowserOpener("darwin", {}, native).open(url);
+  assert.deepEqual(opened, [url]);
+  assert.throws(
+    () => createBrowserOpener("darwin", {}, { ...native, platform: "win32" }).open(url),
+    /platform binding does not match/u,
+  );
 });
 
-test("IPv6 loopback remains numeric and state-bound when the host supports it", async (context) => {
-  const state = "v".repeat(43);
-  let listener;
-  try {
-    listener = await startLoopbackCallback({ expectedState: state, timeoutMs: 1_000, host: "::1" });
-  } catch (error) {
-    if (error?.code === "EADDRNOTAVAIL" || error?.code === "EAFNOSUPPORT") {
-      context.skip("IPv6 loopback is unavailable on this host");
-      return;
-    }
-    throw error;
+test("browser handoff rejects control-bearing and oversized URLs before every platform effect", async () => {
+  const opened = [];
+  const native = Object.freeze({
+    platform: "darwin",
+    open: async (value) => { opened.push(value); },
+  });
+  for (const url of [
+    "http://app.getcuna.com/cli/continue",
+    "https://app.getcuna.com/cli/continue\n",
+    `https://app.getcuna.com/cli/continue?state=${"a".repeat(8_192)}`,
+  ]) {
+    assert.throws(() => createBrowserOpener("darwin", {}, native).open(url), /bounded HTTPS/u);
   }
-  assert.match(listener.redirectUri, /^http:\/\/\[::1\]:\d+\/oauth\/callback$/u);
-  const response = await fetch(`${listener.redirectUri}?code=ipv6-code&state=${state}`);
-  assert.equal(response.status, 200);
-  assert.deepEqual(await listener.completion, { code: "ipv6-code" });
-});
-
-test("duplicate or unexpected callback parameters fail closed", async () => {
-  const state = "d".repeat(43);
-  const listener = await startLoopbackCallback({ expectedState: state, timeoutMs: 1_000 });
-  const completion = listener.completion.catch((error) => error);
-  const response = await fetch(`${listener.redirectUri}?code=one&code=two&state=${state}`);
-  assert.equal(response.status, 400);
-  assert.equal((await completion).code, "runa.auth.callback_invalid");
-});
-
-test("timeout and cancellation are terminal and leave no listening callback", async () => {
-  const timeout = await startLoopbackCallback({ expectedState: "t".repeat(43), timeoutMs: 10 });
-  await assert.rejects(timeout.completion, (error) => error.code === "runa.auth.timeout");
-  await assert.rejects(fetch(`${timeout.redirectUri}?code=late&state=${"t".repeat(43)}`));
-
-  const cancelled = await startLoopbackCallback({ expectedState: "c".repeat(43), timeoutMs: 1_000 });
-  cancelled.cancel();
-  await assert.rejects(cancelled.completion, (error) => error.code === "runa.auth.cancelled");
+  assert.deepEqual(opened, []);
 });

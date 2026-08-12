@@ -14,24 +14,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  governance:
-    name: repository-governance
+  public-controls:
+    name: public-repository-controls
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22.17.1
-      - run: node scripts/verify-repository-governance.mjs
-      - run: node --test scripts/scaffolding-negative-controls.test.mjs
+      - run: node --test scripts/release-negative-controls.test.mjs
       - run: node scripts/verify-release-envelope.mjs --self-test true
 
   source-gates:
-    name: source-quality-gates
-    needs: governance
+    name: source-quality-node-${{ matrix.node }}
+    needs: public-controls
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22.17.1, 24.4.1]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -40,11 +44,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22.17.1
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm install --global npm@11.4.2
-      - run: node scripts/verify-ci-contract.mjs
       - run: npm ci --ignore-scripts
+      - run: node scripts/verify-ci-contract.mjs
       - run: node scripts/verify-dependency-policy.mjs
       - run: npm ls --all
       - run: npm audit --audit-level=high
@@ -53,13 +57,119 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  # The branch ruleset requires a check literally named `source-quality-gates`.
+  # `source-gates` is a matrix, so it can only ever emit
+  # `source-quality-node-<version>` -- one check per Node line, and no check
+  # under the required name. With zero bypass actors that made every pull
+  # request unmergeable. This job is the single stable name the ruleset can
+  # name; it carries no gate logic of its own and exists only to collapse the
+  # matrix result. `if: always()` is required so the job still reports when a
+  # lane fails, and any result other than `success` -- including `skipped`,
+  # which is what a failure in `public-controls` produces -- fails it.
+  source-quality-gates:
+    name: source-quality-gates
+    if: always()
+    needs: source-gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every Node source-quality lane to have succeeded
+        env:
+          SOURCE_GATES_RESULT: ${{ needs.source-gates.result }}
+        run: |
+          echo "source-gates aggregate result: ${SOURCE_GATES_RESULT}"
+          if [ "${SOURCE_GATES_RESULT}" != "success" ]; then
+            echo "::error::source-quality gates did not succeed (${SOURCE_GATES_RESULT})."
+            exit 1
+          fi
+
+  native-source-gates:
+    name: native-source-${{ matrix.id }}
+    needs: public-controls
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64
+            runner: ubuntu-24.04
+          - id: windows-x64
+            runner: windows-2025
+          - id: macos-x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install the exact native toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+      - run: cargo +1.97.1 fmt --all -- --check
+        working-directory: native
+      - run: cargo +1.97.1 check --workspace --all-targets --locked
+        working-directory: native
+      - run: cargo +1.97.1 test --workspace --locked
+        working-directory: native
+      - run: cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings
+        working-directory: native
+
+  native-evidence-gates:
+    name: native-evidence-windows-x64
+    needs: native-source-gates
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Install the exact native toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build the local non-release native artifact
+        run: cargo +1.97.1 build --workspace --release --locked
+        working-directory: native
+      - name: Capture Authenticode, version-resource, digest, and ACL observations
+        shell: pwsh
+        run: >-
+          ./scripts/capture-native-windows-identity.ps1
+          -Executable native/target/release/cuna-native-bridge.exe
+          -Output evidence/native-identity.json
+      - name: Generate content-addressed native SBOM and provenance evidence
+        run: >-
+          node scripts/generate-native-release-evidence.mjs
+          --binary native/target/release/cuna-native-bridge.exe
+          --identity evidence/native-identity.json
+          --output evidence/native-local
+      - name: Verify local evidence remains explicitly non-admissible
+        run: node scripts/verify-native-release-evidence.mjs --evidence evidence/native-local
+      - name: Prove production admission rejects the unsigned local artifact
+        shell: pwsh
+        run: |
+          $output = & node scripts/verify-native-release-evidence.mjs --evidence evidence/native-local --require-production true --publisher-fingerprint AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 2>&1
+          if ($LASTEXITCODE -eq 0) { throw 'Unsigned local native evidence was admitted.' }
+          if (($output -join "`n") -notmatch 'Unsigned/local manifest is not production-admissible') {
+            throw 'Native production negative control failed for an unrelated reason.'
+          }
+          exit 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: local-native-nonrelease-evidence
+          path: evidence/native-local/
+          if-no-files-found: error
+          retention-days: 7
+
   candidate:
     name: immutable-candidate
-    needs: source-gates
+    needs: [source-gates, native-source-gates, native-evidence-gates]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      required_matrix: ${{ steps.matrix.outputs.required_matrix }}
+      observation_matrix: ${{ steps.matrix.outputs.observation_matrix }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -71,6 +181,17 @@ jobs:
       - run: npm install --global npm@11.4.2
       - run: npm ci --ignore-scripts
       - run: npm run build
+      - name: Capture the exact hosted runner identity
+        id: toolchain
+        shell: bash
+        run: echo "runner=${ImageOS:-ubuntu24}:${ImageVersion:-unknown}:${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+      - name: Bind lockfile, dependency, contract, recipe, toolchain, and payload inputs
+        run: >-
+          node scripts/build-release-inputs.mjs
+          --source-commit "${{ github.sha }}"
+          --npm-version "$(npm --version)"
+          --runner "${{ steps.toolchain.outputs.runner }}"
+          --output evidence/release-inputs.json
       - name: Build one package tarball without lifecycle scripts
         id: pack
         shell: bash
@@ -83,17 +204,20 @@ jobs:
         shell: bash
         run: |
           mkdir -p evidence
-          npm sbom --sbom-format cyclonedx > evidence/sbom.cdx.json
+          npm sbom --sbom-format cyclonedx --omit=dev > evidence/sbom.cdx.json
           node -e "const s=require('./evidence/sbom.cdx.json');if(s.bomFormat!=='CycloneDX')process.exit(1)"
       - name: Bind candidate identity
         run: >-
           node scripts/build-release-envelope.mjs
           --tarball "${{ steps.pack.outputs.file }}"
           --sbom evidence/sbom.cdx.json
+          --release-inputs evidence/release-inputs.json
           --version "$(node -p "require('./package.json').version")"
           --source-commit "${{ github.sha }}"
           --run-id "${{ github.run_id }}"
           --run-attempt "${{ github.run_attempt }}"
+          --npm-version "$(npm --version)"
+          --runner "${{ steps.toolchain.outputs.runner }}"
       - run: node scripts/verify-release-envelope.mjs
       - name: Generate all fail-closed distribution projections
         run: >-
@@ -111,12 +235,14 @@ jobs:
         shell: bash
         run: |
           sh -n release-artifacts/distributions/curl/install.sh
-          ruby -c release-artifacts/distributions/homebrew/runa.rb
+          ruby -c release-artifacts/distributions/homebrew/cuna.rb
           bash -n release-artifacts/distributions/aur/PKGBUILD
       - name: Export exact support matrix
         id: matrix
         shell: bash
-        run: echo "matrix=$(node -e "const p=require('./packaging/support-policy.json');process.stdout.write(JSON.stringify({include:p.ciMatrix}))")" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "required_matrix=$(node -e 'const p=require("./packaging/support-policy.json");process.stdout.write(JSON.stringify({include:p.ciMatrix.filter((entry)=>entry.claim!=="observation-only")}))')" >> "$GITHUB_OUTPUT"
+          echo "observation_matrix=$(node -e 'const p=require("./packaging/support-policy.json");process.stdout.write(JSON.stringify({include:p.ciMatrix.filter((entry)=>entry.claim==="observation-only")}))')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-candidate
@@ -129,7 +255,7 @@ jobs:
     needs: candidate
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.candidate.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.candidate.outputs.required_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -150,6 +276,76 @@ jobs:
         with:
           name: platform-${{ matrix.id }}
           path: evidence/platform-receipts/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  observed-artifact:
+    name: observed-${{ matrix.id }}
+    needs: candidate
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.candidate.outputs.observation_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --global npm@11.4.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          path: release-artifacts
+      - run: node scripts/verify-release-envelope.mjs
+      - run: node scripts/verify-installed-candidate.mjs --receipt "evidence/observation-receipts/${{ matrix.id }}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: observation-${{ matrix.id }}
+          path: evidence/observation-receipts/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  observation-summary:
+    name: non-authorizing-observation-summary
+    if: always()
+    needs: [candidate, observed-artifact]
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - if: needs.candidate.result == 'success'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - if: needs.candidate.result == 'success'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+      - if: needs.candidate.result == 'success'
+        run: npm ci --ignore-scripts
+      - if: needs.candidate.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          path: release-artifacts
+      - if: needs.candidate.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: observation-*
+          path: evidence/observation-receipts
+          merge-multiple: true
+      - if: needs.candidate.result == 'success'
+        run: node scripts/summarize-observation-receipts.mjs
+      - if: needs.candidate.result == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: observation-summary
+          path: evidence/observation-summary.json
           if-no-files-found: error
           retention-days: 14
 
@@ -228,7 +424,7 @@ jobs:
           sbom-path: release-artifacts/sbom.cdx.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: admitted-release-candidate
+          name: release-review-candidate
           path: |
             release-artifacts/
             evidence/admission.json

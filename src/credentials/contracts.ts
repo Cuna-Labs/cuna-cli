@@ -1,6 +1,6 @@
 import type { SecretMaterial } from "./secret-material.js";
 
-export const CREDENTIAL_BACKEND_PROTOCOL = "runa.secure-vault.v1" as const;
+export const CREDENTIAL_BACKEND_PROTOCOL = "cuna.secure-vault.v1" as const;
 
 export interface CredentialBinding {
   readonly profileId: string;
@@ -9,7 +9,12 @@ export interface CredentialBinding {
   readonly kind: string;
 }
 
-export type CredentialBackendStatus = "verified" | "unavailable" | "unknown";
+/**
+ * `preview` is deliberately not a native security claim. It is only accepted
+ * by an explicitly constructed preview vault and therefore cannot satisfy the
+ * GA native-auth readiness gate.
+ */
+export type CredentialBackendStatus = "verified" | "preview" | "unavailable" | "unknown";
 
 export interface CredentialBackendEvidence {
   readonly protocol: typeof CREDENTIAL_BACKEND_PROTOCOL;
@@ -18,7 +23,7 @@ export interface CredentialBackendEvidence {
   readonly status: CredentialBackendStatus;
   readonly observedAt: number;
   readonly expiresAt: number;
-  readonly source: "live_round_trip" | "native_bridge_round_trip" | "backend_absent" | "probe_failed";
+  readonly source: "live_round_trip" | "native_bridge_round_trip" | "local_file_preview" | "backend_absent" | "probe_failed";
   readonly reason?: string;
 }
 
@@ -59,7 +64,7 @@ export type CredentialRefreshResult =
   | { readonly status: "rejected" };
 
 export interface NativeCredentialBridge {
-  readonly platform: "darwin";
+  readonly platform: "win32" | "darwin";
   readonly backendId: string;
   readonly transportSecurity: "native_memory_only";
   read(target: string): Promise<Uint8Array | undefined>;

@@ -1,6 +1,6 @@
 import { TextDecoder, TextEncoder } from "node:util";
 
-export const DAEMON_PROTOCOL = "runa.daemon.v1" as const;
+export const DAEMON_PROTOCOL = "cuna.daemon.v1" as const;
 export const DAEMON_PROTOCOL_VERSION = 1 as const;
 export const MAX_IPC_FRAME_BYTES = 1024 * 1024;
 export const MAX_IPC_BUFFER_BYTES = MAX_IPC_FRAME_BYTES * 2;

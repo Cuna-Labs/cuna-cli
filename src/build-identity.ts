@@ -4,7 +4,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const packageEntries = ["LICENSE", "NOTICE", "README.md", "package.json", "dist"] as const;
+const packageEntries = [
+  "LICENSE",
+  "NOTICE",
+  "README.md",
+  "THIRD_PARTY_NOTICES.md",
+  "package.json",
+  "dist",
+  "node_modules/@xterm/headless",
+] as const;
 
 async function collectFiles(relativePath: string): Promise<string[]> {
   const absolutePath = path.join(packageRoot, relativePath);
@@ -25,11 +33,27 @@ async function collectFiles(relativePath: string): Promise<string[]> {
 }
 
 let cachedDigest: Promise<string> | undefined;
+let cachedManifest: Promise<PackageBuildManifest> | undefined;
 
-export function packageBuildDigest(): Promise<string> {
-  cachedDigest ??= (async () => {
+export interface PackageBuildManifestEntry {
+  readonly file: string;
+  readonly size: number;
+  readonly sha256: string;
+}
+
+export interface PackageBuildManifest {
+  readonly schemaVersion: 1;
+  readonly algorithm: "cuna-package-payload-v1";
+  readonly fileCount: number;
+  readonly files: readonly PackageBuildManifestEntry[];
+  readonly sha256: string;
+}
+
+export function packageBuildManifest(): Promise<PackageBuildManifest> {
+  cachedManifest ??= (async () => {
     const files = (await Promise.all(packageEntries.map(collectFiles))).flat().sort();
     const hash = createHash("sha256");
+    const entries: PackageBuildManifestEntry[] = [];
     for (const relativePath of files) {
       const content = await readFile(path.join(packageRoot, relativePath));
       hash.update(relativePath, "utf8");
@@ -38,11 +62,27 @@ export function packageBuildDigest(): Promise<string> {
       hash.update("\0");
       hash.update(content);
       hash.update("\0");
+      entries.push(Object.freeze({
+        file: relativePath,
+        size: content.byteLength,
+        sha256: createHash("sha256").update(content).digest("hex"),
+      }));
     }
-    return hash.digest("hex");
+    return Object.freeze({
+      schemaVersion: 1 as const,
+      algorithm: "cuna-package-payload-v1" as const,
+      fileCount: entries.length,
+      files: Object.freeze(entries),
+      sha256: hash.digest("hex"),
+    });
   })();
+  return cachedManifest;
+}
+
+export function packageBuildDigest(): Promise<string> {
+  cachedDigest ??= packageBuildManifest().then((manifest) => manifest.sha256);
   return cachedDigest;
 }
 
-export const UPDATE_CHANNEL = "npm" as const;
+export const ARTIFACT_CHANNEL = "npm" as const;
 export const PROTOCOL_RANGE = Object.freeze({ minimum: "1", maximum: "1" });
