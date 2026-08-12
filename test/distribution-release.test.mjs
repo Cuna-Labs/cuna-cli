@@ -37,7 +37,7 @@ async function createFixture() {
     packageName: "@runa_laboratories/cli",
     version,
     sourceCommit: "a".repeat(40),
-    repository: "Runa-Laboratories/runa-cli",
+    repository: "Cuna-Labs/cuna-cli",
     registry: "https://registry.npmjs.org",
     tarball: {
       file: tarballFile,
