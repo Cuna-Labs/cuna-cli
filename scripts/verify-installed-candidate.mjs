@@ -13,7 +13,8 @@ const envelope = await readJson(path.join(root, "release-envelope.json"));
 await verifyEnvelopeFiles(envelope, root);
 
 const prefix = await mkdtemp(path.join(tmpdir(), "runa-cli-install-"));
-await execute("npm", ["install", "--global", "--ignore-scripts", "--prefix", prefix, path.join(root, envelope.tarball.file)], {
+const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+await execute(npmCommand, ["install", "--global", "--ignore-scripts", "--prefix", prefix, path.join(root, envelope.tarball.file)], {
   windowsHide: true,
   timeout: 180_000,
   maxBuffer: 8 * 1024 * 1024,

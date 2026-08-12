@@ -128,6 +128,11 @@ test("npm SBOM folder names remain bound by the canonical package purl and bom-r
   assert.equal(result.decision, "BLOCKED");
 });
 
+test("installed candidate uses the Windows npm command name when applicable", async () => {
+  const source = await readFile(path.join(repositoryRoot, "scripts", "verify-installed-candidate.mjs"), "utf8");
+  assert.match(source, /process\.platform === "win32" \? "npm\.cmd" : "npm"/);
+});
+
 test("local projection evidence cannot be relabeled as a live channel", async () => {
   const fixture = await createFixture();
   await project(fixture);
