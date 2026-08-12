@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -13,8 +13,11 @@ const envelope = await readJson(path.join(root, "release-envelope.json"));
 await verifyEnvelopeFiles(envelope, root);
 
 const prefix = await mkdtemp(path.join(tmpdir(), "runa-cli-install-"));
-const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-await execute(npmCommand, ["install", "--global", "--ignore-scripts", "--prefix", prefix, path.join(root, envelope.tarball.file)], {
+const npmArgs = ["install", "--global", "--ignore-scripts", "--prefix", prefix, path.join(root, envelope.tarball.file)];
+const npmInvocation = process.platform === "win32"
+  ? await resolveWindowsNpm()
+  : { command: "npm", args: [] };
+await execute(npmInvocation.command, [...npmInvocation.args, ...npmArgs], {
   windowsHide: true,
   timeout: 180_000,
   maxBuffer: 8 * 1024 * 1024,
@@ -54,3 +57,12 @@ await writeFile(
   { flag: "wx" },
 );
 process.stdout.write(`${JSON.stringify({ status: "installed-artifact-verified", platform: process.platform, architecture: process.arch })}\n`);
+
+async function resolveWindowsNpm() {
+  const where = await execute("where.exe", ["npm.cmd"], { windowsHide: true, timeout: 10_000 });
+  const npmCommand = where.stdout.split(/\r?\n/).map((value) => value.trim()).find(Boolean);
+  invariant(npmCommand, "npm.cmd could not be resolved from PATH");
+  const npmCli = path.join(path.dirname(npmCommand), "node_modules", "npm", "bin", "npm-cli.js");
+  await stat(npmCli);
+  return { command: process.execPath, args: [npmCli] };
+}
