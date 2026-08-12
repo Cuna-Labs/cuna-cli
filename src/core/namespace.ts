@@ -32,12 +32,16 @@ export const CREDENTIAL_BRANDS = Object.freeze(["cuna", DEPLOYED_WIRE_COMPATIBIL
 export type CredentialBrand = (typeof CREDENTIAL_BRANDS)[number];
 
 /**
- * Configuration environment variables are Cuna-only. Earlier-brand credential
- * bytes remain accepted through the deployed wire authority, but no earlier
- * environment-variable name was ever published.
+ * Configuration names are Cuna-only except for `RUNA_API_KEY`, the published
+ * automation alias from the earlier CLI. The canonical name is first so its
+ * presence always wins, including when its value is empty or malformed; a
+ * broken canonical credential must never fall through to stale legacy
+ * authority. No other earlier-brand configuration name is admitted.
  */
 export function brandedEnvironmentNames(suffix: string): readonly string[] {
-  return Object.freeze([`CUNA_${suffix}`]);
+  return suffix === "API_KEY"
+    ? Object.freeze(["CUNA_API_KEY", DEPLOYED_WIRE_COMPATIBILITY.apiKeyEnvironment])
+    : Object.freeze([`CUNA_${suffix}`]);
 }
 
 /** One environment read, carrying the name that actually supplied the value. */
