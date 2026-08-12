@@ -138,12 +138,34 @@ revocation path, and admission authority. Until those artifacts exist and pass
 their platform gates, `SIGNED_PLATFORM_CREDENTIAL_BROWSER_BRIDGES_MISSING`
 remains a mandatory release blocker; arm64 observations are non-authorizing.
 
-Windows native credential and browser operations also remain unavailable for
-release until a native authority owns the `CreateProcessW` process handle from
-creation through loaded-image verification and protected-stdin handoff. A PID,
-an executable-path recheck, or a second helper process cannot prove this
-process-instance identity. The mandatory blocker is
-`WINDOWS_OWNED_PROCESS_HANDLE_IDENTITY_AUTHORITY_MISSING`.
+The source authority now owns the `CreateProcessW` process handle from suspended
+creation through loaded-image verification and protected-stdin handoff. That
+does not authorize release by itself: Node still needs an independently trusted
+loader for the authority addon. A PID, a path recheck, or addon self-attestation
+cannot bootstrap that trust. The remaining mandatory blocker is
+`WINDOWS_SIGNED_SYSTEM_COMPONENT_LOADER_AUTHORITY_MISSING`.
+
+### Windows system-component boundary
+
+The canonical npm package cannot itself authorize Windows native authentication.
+An npm-global directory is owned by the interactive user, and install lifecycle
+scripts are prohibited; copying a `.node` addon from that directory into another
+location would preserve neither installer ownership nor an immutable identity.
+
+`windows-native-system-component.json` is the closed installation contract. A
+future Windows release must use a separately signed MSI to install the signed
+`cuna` launcher and native authority below the operating-system
+`FOLDERID_ProgramFiles\\Cuna` root. The launcher must obtain that known folder
+from Windows rather than an environment variable, retain no-write/no-delete
+handles for every ancestor and artifact across hashing and loading, and prove
+the loaded module's volume/file identity before any protected input is released.
+The npm shim may forward to that admitted launcher, but it may not install,
+repair, replace, or self-attest the system component.
+
+The contract remains `UNCONFIGURED_BLOCKING`, the native release index remains
+empty, and interactive authentication remains unavailable until a signed MSI,
+Authenticode identities, installed-artifact receipts, mutation tests, rollback,
+and uninstall/zero-residue evidence exist for the exact release candidate.
 
 ```bash
 node scripts/verify-distribution-receipts.mjs \
