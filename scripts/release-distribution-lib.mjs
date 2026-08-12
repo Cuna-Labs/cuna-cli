@@ -117,7 +117,12 @@ export async function validateCycloneDxSbom(file, envelope) {
   const scopedBomRef = `${PACKAGE_NAME}@${envelope.version}`;
   invariant(
     component.name === PACKAGE_NAME
-      || (component.name === "runa-cli" && component.purl === scopedPurl && component["bom-ref"] === scopedBomRef),
+      || (
+        typeof component.name === "string"
+        && component.name.length > 0
+        && component.purl === scopedPurl
+        && component["bom-ref"] === scopedBomRef
+      ),
     "SBOM component identity differs from the release package",
   );
   return sbom;

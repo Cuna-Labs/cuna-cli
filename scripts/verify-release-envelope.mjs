@@ -16,7 +16,7 @@ if (args.get("self-test") === "true") {
     packageName: "@runa_laboratories/cli",
     version: "1.2.3-test.1",
     sourceCommit: "a".repeat(40),
-    repository: "Runa-Laboratories/runa-cli",
+    repository: "Cuna-Labs/cuna-cli",
     registry: "https://registry.npmjs.org",
     tarball: {
       file: "runa.tgz",
