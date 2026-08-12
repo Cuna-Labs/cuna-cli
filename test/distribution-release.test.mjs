@@ -37,7 +37,7 @@ async function createFixture() {
     packageName: "@runa_laboratories/cli",
     version,
     sourceCommit: "a".repeat(40),
-    repository: "Runa-Laboratories/runa-cli",
+    repository: "Cuna-Labs/cuna-cli",
     registry: "https://registry.npmjs.org",
     tarball: {
       file: tarballFile,
@@ -112,6 +112,29 @@ test("a syntactically valid but semantically mismatched SBOM is rejected", async
   fixture.envelope.sbom.sha256 = await sha256File(sbomFile);
   await writeFile(path.join(fixture.evidence, "release-envelope.json"), `${JSON.stringify(fixture.envelope, null, 2)}\n`);
   await assert.rejects(project(fixture), /SBOM component version differs/);
+});
+
+test("npm SBOM folder names remain bound by the canonical package purl and bom-ref", async () => {
+  const fixture = await createFixture();
+  const sbomFile = path.join(fixture.evidence, fixture.envelope.sbom.file);
+  const sbom = JSON.parse(await readFile(sbomFile, "utf8"));
+  sbom.metadata.component.name = "cuna-cli";
+  sbom.metadata.component.purl = "pkg:npm/%40runa_laboratories/cli@1.2.3-preview.1";
+  sbom.metadata.component["bom-ref"] = "@runa_laboratories/cli@1.2.3-preview.1";
+  await writeFile(sbomFile, `${JSON.stringify(sbom)}\n`);
+  fixture.envelope.sbom.sha256 = await sha256File(sbomFile);
+  await writeFile(path.join(fixture.evidence, "release-envelope.json"), `${JSON.stringify(fixture.envelope, null, 2)}\n`);
+  const result = JSON.parse((await project(fixture)).stdout);
+  assert.equal(result.decision, "BLOCKED");
+});
+
+test("installed candidate resolves npm-cli.js on Windows without shell execution", async () => {
+  const source = await readFile(path.join(repositoryRoot, "scripts", "verify-installed-candidate.mjs"), "utf8");
+  assert.match(source, /where\.exe/);
+  assert.match(source, /node_modules.*npm.*npm-cli\.js/s);
+  assert.match(source, /node_modules.*@runa_laboratories.*cli.*dist.*bin.*runa\.js/s);
+  assert.match(source, /executableCommand = process\.platform === "win32" \? process\.execPath : executable/);
+  assert.doesNotMatch(source, /shell:\s*true/);
 });
 
 test("local projection evidence cannot be relabeled as a live channel", async () => {

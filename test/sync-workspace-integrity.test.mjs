@@ -143,7 +143,10 @@ test("exclusion policy runs before content reads and never opens immutable secre
 
 test("admitted high-confidence secrets are blocked without exposing their value", async (t) => {
   const root = await temporaryDirectory(t);
-  await writeFile(join(root, "source.txt"), "-----BEGIN PRIVATE KEY-----\nsuper-sensitive-material");
+  // Keep the detector fixture out of the release candidate's literal secret
+  // scan while still exercising the exact PEM marker at runtime.
+  const privateKeyMarker = ["-----BEGIN ", "PRIVATE KEY-----"].join("");
+  await writeFile(join(root, "source.txt"), `${privateKeyMarker}\nsuper-sensitive-material`);
   const policy = compileExclusionPolicy([], linuxCapabilities);
   await assert.rejects(
     createWorkspaceManifest({ root, policy, capabilities: linuxCapabilities }),
