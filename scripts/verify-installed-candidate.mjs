@@ -22,9 +22,13 @@ await execute(npmInvocation.command, [...npmInvocation.args, ...npmArgs], {
   timeout: 180_000,
   maxBuffer: 8 * 1024 * 1024,
 });
-const executable = process.platform === "win32" ? path.join(prefix, "runa.cmd") : path.join(prefix, "bin", "runa");
-const selfTest = await execute(executable, ["self-test", "--offline", "--json"], { windowsHide: true, timeout: 30_000 });
-const version = await execute(executable, ["version", "--json"], { windowsHide: true, timeout: 30_000 });
+const executable = process.platform === "win32"
+  ? path.join(prefix, "node_modules", "@runa_laboratories", "cli", "dist", "bin", "runa.js")
+  : path.join(prefix, "bin", "runa");
+const executableCommand = process.platform === "win32" ? process.execPath : executable;
+const executableArgs = process.platform === "win32" ? [executable] : [];
+const selfTest = await execute(executableCommand, [...executableArgs, "self-test", "--offline", "--json"], { windowsHide: true, timeout: 30_000 });
+const version = await execute(executableCommand, [...executableArgs, "version", "--json"], { windowsHide: true, timeout: 30_000 });
 const selfTestJson = JSON.parse(selfTest.stdout);
 const versionJson = JSON.parse(version.stdout);
 invariant(selfTestJson.schema_version === "1" && selfTestJson.type === "result" && selfTestJson.command === "self-test", "Self-test envelope is invalid");

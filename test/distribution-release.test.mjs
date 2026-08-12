@@ -132,6 +132,8 @@ test("installed candidate resolves npm-cli.js on Windows without shell execution
   const source = await readFile(path.join(repositoryRoot, "scripts", "verify-installed-candidate.mjs"), "utf8");
   assert.match(source, /where\.exe/);
   assert.match(source, /node_modules.*npm.*npm-cli\.js/s);
+  assert.match(source, /node_modules.*@runa_laboratories.*cli.*dist.*bin.*runa\.js/s);
+  assert.match(source, /executableCommand = process\.platform === "win32" \? process\.execPath : executable/);
   assert.doesNotMatch(source, /shell:\s*true/);
 });
 
