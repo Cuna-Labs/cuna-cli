@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   governance:
-    name: repository-governance
+    name: public-repository-controls
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
