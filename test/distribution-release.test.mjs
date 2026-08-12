@@ -114,6 +114,20 @@ test("a syntactically valid but semantically mismatched SBOM is rejected", async
   await assert.rejects(project(fixture), /SBOM component version differs/);
 });
 
+test("npm SBOM folder names remain bound by the canonical package purl and bom-ref", async () => {
+  const fixture = await createFixture();
+  const sbomFile = path.join(fixture.evidence, fixture.envelope.sbom.file);
+  const sbom = JSON.parse(await readFile(sbomFile, "utf8"));
+  sbom.metadata.component.name = "cuna-cli";
+  sbom.metadata.component.purl = "pkg:npm/%40runa_laboratories/cli@1.2.3-preview.1";
+  sbom.metadata.component["bom-ref"] = "@runa_laboratories/cli@1.2.3-preview.1";
+  await writeFile(sbomFile, `${JSON.stringify(sbom)}\n`);
+  fixture.envelope.sbom.sha256 = await sha256File(sbomFile);
+  await writeFile(path.join(fixture.evidence, "release-envelope.json"), `${JSON.stringify(fixture.envelope, null, 2)}\n`);
+  const result = JSON.parse((await project(fixture)).stdout);
+  assert.equal(result.decision, "BLOCKED");
+});
+
 test("local projection evidence cannot be relabeled as a live channel", async () => {
   const fixture = await createFixture();
   await project(fixture);
