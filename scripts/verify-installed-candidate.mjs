@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -13,14 +13,22 @@ const envelope = await readJson(path.join(root, "release-envelope.json"));
 await verifyEnvelopeFiles(envelope, root);
 
 const prefix = await mkdtemp(path.join(tmpdir(), "runa-cli-install-"));
-await execute("npm", ["install", "--global", "--ignore-scripts", "--prefix", prefix, path.join(root, envelope.tarball.file)], {
+const npmArgs = ["install", "--global", "--ignore-scripts", "--prefix", prefix, path.join(root, envelope.tarball.file)];
+const npmInvocation = process.platform === "win32"
+  ? await resolveWindowsNpm()
+  : { command: "npm", args: [] };
+await execute(npmInvocation.command, [...npmInvocation.args, ...npmArgs], {
   windowsHide: true,
   timeout: 180_000,
   maxBuffer: 8 * 1024 * 1024,
 });
-const executable = process.platform === "win32" ? path.join(prefix, "runa.cmd") : path.join(prefix, "bin", "runa");
-const selfTest = await execute(executable, ["self-test", "--offline", "--json"], { windowsHide: true, timeout: 30_000 });
-const version = await execute(executable, ["version", "--json"], { windowsHide: true, timeout: 30_000 });
+const executable = process.platform === "win32"
+  ? path.join(prefix, "node_modules", "@runa_laboratories", "cli", "dist", "bin", "runa.js")
+  : path.join(prefix, "bin", "runa");
+const executableCommand = process.platform === "win32" ? process.execPath : executable;
+const executableArgs = process.platform === "win32" ? [executable] : [];
+const selfTest = await execute(executableCommand, [...executableArgs, "self-test", "--offline", "--json"], { windowsHide: true, timeout: 30_000 });
+const version = await execute(executableCommand, [...executableArgs, "version", "--json"], { windowsHide: true, timeout: 30_000 });
 const selfTestJson = JSON.parse(selfTest.stdout);
 const versionJson = JSON.parse(version.stdout);
 invariant(selfTestJson.schema_version === "1" && selfTestJson.type === "result" && selfTestJson.command === "self-test", "Self-test envelope is invalid");
@@ -53,3 +61,12 @@ await writeFile(
   { flag: "wx" },
 );
 process.stdout.write(`${JSON.stringify({ status: "installed-artifact-verified", platform: process.platform, architecture: process.arch })}\n`);
+
+async function resolveWindowsNpm() {
+  const where = await execute("where.exe", ["npm.cmd"], { windowsHide: true, timeout: 10_000 });
+  const npmCommand = where.stdout.split(/\r?\n/).map((value) => value.trim()).find(Boolean);
+  invariant(npmCommand, "npm.cmd could not be resolved from PATH");
+  const npmCli = path.join(path.dirname(npmCommand), "node_modules", "npm", "bin", "npm-cli.js");
+  await stat(npmCli);
+  return { command: process.execPath, args: [npmCli] };
+}
