@@ -1,6 +1,7 @@
 export * from "./contracts.js";
 export * from "./errors.js";
 export * from "./linux-secret-service.js";
+export * from "./local-session.js";
 export * from "./native-bridge-backend.js";
 export * from "./native-admission.js";
 export * from "./native-process-bridge.js";

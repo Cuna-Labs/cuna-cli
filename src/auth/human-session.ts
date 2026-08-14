@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { EffectiveConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { automationCredentialHint } from "../core/product-web.js";
-import { isRefreshToken } from "../core/namespace.js";
+import { isLoginCode } from "../core/namespace.js";
 import type { CredentialBinding } from "../credentials/contracts.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { SecretMaterial } from "../credentials/secret-material.js";
@@ -29,6 +29,10 @@ interface StoredHumanSession {
   readonly sessionId: string;
   readonly refreshToken: string;
   readonly refreshExpiresAt: string;
+  readonly continuationId: string;
+  readonly state: string;
+  readonly codeVerifier: string;
+  readonly redirectUri: string;
   readonly context: CliIdentityContext;
   readonly intentClass: CliIntentClass;
 }
@@ -44,7 +48,7 @@ export interface HumanAuthResult {
   readonly profile: string;
   readonly sessionId: string;
   readonly context: CliIdentityContext;
-  readonly storageMode?: "native" | "preview";
+  readonly storageMode?: "encrypted-local" | "preview";
 }
 
 export interface HumanAuthService {
@@ -116,6 +120,10 @@ function encodeStored(session: StoredHumanSession): SecretMaterial {
     session_id: session.sessionId,
     refresh_token: session.refreshToken,
     refresh_expires_at: session.refreshExpiresAt,
+    continuation_id: session.continuationId,
+    state: session.state,
+    code_verifier: session.codeVerifier,
+    redirect_uri: session.redirectUri,
     context: contextWire(session.context),
     intent_class: session.intentClass,
   }));
@@ -137,8 +145,8 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
         "refresh_expires_at", "refresh_token", "session_id", "version",
       ]
     : [
-        "base_url", "client_instance_id", "context", "intent_class", "profile",
-        "refresh_expires_at", "refresh_token", "session_id", "version",
+        "base_url", "client_instance_id", "code_verifier", "context", "continuation_id", "intent_class", "profile",
+        "redirect_uri", "refresh_expires_at", "refresh_token", "session_id", "state", "version",
       ];
   const keys = Object.keys(record).sort();
   if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
@@ -147,10 +155,12 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
   if (
     (!legacy && record.version !== 2) ||
     record.base_url !== config.baseUrl || record.profile !== config.profile ||
-    typeof record.refresh_token !== "string" || !isRefreshToken(record.refresh_token) ||
+    typeof record.refresh_token !== "string" || !isLoginCode(record.refresh_token) ||
     typeof record.refresh_expires_at !== "string" || Number.isNaN(Date.parse(record.refresh_expires_at)) ||
     new Date(record.refresh_expires_at).toISOString() !== record.refresh_expires_at ||
     typeof record.client_instance_id !== "string" || typeof record.session_id !== "string" ||
+    typeof record.continuation_id !== "string" || typeof record.state !== "string" ||
+    typeof record.code_verifier !== "string" || typeof record.redirect_uri !== "string" ||
     (!legacy && !new Set<CliIntentClass>([
         "signup", "login", "account.read", "machines.read", "machines.create",
         "agent_sessions.read", "agent_sessions.create",
@@ -166,6 +176,10 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
     sessionId: assertUuid(record.session_id, "session ID"),
     refreshToken: record.refresh_token,
     refreshExpiresAt: record.refresh_expires_at,
+    continuationId: assertUuid(record.continuation_id, "continuation ID"),
+    state: record.state,
+    codeVerifier: record.code_verifier,
+    redirectUri: record.redirect_uri,
     context: decodeCliIdentityContext(record.context),
     intentClass: legacy ? "login" : record.intent_class as CliIntentClass,
   });
@@ -176,6 +190,7 @@ function storedFromTokens(
   clientInstanceId: string,
   tokens: CliTokenSet,
   intentClass: CliIntentClass,
+  continuation: { readonly id: string; readonly state: string; readonly codeVerifier: string; readonly redirectUri: string },
 ): StoredHumanSession {
   return Object.freeze({
     version: 2,
@@ -185,6 +200,10 @@ function storedFromTokens(
     sessionId: tokens.sessionId,
     refreshToken: tokens.refreshToken,
     refreshExpiresAt: tokens.refreshExpiresAt,
+    continuationId: continuation.id,
+    state: continuation.state,
+    codeVerifier: continuation.codeVerifier,
+    redirectUri: continuation.redirectUri,
     context: tokens.context,
     intentClass,
   });
@@ -283,6 +302,7 @@ export function createHumanAuthService(input: {
   readonly client: HumanAuthClient;
   readonly vault: CredentialVault;
   readonly browser: BrowserOpener;
+  readonly readLoginCode: (signal?: AbortSignal) => Promise<string>;
   readonly clock?: () => number;
   readonly sleep?: Sleep;
   readonly random?: RandomSource;
@@ -366,7 +386,7 @@ export function createHumanAuthService(input: {
         "cuna.auth.vault_unavailable",
         input.allowPreviewStorage === true
           ? "The encrypted preview session store is unavailable or cannot be verified."
-          : "Interactive sign-in requires the verified operating-system credential vault.",
+          : "Interactive sign-in requires the verified encrypted local session store.",
         {
           hint: input.allowPreviewStorage === true
             ? "Set CUNA_SESSION_PASSPHRASE to a 12-character-or-longer passphrase and retry `cuna login`."
@@ -388,7 +408,7 @@ export function createHumanAuthService(input: {
     if (vaultStatus.state === "corrupt") {
       const corruptHint = previewStorage
         ? "Remove the encrypted preview session file and retry with a new CUNA_SESSION_PASSPHRASE."
-        : "Remove the damaged credential through the operating-system credential manager.";
+        : "Remove the damaged encrypted local session files, then run `cuna login` again.";
       throw authError(
         "cuna.auth.session_corrupt",
         previewStorage
@@ -456,12 +476,20 @@ export function createHumanAuthService(input: {
         if (status.phase === "cancelled") throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
         if (status.phase === "expired") throw authError("cuna.auth.continuation_expired", "Cuna sign-in expired.");
         if (status.phase === "consumed") throw authError("cuna.auth.continuation_consumed", "This Cuna sign-in was already exchanged.");
+        const loginCode = (await input.readLoginCode(request.signal)).trim();
+        if (!isLoginCode(loginCode)) {
+          throw authError("cuna.auth.login_code_invalid", "The pasted Cuna login code is invalid.", {
+            hint: "Copy the complete cuna_login_ code shown by app.getcuna.com and paste it once.",
+          });
+        }
         const tokens = await input.client.exchange({
           id: issued.id,
-          continuationSecret: issued.continuationSecret,
+          clientInstanceId,
+          profile: input.config.profile,
           state: pkce.state,
           codeVerifier: pkce.verifier,
           redirectUri,
+          loginCode,
           ...(request.signal === undefined ? {} : { signal: request.signal }),
         });
         try {
@@ -470,6 +498,7 @@ export function createHumanAuthService(input: {
             throw authError("cuna.auth.token_expired", "Cuna returned an already-expired sign-in session.");
           }
           if (
+            tokens.refreshToken !== loginCode ||
             tokens.context.requiredTermsVersion !== status.requiredTermsVersion ||
             (status.context !== undefined &&
               JSON.stringify(contextWire(status.context)) !== JSON.stringify(contextWire(tokens.context)))
@@ -486,6 +515,7 @@ export function createHumanAuthService(input: {
             clientInstanceId,
             tokens,
             intentClass,
+            { id: issued.id, state: pkce.state, codeVerifier: pkce.verifier, redirectUri },
           );
           const material = encodeStored(stored);
           try {
@@ -500,7 +530,7 @@ export function createHumanAuthService(input: {
             profile: stored.profile,
             sessionId: stored.sessionId,
             context: stored.context,
-            storageMode: previewStorage ? "preview" as const : "native" as const,
+            storageMode: previewStorage ? "preview" as const : "encrypted-local" as const,
           });
         } catch (error) {
           try { await input.client.logout(tokens.accessToken); } catch { /* family remains server-expiring */ }
@@ -533,16 +563,21 @@ export function createHumanAuthService(input: {
         }
         try {
           const tokens = await input.client.refresh({
-            refreshToken: stored.refreshToken,
+            id: stored.continuationId,
+            loginCode: stored.refreshToken,
             clientInstanceId: stored.clientInstanceId,
             profile: stored.profile,
+            state: stored.state,
+            codeVerifier: stored.codeVerifier,
+            redirectUri: stored.redirectUri,
+            loginCodeExpiresAt: stored.refreshExpiresAt,
             idempotencyKey: stableRefreshIdempotency(stored),
             ...(signal === undefined ? {} : { signal }),
           });
           const refreshedAt = now();
           if (
             tokens.sessionId !== stored.sessionId ||
-            tokens.refreshToken === stored.refreshToken ||
+            tokens.refreshToken !== stored.refreshToken ||
             (stored.intentClass === "signup"
               ? !signupContextTransitionAllowed(stored.context, tokens.context)
               : JSON.stringify(contextWire(tokens.context)) !== JSON.stringify(contextWire(stored.context))) ||
@@ -564,14 +599,24 @@ export function createHumanAuthService(input: {
           }
           captured?.material.dispose();
           captured = { material: SecretMaterial.fromUtf8(tokens.accessToken), expiresAt: Date.parse(tokens.accessExpiresAt) };
+          const nextStored = storedFromTokens(
+            input.config,
+            stored.clientInstanceId,
+            tokens,
+            stored.intentClass,
+            {
+              id: stored.continuationId,
+              state: stored.state,
+              codeVerifier: stored.codeVerifier,
+              redirectUri: stored.redirectUri,
+            },
+          );
+          if (JSON.stringify(nextStored) === JSON.stringify(stored)) {
+            return { status: "retained" } as const;
+          }
           return {
             status: "rotated",
-            material: encodeStored(storedFromTokens(
-              input.config,
-              stored.clientInstanceId,
-              tokens,
-              stored.intentClass,
-            )),
+            material: encodeStored(nextStored),
             expiresAt: Date.parse(tokens.refreshExpiresAt),
           } as const;
         } catch (error) {
@@ -624,7 +669,7 @@ export function createHumanAuthService(input: {
         profile: stored.profile,
         sessionId: stored.sessionId,
         context,
-        storageMode: storageStatus.backendStatus === "preview" ? "preview" as const : "native" as const,
+        storageMode: storageStatus.backendStatus === "preview" ? "preview" as const : "encrypted-local" as const,
       });
     } finally { snapshot.material.dispose(); }
   }

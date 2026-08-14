@@ -23,7 +23,7 @@ export interface CredentialBackendEvidence {
   readonly status: CredentialBackendStatus;
   readonly observedAt: number;
   readonly expiresAt: number;
-  readonly source: "live_round_trip" | "native_bridge_round_trip" | "local_file_preview" | "backend_absent" | "probe_failed";
+  readonly source: "live_round_trip" | "native_bridge_round_trip" | "encrypted_local_file" | "local_file_preview" | "backend_absent" | "probe_failed";
   readonly reason?: string;
 }
 
@@ -61,6 +61,7 @@ export type CredentialRefreshResult =
       readonly material: SecretMaterial;
       readonly expiresAt?: number;
     }
+  | { readonly status: "retained" }
   | { readonly status: "rejected" };
 
 export interface NativeCredentialBridge {

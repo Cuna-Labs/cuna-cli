@@ -85,6 +85,10 @@ for (const entry of entries) {
     !/\.(?:node|dll|dylib|so(?:\.\d+)*)$/iu.test(entry.name),
     `Native binary payload is prohibited in the architecture-neutral root package; signed platform bridges must ship as separately governed artifacts: ${entry.name}`,
   );
+  invariant(
+    !/^package\/dist\/credentials\/(?:index|native-[^/]+|platform)\.(?:js|js\.map|d\.ts|d\.ts\.map)$/iu.test(entry.name),
+    `Dormant native credential loader is prohibited in the pure-JavaScript distributable: ${entry.name}`,
+  );
 }
 
 for (const required of ["package/package.json", "package/LICENSE", "package/NOTICE", "package/THIRD_PARTY_NOTICES.md", "package/README.md"]) {
@@ -110,6 +114,10 @@ invariant(Object.keys(packageJson.bin ?? {}).length === 1 && typeof packageJson.
 invariant(
   JSON.stringify(packageJson.bundleDependencies) === JSON.stringify(["@xterm/headless"]),
   "Packed package must bundle the exact audited runtime dependency closure",
+);
+invariant(
+  packageJson.optionalDependencies === undefined,
+  "Pure-JavaScript package must not declare an optional native dependency",
 );
 const binPath = `package/${packageJson.bin.cuna.replace(/^\.\//, "")}`.toLowerCase();
 invariant(normalized.has(binPath), "Packed cuna bin target is absent");

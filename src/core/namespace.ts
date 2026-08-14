@@ -87,7 +87,7 @@ export const CREDENTIAL_FAMILY_INFIXES = Object.freeze([
   // continuation resume handle and puts it in localStorage, a BroadcastChannel
   // name and a URL fragment. It is a bearer capability, so a resume link pasted
   // into a synced workspace was uploaded rather than blocked.
-  "sk", "at", "rt", "ct", "tc", "se", "sc", "cb", "cr",
+  "sk", "at", "rt", "ct", "tc", "se", "sc", "cb", "cr", "login",
 ] as const);
 
 export type CredentialFamilyInfix = (typeof CREDENTIAL_FAMILY_INFIXES)[number];
@@ -121,6 +121,7 @@ const CREDENTIAL_GRAMMAR = Object.freeze({
   secretKey: Object.freeze({ infix: "sk", suffix: "[A-Za-z0-9_-]{16,256}" }),
   accessToken: Object.freeze({ infix: "at", suffix: OPAQUE_SECRET }),
   refreshToken: Object.freeze({ infix: "rt", suffix: OPAQUE_SECRET }),
+  loginCode: Object.freeze({ infix: "login", suffix: OPAQUE_SECRET }),
   continuation: Object.freeze({ infix: "ct", suffix: OPAQUE_SECRET }),
   terminalConnect: Object.freeze({ infix: "tc", suffix: OPAQUE_SECRET }),
   browserCallbackNonce: Object.freeze({ infix: "cb", suffix: OPAQUE_SECRET }),
@@ -164,6 +165,7 @@ const SECRET_API_KEY = credentialPattern("secretKey");
 const TRANSPORT_CREDENTIAL = credentialPattern("secretKey", "accessToken");
 const ACCESS_TOKEN = credentialPattern("accessToken");
 const REFRESH_TOKEN = credentialPattern("refreshToken");
+const LOGIN_CODE = credentialPattern("loginCode");
 const CONTINUATION_SECRET = credentialPattern("continuation");
 const TERMINAL_CONNECT_TOKEN = credentialPattern("terminalConnect");
 const BROWSER_CALLBACK_NONCE = credentialPattern("browserCallbackNonce");
@@ -200,6 +202,11 @@ export function isAccessToken(value: string): boolean {
 /** An interactive CLI refresh token. */
 export function isRefreshToken(value: string): boolean {
   return REFRESH_TOKEN.test(value);
+}
+
+/** Durable browser-issued CLI login credential; never a product API bearer. */
+export function isLoginCode(value: string): boolean {
+  return LOGIN_CODE.test(value) && value.startsWith("cuna_login_");
 }
 
 /** A browser-continuation secret for the human login exchange. */

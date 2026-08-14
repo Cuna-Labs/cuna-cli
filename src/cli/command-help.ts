@@ -32,19 +32,19 @@ function topic(usage: string, body: string): string {
 const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   signup: topic(
     "Usage:\n  cuna signup",
-    "Create a waitlist-only Cuna account through the browser. Set\nCUNA_SESSION_PASSPHRASE first; the resulting session is encrypted locally.\nNever assigns compute and never starts billing. Accepts no operands and no\ncommand options.",
+    "Create a waitlist-only Cuna account through the browser, paste the displayed\ncuna_login_ code, and store it in the encrypted profile session. Never assigns\ncompute and never starts billing. Accepts no operands and no command options.",
   ),
   login: topic(
-    "Usage:\n  CUNA_SESSION_PASSPHRASE=... cuna login [--session-only]",
-    "Sign in through the Cuna browser continuation. Polling only; no local callback\nlistener is opened. Encrypted profile-scoped preview storage is the default in\nthis build; later authenticated commands reuse it until expiry or cuna logout.\n--session-only remains an explicit compatibility spelling and is not required.\nPreview storage is not a native vault or a GA readiness claim.",
+    "Usage:\n  cuna login",
+    "Open the approved Cuna browser continuation, then paste the high-entropy\ncuna_login_ code displayed once by the page. The code is encrypted at rest in\nthe selected profile and exchanged for short-lived access in each process.",
   ),
   logout: topic(
-    "Usage:\n  cuna logout [--session-only]",
-    "Revoke the interactive token family server-first. If the profile has an\nencrypted preview session, it is selected automatically; keep\nCUNA_SESSION_PASSPHRASE set so it can be decrypted. --session-only is accepted\nfor compatibility but is not required. Accepts no operands otherwise.",
+    "Usage:\n  cuna logout",
+    "Revoke the durable login-code family server-first, then delete both encrypted\nlocal session files. Accepts no operands.",
   ),
   whoami: topic(
-    "Usage:\n  cuna whoami [--session-only]",
-    "Show authoritative interactive account context. An encrypted preview session\nis selected automatically after cuna login; keep CUNA_SESSION_PASSPHRASE set\nso it can be decrypted. --session-only is accepted for compatibility but is not\nrequired. Accepts no operands otherwise.",
+    "Usage:\n  cuna whoami",
+    "Exchange the encrypted profile login code for short-lived access and show the\nauthoritative account context. The login code is never sent as a product API\nbearer. Accepts no operands.",
   ),
   access: topic(
     "Usage:\n  cuna access status",
@@ -137,20 +137,23 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "Show authoritative workspace estimates. The show action is required. No command\noptions.",
   ),
   "api-keys": topic(
-    "Usage:\n  cuna api-keys <list|revoke> [options]",
+    "Usage:\n  cuna api-keys <create|list|revoke> [options]",
     [
-      "Inspect and revoke API keys. Secret values are never returned.",
+      "Create, inspect and revoke API keys. Creation returns the secret exactly once; list and revoke never return it.",
       "",
       "Actions:",
+      "  create --name NAME --yes  Create a key from an interactive session",
       "  list                 List API-key metadata",
       "  revoke KEY_ID --yes  Revoke one API key when server-advertised",
-      "",
-      "API-key creation is not available in this build.",
     ].join("\n"),
   ),
   "api-keys list": topic(
     "Usage:\n  cuna api-keys list",
     "List API-key metadata without secret values. No operands, no command options.",
+  ),
+  "api-keys create": topic(
+    "Usage:\n  cuna api-keys create --name NAME [--expires-at RFC3339] --yes",
+    "Create an automation credential from an interactive session. The secret is printed once and never stored by the CLI.",
   ),
   "api-keys revoke": topic(
     "Usage:\n  cuna api-keys revoke KEY_ID --yes",
@@ -236,7 +239,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   ),
   doctor: topic(
     "Usage:\n  cuna doctor [--json]",
-    "Report platform, Node version, and runtime feature state, including the\ncredential vault that every authenticated command depends on.\n\nRun this first when a command fails with an authentication or capability error.\nAccepts no operands and no command options.",
+    "Report platform, Node version, runtime features, and encrypted local\nsession-store state.\n\nRun this first when a command fails with an authentication or capability error.\nAccepts no operands and no command options.",
   ),
   "self-test": topic(
     "Usage:\n  cuna self-test --offline",

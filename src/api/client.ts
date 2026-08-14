@@ -16,6 +16,7 @@ import {
   decodeAgentSessionItem,
   decodeAgentSessionPage,
   decodeApiKeyList,
+  decodeApiKeyCreation,
   decodeCapabilitySnapshot,
   decodeCredentialRules,
   decodeMachineItem,
@@ -33,6 +34,7 @@ import {
   type AgentSessionPage,
   type AuditRecord,
   type ApiKeyMetadata,
+  type ApiKeyCreation,
   type CapabilityScope,
   type CapabilitySnapshot,
   type CredentialRule,
@@ -96,6 +98,11 @@ export interface CunaApiClient {
   listRecords(): Promise<readonly AuditRecord[]>;
   listAuthorizations(machineId: string): Promise<readonly CredentialRule[]>;
   listApiKeys(): Promise<readonly ApiKeyMetadata[]>;
+  createApiKey(
+    input: { readonly name: string; readonly expiresAt?: string },
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<ApiKeyCreation>;
   revokeApiKey(id: string): Promise<true>;
   createMachine(
     input: MachineCreateInput,
@@ -420,6 +427,19 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
     },
     async listApiKeys() {
       return fetchDecoded({ method: "GET", path: "/v1/api-keys" }, decodeApiKeyList);
+    },
+    async createApiKey(input, idempotencyKey, signal) {
+      assertIdempotencyKey(idempotencyKey);
+      return fetchDecoded({
+        method: "POST",
+        path: "/v1/api-keys",
+        idempotencyKey,
+        body: {
+          name: input.name,
+          ...(input.expiresAt === undefined ? {} : { expires_at: input.expiresAt }),
+        },
+        ...(signal === undefined ? {} : { signal }),
+      }, decodeApiKeyCreation);
     },
     async revokeApiKey(id) {
       const safeId = encodeCanonicalUuid(id, "API key ID");

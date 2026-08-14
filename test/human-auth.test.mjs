@@ -24,10 +24,9 @@ const UUID_C = "00000000-0000-0000-0000-000000000003";
 const CT = `runa_ct_${"c".repeat(43)}`;
 const AT = `runa_at_${"a".repeat(43)}`;
 const AT_2 = `runa_at_${"b".repeat(43)}`;
-const RT = `runa_rt_${"r".repeat(43)}`;
-const RT_2 = `runa_rt_${"s".repeat(43)}`;
 const AT_3 = `runa_at_${"d".repeat(43)}`;
 const RT_3 = `runa_rt_${"t".repeat(43)}`;
+const LOGIN = `cuna_login_${"l".repeat(43)}`;
 const STATE = "x".repeat(43);
 
 const config = Object.freeze({
@@ -72,7 +71,7 @@ class MemoryBackend {
 function tokenSet(overrides = {}) {
   return {
     accessToken: AT,
-    refreshToken: RT,
+    refreshToken: LOGIN,
     tokenType: "Bearer",
     expiresIn: 600,
     accessExpiresAt: "2026-08-08T00:10:00.000Z",
@@ -136,7 +135,7 @@ function fakeClient(overrides = {}) {
       return { id: UUID_A, phase: "cancelled", expiresAt: "2026-08-08T00:10:00.000Z", requiredTermsVersion: "2026-08" };
     },
     async exchange(input) { calls.push(["exchange", input]); return tokenSet(); },
-    async refresh(input) { calls.push(["refresh", input]); return tokenSet({ accessToken: AT_2, refreshToken: RT_2 }); },
+    async refresh(input) { calls.push(["refresh", input]); return tokenSet({ accessToken: AT_2 }); },
     async context(token) { calls.push(["context", token]); return context; },
     async logout(token) { calls.push(["logout", token]); return true; },
     ...overrides,
@@ -159,11 +158,12 @@ function fixture(overrides = {}) {
     sleep: overrides.sleep ?? (async () => undefined),
     random: (size) => new Uint8Array(size).fill(7),
     uuid: () => UUID_A,
+    readLoginCode: async () => LOGIN,
   });
   return { backend, vault, client, opened, service };
 }
 
-test("login uses polling-only PKCE, opens the exact issued URL, and persists no access token", async () => {
+test("login persists durable exchange authority but no access token", async () => {
   const subject = fixture();
   const result = await subject.service.login();
   assert.equal(result.sessionId, UUID_B);
@@ -174,7 +174,7 @@ test("login uses polling-only PKCE, opens the exact issued URL, and persists no 
   assert.equal(subject.client.calls.filter(([name]) => name === "exchange").length, 1);
   const protectedBytes = Buffer.concat([...subject.backend.values.values()].map((value) => Buffer.from(value))).toString("utf8");
   assert.equal(protectedBytes.includes(AT), false);
-  assert.equal(protectedBytes.includes("code_verifier"), false);
+  assert.equal(protectedBytes.includes("code_verifier"), true);
 });
 
 test("waitlist-only signup stores a restricted session and permits one pinned admission transition", async () => {
@@ -221,7 +221,7 @@ test("waitlist-only signup stores a restricted session and permits one pinned ad
       this.calls.push(["refresh", input]);
       return tokenSet({
         accessToken: AT_2,
-        refreshToken: RT_2,
+        refreshToken: LOGIN,
         context: admittedContext,
       });
     },
@@ -361,7 +361,7 @@ test("refresh races coalesce, rotate the vault once, and keep access tokens memo
   const refreshes = nextClient.calls.filter(([name]) => name === "refresh");
   assert.equal(refreshes.length, 1);
   assert.match(refreshes[0][1].idempotencyKey, /^refresh-[A-Za-z0-9_-]{43}$/u);
-  assert.equal(JSON.stringify(nextClient.calls).includes(RT), true);
+  assert.equal(JSON.stringify(nextClient.calls).includes(LOGIN), true);
   assert.equal(Buffer.concat([...original.backend.values.values()].map((value) => Buffer.from(value))).toString("utf8").includes(AT_2), false);
 });
 
@@ -376,7 +376,7 @@ test("one cancelled refresh waiter neither aborts nor poisons the shared credent
       this.calls.push(["refresh", input]);
       refreshEntered();
       await new Promise((resolve) => { releaseRefresh = resolve; });
-      return tokenSet({ accessToken: AT_2, refreshToken: RT_2 });
+      return tokenSet({ accessToken: AT_2, refreshToken: LOGIN });
     },
   });
   const subject = fixture({ backend: original.backend, client });
@@ -422,7 +422,7 @@ test("authoritative refresh rejection deletes the family while unknown failure p
         this.calls.push(["refresh", input]);
         return tokenSet({
           accessToken: AT_2,
-          refreshToken: RT_2,
+          refreshToken: LOGIN,
           context: { ...context, admission: "waitlisted", workspace: { state: "unavailable" } },
         });
       },
@@ -448,7 +448,7 @@ test("logout is server-first and deletes local state only after exact revoked tr
         this.calls.push(["refresh", input]);
         return tokenSet({
           accessToken: `runa_at_${"d".repeat(43)}`,
-          refreshToken: `runa_rt_${"t".repeat(43)}`,
+          refreshToken: LOGIN,
         });
       },
     }),
@@ -495,7 +495,7 @@ test("human authentication rejects clock rollback and tokens that expire during 
     async refresh(input) {
       this.calls.push(["refresh", input]);
       slowNow = Date.parse("2026-08-08T00:10:00.000Z");
-      return tokenSet({ accessToken: AT_2, refreshToken: RT_2 });
+      return tokenSet({ accessToken: AT_2, refreshToken: LOGIN });
     },
   });
   const slow = fixture({ backend: original.backend, client: slowClient, clock: () => slowNow });

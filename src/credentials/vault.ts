@@ -264,6 +264,19 @@ export class CredentialVault {
           "The renewable credential was rejected and has been removed.",
         );
       }
+      if (refreshed.status === "retained") {
+        if (currentEnvelope === undefined) {
+          throw credentialFailure(
+            "credential_refresh_failed",
+            "Credential refresh cannot retain an absent credential.",
+          );
+        }
+        return {
+          bytes: currentEnvelope.payload.slice(),
+          revision: currentEnvelope.header.revision,
+          expiresAt: currentEnvelope.header.expiresAt ?? undefined,
+        };
+      }
       const nextRevision = safeRevisionIncrement(currentEnvelope?.header.revision ?? 0);
       let nextBytes: Uint8Array | undefined;
       let encoded: Uint8Array | undefined;
@@ -675,7 +688,7 @@ function validEvidence(
   allowPreviewBackend: boolean,
 ): boolean {
   const verifiedEvidence = evidence.status === "verified" &&
-    (evidence.source === "live_round_trip" || evidence.source === "native_bridge_round_trip");
+    (evidence.source === "live_round_trip" || evidence.source === "native_bridge_round_trip" || evidence.source === "encrypted_local_file");
   const previewEvidence = allowPreviewBackend && evidence.status === "preview" &&
     evidence.source === "local_file_preview" && evidence.reason === undefined;
   return evidence.protocol === CREDENTIAL_BACKEND_PROTOCOL &&

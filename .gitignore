@@ -8,6 +8,7 @@ coverage/
 # Candidate, release, and verification evidence
 release-artifacts/
 evidence/
+/local-release-candidate*/
 *.tgz
 npm-pack.json
 sbom.cdx.json

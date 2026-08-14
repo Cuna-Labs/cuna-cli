@@ -99,6 +99,26 @@ function requireConfirmation(parsed: ParsedInvocation, command: string): void {
   });
 }
 
+function apiKeyCreateInput(parsed: ParsedInvocation, now = Date.now()): { readonly name: string; readonly expiresAt?: string } {
+  const rawName = stringOption(parsed, "name");
+  if (rawName === undefined || rawName.length < 1 || rawName.length > 80 || rawName.trim() !== rawName) {
+    throw usageError("Option --name is required and must contain 1 through 80 non-padding characters.");
+  }
+  const name = assertSafeDisplayText(rawName, "API key name");
+  const expiresAt = stringOption(parsed, "expires-at");
+  if (expiresAt !== undefined) {
+    const utc = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u;
+    const expiryMs = Date.parse(expiresAt);
+    const oneHour = 60 * 60 * 1_000;
+    const oneYear = 365 * 24 * oneHour;
+    if (!utc.test(expiresAt) || !Number.isFinite(expiryMs) || expiryMs < now + oneHour || expiryMs > now + oneYear) {
+      throw usageError("Option --expires-at must be a UTC instant between 1 hour and 365 days from now.");
+    }
+    return Object.freeze({ name, expiresAt: new Date(expiryMs).toISOString() });
+  }
+  return Object.freeze({ name });
+}
+
 /**
  * The reconciliation key for one create operation.
  *
@@ -244,7 +264,11 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
         return;
       }
       if (action === "create") {
-        throw unsupportedError("API key creation", "api_key_create_reconciliation_unavailable");
+        rejectUnknownOptions(parsed, ["name", "expires-at", "yes"]);
+        if (parsed.operands.length !== 1) throw usageError("api-keys create accepts no operands.");
+        requireConfirmation(parsed, "api-keys.create");
+        apiKeyCreateInput(parsed);
+        return;
       }
       throw usageError(`Unknown api-keys action ${action}.`);
     }
@@ -584,8 +608,16 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     }
     case "api-keys": {
       requireCredential(context);
-      await requireCapability({ client, scope: "account", capabilityId: "api_keys.manage", now: context.now });
       const action = requireOperand(parsed.operands, 0, "api-keys action");
+      if (action === "create" && context.credentialMode !== "interactive") {
+        throw new CunaError({
+          code: "cuna.auth.interactive_required",
+          message: "API-key creation requires an interactive Cuna session.",
+          exitCode: EXIT_CODES.auth,
+          hint: "Unset the automation credential, run `cuna login`, then repeat this command.",
+        });
+      }
+      await requireCapability({ client, scope: "account", capabilityId: "api_keys.manage", now: context.now });
       if (action === "list") {
         const keys = await client.listApiKeys();
         const data = Object.freeze({
@@ -617,7 +649,97 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
           human: `Revoked API key ${id}.`,
         });
       }
-      throw unsupportedError("API key creation", "api_key_create_reconciliation_unavailable");
+      if (action === "create") {
+        const input = apiKeyCreateInput(parsed, context.now);
+        const prior = await client.listApiKeys();
+        const priorIds = new Set(prior.map((key) => key.id));
+        const operationKey = `cuna-api-key-create-${randomUUID()}`;
+        let created;
+        let createFailure: unknown;
+        try {
+          created = await client.createApiKey(input, operationKey);
+        } catch (error) {
+          createFailure = error;
+        }
+        if (created?.idempotencyReplayed === true) {
+          createFailure = new Error("API-key creation replay did not return one-time secret material.");
+        }
+        if (createFailure !== undefined) {
+          // Reuse the same operation authority once. This can recover the exact
+          // committed ID after a timeout or malformed first response without
+          // creating a sibling key. The replay secret, if any, is never used:
+          // after an uncertain response the only safe outcome is reconciliation.
+          let replayed;
+          try { replayed = await client.createApiKey(input, operationKey); } catch { /* post-list remains authoritative */ }
+          const observedAt = context.now + 120_000;
+          const candidates = (await client.listApiKeys()).filter((key) => {
+            const createdAt = Date.parse(key.createdAt);
+            return !priorIds.has(key.id) && key.name === input.name && key.revokedAt === null &&
+              key.expiresAt === (input.expiresAt ?? null) && Number.isFinite(createdAt) &&
+              createdAt >= context.now - 5_000 && createdAt <= observedAt + 5_000;
+          });
+          if (candidates.length === 1) {
+            await client.revokeApiKey(candidates[0]!.id);
+            const remaining = (await client.listApiKeys()).filter(
+              (key) => key.id === candidates[0]!.id && key.revokedAt === null,
+            );
+            if (remaining.length !== 0) {
+              throw new CunaError({
+                code: "cuna.api_keys.create_cleanup_unverified",
+                message: "Cuna could not verify cleanup of an API key created during an uncertain response.",
+                exitCode: EXIT_CODES.conflict,
+                hint: "Revoke the listed API key ID in the Cuna dashboard before retrying.",
+                details: { manual_cleanup_ids: [candidates[0]!.id], idempotency_key: operationKey },
+                cause: createFailure,
+              });
+            }
+            throw new CunaError({
+              code: "cuna.api_keys.create_secret_unobserved",
+              message: "Cuna created the API key, but its one-time secret response was not observed; the CLI revoked it safely.",
+              exitCode: EXIT_CODES.network,
+              hint: "Retry creation with a new name. The unobserved key was revoked and cannot authenticate.",
+              retryable: true,
+              details: { api_key_id: candidates[0]!.id, reconciled: true, revoked: true, cleanup_verified: true, idempotency_replayed: replayed?.idempotencyReplayed ?? null },
+              cause: createFailure,
+            });
+          }
+          if (candidates.length === 0) {
+            throw new CunaError({
+              code: "cuna.api_keys.create_failed_no_commit",
+              message: "API-key creation failed and reconciliation found no newly created key.",
+              exitCode: EXIT_CODES.network,
+              hint: "No cleanup is required. Retry creation with the same name when connectivity is stable.",
+              retryable: true,
+              details: { reconciled: true, created: false, idempotency_key: operationKey },
+              cause: createFailure,
+            });
+          }
+          throw new CunaError({
+            code: "cuna.api_keys.create_reconciliation_ambiguous",
+            message: "API-key creation failed and reconciliation found multiple possible new keys.",
+            exitCode: EXIT_CODES.conflict,
+            hint: "Review and revoke the listed API key IDs in the Cuna dashboard before retrying.",
+            details: { reconciled: false, manual_cleanup_ids: candidates.map((key) => key.id), idempotency_key: operationKey },
+            cause: createFailure,
+          });
+        }
+        if (created === undefined || created.idempotencyReplayed) throw new Error("API-key creation reconciliation invariant failed.");
+        const data = Object.freeze({
+          id: created.id,
+          name: created.name,
+          prefix: created.prefix,
+          last_four: created.lastFour,
+          created_at: created.createdAt,
+          expires_at: created.expiresAt,
+          key: created.key,
+        });
+        return Object.freeze({
+          command: "api-keys.create",
+          data,
+          human: `Created API key ${created.name}. Copy it now; Cuna will not show it again.\n${created.key}`,
+        });
+      }
+      throw usageError(`Unknown api-keys action ${action}.`);
     }
     case "agent-sessions":
       return executeAgentSessions(context);

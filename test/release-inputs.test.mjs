@@ -48,10 +48,20 @@ test("release inputs are reproducible from the checked-out source and payload", 
     assert.ok(boundRecipeFiles.has(releaseAuthority), `release recipe must bind ${releaseAuthority}`);
   }
   for (const contract of [
+    "contracts/infra/cuna-api.openapi.json",
+    "contracts/infra/cuna-api.openapi.sha256",
     "packaging/contract-authority.schema.json",
     "packaging/observation-summary.schema.json",
     "packaging/release-approval-lease.schema.json",
   ]) assert.ok(inputs.contractSet.files.some((entry) => entry.file === contract));
+  assert.deepEqual(inputs.producerContract, {
+    artifact_file: "contracts/infra/cuna-api.openapi.json",
+    canonical_digest_file: "contracts/infra/cuna-api.openapi.sha256",
+    infra_openapi_raw_sha256: "6c162e256184f69dcdf6fe63e482509a30dda7248454e3eee58f2b35819d4091",
+    infra_openapi_canonical_sha256: "870ae3ad5365d3850895f51124960eaf0b8f5935c7a2fe224803aa69b623c023",
+    producer_repository: "Cuna-Labs/infra",
+    producer_revision: "0a592f93d6b9f1fa9c9501409fe4b2a9bc7367f6",
+  });
   assert.ok(inputs.dependencyClosure.components.some((entry) => entry.name === "@xterm/headless"));
 });
 

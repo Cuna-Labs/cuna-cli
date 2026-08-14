@@ -38,16 +38,23 @@ export interface HumanAuthClient {
   cancel(input: { readonly id: string; readonly secret: string; readonly signal?: AbortSignal }): Promise<CliContinuationStatus>;
   exchange(input: {
     readonly id: string;
-    readonly continuationSecret: string;
+    readonly clientInstanceId: string;
+    readonly profile: string;
     readonly state: string;
     readonly codeVerifier: string;
     readonly redirectUri: string;
+    readonly loginCode: string;
     readonly signal?: AbortSignal;
   }): Promise<CliTokenSet>;
   refresh(input: {
-    readonly refreshToken: string;
+    readonly id: string;
+    readonly loginCode: string;
     readonly clientInstanceId: string;
     readonly profile: string;
+    readonly state: string;
+    readonly codeVerifier: string;
+    readonly redirectUri: string;
+    readonly loginCodeExpiresAt: string;
     readonly idempotencyKey: string;
     readonly signal?: AbortSignal;
   }): Promise<CliTokenSet>;
@@ -112,26 +119,32 @@ export function createHumanAuthClient(input: {
         method: "POST",
         path: `/v1/cli-auth/continuations/${id}/exchange`,
         body: {
-          continuation_secret: request.continuationSecret,
+          login_code: request.loginCode,
+          client_instance_id: request.clientInstanceId,
+          profile: request.profile,
           state: request.state,
           code_verifier: request.codeVerifier,
           redirect_uri: request.redirectUri,
         },
         ...(request.signal === undefined ? {} : { signal: request.signal }),
-      }));
+      }), request.loginCode);
     },
     async refresh(request) {
+      const id = encodePublicId(request.id, "continuation ID");
       return decodeCliTokenSet(await input.anonymous.request({
         method: "POST",
-        path: "/v1/cli-auth/refresh",
+        path: `/v1/cli-auth/continuations/${id}/exchange`,
         idempotencyKey: request.idempotencyKey,
         body: {
-          refresh_token: request.refreshToken,
+          login_code: request.loginCode,
           client_instance_id: request.clientInstanceId,
           profile: request.profile,
+          state: request.state,
+          code_verifier: request.codeVerifier,
+          redirect_uri: request.redirectUri,
         },
         ...(request.signal === undefined ? {} : { signal: request.signal }),
-      }));
+      }), request.loginCode, request.loginCodeExpiresAt);
     },
     async context(accessToken, signal) {
       return decodeCliIdentityContext(await input.authenticated(accessToken).request({

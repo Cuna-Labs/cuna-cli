@@ -4,6 +4,7 @@ import {
   isAccessToken,
   isBrowserCallbackNonce,
   isContinuationSecret,
+  isLoginCode,
   isRefreshToken,
 } from "../core/namespace.js";
 import { isObject } from "../core/validation.js";
@@ -282,18 +283,26 @@ export function decodeCliContinuationStatus(value: unknown, expectedId: string):
   });
 }
 
-export function decodeCliTokenSet(value: unknown): CliTokenSet {
+export function decodeCliTokenSet(value: unknown, durableLoginCode?: string, knownLoginCodeExpiresAt?: string): CliTokenSet {
   const record = exact(value, [
-    "access_token", "refresh_token", "token_type", "expires_in", "access_expires_at",
-    "refresh_expires_at", "session_id", "context",
+    "access_token", ...(durableLoginCode === undefined ? ["refresh_token"] : []), "token_type", "expires_in", "access_expires_at",
+    ...(durableLoginCode === undefined
+      ? ["refresh_expires_at"]
+      : knownLoginCodeExpiresAt === undefined ? ["login_code_expires_at"] : []),
+    "session_id", "context",
   ]);
   if (record.token_type !== "Bearer" || record.expires_in !== 600) return malformed("invalid_token_type_or_ttl");
   const accessToken = typeof record.access_token === "string" && isAccessToken(record.access_token)
     ? record.access_token : malformed("invalid_access_token");
-  const refreshToken = typeof record.refresh_token === "string" && isRefreshToken(record.refresh_token)
-    ? record.refresh_token : malformed("invalid_refresh_token");
+  const refreshToken = durableLoginCode === undefined
+    ? typeof record.refresh_token === "string" && isRefreshToken(record.refresh_token)
+      ? record.refresh_token : malformed("invalid_refresh_token")
+    : isLoginCode(durableLoginCode) ? durableLoginCode : malformed("invalid_login_code");
   const accessExpiresAt = date(record.access_expires_at, "invalid_access_expiry");
-  const refreshExpiresAt = date(record.refresh_expires_at, "invalid_refresh_expiry");
+  const refreshExpiresAt = date(
+    durableLoginCode === undefined ? record.refresh_expires_at : knownLoginCodeExpiresAt ?? record.login_code_expires_at,
+    "invalid_refresh_expiry",
+  );
   if (Date.parse(refreshExpiresAt) <= Date.parse(accessExpiresAt)) return malformed("invalid_token_expiry_order");
   return Object.freeze({
     accessToken,

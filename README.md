@@ -23,9 +23,8 @@ opaque remote shell.
 
 - Versioned human and JSON output with stable error and exit-code categories.
 - Exact public Cuna API-origin validation and bounded authenticated transport.
-- Polling-only browser sign-in contracts with PKCE, OS-vault refresh rotation,
-  and memory-only access tokens; native Windows browser and vault adapters are
-  still blocked and fail closed.
+- Browser sign-in with PKCE, a high-entropy durable `cuna_login_` credential,
+  AES-256-GCM local persistence, and memory-only short-lived access tokens.
 - Capability discovery that treats absent, stale, contradictory, or unknown
   evidence as unauthorized for mutation.
 - Machine and AgentSession command foundations over public Cuna contracts.
@@ -40,15 +39,8 @@ AgentSession terminal producer. Daemon integration, workspace synchronization, a
 the local companion remain pre-release work. Browser authentication is
 implemented against the local public 1.5.0 candidate contract. Its immutable
 contract gitlink and provenance approval remain release-blocked.
-Canonical contract approval, producer deployment and native Windows adapters
-remain blocked. Source code or a documented interface is not evidence that a
-capability is deployed.
-
-The Windows native credential and browser boundary additionally requires an
-owned `CreateProcessW` process handle to remain live through loaded-image
-verification and protected-stdin handoff. PID-only or path-only checks are not
-accepted. Until that authority is implemented, signed, and independently
-verified, those native operations and the release remain blocked.
+Canonical contract approval and producer deployment remain blocked. Source
+code or a documented interface is not evidence that a capability is deployed.
 
 ## Quick start for contributors
 
@@ -190,14 +182,15 @@ credential that is set but unusable is refused rather than ignored, and it is
 refused only for commands that select a credential authority — `doctor`,
 `self-test --offline` and `config get` still run and report it. Interactive
 `cuna login` uses the browser continuation contract without a local HTTP
-listener. In this build it is the default interactive flow: set
-`CUNA_SESSION_PASSPHRASE`, open the one-time browser link, and the renewable
-session is stored in an encrypted, profile-scoped preview file. Later
-authenticated commands reuse that encrypted session until it expires or
-`cuna logout` removes it; no `--session-only` repetition is required. This
-preview backend is intentionally not an operating-system vault and is not a GA
-readiness claim. The automation and interactive credential authorities never
-fall back to each other.
+listener. Approve the browser flow and paste the exact high-entropy
+`cuna_login_` value shown once. The CLI encrypts it with AES-256-GCM in a
+profile-scoped session file; the separate random key and ciphertext files are
+restricted to the current user. Each fresh process exchanges the login code for
+a short-lived access token and never sends the code as a product API bearer.
+Logout revokes the server family before deleting both local files. This layer
+protects against accidental disclosure and other local users, but compromise of
+the same OS account can read both files and defeats it. Automation and
+interactive credential authorities never fall back to each other.
 
 Never place API keys in command-line arguments, repository files, issue reports,
 terminal captures, or diagnostics.

@@ -40,7 +40,7 @@ test("--help resolves the command it was typed after, not the root help", async 
     { argv: ["machines", "create", "--help"], topic: "machines create", must: ["--name NAME", "--yes", "--vcpus N"] },
     { argv: ["machines", "list", "--help"], topic: "machines list", must: ["cuna machines list"] },
     { argv: ["agent-sessions", "create", "--help"], topic: "agent-sessions create", must: ["--workspace-binding-id", "--workspace-generation"] },
-    { argv: ["doctor", "--help"], topic: "doctor", must: ["credential vault"] },
+    { argv: ["doctor", "--help"], topic: "doctor", must: ["encrypted local\nsession-store state"] },
     { argv: ["claude", "--help"], topic: "claude", must: ["--agent-session ID", "--no-sync"] },
   ];
   for (const { argv, topic, must } of cases) {

@@ -66,14 +66,9 @@ export async function createProductionNativeAuthBridges(input: {
     packageJsonBytes.fill(0);
   }
 
-  // A hash followed by `require(addonPath)` is not one atomic authority decision on Windows or
-  // macOS: a writable package root can substitute the addon between admission and LoadLibrary,
-  // and a malicious addon cannot be trusted to attest itself. Keep production unavailable until
-  // an admitted signed loader owns the file handle and proves the loaded module identity (or the
-  // process authority is embedded in the already admitted native bridge).
-  throw unavailable(
-    "The signed native module loader authority is not admitted for this release.",
-  );
+  // This release deliberately does not depend on a native loader. Interactive
+  // persistence is provided by the pure-JavaScript encrypted session backend.
+  throw unavailable("Native authentication is not part of this release.");
 }
 
 function resolvePlatformPackage(packageName: NativePlatformReleaseEntry["packageName"]): string {

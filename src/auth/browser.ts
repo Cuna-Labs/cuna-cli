@@ -35,10 +35,15 @@ export function resolveBrowserCommand(
 ): BrowserCommand {
   assertHttpsBrowserUrl(url);
   if (platform === "win32") {
-    throw new Error("Windows browser activation requires the approved signed native adapter, which is unavailable in this build.");
+    const systemRoot = _environment.SystemRoot ?? _environment.WINDIR ?? "C:\\Windows";
+    return {
+      executable: `${systemRoot}\\explorer.exe`,
+      args: [url],
+      cwd: systemRoot,
+    };
   }
   if (platform === "darwin") {
-    throw new Error("macOS browser activation requires the approved signed native adapter, which is unavailable in this build.");
+    return { executable: "/usr/bin/open", args: [url], cwd: "/" };
   }
   if (platform === "linux") return { executable: "/usr/bin/xdg-open", args: [url], cwd: "/" };
   throw new Error("No browser opener is available for this platform.");

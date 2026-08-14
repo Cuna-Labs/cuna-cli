@@ -95,6 +95,5 @@ test("macOS authority stays closed while retaining audit-bound owned-exchange pr
 test("production never lets a native addon attest the bytes that Node then loads", async () => {
   const production = await source("src", "credentials", "native-production.ts");
   assert.doesNotMatch(production, /function loadAuthorityAddon|createRequire\(import\.meta\.url\)\(file\)/u);
-  assert.match(production, /signed native module loader authority is not admitted/u);
-  assert.match(production, /substitute the addon between admission and LoadLibrary/u);
+  assert.match(production, /Native authentication is not part of this release/u);
 });

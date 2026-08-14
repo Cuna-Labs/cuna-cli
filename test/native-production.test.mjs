@@ -68,10 +68,19 @@ test("source-only native package manifests cannot be mistaken for release artifa
   }
 });
 
-test("the public package never selects an unpublished platform package it cannot install", async () => {
+test("the public package neither selects nor ships the dormant native platform path", async () => {
   const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
   assert.equal(Object.hasOwn(manifest, "optionalDependencies"), false);
-  assert.deepEqual(manifest.files, ["dist", "README.md", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]);
+  assert.deepEqual(manifest.files, [
+    "dist",
+    "!dist/credentials/index.*",
+    "!dist/credentials/native-*",
+    "!dist/credentials/platform.*",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+  ]);
   assert.deepEqual(manifest.bin, { cuna: "./dist/bin/cuna.js" });
 });
 

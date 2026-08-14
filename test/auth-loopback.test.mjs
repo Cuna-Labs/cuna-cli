@@ -18,16 +18,13 @@ test("PKCE material is independent, bounded, and S256-verifiable without a callb
   assert.match(material.state, /^[A-Za-z0-9_-]{43,}$/u);
 });
 
-test("browser handoff requires signed native authority on Windows and macOS and pins Linux xdg-open", () => {
+test("browser handoff uses fixed argv-only operating-system launchers", () => {
   const url = "https://app.getcuna.com/cli/continue#opaque";
-  assert.throws(
-    () => resolveBrowserCommand("win32", url, { SystemRoot: "C:\\Windows" }),
-    /approved signed native adapter/u,
-  );
-  assert.throws(
-    () => resolveBrowserCommand("darwin", url, {}),
-    /approved signed native adapter/u,
-  );
+  assert.deepEqual(resolveBrowserCommand("win32", url, { SystemRoot: "C:\\Windows" }), {
+    executable: "C:\\Windows\\explorer.exe",
+    args: [url], cwd: "C:\\Windows",
+  });
+  assert.deepEqual(resolveBrowserCommand("darwin", url, {}), { executable: "/usr/bin/open", args: [url], cwd: "/" });
   assert.deepEqual(resolveBrowserCommand("linux", url, {}), {
     executable: "/usr/bin/xdg-open",
     args: [url],

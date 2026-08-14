@@ -1,6 +1,7 @@
 import {
   containsCredentialValue,
   isApiKeyDisplayPrefix,
+  isSecretApiKey,
   isTerminalConnectToken,
   isTerminalStreamUrl,
 } from "../core/namespace.js";
@@ -854,6 +855,14 @@ export interface ApiKeyMetadata {
   readonly revokedAt: string | null;
 }
 
+/** One-time response from API-key creation. The plaintext key is never decoded
+ * by the generic public-string path because that path correctly rejects every
+ * credential. It is admitted only by the canonical credential grammar here. */
+export type ApiKeyCreation = ApiKeyMetadata & (
+  | { readonly idempotencyReplayed: false; readonly key: string }
+  | { readonly idempotencyReplayed: true; readonly key?: never }
+);
+
 /**
  * Control and format characters may never reach the operator's terminal. The
  * credential half of this guard is NOT written here: it comes from
@@ -992,6 +1001,28 @@ export function decodeApiKeyList(value: unknown): readonly ApiKeyMetadata[] {
   if (!Array.isArray(value) || value.length > 100) throw contractViolation("bounded_array_length");
   return Object.freeze(value.map((item, index) =>
     underField(`[${index}]`, () => decodeApiKeyMetadata(item))));
+}
+
+export function decodeApiKeyCreation(value: unknown): ApiKeyCreation {
+  if (!isObject(value)) throw contractViolation("object");
+  if (typeof value.idempotency_replayed !== "boolean") {
+    throw contractViolation("boolean", "idempotency_replayed");
+  }
+  exactKeys(value, [
+    "id", "name", "prefix", "last_four", "created_at", "expires_at", "last_used_at", "revoked_at",
+    "idempotency_replayed", ...(value.idempotency_replayed ? [] : ["key"]),
+  ]);
+  if (!value.idempotency_replayed && (typeof value.key !== "string" || !isSecretApiKey(value.key))) {
+    throw contractViolation("one_time_api_key");
+  }
+  const { key, idempotency_replayed: idempotencyReplayed, ...metadataValue } = value;
+  const metadata = decodeApiKeyMetadata(metadataValue);
+  if (typeof key === "string" && (!key.startsWith(metadata.prefix) || !key.endsWith(metadata.lastFour))) {
+    throw contractViolation("api_key_secret_metadata_binding");
+  }
+  return idempotencyReplayed
+    ? Object.freeze({ ...metadata, idempotencyReplayed: true })
+    : Object.freeze({ ...metadata, idempotencyReplayed: false, key: key as string });
 }
 
 export function decodeOk(value: unknown): true {

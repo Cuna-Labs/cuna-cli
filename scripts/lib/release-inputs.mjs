@@ -9,8 +9,15 @@ const SHA256 = /^[0-9a-f]{64}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
 const EXACT_VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$/u;
 const EXACT_TOOL_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u;
+const INFRA_OPENAPI_FILE = "contracts/infra/cuna-api.openapi.json";
+const INFRA_OPENAPI_DIGEST_FILE = "contracts/infra/cuna-api.openapi.sha256";
+const INFRA_OPENAPI_RAW_SHA256 = "6c162e256184f69dcdf6fe63e482509a30dda7248454e3eee58f2b35819d4091";
+const INFRA_OPENAPI_CANONICAL_SHA256 = "870ae3ad5365d3850895f51124960eaf0b8f5935c7a2fe224803aa69b623c023";
+const INFRA_PRODUCER_REVISION = "0a592f93d6b9f1fa9c9501409fe4b2a9bc7367f6";
 
 const CONTRACT_FILES = Object.freeze([
+  INFRA_OPENAPI_FILE,
+  INFRA_OPENAPI_DIGEST_FILE,
   "packaging/contract-authority.schema.json",
   "packaging/distribution-manifest.schema.json",
   "packaging/distribution-receipt.schema.json",
@@ -106,7 +113,7 @@ export function aggregateDigest(entries) {
 export function validateReleaseInputs(inputs) {
   exactKeys(
     inputs,
-    ["schemaVersion", "packageName", "version", "sourceCommit", "packageLock", "dependencyClosure", "contractSet", "buildRecipe", "toolchain", "payload"],
+    ["schemaVersion", "packageName", "version", "sourceCommit", "packageLock", "dependencyClosure", "producerContract", "contractSet", "buildRecipe", "toolchain", "payload"],
     "release inputs",
   );
   invariant(inputs.schemaVersion === 1, "Unsupported release-inputs schema");
@@ -137,9 +144,17 @@ export function validateReleaseInputs(inputs) {
   invariant(JSON.stringify(componentKeys) === JSON.stringify([...componentKeys].sort()), "Dependency closure is not sorted");
   invariant(createHash("sha256").update(componentKeys.join(""), "utf8").digest("hex") === inputs.dependencyClosure.aggregateSha256, "Dependency-closure aggregate digest mismatch");
 
+  exactKeys(inputs.producerContract, ["artifact_file", "canonical_digest_file", "infra_openapi_raw_sha256", "infra_openapi_canonical_sha256", "producer_repository", "producer_revision"], "producerContract");
+  invariant(inputs.producerContract.artifact_file === INFRA_OPENAPI_FILE, "Producer contract artifact differs");
+  invariant(inputs.producerContract.canonical_digest_file === INFRA_OPENAPI_DIGEST_FILE, "Producer canonical-digest artifact differs");
+  invariant(inputs.producerContract.infra_openapi_raw_sha256 === INFRA_OPENAPI_RAW_SHA256, "Producer OpenAPI raw digest differs");
+  invariant(inputs.producerContract.infra_openapi_canonical_sha256 === INFRA_OPENAPI_CANONICAL_SHA256, "Producer OpenAPI canonical digest differs");
+  invariant(inputs.producerContract.producer_repository === "Cuna-Labs/infra", "Producer repository differs");
+  invariant(inputs.producerContract.producer_revision === INFRA_PRODUCER_REVISION, "Producer revision differs");
+
   exactKeys(inputs.contractSet, ["algorithm", "authority", "releaseAuthority", "files", "aggregateSha256"], "contractSet");
-  invariant(inputs.contractSet.authority === "CUNA_CLI_LOCAL_CONSUMER_SNAPSHOT", "Contract-set authority differs");
-  invariant(inputs.contractSet.releaseAuthority === "UNRESOLVED_BLOCKING", "Local contract set may not claim canonical release authority");
+  invariant(inputs.contractSet.authority === "CUNA_INFRA_OPENAPI_VENDORED_EXACT", "Contract-set authority differs");
+  invariant(inputs.contractSet.releaseAuthority === "CUNA_CANONICAL_PUBLIC_API_CONTRACT", "Canonical release authority differs");
   exactKeys(inputs.buildRecipe, ["algorithm", "commands", "files", "aggregateSha256"], "buildRecipe");
   invariant(Array.isArray(inputs.buildRecipe.commands) && inputs.buildRecipe.commands.length > 0, "Build-recipe commands are missing");
   for (const command of inputs.buildRecipe.commands) invariant(typeof command === "string" && command.length > 0, "Build-recipe command is invalid");
@@ -217,6 +232,14 @@ export async function buildReleaseInputs({ root, sourceCommit, npmVersion, runne
   });
   const componentKeys = components.map((component) => `${component.name}\0${component.version}\0${component.resolved}\0${component.integrity}\0`);
   const contractFiles = await digestEntries(root, CONTRACT_FILES);
+  const infraOpenapiRawSha256 = await sha256File(path.join(root, INFRA_OPENAPI_FILE));
+  invariant(infraOpenapiRawSha256 === INFRA_OPENAPI_RAW_SHA256, "Vendored infra OpenAPI raw bytes differ from the frozen producer contract");
+  const canonicalDigestDeclaration = (await readFile(path.join(root, INFRA_OPENAPI_DIGEST_FILE), "utf8")).trim().split(/\s+/u);
+  invariant(
+    canonicalDigestDeclaration.length === 2 && canonicalDigestDeclaration[0] === INFRA_OPENAPI_CANONICAL_SHA256 &&
+      canonicalDigestDeclaration[1]?.endsWith("-api.openapi.json") === true,
+    "Vendored infra OpenAPI canonical digest declaration differs from the frozen producer contract",
+  );
   const buildRecipeFiles = await digestEntries(root, BUILD_RECIPE_FILES);
   const buildIdentityModule = await import(`${pathToFileURL(path.join(root, "dist", "build-identity.js")).href}?release-inputs=${Date.now()}`);
 
@@ -236,10 +259,18 @@ export async function buildReleaseInputs({ root, sourceCommit, npmVersion, runne
       components,
       aggregateSha256: createHash("sha256").update(componentKeys.join(""), "utf8").digest("hex"),
     },
+    producerContract: {
+      artifact_file: INFRA_OPENAPI_FILE,
+      canonical_digest_file: INFRA_OPENAPI_DIGEST_FILE,
+      infra_openapi_raw_sha256: infraOpenapiRawSha256,
+      infra_openapi_canonical_sha256: INFRA_OPENAPI_CANONICAL_SHA256,
+      producer_repository: "Cuna-Labs/infra",
+      producer_revision: INFRA_PRODUCER_REVISION,
+    },
     contractSet: {
       algorithm: "cuna-cli-public-contract-files-v1",
-      authority: "CUNA_CLI_LOCAL_CONSUMER_SNAPSHOT",
-      releaseAuthority: "UNRESOLVED_BLOCKING",
+      authority: "CUNA_INFRA_OPENAPI_VENDORED_EXACT",
+      releaseAuthority: "CUNA_CANONICAL_PUBLIC_API_CONTRACT",
       files: contractFiles,
       aggregateSha256: aggregateDigest(contractFiles),
     },

@@ -30,11 +30,9 @@ const EXIT_CODES_SECTION = exitCodeHelpSection();
  * they are deliberately stated as properties of the BUILD rather than of a
  * platform:
  *
- *   - `credentials/native-platform-release-index.ts` ships an EMPTY index, so
- *     `createProductionNativeAuthBridges` fails closed before any package
- *     resolution. Interactive commands therefore use the encrypted browser-link
- *     preview backend in this build; native storage remains unavailable, a
- *     property of the release rather than of an operating system.
+ *   - interactive commands use the pure-JavaScript encrypted browser-link
+ *     session store. Native credential loaders are deliberately absent from
+ *     the distributable package, rather than present as an inactive fallback.
  *   - the automatic journey and exact foreground attach are composed by
  *     `runCli` before the generic command dispatcher. Their local
  *     implementation is present, while each invocation still fails closed
@@ -53,12 +51,12 @@ Usage:
   cuna <command> [options]
 
 First run:
-  1. Set CUNA_SESSION_PASSPHRASE to a passphrase (it is never stored)
-  2. Run \`cuna login\` and complete the one-time browser link
-  3. Continue with \`cuna whoami\` or \`cuna machines list\` without repeating a mode flag
+  1. Run \`cuna doctor\` and confirm encrypted local session storage
+  2. Run \`cuna login\`, approve in the browser, and paste the displayed login code
+  3. Continue with \`cuna whoami\` or \`cuna machines list\` from a fresh shell
 
 Works with no network:
-  doctor                Report platform, runtime, and credential-vault state
+  doctor                Report platform, runtime, and encrypted local session-store state
   version               Show the CLI version, build digest, and protocol range
   config get            Show effective, redacted configuration
   self-test --offline   Verify the installed CLI without network access
@@ -70,6 +68,7 @@ Works with an automation credential:
   machines list         List owned Cuna machines
   records list          List redacted account activity records
   capabilities          Inspect what this deployment actually serves
+  api-keys create       Create an API key and print its secret once
   api-keys list         List API-key metadata without secret values
   claude [PATH]         Synchronize, select or create, and attach Claude Code
   codex [PATH]          Synchronize, select or create, and attach Codex
@@ -77,10 +76,6 @@ Works with an automation credential:
   connect SESSION_ID    Attach one exact AgentSession in this terminal
 
 Not available in this build:
-  native credential vault  Native OS credential storage is not admitted in this
-                           build. \`cuna login\` uses the encrypted browser-link
-                           preview session instead; it is profile-scoped and
-                           remains available until expiry or \`cuna logout\`.
   background daemon, local companion
   Run \`cuna doctor\` to see what this platform and build actually provide.
 
@@ -98,11 +93,10 @@ Usage:
 
 Available now:
   signup                               Create a waitlist-only Cuna account in the browser
-  login [--session-only]               Sign in through the Cuna browser continuation;
-                                       encrypted local storage is the default
-  whoami [--session-only]              Show account context; reuse the encrypted session
+  login                                Sign in through the browser and paste the durable login code
+  whoami                               Show account context; reuse the encrypted session
   access status                        Show identity, admission, and workspace separately
-  logout [--session-only]              Revoke the interactive token family server-first;
+  logout                               Revoke the login-code family server-first;
                                        reuse the encrypted session automatically
   capabilities                         Inspect current server capability truth
   machines list                        List owned Cuna machines
@@ -114,6 +108,7 @@ Available now:
   workspace show                       Show assignment or waitlist state
   usage show                           Show authoritative workspace estimates
   authorizations list --machine ID     List active credential injection rules
+  api-keys create --name NAME --yes    Create an API key and print its secret once
   api-keys list                        List API-key metadata without secret values
   api-keys revoke ID --yes             Revoke one API key when server-advertised
   agent-sessions list --machine ID     List child agent processes
@@ -124,7 +119,7 @@ Available now:
   agent-sessions terminate ID          Terminate when server-advertised
   config get                           Show effective, redacted configuration
   self-test --offline                  Verify the installed CLI without network access
-  doctor                               Report platform, runtime, and credential-vault state
+  doctor                               Report platform, runtime, and encrypted local session-store state
 
 Capability-gated foreground preview:
   connect SESSION_ID [SESSION_ID...]   Attach 1-4 exact cloud sessions in this terminal
@@ -181,13 +176,10 @@ Authentication:
   Create an automation credential at ${API_KEYS_URL}.
   Use cuna signup for waitlist-only enrollment. It never assigns compute or starts billing.
   Use cuna login for a browser-assisted interactive session. The CLI uses polling;
-  it does not open a local callback listener. In this build the one-time browser
-  link is the default login flow and the resulting refresh session is stored only
-  in an encrypted, profile-scoped preview file. Set CUNA_SESSION_PASSPHRASE before
-  login; keep CUNA_SESSION_PASSPHRASE set and later authenticated commands
-  automatically reuse that session until it expires or you run cuna logout.
-  \`--session-only\` remains accepted for explicit
-  compatibility but is not required. This is not a native vault or a GA readiness claim.
+  it does not open a local callback listener. Paste the exact high-entropy
+  cuna_login_ code shown once by the page. Cuna stores it using AES-256-GCM with
+  a separate user-only key file and exchanges it for short-lived access in each
+  process. Compromise of the same OS account can read both files and defeats this layer.
   ${API_KEY_NAMES} selects explicit automation mode and never falls
   back to browser login. Both spellings are accepted and both admit every key brand the
   service has issued; the first one that is SET wins, even when its value is unusable.

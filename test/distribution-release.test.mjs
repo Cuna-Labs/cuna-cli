@@ -54,6 +54,8 @@ async function createFixture() {
   const envelope = syntheticReleaseEnvelope({
     version,
     sourceCommit: "a".repeat(40),
+    repository: "Cuna-Labs/cuna-cli",
+    registry: "https://registry.npmjs.org",
     tarball: {
       file: tarballFile,
       url: `https://registry.npmjs.org/@cuna_labs/cli/-/cli-${version}.tgz`,
@@ -177,6 +179,15 @@ test("SBOM display metadata cannot substitute a different package identity", asy
   fixture.envelope.sbom.sha256 = await sha256File(sbomFile);
   await writeFile(path.join(fixture.evidence, "release-envelope.json"), `${JSON.stringify(fixture.envelope, null, 2)}\n`);
   await assert.rejects(project(fixture), /SBOM component identity differs/);
+});
+
+test("installed candidate resolves npm-cli.js and the Cuna launcher without invoking npm through a shell", async () => {
+  const source = await readFile(path.join(repositoryRoot, "scripts", "lib", "installed-candidate-probe.mjs"), "utf8");
+  assert.match(source, /where\.exe/);
+  assert.match(source, /node_modules.*npm.*npm-cli\.js/s);
+  assert.match(source, /node_modules.*@cuna_labs.*cli/s);
+  assert.match(source, /execute\(process\.execPath, \[npmCli, \.\.\.npmArgs\]/);
+  assert.doesNotMatch(source, /runNpm[\s\S]*shell:\s*true/u);
 });
 
 test("local projection evidence cannot be relabeled as a live channel", async () => {

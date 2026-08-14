@@ -7,6 +7,7 @@ import {
   CREDENTIAL_BRANDS,
   createHttpTransport,
   createCunaApiClient,
+  decodeApiKeyCreation,
   decodeApiKeyList,
   decodeAuditRecords,
   decodeAgentSessionItem,
@@ -304,23 +305,43 @@ test("API-key display metadata decodes every brand the key store has ever stored
   assert.throws(() => decodeApiKeyList([{ ...metadata, prefix: "cuna_at_abcd" }]));
 });
 
-test("TC-037-03 API-key list and revoke use exact public routes and closed acknowledgement", async () => {
+test("TC-037-03 API-key create, list and revoke use exact public routes and closed acknowledgement", async () => {
   const requests = [];
   const id = "11111111-1111-4111-8111-111111111111";
+  const created = {
+    id,
+    name: "local automation",
+    prefix: "cuna_sk_",
+    last_four: "WXYZ",
+    created_at: "2026-08-08T00:00:00.000Z",
+    expires_at: null,
+    last_used_at: null,
+    revoked_at: null,
+    idempotency_replayed: false,
+    key: `cuna_sk_${"a".repeat(16)}WXYZ`,
+  };
   const client = createCunaApiClient({
     async request(request) {
       requests.push(request);
-      return request.method === "GET" ? [] : { ok: true };
+      return request.method === "GET" ? [] : request.method === "POST" ? created : { ok: true };
     },
   });
+  assert.equal((await client.createApiKey({ name: "local automation" })).key, created.key);
   await client.listApiKeys();
   assert.equal(await client.revokeApiKey(id), true);
   assert.deepEqual(requests.map(({ method, path }) => ({ method, path })), [
+    { method: "POST", path: "/v1/api-keys" },
     { method: "GET", path: "/v1/api-keys" },
     { method: "DELETE", path: `/v1/api-keys/${id}` },
   ]);
   await assert.rejects(client.revokeApiKey("invalid"));
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 3);
+  assert.throws(() => decodeApiKeyCreation({ ...created, key: "not-a-credential" }));
+  assert.throws(() => decodeApiKeyCreation({ ...created, last_four: "ABCD" }));
+  const { key: _omitted, ...replayed } = created;
+  assert.equal(decodeApiKeyCreation({ ...replayed, idempotency_replayed: true }).idempotencyReplayed, true);
+  assert.throws(() => decodeApiKeyCreation({ ...created, idempotency_replayed: true }));
+  assert.throws(() => decodeApiKeyCreation({ ...replayed, idempotency_replayed: false }));
 });
 
 function agentSession(overrides = {}) {

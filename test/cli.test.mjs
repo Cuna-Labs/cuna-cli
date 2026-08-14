@@ -51,6 +51,7 @@ function fakeClient(overrides = {}) {
     async listRecords() { return []; },
     async listAuthorizations() { return []; },
     async listApiKeys() { return []; },
+    async createApiKey() { throw new Error("unexpected create API key"); },
     async revokeApiKey() { throw new Error("unexpected revoke API key"); },
     async createMachine() { throw new Error("unexpected create"); },
     async transitionMachine() { throw new Error("unexpected transition"); },
@@ -85,7 +86,7 @@ test("non-TTY help and version are versioned JSON records", async () => {
   // short help, present in the full one.
   assert.doesNotMatch(helpRecord.data.help, /Automatic local-to-cloud journey:/u);
   assert.match(helpRecord.data.help, /cuna help --all/u);
-  assert.match(helpRecord.data.help, /Run `cuna login` and complete the one-time browser link/u);
+  assert.match(helpRecord.data.help, /Run `cuna login`, approve in the browser, and paste the displayed login code/u);
   assert.doesNotMatch(helpRecord.data.help, /Create an automation credential at/u);
   const all = memoryStreams();
   assert.equal(await runCli(["help", "--all"], { streams: all.streams }), EXIT_CODES.success);
@@ -347,18 +348,116 @@ test("TC-037-05 API-key list and revoke require fresh capability plus explicit d
   assert.deepEqual(effects, ["capability", "list", "capability", `revoke:${id}`]);
 });
 
-test("API-key creation remains fail-closed until one-time-secret reconciliation exists", async () => {
+test("API-key creation requires interactive authority and prints the one-time secret exactly once", async () => {
   let effects = 0;
-  const streams = memoryStreams();
-  const exit = await runCli(["api-keys", "create", "--yes"], {
-    streams: streams.streams,
+  const automation = memoryStreams();
+  const automationExit = await runCli(["api-keys", "create", "--name", "local automation", "--yes"], {
+    streams: automation.streams,
     platform,
     env: { CUNA_API_KEY: API_KEY },
-    clientFactory: () => fakeClient({ async listApiKeys() { effects += 1; return []; } }),
+    clientFactory: () => fakeClient({ async discoverCapabilities() { effects += 1; return capabilitySnapshot([]); } }),
   });
-  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(automationExit, EXIT_CODES.auth);
   assert.equal(effects, 0);
-  assert.equal(JSON.parse(streams.stderr()).error.details.reason, "api_key_create_reconciliation_unavailable");
+  assert.equal(JSON.parse(automation.stderr()).error.code, "cuna.auth.interactive_required");
+
+  const oneTimeKey = `cuna_sk_${"a".repeat(16)}WXYZ`;
+  const interactive = memoryStreams();
+  const client = fakeClient({
+    async discoverCapabilities(scope) {
+      effects += 1;
+      return capabilitySnapshot([{
+        id: "api_keys.manage",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "secret_revealing",
+        surfaces: ["cli"],
+        requiredPermissions: ["api_keys:manage", "auth:interactive"],
+      }], scope);
+    },
+    async createApiKey(input) {
+      effects += 1;
+      assert.deepEqual(input, { name: "local automation", expiresAt: "2026-09-01T00:00:00.000Z" });
+      return {
+        id: "11111111-1111-4111-8111-111111111111",
+        name: input.name,
+        prefix: "cuna_sk_",
+        lastFour: "WXYZ",
+        createdAt: "2026-08-08T00:00:00.000Z",
+        expiresAt: input.expiresAt,
+        lastUsedAt: null,
+        revokedAt: null,
+        idempotencyReplayed: false,
+        key: oneTimeKey,
+      };
+    },
+  });
+  const humanAuth = {
+    async acquireAccessToken() { return `cuna_at_${"b".repeat(43)}`; },
+  };
+  const interactiveExit = await runCli([
+    "api-keys", "create", "--name", "local automation", "--expires-at", "2026-09-01T00:00:00.000Z", "--yes",
+  ], {
+    streams: interactive.streams,
+    platform,
+    env: {},
+    humanAuth,
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(interactiveExit, EXIT_CODES.success, interactive.stderr());
+  const output = interactive.stdout();
+  assert.equal(output.split(oneTimeKey).length - 1, 1);
+  assert.equal(JSON.parse(output).data.key, oneTimeKey);
+  assert.equal(interactive.stderr(), "");
+  assert.equal(effects, 2);
+});
+
+test("malformed API-key create response reconciles, revokes, and verifies no active orphan", async () => {
+  const createdAt = "2026-08-08T00:00:01.000Z";
+  let createCalls = 0;
+  let revoked = false;
+  const metadata = {
+    id: "11111111-1111-4111-8111-111111111111",
+    name: "malformed commit",
+    prefix: "cuna_sk_",
+    lastFour: "WXYZ",
+    createdAt,
+    expiresAt: null,
+    lastUsedAt: null,
+    get revokedAt() { return revoked ? "2026-08-08T00:00:02.000Z" : null; },
+  };
+  const client = fakeClient({
+    async discoverCapabilities(scope) {
+      return capabilitySnapshot([{
+        id: "api_keys.manage", availability: "supported", interaction: "native",
+        mutationClass: "secret_revealing", surfaces: ["cli"], requiredPermissions: ["api_keys:manage"],
+      }], scope);
+    },
+    async listApiKeys() { return createCalls === 0 ? [] : [metadata]; },
+    async createApiKey(_input, idempotencyKey) {
+      createCalls += 1;
+      assert.match(idempotencyKey, /^cuna-api-key-create-[0-9a-f-]{36}$/u);
+      if (createCalls === 1) throw new Error("malformed response after commit");
+      return { ...metadata, idempotencyReplayed: true };
+    },
+    async revokeApiKey(id) { assert.equal(id, metadata.id); revoked = true; return true; },
+  });
+  const streams = memoryStreams();
+  const exit = await runCli(["api-keys", "create", "--name", metadata.name, "--yes"], {
+    streams: streams.streams,
+    platform,
+    env: {},
+    humanAuth: { async acquireAccessToken() { return `cuna_at_${"b".repeat(43)}`; } },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(exit, EXIT_CODES.network);
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.api_keys.create_secret_unobserved");
+  assert.equal(createCalls, 2);
+  assert.equal(revoked, true);
+  assert.equal((await client.listApiKeys()).some((key) => key.revokedAt === null), false);
+  assert.equal(streams.stdout(), "");
 });
 
 test("explicit signup, login, whoami, access status, and logout dispatch only to the interactive authority", async () => {
@@ -403,7 +502,7 @@ test("explicit signup, login, whoami, access status, and logout dispatch only to
   assert.deepEqual(calls, ["signup", "login", "whoami", "whoami", "logout"]);
 });
 
-test("login defaults to encrypted preview storage and authenticated commands reuse it without a mode flag", async () => {
+test("login defaults to encrypted local storage and authenticated commands reuse the injected authority", async () => {
   const result = {
     profile: "default",
     sessionId: "00000000-0000-0000-0000-000000000002",
@@ -428,7 +527,7 @@ test("login defaults to encrypted preview storage and authenticated commands reu
     EXIT_CODES.success,
   );
   assert.deepEqual(loginRequest, {});
-  assert.equal(JSON.parse(loginStreams.stdout()).data.storage_mode, "preview");
+  assert.equal(JSON.parse(loginStreams.stdout()).data.storage_mode, "encrypted-local");
 
   let observedAuthorization;
   const commandStreams = memoryStreams();
@@ -450,7 +549,7 @@ test("login defaults to encrypted preview storage and authenticated commands reu
 
 test("preview login never prints a capability-bearing browser URL to JSON or redirected output", async () => {
   const streams = memoryStreams();
-  const exit = await runCli(["login", "--json"], {
+  const exit = await runCli(["login", "--session-only", "--json"], {
     streams: streams.streams,
     platform,
     env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
@@ -463,7 +562,7 @@ test("preview login never prints a capability-bearing browser URL to JSON or red
 
 test("preview login refuses a redirected stderr before creating a browser continuation", async () => {
   const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: false });
-  const exit = await runCli(["login"], {
+  const exit = await runCli(["login", "--session-only"], {
     streams: streams.streams,
     platform,
     env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
@@ -474,7 +573,7 @@ test("preview login refuses a redirected stderr before creating a browser contin
   assert.equal(urlCount(streams.stderr()), 0);
 });
 
-test("production preview path uses encrypted backend without resolving native authority", async () => {
+test("production login uses the encrypted backend and reuses the canonical durable exchange", async () => {
   const configDirectory = await mkdtemp(join(tmpdir(), "cuna-cli-preview-"));
   const continuationId = "123e4567-e89b-12d3-a456-426614174000";
   const sessionId = "123e4567-e89b-12d3-a456-426614174001";
@@ -525,28 +624,14 @@ test("production preview path uses encrypted backend without resolving native au
       }), { status: 200 });
     }
     if (requestUrl.pathname === `/v1/cli-auth/continuations/${continuationId}/exchange`) {
-      return new Response(JSON.stringify({
-        access_token: `cuna_at_${"a".repeat(43)}`,
-        refresh_token: `cuna_rt_${"r".repeat(43)}`,
-        token_type: "Bearer",
-        expires_in: 600,
-        access_expires_at: "2030-01-01T00:10:00.000Z",
-        refresh_expires_at: "2030-02-01T00:00:00.000Z",
-        session_id: sessionId,
-        context,
-      }), { status: 200 });
-    }
-    if (requestUrl.pathname === "/v1/cli-auth/refresh") {
-      const accessSuffix = String.fromCharCode("b".charCodeAt(0) + refreshCount);
-      const refreshSuffix = String.fromCharCode("u".charCodeAt(0) + refreshCount);
+      const initial = refreshCount === 0;
       refreshCount += 1;
       return new Response(JSON.stringify({
-        access_token: `cuna_at_${accessSuffix.repeat(43)}`,
-        refresh_token: `cuna_rt_${refreshSuffix.repeat(43)}`,
+        access_token: `cuna_at_${(initial ? "a" : "b").repeat(43)}`,
         token_type: "Bearer",
         expires_in: 600,
-        access_expires_at: "2030-01-01T00:20:00.000Z",
-        refresh_expires_at: "2030-03-01T00:00:00.000Z",
+        access_expires_at: initial ? "2030-01-01T00:10:00.000Z" : "2030-01-01T00:20:00.000Z",
+        ...(initial ? { login_code_expires_at: "2030-02-01T00:00:00.000Z" } : {}),
         session_id: sessionId,
         context,
       }), { status: 200 });
@@ -569,17 +654,20 @@ test("production preview path uses encrypted backend without resolving native au
       streams: streams.streams,
       platform: {
         ...platform,
+        kind: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
         paths: { ...platform.paths, configDirectory },
       },
-      env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
+      env: {},
       fetch,
       browser: { async open(url) { browserUrl = url; } },
+      readLoginCode: async () => `cuna_login_${"l".repeat(43)}`,
     });
     assert.equal(exit, EXIT_CODES.success, streams.stderr());
     assert.match(browserUrl, /^https:\/\/app\.getcuna\.com\/cli\/continue#/u);
-    const files = await readdir(configDirectory);
-    assert.equal(files.length, 1);
-    const stored = await readFile(join(configDirectory, files[0]), "utf8");
+    const files = await readdir(join(configDirectory, "sessions"));
+    assert.equal(files.length, 2);
+    const storedFile = files.find((file) => file.endsWith(".json"));
+    const stored = await readFile(join(configDirectory, "sessions", storedFile), "utf8");
     assert.doesNotMatch(stored, /cuna_(?:at|rt)_/u);
 
     const laterStreams = memoryStreams();
@@ -587,6 +675,7 @@ test("production preview path uses encrypted backend without resolving native au
       streams: laterStreams.streams,
       platform: {
         ...platform,
+        kind: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
         paths: { ...platform.paths, configDirectory },
       },
       env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
@@ -600,6 +689,7 @@ test("production preview path uses encrypted backend without resolving native au
       streams: whoamiStreams.streams,
       platform: {
         ...platform,
+        kind: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
         paths: { ...platform.paths, configDirectory },
       },
       env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
@@ -612,13 +702,14 @@ test("production preview path uses encrypted backend without resolving native au
       streams: logoutStreams.streams,
       platform: {
         ...platform,
+        kind: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
         paths: { ...platform.paths, configDirectory },
       },
       env: { CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
       fetch,
     });
     assert.equal(logoutExit, EXIT_CODES.success, logoutStreams.stderr());
-    assert.equal((await readdir(configDirectory)).length, 0);
+    assert.equal((await readdir(join(configDirectory, "sessions"))).length, 0);
   } finally {
     await rm(configDirectory, { recursive: true, force: true });
   }
@@ -659,15 +750,15 @@ test("CUNA_API_KEY automation mode never falls back to or mutates interactive au
   assert.equal(calls, 0);
 });
 
-test("session-only cannot be overridden by a valid automation API key", async () => {
+test("removed session-only mode is rejected before automation auth", async () => {
   const streams = memoryStreams();
   const exit = await runCli(["machines", "list", "--session-only"], {
     streams: streams.streams,
     platform,
     env: { CUNA_API_KEY: API_KEY, CUNA_SESSION_PASSPHRASE: "preview-passphrase-2026" },
   });
-  assert.equal(exit, EXIT_CODES.auth);
-  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.auth.mode_conflict");
+  assert.equal(exit, EXIT_CODES.usage);
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.usage.invalid");
 });
 
 test("interactive bearer authenticates cloud commands without exposing or persisting the access token", async () => {

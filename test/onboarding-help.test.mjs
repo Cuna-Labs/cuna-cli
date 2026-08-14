@@ -28,7 +28,7 @@ test("the full help names where an API key comes from while short help leads wit
   // still documents the explicit automation mode and its source.
   assert.doesNotMatch(SHORT_HELP, /https?:\/\//u);
   assert.doesNotMatch(SHORT_HELP, /Create an automation credential at/u);
-  assert.match(SHORT_HELP, /Run `cuna login` and complete the one-time browser link/u);
+  assert.match(SHORT_HELP, /Run `cuna login`, approve in the browser, and paste the displayed login code/u);
   assert.match(FULL_HELP, /https?:\/\//u);
   const fullHelpUrls = new Set(
     (FULL_HELP.match(/https?:\/\/[^\s`]+/gu) ?? []).map((url) => url.replace(/[.,)]+$/u, "")),
@@ -117,7 +117,7 @@ test("per-command help is unchanged by the split", async () => {
   const cases = [
     [["machines", "create", "--help"], "machines create", "--memory-mib N"],
     [["agent-sessions", "create", "--help"], "agent-sessions create", "--workspace-generation N"],
-    [["doctor", "--help"], "doctor", "credential vault"],
+    [["doctor", "--help"], "doctor", "encrypted local\nsession-store state"],
     [["claude", "--help"], "claude", "--agent-session ID"],
   ];
   for (const [argv, topic, fragment] of cases) {
@@ -146,7 +146,7 @@ test("--all on a command topic is refused rather than silently ignored", async (
 /* S-7: the short help must not promise what this build cannot do              */
 /* -------------------------------------------------------------------------- */
 
-test("the short help presents the composed journey and distinguishes preview sign-in from native storage", () => {
+test("the short help presents the composed journey without obsolete native or preview caveats", () => {
   const available = SHORT_HELP.slice(
     SHORT_HELP.indexOf("Works with no network:"),
     SHORT_HELP.indexOf("Not available in this build:"),
@@ -162,12 +162,23 @@ test("the short help presents the composed journey and distinguishes preview sig
     assert.ok(new RegExp(`^\\s{2}${command}\\b`, "mu").test(available), `${command} must be listed as available`);
   }
   const unavailable = SHORT_HELP.slice(SHORT_HELP.indexOf("Not available in this build:"));
-  assert.ok(unavailable.includes("native credential vault"), unavailable);
-  assert.ok(unavailable.includes("cuna login"), unavailable);
-  assert.ok(unavailable.includes("encrypted browser-link"), unavailable);
+  assert.ok(!unavailable.includes("native credential vault"), unavailable);
+  assert.ok(!unavailable.includes("cuna login"), unavailable);
+  assert.ok(!unavailable.includes("encrypted browser-link"), unavailable);
   for (const command of ["claude", "codex", "openclaw", "connect"]) {
     assert.ok(!unavailable.includes(command), `${command} must not be marked unavailable`);
   }
+});
+
+test("doctor help describes only the encrypted local session-store provider", async () => {
+  const { exit, record } = await helpFor(["doctor", "--help"]);
+  assert.equal(exit, 0);
+  const publicHelp = `${SHORT_HELP}\n${FULL_HELP}\n${record.data.help}`;
+  assert.match(publicHelp, /encrypted local session-store state/u);
+  assert.doesNotMatch(
+    publicHelp,
+    /credential[- ]vault|credential manager|keychain|native (?:vault|credential|storage)|operating-system credential/iu,
+  );
 });
 
 test("the unavailability the short help claims is the unavailability this build has", () => {

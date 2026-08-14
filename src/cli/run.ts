@@ -3,7 +3,7 @@ import { createInterface } from "node:readline/promises";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
 import { createHttpTransport, type HttpRequest } from "../api/http.js";
-import { createBrowserOpener, createManualBrowserOpener, type BrowserOpener } from "../auth/browser.js";
+import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
@@ -17,13 +17,8 @@ import {
 } from "../core/product-web.js";
 import { integerArgument } from "../core/validation.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
-import { resolvePlatformAuthority, type ResolvedPlatformAuthority } from "../credentials/platform.js";
 import { CredentialVault } from "../credentials/vault.js";
-import {
-  LocalSessionPreviewBackend,
-  localSessionPreviewPath,
-  previewSessionFileExists,
-} from "../credentials/local-session-preview.js";
+import { LocalEncryptedSessionBackend, localEncryptedSessionPaths } from "../credentials/local-session.js";
 import {
   conservativeFilesystemCapabilities,
   createApiAgentJourneyEffects,
@@ -60,6 +55,7 @@ export interface RunCliDependencies {
   readonly humanAuth?: HumanAuthService;
   readonly credentialVault?: CredentialVault;
   readonly browser?: BrowserOpener;
+  readonly readLoginCode?: (signal?: AbortSignal) => Promise<string>;
   readonly signal?: AbortSignal;
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
   readonly foregroundTerminalRunner?: ForegroundSessionRunner;
@@ -72,8 +68,6 @@ export interface RunCliDependencies {
     readonly signal?: AbortSignal;
   }) => AgentJourneyEffects;
   readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw", signal: AbortSignal) => Promise<boolean>;
-  /** Test-only injection; production uses CUNA_SESSION_PASSPHRASE. */
-  readonly sessionPassphrase?: string;
 }
 
 async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw", signal: AbortSignal): Promise<boolean> {
@@ -84,6 +78,15 @@ async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw",
     return answer.trim().toLocaleLowerCase("en-US") === "y" || answer.trim().toLocaleLowerCase("en-US") === "yes";
   } catch {
     return false;
+  } finally {
+    prompt.close();
+  }
+}
+
+async function promptLoginCode(signal?: AbortSignal): Promise<string> {
+  const prompt = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+  try {
+    return await prompt.question("Paste the cuna_login_ code shown by app.getcuna.com: ", signal === undefined ? {} : { signal });
   } finally {
     prompt.close();
   }
@@ -201,22 +204,6 @@ function nodePlatform(kind: PlatformAdapter["kind"]): NodeJS.Platform {
   return kind === "windows" ? "win32" : kind === "macos" ? "darwin" : "linux";
 }
 
-function previewSessionPassphrase(
-  environment: NodeJS.ProcessEnv,
-  injected: string | undefined,
-): string {
-  const passphrase = injected ?? environment.CUNA_SESSION_PASSPHRASE;
-  if (passphrase === undefined || passphrase.length === 0) {
-    throw new CunaError({
-      code: "cuna.auth.preview_passphrase_required",
-      message: "Preview authentication stores an encrypted local session and requires CUNA_SESSION_PASSPHRASE.",
-      exitCode: EXIT_CODES.auth,
-      hint: "Set a passphrase of at least 12 characters, then run `cuna login` again. This is preview storage, not a native vault.",
-    });
-  }
-  return passphrase;
-}
-
 function runtimeError(error: RuntimeBoundaryError): CunaError {
   const exitCode = error.code === "session_conflict"
     ? EXIT_CODES.conflict
@@ -243,7 +230,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   const label = commandLabel(argv);
   try {
     const parsed = parseArgv(argv);
-    if (booleanOption(parsed, "version") || parsed.command === "version") {
+    if (!booleanOption(parsed, "help") && (booleanOption(parsed, "version") || parsed.command === "version")) {
       rejectUnknownOptions(parsed, ["version"]);
       if (parsed.command === "version" && parsed.operands.length !== 0) {
         throw usageError("version accepts no operands.");
@@ -327,14 +314,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
 
     const foreground = foregroundSelection(parsed);
     const sessionOnly = booleanOption(parsed, "session-only");
-    // Browser-link login is the default interactive path in this release. The
-    // encrypted preview record then selects the same authority for subsequent
-    // commands, so users do not have to repeat a mode flag. `--session-only`
-    // remains accepted as an explicit compatibility spelling, but it never
-    // silently downgrades an existing native or automation authority.
-    const previewRequested = sessionOnly || parsed.command === "login" || parsed.command === "signup";
-    if (sessionOnly && !usesCredentialAuthority(parsed.command, foreground)) {
-      throw usageError("Option --session-only applies only to authenticated commands.");
+    if (sessionOnly) {
+      throw usageError("Option --session-only is not supported by this release.", "Use the encrypted profile session selected automatically by cuna login.");
     }
     if ((foreground !== undefined || journeyIntent?.target === "reconcile") &&
       (writer.structured || !streams.stdinIsTTY || !streams.stdoutIsTTY)) {
@@ -383,12 +364,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // `*_API_KEY` refuses the command rather than silently demoting automation
     // mode to an interactive browser sign-in.
     if (usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
-    const previewPath = localSessionPreviewPath(platform.paths.configDirectory, config.profile);
-    const previewRecordExists = config.apiKey === undefined && usesCredentialAuthority(parsed.command, foreground)
-      ? await previewSessionFileExists(previewPath)
-      : false;
-    const previewMode = previewRequested || previewRecordExists;
-    if (previewMode && config.apiKey !== undefined) {
+    const sessionPaths = localEncryptedSessionPaths(platform.paths.configDirectory, config.profile);
+    if (config.apiKey !== undefined && (parsed.command === "login" || parsed.command === "signup")) {
       throw new CunaError({
         code: "cuna.auth.mode_conflict",
         message: `Encrypted browser authentication cannot be combined with ${config.apiKeyVariable ?? "CUNA_API_KEY"}.`,
@@ -397,29 +374,17 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       });
     }
     if (
-      previewRequested &&
+      (parsed.command === "login" || parsed.command === "signup") &&
       (writer.structured || !streams.stdinIsTTY || !streams.stdoutIsTTY || streams.stderrIsTTY !== true) &&
       dependencies.humanAuth === undefined &&
       dependencies.browser === undefined &&
       (parsed.command === "login" || parsed.command === "signup")
     ) {
       throw usageError(
-        "Preview browser authentication requires an interactive terminal and does not support JSON or redirected output.",
+        "Browser authentication requires an interactive terminal and does not support JSON or redirected output.",
         "Run `cuna login` directly in a TTY; the one-time link is printed only to the terminal.",
       );
     }
-    // One resolution of the signed native authority per process, shared by the
-    // credential vault and the Windows browser opener. Both used to construct
-    // their own unwired defaults, so neither ever saw a native bridge.
-    let platformAuthority: ResolvedPlatformAuthority | undefined;
-    const getPlatformAuthority = async (): Promise<ResolvedPlatformAuthority> => {
-      platformAuthority ??= await resolvePlatformAuthority({
-        platform: nodePlatform(platform.kind),
-        ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
-      });
-      return platformAuthority;
-    };
-
     let humanAuth = dependencies.humanAuth;
     const getHumanAuth = async (): Promise<HumanAuthService> => {
       if (humanAuth !== undefined) return humanAuth;
@@ -432,45 +397,22 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         anonymous: createHttpTransport(transportOptions),
         authenticated: (accessToken) => createHttpTransport({ ...transportOptions, bearerToken: accessToken }),
       });
-      const authority = previewMode
-        ? undefined
-        : dependencies.credentialVault !== undefined && dependencies.browser !== undefined
-        ? undefined
-        : await getPlatformAuthority();
-      const previewPassphrase = previewMode
-        ? previewSessionPassphrase(effectiveEnvironment, dependencies.sessionPassphrase)
-        : undefined;
-      // Preview mode always owns the explicitly encrypted file backend. An
-      // injected vault is a test seam for native mode; allowing it to replace
-      // this backend would make `cuna login` claim preview storage while
-      // writing to an unrelated authority.
-      const previewBackend = previewMode
-        ? new LocalSessionPreviewBackend({
-            filePath: previewPath,
-            passphrase: previewPassphrase!,
-            platform: nodePlatform(platform.kind),
-            ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
-          })
-        : undefined;
       humanAuth = createHumanAuthService({
         config,
         client: humanClient,
-        vault: !previewMode && dependencies.credentialVault !== undefined
+        vault: dependencies.credentialVault !== undefined
           ? dependencies.credentialVault
           : new CredentialVault({
-          backend: previewBackend ?? authority!.credentials,
+          backend: new LocalEncryptedSessionBackend({
+            ...sessionPaths,
+            platform: nodePlatform(platform.kind),
+            ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
+          }),
           platform: nodePlatform(platform.kind),
           ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
-          ...(previewMode ? { allowPreviewBackend: true } : {}),
         }),
-        browser: dependencies.browser ?? (previewMode
-          ? createManualBrowserOpener((message) => { streams.stderr.write(message); })
-          : createBrowserOpener(
-              nodePlatform(platform.kind),
-              effectiveEnvironment,
-              ...(authority?.browserBridge === undefined ? [] : [authority.browserBridge]),
-            )),
-        ...(previewMode ? { allowPreviewStorage: true } : {}),
+        browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
+        readLoginCode: dependencies.readLoginCode ?? promptLoginCode,
         ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
       });
       return humanAuth;
@@ -517,12 +459,12 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         );
         const data = Object.freeze({
           ...humanResult(result),
-          ...(previewMode ? { storage_mode: "preview" as const } : {}),
+          storage_mode: "encrypted-local" as const,
         });
         writer.success(
           "login",
           data,
-          `Signed in to Cuna profile ${result.profile} using an encrypted local session (no native vault).`,
+          `Signed in to Cuna profile ${result.profile} using the encrypted local session store.`,
         );
       } else if (parsed.command === "whoami" || parsed.command === "access") {
         const result = await (await getHumanAuth()).whoami(dependencies.signal);
@@ -541,9 +483,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
 
     let bearerToken: string | undefined;
     let credentialMode: "automation" | "interactive" | undefined = config.apiKey === undefined ? undefined : "automation";
-    if (config.apiKey === undefined && needsRemoteCredential(parsed.command, foreground) && dependencies.clientFactory === undefined) {
-      bearerToken = await (await getHumanAuth()).acquireAccessToken(dependencies.signal);
-      credentialMode = "interactive";
+    if (config.apiKey === undefined && needsRemoteCredential(parsed.command, foreground)) {
+      if (dependencies.clientFactory === undefined || dependencies.humanAuth !== undefined) {
+        bearerToken = await (await getHumanAuth()).acquireAccessToken(dependencies.signal);
+        credentialMode = "interactive";
+      }
     }
     const httpTransport = dependencies.clientFactory === undefined ? createHttpTransport({
       baseUrl: config.baseUrl,
@@ -669,7 +613,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     }
     let runtimeFeatures = dependencies.runtimeFeatures;
     if (parsed.command === "doctor" && runtimeFeatures === undefined) {
-      const backend = (await getPlatformAuthority()).credentials;
+      const backend = new LocalEncryptedSessionBackend({
+        ...sessionPaths,
+        platform: nodePlatform(platform.kind),
+        ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
+      });
       let credentialBackendStatus: "verified" | "unavailable" | "unknown" = "unknown";
       let credentialBackendReason: string | undefined;
       try {
