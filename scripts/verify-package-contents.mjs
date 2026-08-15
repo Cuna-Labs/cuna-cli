@@ -16,6 +16,15 @@ const bundledDependencyRoot = "package/node_modules/@xterm/headless/";
 const MAX_ENTRY_COUNT = 2_048;
 const MAX_UNPACKED_BYTES = 8 * 1024 * 1024;
 const MAX_SOURCE_MAP_BYTES = 1024 * 1024;
+const PRODUCT_CREDENTIAL_ARTIFACT = /^package\/dist\/credentials\/(?:contracts|errors|index|local-session|secret-material|vault)\.(?:js|js\.map|d\.ts|d\.ts\.map)$/iu;
+// Kept compositionally so this verifier itself cannot become evidence that a
+// retired credential protocol remains in the packaged product.
+const RETIRED_HUMAN_AUTH_MARKERS = Object.freeze([
+  ["cuna_", "rt_"].join(""),
+  ["/v1/cli-auth/", "refresh"].join(""),
+  ["refresh_", "token"].join(""),
+  ["refresh_", "family_ttl_seconds"].join(""),
+]);
 
 function octal(buffer) {
   const text = buffer.toString("ascii").replaceAll("\0", "").trim();
@@ -85,10 +94,18 @@ for (const entry of entries) {
     !/\.(?:node|dll|dylib|so(?:\.\d+)*)$/iu.test(entry.name),
     `Native binary payload is prohibited in the architecture-neutral root package; signed platform bridges must ship as separately governed artifacts: ${entry.name}`,
   );
-  invariant(
-    !/^package\/dist\/credentials\/(?:index|native-[^/]+|platform)\.(?:js|js\.map|d\.ts|d\.ts\.map)$/iu.test(entry.name),
-    `Dormant native credential loader is prohibited in the pure-JavaScript distributable: ${entry.name}`,
-  );
+  if (entry.name.startsWith("package/dist/credentials/")) {
+    invariant(
+      PRODUCT_CREDENTIAL_ARTIFACT.test(entry.name),
+      `Only the AES-GCM credential surface may ship in the public package: ${entry.name}`,
+    );
+  }
+  if (entry.name.startsWith("package/dist/") && /\.(?:js|d\.ts|map)$/iu.test(entry.name)) {
+    const emitted = entry.body.toString("utf8");
+    for (const retired of RETIRED_HUMAN_AUTH_MARKERS) {
+      invariant(!emitted.includes(retired), `Retired human-auth protocol marker ships in package: ${retired}`);
+    }
+  }
 }
 
 for (const required of ["package/package.json", "package/LICENSE", "package/NOTICE", "package/THIRD_PARTY_NOTICES.md", "package/README.md"]) {

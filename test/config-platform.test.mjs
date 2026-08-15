@@ -82,6 +82,7 @@ test("only the published API-key alias survives the configuration rename", async
   assert.deepEqual(brandedEnvironmentNames("BASE_URL"), ["CUNA_BASE_URL"]);
   assert.deepEqual(brandedEnvironmentNames("PROFILE"), ["CUNA_PROFILE"]);
   assert.deepEqual(brandedEnvironmentNames("CONFIG_FILE"), ["CUNA_CONFIG_FILE"]);
+  assert.deepEqual(brandedEnvironmentNames("OPENCODE_ENABLED"), ["CUNA_OPENCODE_ENABLED"]);
 
   for (const variable of ["CUNA_API_KEY", "RUNA_API_KEY"]) {
     for (const brand of new Set(["cuna", "runa", ...CREDENTIAL_BRANDS])) {
@@ -114,6 +115,54 @@ test("only the published API-key alias survives the configuration rename", async
     env: { CUNA_CONFIG_FILE: "/explicit/config.json" },
   });
   assert.equal(file.configFile, "/explicit/config.json");
+});
+
+test("OpenCode local consumer admission requires exact env true and an immutable producer witness", async () => {
+  const defaultGate = await resolveConfig({ platform: fakePlatform(), env: {} });
+  assert.deepEqual(defaultGate.opencodeFeatureGate, {
+    state: "disabled",
+    source: "default",
+    variable: "CUNA_OPENCODE_ENABLED",
+    reason: "environment_not_enabled",
+  });
+
+  for (const value of ["", "TRUE", "1", " true "]) {
+    const gate = await resolveConfig({
+      platform: fakePlatform(),
+      env: { CUNA_OPENCODE_ENABLED: value },
+    });
+    assert.deepEqual(gate.opencodeFeatureGate, {
+      state: "disabled",
+      source: "environment",
+      variable: "CUNA_OPENCODE_ENABLED",
+      reason: "environment_not_enabled",
+    }, JSON.stringify(value));
+  }
+
+  const mutableProducer = await resolveConfig({
+    platform: fakePlatform(),
+    env: { CUNA_OPENCODE_ENABLED: "true" },
+  });
+  assert.deepEqual(mutableProducer.opencodeFeatureGate, {
+    state: "disabled",
+    source: "environment",
+    variable: "CUNA_OPENCODE_ENABLED",
+    reason: "immutable_contract_witness_required",
+  });
+  assert.deepEqual(publicConfig(mutableProducer), {
+    profile: "default",
+    profile_source: "default",
+    base_url: DEFAULT_BASE_URL,
+    base_url_source: "default",
+    development_profile: false,
+    api_key: "absent",
+    api_key_source: "absent",
+    api_key_variable: null,
+    opencode_feature: "disabled",
+    opencode_feature_source: "environment",
+    opencode_feature_variable: "CUNA_OPENCODE_ENABLED",
+    config_file: "/home/test/.config/cuna/config.json",
+  });
 });
 
 test("the legacy alias carries the exact legacy credential to HTTP", async () => {

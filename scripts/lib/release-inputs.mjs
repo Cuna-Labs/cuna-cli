@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -7,17 +8,17 @@ import { PACKAGE_NAME, invariant, readJson, sha256File } from "./release-evidenc
 
 const SHA256 = /^[0-9a-f]{64}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
+const GIT_OBJECT_FORMATS = new Set(["sha1", "sha256"]);
 const EXACT_VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$/u;
 const EXACT_TOOL_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u;
 const INFRA_OPENAPI_FILE = "contracts/infra/cuna-api.openapi.json";
 const INFRA_OPENAPI_DIGEST_FILE = "contracts/infra/cuna-api.openapi.sha256";
-const INFRA_OPENAPI_RAW_SHA256 = "6c162e256184f69dcdf6fe63e482509a30dda7248454e3eee58f2b35819d4091";
-const INFRA_OPENAPI_CANONICAL_SHA256 = "870ae3ad5365d3850895f51124960eaf0b8f5935c7a2fe224803aa69b623c023";
-const INFRA_PRODUCER_REVISION = "0a592f93d6b9f1fa9c9501409fe4b2a9bc7367f6";
+const INFRA_OPENAPI_IDENTITY_FILE = "contracts/infra/cuna-api.openapi.identity.json";
 
 const CONTRACT_FILES = Object.freeze([
   INFRA_OPENAPI_FILE,
   INFRA_OPENAPI_DIGEST_FILE,
+  INFRA_OPENAPI_IDENTITY_FILE,
   "packaging/contract-authority.schema.json",
   "packaging/distribution-manifest.schema.json",
   "packaging/distribution-receipt.schema.json",
@@ -30,6 +31,7 @@ const CONTRACT_FILES = Object.freeze([
   "src/cli/output.ts",
   "src/cli/run.ts",
   "src/commands/commands.ts",
+  "src/config/infra-contract-witness.ts",
   "src/core/errors.ts",
   "src/pty/contracts.ts",
   "src/runtime/contracts.ts",
@@ -53,7 +55,9 @@ const BUILD_RECIPE_FILES = Object.freeze([
   "packaging/templates/install.sh.template",
   "scripts/build-release-envelope.mjs",
   "scripts/build-release-inputs.mjs",
+  "scripts/emit-infra-contract-witness.mjs",
   "scripts/lib/release-evidence.mjs",
+  "scripts/lib/infra-contract-witness.mjs",
   "scripts/lib/npm-preview-publication.mjs",
   "scripts/lib/release-approval-lease.mjs",
   "scripts/lib/release-approval-consumption.mjs",
@@ -63,6 +67,7 @@ const BUILD_RECIPE_FILES = Object.freeze([
   "scripts/release-project-distributions.mjs",
   "scripts/publish-npm-preview.mjs",
   "scripts/run-build-operation.mjs",
+  "scripts/sync-infra-openapi.mjs",
   "scripts/summarize-observation-receipts.mjs",
   "scripts/consume-release-approval-nonce.mjs",
   "scripts/verify-ci-contract.mjs",
@@ -87,6 +92,103 @@ function exactKeys(value, expected, label) {
   const wanted = [...expected].sort();
   invariant(JSON.stringify(actual) === JSON.stringify(wanted), `${label} keys differ: ${actual.join(", ")}`);
 }
+
+function isGitObjectId(value, objectFormat) {
+  const length = objectFormat === "sha1" ? 40 : 64;
+  return typeof value === "string" && new RegExp(`^[0-9a-f]{${length}}$`, "u").test(value);
+}
+
+function validateCommittedOpenCodeWitness(identity) {
+  const tree = identity.producer_full_tree;
+  invariant(tree && typeof tree === "object" && !Array.isArray(tree), "Committed Infra tree witness is invalid");
+  exactKeys(tree, ["object_format", "commit", "tree", "contract_blob"], "Committed Infra tree witness");
+  invariant(GIT_OBJECT_FORMATS.has(tree.object_format), "Committed Infra tree object format is invalid");
+  invariant(tree.commit === identity.producer_revision, "Committed Infra tree revision differs");
+  invariant(isGitObjectId(tree.commit, tree.object_format), "Committed Infra tree commit is invalid");
+  invariant(isGitObjectId(tree.tree, tree.object_format), "Committed Infra tree object is invalid");
+  invariant(isGitObjectId(tree.contract_blob, tree.object_format), "Committed Infra contract blob is invalid");
+  const featureContracts = identity.feature_contracts;
+  invariant(featureContracts && typeof featureContracts === "object" && !Array.isArray(featureContracts), "Committed Infra feature witness is invalid");
+  exactKeys(featureContracts, ["opencode_interactive_only"], "Committed Infra feature witness");
+  const witness = featureContracts.opencode_interactive_only;
+  invariant(witness && typeof witness === "object" && !Array.isArray(witness), "Committed OpenCode witness is missing");
+  exactKeys(witness, ["openapi_raw_sha256", "openapi_canonical_sha256", "producer_commit", "producer_tree", "producer_contract_blob"], "Committed OpenCode witness");
+  invariant(witness.openapi_raw_sha256 === identity.infra_openapi_raw_sha256, "Committed OpenCode raw digest differs");
+  invariant(witness.openapi_canonical_sha256 === identity.infra_openapi_canonical_sha256, "Committed OpenCode canonical digest differs");
+  invariant(witness.producer_commit === tree.commit, "Committed OpenCode revision differs");
+  invariant(witness.producer_tree === tree.tree, "Committed OpenCode tree differs");
+  invariant(witness.producer_contract_blob === tree.contract_blob, "Committed OpenCode contract blob differs");
+}
+
+function loadInfraOpenapiIdentity() {
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(new URL("../../contracts/infra/cuna-api.openapi.identity.json", import.meta.url), "utf8"));
+  } catch (error) {
+    throw new Error(`Vendored Infra OpenAPI identity is unreadable: ${error instanceof Error ? error.message : "unknown failure"}`);
+  }
+  invariant(parsed && typeof parsed === "object" && !Array.isArray(parsed), "Vendored Infra OpenAPI identity is invalid");
+  if (parsed.schemaVersion === 1) {
+    exactKeys(parsed, [
+      "schemaVersion",
+      "artifact_file",
+      "canonical_digest_file",
+      "infra_openapi_raw_sha256",
+      "infra_openapi_canonical_sha256",
+      "producer_repository",
+      "producer_content_state",
+      "producer_base_revision",
+      "producer_contract_verifier",
+      "producer_projection_sha256",
+      "producer_runtime_manifest_sha256",
+    ], "vendored legacy mutable Infra OpenAPI identity");
+    invariant(parsed.producer_content_state === "working_tree_product_delta", "Legacy Infra identity cannot claim immutable producer state");
+    invariant(COMMIT.test(parsed.producer_base_revision), "Vendored Infra producer revision is invalid");
+  } else if (parsed.schemaVersion === 2) {
+    const shared = [
+      "schemaVersion",
+      "artifact_file",
+      "canonical_digest_file",
+      "infra_openapi_raw_sha256",
+      "infra_openapi_canonical_sha256",
+      "producer_repository",
+      "producer_content_state",
+      "producer_full_tree",
+      "producer_contract_verifier",
+      "producer_projection_sha256",
+      "producer_runtime_manifest_sha256",
+      "feature_contracts",
+    ];
+    if (parsed.producer_content_state === "committed") {
+      exactKeys(parsed, [...shared, "producer_revision"], "vendored committed Infra OpenAPI identity");
+      invariant(COMMIT.test(parsed.producer_revision), "Vendored committed Infra revision is invalid");
+      validateCommittedOpenCodeWitness(parsed);
+    } else if (parsed.producer_content_state === "working_tree_product_delta") {
+      exactKeys(parsed, [...shared, "producer_base_revision"], "vendored mutable Infra OpenAPI identity");
+      invariant(COMMIT.test(parsed.producer_base_revision), "Vendored mutable Infra revision is invalid");
+      invariant(parsed.producer_full_tree === null, "Mutable Infra identity must not claim a Git tree");
+      exactKeys(parsed.feature_contracts, ["opencode_interactive_only"], "Mutable Infra feature witness");
+      invariant(parsed.feature_contracts.opencode_interactive_only === null, "Mutable Infra identity must not enable OpenCode");
+    } else {
+      invariant(false, "Vendored Infra producer state differs");
+    }
+  } else {
+    invariant(false, "Vendored Infra OpenAPI identity schema differs");
+  }
+  invariant(parsed.artifact_file === INFRA_OPENAPI_FILE, "Vendored Infra OpenAPI identity artifact differs");
+  invariant(parsed.canonical_digest_file === INFRA_OPENAPI_DIGEST_FILE, "Vendored Infra OpenAPI identity digest artifact differs");
+  invariant(SHA256.test(parsed.infra_openapi_raw_sha256), "Vendored Infra OpenAPI identity raw digest is invalid");
+  invariant(SHA256.test(parsed.infra_openapi_canonical_sha256), "Vendored Infra OpenAPI identity canonical digest is invalid");
+  invariant(parsed.producer_repository === "Cuna-Labs/infra", "Vendored Infra producer repository differs");
+  invariant(parsed.producer_contract_verifier === "contracts/tools/verify-contract.mjs", "Vendored Infra verifier identity differs");
+  invariant(SHA256.test(parsed.producer_projection_sha256), "Vendored Infra projection digest is invalid");
+  invariant(SHA256.test(parsed.producer_runtime_manifest_sha256), "Vendored Infra runtime digest is invalid");
+  return Object.freeze(parsed);
+}
+
+export const INFRA_OPENAPI_CONTRACT_IDENTITY = loadInfraOpenapiIdentity();
+const INFRA_OPENAPI_RAW_SHA256 = INFRA_OPENAPI_CONTRACT_IDENTITY.infra_openapi_raw_sha256;
+const INFRA_OPENAPI_CANONICAL_SHA256 = INFRA_OPENAPI_CONTRACT_IDENTITY.infra_openapi_canonical_sha256;
 
 function validateDigestEntries(entries, expectedFiles, label) {
   invariant(Array.isArray(entries), `${label}.files must be an array`);
@@ -144,17 +246,14 @@ export function validateReleaseInputs(inputs) {
   invariant(JSON.stringify(componentKeys) === JSON.stringify([...componentKeys].sort()), "Dependency closure is not sorted");
   invariant(createHash("sha256").update(componentKeys.join(""), "utf8").digest("hex") === inputs.dependencyClosure.aggregateSha256, "Dependency-closure aggregate digest mismatch");
 
-  exactKeys(inputs.producerContract, ["artifact_file", "canonical_digest_file", "infra_openapi_raw_sha256", "infra_openapi_canonical_sha256", "producer_repository", "producer_revision"], "producerContract");
-  invariant(inputs.producerContract.artifact_file === INFRA_OPENAPI_FILE, "Producer contract artifact differs");
-  invariant(inputs.producerContract.canonical_digest_file === INFRA_OPENAPI_DIGEST_FILE, "Producer canonical-digest artifact differs");
-  invariant(inputs.producerContract.infra_openapi_raw_sha256 === INFRA_OPENAPI_RAW_SHA256, "Producer OpenAPI raw digest differs");
-  invariant(inputs.producerContract.infra_openapi_canonical_sha256 === INFRA_OPENAPI_CANONICAL_SHA256, "Producer OpenAPI canonical digest differs");
-  invariant(inputs.producerContract.producer_repository === "Cuna-Labs/infra", "Producer repository differs");
-  invariant(inputs.producerContract.producer_revision === INFRA_PRODUCER_REVISION, "Producer revision differs");
+  invariant(
+    JSON.stringify(inputs.producerContract) === JSON.stringify(INFRA_OPENAPI_CONTRACT_IDENTITY),
+    "Producer contract identity differs from the vendored Infra witness",
+  );
 
   exactKeys(inputs.contractSet, ["algorithm", "authority", "releaseAuthority", "files", "aggregateSha256"], "contractSet");
   invariant(inputs.contractSet.authority === "CUNA_INFRA_OPENAPI_VENDORED_EXACT", "Contract-set authority differs");
-  invariant(inputs.contractSet.releaseAuthority === "CUNA_CANONICAL_PUBLIC_API_CONTRACT", "Canonical release authority differs");
+  invariant(inputs.contractSet.releaseAuthority === "UNRESOLVED_BLOCKING", "Working-tree producer delta must not claim canonical release authority");
   exactKeys(inputs.buildRecipe, ["algorithm", "commands", "files", "aggregateSha256"], "buildRecipe");
   invariant(Array.isArray(inputs.buildRecipe.commands) && inputs.buildRecipe.commands.length > 0, "Build-recipe commands are missing");
   for (const command of inputs.buildRecipe.commands) invariant(typeof command === "string" && command.length > 0, "Build-recipe command is invalid");
@@ -259,18 +358,11 @@ export async function buildReleaseInputs({ root, sourceCommit, npmVersion, runne
       components,
       aggregateSha256: createHash("sha256").update(componentKeys.join(""), "utf8").digest("hex"),
     },
-    producerContract: {
-      artifact_file: INFRA_OPENAPI_FILE,
-      canonical_digest_file: INFRA_OPENAPI_DIGEST_FILE,
-      infra_openapi_raw_sha256: infraOpenapiRawSha256,
-      infra_openapi_canonical_sha256: INFRA_OPENAPI_CANONICAL_SHA256,
-      producer_repository: "Cuna-Labs/infra",
-      producer_revision: INFRA_PRODUCER_REVISION,
-    },
+    producerContract: INFRA_OPENAPI_CONTRACT_IDENTITY,
     contractSet: {
       algorithm: "cuna-cli-public-contract-files-v1",
       authority: "CUNA_INFRA_OPENAPI_VENDORED_EXACT",
-      releaseAuthority: "CUNA_CANONICAL_PUBLIC_API_CONTRACT",
+      releaseAuthority: "UNRESOLVED_BLOCKING",
       files: contractFiles,
       aggregateSha256: aggregateDigest(contractFiles),
     },

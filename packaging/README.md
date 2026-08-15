@@ -130,20 +130,12 @@ authentication remains `UNVERIFIED`, distribution and release remain
 observation authority plus replay/lease enforcement are explicit unresolved
 release blockers.
 
-The root npm tarball is intentionally architecture-neutral JavaScript. That
-check does not prohibit the product's required native credential and browser
-bridges: Windows and macOS bridges must be separately named, signed,
-platform-scoped artifacts with their own provenance, installation receipts,
-revocation path, and admission authority. Until those artifacts exist and pass
-their platform gates, `SIGNED_PLATFORM_CREDENTIAL_BROWSER_BRIDGES_MISSING`
-remains a mandatory release blocker; arm64 observations are non-authorizing.
-
-Windows native credential and browser operations also remain unavailable for
-release until a native authority owns the `CreateProcessW` process handle from
-creation through loaded-image verification and protected-stdin handoff. A PID,
-an executable-path recheck, or a second helper process cannot prove this
-process-instance identity. The mandatory blocker is
-`WINDOWS_OWNED_PROCESS_HANDLE_IDENTITY_AUTHORITY_MISSING`.
+The root npm tarball is intentionally architecture-neutral JavaScript. Browser
+onboarding uses the public `app.getcuna.com` handoff and the reusable local
+profile is persisted only as an AES-256-GCM key/ciphertext pair protected by
+owner-only filesystem permissions. This release has no platform credential
+vault, browser helper, signing helper, or operating-system credential-store
+dependency.
 
 ```bash
 node scripts/verify-distribution-receipts.mjs \

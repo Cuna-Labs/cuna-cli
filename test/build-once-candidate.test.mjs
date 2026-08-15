@@ -13,6 +13,8 @@ test("local build-once composes the canonical release envelope and never introdu
   assert.match(source, /build-release-inputs\.mjs/u);
   assert.match(source, /build-release-envelope\.mjs/u);
   assert.match(source, /verify-release-envelope\.mjs/u);
+  assert.match(source, /assertCleanSource/u);
+  assert.match(source, /status", "--porcelain=v1", "--untracked-files=all"/u);
   assert.doesNotMatch(source, /native|component-release-manifest/iu);
   assert.equal(schema.properties.authority.properties.releaseEligible.const, false);
 });

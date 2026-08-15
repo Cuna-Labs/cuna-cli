@@ -1,6 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
-
+import { randomBytes, randomUUID } from "node:crypto";
 import type { EffectiveConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { automationCredentialHint } from "../core/product-web.js";
@@ -17,18 +15,18 @@ import {
   decodeCliIdentityContext,
   type CliIdentityContext,
   type CliIntentClass,
-  type CliTokenSet,
+  type CliLoginCodeExchangeResult,
 } from "./human-contracts.js";
 import { createPkceAuthorization } from "./pkce.js";
 
 interface StoredHumanSession {
-  readonly version: 2;
+  readonly version: 3;
   readonly baseUrl: string;
   readonly profile: string;
   readonly clientInstanceId: string;
   readonly sessionId: string;
-  readonly refreshToken: string;
-  readonly refreshExpiresAt: string;
+  readonly loginCode: string;
+  readonly loginCodeExpiresAt: string;
   readonly continuationId: string;
   readonly state: string;
   readonly codeVerifier: string;
@@ -48,7 +46,7 @@ export interface HumanAuthResult {
   readonly profile: string;
   readonly sessionId: string;
   readonly context: CliIdentityContext;
-  readonly storageMode?: "encrypted-local" | "preview";
+  readonly storageMode?: "encrypted-local";
 }
 
 export interface HumanAuthService {
@@ -59,15 +57,14 @@ export interface HumanAuthService {
   logout(signal?: AbortSignal): Promise<{ readonly revoked: true }>;
 }
 
-type Sleep = (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 type RandomSource = (size: number) => Uint8Array;
 
 /**
  * The automation-only hint used when a command has no admitted interactive
- * session. Browser-link login itself uses the encrypted preview backend in
- * this build; this message must not imply that an API key is a login fallback.
+ * session. Browser-link login uses the encrypted local session store; this
+ * message must not imply that an API key is a login fallback.
  *
- * `CUNA_API_KEY` never touches either local session store:
+ * `CUNA_API_KEY` never touches the encrypted local session store:
  * `cli/run.ts` selects automation mode from it and hands the key straight to
  * the HTTP transport. Measured on this host — the vault reports an unverified
  * backend, so an explicit automation credential remains separate from the
@@ -97,7 +94,7 @@ function binding(config: EffectiveConfig): CredentialBinding {
     profileId: config.profile,
     accountId: config.baseUrl,
     workspaceId: "cli-human-auth",
-    kind: "refresh-session-v1",
+    kind: "login-code-session-v1",
   });
 }
 
@@ -118,8 +115,8 @@ function encodeStored(session: StoredHumanSession): SecretMaterial {
     profile: session.profile,
     client_instance_id: session.clientInstanceId,
     session_id: session.sessionId,
-    refresh_token: session.refreshToken,
-    refresh_expires_at: session.refreshExpiresAt,
+    login_code: session.loginCode,
+    login_code_expires_at: session.loginCodeExpiresAt,
     continuation_id: session.continuationId,
     state: session.state,
     code_verifier: session.codeVerifier,
@@ -138,30 +135,24 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
     throw authError("cuna.auth.session_corrupt", "The protected Cuna sign-in session is malformed.");
   }
   const record = parsed as Record<string, unknown>;
-  const legacy = record.version === 1;
-  const expected = legacy
-    ? [
-        "base_url", "client_instance_id", "context", "profile",
-        "refresh_expires_at", "refresh_token", "session_id", "version",
-      ]
-    : [
-        "base_url", "client_instance_id", "code_verifier", "context", "continuation_id", "intent_class", "profile",
-        "redirect_uri", "refresh_expires_at", "refresh_token", "session_id", "state", "version",
-      ];
+  const expected = [
+    "base_url", "client_instance_id", "code_verifier", "context", "continuation_id", "intent_class", "login_code",
+    "login_code_expires_at", "profile", "redirect_uri", "session_id", "state", "version",
+  ];
   const keys = Object.keys(record).sort();
   if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
     throw authError("cuna.auth.session_corrupt", "The protected Cuna sign-in session has an invalid shape.");
   }
   if (
-    (!legacy && record.version !== 2) ||
+    record.version !== 3 ||
     record.base_url !== config.baseUrl || record.profile !== config.profile ||
-    typeof record.refresh_token !== "string" || !isLoginCode(record.refresh_token) ||
-    typeof record.refresh_expires_at !== "string" || Number.isNaN(Date.parse(record.refresh_expires_at)) ||
-    new Date(record.refresh_expires_at).toISOString() !== record.refresh_expires_at ||
+    typeof record.login_code !== "string" || !isLoginCode(record.login_code) ||
+    typeof record.login_code_expires_at !== "string" || Number.isNaN(Date.parse(record.login_code_expires_at)) ||
+    new Date(record.login_code_expires_at).toISOString() !== record.login_code_expires_at ||
     typeof record.client_instance_id !== "string" || typeof record.session_id !== "string" ||
     typeof record.continuation_id !== "string" || typeof record.state !== "string" ||
     typeof record.code_verifier !== "string" || typeof record.redirect_uri !== "string" ||
-    (!legacy && !new Set<CliIntentClass>([
+    (!new Set<CliIntentClass>([
         "signup", "login", "account.read", "machines.read", "machines.create",
         "agent_sessions.read", "agent_sessions.create",
       ]).has(record.intent_class as CliIntentClass))
@@ -169,64 +160,73 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
     throw authError("cuna.auth.session_corrupt", "The protected Cuna sign-in session failed validation.");
   }
   return Object.freeze({
-    version: 2,
+    version: 3,
     baseUrl: config.baseUrl,
     profile: assertProfile(config.profile),
     clientInstanceId: assertUuid(record.client_instance_id, "client instance ID"),
     sessionId: assertUuid(record.session_id, "session ID"),
-    refreshToken: record.refresh_token,
-    refreshExpiresAt: record.refresh_expires_at,
+    loginCode: record.login_code,
+    loginCodeExpiresAt: record.login_code_expires_at,
     continuationId: assertUuid(record.continuation_id, "continuation ID"),
     state: record.state,
     codeVerifier: record.code_verifier,
     redirectUri: record.redirect_uri,
     context: decodeCliIdentityContext(record.context),
-    intentClass: legacy ? "login" : record.intent_class as CliIntentClass,
+    intentClass: record.intent_class as CliIntentClass,
   });
 }
 
-function storedFromTokens(
+function storedFromExchange(
   config: EffectiveConfig,
   clientInstanceId: string,
-  tokens: CliTokenSet,
+  loginCode: string,
+  exchange: CliLoginCodeExchangeResult,
   intentClass: CliIntentClass,
   continuation: { readonly id: string; readonly state: string; readonly codeVerifier: string; readonly redirectUri: string },
 ): StoredHumanSession {
   return Object.freeze({
-    version: 2,
+    version: 3,
     baseUrl: config.baseUrl,
     profile: config.profile,
     clientInstanceId,
-    sessionId: tokens.sessionId,
-    refreshToken: tokens.refreshToken,
-    refreshExpiresAt: tokens.refreshExpiresAt,
+    sessionId: exchange.sessionId,
+    loginCode,
+    loginCodeExpiresAt: exchange.loginCodeExpiresAt,
     continuationId: continuation.id,
     state: continuation.state,
     codeVerifier: continuation.codeVerifier,
     redirectUri: continuation.redirectUri,
-    context: tokens.context,
+    context: exchange.context,
     intentClass,
   });
 }
 
-function stableRefreshIdempotency(session: StoredHumanSession): string {
-  const digest = createHash("sha256")
-    .update("cuna-cli-refresh-v1\0", "utf8")
-    .update(session.refreshToken, "utf8")
-    .update("\0", "utf8")
-    .update(session.clientInstanceId, "ascii")
-    .update("\0", "utf8")
-    .update(session.profile, "utf8")
-    .digest("base64url");
-  return `refresh-${digest}`;
+function isAuthoritativeReexchangeRejection(error: unknown): boolean {
+  if (!(error instanceof CunaError)) return false;
+  const status = error.details?.http_status;
+  const reason = error.details?.reason;
+  // A generic 4xx is not proof that this exact login-code family was revoked:
+  // the current OpenAPI `Problem` response is intentionally extensible. Only
+  // these server-defined terminal pairs may remove the durable code.
+  return (status === 401 &&
+    (reason === "cli_auth_rejected" || reason === "cli_session_revoked"));
 }
 
-function isAuthoritativeRefreshRejection(error: unknown): boolean {
+/**
+ * A second logout is allowed to finish local cleanup only after the server has
+ * made an irreversible fact visible.  In particular, a lost response and a
+ * later 401 are not equivalent: the former is indeterminate and preserves the
+ * encrypted login code; the latter proves the family cannot be used again.
+ */
+function isDefinitiveLogoutTermination(error: unknown): boolean {
   if (!(error instanceof CunaError)) return false;
   const reason = error.details?.reason;
-  return error.code === "cuna.auth.rejected" ||
-    reason === "cli_auth_rejected" || reason === "cli_refresh_reuse" ||
-    reason === "cli_session_revoked" || reason === "terms_version_mismatch";
+  return (
+    // Re-exchange emits this marker only after CredentialVault used a
+    // revision-fenced deletion (or observed the exact old record absent).
+    error.code === "cuna.auth.reauthentication_required" && reason === "durable_session_removed"
+  ) ||
+    isAuthoritativeReexchangeRejection(error);
 }
 
 function ensureOnboardingReady(context: CliIdentityContext): void {
@@ -304,21 +304,25 @@ export function createHumanAuthService(input: {
   readonly browser: BrowserOpener;
   readonly readLoginCode: (signal?: AbortSignal) => Promise<string>;
   readonly clock?: () => number;
-  readonly sleep?: Sleep;
   readonly random?: RandomSource;
   readonly uuid?: () => string;
-  /** Explicit preview-only local session storage. Normal auth remains native-only. */
-  readonly allowPreviewStorage?: boolean;
 }): HumanAuthService {
   const clock = input.clock ?? Date.now;
   const random = input.random ?? randomBytes;
-  const sleep: Sleep = input.sleep ?? (async (milliseconds, signal) => {
-    await delay(milliseconds, undefined, { signal });
-  });
   const credentialBinding = binding(input.config);
   let lastObservedNow: number | undefined;
-  let access: { readonly material: SecretMaterial; readonly expiresAt: number } | undefined;
-  let refreshFlight: Promise<void> | undefined;
+  // Profile and session ID are non-secret identity metadata decoded from the
+  // same encrypted record that authorizes a re-exchange. Keeping that validated
+  // metadata with the in-memory access token avoids a second durable-store
+  // read merely to render `whoami`.
+  let access: {
+    readonly material: SecretMaterial;
+    readonly expiresAt: number;
+    readonly profile: string;
+    readonly sessionId: string;
+    readonly revision: number;
+  } | undefined;
+  let reexchangeFlight: Promise<void> | undefined;
 
   function now(): number {
     const observed = clock();
@@ -329,23 +333,24 @@ export function createHumanAuthService(input: {
     return observed;
   }
 
-  function cacheAccessToken(token: string, expiresAt: number): boolean {
-    if (!Number.isSafeInteger(expiresAt) || expiresAt - now() <= 30_000) return false;
+  function cacheAccessToken(
+    token: string,
+    expiresAt: number,
+    session: Pick<StoredHumanSession, "profile" | "sessionId">,
+    revision: number,
+  ): boolean {
+    if (!Number.isSafeInteger(expiresAt) || expiresAt - now() <= 30_000 || !Number.isSafeInteger(revision) || revision < 1) return false;
     const material = SecretMaterial.fromUtf8(token);
     access?.material.dispose();
-    access = { material, expiresAt };
+    access = { material, expiresAt, profile: session.profile, sessionId: session.sessionId, revision };
     return true;
   }
 
   function cachedAccessToken(): string {
     if (access === undefined || access.expiresAt - now() <= 30_000) {
-      throw authError("cuna.auth.refresh_unknown", "Cuna could not establish a fresh in-memory access token.", { retryable: true });
+      throw authError("cuna.auth.reexchange_unknown", "Cuna could not establish a fresh in-memory access token.", { retryable: true });
     }
     return access.material.withBytes((bytes) => new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  }
-
-  async function cancelBestEffort(id: string, secret: string): Promise<void> {
-    try { await input.client.cancel({ id, secret }); } catch { /* unknown cancellation remains server-expiring */ }
   }
 
   function assertNotCancelled(signal?: AbortSignal): void {
@@ -354,7 +359,76 @@ export function createHumanAuthService(input: {
     }
   }
 
-  async function waitForRefresh(flight: Promise<void>, signal?: AbortSignal): Promise<void> {
+  async function readLoginCodeBeforeExpiry(expiresAt: string, signal?: AbortSignal): Promise<string> {
+    const deadline = Date.parse(expiresAt);
+    const remaining = deadline - now();
+    if (remaining <= 0) {
+      throw authError("cuna.auth.continuation_expired", "Cuna sign-in expired before the browser code could be entered.");
+    }
+    const controller = new AbortController();
+    let expired = false;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let removeCancellation: (() => void) | undefined;
+    const deadlineReached = new Promise<{ readonly kind: "expired" }>((resolve) => {
+      timer = setTimeout(() => {
+        expired = true;
+        controller.abort();
+        resolve(Object.freeze({ kind: "expired" as const }));
+      }, remaining);
+    });
+    const callerCancelled = signal === undefined
+      ? new Promise<never>(() => {})
+      : new Promise<{ readonly kind: "cancelled" }>((resolve) => {
+        const cancel = () => {
+          cancelled = true;
+          controller.abort();
+          resolve(Object.freeze({ kind: "cancelled" as const }));
+        };
+        removeCancellation = () => signal.removeEventListener("abort", cancel);
+        signal.addEventListener("abort", cancel, { once: true });
+        // AbortSignal does not replay an event delivered just before listener
+        // registration. Recheck the state so cancellation cannot leave the
+        // hidden reader blocked until the continuation deadline.
+        if (signal.aborted) cancel();
+      });
+    try {
+      // Do not start a reader after the post-registration recheck found the
+      // caller cancelled. If cancellation arrives immediately afterwards, the
+      // registered handler aborts this controller and wins the race below.
+      const codeRead = cancelled
+        ? new Promise<never>(() => {})
+        : input.readLoginCode(controller.signal).then((loginCode) => Object.freeze({ kind: "login_code" as const, loginCode }));
+      const outcome = await Promise.race([
+        codeRead,
+        deadlineReached,
+        callerCancelled,
+      ]);
+      if (outcome.kind === "expired") {
+        throw authError("cuna.auth.continuation_expired", "Cuna sign-in expired before the browser code could be entered.");
+      }
+      if (outcome.kind === "cancelled") {
+        throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
+      }
+      const loginCode = outcome.loginCode;
+      if (expired || Date.parse(expiresAt) <= now()) {
+        throw authError("cuna.auth.continuation_expired", "Cuna sign-in expired before the browser code could be entered.");
+      }
+      assertNotCancelled(signal);
+      return loginCode;
+    } catch (error) {
+      if (expired) {
+        throw authError("cuna.auth.continuation_expired", "Cuna sign-in expired before the browser code could be entered.");
+      }
+      if (signal?.aborted === true) throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
+      throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      removeCancellation?.();
+    }
+  }
+
+  async function waitForReexchange(flight: Promise<void>, signal?: AbortSignal): Promise<void> {
     assertNotCancelled(signal);
     if (signal === undefined) return await flight;
     return await new Promise<void>((resolve, reject) => {
@@ -380,17 +454,12 @@ export function createHumanAuthService(input: {
     const intentClass = request.intentClass ?? "login";
     assertNotCancelled(request.signal);
     const vaultStatus = await input.vault.status(credentialBinding);
-    const previewStorage = input.allowPreviewStorage === true && vaultStatus.backendStatus === "preview";
-    if (vaultStatus.backendStatus !== "verified" && !previewStorage) {
+    if (vaultStatus.backendStatus !== "verified") {
       throw authError(
-        "cuna.auth.vault_unavailable",
-        input.allowPreviewStorage === true
-          ? "The encrypted preview session store is unavailable or cannot be verified."
-          : "Interactive sign-in requires the verified encrypted local session store.",
+        "cuna.auth.session_store_unavailable",
+        "The encrypted local session store is unavailable or cannot be verified.",
         {
-          hint: input.allowPreviewStorage === true
-            ? "Set CUNA_SESSION_PASSPHRASE to a 12-character-or-longer passphrase and retry `cuna login`."
-            : AUTOMATION_CREDENTIAL_HINT,
+          hint: "Run `cuna doctor` to verify encrypted local session storage, then retry `cuna login`.",
         },
       );
     }
@@ -398,23 +467,14 @@ export function createHumanAuthService(input: {
       throw authError(
         "cuna.auth.already_signed_in",
         "This Cuna profile already has an interactive session.",
-        {
-          hint: previewStorage
-            ? "Run `cuna logout` before signing in again."
-            : "Run `cuna logout` before signing in again.",
-        },
+        { hint: "Run `cuna logout` before signing in again." },
       );
     }
     if (vaultStatus.state === "corrupt") {
-      const corruptHint = previewStorage
-        ? "Remove the encrypted preview session file and retry with a new CUNA_SESSION_PASSPHRASE."
-        : "Remove the damaged encrypted local session files, then run `cuna login` again.";
       throw authError(
         "cuna.auth.session_corrupt",
-        previewStorage
-          ? "The encrypted preview Cuna session is corrupt and cannot be replaced implicitly."
-          : "The protected Cuna session is corrupt and cannot be replaced implicitly.",
-        { hint: corruptHint },
+        "The protected Cuna session is corrupt and cannot be replaced implicitly.",
+        { hint: "Remove the damaged encrypted local session files, then run `cuna login` again." },
       );
     }
     const bootstrap = await input.client.bootstrap(request.signal);
@@ -447,240 +507,331 @@ export function createHumanAuthService(input: {
       browserOrigin: bootstrap.browserOrigin,
       ...(request.signal === undefined ? {} : { signal: request.signal }),
     });
-    try {
+    // Terminal cancellation is local. Browser cancellation is a separately
+    // authenticated cuna_cb_ callback owned by the approved browser flow;
+    // this CLI never has a continuation secret or a cancel endpoint.
+    {
       if (Date.parse(issued.expiresAt) <= now()) {
         throw authError("cuna.auth.continuation_expired", "Cuna issued an already-expired sign-in continuation.");
       }
       await input.browser.open(issued.browserUrl);
-      let interval = Math.max(bootstrap.pollAfterMs, issued.pollAfterMs);
-      for (let attempt = 0; attempt < bootstrap.pollLimit; attempt += 1) {
-        if (request.signal?.aborted) throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
-        const remaining = Date.parse(issued.expiresAt) - now();
-        if (remaining <= 0) break;
-        try { await sleep(Math.min(interval, remaining), request.signal); } catch {
-          if (request.signal?.aborted) throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
-          throw authError("cuna.auth.poll_failed", "Cuna could not continue sign-in polling.", { retryable: true });
-        }
-        const status = await input.client.continuation({
-          id: issued.id,
-          secret: issued.continuationSecret,
-          ...(request.signal === undefined ? {} : { signal: request.signal }),
+      const loginCode = (await readLoginCodeBeforeExpiry(issued.expiresAt, request.signal)).trim();
+      if (!isLoginCode(loginCode)) {
+        throw authError("cuna.auth.login_code_invalid", "The pasted Cuna login code is invalid.", {
+          hint: "Copy the complete cuna_login_ code shown by app.getcuna.com and paste it once.",
         });
-        if (Date.parse(status.expiresAt) !== Date.parse(issued.expiresAt)) {
-          throw authError("cuna.auth.continuation_mismatch", "Cuna returned contradictory continuation authority.");
-        }
-        if (status.phase === "issued") {
-          interval = Math.max(bootstrap.pollAfterMs, status.pollAfterMs ?? interval);
-          continue;
-        }
-        if (status.phase === "cancelled") throw authError("cuna.auth.cancelled", "Cuna sign-in was cancelled.");
-        if (status.phase === "expired") throw authError("cuna.auth.continuation_expired", "Cuna sign-in expired.");
-        if (status.phase === "consumed") throw authError("cuna.auth.continuation_consumed", "This Cuna sign-in was already exchanged.");
-        const loginCode = (await input.readLoginCode(request.signal)).trim();
-        if (!isLoginCode(loginCode)) {
-          throw authError("cuna.auth.login_code_invalid", "The pasted Cuna login code is invalid.", {
-            hint: "Copy the complete cuna_login_ code shown by app.getcuna.com and paste it once.",
-          });
-        }
-        const tokens = await input.client.exchange({
-          id: issued.id,
-          clientInstanceId,
-          profile: input.config.profile,
-          state: pkce.state,
-          codeVerifier: pkce.verifier,
-          redirectUri,
-          loginCode,
-          ...(request.signal === undefined ? {} : { signal: request.signal }),
-        });
-        try {
-          const exchangedAt = now();
-          if (Date.parse(tokens.refreshExpiresAt) <= exchangedAt || Date.parse(tokens.accessExpiresAt) <= exchangedAt) {
-            throw authError("cuna.auth.token_expired", "Cuna returned an already-expired sign-in session.");
-          }
-          if (
-            tokens.refreshToken !== loginCode ||
-            tokens.context.requiredTermsVersion !== status.requiredTermsVersion ||
-            (status.context !== undefined &&
-              JSON.stringify(contextWire(status.context)) !== JSON.stringify(contextWire(tokens.context)))
-          ) {
-            throw authError("cuna.auth.context_mismatch", "Cuna returned contradictory sign-in context authority.");
-          }
-          if (intentClass === "signup") {
-            ensureSignupContext(tokens.context, false);
-          } else {
-            ensureOnboardingReady(tokens.context);
-          }
-          const stored = storedFromTokens(
-            input.config,
-            clientInstanceId,
-            tokens,
-            intentClass,
-            { id: issued.id, state: pkce.state, codeVerifier: pkce.verifier, redirectUri },
-          );
-          const material = encodeStored(stored);
-          try {
-            await input.vault.rotate({
-              binding: credentialBinding,
-              material,
-              expiresAt: Date.parse(stored.refreshExpiresAt),
-            });
-          } finally { material.dispose(); }
-          cacheAccessToken(tokens.accessToken, Date.parse(tokens.accessExpiresAt));
-          return Object.freeze({
-            profile: stored.profile,
-            sessionId: stored.sessionId,
-            context: stored.context,
-            storageMode: previewStorage ? "preview" as const : "encrypted-local" as const,
-          });
-        } catch (error) {
-          try { await input.client.logout(tokens.accessToken); } catch { /* family remains server-expiring */ }
-          throw error;
-        }
       }
-      throw authError("cuna.auth.timeout", "Cuna sign-in did not complete within its bounded polling window.", { retryable: true });
-    } catch (error) {
-      await cancelBestEffort(issued.id, issued.continuationSecret);
-      throw error;
+      const exchange = await input.client.exchange({
+        id: issued.id,
+        clientInstanceId,
+        profile: input.config.profile,
+        state: pkce.state,
+        codeVerifier: pkce.verifier,
+        redirectUri,
+        loginCode,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+      });
+      let persistedRevision: number | undefined;
+      try {
+        // The remote family now exists even if the caller interrupted the
+        // exchange request. Never persist or cache it after that interruption.
+        assertNotCancelled(request.signal);
+        const exchangedAt = now();
+        if (Date.parse(exchange.loginCodeExpiresAt) <= exchangedAt || Date.parse(exchange.accessExpiresAt) <= exchangedAt) {
+          throw authError("cuna.auth.token_expired", "Cuna returned an already-expired sign-in session.");
+        }
+        if (intentClass === "signup") {
+          ensureSignupContext(exchange.context, false);
+        } else {
+          ensureOnboardingReady(exchange.context);
+        }
+        const stored = storedFromExchange(
+          input.config,
+          clientInstanceId,
+          loginCode,
+          exchange,
+          intentClass,
+          { id: issued.id, state: pkce.state, codeVerifier: pkce.verifier, redirectUri },
+        );
+        const material = encodeStored(stored);
+        try {
+          const rotated = await input.vault.rotate({
+            binding: credentialBinding,
+            material,
+            expiresAt: Date.parse(stored.loginCodeExpiresAt),
+          });
+          persistedRevision = rotated.revision;
+          if (persistedRevision === undefined) {
+            throw authError(
+              "cuna.auth.session_cleanup_failed",
+              "Cuna could not prove the encrypted session revision required for cancellation cleanup.",
+              { retryable: true },
+            );
+          }
+        } finally { material.dispose(); }
+        // Rotation is an await boundary. If cancellation arrived while it was
+        // committing, the catch below removes only this fenced revision before
+        // returning the cancellation to the caller.
+        assertNotCancelled(request.signal);
+        cacheAccessToken(exchange.accessToken, Date.parse(exchange.accessExpiresAt), stored, persistedRevision);
+        return Object.freeze({
+          profile: stored.profile,
+          sessionId: stored.sessionId,
+          context: stored.context,
+          storageMode: "encrypted-local",
+        });
+      } catch (error) {
+        let localCleanupFailed = false;
+        if (persistedRevision !== undefined) {
+          try {
+            await input.vault.deleteIfRevision({
+              binding: credentialBinding,
+              expectedRevision: persistedRevision,
+            });
+          } catch {
+            // Do not expose a backend cause: it may include protected-path or
+            // provider diagnostics. Still revoke the remote family below.
+            localCleanupFailed = true;
+          }
+        }
+        try { await input.client.logout(exchange.accessToken); } catch { /* family remains server-expiring */ }
+        if (localCleanupFailed) {
+          throw authError(
+            "cuna.auth.session_cleanup_failed",
+            "Cuna stopped sign-in but could not prove removal of its encrypted local session.",
+            { retryable: true },
+          );
+        }
+        throw error;
+      }
     }
   }
 
-  async function refreshAccess(signal?: AbortSignal): Promise<void> {
+  async function reexchangeAccess(signal?: AbortSignal): Promise<void> {
     assertNotCancelled(signal);
-    let captured: { readonly material: SecretMaterial; readonly expiresAt: number } | undefined;
-    const existing = await input.vault.load(credentialBinding);
-    if (existing === undefined) {
-      throw authError("cuna.auth.required", "No interactive Cuna session is stored.", { hint: "Run `cuna login`." });
-    }
-    existing.material.dispose();
+    // `vault.refresh` already reads, validates, and locks the exact encrypted
+    // record before invoking this callback. An initial `vault.load` duplicated
+    // that secure-store round trip in every fresh CLI process.
+    let captured: {
+      readonly material: SecretMaterial;
+      readonly expiresAt: number;
+      readonly profile: string;
+      readonly sessionId: string;
+    } | undefined;
+    let capturedRevision: number | undefined;
     try {
       const snapshot = await input.vault.refresh(credentialBinding, async (current) => {
         if (current === undefined) {
-          throw authError("cuna.auth.required", "No interactive Cuna session is stored.", { hint: "Run `cuna login`." });
+          return { status: "missing" } as const;
         }
         const stored = current.material.withBytes((bytes) => decodeStored(bytes, input.config));
-        if (Date.parse(stored.refreshExpiresAt) <= now()) {
-          return { status: "rejected" } as const;
+        if (Date.parse(stored.loginCodeExpiresAt) <= now()) {
+          return { status: "rejected", reason: "local_expired" } as const;
         }
         try {
-          const tokens = await input.client.refresh({
+          const exchange = await input.client.exchange({
             id: stored.continuationId,
-            loginCode: stored.refreshToken,
+            loginCode: stored.loginCode,
             clientInstanceId: stored.clientInstanceId,
             profile: stored.profile,
             state: stored.state,
             codeVerifier: stored.codeVerifier,
             redirectUri: stored.redirectUri,
-            loginCodeExpiresAt: stored.refreshExpiresAt,
-            idempotencyKey: stableRefreshIdempotency(stored),
+            expectedLoginCodeExpiresAt: stored.loginCodeExpiresAt,
             ...(signal === undefined ? {} : { signal }),
           });
-          const refreshedAt = now();
+          const exchangedAt = now();
           if (
-            tokens.sessionId !== stored.sessionId ||
-            tokens.refreshToken !== stored.refreshToken ||
+            exchange.sessionId !== stored.sessionId ||
+            exchange.loginCodeExpiresAt !== stored.loginCodeExpiresAt ||
             (stored.intentClass === "signup"
-              ? !signupContextTransitionAllowed(stored.context, tokens.context)
-              : JSON.stringify(contextWire(tokens.context)) !== JSON.stringify(contextWire(stored.context))) ||
-            Date.parse(tokens.refreshExpiresAt) <= refreshedAt ||
-            Date.parse(tokens.accessExpiresAt) <= refreshedAt
+              ? !signupContextTransitionAllowed(stored.context, exchange.context)
+              : JSON.stringify(contextWire(exchange.context)) !== JSON.stringify(contextWire(stored.context))) ||
+            Date.parse(exchange.loginCodeExpiresAt) <= exchangedAt ||
+            Date.parse(exchange.accessExpiresAt) <= exchangedAt
           ) {
-            try { await input.client.logout(tokens.accessToken, signal); } catch { /* best-effort family cleanup */ }
-            return { status: "rejected" } as const;
+            try { await input.client.logout(exchange.accessToken, signal); } catch { /* best-effort family cleanup */ }
+            return { status: "rejected", reason: "local_integrity" } as const;
           }
           try {
             if (stored.intentClass === "signup") {
-              ensureSignupContext(tokens.context, true);
+              ensureSignupContext(exchange.context, true);
             } else {
-              ensureOnboardingReady(tokens.context);
+              ensureOnboardingReady(exchange.context);
             }
           } catch {
-            try { await input.client.logout(tokens.accessToken, signal); } catch { /* best-effort family cleanup */ }
-            return { status: "rejected" } as const;
+            try { await input.client.logout(exchange.accessToken, signal); } catch { /* best-effort family cleanup */ }
+            return { status: "rejected", reason: "local_integrity" } as const;
           }
           captured?.material.dispose();
-          captured = { material: SecretMaterial.fromUtf8(tokens.accessToken), expiresAt: Date.parse(tokens.accessExpiresAt) };
-          const nextStored = storedFromTokens(
-            input.config,
-            stored.clientInstanceId,
-            tokens,
-            stored.intentClass,
-            {
-              id: stored.continuationId,
-              state: stored.state,
-              codeVerifier: stored.codeVerifier,
-              redirectUri: stored.redirectUri,
-            },
-          );
-          if (JSON.stringify(nextStored) === JSON.stringify(stored)) {
-            return { status: "retained" } as const;
-          }
-          return {
-            status: "rotated",
-            material: encodeStored(nextStored),
-            expiresAt: Date.parse(tokens.refreshExpiresAt),
-          } as const;
+          captured = {
+            material: SecretMaterial.fromUtf8(exchange.accessToken),
+            expiresAt: Date.parse(exchange.accessExpiresAt),
+            profile: stored.profile,
+            sessionId: stored.sessionId,
+          };
+          // Re-exchange has no durable-token rotation.  The exact encrypted
+          // browser code stays revision-fenced in place until logout or a
+          // terminal server rejection proves it must be removed.
+          return { status: "retained" } as const;
         } catch (error) {
-          if (isAuthoritativeRefreshRejection(error)) return { status: "rejected" } as const;
+          if (isAuthoritativeReexchangeRejection(error)) {
+            return { status: "rejected", reason: "authoritative_remote" } as const;
+          }
           throw error;
         }
       });
-      snapshot.material.dispose();
+      try {
+        capturedRevision = snapshot.revision;
+      } finally {
+        snapshot.material.dispose();
+      }
     } catch (error) {
       captured?.material.dispose();
+      if (error instanceof CredentialBoundaryError && error.code === "credential_missing") {
+        throw authError("cuna.auth.required", "No interactive Cuna session is stored.", { hint: "Run `cuna login`." });
+      }
       if (error instanceof CredentialBoundaryError && error.code === "credential_revoked") {
-        throw authError("cuna.auth.reauthentication_required", "The Cuna session was rejected and removed.", { hint: "Run `cuna login`." });
+        throw authError(
+          "cuna.auth.reauthentication_required",
+          "The Cuna session was rejected and removed.",
+          {
+            hint: "Run `cuna login`.",
+            ...(error.safeDetails?.refreshRejection === "authoritative_remote"
+              ? { details: { reason: "durable_session_removed" } }
+              : {}),
+          },
+        );
       }
       throw error;
     }
-    if (captured === undefined) {
-      throw authError("cuna.auth.refresh_unknown", "Cuna could not establish a new in-memory access token.", { retryable: true });
+    if (captured === undefined || capturedRevision === undefined || !Number.isSafeInteger(capturedRevision) || capturedRevision < 1) {
+      captured?.material.dispose();
+      throw authError("cuna.auth.reexchange_unknown", "Cuna could not establish a new in-memory access token.", { retryable: true });
     }
     access?.material.dispose();
-    access = captured;
+    access = { ...captured, revision: capturedRevision };
   }
 
   async function acquireAccessToken(signal?: AbortSignal): Promise<string> {
     assertNotCancelled(signal);
     if (access !== undefined && access.expiresAt - now() > 30_000) return cachedAccessToken();
-    if (refreshFlight === undefined) {
-      const created = refreshAccess();
-      refreshFlight = created;
+    if (reexchangeFlight === undefined) {
+      const created = reexchangeAccess();
+      reexchangeFlight = created;
       void created.then(
-        () => { if (refreshFlight === created) refreshFlight = undefined; },
-        () => { if (refreshFlight === created) refreshFlight = undefined; },
+        () => { if (reexchangeFlight === created) reexchangeFlight = undefined; },
+        () => { if (reexchangeFlight === created) reexchangeFlight = undefined; },
       );
     }
-    await waitForRefresh(refreshFlight, signal);
+    await waitForReexchange(reexchangeFlight, signal);
     return cachedAccessToken();
   }
 
   async function whoami(signal?: AbortSignal): Promise<HumanAuthResult> {
     const token = await acquireAccessToken(signal);
-    const context = await input.client.context(token, signal);
-    const storageStatus = await input.vault.status(credentialBinding);
-    if (storageStatus.backendStatus !== "verified" && storageStatus.backendStatus !== "preview") {
-      throw authError("cuna.auth.required", "No interactive Cuna session is stored.");
+    const session = access;
+    if (session === undefined) {
+      throw authError("cuna.auth.reexchange_unknown", "Cuna could not establish a fresh in-memory access token.", { retryable: true });
     }
-    const snapshot = await input.vault.load(credentialBinding);
-    if (snapshot === undefined) throw authError("cuna.auth.required", "No interactive Cuna session is stored.");
+    const context = await input.client.context(token, signal);
+    return Object.freeze({
+      profile: session.profile,
+      sessionId: session.sessionId,
+      context,
+      storageMode: "encrypted-local",
+    });
+  }
+
+  function discardCachedAccess(): void {
+    access?.material.dispose();
+    access = undefined;
+  }
+
+  /**
+   * A remote logout fact applies only to the durable revision that supplied
+   * this command's bearer.  A different shell may have completed a new browser
+   * sign-in while this request was in flight, so a plain delete would turn a
+   * confirmed old-family logout into destruction of the new family locally.
+   */
+  async function removeConfirmedLocalSession(expectedRevision: number | undefined): Promise<void> {
+    discardCachedAccess();
+    // Re-exchange reached this state only after CredentialVault fenced the
+    // exact rejected envelope. Do not issue a second unfenced delete.
+    if (expectedRevision === undefined) return;
+    let outcome: "deleted" | "absent" | "conflict";
     try {
-      const stored = snapshot.material.withBytes((bytes) => decodeStored(bytes, input.config));
-      return Object.freeze({
-        profile: stored.profile,
-        sessionId: stored.sessionId,
-        context,
-        storageMode: storageStatus.backendStatus === "preview" ? "preview" as const : "encrypted-local" as const,
+      outcome = await input.vault.deleteIfRevision({
+        binding: credentialBinding,
+        expectedRevision,
       });
-    } finally { snapshot.material.dispose(); }
+    } catch {
+      throw authError(
+        "cuna.auth.session_cleanup_failed",
+        "Cuna confirmed sign-out but could not prove removal of its encrypted local session.",
+        { retryable: true },
+      );
+    }
+    if (outcome === "conflict") {
+      throw authError(
+        "cuna.auth.session_cleanup_conflict",
+        "Cuna confirmed sign-out for the prior session, but a newer encrypted local session was preserved.",
+        {
+          hint: "Inspect the current session before deciding whether to sign out again.",
+          details: { reason: "newer_local_session" },
+        },
+      );
+    }
   }
 
   async function logout(signal?: AbortSignal): Promise<{ readonly revoked: true }> {
-    const token = await acquireAccessToken(signal);
-    const revoked = await input.client.logout(token, signal);
-    if (revoked !== true) throw authError("cuna.auth.logout_unknown", "Cuna could not confirm server-side logout.", { retryable: true });
-    await input.vault.delete(credentialBinding);
-    access?.material.dispose();
-    access = undefined;
+    let cleanupRevision: number | undefined;
+    try {
+      const token = await acquireAccessToken(signal);
+      const session = access;
+      if (session === undefined) {
+        throw authError(
+          "cuna.auth.session_cleanup_failed",
+          "Cuna could not prove which encrypted local session authorized sign-out.",
+          { retryable: true },
+        );
+      }
+      cleanupRevision = session.revision;
+      const revoked = await input.client.logout(token, signal);
+      if (revoked !== true) {
+        throw authError("cuna.auth.logout_unknown", "Cuna could not confirm server-side logout.", { retryable: true });
+      }
+    } catch (error) {
+      if (!isDefinitiveLogoutTermination(error)) {
+        // An ambiguous remote write must not leave a possibly-revoked bearer
+        // usable in this process. The encrypted durable code remains for the
+        // next, fresh acquisition and is never destroyed on this path.
+        discardCachedAccess();
+        throw error;
+      }
+      if (
+        error instanceof CunaError &&
+        error.code === "cuna.auth.reauthentication_required" &&
+        error.details?.reason === "durable_session_removed"
+      ) {
+        // The re-exchange path proved a terminal server result and already
+        // compare-deleted the exact envelope it read.
+        cleanupRevision = undefined;
+      } else {
+        const session = access;
+        if (session === undefined) {
+          discardCachedAccess();
+          throw authError(
+            "cuna.auth.session_cleanup_failed",
+            "Cuna received a terminal sign-out response but could not identify the encrypted local session to remove.",
+            { retryable: true },
+          );
+        }
+        cleanupRevision = session.revision;
+      }
+    }
+
+    await removeConfirmedLocalSession(cleanupRevision);
     return Object.freeze({ revoked: true });
   }
 

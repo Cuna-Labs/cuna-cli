@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Cuna API",
-    "version": "1.7.0",
+    "version": "2.0.0",
     "description": "Authoritative Cuna control-plane contract. JSON responses are UTF-8, redirects are not API successes, and x-sdk-exposed defaults to false."
   },
   "servers": [
@@ -54,7 +54,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -141,7 +141,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -184,7 +184,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       },
@@ -235,7 +235,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ],
         "parameters": [
@@ -289,7 +289,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       },
@@ -320,7 +320,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -367,7 +367,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -437,7 +437,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       },
@@ -491,7 +491,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -545,7 +545,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -599,7 +599,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -669,7 +669,7 @@
             "SupabaseJwt": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -715,7 +715,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       },
@@ -764,7 +764,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -810,7 +810,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -879,7 +879,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -952,7 +952,7 @@
         },
         "responses": {
           "201": {
-            "description": "Short-lived browser continuation. Secret material is returned only in this response body.",
+            "description": "Short-lived browser continuation. The only browser proof is carried in the fragment URL; no continuation secret is returned to the CLI.",
             "content": {
               "application/json": {
                 "schema": {
@@ -969,73 +969,12 @@
         "x-runa-required-permissions": []
       }
     },
-    "/v1/cli-auth/continuations/{id}": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/CliContinuationId"
-        },
-        {
-          "$ref": "#/components/parameters/CliContinuationSecret"
-        }
-      ],
-      "get": {
-        "operationId": "humanAuth.getContinuation",
-        "x-sdk-exposed": false,
-        "x-runa-error-model": "problem",
-        "security": [],
-        "responses": {
-          "200": {
-            "description": "Bounded authoritative onboarding status.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CliContinuationCompleted"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-runa-auth-classes": [],
-        "x-runa-required-permissions": []
-      }
-    },
-    "/v1/cli-auth/continuations/{id}/cancel": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/CliContinuationId"
-        },
-        {
-          "$ref": "#/components/parameters/CliContinuationSecret"
-        }
-      ],
-      "post": {
-        "operationId": "humanAuth.cancelContinuation",
-        "x-sdk-exposed": false,
-        "x-runa-error-model": "problem",
-        "security": [],
-        "responses": {
-          "200": {
-            "description": "Cancelled continuation; no renewable credential or cloud resource is created.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CliContinuationStatus"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-runa-auth-classes": [],
-        "x-runa-required-permissions": []
-      }
-    },
     "/v1/cli-auth/continuations/{id}/browser-cancel": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/CliContinuationId"
+        }
+      ],
       "post": {
         "operationId": "humanAuth.cancelContinuationBrowser",
         "x-sdk-exposed": false,
@@ -1067,7 +1006,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CliContinuationStatus"
+                  "$ref": "#/components/schemas/CliContinuationCancelled"
                 }
               }
             }
@@ -1153,51 +1092,11 @@
         },
         "responses": {
           "200": {
-            "description": "One-time PKCE exchange after current identity, admission, workspace and terms proof.",
+            "description": "Reusable login-code exchange bound to the original continuation, client, profile, state, redirect and S256 verifier. Each successful exchange mints only short-lived access and never returns or rotates the login code.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/CliLoginCodeExchangeResult"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-runa-auth-classes": [],
-        "x-runa-required-permissions": []
-      }
-    },
-    "/v1/cli-auth/refresh": {
-      "post": {
-        "operationId": "humanAuth.refresh",
-        "x-sdk-exposed": false,
-        "x-runa-error-model": "problem",
-        "security": [],
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json; charset=utf-8": {
-              "schema": {
-                "$ref": "#/components/schemas/CliRefreshRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Rotated token family; identical concurrent retries coalesce for 30 seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CliTokenSet"
                 }
               }
             }
@@ -1217,7 +1116,7 @@
         "x-runa-error-model": "problem",
         "security": [
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ],
         "responses": {
@@ -1262,7 +1161,7 @@
             "SupabaseJwt": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ],
         "responses": {
@@ -1322,7 +1221,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1360,7 +1259,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1398,7 +1297,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1436,7 +1335,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1491,7 +1390,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1539,7 +1438,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1623,7 +1522,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1658,7 +1557,7 @@
             "SupabaseJwt": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       },
@@ -1767,7 +1666,7 @@
             "SupabaseJwt": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1807,7 +1706,7 @@
             "SupabaseJwt": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1845,7 +1744,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1878,7 +1777,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1911,7 +1810,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -1954,7 +1853,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       },
@@ -1985,7 +1884,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2018,7 +1917,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       },
@@ -2059,7 +1958,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2092,7 +1991,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2130,7 +2029,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2193,7 +2092,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2295,7 +2194,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2362,7 +2261,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2429,7 +2328,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2502,7 +2401,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       },
@@ -2557,7 +2456,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2624,7 +2523,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2707,7 +2606,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2774,7 +2673,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2825,7 +2724,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2876,7 +2775,7 @@
             "RunaApiKey": []
           },
           {
-            "RunaHumanBearer": []
+            "CunaHumanBearer": []
           }
         ]
       }
@@ -2896,10 +2795,10 @@
         "bearerFormat": "runa_sk_",
         "description": "Programmatic Cuna API key. Not valid for key-management operations."
       },
-      "RunaHumanBearer": {
+      "CunaHumanBearer": {
         "type": "http",
         "scheme": "bearer",
-        "bearerFormat": "runa_at_",
+        "bearerFormat": "cuna_at_",
         "description": "Short-lived opaque Cuna CLI human access token."
       }
     },
@@ -2948,16 +2847,6 @@
         "required": true,
         "schema": {
           "$ref": "#/components/schemas/Uuid"
-        }
-      },
-      "CliContinuationSecret": {
-        "name": "X-Runa-Continuation",
-        "in": "header",
-        "required": true,
-        "description": "Opaque one-time continuation secret; plaintext is never persisted.",
-        "schema": {
-          "type": "string",
-          "pattern": "^runa_ct_[A-Za-z0-9_-]{43}$"
         }
       }
     },
@@ -3414,7 +3303,7 @@
           "redirect_uri": {
             "type": "string",
             "pattern": "^http://(?:127\\.0\\.0\\.1|\\[::1\\]):(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])/callback$",
-            "description": "Exact loopback URI bound into the S256 exchange proof. The producer does not redirect to it; completion is polled."
+            "description": "Exact loopback URI bound into the S256 exchange proof. The producer never redirects to it; the user pastes the browser-issued login code into the CLI."
           },
           "client_instance_id": {
             "$ref": "#/components/schemas/Uuid"
@@ -3442,7 +3331,6 @@
         "additionalProperties": false,
         "required": [
           "id",
-          "continuation_secret",
           "browser_url",
           "expires_at",
           "completion_mode"
@@ -3451,13 +3339,10 @@
           "id": {
             "$ref": "#/components/schemas/Uuid"
           },
-          "continuation_secret": {
-            "type": "string",
-            "pattern": "^runa_ct_[A-Za-z0-9_-]{43}$"
-          },
           "browser_url": {
             "type": "string",
-            "pattern": "^https://app\\.getcuna\\.com/cli/continue#[^?#]+$"
+            "pattern": "^https://[^/?#@]+/cli/continue#[^?#]+$",
+            "description": "Exact deployment-approved HTTPS browser origin with fragment-only continuation proof; the runtime validates the configured production or isolated staging origin."
           },
           "expires_at": {
             "type": "string",
@@ -3525,7 +3410,7 @@
           }
         }
       },
-      "CliContinuationStatus": {
+      "CliContinuationCancelled": {
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -3539,30 +3424,17 @@
             "$ref": "#/components/schemas/Uuid"
           },
           "phase": {
-            "enum": [
-              "issued",
-              "completed",
-              "cancelled",
-              "consumed",
-              "expired"
-            ]
+            "const": "cancelled"
           },
           "expires_at": {
             "type": "string",
             "format": "date-time"
           },
-          "poll_after_ms": {
-            "type": "integer",
-            "minimum": 2000
-          },
-          "context": {
-            "$ref": "#/components/schemas/CliIdentityContext"
-          },
           "required_terms_version": {
             "type": "string",
             "minLength": 1,
             "maxLength": 80,
-            "description": "Authoritative terms version the browser must accept before completion."
+            "description": "Authoritative terms version that governed the cancelled browser continuation."
           }
         }
       },
@@ -3577,7 +3449,7 @@
         "properties": {
           "browser_nonce": {
             "type": "string",
-            "pattern": "^(?:cuna|runa)_cb_[A-Za-z0-9_-]{43}$"
+            "pattern": "^cuna_cb_[A-Za-z0-9_-]{43}$"
           },
           "state": {
             "type": "string",
@@ -3611,7 +3483,7 @@
             "properties": {
               "client_instance_id": { "$ref": "#/components/schemas/Uuid" },
               "client_name": { "const": "Cuna CLI" },
-              "intent": { "enum": ["login", "signup"] },
+              "intent": { "enum": ["signup", "login", "account.read", "machines.read", "machines.create", "agent_sessions.read", "agent_sessions.create"] },
               "scopes": { "const": ["cli:session"] }
             }
           },
@@ -3657,81 +3529,19 @@
       "CliLoginCodeExchangeResult": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["access_token", "token_type", "expires_in", "access_expires_at", "session_id", "context"],
+        "required": ["access_token", "token_type", "expires_in", "access_expires_at", "login_code_expires_at", "session_id", "context"],
         "properties": {
-          "access_token": { "type": "string", "pattern": "^runa_at_[A-Za-z0-9_-]{43}$" },
+          "access_token": { "type": "string", "pattern": "^cuna_at_[A-Za-z0-9_-]{43}$" },
           "token_type": { "const": "Bearer" },
           "expires_in": { "const": 600 },
           "access_expires_at": { "type": "string", "format": "date-time" },
+          "login_code_expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Authoritative expiry of the reusable login code. Repeated exchanges return the same expiry and never the code itself."
+          },
           "session_id": { "$ref": "#/components/schemas/Uuid" },
           "context": { "$ref": "#/components/schemas/CliIdentityContext" }
-        }
-      },
-      "CliRefreshRequest": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "refresh_token",
-          "client_instance_id",
-          "profile"
-        ],
-        "properties": {
-          "refresh_token": {
-            "type": "string",
-            "pattern": "^runa_rt_[A-Za-z0-9_-]{43}$"
-          },
-          "client_instance_id": {
-            "$ref": "#/components/schemas/Uuid"
-          },
-          "profile": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 80
-          }
-        }
-      },
-      "CliTokenSet": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "access_token",
-          "refresh_token",
-          "token_type",
-          "expires_in",
-          "access_expires_at",
-          "refresh_expires_at",
-          "session_id",
-          "context"
-        ],
-        "properties": {
-          "access_token": {
-            "type": "string",
-            "pattern": "^runa_at_[A-Za-z0-9_-]{43}$"
-          },
-          "refresh_token": {
-            "type": "string",
-            "pattern": "^runa_rt_[A-Za-z0-9_-]{43}$"
-          },
-          "token_type": {
-            "const": "Bearer"
-          },
-          "expires_in": {
-            "const": 600
-          },
-          "access_expires_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "refresh_expires_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "session_id": {
-            "$ref": "#/components/schemas/Uuid"
-          },
-          "context": {
-            "$ref": "#/components/schemas/CliIdentityContext"
-          }
         }
       },
       "AgentAuth": {
@@ -3752,6 +3562,7 @@
             "enum": [
               "claude-code",
               "codex",
+              "opencode",
               "openclaw",
               null
             ]
@@ -3777,6 +3588,9 @@
         "oneOf": [
           {
             "properties": {
+              "agent": {
+                "const": null
+              },
               "method": {
                 "const": "none"
               },
@@ -3787,6 +3601,12 @@
           },
           {
             "properties": {
+              "agent": {
+                "enum": [
+                  "claude-code",
+                  "codex"
+                ]
+              },
               "method": {
                 "const": "interactive_login"
               },
@@ -3802,6 +3622,31 @@
           },
           {
             "properties": {
+              "agent": {
+                "const": "opencode"
+              },
+              "method": {
+                "const": "interactive_login"
+              },
+              "state": {
+                "enum": [
+                  "installing",
+                  "login_required",
+                  "configured",
+                  "unavailable"
+                ]
+              }
+            }
+          },
+          {
+            "properties": {
+              "agent": {
+                "enum": [
+                  "claude-code",
+                  "codex",
+                  "openclaw"
+                ]
+              },
               "method": {
                 "const": "api_key"
               },
@@ -3829,6 +3674,35 @@
         "oneOf": [
           {
             "properties": {
+              "agent": {
+                "const": "opencode"
+              },
+              "auth_mode": {
+                "const": "interactive_login"
+              },
+              "process_epoch": {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              "agent_version": {
+                "type": "string",
+                "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+              },
+              "evidence_class": {
+                "const": "provider_cli_credential_presence"
+              },
+              "state": {
+                "enum": [
+                  "login_required",
+                  "configured"
+                ]
+              }
+            }
+          },
+          {
+            "properties": {
+              "agent": {
+                "const": "claude-code"
+              },
               "auth_mode": {
                 "const": "interactive_login"
               },
@@ -3852,6 +3726,13 @@
           },
           {
             "properties": {
+              "agent": {
+                "enum": [
+                  "claude-code",
+                  "codex",
+                  "openclaw"
+                ]
+              },
               "auth_mode": {
                 "const": "credential_binding"
               },
@@ -3871,6 +3752,20 @@
             }
           },
           {
+            "not": {
+              "properties": {
+                "agent": {
+                  "const": "opencode"
+                },
+                "auth_mode": {
+                  "const": "credential_binding"
+                }
+              },
+              "required": [
+                "agent",
+                "auth_mode"
+              ]
+            },
             "properties": {
               "evidence_class": {
                 "const": "insufficient"
@@ -3884,6 +3779,7 @@
         "required": [
           "observation_id",
           "agent_session_id",
+          "agent",
           "process_epoch",
           "auth_mode",
           "agent_version",
@@ -3899,6 +3795,14 @@
           },
           "agent_session_id": {
             "$ref": "#/components/schemas/Uuid"
+          },
+          "agent": {
+            "enum": [
+              "claude-code",
+              "codex",
+              "opencode",
+              "openclaw"
+            ]
           },
           "process_epoch": {
             "oneOf": [
@@ -3926,6 +3830,7 @@
           "evidence_class": {
             "enum": [
               "provider_cli_login_status",
+              "provider_cli_credential_presence",
               "credential_binding_authority",
               "insufficient"
             ]
@@ -4001,6 +3906,33 @@
       "AgentSession": {
         "type": "object",
         "additionalProperties": false,
+        "oneOf": [
+          {
+            "properties": {
+              "agent": {
+                "const": "opencode"
+              },
+              "auth_mode": {
+                "const": "interactive_login"
+              }
+            },
+            "required": [
+              "agent",
+              "auth_mode"
+            ]
+          },
+          {
+            "properties": {
+              "agent": {
+                "enum": [
+                  "claude-code",
+                  "codex",
+                  "openclaw"
+                ]
+              }
+            }
+          }
+        ],
         "dependentRequired": {
           "workspace_binding_id": [
             "workspace_generation"
@@ -4048,6 +3980,7 @@
             "enum": [
               "claude-code",
               "codex",
+              "opencode",
               "openclaw"
             ]
           },
@@ -4146,6 +4079,38 @@
       "AgentSessionCreate": {
         "type": "object",
         "additionalProperties": false,
+        "oneOf": [
+          {
+            "properties": {
+              "agent": {
+                "const": "opencode"
+              },
+              "auth_mode": {
+                "const": "interactive_login"
+              }
+            },
+            "required": [
+              "agent",
+              "auth_mode"
+            ],
+            "not": {
+              "required": [
+                "credential_binding_id"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "agent": {
+                "enum": [
+                  "claude-code",
+                  "codex",
+                  "openclaw"
+                ]
+              }
+            }
+          }
+        ],
         "required": [
           "agent",
           "cwd",
@@ -4162,6 +4127,7 @@
             "enum": [
               "claude-code",
               "codex",
+              "opencode",
               "openclaw"
             ]
           },
@@ -4430,6 +4396,7 @@
             "enum": [
               "claude-code",
               "codex",
+              "opencode",
               "openclaw"
             ]
           },
@@ -4485,6 +4452,7 @@
             "enum": [
               "claude-code",
               "codex",
+              "opencode",
               "openclaw"
             ]
           },
@@ -4523,6 +4491,17 @@
       "ConsoleCreateSession": {
         "type": "object",
         "additionalProperties": false,
+        "not": {
+          "required": [
+            "agent",
+            "api_key"
+          ],
+          "properties": {
+            "agent": {
+              "const": "opencode"
+            }
+          }
+        },
         "required": [
           "name"
         ],
@@ -4536,6 +4515,7 @@
             "enum": [
               "claude-code",
               "codex",
+              "opencode",
               "openclaw"
             ]
           },
@@ -4887,7 +4867,6 @@
           "pkce_method",
           "continuation_ttl_seconds",
           "access_token_ttl_seconds",
-          "refresh_family_ttl_seconds",
           "browser_origin"
         ],
         "properties": {
@@ -4906,9 +4885,6 @@
           },
           "access_token_ttl_seconds": {
             "const": 600
-          },
-          "refresh_family_ttl_seconds": {
-            "const": 2592000
           },
           "browser_origin": {
             "type": [
@@ -4930,7 +4906,7 @@
         "properties": {
           "browser_nonce": {
             "type": "string",
-            "pattern": "^(?:cuna|runa)_cb_[A-Za-z0-9_-]{43}$"
+            "pattern": "^cuna_cb_[A-Za-z0-9_-]{43}$"
           },
           "state": {
             "type": "string",

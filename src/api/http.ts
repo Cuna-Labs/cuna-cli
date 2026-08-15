@@ -1,5 +1,4 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
-import { DEPLOYED_WIRE_COMPATIBILITY } from "../core/deployed-wire-compatibility.js";
 import {
   INTERNAL_DEFECT_HINT,
   OFF_CONTRACT_RESPONSE_HINT,
@@ -7,7 +6,6 @@ import {
   automationCredentialHint,
 } from "../core/product-web.js";
 import {
-  isContinuationSecret,
   isProblemType,
   isProblemTypeForCode,
   isTransportCredential,
@@ -49,7 +47,6 @@ export interface HttpRequest {
   readonly contentType?: "application/json; charset=utf-8" | "application/octet-stream";
   readonly idempotencyKey?: string;
   readonly machineCreateRequestId?: string;
-  readonly continuationSecret?: string;
   readonly signal?: AbortSignal;
 }
 
@@ -389,17 +386,6 @@ export function createHttpTransport(input: {
         });
       }
       if (
-        request.continuationSecret !== undefined &&
-        !isContinuationSecret(request.continuationSecret)
-      ) {
-        throw new CunaError({
-          code: "cuna.internal.invalid_continuation_secret",
-          message: "Cuna refused an invalid continuation credential.",
-          exitCode: EXIT_CODES.internal,
-          hint: INTERNAL_DEFECT_HINT,
-        });
-      }
-      if (
         request.machineCreateRequestId !== undefined &&
         !UUID.test(request.machineCreateRequestId)
       ) {
@@ -490,16 +476,6 @@ export function createHttpTransport(input: {
             ...(request.machineCreateRequestId === undefined
               ? {}
               : { "X-Cuna-Machine-Create-Request-Id": request.machineCreateRequestId }),
-            // Both spellings, always. The deployed API reads only
-            // `X-Runa-Continuation`; the renamed API reads either. Sending one
-            // name pins the CLI to whichever side happens to be live, and a
-            // dropped continuation header fails every human login exchange.
-            ...(request.continuationSecret === undefined
-              ? {}
-              : {
-                "X-Cuna-Continuation": request.continuationSecret,
-                [DEPLOYED_WIRE_COMPATIBILITY.continuationHeader]: request.continuationSecret,
-              }),
           },
           ...(body === undefined ? {} : { body }),
           signal: controller.signal,

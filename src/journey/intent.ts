@@ -3,7 +3,7 @@ import { parseArgv, type OptionValue, type ParsedInvocation } from "../cli/parse
 import { usageError } from "../core/errors.js";
 import { assertCanonicalUuid, assertSafeDisplayText } from "../core/validation.js";
 
-export type AgentJourneyCommand = "claude" | "codex" | "openclaw";
+export type AgentJourneyCommand = "claude" | "codex" | "openclaw" | "opencode";
 export type AgentJourneySyncMode = "enabled" | "disabled" | "not-applicable";
 
 export type MachineJourneySelection =
@@ -84,9 +84,11 @@ function commandAgent(command: string | undefined): {
       return Object.freeze({ command, agent: "codex" });
     case "openclaw":
       return Object.freeze({ command, agent: "openclaw" });
+    case "opencode":
+      return Object.freeze({ command, agent: "opencode" });
     default:
       throw usageError(
-        `Agent journey command must be claude, codex, or openclaw; received ${command ?? "<none>"}.`,
+        `Agent journey command must be claude, codex, openclaw, or opencode; received ${command ?? "<none>"}.`,
       );
   }
 }
@@ -205,6 +207,12 @@ export function preflightAgentJourneyInvocation(parsed: ParsedInvocation): Agent
   const machineName = stringOption(parsed, "machine");
   const authMode = normalizedAuthMode(parsed);
   const rawCredentialBindingId = stringOption(parsed, "credential-binding");
+  if (identity.agent === "opencode" && (authMode === "credential_binding" || rawCredentialBindingId !== undefined)) {
+    throw usageError(
+      "OpenCode supports interactive_login only; credential bindings are not accepted.",
+      "Configure a provider interactively with OpenCode, then retry without --credential-binding.",
+    );
+  }
   if (authMode === "credential_binding" && rawCredentialBindingId === undefined) {
     throw usageError(
       "Option --credential-binding is required for credential_binding auth mode.",

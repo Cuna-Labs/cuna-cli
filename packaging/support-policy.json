@@ -29,7 +29,7 @@
   ],
   "preGaExternalEvidence": [
     "Windows 11 x64 installed-artifact receipt",
-    "Windows native child-identity evidence proving an owned CreateProcessW process handle is retained from creation through loaded-image verification and protected-stdin handoff",
+    "Windows installed-artifact AES-256-GCM profile-store receipt proving owner-only permissions, decryptability in a new shell, and cleanup on logout",
     "non-authorizing Linux, Windows, and macOS arm64 installed-artifact observations for every supported Node line",
     "interactive terminal behavior on physical or policy-approved virtual Windows, macOS, and Linux hosts",
     "npm global-install and clean-uninstall receipts on every Tier-1 platform",

@@ -40,8 +40,9 @@ export interface RuntimeFeatureGate {
     | "terminal_workspace"
     | "workspace_sync"
     | "browser_auth"
+    | "browser_login_remote"
     | "local_companion"
-    | "credential_vault";
+    | "encrypted_local_session_store";
   readonly implementation: "unsupported" | "available";
   readonly reason: string;
 }
@@ -51,14 +52,25 @@ export function runtimeFeatureGates(input: {
   readonly credentialBackendStatus: "verified" | "unavailable" | "unknown";
   readonly credentialBackendId?: string;
   readonly credentialBackendReason?: string;
+  /**
+   * The anonymous `/v1/cli-auth/bootstrap` observation. It is intentionally
+   * absent from the default `doctor` invocation: proving a local AES store
+   * must never imply that the configured deployment currently serves browser
+   * login.
+   */
+  readonly browserLoginRemoteStatus?: "verified" | "unavailable" | "unknown" | "not_checked";
+  readonly browserLoginRemoteReason?: string;
 }): readonly RuntimeFeatureGate[] {
-  const browserCommandAvailable = input.platform !== "windows";
-  const browserAuthAvailable = browserCommandAvailable && input.credentialBackendStatus === "verified";
-  const browserReason = !browserCommandAvailable
-    ? "signed_windows_browser_adapter_unavailable"
-    : input.credentialBackendStatus !== "verified"
-      ? `secure_vault_${input.credentialBackendStatus}`
-      : "polling_continuation_v1_3";
+  const remoteStatus = input.browserLoginRemoteStatus ?? "not_checked";
+  const remoteReason = remoteStatus === "verified"
+    ? "remote_browser_login_bootstrap_verified"
+    : input.browserLoginRemoteReason ?? `remote_browser_login_${remoteStatus}`;
+  const browserAuthAvailable = input.credentialBackendStatus === "verified" && remoteStatus === "verified";
+  const browserReason = input.credentialBackendStatus !== "verified"
+    ? input.credentialBackendReason ?? `encrypted_local_session_${input.credentialBackendStatus}`
+    : remoteStatus !== "verified"
+      ? remoteReason
+      : "browser_login_remote_and_encrypted_local_verified";
   return Object.freeze([
     Object.freeze({ feature: "daemon", implementation: "unsupported", reason: "daemon_runtime_unavailable" }),
     Object.freeze({
@@ -83,21 +95,29 @@ export function runtimeFeatureGates(input: {
       implementation: browserAuthAvailable ? "available" : "unsupported",
       reason: browserReason,
     }),
+    // This is deliberately separate from `encrypted_local_session_store`.
+    // The former is an explicit anonymous deployment observation; the latter
+    // is a local filesystem/cryptography probe. Neither one implies the other.
+    Object.freeze({
+      feature: "browser_login_remote",
+      implementation: remoteStatus === "verified" ? "available" : "unsupported",
+      reason: remoteReason,
+    }),
     Object.freeze({
       feature: "local_companion",
       implementation: "unsupported",
       reason: "local_companion_unavailable",
     }),
-    // The credential vault is the precondition for every authenticated command,
-    // and it was the one subsystem `doctor` did not report. Its failure surfaced
-    // only as `secure_vault_unavailable` on browser_auth, which reads as a
-    // browser problem. The backend's own reason is carried through verbatim so
-    // the operator can tell "not installed" from "identity does not match".
+    // Browser login persists only the reusable login-code envelope in the
+    // pure-JavaScript AES-256-GCM store. Its local availability is a filesystem
+    // and cryptography fact, not an operating-system credential-store claim.
     Object.freeze({
-      feature: "credential_vault",
+      feature: "encrypted_local_session_store",
       implementation: input.credentialBackendStatus === "verified" ? "available" : "unsupported",
-      reason: input.credentialBackendReason ??
-        `secure_vault_${input.credentialBackendStatus}${input.credentialBackendId === undefined ? "" : ` (${input.credentialBackendId})`}`,
+      reason: input.credentialBackendStatus === "verified"
+        ? "encrypted_local_aes256gcm_verified"
+        : input.credentialBackendReason ??
+          `encrypted_local_session_${input.credentialBackendStatus}${input.credentialBackendId === undefined ? "" : ` (${input.credentialBackendId})`}`,
     }),
   ]);
 }

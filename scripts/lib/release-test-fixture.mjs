@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import {
   aggregateDigest,
+  INFRA_OPENAPI_CONTRACT_IDENTITY,
   releaseInputIdentities,
   RELEASE_INPUT_BUILD_RECIPE_FILES,
   RELEASE_INPUT_CONTRACT_FILES,
@@ -38,18 +39,11 @@ export function syntheticReleaseInputs({ version = "1.2.3-preview.1", sourceComm
       }],
       aggregateSha256: createHash("sha256").update(componentKey, "utf8").digest("hex"),
     },
-    producerContract: {
-      artifact_file: "contracts/infra/cuna-api.openapi.json",
-      canonical_digest_file: "contracts/infra/cuna-api.openapi.sha256",
-      infra_openapi_raw_sha256: "6c162e256184f69dcdf6fe63e482509a30dda7248454e3eee58f2b35819d4091",
-      infra_openapi_canonical_sha256: "870ae3ad5365d3850895f51124960eaf0b8f5935c7a2fe224803aa69b623c023",
-      producer_repository: "Cuna-Labs/infra",
-      producer_revision: "0a592f93d6b9f1fa9c9501409fe4b2a9bc7367f6",
-    },
+    producerContract: INFRA_OPENAPI_CONTRACT_IDENTITY,
     contractSet: {
       algorithm: "cuna-cli-public-contract-files-v1",
       authority: "CUNA_INFRA_OPENAPI_VENDORED_EXACT",
-      releaseAuthority: "CUNA_CANONICAL_PUBLIC_API_CONTRACT",
+      releaseAuthority: "UNRESOLVED_BLOCKING",
       files: contractFiles,
       aggregateSha256: aggregateDigest(contractFiles),
     },

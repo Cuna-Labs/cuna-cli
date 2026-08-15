@@ -578,6 +578,171 @@ test("TC-055-06 auth evidence expiring exactly now cannot reach the appbar", asy
   await operation;
 });
 
+test("OpenCode rejects an authenticated claim instead of upgrading provider credential presence", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  await assert.rejects(runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) { return session(id, { agent: "opencode" }); },
+      async getAgentSessionAuth(id) {
+        return {
+          observationId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          agentSessionId: id,
+          processEpoch: `epoch-${id}`,
+          authMode: "interactive_login",
+          agentVersion: "1.18.18",
+          adapterVersion: "runa.agent-auth.v1",
+          evidenceClass: "provider_cli_login_status",
+          observedAt: new Date(NOW - 250).toISOString(),
+          validUntil: new Date(NOW + 10_000).toISOString(),
+          state: "authenticated",
+        };
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  }), (error) => error?.code === "remote_state_unproven");
+  assert.equal(host.acquired, 0, "invalid OpenCode evidence must not reach terminal ownership");
+  assert.equal(events.some((event) => event.startsWith("wire:")), false, "invalid OpenCode evidence must not create a terminal wire");
+});
+
+test("OpenCode turns a missing provider credential observation into fail-closed admission before host or terminal child effects", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  let authReads = 0;
+  await assert.rejects(runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) { return session(id, { agent: "opencode" }); },
+      async getAgentSessionAuth() {
+        authReads += 1;
+        const error = new Error("agent auth observation not found");
+        error.code = "cuna.remote.not_found";
+        throw error;
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  }), (error) => error?.code === "remote_state_unproven");
+  assert.equal(authReads, 1);
+  assert.equal(host.acquired, 0, "missing OpenCode evidence must not acquire terminal ownership");
+  assert.equal(events.some((event) => event.startsWith("wire:") || event.startsWith("grant:")), false, "missing OpenCode evidence must not create a terminal child or grant");
+});
+
+test("OpenCode permits a fresh login_required provider credential observation so /connect remains available", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) { return session(id, { agent: "opencode" }); },
+      async getAgentSessionAuth(id) {
+        return {
+          observationId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          agentSessionId: id,
+          processEpoch: `epoch-${id}`,
+          authMode: "interactive_login",
+          agentVersion: "1.18.18",
+          adapterVersion: "runa.agent-auth.v1",
+          evidenceClass: "provider_cli_credential_presence",
+          observedAt: new Date(NOW - 250).toISOString(),
+          validUntil: new Date(NOW + 10_000).toISOString(),
+          state: "login_required",
+        };
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => events.includes("wire:connected"), "a valid login_required observation must reach the OpenCode terminal");
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+});
+
+test("OpenCode permits a fresh configured provider credential observation", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) { return session(id, { agent: "opencode" }); },
+      async getAgentSessionAuth(id) {
+        return {
+          observationId: "efefefef-efef-4fef-8fef-efefefefefef",
+          agentSessionId: id,
+          processEpoch: `epoch-${id}`,
+          authMode: "interactive_login",
+          agentVersion: "1.18.18",
+          adapterVersion: "runa.agent-auth.v1",
+          evidenceClass: "provider_cli_credential_presence",
+          observedAt: new Date(NOW - 250).toISOString(),
+          validUntil: new Date(NOW + 10_000).toISOString(),
+          state: "configured",
+        };
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => events.includes("wire:connected"), "a valid configured observation must reach the OpenCode terminal");
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+});
+
+test("OpenCode foreground admission rejects a non-interactive AgentSession before auth or terminal effects", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  let authReads = 0;
+  await assert.rejects(
+    runSupportedForegroundSessions({
+      client: fakeClient(events, {
+        async getAgentSession(id) {
+          return session(id, { agent: "opencode", authMode: "credential_binding" });
+        },
+        async getAgentSessionAuth() {
+          authReads += 1;
+          throw new Error("must not read provider auth for an invalid OpenCode session");
+        },
+      }),
+      baseUrl: "https://api.getcuna.com",
+      agentSessionIds: [SESSION_A],
+    }, {
+      host,
+      controlPlane: system.controlPlane,
+      terminalConnector: system.terminalConnector,
+      clock: () => NOW,
+    }),
+    (error) => error?.code === "remote_state_unproven",
+  );
+  assert.equal(authReads, 0);
+  assert.equal(host.acquired, 0);
+});
+
 test("TC-009-02/05 plain mode binds one exact session without painting an appbar", async () => {
   const events = [];
   const host = new FakeHost(events);

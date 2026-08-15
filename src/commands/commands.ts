@@ -7,6 +7,7 @@ import {
 } from "../api/client.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import type {
+  AgentAuthMode,
   AgentKind,
   AgentSession,
   CapabilitySnapshot,
@@ -14,7 +15,11 @@ import type {
 } from "../api/contracts.js";
 import type { EffectiveConfig } from "../config/config.js";
 import { DEFAULT_BASE_URL, environmentCredentialState, publicConfig } from "../config/config.js";
-import { EXIT_CODES, CunaError, unsupportedError, usageError } from "../core/errors.js";
+import {
+  assertOpenCodeExecutionEnabled,
+  resolveOpenCodeFeatureGate,
+} from "../config/opencode-feature-gate.js";
+import { EXIT_CODES, CunaError, unsupportedError, usageError, type SafeErrorDetails } from "../core/errors.js";
 import { OFF_CONTRACT_RESPONSE_HINT, SUPPORT_URL, automationCredentialHint } from "../core/product-web.js";
 import {
   assertCanonicalUuid,
@@ -83,10 +88,41 @@ function agentOption(parsed: ParsedInvocation, required: boolean): AgentKind | u
     if (required) throw usageError("Option --agent is required.");
     return undefined;
   }
-  if (raw !== "claude-code" && raw !== "codex" && raw !== "openclaw") {
-    throw usageError("Option --agent must be claude-code, codex, or openclaw.");
+  if (raw !== "claude-code" && raw !== "codex" && raw !== "openclaw" && raw !== "opencode") {
+    throw usageError("Option --agent must be claude-code, codex, openclaw, or opencode.");
   }
   return raw;
+}
+
+function normalizedAgentSessionAuthMode(
+  agent: AgentKind,
+  rawAuthMode: string | undefined,
+  credentialBinding: string | undefined,
+): AgentAuthMode | undefined {
+  let authMode: AgentAuthMode | undefined;
+  if (rawAuthMode === undefined) {
+    authMode = undefined;
+  } else if (rawAuthMode === "interactive_login" || rawAuthMode === "credential_binding") {
+    authMode = rawAuthMode;
+  } else {
+    throw usageError("Option --auth-mode must be interactive_login or credential_binding.");
+  }
+
+  if (agent === "opencode") {
+    if (authMode === "credential_binding" || credentialBinding !== undefined) {
+      throw usageError("OpenCode AgentSessions support interactive_login only.");
+    }
+    // The flag is optional for ergonomics, but the wire intent is never
+    // optional: OpenCode has no server-default authentication mode.
+    return "interactive_login";
+  }
+  if (authMode === "credential_binding" && credentialBinding === undefined) {
+    throw usageError("Option --credential-binding is required for credential_binding auth mode.");
+  }
+  if (authMode !== "credential_binding" && credentialBinding !== undefined) {
+    throw usageError("Option --credential-binding requires --auth-mode credential_binding.");
+  }
+  return authMode;
 }
 
 function requireConfirmation(parsed: ParsedInvocation, command: string): void {
@@ -96,6 +132,16 @@ function requireConfirmation(parsed: ParsedInvocation, command: string): void {
     message: `The ${command} mutation requires explicit confirmation in this initial build.`,
     exitCode: EXIT_CODES.policy,
     hint: `Review the target and repeat with --yes.`,
+  });
+}
+
+function postconditionUnverified(operation: string, details: SafeErrorDetails): never {
+  throw new CunaError({
+    code: "cuna.remote.postcondition_unverified",
+    message: `Cuna accepted ${operation}, but the CLI could not verify the resulting remote state.`,
+    exitCode: EXIT_CODES.conflict,
+    hint: "Inspect the target with a read-only command before retrying the mutation.",
+    details,
   });
 }
 
@@ -196,7 +242,10 @@ function capabilityRecord(snapshot: CapabilitySnapshot): Readonly<Record<string,
   });
 }
 
-export function preflightInvocation(parsed: ParsedInvocation): void {
+export function preflightInvocation(
+  parsed: ParsedInvocation,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): void {
   switch (parsed.command) {
     case "config":
       rejectUnknownOptions(parsed, []);
@@ -219,7 +268,7 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
       return;
     }
     case "machines":
-      preflightMachines(parsed);
+      preflightMachines(parsed, environment);
       return;
     case "records":
       rejectUnknownOptions(parsed, []);
@@ -238,8 +287,8 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
     case "workspace": {
       rejectUnknownOptions(parsed, []);
       const action = requireOperand(parsed.operands, 0, `${parsed.command} action`);
-      if ((action !== "show" && action !== "open") || parsed.operands.length !== 1) {
-        throw usageError(`${parsed.command} requires the show or open action.`);
+      if (action !== "show" || parsed.operands.length !== 1) {
+        throw usageError(`${parsed.command} requires the show action.`);
       }
       return;
     }
@@ -273,7 +322,7 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
       throw usageError(`Unknown api-keys action ${action}.`);
     }
     case "agent-sessions":
-      preflightAgentSessions(parsed);
+      preflightAgentSessions(parsed, environment);
       return;
     case "agent": {
       rejectUnknownOptions(parsed, ["agent-session", "yes"]);
@@ -305,8 +354,12 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
       return;
     case "claude":
     case "codex":
-    case "openclaw": {
-      preflightAgentJourneyInvocation(parsed);
+    case "openclaw":
+    case "opencode": {
+      const intent = preflightAgentJourneyInvocation(parsed);
+      if (intent.agent === "opencode") {
+        assertOpenCodeExecutionEnabled(resolveOpenCodeFeatureGate(environment));
+      }
       return;
     }
     case "shell":
@@ -326,7 +379,7 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
       for (const agentSessionId of parsed.operands) assertCanonicalUuid(agentSessionId, "AgentSession ID");
       return;
     case "doctor":
-      rejectUnknownOptions(parsed, []);
+      rejectUnknownOptions(parsed, ["check-browser-login"]);
       if (parsed.operands.length !== 0) throw usageError("doctor accepts no operands.");
       return;
     case "self-test":
@@ -349,7 +402,10 @@ export function preflightInvocation(parsed: ParsedInvocation): void {
   }
 }
 
-function preflightMachines(parsed: ParsedInvocation): void {
+function preflightMachines(
+  parsed: ParsedInvocation,
+  environment: Readonly<Record<string, string | undefined>>,
+): void {
   const action = requireOperand(parsed.operands, 0, "machines action");
   if (action === "list") {
     rejectUnknownOptions(parsed, []);
@@ -365,9 +421,12 @@ function preflightMachines(parsed: ParsedInvocation): void {
     if (rawName === undefined) throw usageError("Option --name is required.");
     const name = assertSafeDisplayText(rawName, "machine name");
     if (name.length < 1 || name.length > 80) throw usageError("Option --name must contain 1 through 80 characters.");
-    agentOption(parsed, false);
+    const agent = agentOption(parsed, false);
     integerOption(parsed, "vcpus", 1, 8);
     integerOption(parsed, "memory-mib", 512, 16_384);
+    if (agent === "opencode") {
+      assertOpenCodeExecutionEnabled(resolveOpenCodeFeatureGate(environment));
+    }
     return;
   }
   if (action === "start" || action === "pause" || action === "resume" || action === "stop" || action === "delete") {
@@ -380,7 +439,10 @@ function preflightMachines(parsed: ParsedInvocation): void {
   throw usageError(`Unknown machines action ${action}.`);
 }
 
-function preflightAgentSessions(parsed: ParsedInvocation): void {
+function preflightAgentSessions(
+  parsed: ParsedInvocation,
+  environment: Readonly<Record<string, string | undefined>>,
+): void {
   const action = requireOperand(parsed.operands, 0, "agent-sessions action");
   if (action === "list") {
     rejectUnknownOptions(parsed, ["machine", "limit", "cursor"]);
@@ -414,7 +476,8 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
     if (integerOption(parsed, "workspace-generation", 1, Number.MAX_SAFE_INTEGER) === undefined) {
       throw usageError("Option --workspace-generation is required.");
     }
-    agentOption(parsed, true);
+    const agent = agentOption(parsed, true);
+    if (agent === undefined) throw usageError("Option --agent is required.");
     const cwd = assertSafeDisplayText(stringOption(parsed, "cwd") ?? "/workspace", "workspace path");
     if (!cwd.startsWith("/workspace") || cwd.split("/").includes("..") || cwd.length > 1024) {
       throw usageError("Option --cwd must be a safe absolute path inside /workspace.");
@@ -423,19 +486,13 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
     if (name !== undefined && (assertSafeDisplayText(name, "AgentSession name").length < 1 || name.length > 80)) {
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
-    const authMode = stringOption(parsed, "auth-mode");
-    if (authMode !== undefined && authMode !== "interactive_login" && authMode !== "credential_binding") {
-      throw usageError("Option --auth-mode must be interactive_login or credential_binding.");
-    }
     const binding = stringOption(parsed, "credential-binding");
-    if (authMode === "credential_binding" && binding === undefined) {
-      throw usageError("Option --credential-binding is required for credential_binding auth mode.");
-    }
-    if (authMode !== "credential_binding" && binding !== undefined) {
-      throw usageError("Option --credential-binding requires --auth-mode credential_binding.");
-    }
+    normalizedAgentSessionAuthMode(agent, stringOption(parsed, "auth-mode"), binding);
     if (binding !== undefined) assertPublicId(binding, "credential binding ID");
     idempotencyKey(parsed);
+    if (agent === "opencode") {
+      assertOpenCodeExecutionEnabled(resolveOpenCodeFeatureGate(environment));
+    }
     return;
   }
   if (action === "terminate" || action === "rename") {
@@ -561,18 +618,12 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     }
     case "account": {
       requireCredential(context);
-      if (parsed.operands[0] === "open") {
-        throw unsupportedError("account browser handoff", "browser_handoff_authority_unavailable");
-      }
       const identity = await client.getIdentity();
       const data = Object.freeze({ id: identity.id, email: identity.email });
       return Object.freeze({ command: "account.show", data, human: `${identity.id}\t${identity.email}` });
     }
     case "workspace": {
       requireCredential(context);
-      if (parsed.operands[0] === "open") {
-        throw unsupportedError("workspace browser handoff", "browser_handoff_authority_unavailable");
-      }
       const identity = await client.getIdentity();
       const data = Object.freeze({
         assigned: identity.workspaceAssigned,
@@ -609,10 +660,10 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     case "api-keys": {
       requireCredential(context);
       const action = requireOperand(parsed.operands, 0, "api-keys action");
-      if (action === "create" && context.credentialMode !== "interactive") {
+      if (context.credentialMode !== "interactive") {
         throw new CunaError({
           code: "cuna.auth.interactive_required",
-          message: "API-key creation requires an interactive Cuna session.",
+          message: "API-key management requires an interactive Cuna session.",
           exitCode: EXIT_CODES.auth,
           hint: "Unset the automation credential, run `cuna login`, then repeat this command.",
         });
@@ -643,6 +694,10 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       if (action === "revoke") {
         const id = assertCanonicalUuid(parsed.operands[1] ?? "", "API key ID");
         await client.revokeApiKey(id);
+        const observed = (await client.listApiKeys()).find((key) => key.id === id);
+        if (observed !== undefined && observed.revokedAt === null) {
+          postconditionUnverified("API-key revocation", { api_key_id: id, observed_state: "active" });
+        }
         return Object.freeze({
           command: "api-keys.revoke",
           data: Object.freeze({ id, revoked: true }),
@@ -801,6 +856,17 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
           },
         });
       }
+      const observedAuth = await client.getAgentSessionAuth(id);
+      if (
+        observedAuth.agentSessionId !== id ||
+        observedAuth.processEpoch !== session.processEpoch ||
+        observedAuth.state !== "login_required"
+      ) {
+        postconditionUnverified("AgentSession provider logout", {
+          agent_session_id: id,
+          observed_state: observedAuth.state,
+        });
+      }
       return Object.freeze({
         command: "agent.logout",
         data: Object.freeze({
@@ -826,6 +892,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     case "claude":
     case "codex":
     case "openclaw":
+    case "opencode":
     case "connect":
       // Public process dispatch is owned by runCli, which composes exact attach
       // and the automatic journey before this generic command dispatcher. A
@@ -840,7 +907,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     case "companion":
       throw unsupportedError("local companion", "local_companion_unavailable");
     case "doctor": {
-      rejectUnknownOptions(parsed, []);
+      rejectUnknownOptions(parsed, ["check-browser-login"]);
       // `doctor` reads no credential, so an unusable one must not stop it —
       // that is the whole reason the refusal moved out of `resolveConfig`. It
       // reports the state instead, because a diagnostic that survives a broken
@@ -999,6 +1066,9 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     const agent = agentOption(parsed, false);
     const vcpus = integerOption(parsed, "vcpus", 1, 8);
     const memoryMiB = integerOption(parsed, "memory-mib", 512, 16_384);
+    if (agent === "opencode") {
+      assertOpenCodeExecutionEnabled(context.config.opencodeFeatureGate);
+    }
     await requireCapability({ client, scope: "account", capabilityId: "machines.create", now });
     const input: MachineCreateInput = {
       name,
@@ -1008,10 +1078,23 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
       ...(booleanOption(parsed, "background") ? { background: true } : {}),
     };
     const machine = await client.createMachine(input, key);
+    const observed = await client.getMachine(machine.id);
+    if (
+      observed.id !== machine.id || observed.name !== name ||
+      (agent !== undefined && observed.agent !== agent) ||
+      (vcpus !== undefined && observed.vcpus !== vcpus) ||
+      (memoryMiB !== undefined && observed.memoryMiB !== memoryMiB)
+    ) {
+      postconditionUnverified("machine creation", {
+        machine_id: machine.id,
+        observed_id: observed.id,
+        observed_name: observed.name,
+      });
+    }
     return Object.freeze({
       command: "machines.create",
-      data: machineRecord(machine),
-      human: `Created machine ${machine.name} (${machine.id}) in state ${machine.state}.`,
+      data: machineRecord(observed),
+      human: `Created machine ${observed.name} (${observed.id}) in state ${observed.state}.`,
     });
   }
   if (action === "start" || action === "pause" || action === "resume" || action === "stop") {
@@ -1025,10 +1108,19 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     // that the producer never advertises.
     await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.lifecycle", now });
     const machine = await client.transitionMachine(id, action);
+    const observed = await client.getMachine(id);
+    const expectedState = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
+    if (machine.id !== id || observed.id !== id || observed.state !== expectedState) {
+      postconditionUnverified(`machine ${action}`, {
+        machine_id: id,
+        expected_state: expectedState,
+        observed_state: observed.state,
+      });
+    }
     return Object.freeze({
       command: `machines.${action}`,
-      data: machineRecord(machine),
-      human: `Machine ${machine.name} is ${machine.state}.`,
+      data: machineRecord(observed),
+      human: `Machine ${observed.name} is ${observed.state}.`,
     });
   }
   if (action === "delete") {
@@ -1038,6 +1130,12 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
     await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.delete", now });
     await client.deleteMachine(id);
+    try {
+      await client.getMachine(id);
+      postconditionUnverified("machine deletion", { machine_id: id, observed_state: "present" });
+    } catch (error) {
+      if (!(error instanceof CunaError) || error.code !== "cuna.remote.not_found") throw error;
+    }
     return Object.freeze({ command: "machines.delete", data: { id, acknowledged: true }, human: `Delete acknowledged for ${id}.` });
   }
   throw usageError(`Unknown machines action ${action}.`);
@@ -1105,20 +1203,14 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     if (name !== undefined && (name.length < 1 || name.length > 80)) {
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
-    const rawAuthMode = stringOption(parsed, "auth-mode");
-    if (
-      rawAuthMode !== undefined &&
-      rawAuthMode !== "interactive_login" &&
-      rawAuthMode !== "credential_binding"
-    ) {
-      throw usageError("Option --auth-mode must be interactive_login or credential_binding.");
-    }
     const credentialBinding = stringOption(parsed, "credential-binding");
-    if (rawAuthMode === "credential_binding" && credentialBinding === undefined) {
-      throw usageError("Option --credential-binding is required for credential_binding auth mode.");
-    }
-    if (rawAuthMode !== "credential_binding" && credentialBinding !== undefined) {
-      throw usageError("Option --credential-binding requires --auth-mode credential_binding.");
+    const authMode = normalizedAgentSessionAuthMode(
+      agent,
+      stringOption(parsed, "auth-mode"),
+      credentialBinding,
+    );
+    if (agent === "opencode") {
+      assertOpenCodeExecutionEnabled(context.config.opencodeFeatureGate);
     }
     await requireCapability({ client, scope: "machine", resourceId: machineId, capabilityId: "agent_sessions.create", now });
     const session = await client.createAgentSession(machineId, {
@@ -1127,12 +1219,26 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
       cwd,
       workspaceBindingId,
       workspaceGeneration,
-      ...(rawAuthMode === undefined ? {} : { authMode: rawAuthMode }),
+      ...(authMode === undefined ? {} : { authMode }),
       ...(credentialBinding === undefined
         ? {}
         : { credentialBindingId: assertCanonicalUuid(credentialBinding, "credential binding ID") }),
     }, idempotencyKey(parsed));
-    return Object.freeze({ command: "agent-sessions.create", data: agentSessionRecord(session), human: `Created ${session.agent} AgentSession ${session.id}.` });
+    const observed = await client.getAgentSession(session.id);
+    if (
+      observed.id !== session.id || observed.machineId !== machineId || observed.agent !== agent ||
+      observed.cwd !== cwd || observed.workspaceBindingId !== workspaceBindingId ||
+      observed.workspaceGeneration !== workspaceGeneration ||
+      (name !== undefined && observed.name !== name) ||
+      (authMode !== undefined && observed.authMode !== authMode)
+    ) {
+      postconditionUnverified("AgentSession creation", {
+        agent_session_id: session.id,
+        machine_id: machineId,
+        observed_agent: observed.agent,
+      });
+    }
+    return Object.freeze({ command: "agent-sessions.create", data: agentSessionRecord(observed), human: `Created ${observed.agent} AgentSession ${observed.id}.` });
   }
   if (action === "terminate") {
     rejectUnknownOptions(parsed, ["yes"]);
@@ -1140,8 +1246,19 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     requireConfirmation(parsed, "agent-sessions.terminate");
     const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.terminate", now });
-    const session = await client.terminateAgentSession(id);
-    return Object.freeze({ command: "agent-sessions.terminate", data: agentSessionRecord(session), human: `AgentSession ${session.id} is ${session.requestState}/${session.processState}.` });
+    await client.terminateAgentSession(id);
+    const observed = await client.getAgentSession(id);
+    if (
+      observed.id !== id || observed.desiredState !== "terminated" ||
+      observed.requestState !== "terminal" || observed.processState !== "terminated"
+    ) {
+      postconditionUnverified("AgentSession termination", {
+        agent_session_id: id,
+        observed_desired_state: observed.desiredState,
+        observed_request_state: observed.requestState,
+      });
+    }
+    return Object.freeze({ command: "agent-sessions.terminate", data: agentSessionRecord(observed), human: `AgentSession ${observed.id} is ${observed.requestState}/${observed.processState}.` });
   }
   if (action === "rename") {
     rejectUnknownOptions(parsed, ["name", "yes"]);
@@ -1154,11 +1271,15 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
     await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.rename", now });
-    const session = await client.renameAgentSession(id, name);
+    await client.renameAgentSession(id, name);
+    const observed = await client.getAgentSession(id);
+    if (observed.id !== id || observed.name !== name) {
+      postconditionUnverified("AgentSession rename", { agent_session_id: id, expected_name: name, observed_name: observed.name });
+    }
     return Object.freeze({
       command: "agent-sessions.rename",
-      data: agentSessionRecord(session),
-      human: `Renamed AgentSession ${session.id} to ${session.name}.`,
+      data: agentSessionRecord(observed),
+      human: `Renamed AgentSession ${observed.id} to ${observed.name}.`,
     });
   }
   if (action === "attach") {

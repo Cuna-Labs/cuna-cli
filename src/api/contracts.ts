@@ -385,7 +385,7 @@ export function decodeCunaIdentity(value: unknown): CunaIdentity {
   });
 }
 
-export type AgentKind = "claude-code" | "codex" | "openclaw";
+export type AgentKind = "claude-code" | "codex" | "openclaw" | "opencode";
 export type AgentAuthMode = "interactive_login" | "credential_binding";
 export type AgentSessionAuthState =
   | "login_required"
@@ -394,6 +394,7 @@ export type AgentSessionAuthState =
   | "unavailable";
 export type AgentSessionAuthEvidenceClass =
   | "provider_cli_login_status"
+  | "provider_cli_credential_presence"
   | "credential_binding_authority"
   | "insufficient";
 export const AGENT_SESSION_AUTH_ADAPTER_VERSION = DEPLOYED_WIRE_COMPATIBILITY.agentSessionAuthAdapterVersion;
@@ -472,7 +473,7 @@ export interface AgentSessionAuthLogout {
   readonly outcome: "logout_confirmed";
 }
 
-const AGENTS = new Set<AgentKind>(["claude-code", "codex", "openclaw"]);
+const AGENTS = new Set<AgentKind>(["claude-code", "codex", "openclaw", "opencode"]);
 const AUTH_MODES = new Set<AgentAuthMode>(["interactive_login", "credential_binding"]);
 const DESIRED_STATES = new Set<AgentSessionDesiredState>(["running", "terminated"]);
 const REQUEST_STATES = new Set<AgentSessionRequestState>([
@@ -485,7 +486,7 @@ const AGENT_AUTH_STATES = new Set<AgentSessionAuthState>([
   "login_required", "authenticated", "configured", "unavailable",
 ]);
 const AGENT_AUTH_EVIDENCE_CLASSES = new Set<AgentSessionAuthEvidenceClass>([
-  "provider_cli_login_status", "credential_binding_authority", "insufficient",
+  "provider_cli_login_status", "provider_cli_credential_presence", "credential_binding_authority", "insufficient",
 ]);
 const AGENT_AUTH_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+$/u;
 
@@ -522,6 +523,11 @@ function decodeAgentSession(value: unknown): AgentSession {
   }
   const agent = enumField(value, "agent", AGENTS);
   const authMode = enumField(value, "auth_mode", AUTH_MODES);
+  // Read paths intentionally remain tolerant of legacy OpenCode rows.  The
+  // producer and every mutation path reject credential bindings for OpenCode,
+  // while foreground admission rejects an unsafe legacy row before it can own
+  // a terminal.  Rejecting it here would make an entire paginated list
+  // unreadable during a consumer-first rollback.
   const desiredState = enumField(value, "desired_state", DESIRED_STATES);
   const requestState = enumField(value, "request_state", REQUEST_STATES);
   const processState = enumField(value, "process_state", PROCESS_STATES);
@@ -635,17 +641,24 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
   }
   const evidenceClass = enumField(value, "evidence_class", AGENT_AUTH_EVIDENCE_CLASSES);
   const state = enumField(value, "state", AGENT_AUTH_STATES);
-  const positiveInteractive = state === "authenticated" || state === "login_required";
-  const configured = state === "configured";
   const unavailable = state === "unavailable";
+  const providerCredentialPresence =
+    authMode === "interactive_login" &&
+    evidenceClass === "provider_cli_credential_presence" &&
+    (state === "login_required" || state === "configured");
+  const providerLoginStatus =
+    authMode === "interactive_login" &&
+    evidenceClass === "provider_cli_login_status" &&
+    (state === "login_required" || state === "authenticated");
+  const credentialBindingAuthority =
+    authMode === "credential_binding" &&
+    evidenceClass === "credential_binding_authority" &&
+    state === "configured";
   if (
     (!unavailable && processEpoch === null) ||
     (!unavailable && validUntilTime === observedTime) ||
     (!unavailable && !AGENT_AUTH_VERSION.test(agentVersion)) ||
-    (positiveInteractive &&
-      (authMode !== "interactive_login" || evidenceClass !== "provider_cli_login_status")) ||
-    (configured &&
-      (authMode !== "credential_binding" || evidenceClass !== "credential_binding_authority")) ||
+    (!unavailable && !(providerCredentialPresence || providerLoginStatus || credentialBindingAuthority)) ||
     (unavailable !== (evidenceClass === "insufficient")) ||
     (unavailable && validUntilTime !== observedTime) ||
     (agentVersion === "unavailable" && !unavailable)

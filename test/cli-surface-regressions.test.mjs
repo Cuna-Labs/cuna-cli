@@ -39,9 +39,11 @@ test("--help resolves the command it was typed after, not the root help", async 
     { argv: ["machines", "--help"], topic: "machines", must: ["cuna machines <list|create"] },
     { argv: ["machines", "create", "--help"], topic: "machines create", must: ["--name NAME", "--yes", "--vcpus N"] },
     { argv: ["machines", "list", "--help"], topic: "machines list", must: ["cuna machines list"] },
-    { argv: ["agent-sessions", "create", "--help"], topic: "agent-sessions create", must: ["--workspace-binding-id", "--workspace-generation"] },
-    { argv: ["doctor", "--help"], topic: "doctor", must: ["encrypted local\nsession-store state"] },
+    { argv: ["agent-sessions", "create", "--help"], topic: "agent-sessions create", must: ["--workspace-binding-id", "--workspace-generation", "Always sends interactive_login"] },
+    { argv: ["agent", "--help"], topic: "agent", must: ["does not\nlog out OpenCode", "own interactive provider flow"] },
+    { argv: ["doctor", "--help"], topic: "doctor", must: ["encrypted local\nsession-store state", "--check-browser-login"] },
     { argv: ["claude", "--help"], topic: "claude", must: ["--agent-session ID", "--no-sync"] },
+    { argv: ["opencode", "--help"], topic: "opencode", must: ["--agent-session ID", "--no-sync", "ChatGPT Pro/Plus (headless)", "interactive_login only"] },
   ];
   for (const { argv, topic, must } of cases) {
     const { exit, record } = await runJson([...argv, "--json"]);
@@ -312,6 +314,7 @@ async function pauseWith(snapshot) {
     clientFactory: () => ({
       discoverCapabilities: async () => snapshot,
       transitionMachine: async (id) => ({ id, name: "dev", state: "paused" }),
+      getMachine: async (id) => ({ id, name: "dev", state: "paused" }),
     }),
   });
 }
@@ -400,6 +403,7 @@ test("machines create generates an idempotency key and still honours an override
       keys.push(idempotencyKey);
       return { id: MACHINE_ID, name: "dev", state: "creating" };
     },
+    getMachine: async (id) => ({ id, name: "dev", state: "creating" }),
   };
   const generated = await runJson(["machines", "create", "--name", "dev", "--yes", "--json"], {
     env: { CUNA_API_KEY: API_KEY },

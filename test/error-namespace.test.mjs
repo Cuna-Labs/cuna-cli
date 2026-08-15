@@ -49,9 +49,29 @@ const SCRIPTS_ROOT = fileURLToPath(new URL("../scripts", import.meta.url));
 const COMPATIBILITY_FILE = "core/deployed-wire-compatibility.ts";
 const EARLIER_BRAND_LITERAL = /(?:^|[^a-z])runa(?:code)?(?:[^a-z]|$)/iu;
 
+// `sync-infra-openapi.mjs` is an offline contract importer, not shipped
+// runtime behavior.  It must name the producer's historical artifact and
+// reject every retired wire marker before it copies a contract.  Keep this
+// exception line-exact: a new earlier-brand literal anywhere else in the
+// synchronizer is still a failure, rather than a broad exemption for tools.
+const CONTRACT_SYNC_EARLIER_BRAND_GUARDS = Object.freeze(new Set([
+  'const expectedSourceName = "runa-api.openapi.json";',
+  '"cuna_rt_", "runa_ct_", "runa_cb_", "runa_at_", "runa_rt_",',
+  'fail("CUNA_INFRA_OPENAPI_PATH must name the Infra contracts/runa-api.openapi.json artifact");',
+  ') fail("source must be the exact Infra contracts/runa-api.openapi.json artifact");',
+  'env: { ...process.env, RUNA_CONTRACT_ARTIFACT: sourceArtifact },',
+  'const sourceDigest = (await readFile(path.join(sourceContracts, "runa-api.openapi.sha256"), "utf8")).trim().split(/\\s+/u);',
+]));
+
 function isCommentLine(line) {
   const trimmed = line.trimStart();
   return trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*");
+}
+
+function isOfflineContractSyncGuard(label, relative, line) {
+  return label === "scripts" &&
+    relative === "sync-infra-openapi.mjs" &&
+    CONTRACT_SYNC_EARLIER_BRAND_GUARDS.has(line.trim());
 }
 
 async function sourceFiles(directory) {
@@ -89,7 +109,6 @@ test("the deployed wire compatibility authority has an exact closed schema and v
     terminalProtocol: "runa.terminal.v1",
     agentSessionAuthAdapterVersion: "runa.agent-auth.v1",
     websocketAuthPrefix: "runa.auth.",
-    continuationHeader: "X-Runa-Continuation",
     credentialBrand: "runa",
     apiOrigin: "https://api.runacode.io",
     apiKeyEnvironment: "RUNA_API_KEY",
@@ -110,6 +129,7 @@ test("earlier-brand runtime literals exist only in the exact deployed wire autho
             unclassified = unclassified.replaceAll(JSON.stringify(value), "");
           }
         }
+        if (isOfflineContractSyncGuard(label, relative, line)) continue;
         if (!EARLIER_BRAND_LITERAL.test(unclassified)) continue;
         unexplained.push(`${label}/${relative}:${index + 1}: ${line.trim()}`);
       }

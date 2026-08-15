@@ -179,11 +179,10 @@ test("every validated family accepts its own mint and nothing else", () => {
   }
 });
 
-test("the browser callback nonce is validated by the authority, in both brands", () => {
-  for (const brand of REQUIRED_CREDENTIAL_BRANDS) {
-    assert.equal(isBrowserCallbackNonce(`${brand}_cb_${OPAQUE_SUFFIX}`), true, brand);
-  }
+test("the browser callback nonce admits only the current Cuna callback flow", () => {
+  assert.equal(isBrowserCallbackNonce(`cuna_cb_${OPAQUE_SUFFIX}`), true);
   for (const rejected of [
+    `runa_cb_${OPAQUE_SUFFIX}`, // former callback values remain denylist-only
     `cuna_cb_${"A".repeat(42)}`, // one character short of the minted suffix
     `cuna_cb_${"A".repeat(44)}`, // one character long
     `cuna_ct_${OPAQUE_SUFFIX}`, // a different family must not authenticate as cb

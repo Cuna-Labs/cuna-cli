@@ -87,7 +87,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  --yes               Confirm this mutating operation",
       "",
       "Options:",
-      "  --agent KIND        claude-code, codex, or openclaw",
+      "  --agent KIND        claude-code, codex, openclaw, or opencode",
       "  --vcpus N           Base-10 integer, 1 through 8",
       "  --memory-mib N      Base-10 integer, 512 through 16384",
       "  --background        Do not wait for the machine to become ready",
@@ -125,12 +125,12 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "List active credential injection rules for one machine.\n\nRequired:\n  --machine ID        Canonical lowercase Cuna UUID",
   ),
   account: topic(
-    "Usage:\n  cuna account <show|open>",
-    "Show the public account identity, or open it in the browser. No command options.",
+    "Usage:\n  cuna account show",
+    "Show the public account identity. The show action is required. No command options.",
   ),
   workspace: topic(
-    "Usage:\n  cuna workspace <show|open>",
-    "Show workspace assignment or waitlist state, or open it in the browser.\nNo command options.",
+    "Usage:\n  cuna workspace show",
+    "Show workspace assignment or waitlist state. The show action is required.\nNo command options.",
   ),
   usage: topic(
     "Usage:\n  cuna usage show",
@@ -201,7 +201,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  --workspace-generation N  Base-10 integer, 1 or greater. This is a fencing",
       "                            token compared exactly, so an exponent or hex form",
       "                            is rejected rather than quietly coerced.",
-      "  --agent KIND              claude-code, codex, or openclaw",
+      "  --agent KIND              claude-code, codex, openclaw, or opencode",
       "  --yes                     Confirm this mutating operation",
       "",
       "Options:",
@@ -210,6 +210,11 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  --auth-mode MODE          interactive_login or credential_binding",
       "  --credential-binding ID   Required exactly when --auth-mode is",
       "                            credential_binding, and rejected otherwise",
+      "  OpenCode                  Always sends interactive_login; credential bindings",
+      "                            are rejected",
+      "                            Execution is locally OFF unless",
+      "                            CUNA_OPENCODE_ENABLED=true exactly and this",
+      "                            installed CLI contains a committed Infra witness.",
       "  --idempotency-key K       Generated per invocation when omitted",
     ].join("\n"),
   ),
@@ -227,7 +232,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   ),
   agent: topic(
     "Usage:\n  cuna agent logout --agent-session SESSION_ID --yes",
-    "Sign the provider out of one exact AgentSession.\n\nRequired:\n  --agent-session ID  Canonical lowercase Cuna UUID\n  --yes               Confirm this mutating operation",
+    "Sign Claude Code or Codex out of one exact AgentSession. This command does not\nlog out OpenCode; use OpenCode's own interactive provider flow.\n\nRequired:\n  --agent-session ID  Canonical lowercase Cuna UUID\n  --yes               Confirm this mutating operation",
   ),
   connect: topic(
     "Usage:\n  cuna connect SESSION_ID [SESSION_ID...]",
@@ -238,8 +243,8 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "Show effective, redacted configuration. Configuration writes are not implemented\nin this build. No command options.",
   ),
   doctor: topic(
-    "Usage:\n  cuna doctor [--json]",
-    "Report platform, Node version, runtime features, and encrypted local\nsession-store state.\n\nRun this first when a command fails with an authentication or capability error.\nAccepts no operands and no command options.",
+    "Usage:\n  cuna doctor [--check-browser-login] [--json]",
+    "Report platform, Node version, runtime features, and encrypted local\nsession-store state without network access by default.\n\nOptional:\n  --check-browser-login  Probe the anonymous remote browser-login bootstrap\n\nThe local AES store and remote browser-login bootstrap are reported separately.\nRun this first when a command fails with an authentication or capability error.\nAccepts no operands.",
   ),
   "self-test": topic(
     "Usage:\n  cuna self-test --offline",
@@ -251,9 +256,25 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   ),
 });
 
-function agentHelp(command: "claude" | "codex" | "openclaw"): string {
+function agentHelp(command: "claude" | "codex" | "openclaw" | "opencode"): string {
   const sync = command === "openclaw" ? "" : "\n  --no-sync                 Bind without synchronizing workspace contents";
   const syncExclusion = command === "openclaw" ? "" : " --no-sync,";
+  const authOptions = command === "opencode"
+    ? [
+        "  --auth-mode MODE          OpenCode accepts interactive_login only",
+        "  OpenAI subscription: in OpenCode choose /connect, OpenAI, then",
+        "  ChatGPT Pro/Plus (headless) for a remote Cuna machine.",
+        "  OpenCode owns its OAuth tokens; Cuna never copies Codex credentials.",
+        "  Execution, including exact --agent-session attach, is locally OFF by",
+        "  default. Set CUNA_OPENCODE_ENABLED=true only after this installed CLI",
+        "  contains a committed Infra OpenCode-contract witness; this local",
+        "  consumer gate does not enable Edge or inject credentials.",
+      ]
+    : [
+        "  --auth-mode MODE          interactive_login or credential_binding",
+        "  --credential-binding ID   Required exactly when --auth-mode is",
+        "                            credential_binding",
+      ];
   return topic(
     `Usage:\n  cuna ${command} [PATH] [--machine NAME | --new] [--new-session] [options]\n  cuna ${command} --agent-session SESSION_ID`,
     [
@@ -270,12 +291,13 @@ function agentHelp(command: "claude" | "codex" | "openclaw"): string {
       "  --machine NAME            Use one named machine",
       "  --new                     Create a machine instead of selecting one",
       `  --new-session             Create a child process instead of reusing one${sync}`,
-      "  --auth-mode MODE          interactive_login or credential_binding",
-      "  --credential-binding ID   Required exactly when --auth-mode is",
-      "                            credential_binding",
+      ...authOptions,
       "  --agent-session ID        Attach one exact child and skip reconciliation.",
       "                            Cannot be combined with PATH, --machine, --new,",
       `                            --new-session,${syncExclusion} --auth-mode or --credential-binding.`,
+      ...(command === "opencode"
+        ? ["                            Exact --agent-session attachment remains available while the local creation gate is OFF."]
+        : []),
       "",
       "Requires an interactive terminal; JSON and redirected output fail closed.",
     ].join("\n"),
@@ -288,12 +310,13 @@ export const HELP_TOPICS: readonly string[] = Object.freeze([
   "claude",
   "codex",
   "openclaw",
+  "opencode",
 ]);
 
 /** Help for `command` plus its action operands, falling back to the root help. */
 export function commandHelp(command: string | undefined, operands: readonly string[]): string {
   if (command === undefined) return ROOT_HELP;
-  if (command === "claude" || command === "codex" || command === "openclaw") return agentHelp(command);
+  if (command === "claude" || command === "codex" || command === "openclaw" || command === "opencode") return agentHelp(command);
   const action = operands[0];
   if (action !== undefined) {
     const specific = COMMAND_HELP[`${command} ${action}`];

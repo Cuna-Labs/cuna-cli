@@ -11,7 +11,7 @@ const GRAPHEME_SEGMENTER = new Intl.Segmenter("en", { granularity: "grapheme" })
 export interface WorkbenchTab {
   readonly id: string;
   readonly label: string;
-  readonly agent: "claude-code" | "codex" | "openclaw" | "shell";
+  readonly agent: "claude-code" | "codex" | "openclaw" | "opencode" | "shell";
   readonly viewport: ViewportSnapshot;
 }
 
@@ -146,6 +146,7 @@ function agentLabel(agent: WorkbenchTab["agent"]): string {
     case "claude-code": return "Claude";
     case "codex": return "Codex";
     case "openclaw": return "OpenClaw";
+    case "opencode": return "OpenCode";
     case "shell": return "Shell";
   }
 }

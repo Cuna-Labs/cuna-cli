@@ -14,6 +14,7 @@ const staging = await mkdtemp(path.join(tmpdir(), "cuna-local-candidate-"));
 
 try {
   const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+  await assertCleanSource(root);
   const sourceCommit = (await run("git", ["rev-parse", "HEAD"], root, 10_000)).stdout.trim();
   const npmVersion = (await runNpm(["--version"], root, 10_000)).stdout.trim();
   const runner = `local-${process.platform}-${process.arch}`;
@@ -60,6 +61,14 @@ try {
   })}\n`);
 } finally {
   await rm(staging, { recursive: true, force: true });
+}
+
+async function assertCleanSource(root) {
+  const status = await run("git", ["status", "--porcelain=v1", "--untracked-files=all"], root, 10_000);
+  invariant(
+    status.stdout.trim() === "",
+    "Refusing to build a local release candidate from a dirty source tree. Commit or stash the source changes, then build the exact candidate again.",
+  );
 }
 
 async function runNpm(npmArgs, cwd, timeout) {

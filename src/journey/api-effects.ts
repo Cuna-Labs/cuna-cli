@@ -17,7 +17,7 @@ export interface ApiAgentJourneyEffectsInput {
   readonly synchronizeWorkspace: AgentJourneyEffects["synchronizeWorkspace"];
   readonly attach: AgentJourneyEffects["attach"];
   readonly authorizeMachineCreate: (input: {
-    readonly requestedAgent: "claude-code" | "codex" | "openclaw";
+    readonly requestedAgent: "claude-code" | "codex" | "openclaw" | "opencode";
     readonly signal: AbortSignal;
   }) => Promise<boolean>;
   readonly reconcileCancellation?: (input: {
@@ -116,7 +116,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         return Object.freeze({
           id: machine.id,
           name: machine.name,
-          agent: machine.agent === "claude-code" || machine.agent === "codex" || machine.agent === "openclaw"
+          agent: machine.agent === "claude-code" || machine.agent === "codex" || machine.agent === "openclaw" || machine.agent === "opencode"
             ? machine.agent
             : "unknown" as const,
           requestedAgentSupport: support,

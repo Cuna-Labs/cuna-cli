@@ -34,7 +34,7 @@ opaque remote shell.
   available.
 
 Foreground terminal attachment is implemented as a capability-gated preview and
-fails before terminal ownership unless the server proves a current native
+fails before terminal ownership unless the server proves a current
 AgentSession terminal producer. Daemon integration, workspace synchronization, and
 the local companion remain pre-release work. Browser authentication is
 implemented against the local public 1.5.0 candidate contract. Its immutable
@@ -176,6 +176,15 @@ both names are present, `CUNA_API_KEY` always wins. An empty or malformed
 canonical value fails instead of falling through to the legacy credential.
 Other earlier-brand environment-variable names and local paths are not accepted.
 
+`CUNA_OPENCODE_ENABLED=true` is the only local CLI opt-in for OpenCode creation
+and automatic attachment; it is exact and case-sensitive. The default, unset,
+empty, or any other value is disabled. This is a consumer safety gate, not a
+release authority: it cannot enable Edge, override the release manifest, or
+inject/copy any Cuna, Codex, OpenAI, or OpenCode credential. Existing OpenCode
+rows remain readable and an exact `--agent-session` attachment remains
+available while the local creation gate is off. `cuna config get --json`
+reports the non-secret gate state and source.
+
 `CUNA_API_KEY` and its deprecated `RUNA_API_KEY` alias are explicit automation
 credentials and are never persisted automatically. An automation
 credential that is set but unusable is refused rather than ignored, and it is
@@ -188,8 +197,8 @@ profile-scoped session file; the separate random key and ciphertext files are
 restricted to the current user. Each fresh process exchanges the login code for
 a short-lived access token and never sends the code as a product API bearer.
 Logout revokes the server family before deleting both local files. This layer
-protects against accidental disclosure and other local users, but compromise of
-the same OS account can read both files and defeats it. Automation and
+does not protect a copied profile containing both files, and compromise of the
+same OS account can read both files and defeats it. Automation and
 interactive credential authorities never fall back to each other.
 
 Never place API keys in command-line arguments, repository files, issue reports,

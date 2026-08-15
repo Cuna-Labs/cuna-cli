@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
+import { readdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { cleanBuildOutput } from "./clean-build-output.mjs";
 import { acquireExclusiveBuildLock } from "./lib/exclusive-build-lock.mjs";
+import { emitVendoredInfraContractWitness } from "./lib/infra-contract-witness.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repositoryRoot = resolve(dirname(scriptPath), "..");
@@ -27,15 +29,18 @@ const operation = process.argv[2];
  * named failing test instead of a stall.
  */
 const TEST_TIMEOUT_MS = 300_000;
+const EXPERIMENTAL_CREDENTIAL_TEST_FILES = new Set([
+  "local-session-preview.test.mjs",
+]);
 
 if (operation !== "build" && operation !== "test") {
   throw new Error("Expected exactly one build operation: build or test.");
 }
 
-async function runNode(args) {
+async function runNode(args, env = process.env) {
   const child = spawn(process.execPath, args, {
     cwd: repositoryRoot,
-    env: process.env,
+    env,
     stdio: "inherit",
     windowsHide: true,
   });
@@ -56,11 +61,34 @@ async function runNode(args) {
   }
 }
 
+async function productTestFiles() {
+  const testDirectory = resolve(repositoryRoot, "test");
+  return (await readdir(testDirectory))
+    .filter((file) => file.endsWith(".test.mjs") && !EXPERIMENTAL_CREDENTIAL_TEST_FILES.has(file))
+    .sort()
+    .map((file) => resolve(testDirectory, file));
+}
+
 const lock = await acquireExclusiveBuildLock(repositoryRoot);
 try {
+  // The feature gate consumes the compiled witness from the npm artifact.
+  // Regenerate it inside the build lock so a changed vendored identity cannot
+  // leave an earlier committed/mutable verdict in dist.  The emitter is
+  // content-stable and performs no network or producer lookup.
+  await emitVendoredInfraContractWitness(repositoryRoot);
   await cleanBuildOutput(repositoryRoot);
   await runNode([resolve(repositoryRoot, "node_modules/typescript/bin/tsc"), "-p", "tsconfig.json"]);
-  if (operation === "test") await runNode(["--test", `--test-timeout=${TEST_TIMEOUT_MS}`, "test/*.test.mjs"]);
+  if (operation === "test") {
+    // Source-quality tests may exercise a deliberately named development pack,
+    // but release-mode installed E2E must receive an immutable candidate
+    // directory explicitly. Never let a generic `npm test` silently masquerade
+    // as release evidence.
+    const testEnvironment = {
+      ...process.env,
+      ...(process.env.CUNA_E2E_MODE === undefined ? { CUNA_E2E_MODE: "development" } : {}),
+    };
+    await runNode(["--test", `--test-timeout=${TEST_TIMEOUT_MS}`, ...await productTestFiles()], testEnvironment);
+  }
 } finally {
   await lock.release();
 }

@@ -220,7 +220,7 @@ const REUSABLE_MACHINE_STATES = new Set<MachineSelectionState>([
   "suspended",
   "stopped",
 ]);
-const AGENTS = new Set<AgentKind>(["claude-code", "codex", "openclaw"]);
+const AGENTS = new Set<AgentKind>(["claude-code", "codex", "openclaw", "opencode"]);
 const AUTH_MODES = new Set<AgentAuthMode>(["interactive_login", "credential_binding"]);
 const PROCESS_STATES = new Set<AgentSessionProcessState>([
   "unknown",

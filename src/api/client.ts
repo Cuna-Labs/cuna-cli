@@ -292,6 +292,16 @@ function validateAgentSessionCreate(input: AgentSessionCreateInput): void {
       exitCode: EXIT_CODES.usage,
     });
   }
+  if (
+    input.agent === "opencode" &&
+    (input.authMode !== "interactive_login" || input.credentialBindingId !== undefined)
+  ) {
+    throw new CunaError({
+      code: "cuna.usage.invalid",
+      message: "OpenCode AgentSessions require interactive_login and do not accept a credential binding.",
+      exitCode: EXIT_CODES.usage,
+    });
+  }
   if (input.authMode === "credential_binding" && input.credentialBindingId === undefined) {
     throw new CunaError({
       code: "cuna.usage.invalid",

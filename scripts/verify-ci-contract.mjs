@@ -45,47 +45,15 @@ const releaseReviewWorkflow = parseYaml(releaseReview, { prettyErrors: true, uni
 invariant(workflow && typeof workflow === "object" && !Array.isArray(workflow), "CI workflow must parse as a YAML object");
 const jobs = workflow.jobs;
 invariant(jobs && typeof jobs === "object" && !Array.isArray(jobs), "CI workflow jobs are missing");
-for (const job of ["public-controls", "source-gates", "native-source-gates", "native-evidence-gates", "candidate", "installed-artifact", "observed-artifact", "observation-summary", "admission", "handoff"]) {
+for (const job of ["public-controls", "source-gates", "candidate", "installed-artifact", "observed-artifact", "observation-summary", "admission", "handoff"]) {
   invariant(jobs[job] && typeof jobs[job] === "object", `CI workflow job is missing: ${job}`);
   invariant(Array.isArray(jobs[job].steps), `CI workflow job has no executable steps: ${job}`);
 }
 const needsList = (job) => Array.isArray(job.needs) ? job.needs : typeof job.needs === "string" ? [job.needs] : [];
 
 invariant(
-  JSON.stringify(needsList(jobs.candidate).sort()) === JSON.stringify(["native-evidence-gates", "native-source-gates", "source-gates"]),
-  "Candidate generation must depend on Node, native source, and native evidence gates",
-);
-const nativeMatrix = jobs["native-source-gates"].strategy?.matrix?.include;
-invariant(
-  Array.isArray(nativeMatrix) &&
-    JSON.stringify(nativeMatrix.map((entry) => entry.id).sort()) === JSON.stringify(["linux-x64", "macos-x64", "windows-x64"]),
-  "Native source gates must compile all three Tier-1 platform families",
-);
-const nativeRuns = jobs["native-source-gates"].steps
-  .map((step) => step?.run)
-  .filter((run) => typeof run === "string")
-  .join("\n");
-for (const command of [
-  "cargo +1.97.1 fmt --all -- --check",
-  "cargo +1.97.1 check --workspace --all-targets --locked",
-  "cargo +1.97.1 test --workspace --locked",
-  "cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings",
-]) invariant(nativeRuns.includes(command), `Native source gate is missing: ${command}`);
-const nativeEvidenceRuns = jobs["native-evidence-gates"].steps
-  .map((step) => step?.run)
-  .filter((run) => typeof run === "string")
-  .join("\n");
-for (const command of [
-  "cargo +1.97.1 build --workspace --release --locked",
-  "scripts/capture-native-windows-identity.ps1",
-  "node scripts/generate-native-release-evidence.mjs",
-  "node scripts/verify-native-release-evidence.mjs --evidence evidence/native-local",
-  "--require-production true",
-  "Unsigned/local manifest is not production-admissible",
-]) invariant(nativeEvidenceRuns.includes(command), `Native evidence gate is missing: ${command}`);
-invariant(
-  JSON.stringify(needsList(jobs["native-evidence-gates"])) === JSON.stringify(["native-source-gates"]),
-  "Native evidence generation must follow all native source gates",
+  JSON.stringify(needsList(jobs.candidate)) === JSON.stringify(["source-gates"]),
+  "Candidate generation must depend only on the product source gate",
 );
 const allSteps = Object.values(jobs).flatMap((job) => Array.isArray(job?.steps) ? job.steps : []);
 const runCommands = allSteps.map((step) => step?.run).filter((run) => typeof run === "string");

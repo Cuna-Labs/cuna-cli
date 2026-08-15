@@ -8,6 +8,7 @@ import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import { assertApiKeyUsable, resolveConfig, type EffectiveConfig } from "../config/config.js";
+import { assertOpenCodeExecutionEnabled } from "../config/opencode-feature-gate.js";
 import { executeCommand, preflightInvocation } from "../commands/commands.js";
 import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
 import {
@@ -17,6 +18,7 @@ import {
 } from "../core/product-web.js";
 import { integerArgument } from "../core/validation.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
+import type { SecureCredentialBackend } from "../credentials/contracts.js";
 import { CredentialVault } from "../credentials/vault.js";
 import { LocalEncryptedSessionBackend, localEncryptedSessionPaths } from "../credentials/local-session.js";
 import {
@@ -57,6 +59,14 @@ export interface RunCliDependencies {
   readonly browser?: BrowserOpener;
   readonly readLoginCode?: (signal?: AbortSignal) => Promise<string>;
   readonly signal?: AbortSignal;
+  /**
+   * Test seam for the diagnostic-only local-store observation. Production CLI
+   * invocations leave this absent and construct the AES backend below. Keeping
+   * the remote bootstrap probe outside this seam lets tests prove the two
+   * independent `doctor --check-browser-login` predicates without depending on
+   * host ACL subprocess availability.
+   */
+  readonly doctorCredentialBackend?: Pick<SecureCredentialBackend, "backendId" | "probe">;
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
   readonly foregroundTerminalRunner?: ForegroundSessionRunner;
   readonly automaticJourneyEffectsFactory?: (input: {
@@ -67,10 +77,10 @@ export interface RunCliDependencies {
     readonly credentialMode: "automation" | "interactive";
     readonly signal?: AbortSignal;
   }) => AgentJourneyEffects;
-  readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw", signal: AbortSignal) => Promise<boolean>;
+  readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal) => Promise<boolean>;
 }
 
-async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw", signal: AbortSignal): Promise<boolean> {
+async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return false;
   const prompt = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
   try {
@@ -83,13 +93,113 @@ async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw",
   }
 }
 
-async function promptLoginCode(signal?: AbortSignal): Promise<string> {
-  const prompt = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
-  try {
-    return await prompt.question("Paste the cuna_login_ code shown by app.getcuna.com: ", signal === undefined ? {} : { signal });
-  } finally {
-    prompt.close();
+function loginCodeInputError(code: "unavailable" | "cancelled" | "too_long", message: string): CunaError {
+  return new CunaError({
+    code: `cuna.auth.login_code_input_${code}`,
+    message,
+    exitCode: EXIT_CODES.auth,
+    hint: code === "unavailable"
+      ? "Run `cuna login` from an interactive terminal that supports hidden input."
+      : "Run `cuna login` again and paste the complete cuna_login_ code.",
+  });
+}
+
+/**
+ * Read the reusable browser login code without writing its bytes to terminal
+ * output. `readline.question` echoes pasted text, which is unacceptable for a
+ * credential retained in the encrypted local session store. Raw TTY input is
+ * the narrowest portable Node primitive that gives this command that boundary.
+ *
+ * This intentionally refuses pipes and terminals without `setRawMode`: a
+ * process that cannot suppress echo must not accept the durable code at all.
+ */
+export async function readHiddenLoginCode(
+  input: NodeJS.ReadStream,
+  output: Writable,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (input.isTTY !== true || typeof input.setRawMode !== "function") {
+    throw loginCodeInputError("unavailable", "Cuna cannot safely accept a login code from this input.");
   }
+  if (signal?.aborted) throw loginCodeInputError("cancelled", "Cuna sign-in was cancelled.");
+
+  const wasRaw = input.isRaw === true;
+  const bytes: number[] = [];
+  const maxBytes = 256;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      input.off("data", onData);
+      input.off("error", onError);
+      input.off("end", onEnd);
+      signal?.removeEventListener("abort", onAbort);
+      try { input.setRawMode?.(wasRaw); } catch { /* best-effort terminal restoration */ }
+      output.write("\n");
+      bytes.fill(0);
+    };
+    const settle = (outcome: { readonly value: string } | { readonly error: CunaError }) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if ("error" in outcome) reject(outcome.error);
+      else resolve(outcome.value);
+    };
+    const finish = () => {
+      const raw = Buffer.from(bytes).toString("utf8");
+      // Several terminals wrap a paste in these control sequences while raw
+      // mode is active. Accept exactly the pair, never arbitrary escapes.
+      const bracketedPasteStart = `${String.fromCharCode(0x1b)}[200~`;
+      const bracketedPasteEnd = `${String.fromCharCode(0x1b)}[201~`;
+      const withoutPasteStart = raw.startsWith(bracketedPasteStart)
+        ? raw.slice(bracketedPasteStart.length)
+        : raw;
+      const value = withoutPasteStart.endsWith(bracketedPasteEnd)
+        ? withoutPasteStart.slice(0, -bracketedPasteEnd.length)
+        : withoutPasteStart;
+      settle({ value });
+    };
+    const onAbort = () => settle({ error: loginCodeInputError("cancelled", "Cuna sign-in was cancelled.") });
+    const onError = () => settle({ error: loginCodeInputError("unavailable", "Cuna could not safely read the login code.") });
+    const onEnd = () => settle({ error: loginCodeInputError("cancelled", "Cuna did not receive a login code.") });
+    const onData = (chunk: Buffer | string) => {
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      for (const byte of data) {
+        if (byte === 0x03) return onAbort(); // Ctrl+C
+        if (byte === 0x04) return onEnd(); // Ctrl+D
+        if (byte === 0x0d || byte === 0x0a) return finish();
+        if (byte === 0x08 || byte === 0x7f) {
+          bytes.pop();
+          continue;
+        }
+        if (bytes.length >= maxBytes) {
+          return settle({ error: loginCodeInputError("too_long", "The pasted Cuna login code is too long.") });
+        }
+        bytes.push(byte);
+      }
+    };
+
+    try {
+      input.setRawMode(true);
+      output.write("Paste the cuna_login_ code shown by app.getcuna.com (input hidden): ");
+      input.on("data", onData);
+      input.once("error", onError);
+      input.once("end", onEnd);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      // AbortSignal does not replay an abort that happened immediately before
+      // listener registration (for example while raw mode is being enabled).
+      // Recheck before resuming input so hidden-code input never waits for a
+      // second user action after cancellation.
+      if (signal?.aborted === true) return onAbort();
+      input.resume();
+    } catch {
+      settle({ error: loginCodeInputError("unavailable", "Cuna cannot safely prepare hidden login-code input.") });
+    }
+  });
+}
+
+async function promptLoginCode(signal?: AbortSignal): Promise<string> {
+  return readHiddenLoginCode(process.stdin, process.stderr, signal);
 }
 
 function defaultStreams(): CliStreams {
@@ -147,7 +257,7 @@ function needsRemoteCredential(command: string | undefined, foreground: Foregrou
     command === "agent" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
     command === "account" || command === "workspace" || command === "usage" ||
-    command === "claude" || command === "codex" || command === "openclaw" || foreground !== undefined;
+    command === "claude" || command === "codex" || command === "openclaw" || command === "opencode" || foreground !== undefined;
 }
 
 function managesInteractiveSession(command: string | undefined): boolean {
@@ -177,7 +287,7 @@ function usesCredentialAuthority(
 
 interface ForegroundSelection {
   readonly agentSessionIds: readonly string[];
-  readonly expectedAgentKinds?: readonly ("claude-code" | "codex" | "openclaw")[];
+  readonly expectedAgentKinds?: readonly ("claude-code" | "codex" | "openclaw" | "opencode")[];
 }
 
 function foregroundSelection(parsed: ParsedInvocation): ForegroundSelection | undefined {
@@ -185,9 +295,9 @@ function foregroundSelection(parsed: ParsedInvocation): ForegroundSelection | un
   if (parsed.command === "agent-sessions" && parsed.operands[0] === "attach") {
     return Object.freeze({ agentSessionIds: parsed.operands.slice(1) });
   }
-  const expectedAgent: "claude-code" | "codex" | "openclaw" | undefined = parsed.command === "claude"
+  const expectedAgent: "claude-code" | "codex" | "openclaw" | "opencode" | undefined = parsed.command === "claude"
     ? "claude-code"
-    : parsed.command === "codex" || parsed.command === "openclaw"
+    : parsed.command === "codex" || parsed.command === "openclaw" || parsed.command === "opencode"
       ? parsed.command
       : undefined;
   const agentSessionId = stringOption(parsed, "agent-session");
@@ -202,6 +312,44 @@ function foregroundSelection(parsed: ParsedInvocation): ForegroundSelection | un
 
 function nodePlatform(kind: PlatformAdapter["kind"]): NodeJS.Platform {
   return kind === "windows" ? "win32" : kind === "macos" ? "darwin" : "linux";
+}
+
+type BrowserLoginRemoteProbe = Readonly<{
+  status: "verified" | "unavailable" | "unknown" | "not_checked";
+  reason: string;
+}>;
+
+/**
+ * `doctor` must distinguish two independent facts: whether this host can
+ * protect a durable login-code envelope, and whether the selected deployment
+ * currently serves the anonymous browser-login bootstrap. The latter is an
+ * opt-in network check so the normal diagnostic stays safe and offline.
+ */
+async function probeBrowserLoginRemote(input: {
+  readonly config: EffectiveConfig;
+  readonly timeoutMs: number;
+  readonly fetch?: typeof globalThis.fetch;
+  readonly signal?: AbortSignal;
+}): Promise<BrowserLoginRemoteProbe> {
+  const transportOptions = {
+    baseUrl: input.config.baseUrl,
+    timeoutMs: input.timeoutMs,
+    ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
+  };
+  try {
+    const bootstrap = await createHumanAuthClient({
+      anonymous: createHttpTransport(transportOptions),
+      authenticated: (accessToken) => createHttpTransport({ ...transportOptions, bearerToken: accessToken }),
+    }).bootstrap(input.signal);
+    return bootstrap.enabled
+      ? Object.freeze({ status: "verified", reason: "remote_browser_login_bootstrap_verified" })
+      : Object.freeze({ status: "unavailable", reason: "remote_browser_login_disabled" });
+  } catch {
+    // The exact transport/decoder error is intentionally not copied into a
+    // public diagnostic. It might contain an untrusted endpoint response, and
+    // this gate only needs to say that a fresh bootstrap could not be proven.
+    return Object.freeze({ status: "unknown", reason: "remote_browser_login_probe_failed" });
+  }
 }
 
 function runtimeError(error: RuntimeBoundaryError): CunaError {
@@ -306,17 +454,19 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       return EXIT_CODES.success;
     }
 
-    preflightInvocation(parsed);
+    // Preflight gates and configuration must read the same invocation
+    // environment. Otherwise an injected test or embedding could report an
+    // OpenCode gate as enabled after preflight had already read a different
+    // process-level value.
+    const effectiveEnvironment: NodeJS.ProcessEnv = { ...(dependencies.env ?? process.env) };
+    Object.freeze(effectiveEnvironment);
+    preflightInvocation(parsed, effectiveEnvironment);
 
-    const journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "openclaw"
+    const journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "openclaw" || parsed.command === "opencode"
       ? preflightAgentJourneyInvocation(parsed)
       : undefined;
 
     const foreground = foregroundSelection(parsed);
-    const sessionOnly = booleanOption(parsed, "session-only");
-    if (sessionOnly) {
-      throw usageError("Option --session-only is not supported by this release.", "Use the encrypted profile session selected automatically by cuna login.");
-    }
     if ((foreground !== undefined || journeyIntent?.target === "reconcile") &&
       (writer.structured || !streams.stdinIsTTY || !streams.stdoutIsTTY)) {
       throw usageError(
@@ -324,7 +474,6 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         "Run this command directly in an interactive terminal without --json or output redirection.",
       );
     }
-    const effectiveEnvironment = dependencies.env ?? process.env;
     const platform = dependencies.platform ?? createPlatformAdapter({ env: effectiveEnvironment });
     let foregroundPresentation: ForegroundPresentationMode | undefined;
     if (foreground !== undefined) {
@@ -352,13 +501,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     const configFile = stringOption(parsed, "config-file");
     const config = await resolveConfig({
       platform,
-      ...(dependencies.env === undefined ? {} : { env: dependencies.env }),
+      env: effectiveEnvironment,
       overrides: {
         ...(profile === undefined ? {} : { profile }),
         ...(baseUrl === undefined ? {} : { baseUrl }),
         ...(configFile === undefined ? {} : { configFile }),
       },
     });
+    // Re-admit every executable OpenCode journey from the immutable, resolved
+    // configuration. This prevents a mutable embedding environment from
+    // passing preflight under one value and reaching remote, host, or child
+    // effects after it has changed under another.
+    if (journeyIntent?.agent === "opencode") {
+      assertOpenCodeExecutionEnabled(config.opencodeFeatureGate);
+    }
     // Fail closed before any authority is selected, and only for a command that
     // selects one. Empty or malformed still never means absent: an unusable
     // `*_API_KEY` refuses the command rather than silently demoting automation
@@ -425,7 +581,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       parsed.command === "whoami" ||
       parsed.command === "access"
     ) {
-      rejectUnknownOptions(parsed, ["session-only"]);
+      rejectUnknownOptions(parsed, []);
       if (parsed.command === "access") {
         if (parsed.operands.length !== 1 || parsed.operands[0] !== "status") {
           throw usageError("access requires the status action.");
@@ -613,7 +769,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     }
     let runtimeFeatures = dependencies.runtimeFeatures;
     if (parsed.command === "doctor" && runtimeFeatures === undefined) {
-      const backend = new LocalEncryptedSessionBackend({
+      const backend = dependencies.doctorCredentialBackend ?? new LocalEncryptedSessionBackend({
         ...sessionPaths,
         platform: nodePlatform(platform.kind),
         ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
@@ -627,11 +783,24 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       } catch {
         credentialBackendStatus = "unavailable";
       }
+      const browserLoginRemote = booleanOption(parsed, "check-browser-login")
+        ? await probeBrowserLoginRemote({
+          config,
+          timeoutMs,
+          ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
+          ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+        })
+        : Object.freeze<BrowserLoginRemoteProbe>({
+          status: "not_checked",
+          reason: "remote_browser_login_not_checked",
+        });
       runtimeFeatures = runtimeFeatureGates({
         platform: platform.kind,
         credentialBackendStatus,
         credentialBackendId: backend.backendId,
         ...(credentialBackendReason === undefined ? {} : { credentialBackendReason }),
+        browserLoginRemoteStatus: browserLoginRemote.status,
+        browserLoginRemoteReason: browserLoginRemote.reason,
       });
     }
     const result = await executeCommand({

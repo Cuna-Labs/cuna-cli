@@ -120,9 +120,7 @@ const OPAQUE_SECRET = "[A-Za-z0-9_-]{43}";
 const CREDENTIAL_GRAMMAR = Object.freeze({
   secretKey: Object.freeze({ infix: "sk", suffix: "[A-Za-z0-9_-]{16,256}" }),
   accessToken: Object.freeze({ infix: "at", suffix: OPAQUE_SECRET }),
-  refreshToken: Object.freeze({ infix: "rt", suffix: OPAQUE_SECRET }),
   loginCode: Object.freeze({ infix: "login", suffix: OPAQUE_SECRET }),
-  continuation: Object.freeze({ infix: "ct", suffix: OPAQUE_SECRET }),
   terminalConnect: Object.freeze({ infix: "tc", suffix: OPAQUE_SECRET }),
   browserCallbackNonce: Object.freeze({ infix: "cb", suffix: OPAQUE_SECRET }),
   browserResumeHandle: Object.freeze({ infix: "cr", suffix: OPAQUE_SECRET }),
@@ -142,7 +140,10 @@ export type CredentialFamily = keyof typeof CREDENTIAL_GRAMMAR;
  * `se` remains here because its minted suffix shape has not been observed. Do
  * not guess one: a grammar narrower than the mint rejects live credentials.
  */
-export const CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR = Object.freeze(["se"] as const);
+// `ct` remains a denylist-only historical family: detecting a leaked former
+// continuation credential is necessary, but this CLI no longer authenticates
+// or transports one.
+export const CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR = Object.freeze(["rt", "ct", "se"] as const);
 
 const BRAND_GROUP = `(?:${CREDENTIAL_BRANDS.join("|")})`;
 
@@ -164,9 +165,7 @@ function credentialPattern(...families: readonly CredentialFamily[]): RegExp {
 const SECRET_API_KEY = credentialPattern("secretKey");
 const TRANSPORT_CREDENTIAL = credentialPattern("secretKey", "accessToken");
 const ACCESS_TOKEN = credentialPattern("accessToken");
-const REFRESH_TOKEN = credentialPattern("refreshToken");
 const LOGIN_CODE = credentialPattern("loginCode");
-const CONTINUATION_SECRET = credentialPattern("continuation");
 const TERMINAL_CONNECT_TOKEN = credentialPattern("terminalConnect");
 const BROWSER_CALLBACK_NONCE = credentialPattern("browserCallbackNonce");
 
@@ -199,19 +198,9 @@ export function isAccessToken(value: string): boolean {
   return ACCESS_TOKEN.test(value);
 }
 
-/** An interactive CLI refresh token. */
-export function isRefreshToken(value: string): boolean {
-  return REFRESH_TOKEN.test(value);
-}
-
 /** Durable browser-issued CLI login credential; never a product API bearer. */
 export function isLoginCode(value: string): boolean {
   return LOGIN_CODE.test(value) && value.startsWith("cuna_login_");
-}
-
-/** A browser-continuation secret for the human login exchange. */
-export function isContinuationSecret(value: string): boolean {
-  return CONTINUATION_SECRET.test(value);
 }
 
 /** A one-use terminal connection token. */
@@ -221,7 +210,7 @@ export function isTerminalConnectToken(value: string): boolean {
 
 /** The nonce the browser carries back from a human sign-in handoff. */
 export function isBrowserCallbackNonce(value: string): boolean {
-  return BROWSER_CALLBACK_NONCE.test(value);
+  return BROWSER_CALLBACK_NONCE.test(value) && value.startsWith("cuna_cb_");
 }
 
 const FAMILY_VALIDATORS: ReadonlyMap<string, RegExp> = new Map(

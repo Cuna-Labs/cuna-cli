@@ -3,21 +3,22 @@ import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createHash } from "node:crypto";
 
-import {
-  CREDENTIAL_BACKEND_PROTOCOL,
-  CredentialBoundaryError,
-  CredentialVault,
-  SecretMaterial,
-  bindingDigest,
-  createLinuxSecretServiceBackend,
-  createMacOsKeychainBackend,
-  createSecureProcessRunner,
-  createUnavailableCredentialBackend,
-  createPlatformCredentialBackend,
-  resolvePlatformAuthority,
-  credentialTarget,
-} from "../dist/credentials/index.js";
+import { CREDENTIAL_BACKEND_PROTOCOL } from "../dist/credentials/contracts.js";
+import { CredentialBoundaryError } from "../dist/credentials/errors.js";
+import { SecretMaterial } from "../dist/credentials/secret-material.js";
+import { CredentialVault, bindingDigest, credentialTarget } from "../dist/credentials/vault.js";
+
+// These names keep the isolated experimental cases parseable without loading
+// a legacy backend into the product candidate test process. They are never
+// evaluated because the cases below are explicitly skipped.
+const experimentalOnly = () => { throw new Error("Experimental credential backend is not part of the product candidate."); };
+const createLinuxSecretServiceBackend = experimentalOnly;
+const createMacOsKeychainBackend = experimentalOnly;
+const createSecureProcessRunner = experimentalOnly;
+const createPlatformCredentialBackend = experimentalOnly;
+const resolvePlatformAuthority = experimentalOnly;
 
 const NOW = 1_800_000_000_000;
 const BINDING = Object.freeze({
@@ -34,12 +35,15 @@ class MemorySecureBackend {
     this.values = new Map();
     this.replaceCalls = 0;
     this.readCalls = 0;
+    this.probeCalls = 0;
     this.failNextReplace = false;
     this.commitThenThrowNextReplace = false;
     this.ambiguousNextReplace = false;
+    this.beforeCompareDelete = undefined;
   }
 
   async probe() {
+    this.probeCalls += 1;
     return {
       protocol: CREDENTIAL_BACKEND_PROTOCOL,
       backendId: this.backendId,
@@ -78,6 +82,61 @@ class MemorySecureBackend {
 
   async delete(target) {
     return this.values.delete(target) ? "deleted" : "absent";
+  }
+
+  async compareAndDelete(target, expectedSha256) {
+    await this.beforeCompareDelete?.();
+    const current = this.values.get(target);
+    if (current === undefined) return "absent";
+    const actual = createHash("sha256").update(current).digest("hex");
+    if (actual !== expectedSha256) return "conflict";
+    this.values.delete(target);
+    return "deleted";
+  }
+}
+
+test("vault reuses valid process-local probe evidence but preserves a backend read boundary for each operation", async () => {
+  const backend = new MemorySecureBackend();
+  let now = NOW;
+  backend.probe = async () => {
+    backend.probeCalls += 1;
+    return {
+      protocol: CREDENTIAL_BACKEND_PROTOCOL,
+      backendId: backend.backendId,
+      platform: backend.platform,
+      status: "verified",
+      observedAt: now - 1,
+      expiresAt: now + 100,
+      source: "live_round_trip",
+    };
+  };
+  const vault = new CredentialVault({ backend, clock: () => now });
+  const material = SecretMaterial.fromUtf8("probe-cache-session");
+  await vault.rotate({ binding: BINDING, material, expiresAt: now + 10_000 });
+  const loaded = await vault.load(BINDING);
+  loaded?.material.dispose();
+  await vault.status(BINDING);
+  assert.equal(backend.probeCalls, 1, "valid liveness evidence should not repeat an OS probe in one process");
+  assert.equal(backend.readCalls, 3, "each vault operation still reads through the backend boundary");
+
+  now += 101;
+  await vault.status(BINDING);
+  assert.equal(backend.probeCalls, 2, "expired evidence must be reprobed before another operation");
+  assert.equal(backend.readCalls, 4);
+});
+
+class UnavailableSecureBackend extends MemorySecureBackend {
+  async probe() {
+    return {
+      protocol: CREDENTIAL_BACKEND_PROTOCOL,
+      backendId: this.backendId,
+      platform: this.platform,
+      status: "unavailable",
+      observedAt: NOW - 1,
+      expiresAt: NOW + 60_000,
+      source: "probe_failed",
+      reason: "test negative control",
+    };
   }
 }
 
@@ -134,8 +193,125 @@ test("expired credentials fail closed and status never reports them as present",
   now = NOW + 1;
   assert.equal(await vault.load(BINDING), undefined);
   const expired = await vault.status(BINDING);
-  assert.equal(expired.state, "expired");
-  assert.equal(expired.expiresAt, NOW + 1);
+  assert.equal(expired.state, "absent");
+  assert.equal(backend.values.size, 0, "loading an expired credential removes its durable bytes");
+});
+
+test("expiry cleanup compare-delete preserves a rotation committed by another vault instance", async () => {
+  const backend = new MemorySecureBackend();
+  let now = NOW;
+  const expiringVault = new CredentialVault({ backend, clock: () => now });
+  const rotatingVault = new CredentialVault({ backend, clock: () => NOW + 2 });
+  const expired = SecretMaterial.fromUtf8("expired-before-race");
+  await expiringVault.rotate({ binding: BINDING, material: expired, expiresAt: NOW + 1 });
+  expired.dispose();
+  now = NOW + 2;
+  backend.beforeCompareDelete = async () => {
+    backend.beforeCompareDelete = undefined;
+    const rotated = SecretMaterial.fromUtf8("rotation-wins-race");
+    try {
+      await rotatingVault.rotate({ binding: BINDING, material: rotated, expectedRevision: 1, expiresAt: NOW + 60_000 });
+    } finally {
+      rotated.dispose();
+    }
+  };
+
+  assert.equal(await expiringVault.load(BINDING), undefined);
+  const preserved = await rotatingVault.load(BINDING);
+  assert.equal(preserved.revision, 2);
+  assert.equal(utf8(preserved.material), "rotation-wins-race");
+  preserved.material.dispose();
+});
+
+test("revision-fenced compensation preserves a newer concurrent session", async () => {
+  const backend = new MemorySecureBackend();
+  const cancellingVault = new CredentialVault({ backend, clock: () => NOW });
+  const concurrentVault = new CredentialVault({ backend, clock: () => NOW + 2 });
+  const first = SecretMaterial.fromUtf8("cancelled-attempt-refresh");
+  const firstStatus = await cancellingVault.rotate({ binding: BINDING, material: first, expiresAt: NOW + 60_000 });
+  first.dispose();
+  assert.equal(firstStatus.revision, 1);
+
+  backend.beforeCompareDelete = async () => {
+    backend.beforeCompareDelete = undefined;
+    const newer = SecretMaterial.fromUtf8("concurrent-session-must-survive");
+    try {
+      await concurrentVault.rotate({ binding: BINDING, material: newer, expectedRevision: 1, expiresAt: NOW + 120_000 });
+    } finally {
+      newer.dispose();
+    }
+  };
+
+  assert.equal(
+    await cancellingVault.deleteIfRevision({ binding: BINDING, expectedRevision: firstStatus.revision }),
+    "conflict",
+  );
+  const preserved = await concurrentVault.load(BINDING);
+  assert.equal(preserved.revision, 2);
+  assert.equal(utf8(preserved.material), "concurrent-session-must-survive");
+  preserved.material.dispose();
+});
+
+test("refresh-derived fence avoids a redundant pre-CAS read while physical compare-delete remains mandatory", async () => {
+  const backend = new MemorySecureBackend();
+  const vault = new CredentialVault({ backend, clock: () => NOW });
+  const material = SecretMaterial.fromUtf8("retained-session-for-fast-cas");
+  await vault.rotate({ binding: BINDING, material, expiresAt: NOW + 60_000 });
+  material.dispose();
+
+  const snapshot = await vault.refresh(BINDING, async (current) => {
+    assert.equal(current.revision, 1);
+    assert.equal(utf8(current.material), "retained-session-for-fast-cas");
+    return { status: "retained" };
+  });
+  snapshot.material.dispose();
+  const readsAfterRefresh = backend.readCalls;
+
+  assert.equal(
+    await vault.deleteIfRevision({ binding: BINDING, expectedRevision: snapshot.revision }),
+    "deleted",
+  );
+  assert.equal(
+    backend.readCalls,
+    readsAfterRefresh,
+    "a retained refresh supplies only the exact digest for the physical CAS; vault must not pre-read the same envelope again",
+  );
+  assert.equal(backend.values.size, 0);
+});
+
+test("refresh-derived fence preserves a newer concurrent session when physical compare-delete conflicts", async () => {
+  const backend = new MemorySecureBackend();
+  const cancellingVault = new CredentialVault({ backend, clock: () => NOW });
+  const concurrentVault = new CredentialVault({ backend, clock: () => NOW + 1 });
+  const first = SecretMaterial.fromUtf8("retained-session-before-race");
+  await cancellingVault.rotate({ binding: BINDING, material: first, expiresAt: NOW + 60_000 });
+  first.dispose();
+
+  const snapshot = await cancellingVault.refresh(BINDING, async () => ({ status: "retained" }));
+  snapshot.material.dispose();
+  backend.beforeCompareDelete = async () => {
+    backend.beforeCompareDelete = undefined;
+    const newer = SecretMaterial.fromUtf8("newer-session-must-survive-fast-cas");
+    try {
+      await concurrentVault.rotate({
+        binding: BINDING,
+        material: newer,
+        expectedRevision: 1,
+        expiresAt: NOW + 120_000,
+      });
+    } finally {
+      newer.dispose();
+    }
+  };
+
+  assert.equal(
+    await cancellingVault.deleteIfRevision({ binding: BINDING, expectedRevision: snapshot.revision }),
+    "conflict",
+  );
+  const preserved = await concurrentVault.load(BINDING);
+  assert.equal(preserved.revision, 2);
+  assert.equal(utf8(preserved.material), "newer-session-must-survive-fast-cas");
+  preserved.material.dispose();
 });
 
 test("atomic backend failure preserves the previously valid credential", async () => {
@@ -247,7 +423,7 @@ test("server refresh rejection deletes renewable material and leaves redacted re
   const secret = SecretMaterial.fromUtf8("revoked-refresh-secret");
   await vault.rotate({ binding: BINDING, material: secret });
   await assert.rejects(
-    vault.refresh(BINDING, async () => ({ status: "rejected" })),
+    vault.refresh(BINDING, async () => ({ status: "rejected", reason: "authoritative_remote" })),
     (error) => error instanceof CredentialBoundaryError && error.code === "credential_revoked",
   );
   assert.equal(await vault.load(BINDING), undefined);
@@ -255,6 +431,42 @@ test("server refresh rejection deletes renewable material and leaves redacted re
   assert.equal(status.state, "revoked");
   assert.doesNotMatch(JSON.stringify(status), /revoked-refresh-secret/u);
   secret.dispose();
+});
+
+test("authoritative refresh rejection never erases a newer concurrently rotated session", async () => {
+  const backend = new MemorySecureBackend();
+  const rejectingVault = new CredentialVault({ backend, clock: () => NOW });
+  const concurrentVault = new CredentialVault({ backend, clock: () => NOW + 1 });
+  const oldMaterial = SecretMaterial.fromUtf8("old-refresh-family");
+  await rejectingVault.rotate({ binding: BINDING, material: oldMaterial, expiresAt: NOW + 60_000 });
+  oldMaterial.dispose();
+
+  backend.beforeCompareDelete = async () => {
+    backend.beforeCompareDelete = undefined;
+    const newerMaterial = SecretMaterial.fromUtf8("newer-refresh-family-must-survive");
+    try {
+      await concurrentVault.rotate({
+        binding: BINDING,
+        material: newerMaterial,
+        expectedRevision: 1,
+        expiresAt: NOW + 120_000,
+      });
+    } finally {
+      newerMaterial.dispose();
+    }
+  };
+
+  await assert.rejects(
+    rejectingVault.refresh(BINDING, async () => ({ status: "rejected", reason: "authoritative_remote" })),
+    (error) => error instanceof CredentialBoundaryError &&
+      error.code === "credential_revision_conflict" &&
+      error.retryable === true,
+  );
+
+  const preserved = await concurrentVault.load(BINDING);
+  assert.equal(preserved.revision, 2);
+  assert.equal(utf8(preserved.material), "newer-refresh-family-must-survive");
+  preserved.material.dispose();
 });
 
 test("refresh exceptions preserve the old credential and do not retain untrusted secret-bearing causes", async () => {
@@ -298,12 +510,8 @@ test("tampering and cross-binding substitution are reported as corruption before
 });
 
 test("absence of an approved secure backend fails closed before any plaintext fallback", async () => {
-  const backend = createUnavailableCredentialBackend({
-    backendId: "no-secure-store",
-    platform: process.platform,
-    reason: "test negative control",
-    clock: () => NOW,
-  });
+  const backend = new UnavailableSecureBackend(process.platform);
+  backend.backendId = "no-secure-store";
   const vault = new CredentialVault({ backend, clock: () => NOW });
   const secret = SecretMaterial.fromUtf8("must-never-hit-disk");
   await assert.rejects(
@@ -323,7 +531,7 @@ test("self-reported or cross-platform vault evidence cannot authorize credential
     status: "verified",
     observedAt: NOW - 1,
     expiresAt: NOW + 60_000,
-    source: "backend_absent",
+    source: "probe_failed",
   });
   const vault = new CredentialVault({ backend, clock: () => NOW, platform: "win32" });
   const secret = SecretMaterial.fromUtf8("must-not-be-admitted");
@@ -335,7 +543,7 @@ test("self-reported or cross-platform vault evidence cannot authorize credential
   secret.dispose();
 });
 
-test("vault rejects clock rollback and evidence that expires while the native probe is in flight", async () => {
+test("vault rejects clock rollback and evidence that expires while the backend probe is in flight", async () => {
   const backend = new MemorySecureBackend();
   let now = NOW;
   const vault = new CredentialVault({ backend, clock: () => now });
@@ -360,7 +568,7 @@ test("vault rejects clock rollback and evidence that expires while the native pr
   material.dispose();
 });
 
-test("secure process runner kills oversized output without returning it", async () => {
+test.skip("experimental secure process runner kills oversized output without returning it", async () => {
   const runner = createSecureProcessRunner();
   await assert.rejects(
     runner.run({
@@ -373,7 +581,7 @@ test("secure process runner kills oversized output without returning it", async 
   );
 });
 
-test("secure process timeout waits for confirmed child closure before rejecting", async () => {
+test.skip("experimental secure process timeout waits for confirmed child closure before rejecting", async () => {
   const runner = createSecureProcessRunner();
   const startedAt = Date.now();
   await assert.rejects(
@@ -388,7 +596,7 @@ test("secure process timeout waits for confirmed child closure before rejecting"
   assert.ok(Date.now() - startedAt >= 90);
 });
 
-test("post-spawn loaded-image rejection kills the identified child before protected stdin is released", async (context) => {
+test.skip("experimental post-spawn loaded-image rejection kills the identified child before protected stdin is released", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cuna-stdin-admission-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const marker = path.join(root, "stdin-observed.txt");
@@ -417,7 +625,7 @@ test("post-spawn loaded-image rejection kills the identified child before protec
   assert.throws(() => process.kill(spawnedPid, 0), { code: "ESRCH" });
 });
 
-test("secure process runner retains and releases the process-instance lease around protected stdin", async () => {
+test.skip("experimental secure process runner retains and releases the process-instance lease around protected stdin", async () => {
   const runner = createSecureProcessRunner();
   let releaseCalls = 0;
   const result = await runner.run({
@@ -434,7 +642,7 @@ test("secure process runner retains and releases the process-instance lease arou
   result.stdout.fill(0);
 });
 
-test("secure process runner fails closed when the process-instance lease cannot be released", async () => {
+test.skip("experimental secure process runner fails closed when the process-instance lease cannot be released", async () => {
   const runner = createSecureProcessRunner();
   await assert.rejects(
     runner.run({
@@ -448,7 +656,7 @@ test("secure process runner fails closed when the process-instance lease cannot 
   );
 });
 
-test("Linux Secret Service adapter transports protected values only through stdin", async () => {
+test.skip("experimental Linux Secret Service adapter transports protected values only through stdin", async () => {
   const calls = [];
   const values = new Map();
   const runner = {
@@ -495,7 +703,7 @@ test("Linux Secret Service adapter transports protected values only through stdi
   sentinel.fill(0);
 });
 
-test("secure credential helpers require absolute executable and working-directory authority", async () => {
+test.skip("experimental secure credential helpers require absolute executable and working-directory authority", async () => {
   const runner = createSecureProcessRunner();
   await assert.rejects(
     runner.run({ executable: "powershell.exe", cwd: process.cwd(), args: [] }),
@@ -507,7 +715,7 @@ test("secure credential helpers require absolute executable and working-director
   );
 });
 
-test("Windows fails closed until a signed native vault bridge is available", async () => {
+test.skip("experimental Windows credential backend refuses unavailable authority", async () => {
   const backend = createPlatformCredentialBackend({ platform: "win32", clock: () => NOW });
   const evidence = await backend.probe();
   assert.equal(evidence.status, "unavailable");
@@ -518,7 +726,7 @@ test("Windows fails closed until a signed native vault bridge is available", asy
   );
 });
 
-test("macOS adapter refuses argv-based Keychain fallback when no native bridge exists", async () => {
+test.skip("experimental macOS credential backend refuses unavailable authority", async () => {
   const backend = createMacOsKeychainBackend({ clock: () => NOW });
   const evidence = await backend.probe();
   assert.equal(evidence.status, "unavailable");
@@ -555,7 +763,7 @@ function stubCredentialBridge(platform) {
   });
 }
 
-test("a resolved native bridge is installed into the platform credential backend", async () => {
+test.skip("experimental resolved bridge is installed into the platform credential backend", async () => {
   for (const platform of ["win32", "darwin"]) {
     const authority = await resolvePlatformAuthority({
       platform,
@@ -578,7 +786,7 @@ test("a resolved native bridge is installed into the platform credential backend
   }
 });
 
-test("a refused native authority fails closed and carries its reason", async () => {
+test.skip("experimental refused authority fails closed and carries its reason", async () => {
   const authority = await resolvePlatformAuthority({
     platform: "win32",
     nativeBridges: async () => {
@@ -602,7 +810,7 @@ test("a refused native authority fails closed and carries its reason", async () 
   );
 });
 
-test("Linux resolves its own adapter without consulting the native package", async () => {
+test.skip("experimental Linux backend resolves without consulting another platform package", async () => {
   let consulted = false;
   const authority = await resolvePlatformAuthority({
     platform: "linux",

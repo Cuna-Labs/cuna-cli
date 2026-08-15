@@ -23,6 +23,7 @@ test("agent commands normalize to closed agent kinds without performing journey 
     ["claude", "claude-code"],
     ["codex", "codex"],
     ["openclaw", "openclaw"],
+    ["opencode", "opencode"],
   ];
   for (const [command, agent] of cases) {
     const argv = [command];
@@ -95,6 +96,7 @@ test("explicit --agent-session semantics remain exact and bypass path, sync, and
     ["claude", "claude-code"],
     ["codex", "codex"],
     ["openclaw", "openclaw"],
+    ["opencode", "opencode"],
   ]) {
     const intent = parseAgentJourneyIntent([
       command,
@@ -171,6 +173,7 @@ test("mutually exclusive and command-specific options fail closed", () => {
   );
   assert.equal(parseAgentJourneyIntent(["claude", "--no-sync"]).syncMode, "disabled");
   assert.equal(parseAgentJourneyIntent(["codex", "--no-sync"]).syncMode, "disabled");
+  assert.equal(parseAgentJourneyIntent(["opencode", "--no-sync"]).syncMode, "disabled");
   assertUsageError(
     () => parseAgentJourneyIntent(["claude", "--auth-mode", "credential_binding"]),
     /--credential-binding is required/u,
@@ -178,6 +181,14 @@ test("mutually exclusive and command-specific options fail closed", () => {
   assertUsageError(
     () => parseAgentJourneyIntent(["claude", "--credential-binding", CREDENTIAL_BINDING_ID]),
     /requires --auth-mode credential_binding/u,
+  );
+  assertUsageError(
+    () => parseAgentJourneyIntent(["opencode", "--auth-mode", "credential_binding", "--credential-binding", CREDENTIAL_BINDING_ID]),
+    /interactive_login only/u,
+  );
+  assertUsageError(
+    () => parseAgentJourneyIntent(["opencode", "--credential-binding", CREDENTIAL_BINDING_ID]),
+    /interactive_login only/u,
   );
   assertUsageError(
     () => parseAgentJourneyIntent([
@@ -204,7 +215,7 @@ test("surplus operands, unknown options, and malformed auth modes never produce 
     () => parseAgentJourneyIntent(["openclaw", "--auth-mode", "automatic"]),
     /interactive_login or credential_binding/u,
   );
-  assertUsageError(() => parseAgentJourneyIntent(["shell"]), /must be claude, codex, or openclaw/u);
+  assertUsageError(() => parseAgentJourneyIntent(["shell"]), /must be claude, codex, openclaw, or opencode/u);
 });
 
 test("argv-derived values with unsafe types, controls, empty paths, or oversized selectors are rejected safely", () => {

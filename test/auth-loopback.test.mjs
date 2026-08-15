@@ -32,33 +32,12 @@ test("browser handoff uses fixed argv-only operating-system launchers", () => {
   });
 });
 
-test("macOS browser handoff uses only a platform-bound admitted native bridge", async () => {
-  const url = "https://app.getcuna.com/cli/continue#opaque";
-  const opened = [];
-  const native = Object.freeze({
-    platform: "darwin",
-    open: async (value) => { opened.push(value); },
-  });
-  await createBrowserOpener("darwin", {}, native).open(url);
-  assert.deepEqual(opened, [url]);
-  assert.throws(
-    () => createBrowserOpener("darwin", {}, { ...native, platform: "win32" }).open(url),
-    /platform binding does not match/u,
-  );
-});
-
-test("browser handoff rejects control-bearing and oversized URLs before every platform effect", async () => {
-  const opened = [];
-  const native = Object.freeze({
-    platform: "darwin",
-    open: async (value) => { opened.push(value); },
-  });
+test("browser handoff rejects control-bearing and oversized URLs before every platform effect", () => {
   for (const url of [
     "http://app.getcuna.com/cli/continue",
     "https://app.getcuna.com/cli/continue\n",
     `https://app.getcuna.com/cli/continue?state=${"a".repeat(8_192)}`,
   ]) {
-    assert.throws(() => createBrowserOpener("darwin", {}, native).open(url), /bounded HTTPS/u);
+    assert.throws(() => createBrowserOpener("darwin", {}).open(url), /bounded HTTPS/u);
   }
-  assert.deepEqual(opened, []);
 });

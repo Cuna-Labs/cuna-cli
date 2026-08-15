@@ -11,9 +11,7 @@
   },
   "files": [
     "dist",
-    "!dist/credentials/index.*",
-    "!dist/credentials/native-*",
-    "!dist/credentials/platform.*",
+    "!dist/credentials/local-session-preview.*",
     "README.md",
     "LICENSE",
     "NOTICE",
@@ -32,6 +30,7 @@
     "lint": "oxlint --deny-warnings src test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node scripts/run-build-operation.mjs test",
+    "contract:sync:infra": "node scripts/sync-infra-openapi.mjs",
     "candidate:local": "node scripts/build-local-release-candidate.mjs",
     "prepack": "npm run build"
   },

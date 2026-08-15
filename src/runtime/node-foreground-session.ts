@@ -303,6 +303,12 @@ function admitSessionIdentity(
   observation: ReturnType<typeof assertRemoteAgentSessionEvidence>,
   expectedAgentSessionId: string,
 ): void {
+  if (session.agent === "opencode" && session.authMode !== "interactive_login") {
+    throw runtimeFailure(
+      "remote_state_unproven",
+      "OpenCode AgentSessions must use interactive_login before foreground terminal admission.",
+    );
+  }
   if (
     session.id !== expectedAgentSessionId ||
     session.machineId !== observation.machineId ||
@@ -327,13 +333,25 @@ async function observeProviderAuthentication(input: Readonly<{
   let status: AgentSessionAuth;
   try {
     status = await input.client.getAgentSessionAuth(input.session.id, input.signal);
-  } catch {
+  } catch (error) {
     throwIfAborted(input.signal);
+    if (input.session.agent === "opencode") {
+      throw runtimeFailure(
+        "remote_state_unproven",
+        "OpenCode foreground admission requires a current provider credential observation.",
+        { cause: error },
+      );
+    }
     return undefined;
   }
   const observedAt = Date.parse(status.observedAt);
   const validUntil = Date.parse(status.validUntil);
   const now = input.now();
+  const providerSemanticsMatch = input.session.agent === "opencode"
+    ? status.authMode === "interactive_login" &&
+      status.evidenceClass === "provider_cli_credential_presence" &&
+      (status.state === "login_required" || status.state === "configured")
+    : status.evidenceClass !== "provider_cli_credential_presence";
   if (
     status.agentSessionId !== input.session.id ||
     status.authMode !== input.session.authMode ||
@@ -344,8 +362,15 @@ async function observeProviderAuthentication(input: Readonly<{
     !Number.isFinite(validUntil) ||
     observedAt > now + AGENT_SESSION_AUTH_MAX_FUTURE_SKEW_MS ||
     validUntil - observedAt > AGENT_SESSION_AUTH_MAX_TTL_MS ||
-    validUntil <= now
+    validUntil <= now ||
+    !providerSemanticsMatch
   ) {
+    if (input.session.agent === "opencode") {
+      throw runtimeFailure(
+        "remote_state_unproven",
+        "OpenCode foreground admission received invalid provider credential evidence.",
+      );
+    }
     return undefined;
   }
   return Object.freeze({

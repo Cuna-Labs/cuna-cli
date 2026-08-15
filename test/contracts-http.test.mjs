@@ -385,6 +385,12 @@ test("AgentSession decoder preserves separate intent and observed runtime truth"
   assert.throws(() => decodeAgentSessionItem(agentSession({ row_version: -1 })));
   assert.throws(() => decodeAgentSessionItem(agentSession({ workspace_generation: undefined })));
   assert.throws(() => decodeAgentSessionItem(agentSession({ workspace_generation: 0 })));
+  const legacyOpenCode = decodeAgentSessionItem(agentSession({
+    agent: "opencode",
+    auth_mode: "credential_binding",
+  }));
+  assert.equal(legacyOpenCode.agent, "opencode");
+  assert.equal(legacyOpenCode.authMode, "credential_binding");
   assert.throws(() => decodeAgentSessionItem(agentSession({
     workspace_binding_id: undefined,
     workspace_id: "33333333-3333-4333-8333-333333333333",
@@ -430,6 +436,23 @@ test("AgentSession authentication evidence is closed, fresh, and process-scoped"
     state: "configured",
     auth_mode: "interactive_login",
     evidence_class: "credential_binding_authority",
+  })));
+  const opencodeConfigured = decodeAgentSessionAuth(agentSessionAuth({
+    state: "configured",
+    auth_mode: "interactive_login",
+    evidence_class: "provider_cli_credential_presence",
+  }));
+  assert.equal(opencodeConfigured.state, "configured");
+  const opencodeLoginRequired = decodeAgentSessionAuth(agentSessionAuth({
+    state: "login_required",
+    auth_mode: "interactive_login",
+    evidence_class: "provider_cli_credential_presence",
+  }));
+  assert.equal(opencodeLoginRequired.state, "login_required");
+  assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({
+    state: "authenticated",
+    auth_mode: "interactive_login",
+    evidence_class: "provider_cli_credential_presence",
   })));
   assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({
     state: "login_required",
@@ -584,6 +607,47 @@ test("AgentSession client sends bounded pagination, complete create intent, and 
   assert.equal(requests[2].method, "PATCH");
   assert.equal(requests[2].path, `/v1/agent-sessions/${sessionId}`);
   assert.deepEqual(requests[2].body, { name: "renamed" });
+});
+
+test("OpenCode AgentSession client requires and serializes interactive login", async () => {
+  const requests = [];
+  const client = createCunaApiClient({
+    async request(request) {
+      requests.push(request);
+      return agentSession({ agent: request.body?.agent, auth_mode: request.body?.auth_mode });
+    },
+  });
+  const machineId = "22222222-2222-4222-8222-222222222222";
+  const input = {
+    agent: "opencode",
+    cwd: "/workspace/repo",
+    workspaceBindingId: "33333333-3333-4333-8333-333333333333",
+    workspaceGeneration: 7,
+  };
+  await client.createAgentSession(machineId, {
+    ...input,
+    authMode: "interactive_login",
+  }, "opencode-interactive-create");
+  assert.deepEqual(requests[0].body, {
+    agent: "opencode",
+    cwd: "/workspace/repo",
+    workspace_binding_id: "33333333-3333-4333-8333-333333333333",
+    workspace_generation: 7,
+    auth_mode: "interactive_login",
+  });
+  await assert.rejects(
+    client.createAgentSession(machineId, input, "opencode-missing-auth"),
+    CunaError,
+  );
+  await assert.rejects(
+    client.createAgentSession(machineId, {
+      ...input,
+      authMode: "credential_binding",
+      credentialBindingId: "44444444-4444-4444-8444-444444444444",
+    }, "opencode-credential-binding"),
+    CunaError,
+  );
+  assert.equal(requests.length, 1);
 });
 
 test("AgentSession client rejects malformed page and auth bindings before transport", async () => {
@@ -842,12 +906,8 @@ test("HTTP transport binds origin, authorization, idempotency, and public path",
   assert.equal(observed.init.headers.Accept, "application/json, application/problem+json");
 });
 
-// The continuation secret must reach whichever API is actually live. The
-// deployed API reads only `X-Runa-Continuation`; the renamed API reads either.
-// Asserting a single spelling — which this test previously did, by requiring
-// `X-Runa-Continuation` to be absent — pins the CLI to one side and silently
-// drops the secret from every human login exchange against the other.
-test("Cuna transport carries the continuation secret under every spelling the API reads", async () => {
+// The strict paste-code protocol has no terminal-held continuation credential.
+test("Cuna transport never emits a continuation-secret header", async () => {
   const observations = [];
   const fetch = async (url, init) => {
     observations.push({ url: url.toString(), headers: init.headers });
@@ -858,11 +918,14 @@ test("Cuna transport carries the continuation secret under every spelling the AP
     baseUrl: "https://api.getcuna.com",
     apiKey: "cuna_sk_abcdefghijklmnop",
     fetch,
+    // An untyped caller cannot restore the retired field: HttpRequest no longer
+    // admits it, and the runtime transport ignores it rather than transporting a
+    // secret to either old or new infrastructure.
   }).request({ method: "GET", path: "/v1/sessions", continuationSecret: secret });
   assert.equal(observations[0].url, "https://api.getcuna.com/v1/sessions");
   assert.equal(observations[0].headers["User-Agent"].startsWith("cuna-cli/"), true);
-  assert.equal(observations[0].headers["X-Cuna-Continuation"], secret);
-  assert.equal(observations[0].headers["X-Runa-Continuation"], secret);
+  assert.equal(observations[0].headers["X-Cuna-Continuation"], undefined);
+  assert.equal(observations[0].headers["X-Runa-Continuation"], undefined);
   assert.equal(observations.length, 1);
 });
 

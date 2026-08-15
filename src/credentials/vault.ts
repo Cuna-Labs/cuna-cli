@@ -3,6 +3,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   CREDENTIAL_BACKEND_PROTOCOL,
   type CredentialBinding,
+  type CredentialBackendEvidence,
   type CredentialRefreshResult,
   type CredentialSnapshot,
   type CredentialStatus,
@@ -32,6 +33,17 @@ interface RefreshPayload {
   readonly expiresAt: number | undefined;
 }
 
+/**
+ * A process-local hint for one exact encrypted envelope observed by
+ * `refresh`. It is deliberately not an authority: deletion still issues the
+ * backend's physical compare-and-delete with this digest, so a second process
+ * can only turn the fast path into a safe conflict.
+ */
+interface ObservedRevisionFence {
+  readonly revision: number;
+  readonly storageSha256: string;
+}
+
 interface RefreshFlight {
   readonly promise: Promise<RefreshPayload>;
   waiters: number;
@@ -40,6 +52,7 @@ interface RefreshFlight {
 interface DecodedEnvelope {
   readonly header: EnvelopeHeader;
   readonly payload: Uint8Array;
+  readonly storageSha256: string;
 }
 
 export class CredentialVault {
@@ -50,6 +63,12 @@ export class CredentialVault {
   readonly #queues = new Map<string, Promise<void>>();
   readonly #refreshes = new Map<string, RefreshFlight>();
   readonly #revoked = new Set<string>();
+  readonly #observedRevisionFences = new Map<string, ObservedRevisionFence>();
+  // This is process-local liveness evidence only. It never replaces the
+  // backend's own lock, ACL, metadata, or CAS checks performed by every read
+  // and write. Avoiding redundant probes matters on Windows, where a probe
+  // itself requires an owner/DACL inspection through the OS boundary.
+  #backendEvidence: CredentialBackendEvidence | undefined;
   #lastObservedNow: number | undefined;
 
   constructor(input: {
@@ -67,23 +86,36 @@ export class CredentialVault {
   async load(binding: CredentialBinding): Promise<CredentialSnapshot | undefined> {
     const normalized = normalizeBinding(binding);
     const target = credentialTarget(normalized);
-    await this.#requireBackend();
-    const encoded = await this.#backend.read(target);
-    if (encoded === undefined) return undefined;
-    try {
-      const decoded = decodeEnvelope(encoded, bindingDigest(normalized));
-      if (decoded.header.expiresAt !== null && decoded.header.expiresAt <= this.#now()) {
+    return await this.#exclusive(target, async () => {
+      await this.#requireBackend();
+      const encoded = await this.#backend.read(target);
+      if (encoded === undefined) return undefined;
+      try {
+        const decoded = decodeEnvelope(encoded, bindingDigest(normalized));
+        if (decoded.header.expiresAt !== null && decoded.header.expiresAt <= this.#now()) {
+          decoded.payload.fill(0);
+          // Expired renewable material has no future use. Remove it while the
+          // target is exclusively locked so a concurrent rotation cannot be
+          // mistaken for the stale envelope we just decoded.
+          if (this.#backend.compareAndDelete !== undefined) {
+            // The digest belongs to the exact ciphertext decoded above. If a
+            // different process rotated it, expiry cleanup loses the compare
+            // and must not erase the newer session.
+            await this.#backend.compareAndDelete(target, decoded.storageSha256);
+          }
+          return undefined;
+        }
+        const material = SecretMaterial.fromBytes(decoded.payload);
         decoded.payload.fill(0);
-        return undefined;
+        return {
+          material,
+          revision: decoded.header.revision,
+          expiresAt: decoded.header.expiresAt ?? undefined,
+        };
+      } finally {
+        encoded.fill(0);
       }
-      return {
-        material: SecretMaterial.fromBytes(decoded.payload),
-        revision: decoded.header.revision,
-        expiresAt: decoded.header.expiresAt ?? undefined,
-      };
-    } finally {
-      encoded.fill(0);
-    }
+    });
   }
 
   async rotate(input: {
@@ -96,6 +128,10 @@ export class CredentialVault {
     const target = credentialTarget(normalized);
     return await this.#exclusive(target, async () => {
       await this.#requireBackend();
+      // A rotation attempt makes any prior read fence unsuitable for a later
+      // fast deletion. Even an ambiguous write must fall back to a fresh
+      // observation rather than treating a process-local hint as authority.
+      this.#observedRevisionFences.delete(target);
       const current = await this.#readEnvelope(target, normalized);
       try {
         if (input.expectedRevision !== undefined && current?.header.revision !== input.expectedRevision) {
@@ -166,6 +202,7 @@ export class CredentialVault {
     const target = credentialTarget(normalized);
     return await this.#exclusive(target, async () => {
       await this.#requireBackend();
+      this.#observedRevisionFences.delete(target);
       await this.#backend.delete(target);
       this.#revoked.add(target);
       return {
@@ -177,19 +214,78 @@ export class CredentialVault {
     });
   }
 
+  /**
+   * Remove a session only when the exact revision written by this operation is
+   * still current.  A conflict is a successful safety outcome: a concurrent
+   * process owns the newer session and must not be erased as compensation for
+   * this caller.
+   */
+  async deleteIfRevision(input: {
+    readonly binding: CredentialBinding;
+    readonly expectedRevision: number;
+  }): Promise<"deleted" | "absent" | "conflict"> {
+    if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
+      throw credentialFailure("credential_binding_invalid", "The credential revision is invalid.");
+    }
+    const normalized = normalizeBinding(input.binding);
+    const target = credentialTarget(normalized);
+    return await this.#exclusive(target, async () => {
+      await this.#requireBackend();
+      if (this.#backend.compareAndDelete === undefined) {
+        throw credentialFailure(
+          "credential_backend_unverified",
+          "The secure credential store cannot safely remove a revision-fenced session.",
+        );
+      }
+      // `refresh` has already parsed this exact envelope while it was read
+      // through the backend boundary. Avoid a second identical read only when
+      // that private observation matches the requested revision. The backend
+      // still atomically reads and compares the digest under its physical
+      // lock; a changed session is a conflict, never a deletion.
+      const fence = this.#observedRevisionFences.get(target);
+      if (fence !== undefined && fence.revision === input.expectedRevision) {
+        this.#observedRevisionFences.delete(target);
+        const outcome = await this.#backend.compareAndDelete(target, fence.storageSha256);
+        if (outcome === "deleted" || outcome === "absent") {
+          this.#revoked.add(target);
+          return outcome;
+        }
+        if (outcome === "conflict") return outcome;
+        throw credentialFailure(
+          "credential_backend_failure",
+          "The secure credential store returned an invalid revision-fenced deletion result.",
+        );
+      }
+      const current = await this.#readEnvelope(target, normalized);
+      if (current === undefined) {
+        this.#revoked.add(target);
+        return "absent";
+      }
+      try {
+        if (current.header.revision !== input.expectedRevision) return "conflict";
+        const outcome = await this.#backend.compareAndDelete(target, current.storageSha256);
+        if (outcome === "deleted" || outcome === "absent") {
+          this.#revoked.add(target);
+          return outcome;
+        }
+        if (outcome === "conflict") return outcome;
+        throw credentialFailure(
+          "credential_backend_failure",
+          "The secure credential store returned an invalid revision-fenced deletion result.",
+        );
+      } finally {
+        current.payload.fill(0);
+      }
+    });
+  }
+
   async status(binding: CredentialBinding): Promise<CredentialStatus> {
     const normalized = normalizeBinding(binding);
     const target = credentialTarget(normalized);
-    let evidence;
-    let observedNow: number;
+    let evidence: CredentialBackendEvidence;
     try {
-      this.#now();
-      evidence = await this.#backend.probe();
-      observedNow = this.#now();
+      evidence = await this.#requireBackend();
     } catch {
-      return this.#unavailableStatus(normalized);
-    }
-    if (!validEvidence(evidence, this.#backend, this.#platform, observedNow, this.#allowPreviewBackend)) {
       return this.#unavailableStatus(normalized);
     }
     if (this.#revoked.has(target)) {
@@ -239,6 +335,10 @@ export class CredentialVault {
     refresher: (current: CredentialSnapshot | undefined) => Promise<CredentialRefreshResult>,
   ): Promise<RefreshPayload> {
     await this.#requireBackend();
+    // A new refresh is a fresh durability observation. Any fence from an
+    // earlier refresh must not be reused if this invocation rejects, rotates,
+    // or encounters an uncertain backend outcome.
+    this.#observedRevisionFences.delete(target);
     const currentEnvelope = await this.#readEnvelope(target, binding);
     const currentSnapshot = currentEnvelope === undefined ? undefined : {
       material: SecretMaterial.fromBytes(currentEnvelope.payload),
@@ -256,12 +356,59 @@ export class CredentialVault {
           { retryable: true },
         );
       }
+      if (refreshed.status === "missing") {
+        if (currentEnvelope !== undefined) {
+          throw credentialFailure(
+            "credential_refresh_failed",
+            "Credential refresh reported an absent credential after reading one.",
+          );
+        }
+        throw credentialFailure(
+          "credential_missing",
+          "Credential refresh requires a stored credential.",
+        );
+      }
       if (refreshed.status === "rejected") {
-        await this.#backend.delete(target);
+        if (currentEnvelope === undefined) {
+          throw credentialFailure(
+            "credential_refresh_failed",
+            "Credential refresh rejected an absent credential.",
+          );
+        }
+        if (this.#backend.compareAndDelete === undefined) {
+          throw credentialFailure(
+            "credential_backend_unverified",
+            "The secure credential store cannot safely reconcile a rejected session.",
+          );
+        }
+        let outcome: "deleted" | "absent" | "conflict";
+        try {
+          outcome = await this.#backend.compareAndDelete(target, currentEnvelope.storageSha256);
+        } catch (cause) {
+          throw credentialFailure(
+            "credential_backend_failure",
+            "The secure credential store could not reconcile a rejected session.",
+            { retryable: true, cause },
+          );
+        }
+        if (outcome === "conflict") {
+          throw credentialFailure(
+            "credential_revision_conflict",
+            "The credential changed while a rejected session was being reconciled.",
+            { retryable: true },
+          );
+        }
+        if (outcome !== "deleted" && outcome !== "absent") {
+          throw credentialFailure(
+            "credential_backend_failure",
+            "The secure credential store returned an invalid rejected-session reconciliation result.",
+          );
+        }
         this.#revoked.add(target);
         throw credentialFailure(
           "credential_revoked",
           "The renewable credential was rejected and has been removed.",
+          { safeDetails: { refreshRejection: refreshed.reason } },
         );
       }
       if (refreshed.status === "retained") {
@@ -271,6 +418,13 @@ export class CredentialVault {
             "Credential refresh cannot retain an absent credential.",
           );
         }
+        // This is only an optimization token for a subsequent exact
+        // revision-fenced cleanup in this vault instance. It is not returned
+        // to callers and never bypasses the backend's physical CAS.
+        this.#observedRevisionFences.set(target, {
+          revision: currentEnvelope.header.revision,
+          storageSha256: currentEnvelope.storageSha256,
+        });
         return {
           bytes: currentEnvelope.payload.slice(),
           revision: currentEnvelope.header.revision,
@@ -320,8 +474,12 @@ export class CredentialVault {
     }
   }
 
-  async #requireBackend(): Promise<void> {
-    this.#now();
+  async #requireBackend(): Promise<CredentialBackendEvidence> {
+    const now = this.#now();
+    const cached = this.#backendEvidence;
+    if (cached !== undefined && validEvidence(cached, this.#backend, this.#platform, now, this.#allowPreviewBackend)) {
+      return cached;
+    }
     let evidence;
     try {
       evidence = await this.#backend.probe();
@@ -347,6 +505,8 @@ export class CredentialVault {
         },
       );
     }
+    this.#backendEvidence = evidence;
+    return evidence;
   }
 
   async #replaceWithReconciliation(
@@ -356,12 +516,24 @@ export class CredentialVault {
     previous: DecodedEnvelope | undefined,
   ): Promise<void> {
     try {
-      await this.#backend.replace(target, encoded);
+      if (this.#backend.compareAndSwap !== undefined) {
+        const result = await this.#backend.compareAndSwap(target, previous?.storageSha256 ?? null, encoded);
+        if (result === "conflict") {
+          throw credentialFailure(
+            "credential_revision_conflict",
+            "The credential changed before rotation could be applied.",
+            { retryable: true },
+          );
+        }
+      } else {
+        await this.#backend.replace(target, encoded);
+      }
       return;
-    } catch {
-      // A native vault can commit and still lose its acknowledgement. Retrying an
-      // unknown replacement would rotate the same logical credential twice. Read
-      // back by stable target and adjudicate the effect before returning.
+    } catch (error) {
+      if (error instanceof CredentialBoundaryError && error.code === "credential_revision_conflict") throw error;
+      // A durable backend can commit and still lose its acknowledgement. Retrying
+      // an unknown replacement would rotate the same logical credential twice.
+      // Read back by stable target and adjudicate the effect before returning.
     }
     let observed: Uint8Array | undefined;
     try {
@@ -459,18 +631,9 @@ export class CredentialVault {
 
 /**
  * The single mint for the credential namespace. Every target this product hands
- * to a backend -- real or probe -- is produced here.
- *
- * The acceptors keep their own independent copies of the predicate on purpose:
- * `CREDENTIAL_TARGET` in `native-process-bridge.ts`, and
- * `valid_credential_target` in the Rust bridge's `protocol.rs`. Independent
- * acceptance is defence in depth and must stay that way. What must never
- * happen again is a second *mint*: `native-bridge-backend.ts` spelled its own
- * probe target as `cuna-cli:probe:<32 hex>`, which no acceptor in either
- * language admits, so the liveness probe threw `credential_binding_invalid` on
- * its very first call and every interactive sign-in resolved to
- * `cuna.auth.vault_unavailable` -- on a bridge that was working perfectly.
- * Mint through this function or the value is not a credential target.
+ * to its encrypted local store -- real or probe -- is produced here. Callers
+ * must not concatenate target strings: a target outside this grammar is not a
+ * credential target and must fail before it reaches storage.
  */
 export function credentialTarget(binding: CredentialBinding): string {
   return `cuna-cli:v1:${bindingDigest(normalizeBinding(binding))}`;
@@ -592,6 +755,7 @@ function encodeEnvelope(input: {
 function decodeEnvelope(encoded: Uint8Array, expectedBindingDigest: string): {
   readonly header: EnvelopeHeader;
   readonly payload: Uint8Array;
+  readonly storageSha256: string;
 } {
   if (encoded.byteLength < ENVELOPE_MAGIC.byteLength + 5 || encoded.byteLength > MAXIMUM_ENVELOPE_BYTES) {
     throw credentialFailure("credential_corrupt", "The protected credential envelope is invalid.");
@@ -626,7 +790,7 @@ function decodeEnvelope(encoded: Uint8Array, expectedBindingDigest: string): {
     payload.fill(0);
     throw credentialFailure("credential_corrupt", "The protected credential failed binding or integrity validation.");
   }
-  return { header, payload };
+  return { header, payload, storageSha256: createHash("sha256").update(encoded).digest("hex") };
 }
 
 function parseHeader(value: unknown): EnvelopeHeader {
@@ -688,7 +852,7 @@ function validEvidence(
   allowPreviewBackend: boolean,
 ): boolean {
   const verifiedEvidence = evidence.status === "verified" &&
-    (evidence.source === "live_round_trip" || evidence.source === "native_bridge_round_trip" || evidence.source === "encrypted_local_file");
+    (evidence.source === "live_round_trip" || evidence.source === "encrypted_local_file");
   const previewEvidence = allowPreviewBackend && evidence.status === "preview" &&
     evidence.source === "local_file_preview" && evidence.reason === undefined;
   return evidence.protocol === CREDENTIAL_BACKEND_PROTOCOL &&

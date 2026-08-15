@@ -136,42 +136,17 @@ test("CI contract rejects a declared Node line omitted from the full behavioral 
   await assert.rejects(verify(root), /Every declared tested Node line/);
 });
 
-test("CI contract rejects candidate generation that bypasses every mandatory native gate", async () => {
+test("CI contract rejects candidate generation that waits on experimental native gates", async () => {
   const root = await fixture();
   const workflow = path.join(root, ".github", "workflows", "ci.yml");
   const original = await readFile(workflow, "utf8");
   const content = original.replace(
-    "needs: [source-gates, native-source-gates, native-evidence-gates]",
-    "needs: source-gates",
+    "  candidate:\n    name: immutable-candidate\n    needs: source-gates",
+    "  candidate:\n    name: immutable-candidate\n    needs: [source-gates, native-source-gates]",
   );
   assert.notEqual(content, original, "negative control must mutate the candidate dependency edge");
   await writeFile(workflow, content);
-  await assert.rejects(verify(root), /Node, native source, and native evidence gates/);
-});
-
-test("CI contract rejects candidate generation that bypasses native admission evidence", async () => {
-  const root = await fixture();
-  const workflow = path.join(root, ".github", "workflows", "ci.yml");
-  const original = await readFile(workflow, "utf8");
-  const content = original.replace(
-    "needs: [source-gates, native-source-gates, native-evidence-gates]",
-    "needs: [source-gates, native-source-gates]",
-  );
-  assert.notEqual(content, original, "negative control must remove only native evidence authority");
-  await writeFile(workflow, content);
-  await assert.rejects(verify(root), /Node, native source, and native evidence gates/);
-});
-
-test("CI contract rejects an incomplete native quality gate", async () => {
-  const root = await fixture();
-  const workflow = path.join(root, ".github", "workflows", "ci.yml");
-  const content = (await readFile(workflow, "utf8"))
-    .replace(
-      "cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings",
-      "cargo +1.97.1 check --workspace --locked",
-    );
-  await writeFile(workflow, content);
-  await assert.rejects(verify(root), /Native source gate is missing/);
+  await assert.rejects(verify(root), /Candidate generation must depend only on the product source gate/);
 });
 
 test("CI contract rejects an observation summary that can block the release DAG", async () => {

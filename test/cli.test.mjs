@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
+import { CREDENTIAL_BACKEND_PROTOCOL } from "../dist/credentials/contracts.js";
 
 const API_KEY = "cuna_sk_abcdefghijklmnop";
 // A machine ID in the one shape the product accepts. This fixture used to be
@@ -244,7 +245,7 @@ test("workspace and usage preserve unassigned waitlist truth without fabricating
   assert.equal(JSON.parse(usage.stderr()).error.details.reason, "workspace_usage_unavailable");
 });
 
-test("account and workspace browser opens fail closed without handoff authority", async () => {
+test("unadvertised account and workspace browser actions are rejected as usage", async () => {
   for (const argv of [["account", "open"], ["workspace", "open"]]) {
     let identityReads = 0;
     const streams = memoryStreams();
@@ -253,9 +254,9 @@ test("account and workspace browser opens fail closed without handoff authority"
       platform,
       env: { CUNA_API_KEY: API_KEY },
       clientFactory: () => fakeClient({ async getIdentity() { identityReads += 1; throw new Error("unexpected"); } }),
-    }), EXIT_CODES.unsupported);
+    }), EXIT_CODES.usage);
     assert.equal(identityReads, 0);
-    assert.equal(JSON.parse(streams.stderr()).error.details.reason, "browser_handoff_authority_unavailable");
+    assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.usage.invalid");
   }
 });
 
@@ -285,9 +286,10 @@ test("TC-037-02 unavailable parity capabilities perform no record or authorizati
   assert.equal(effects, 0);
 });
 
-test("TC-037-05 API-key list and revoke require fresh capability plus explicit destructive confirmation", async () => {
+test("TC-037-05 API-key management requires interactive authority, fresh capability, and explicit destructive confirmation", async () => {
   const id = "11111111-1111-4111-8111-111111111111";
   const effects = [];
+  let revokedAt = null;
   const client = fakeClient({
     async discoverCapabilities(scope) {
       effects.push("capability");
@@ -310,19 +312,35 @@ test("TC-037-05 API-key list and revoke require fresh capability plus explicit d
         createdAt: "2026-08-08T00:00:00.000Z",
         expiresAt: null,
         lastUsedAt: null,
-        revokedAt: null,
+        revokedAt,
       }];
     },
     async revokeApiKey(observed) {
       effects.push(`revoke:${observed}`);
+      revokedAt = "2026-08-08T00:00:01.000Z";
       return true;
     },
   });
+  for (const argv of [["api-keys", "list"], ["api-keys", "revoke", id, "--yes"]]) {
+    const automation = memoryStreams();
+    assert.equal(await runCli(argv, {
+      streams: automation.streams,
+      platform,
+      env: { CUNA_API_KEY: API_KEY },
+      now: () => Date.parse("2026-08-08T00:00:00Z"),
+      clientFactory: () => client,
+    }), EXIT_CODES.auth);
+    assert.equal(JSON.parse(automation.stderr()).error.code, "cuna.auth.interactive_required");
+  }
+  assert.deepEqual(effects, []);
+
+  const humanAuth = { async acquireAccessToken() { return `cuna_at_${"b".repeat(43)}`; } };
   const list = memoryStreams();
   assert.equal(await runCli(["api-keys", "list"], {
     streams: list.streams,
     platform,
-    env: { CUNA_API_KEY: API_KEY },
+    env: {},
+    humanAuth,
     now: () => Date.parse("2026-08-08T00:00:00Z"),
     clientFactory: () => client,
   }), EXIT_CODES.success);
@@ -332,7 +350,8 @@ test("TC-037-05 API-key list and revoke require fresh capability plus explicit d
   assert.equal(await runCli(["api-keys", "revoke", id], {
     streams: unconfirmed.streams,
     platform,
-    env: { CUNA_API_KEY: API_KEY },
+    env: {},
+    humanAuth,
     clientFactory: () => client,
   }), EXIT_CODES.policy);
 
@@ -340,12 +359,13 @@ test("TC-037-05 API-key list and revoke require fresh capability plus explicit d
   assert.equal(await runCli(["api-keys", "revoke", id, "--yes"], {
     streams: revoke.streams,
     platform,
-    env: { CUNA_API_KEY: API_KEY },
+    env: {},
+    humanAuth,
     now: () => Date.parse("2026-08-08T00:00:00Z"),
     clientFactory: () => client,
   }), EXIT_CODES.success);
   assert.equal(JSON.parse(revoke.stdout()).data.revoked, true);
-  assert.deepEqual(effects, ["capability", "list", "capability", `revoke:${id}`]);
+  assert.deepEqual(effects, ["capability", "list", "capability", `revoke:${id}`, "list"]);
 });
 
 test("API-key creation requires interactive authority and prints the one-time secret exactly once", async () => {
@@ -578,8 +598,19 @@ test("production login uses the encrypted backend and reuses the canonical durab
   const continuationId = "123e4567-e89b-12d3-a456-426614174000";
   const sessionId = "123e4567-e89b-12d3-a456-426614174001";
   const browserNonce = `cuna_cb_${"n".repeat(43)}`;
+  // The issued continuation must be a coherent, short-lived browser code
+  // fixture. A distant calendar date overflows Node's signed timer bound and
+  // can turn an immediate code-entry test into a spurious expiry race.
+  const continuationDeadlineMs = Date.now() + 5 * 60_000;
+  const continuationExpiresAt = new Date(continuationDeadlineMs).toISOString();
+  assert.ok(continuationDeadlineMs - Date.now() > 0 && continuationDeadlineMs - Date.now() <= 600_000);
   let observedAuthorization;
-  let refreshCount = 0;
+  let exchangeCount = 0;
+  let retiredContinuationStatusRequests = 0;
+  const timeoutWarnings = [];
+  const recordWarning = (warning) => {
+    if (warning?.name === "TimeoutOverflowWarning") timeoutWarnings.push(warning);
+  };
   const context = {
     required_terms_version: "2026-08",
     identity: "active",
@@ -592,13 +623,10 @@ test("production login uses the encrypted backend and reuses the canonical durab
     if (requestUrl.pathname === "/v1/cli-auth/bootstrap") {
       return new Response(JSON.stringify({
         enabled: true,
-        completion_mode: "poll",
+        completion_mode: "paste_login_code",
         pkce_method: "S256",
         continuation_ttl_seconds: 600,
-        poll_after_ms: 2000,
-        poll_limit: 1,
         access_token_ttl_seconds: 600,
-        refresh_family_ttl_seconds: 2592000,
         browser_origin: "https://app.getcuna.com",
       }), { status: 200 });
     }
@@ -607,31 +635,27 @@ test("production login uses the encrypted backend and reuses the canonical durab
       browserUrl = `https://app.getcuna.com/cli/continue#continuation=${continuationId}&nonce=${browserNonce}&state=${body.state}`;
       return new Response(JSON.stringify({
         id: continuationId,
-        continuation_secret: `cuna_ct_${"s".repeat(43)}`,
         browser_url: browserUrl,
-        expires_at: "2030-01-01T00:00:00.000Z",
-        poll_after_ms: 2000,
-        completion_mode: "poll",
+        expires_at: continuationExpiresAt,
+        completion_mode: "paste_login_code",
       }), { status: 200 });
     }
     if (requestUrl.pathname === `/v1/cli-auth/continuations/${continuationId}`) {
-      return new Response(JSON.stringify({
-        id: continuationId,
-        phase: "completed",
-        expires_at: "2030-01-01T00:00:00.000Z",
-        required_terms_version: "2026-08",
-        context,
-      }), { status: 200 });
+      retiredContinuationStatusRequests += 1;
+      throw new Error("strict paste-code CLI must not fetch a retired continuation status route");
     }
     if (requestUrl.pathname === `/v1/cli-auth/continuations/${continuationId}/exchange`) {
-      const initial = refreshCount === 0;
-      refreshCount += 1;
+      const body = JSON.parse(String(init.body));
+      assert.equal(body.login_code, `cuna_login_${"l".repeat(43)}`);
+      assert.equal(Object.hasOwn(body, "refresh_token"), false);
+      const initial = exchangeCount === 0;
+      exchangeCount += 1;
       return new Response(JSON.stringify({
         access_token: `cuna_at_${(initial ? "a" : "b").repeat(43)}`,
         token_type: "Bearer",
         expires_in: 600,
         access_expires_at: initial ? "2030-01-01T00:10:00.000Z" : "2030-01-01T00:20:00.000Z",
-        ...(initial ? { login_code_expires_at: "2030-02-01T00:00:00.000Z" } : {}),
+        login_code_expires_at: "2030-02-01T00:00:00.000Z",
         session_id: sessionId,
         context,
       }), { status: 200 });
@@ -649,6 +673,7 @@ test("production login uses the encrypted backend and reuses the canonical durab
     throw new Error(`unexpected preview auth request: ${requestUrl.pathname}`);
   };
   const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  process.on("warning", recordWarning);
   try {
     const exit = await runCli(["login"], {
       streams: streams.streams,
@@ -683,6 +708,7 @@ test("production login uses the encrypted backend and reuses the canonical durab
     });
     assert.equal(laterExit, EXIT_CODES.success, laterStreams.stderr());
     assert.equal(observedAuthorization, `Bearer cuna_at_${"b".repeat(43)}`);
+    assert.equal(retiredContinuationStatusRequests, 0);
 
     const whoamiStreams = memoryStreams();
     const whoamiExit = await runCli(["whoami"], {
@@ -710,7 +736,10 @@ test("production login uses the encrypted backend and reuses the canonical durab
     });
     assert.equal(logoutExit, EXIT_CODES.success, logoutStreams.stderr());
     assert.equal((await readdir(join(configDirectory, "sessions"))).length, 0);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(timeoutWarnings.length, 0, "a coherent continuation deadline must not overflow Node's timer");
   } finally {
+    process.off("warning", recordWarning);
     await rm(configDirectory, { recursive: true, force: true });
   }
 });
@@ -915,6 +944,7 @@ test("advertised native capability admits exactly one documented mutation", asyn
       key = idempotencyKey;
       return { id: "m_1", name: "dev", state: "creating" };
     },
+    async getMachine(id) { return { id, name: "dev", state: "creating" }; },
   });
   const exit = await runCli(["machines", "create", "--name", "dev", "--yes", "--idempotency-key", "operation-1"], {
     streams: streams.streams,
@@ -951,6 +981,7 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
       assert.equal(action, "pause");
       return { id, name: "dev", state: "paused" };
     },
+    async getMachine(id) { return { id, name: "dev", state: "paused" }; },
   });
   const exit = await runCli(["machines", "pause", MACHINE_ID, "--yes"], {
     streams: streams.streams,
@@ -963,6 +994,53 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
   assert.equal(transitions, 1);
   assert.deepEqual(discoveries, [{ scope: "machine", resourceId: MACHINE_ID }]);
   assert.equal(JSON.parse(streams.stdout()).data.state, "paused");
+});
+
+test("mutations fail closed when independent readback contradicts the write response", async () => {
+  const cases = [
+    {
+      argv: ["machines", "pause", MACHINE_ID, "--yes", "--json"],
+      capability: "machines.lifecycle",
+      scope: "machine",
+      client: {
+        async transitionMachine(id) { return { id, name: "dev", state: "paused" }; },
+        async getMachine(id) { return { id, name: "dev", state: "running" }; },
+      },
+    },
+    {
+      argv: ["api-keys", "revoke", "11111111-1111-4111-8111-111111111111", "--yes", "--json"],
+      capability: "api_keys.manage",
+      scope: "account",
+      authority: "interactive",
+      client: {
+        async revokeApiKey() { return true; },
+        async listApiKeys() { return [{ id: "11111111-1111-4111-8111-111111111111", name: "still-active", prefix: "cuna_sk_", lastFour: "WXYZ", createdAt: "2026-08-08T00:00:00.000Z", expiresAt: null, lastUsedAt: null, revokedAt: null }]; },
+      },
+    },
+  ];
+  for (const candidate of cases) {
+    const streams = memoryStreams();
+    const client = fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{ id: candidate.capability, availability: "supported", interaction: "native", mutationClass: "reversible", surfaces: ["cli"], requiredPermissions: ["write"] }], scope, resourceId);
+      },
+      ...candidate.client,
+    });
+    const authority = candidate.authority === "interactive"
+      ? {
+          env: {},
+          humanAuth: { async acquireAccessToken() { return `cuna_at_${"b".repeat(43)}`; } },
+        }
+      : { env: { CUNA_API_KEY: API_KEY } };
+    assert.equal(await runCli(candidate.argv, {
+      streams: streams.streams,
+      platform,
+      ...authority,
+      now: () => Date.parse("2026-08-08T00:00:00Z"),
+      clientFactory: () => client,
+    }), EXIT_CODES.conflict);
+    assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.remote.postcondition_unverified");
+  }
 });
 
 function agentSession(overrides = {}) {
@@ -1006,6 +1084,19 @@ test("AgentSession create keeps auth mode explicit and rename is capability-gate
     async createAgentSession(observedMachine, input, key) {
       calls.push({ operation: "create", observedMachine, input, key });
       return agentSession({ machineId: observedMachine, name: input.name, agent: input.agent, cwd: input.cwd, authMode: input.authMode });
+    },
+    async getAgentSession(id) {
+      const created = calls.find((entry) => entry.operation === "create");
+      const renamed = calls.find((entry) => entry.operation === "rename");
+      return agentSession({
+        id,
+        name: renamed?.name ?? created?.input.name ?? "review",
+        agent: created?.input.agent ?? "claude-code",
+        cwd: created?.input.cwd ?? "/workspace",
+        workspaceBindingId: created?.input.workspaceBindingId ?? workspaceBindingId,
+        workspaceGeneration: created?.input.workspaceGeneration ?? 7,
+        authMode: created?.input.authMode ?? "interactive_login",
+      });
     },
     async renameAgentSession(id, name) {
       calls.push({ operation: "rename", id, name });
@@ -1058,6 +1149,169 @@ test("AgentSession create keeps auth mode explicit and rename is capability-gate
   assert.equal(JSON.parse(renameStreams.stdout()).data.name, "renamed");
 });
 
+test("OpenCode AgentSession creation remains blocked by a mutable producer witness even when env is exact true", async () => {
+  let effects = 0;
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      effects += 1;
+      return capabilitySnapshot([{
+        id: "agent_sessions.create",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["agent_sessions:create"],
+      }], scope, resourceId);
+    },
+    async createAgentSession(machineId, input) {
+      effects += 1;
+      return agentSession({ machineId, agent: input.agent, cwd: input.cwd, authMode: input.authMode });
+    },
+    async getAgentSession(id) {
+      effects += 1;
+      return agentSession({
+        id,
+        machineId: MACHINE_ID,
+        workspaceBindingId: "33333333-3333-4333-8333-333333333333",
+        workspaceGeneration: 7,
+        agent: "opencode",
+        cwd: "/workspace/repo",
+        authMode: "interactive_login",
+      });
+    },
+  });
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo",
+    "--yes",
+  ], {
+    streams: streams.streams,
+    platform: {
+      ...platform,
+      async readSafeConfig() { effects += 1; return { exists: false }; },
+    },
+    env: { CUNA_API_KEY: API_KEY, CUNA_OPENCODE_ENABLED: "true" },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => { effects += 1; return client; },
+  });
+  assert.equal(exit, EXIT_CODES.policy);
+  assert.match(streams.stderr(), /immutable_contract_witness_required/u);
+  assert.equal(effects, 0);
+});
+
+test("OpenCode AgentSession creation rejects credential bindings before capability or mutation effects", async () => {
+  let effects = 0;
+  const client = fakeClient({
+    async discoverCapabilities() { effects += 1; return capabilitySnapshot([]); },
+    async createAgentSession() { effects += 1; throw new Error("unreachable"); },
+  });
+  for (const suffix of [
+    ["--auth-mode", "credential_binding"],
+    ["--credential-binding", "44444444-4444-4444-8444-444444444444"],
+  ]) {
+    const streams = memoryStreams();
+    const exit = await runCli([
+      "agent-sessions", "create", "--machine", MACHINE_ID,
+      "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+      "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo",
+      ...suffix,
+      "--yes",
+    ], {
+      streams: streams.streams,
+      platform,
+      env: { CUNA_API_KEY: API_KEY },
+      clientFactory: () => client,
+    });
+    assert.equal(exit, EXIT_CODES.usage);
+    assert.match(streams.stderr(), /interactive_login only/u);
+  }
+  assert.equal(effects, 0);
+});
+
+test("OpenCode mutable producer identity blocks env true before configuration, credentials, API, host, or terminal effects", async () => {
+  const cases = [
+    ["machines", "create", "--name", "opencode-machine", "--agent", "opencode", "--yes"],
+    [
+      "agent-sessions", "create", "--machine", MACHINE_ID,
+      "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+      "--workspace-generation", "7", "--agent", "opencode", "--yes",
+    ],
+    ["opencode", ".", "--new-session"],
+    ["opencode", "--agent-session", FOREGROUND_SESSION_A],
+  ];
+  for (const argv of cases) {
+    let effects = 0;
+    const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+    const exit = await runCli(argv, {
+      streams: streams.streams,
+      platform: {
+        ...platform,
+        async readSafeConfig() { effects += 1; return { exists: false }; },
+      },
+      // A valid automation credential and a provider-shaped value must not be
+      // selected, copied, or injected when the local gate refuses the command.
+      env: {
+        CUNA_API_KEY: API_KEY,
+        CUNA_OPENCODE_ENABLED: "true",
+        OPENAI_API_KEY: "must-not-be-read",
+      },
+      humanAuth: {
+        async acquireAccessToken() { effects += 1; return "must-not-be-read"; },
+      },
+      clientFactory: () => { effects += 1; return fakeClient(); },
+      automaticJourneyEffectsFactory: () => { effects += 1; throw new Error("unreachable"); },
+      foregroundTerminalRunner: async () => { effects += 1; },
+    });
+    assert.equal(exit, EXIT_CODES.policy, argv.join(" "));
+    assert.match(streams.stderr(), /cuna\.feature\.opencode_disabled/u);
+    assert.match(streams.stderr(), /CUNA_OPENCODE_ENABLED=true/u);
+    assert.match(streams.stderr(), /immutable_contract_witness_required/u);
+    assert.equal(effects, 0, `${argv.join(" ")} must stop before protected effects`);
+  }
+});
+
+test("OpenCode mutable producer identity blocks before a remotely downgraded auth mode can be observed", async () => {
+  let effects = 0;
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      effects += 1;
+      return capabilitySnapshot([{
+        id: "agent_sessions.create",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["agent_sessions:create"],
+      }], scope, resourceId);
+    },
+    async createAgentSession(machineId) {
+      effects += 1;
+      return agentSession({ machineId, agent: "opencode", authMode: "interactive_login" });
+    },
+    async getAgentSession(id) {
+      effects += 1;
+      return agentSession({ id, agent: "opencode", authMode: "credential_binding" });
+    },
+  });
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--yes",
+  ], {
+    streams: streams.streams,
+    platform: { ...platform, async readSafeConfig() { effects += 1; return { exists: false }; } },
+    env: { CUNA_API_KEY: API_KEY, CUNA_OPENCODE_ENABLED: "true" },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => { effects += 1; return client; },
+  });
+  assert.equal(exit, EXIT_CODES.policy);
+  assert.match(streams.stderr(), /immutable_contract_witness_required/u);
+  assert.equal(effects, 0);
+});
+
 test("agent logout binds confirmation to one exact AgentSession generation", async () => {
   const id = "11111111-1111-4111-8111-111111111111";
   const epoch = "33333333-3333-4333-8333-333333333333";
@@ -1092,6 +1346,21 @@ test("agent logout binds confirmation to one exact AgentSession generation", asy
         outcome: "logout_confirmed",
       };
     },
+    async getAgentSessionAuth(observedId) {
+      calls.push({ operation: "observe-auth", id: observedId });
+      return {
+        observationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        agentSessionId: id,
+        processEpoch: epoch,
+        authMode: "interactive_login",
+        agent: "claude-code",
+        agentVersion: "2.1.226",
+        adapterVersion: "runa.agent-auth.v1",
+        observedAt: "2026-08-08T00:00:02.000Z",
+        evidenceClass: "provider_cli_login_status",
+        state: "login_required",
+      };
+    },
   });
   const streams = memoryStreams();
   const exit = await runCli(["agent", "logout", "--agent-session", id, "--yes"], {
@@ -1107,6 +1376,7 @@ test("agent logout binds confirmation to one exact AgentSession generation", asy
     { operation: "get", id },
     { operation: "capabilities", scope: "agent_session", resourceId: id },
     { operation: "logout", id, epoch },
+    { operation: "observe-auth", id },
   ]);
 
   const denied = memoryStreams();
@@ -1116,7 +1386,7 @@ test("agent logout binds confirmation to one exact AgentSession generation", asy
     env: { CUNA_API_KEY: API_KEY },
     clientFactory: () => client,
   }), EXIT_CODES.success);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
 });
 
 test("AgentSession capability subject mismatch blocks mutation before the client call", async () => {
@@ -1165,10 +1435,12 @@ test("valid automatic agent intents execute the effects-fenced journey and exact
     const phases = [];
     let attached;
     const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
-    const exit = await runCli(argv, {
+    const invoke = () => runCli(argv, {
       streams: streams.streams,
       platform,
-      env: { CUNA_API_KEY: "cuna_sk_abcdefghijklmnop" },
+      env: {
+        CUNA_API_KEY: "cuna_sk_abcdefghijklmnop",
+      },
       clientFactory: () => fakeClient(),
       automaticJourneyEffectsFactory: () => ({
         onPhase(phase) { phases.push(phase); },
@@ -1187,6 +1459,7 @@ test("valid automatic agent intents execute the effects-fenced journey and exact
         async reconcileCancellation() {},
       }),
     });
+    const exit = await invoke();
     assert.equal(exit, EXIT_CODES.success);
     assert.deepEqual(attached, { id: FOREGROUND_SESSION_C, agent: argv[0] === "claude" ? "claude-code" : argv[0] });
     assert.equal(phases[0], "inspect-workspace");
@@ -1223,6 +1496,7 @@ test("explicit agent shorthand rejects ambiguous or misleading input before effe
     ["claude", ".", "--agent-session", FOREGROUND_SESSION_A],
     ["codex", "--agent-session", "not-a-session"],
     ["openclaw", "--agent-session", FOREGROUND_SESSION_A, "--new"],
+    ["opencode", "--agent-session", FOREGROUND_SESSION_A, "--no-sync"],
   ]) {
     let effects = 0;
     const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
@@ -1440,18 +1714,91 @@ test("TC-055-01 malformed, duplicate, and oversized connect identities fail befo
   }
 });
 
-test("doctor never advertises interactive browser auth without a verified platform vault", async () => {
-  for (const kind of ["windows", "macos"]) {
+test("doctor keeps the local encrypted-store probe separate from the unprobed remote browser-login bootstrap", async () => {
+  for (const kind of ["windows"]) {
     const streams = memoryStreams();
+    let remoteCalls = 0;
     const exit = await runCli(["doctor"], {
       streams: streams.streams,
       platform: { ...platform, kind },
       env: {},
+      fetch: async () => {
+        remoteCalls += 1;
+        throw new Error("default doctor must not make a network request");
+      },
     });
     assert.equal(exit, EXIT_CODES.success);
     const browserAuth = JSON.parse(streams.stdout()).data.runtime_features.find((item) => item.feature === "browser_auth");
+    const remoteBrowserLogin = JSON.parse(streams.stdout()).data.runtime_features.find((item) => item.feature === "browser_login_remote");
+    const encryptedStore = JSON.parse(streams.stdout()).data.runtime_features.find((item) => item.feature === "encrypted_local_session_store");
+    assert.equal(remoteCalls, 0);
     assert.equal(browserAuth.implementation, "unsupported");
-    assert.notEqual(browserAuth.reason, "polling_continuation_v1_3");
+    assert.equal(browserAuth.reason, "remote_browser_login_not_checked");
+    assert.equal(remoteBrowserLogin.implementation, "unsupported");
+    assert.equal(remoteBrowserLogin.reason, "remote_browser_login_not_checked");
+    assert.equal(encryptedStore.implementation, "available");
+    assert.equal(encryptedStore.reason, "encrypted_local_aes256gcm_verified");
+  }
+});
+
+test("doctor probes browser login only when explicitly requested and composes it with the local AES gate", async () => {
+  const configDirectory = await mkdtemp(join(tmpdir(), "cuna-doctor-remote-"));
+  try {
+    const streams = memoryStreams();
+    let remoteCalls = 0;
+    let localStoreProbes = 0;
+    const exit = await runCli(["doctor", "--check-browser-login"], {
+      streams: streams.streams,
+      platform: {
+        kind: "linux",
+        paths: { configDirectory, stateDirectory: configDirectory, runtimeDirectory: configDirectory },
+        async readSafeConfig() { return { exists: false }; },
+      },
+      env: {},
+      doctorCredentialBackend: {
+        backendId: "cuna-local-aes256gcm-v1",
+        async probe() {
+          localStoreProbes += 1;
+          return {
+            protocol: CREDENTIAL_BACKEND_PROTOCOL,
+            backendId: "cuna-local-aes256gcm-v1",
+            platform: "linux",
+            status: "verified",
+            observedAt: Date.parse("2026-08-08T00:00:00.000Z"),
+            expiresAt: Date.parse("2026-08-08T00:01:00.000Z"),
+            source: "encrypted_local_file",
+          };
+        },
+      },
+      fetch: async (input) => {
+        remoteCalls += 1;
+        assert.match(String(input), /\/v1\/cli-auth\/bootstrap$/u);
+        return new Response(JSON.stringify({
+          enabled: true,
+          completion_mode: "paste_login_code",
+          pkce_method: "S256",
+          continuation_ttl_seconds: 600,
+          access_token_ttl_seconds: 600,
+          browser_origin: "https://app.getcuna.com",
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+    assert.equal(exit, EXIT_CODES.success);
+    assert.equal(localStoreProbes, 1);
+    assert.equal(remoteCalls, 1);
+    const features = JSON.parse(streams.stdout()).data.runtime_features;
+    assert.deepEqual(features.find((item) => item.feature === "browser_login_remote"), {
+      feature: "browser_login_remote",
+      implementation: "available",
+      reason: "remote_browser_login_bootstrap_verified",
+    });
+    assert.deepEqual(features.find((item) => item.feature === "browser_auth"), {
+      feature: "browser_auth",
+      implementation: "available",
+      reason: "browser_login_remote_and_encrypted_local_verified",
+    });
+  } finally {
+    await rm(configDirectory, { recursive: true, force: true });
   }
 });
 

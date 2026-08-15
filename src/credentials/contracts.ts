@@ -10,9 +10,9 @@ export interface CredentialBinding {
 }
 
 /**
- * `preview` is deliberately not a native security claim. It is only accepted
- * by an explicitly constructed preview vault and therefore cannot satisfy the
- * GA native-auth readiness gate.
+ * `preview` is deliberately not a production security claim. It is only
+ * accepted by an explicitly constructed preview vault and therefore cannot
+ * satisfy the public encrypted-session readiness gate.
  */
 export type CredentialBackendStatus = "verified" | "preview" | "unavailable" | "unknown";
 
@@ -23,7 +23,7 @@ export interface CredentialBackendEvidence {
   readonly status: CredentialBackendStatus;
   readonly observedAt: number;
   readonly expiresAt: number;
-  readonly source: "live_round_trip" | "native_bridge_round_trip" | "encrypted_local_file" | "local_file_preview" | "backend_absent" | "probe_failed";
+  readonly source: "live_round_trip" | "encrypted_local_file" | "local_file_preview" | "probe_failed";
   readonly reason?: string;
 }
 
@@ -38,6 +38,20 @@ export interface SecureCredentialBackend {
   read(target: string): Promise<Uint8Array | undefined>;
   replace(target: string, protectedValue: Uint8Array): Promise<void>;
   delete(target: string): Promise<"deleted" | "absent">;
+  /**
+   * Optional durable compare-and-swap operations. File-backed implementations
+   * use these to fence independent CLI processes; an in-memory queue is not an
+   * inter-process authority.
+   */
+  compareAndSwap?(
+    target: string,
+    expectedSha256: string | null,
+    protectedValue: Uint8Array,
+  ): Promise<"replaced" | "conflict">;
+  compareAndDelete?(
+    target: string,
+    expectedSha256: string,
+  ): Promise<"deleted" | "absent" | "conflict">;
 }
 
 export interface CredentialSnapshot {
@@ -62,13 +76,17 @@ export type CredentialRefreshResult =
       readonly expiresAt?: number;
     }
   | { readonly status: "retained" }
-  | { readonly status: "rejected" };
-
-export interface NativeCredentialBridge {
-  readonly platform: "win32" | "darwin";
-  readonly backendId: string;
-  readonly transportSecurity: "native_memory_only";
-  read(target: string): Promise<Uint8Array | undefined>;
-  replace(target: string, protectedValue: Uint8Array): Promise<void>;
-  delete(target: string): Promise<"deleted" | "absent">;
-}
+  // The refresher observed no durable record. This is intentionally distinct
+  // from a server rejection: it must not manufacture a revocation or mutate
+  // the backend merely to report that the user has not signed in yet.
+  | { readonly status: "missing" }
+  | {
+      readonly status: "rejected";
+      /**
+       * The vault always revision-fences removal, but the caller must still
+       * distinguish a remote terminal fact from local expiry or validation.
+       * Only `authoritative_remote` permits a later logout to report that the
+       * remote family was already revoked.
+       */
+      readonly reason: "authoritative_remote" | "local_expired" | "local_integrity";
+    };

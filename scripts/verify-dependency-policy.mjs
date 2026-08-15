@@ -51,47 +51,8 @@ if (JSON.stringify(bundledDependencyNames) !== JSON.stringify(runtimeDependencyN
   );
 }
 
-// Platform-native authentication packages are deliberately separate optional
-// dependencies. Bundling them into the architecture-neutral root tarball would
-// either ship foreign binaries or make the root artifact platform-specific.
-// The root may name them only as one complete, exact-version cohort after all
-// three packages exist in the canonical registry and the immutable release
-// index admits their signed contents.
-const nativePackageCohort = [
-  ["@cuna_labs/cli-native-darwin-arm64", "darwin", "arm64"],
-  ["@cuna_labs/cli-native-darwin-x64", "darwin", "x64"],
-  ["@cuna_labs/cli-native-win32-x64", "win32", "x64"],
-];
-const expectedNativeNames = nativePackageCohort.map(([name]) => name).sort();
-const selectedNativeNames = optionalDependencyNames
-  .filter((name) => name.startsWith("@cuna_labs/cli-native-"))
-  .sort();
-if (JSON.stringify(optionalDependencyNames) !== JSON.stringify(selectedNativeNames)) {
-  findings.push("optionalDependencies may contain only the governed Cuna native package cohort");
-}
-if (selectedNativeNames.length > 0 &&
-    JSON.stringify(selectedNativeNames) !== JSON.stringify(expectedNativeNames)) {
-  findings.push("native optional dependencies must be admitted as one complete platform cohort");
-}
-if (selectedNativeNames.length > 0 &&
-    !sameStringMap(
-      lock.packages[""]?.optionalDependencies ?? {},
-      packageJson.optionalDependencies ?? {},
-    )) {
-  findings.push("root lock optionalDependencies must exactly match package.json");
-}
-for (const [name, os, cpu] of nativePackageCohort) {
-  const selectedVersion = packageJson.optionalDependencies?.[name];
-  if (selectedVersion === undefined) continue;
-  if (selectedVersion !== packageJson.version) {
-    findings.push(`optionalDependencies.${name}: native package version must equal root version ${packageJson.version}`);
-  }
-  const locked = lock.packages[`node_modules/${name}`];
-  if (locked?.optional !== true || locked?.inBundle === true ||
-      JSON.stringify(locked?.os) !== JSON.stringify([os]) ||
-      JSON.stringify(locked?.cpu) !== JSON.stringify([cpu])) {
-    findings.push(`${name}: lock entry must be optional, unbundled, and bound to ${os}/${cpu}`);
-  }
+if (optionalDependencyNames.length !== 0) {
+  findings.push("optionalDependencies are prohibited in the pure-JavaScript CLI package");
 }
 for (const section of ["dependencies", "optionalDependencies", "devDependencies"]) {
   for (const [name, version] of Object.entries(packageJson[section] ?? {})) {
@@ -110,12 +71,6 @@ for (const section of ["dependencies", "optionalDependencies", "devDependencies"
       }
     }
   }
-}
-
-function sameStringMap(left, right) {
-  const leftEntries = Object.entries(left).sort(([a], [b]) => a.localeCompare(b));
-  const rightEntries = Object.entries(right).sort(([a], [b]) => a.localeCompare(b));
-  return JSON.stringify(leftEntries) === JSON.stringify(rightEntries);
 }
 
 try {

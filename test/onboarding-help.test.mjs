@@ -4,7 +4,6 @@ import test from "node:test";
 
 import { API_KEYS_URL, SUPPORT_URL, memoryStreams, runCli, runtimeFeatureGates } from "../dist/index.js";
 import { FULL_HELP, SHORT_HELP } from "../dist/cli/help.js";
-import { NATIVE_PLATFORM_RELEASE_INDEX } from "../dist/credentials/native-platform-release-index.js";
 
 const platform = {
   kind: "linux",
@@ -117,7 +116,7 @@ test("per-command help is unchanged by the split", async () => {
   const cases = [
     [["machines", "create", "--help"], "machines create", "--memory-mib N"],
     [["agent-sessions", "create", "--help"], "agent-sessions create", "--workspace-generation N"],
-    [["doctor", "--help"], "doctor", "encrypted local\nsession-store state"],
+    [["doctor", "--help"], "doctor", "--check-browser-login"],
     [["claude", "--help"], "claude", "--agent-session ID"],
   ];
   for (const [argv, topic, fragment] of cases) {
@@ -158,37 +157,32 @@ test("the short help presents the composed journey without obsolete native or pr
       `${command} must not be listed as available`,
     );
   }
-  for (const command of ["claude", "codex", "openclaw", "connect"]) {
+  for (const command of ["claude", "codex", "openclaw", "opencode", "connect"]) {
     assert.ok(new RegExp(`^\\s{2}${command}\\b`, "mu").test(available), `${command} must be listed as available`);
   }
   const unavailable = SHORT_HELP.slice(SHORT_HELP.indexOf("Not available in this build:"));
   assert.ok(!unavailable.includes("native credential vault"), unavailable);
   assert.ok(!unavailable.includes("cuna login"), unavailable);
   assert.ok(!unavailable.includes("encrypted browser-link"), unavailable);
-  for (const command of ["claude", "codex", "openclaw", "connect"]) {
+  for (const command of ["claude", "codex", "openclaw", "opencode", "connect"]) {
     assert.ok(!unavailable.includes(command), `${command} must not be marked unavailable`);
   }
 });
 
-test("doctor help describes only the encrypted local session-store provider", async () => {
+test("doctor help distinguishes the encrypted local store from the opt-in remote browser-login probe", async () => {
   const { exit, record } = await helpFor(["doctor", "--help"]);
   assert.equal(exit, 0);
   const publicHelp = `${SHORT_HELP}\n${FULL_HELP}\n${record.data.help}`;
   assert.match(publicHelp, /encrypted local session-store state/u);
+  assert.match(record.data.help, /without network access by default/u);
+  assert.match(record.data.help, /--check-browser-login/u);
   assert.doesNotMatch(
     publicHelp,
-    /credential[- ]vault|credential manager|keychain|native (?:vault|credential|storage)|operating-system credential/iu,
+    /credential[- ]vault|credential manager|keychain|native|code[- ]signing|authenticode|operating-system credential/iu,
   );
 });
 
-test("the unavailability the short help claims is the unavailability this build has", () => {
-  // Derived from the authorities, not from the help text, so the help cannot go
-  // on claiming an outage after the build gains the capability.
-  //
-  // Interactive sign-in: the signed native release index is empty, so
-  // `createProductionNativeAuthBridges` fails closed before package resolution.
-  assert.equal(NATIVE_PLATFORM_RELEASE_INDEX.length, 0);
-
+test("the short help makes only local composition claims", () => {
   // The journey and foreground attach are local composition claims. Remote
   // capability and resource authority are re-proven per invocation.
   for (const platformName of ["windows", "macos", "linux"]) {
@@ -207,7 +201,7 @@ test("the unavailability the short help claims is the unavailability this build 
 });
 
 test("the short help points at doctor rather than asserting a platform list", () => {
-  // A static string cannot know the vault verdict, which is a runtime fact and
+  // A static string cannot know the encrypted-store verdict, which is a runtime fact and
   // is genuinely different on linux. Claiming a platform list here would be the
   // "universal claim from a partial set" this workspace keeps paying for.
   assert.ok(SHORT_HELP.includes("cuna doctor"), SHORT_HELP);
