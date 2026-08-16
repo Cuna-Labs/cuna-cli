@@ -60,6 +60,21 @@ try {
   validateSupportPolicy(await readJson(supportSource));
 
   const installPrefix = path.join(temporaryRoot, "install-prefix");
+  // npm's offline installer still needs a cached package manifest to resolve
+  // the tarball's exact runtime dependencies.  A clean CI runner has the
+  // dependency tarballs from `npm ci`, but not necessarily that manifest.
+  // Prime the cache from the locked direct dependency declarations before the
+  // offline-only installation check; the installation itself remains unable
+  // to use the network.
+  for (const [name, version] of Object.entries(packageJson.dependencies ?? {})) {
+    invariant(typeof version === "string" && /^\d+\.\d+\.\d+$/u.test(version), "Runtime dependency must be exactly pinned");
+    await runNpm(["cache", "add", "--ignore-scripts", "--no-audit", "--no-fund", `${name}@${version}`], {
+      cwd: repositoryRoot,
+      windowsHide: true,
+      timeout: 120_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+  }
   await runNpm(["install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--prefix", installPrefix, tarballSource], {
     windowsHide: true,
     timeout: 180_000,
