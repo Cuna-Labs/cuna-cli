@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "status": "UNCONFIGURED_BLOCKING",
+  "repository": "Cuna-Labs/cuna-cli",
+  "environment": "release-review-npm-preview",
+  "protectedRef": "main",
+  "requiredReviewer": {"type": "User", "id": 312749809, "login": "cunitacodeitor"},
+  "requirePreventSelfReview": true,
+  "requireAdminBypassDisabled": true,
+  "observedAdminBypass": true,
+  "requiredApprovalEvidence": "EXACT_APPROVER_ID_LOGIN_EVENT_AND_RUN_BINDING",
+  "blockers": [
+    "RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED",
+    "ACTUAL_ENVIRONMENT_APPROVAL_EVENT_NOT_OBSERVABLE_BY_WORKFLOW_TOKEN",
+    "CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE",
+    "CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE",
+    "CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED"
+  ]
+}

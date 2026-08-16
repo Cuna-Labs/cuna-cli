@@ -1,27 +1,38 @@
 {
-  "name": "@runa_laboratories/cli",
+  "name": "@cuna_labs/cli",
   "version": "0.1.0",
-  "description": "The official Runa command-line interface.",
+  "description": "The official Cuna command-line interface.",
   "type": "module",
   "bin": {
-    "runa": "./dist/bin/runa.js"
+    "cuna": "./dist/bin/cuna.js"
+  },
+  "exports": {
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "!dist/credentials/local-session-preview.*",
     "README.md",
     "LICENSE",
     "NOTICE",
     "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
-    "node": ">=22.17.1"
+    "node": "^22.17.1 || ^24.4.1"
   },
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/run-build-operation.mjs build",
     "lint": "oxlint --deny-warnings src test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test test/*.test.mjs",
-    "prepack": "npm run typecheck && npm test"
+    "test": "node scripts/run-build-operation.mjs test",
+    "contract:sync:infra": "node scripts/sync-infra-openapi.mjs",
+    "candidate:local": "node scripts/build-local-release-candidate.mjs",
+    "prepack": "npm run build"
   },
   "publishConfig": {
     "access": "public",
@@ -31,14 +42,14 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Runa-Laboratories/runa-cli.git"
+    "url": "git+https://github.com/Cuna-Labs/cuna-cli.git"
   },
   "bugs": {
-    "url": "https://github.com/Runa-Laboratories/runa-cli/issues"
+    "url": "https://github.com/Cuna-Labs/cuna-cli/issues"
   },
-  "homepage": "https://runacode.io",
+  "homepage": "https://getcuna.com",
   "keywords": [
-    "runa",
+    "cuna",
     "cli",
     "cloud-development",
     "claude-code",
@@ -47,7 +58,8 @@
   "devDependencies": {
     "@types/node": "^22.15.0",
     "oxlint": "1.77.0",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "yaml": "2.9.0"
   },
   "dependencies": {
     "@xterm/headless": "6.0.0"

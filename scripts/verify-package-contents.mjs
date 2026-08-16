@@ -4,10 +4,27 @@ import path from "node:path";
 import { invariant, parseArgs } from "./lib/release-evidence.mjs";
 
 const args = parseArgs(process.argv.slice(2));
-const tarball = path.resolve(args.get("tarball") ?? "");
+const tarballArgument = args.get("tarball");
+invariant(
+  typeof tarballArgument === "string" && tarballArgument.length > 0,
+  "--tarball is required",
+);
+const tarball = path.resolve(tarballArgument);
 const archive = gunzipSync(await readFile(tarball));
 const entries = [];
 const bundledDependencyRoot = "package/node_modules/@xterm/headless/";
+const MAX_ENTRY_COUNT = 2_048;
+const MAX_UNPACKED_BYTES = 8 * 1024 * 1024;
+const MAX_SOURCE_MAP_BYTES = 1024 * 1024;
+const PRODUCT_CREDENTIAL_ARTIFACT = /^package\/dist\/credentials\/(?:contracts|errors|index|local-session|secret-material|vault)\.(?:js|js\.map|d\.ts|d\.ts\.map)$/iu;
+// Kept compositionally so this verifier itself cannot become evidence that a
+// retired credential protocol remains in the packaged product.
+const RETIRED_HUMAN_AUTH_MARKERS = Object.freeze([
+  ["cuna_", "rt_"].join(""),
+  ["/v1/cli-auth/", "refresh"].join(""),
+  ["refresh_", "token"].join(""),
+  ["refresh_", "family_ttl_seconds"].join(""),
+]);
 
 function octal(buffer) {
   const text = buffer.toString("ascii").replaceAll("\0", "").trim();
@@ -28,6 +45,11 @@ for (let offset = 0; offset + 512 <= archive.length;) {
 }
 
 invariant(entries.length > 0, "npm tarball is empty or unreadable");
+invariant(entries.length <= MAX_ENTRY_COUNT, "npm tarball contains too many entries");
+invariant(
+  entries.reduce((total, entry) => total + entry.size, 0) <= MAX_UNPACKED_BYTES,
+  "npm tarball exceeds the admitted unpacked footprint",
+);
 const normalized = new Set();
 for (const entry of entries) {
   invariant(entry.name.startsWith("package/"), `Tar entry escapes package root: ${entry.name}`);
@@ -47,6 +69,10 @@ for (const entry of entries) {
     `Unexpected npm tarball content: ${entry.name}`,
   );
   if (entry.name.endsWith(".map")) {
+    invariant(
+      entry.size <= MAX_SOURCE_MAP_BYTES,
+      `Source map exceeds the admitted footprint: ${entry.name}`,
+    );
     let sourceMap;
     try {
       sourceMap = JSON.parse(entry.body.toString("utf8"));
@@ -64,6 +90,22 @@ for (const entry of entries) {
       `Source map exposes an absolute developer path: ${entry.name}`,
     );
   }
+  invariant(
+    !/\.(?:node|dll|dylib|so(?:\.\d+)*)$/iu.test(entry.name),
+    `Native binary payload is prohibited in the architecture-neutral root package; signed platform bridges must ship as separately governed artifacts: ${entry.name}`,
+  );
+  if (entry.name.startsWith("package/dist/credentials/")) {
+    invariant(
+      PRODUCT_CREDENTIAL_ARTIFACT.test(entry.name),
+      `Only the AES-GCM credential surface may ship in the public package: ${entry.name}`,
+    );
+  }
+  if (entry.name.startsWith("package/dist/") && /\.(?:js|d\.ts|map)$/iu.test(entry.name)) {
+    const emitted = entry.body.toString("utf8");
+    for (const retired of RETIRED_HUMAN_AUTH_MARKERS) {
+      invariant(!emitted.includes(retired), `Retired human-auth protocol marker ships in package: ${retired}`);
+    }
+  }
 }
 
 for (const required of ["package/package.json", "package/LICENSE", "package/NOTICE", "package/THIRD_PARTY_NOTICES.md", "package/README.md"]) {
@@ -71,18 +113,31 @@ for (const required of ["package/package.json", "package/LICENSE", "package/NOTI
 }
 const packageEntry = entries.find((entry) => entry.name === "package/package.json");
 const packageJson = JSON.parse(packageEntry.body.toString("utf8"));
-invariant(packageJson.name === "@runa_laboratories/cli", "Packed package identity differs");
+invariant(packageJson.name === "@cuna_labs/cli", "Packed package identity differs");
 invariant(packageJson.license === "Apache-2.0", "Packed package license differs");
+invariant(packageJson.engines?.node === "^22.17.1 || ^24.4.1", "Packed package Node support range differs");
+invariant(
+  packageJson.cpu === undefined,
+  "Packed package must not contain a CPU installation filter",
+);
+invariant(
+  JSON.stringify(packageJson.os) === JSON.stringify(["win32", "darwin", "linux"]),
+  "Packed package operating-system policy differs",
+);
 for (const script of ["preinstall", "install", "postinstall"]) {
   invariant(packageJson.scripts?.[script] === undefined, `Packed package contains prohibited ${script} lifecycle`);
 }
-invariant(typeof packageJson.bin?.runa === "string", "Packed package lacks runa bin");
+invariant(Object.keys(packageJson.bin ?? {}).length === 1 && typeof packageJson.bin?.cuna === "string", "Packed package lacks its sole cuna bin");
 invariant(
   JSON.stringify(packageJson.bundleDependencies) === JSON.stringify(["@xterm/headless"]),
   "Packed package must bundle the exact audited runtime dependency closure",
 );
-const binPath = `package/${packageJson.bin.runa.replace(/^\.\//, "")}`.toLowerCase();
-invariant(normalized.has(binPath), "Packed runa bin target is absent");
+invariant(
+  packageJson.optionalDependencies === undefined,
+  "Pure-JavaScript package must not declare an optional native dependency",
+);
+const binPath = `package/${packageJson.bin.cuna.replace(/^\.\//, "")}`.toLowerCase();
+invariant(normalized.has(binPath), "Packed cuna bin target is absent");
 
 const bundledManifest = entries.find((entry) => entry.name === `${bundledDependencyRoot}package.json`);
 invariant(bundledManifest !== undefined, "Bundled @xterm/headless manifest is absent");
@@ -90,6 +145,10 @@ const bundledPackageJson = JSON.parse(bundledManifest.body.toString("utf8"));
 invariant(bundledPackageJson.name === "@xterm/headless", "Bundled dependency identity differs");
 invariant(bundledPackageJson.version === "6.0.0", "Bundled dependency version differs");
 invariant(bundledPackageJson.license === "MIT", "Bundled dependency license differs");
+invariant(
+  bundledPackageJson.cpu === undefined && bundledPackageJson.os === undefined,
+  "Bundled runtime dependency must remain architecture-neutral",
+);
 for (const script of ["preinstall", "install", "postinstall"]) {
   invariant(bundledPackageJson.scripts?.[script] === undefined, `Bundled dependency contains prohibited ${script} lifecycle`);
 }

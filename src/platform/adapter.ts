@@ -3,7 +3,7 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 
-import { EXIT_CODES, RunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError } from "../core/errors.js";
 
 export type PlatformKind = "windows" | "macos" | "linux";
 
@@ -35,8 +35,9 @@ export function resolvePlatformKind(platform: NodeJS.Platform): PlatformKind {
   if (platform === "win32") return "windows";
   if (platform === "darwin") return "macos";
   if (platform === "linux") return "linux";
-  throw new RunaError({
-    code: "runa.platform.unsupported",
+  throw new CunaError({
+    code: "cuna.platform.unsupported",
+    hint: "Run `cuna doctor` to see which runtime features this platform provides.",
     message: `The ${platform} operating system is not supported.`,
     exitCode: EXIT_CODES.unsupported,
     details: { platform },
@@ -49,25 +50,25 @@ export function resolvePlatformPaths(input: PlatformEnvironment): PlatformPaths 
     const appData = input.env.APPDATA ?? win32.join(input.homeDirectory, "AppData", "Roaming");
     const localAppData = input.env.LOCALAPPDATA ?? win32.join(input.homeDirectory, "AppData", "Local");
     return Object.freeze({
-      configDirectory: win32.join(appData, "Runa"),
-      stateDirectory: win32.join(localAppData, "Runa", "State"),
-      runtimeDirectory: win32.join(localAppData, "Runa", "Runtime"),
+      configDirectory: win32.join(appData, "Cuna"),
+      stateDirectory: win32.join(localAppData, "Cuna", "State"),
+      runtimeDirectory: win32.join(localAppData, "Cuna", "Runtime"),
     });
   }
   if (kind === "macos") {
     return Object.freeze({
-      configDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Runa"),
-      stateDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Runa", "State"),
-      runtimeDirectory: posix.join(input.env.TMPDIR ?? "/tmp", `runa-${input.userId ?? "user"}`),
+      configDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Cuna"),
+      stateDirectory: posix.join(input.homeDirectory, "Library", "Application Support", "Cuna", "State"),
+      runtimeDirectory: posix.join(input.env.TMPDIR ?? "/tmp", `cuna-${input.userId ?? "user"}`),
     });
   }
   const configRoot = input.env.XDG_CONFIG_HOME ?? posix.join(input.homeDirectory, ".config");
   const stateRoot = input.env.XDG_STATE_HOME ?? posix.join(input.homeDirectory, ".local", "state");
   const runtimeRoot = input.env.XDG_RUNTIME_DIR ?? posix.join(input.homeDirectory, ".local", "run");
   return Object.freeze({
-    configDirectory: posix.join(configRoot, "runa"),
-    stateDirectory: posix.join(stateRoot, "runa"),
-    runtimeDirectory: posix.join(runtimeRoot, "runa"),
+    configDirectory: posix.join(configRoot, "cuna"),
+    stateDirectory: posix.join(stateRoot, "cuna"),
+    runtimeDirectory: posix.join(runtimeRoot, "cuna"),
   });
 }
 
@@ -98,17 +99,17 @@ async function readSafeConfig(
     if (Buffer.byteLength(text, "utf8") > maximumBytes) throw configFileError("oversized");
     return Object.freeze({ exists: true, text });
   } catch (error) {
-    if (error instanceof RunaError) throw error;
+    if (error instanceof CunaError) throw error;
     throw configFileError("unreadable", error);
   } finally {
     await handle.close();
   }
 }
 
-function configFileError(reason: string, cause?: unknown): RunaError {
-  return new RunaError({
-    code: "runa.config.unsafe_file",
-    message: "The Runa configuration file is unavailable or unsafe.",
+function configFileError(reason: string, cause?: unknown): CunaError {
+  return new CunaError({
+    code: "cuna.config.unsafe_file",
+    message: "The Cuna configuration file is unavailable or unsafe.",
     exitCode: EXIT_CODES.policy,
     hint: "Fix the user-owned configuration file permissions or select a safe file explicitly.",
     details: { reason },

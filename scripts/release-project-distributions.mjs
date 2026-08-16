@@ -3,12 +3,11 @@ import path from "node:path";
 
 import { parseArgs, readJson, sha256File } from "./lib/release-evidence.mjs";
 import {
-  CHANNEL_DEFINITIONS,
-  CHANNEL_ORDER,
+  DISTRIBUTION_SCHEMA_VERSION,
   DISTRIBUTION_MANIFEST_FILE,
   RELEASE_ENVIRONMENT,
   RELEASE_WORKFLOW,
-  immutableCommands,
+  candidateInvocations,
   validateDistributionManifest,
   verifyDistributionInputs,
 } from "./release-distribution-lib.mjs";
@@ -19,14 +18,17 @@ const evidenceRoot = path.resolve(repositoryRoot, args.get("evidence") ?? "relea
 const outputRoot = path.resolve(repositoryRoot, args.get("output") ?? "release-artifacts/distributions");
 const envelopeFile = path.join(evidenceRoot, "release-envelope.json");
 const envelope = await readJson(envelopeFile);
-await verifyDistributionInputs(envelope, evidenceRoot);
+const { channelDefinitions, channelOrder } = await verifyDistributionInputs(envelope, evidenceRoot);
 
-const commands = immutableCommands(envelope.version);
+const commands = candidateInvocations(envelope.version, channelDefinitions);
 const replacements = new Map([
   ["@@VERSION@@", envelope.version],
   ["@@AUR_VERSION@@", envelope.version.replaceAll("-", "_")],
   ["@@TARBALL_URL@@", envelope.tarball.url],
   ["@@TARBALL_SHA256@@", envelope.tarball.sha256],
+  ["@@PAYLOAD_SHA256@@", envelope.identities.payloadSha256],
+  ["@@HOMEBREW_NODE_FORMULA@@", channelDefinitions.homebrew.runtimeDependency],
+  ["@@AUR_NODE_DEPENDENCY@@", channelDefinitions.aur.runtimeDependency],
 ]);
 
 async function writeExclusive(relative, content, mode = undefined) {
@@ -47,13 +49,13 @@ async function render(templateRelative, outputRelative, mode = undefined) {
 
 const outputs = new Map();
 outputs.set(
-  CHANNEL_DEFINITIONS.npm.projectionFile,
+  channelDefinitions.npm.projectionFile,
   await writeExclusive(
-    CHANNEL_DEFINITIONS.npm.projectionFile,
+    channelDefinitions.npm.projectionFile,
     [
-      "# Generated from an admitted Runa CLI release envelope. Do not edit.",
-      `public_command=${CHANNEL_DEFINITIONS.npm.publicCommand}`,
-      `immutable_command=${commands.npm}`,
+      "# Generated from a candidate-bound Cuna CLI release envelope. Do not edit.",
+      `public_command=${channelDefinitions.npm.publicCommand}`,
+      `candidate_invocation=${commands.npm}`,
       `package=${envelope.packageName}`,
       `version=${envelope.version}`,
       `registry=${envelope.registry}`,
@@ -66,13 +68,13 @@ outputs.set(
   ),
 );
 outputs.set(
-  CHANNEL_DEFINITIONS.bun.projectionFile,
+  channelDefinitions.bun.projectionFile,
   await writeExclusive(
-    CHANNEL_DEFINITIONS.bun.projectionFile,
+    channelDefinitions.bun.projectionFile,
     [
-      "# Generated from an admitted Runa CLI release envelope. Do not edit.",
-      `public_command=${CHANNEL_DEFINITIONS.bun.publicCommand}`,
-      `immutable_command=${commands.bun}`,
+      "# Generated from a candidate-bound Cuna CLI release envelope. Do not edit.",
+      `public_command=${channelDefinitions.bun.publicCommand}`,
+      `candidate_invocation=${commands.bun}`,
       `package=${envelope.packageName}`,
       `version=${envelope.version}`,
       `registry=${envelope.registry}`,
@@ -80,28 +82,36 @@ outputs.set(
       "installer_of_record=bun",
       "artifact_channel=npm",
       "availability=PROJECTED_NOT_PUBLISHED",
+      `supported_platforms=${channelDefinitions.bun.platforms.join(",")}`,
+      `blocked_platforms=${channelDefinitions.bun.blockedPlatforms.map(({ platform }) => platform).join(",")}`,
+      `windows_availability=${channelDefinitions.bun.blockedPlatforms[0].availability}`,
+      `windows_block_reason=${channelDefinitions.bun.blockedPlatforms[0].reasonCode}`,
+      `verified_affected_bun_versions=${channelDefinitions.bun.blockedPlatforms[0].verifiedAffectedVersions.join(",")}`,
+      `upstream_source=${channelDefinitions.bun.blockedPlatforms[0].upstreamRepository}@${channelDefinitions.bun.blockedPlatforms[0].upstreamCommit}`,
+      `windows_fallback_command=${channelDefinitions.npm.publicCommand}`,
+      `windows_readmission_gate=${channelDefinitions.bun.blockedPlatforms[0].readmissionGate}`,
       "",
     ].join("\n"),
   ),
 );
 outputs.set(
-  CHANNEL_DEFINITIONS.curl.projectionFile,
-  await render("packaging/templates/install.sh.template", CHANNEL_DEFINITIONS.curl.projectionFile, 0o555),
+  channelDefinitions.curl.projectionFile,
+  await render("packaging/templates/install.sh.template", channelDefinitions.curl.projectionFile, 0o555),
 );
 outputs.set(
-  CHANNEL_DEFINITIONS.homebrew.projectionFile,
-  await render("packaging/templates/homebrew/runa.rb.template", CHANNEL_DEFINITIONS.homebrew.projectionFile),
+  channelDefinitions.homebrew.projectionFile,
+  await render("packaging/templates/homebrew/cuna.rb.template", channelDefinitions.homebrew.projectionFile),
 );
 outputs.set(
-  CHANNEL_DEFINITIONS.aur.projectionFile,
-  await render("packaging/templates/aur/PKGBUILD.template", CHANNEL_DEFINITIONS.aur.projectionFile),
+  channelDefinitions.aur.projectionFile,
+  await render("packaging/templates/aur/PKGBUILD.template", channelDefinitions.aur.projectionFile),
 );
 
 const files = {};
 for (const [relative, absolute] of outputs) files[relative] = await sha256File(absolute);
 
 const manifest = {
-  schemaVersion: 2,
+  schemaVersion: DISTRIBUTION_SCHEMA_VERSION,
   releaseEnvelope: {
     file: "release-envelope.json",
     sha256: await sha256File(envelopeFile),
@@ -128,16 +138,22 @@ const manifest = {
     expectedEnvironment: RELEASE_ENVIRONMENT,
     longLivedTokenAllowed: false,
   },
-  channels: CHANNEL_ORDER.map((id) => {
-    const definition = CHANNEL_DEFINITIONS[id];
+  channels: channelOrder.map((id) => {
+    const definition = channelDefinitions[id];
     return {
       id,
       role: definition.role,
-      availability: "PROJECTED_NOT_PUBLISHED",
+      availability: definition.availability,
+      artifactChannel: definition.artifactChannel,
       installerOfRecord: definition.installerOfRecord,
+      runtimeDependency: definition.runtimeDependency,
       platforms: [...definition.platforms],
+      blockedPlatforms: definition.blockedPlatforms.map((blocked) => ({
+        ...blocked,
+        verifiedAffectedVersions: [...blocked.verifiedAffectedVersions],
+      })),
       publicCommand: definition.publicCommand,
-      immutableCommand: commands[id],
+      candidateInvocation: commands[id],
       artifactSha256: envelope.tarball.sha256,
       projection: { file: definition.projectionFile, sha256: files[definition.projectionFile] },
       liveEvidenceReceipt: null,
@@ -156,6 +172,9 @@ const manifest = {
     decision: "BLOCKED",
     blockers: [
       "PUBLISHED_NPM_TARBALL_AND_PROVENANCE_NOT_VERIFIED",
+      "SIGNED_PLATFORM_CREDENTIAL_BROWSER_BRIDGES_MISSING",
+      "WINDOWS_OWNED_PROCESS_HANDLE_IDENTITY_AUTHORITY_MISSING",
+      "BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS",
       "CHANNEL_INSTALL_RECEIPTS_MISSING",
       "ROLLBACK_OR_FIXED_FORWARD_REHEARSAL_MISSING",
       "OBSERVATION_THRESHOLDS_AND_TELEMETRY_MISSING",
@@ -164,7 +183,7 @@ const manifest = {
   },
 };
 
-validateDistributionManifest(manifest, envelope);
+validateDistributionManifest(manifest, envelope, channelDefinitions);
 await writeFile(path.join(outputRoot, DISTRIBUTION_MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
 process.stdout.write(
   `${JSON.stringify({
@@ -172,6 +191,6 @@ process.stdout.write(
     decision: manifest.readiness.decision,
     version: envelope.version,
     tarballSha256: envelope.tarball.sha256,
-    channels: CHANNEL_ORDER,
+      channels: channelOrder,
   })}\n`,
 );

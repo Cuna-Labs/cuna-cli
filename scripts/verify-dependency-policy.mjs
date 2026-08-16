@@ -40,10 +40,8 @@ for (const [location, entry] of Object.entries(lock.packages)) {
 }
 
 const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
-const runtimeDependencyNames = [
-  ...Object.keys(packageJson.dependencies ?? {}),
-  ...Object.keys(packageJson.optionalDependencies ?? {}),
-].sort();
+const runtimeDependencyNames = Object.keys(packageJson.dependencies ?? {}).sort();
+const optionalDependencyNames = Object.keys(packageJson.optionalDependencies ?? {}).sort();
 const bundledDependencyNames = Array.isArray(packageJson.bundleDependencies)
   ? [...packageJson.bundleDependencies].sort()
   : [];
@@ -51,6 +49,10 @@ if (JSON.stringify(bundledDependencyNames) !== JSON.stringify(runtimeDependencyN
   findings.push(
     `bundleDependencies must equal the exact runtime dependency closure: expected ${runtimeDependencyNames.join(", ") || "<empty>"}`,
   );
+}
+
+if (optionalDependencyNames.length !== 0) {
+  findings.push("optionalDependencies are prohibited in the pure-JavaScript CLI package");
 }
 for (const section of ["dependencies", "optionalDependencies", "devDependencies"]) {
   for (const [name, version] of Object.entries(packageJson[section] ?? {})) {
@@ -62,8 +64,10 @@ for (const section of ["dependencies", "optionalDependencies", "devDependencies"
       const locked = lock.packages[`node_modules/${name}`];
       if (locked === undefined || locked.version !== version) {
         findings.push(`${section}.${name}: lock entry does not match exact runtime version ${version}`);
-      } else if (locked.inBundle !== true) {
+      } else if (section === "dependencies" && locked.inBundle !== true) {
         findings.push(`${section}.${name}: runtime dependency is not marked as bundled in package-lock.json`);
+      } else if (section === "optionalDependencies" && locked.inBundle === true) {
+        findings.push(`${section}.${name}: platform optional dependency must not be bundled in the root tarball`);
       }
     }
   }

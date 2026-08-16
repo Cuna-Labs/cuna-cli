@@ -2,21 +2,22 @@ import type { HttpTransport } from "../api/http.js";
 import { encodePublicId } from "../core/validation.js";
 import {
   decodeCliAuthBootstrap,
+  decodeCliSignupCapability,
   decodeCliContinuationIssued,
-  decodeCliContinuationStatus,
   decodeCliIdentityContext,
-  decodeCliTokenSet,
+  decodeCliLoginCodeExchangeResult,
   decodeRevocation,
   type CliAuthBootstrap,
+  type CliSignupCapability,
   type CliContinuationIssued,
-  type CliContinuationStatus,
   type CliIdentityContext,
   type CliIntentClass,
-  type CliTokenSet,
+  type CliLoginCodeExchangeResult,
 } from "./human-contracts.js";
 
 export interface HumanAuthClient {
   bootstrap(signal?: AbortSignal): Promise<CliAuthBootstrap>;
+  signupCapability(signal?: AbortSignal): Promise<CliSignupCapability>;
   createContinuation(input: {
     readonly state: string;
     readonly codeChallenge: string;
@@ -27,27 +28,22 @@ export interface HumanAuthClient {
     readonly browserOrigin: string;
     readonly signal?: AbortSignal;
   }): Promise<CliContinuationIssued>;
-  continuation(input: {
-    readonly id: string;
-    readonly secret: string;
-    readonly signal?: AbortSignal;
-  }): Promise<CliContinuationStatus>;
-  cancel(input: { readonly id: string; readonly secret: string; readonly signal?: AbortSignal }): Promise<CliContinuationStatus>;
   exchange(input: {
     readonly id: string;
-    readonly continuationSecret: string;
+    readonly clientInstanceId: string;
+    readonly profile: string;
     readonly state: string;
     readonly codeVerifier: string;
     readonly redirectUri: string;
+    readonly loginCode: string;
+    /**
+     * A durable-code re-exchange must preserve the server-issued code expiry.
+     * It is optional for the first browser exchange because no local record
+     * exists yet to bind against.
+     */
+    readonly expectedLoginCodeExpiresAt?: string;
     readonly signal?: AbortSignal;
-  }): Promise<CliTokenSet>;
-  refresh(input: {
-    readonly refreshToken: string;
-    readonly clientInstanceId: string;
-    readonly profile: string;
-    readonly idempotencyKey: string;
-    readonly signal?: AbortSignal;
-  }): Promise<CliTokenSet>;
+  }): Promise<CliLoginCodeExchangeResult>;
   context(accessToken: string, signal?: AbortSignal): Promise<CliIdentityContext>;
   logout(accessToken: string, signal?: AbortSignal): Promise<true>;
 }
@@ -60,6 +56,13 @@ export function createHumanAuthClient(input: {
     async bootstrap(signal) {
       return decodeCliAuthBootstrap(await input.anonymous.request({
         method: "GET", path: "/v1/cli-auth/bootstrap", ...(signal === undefined ? {} : { signal }),
+      }));
+    },
+    async signupCapability(signal) {
+      return decodeCliSignupCapability(await input.anonymous.request({
+        method: "GET",
+        path: "/v1/cli-auth/signup-capability",
+        ...(signal === undefined ? {} : { signal }),
       }));
     },
     async createContinuation(request) {
@@ -78,50 +81,21 @@ export function createHumanAuthClient(input: {
       });
       return decodeCliContinuationIssued(response, { browserOrigin: request.browserOrigin, state: request.state });
     },
-    async continuation(request) {
-      const id = encodePublicId(request.id, "continuation ID");
-      return decodeCliContinuationStatus(await input.anonymous.request({
-        method: "GET",
-        path: `/v1/cli-auth/continuations/${id}`,
-        continuationSecret: request.secret,
-        ...(request.signal === undefined ? {} : { signal: request.signal }),
-      }), request.id);
-    },
-    async cancel(request) {
-      const id = encodePublicId(request.id, "continuation ID");
-      return decodeCliContinuationStatus(await input.anonymous.request({
-        method: "POST",
-        path: `/v1/cli-auth/continuations/${id}/cancel`,
-        continuationSecret: request.secret,
-        ...(request.signal === undefined ? {} : { signal: request.signal }),
-      }), request.id);
-    },
     async exchange(request) {
       const id = encodePublicId(request.id, "continuation ID");
-      return decodeCliTokenSet(await input.anonymous.request({
+      return decodeCliLoginCodeExchangeResult(await input.anonymous.request({
         method: "POST",
         path: `/v1/cli-auth/continuations/${id}/exchange`,
         body: {
-          continuation_secret: request.continuationSecret,
+          login_code: request.loginCode,
+          client_instance_id: request.clientInstanceId,
+          profile: request.profile,
           state: request.state,
           code_verifier: request.codeVerifier,
           redirect_uri: request.redirectUri,
         },
         ...(request.signal === undefined ? {} : { signal: request.signal }),
-      }));
-    },
-    async refresh(request) {
-      return decodeCliTokenSet(await input.anonymous.request({
-        method: "POST",
-        path: "/v1/cli-auth/refresh",
-        idempotencyKey: request.idempotencyKey,
-        body: {
-          refresh_token: request.refreshToken,
-          client_instance_id: request.clientInstanceId,
-          profile: request.profile,
-        },
-        ...(request.signal === undefined ? {} : { signal: request.signal }),
-      }));
+      }), request.loginCode, request.expectedLoginCodeExpiresAt);
     },
     async context(accessToken, signal) {
       return decodeCliIdentityContext(await input.authenticated(accessToken).request({

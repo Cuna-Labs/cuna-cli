@@ -2,15 +2,16 @@ import type { AppbarModel, TruthProjection } from "./appbar.js";
 import type { ViewportSnapshot } from "./viewport.js";
 
 const ESC = "\u001b[";
-const RUNA_ORANGE = "48;2;235;86;37";
-const RUNA_ORANGE_DARK = "48;2;121;48;25";
+const CUNA_ORANGE = "48;2;235;86;37";
+const CUNA_ORANGE_DARK = "48;2;121;48;25";
 const WHITE = "38;2;255;255;255";
 const MUTED = "38;2;224;210;203";
+const GRAPHEME_SEGMENTER = new Intl.Segmenter("en", { granularity: "grapheme" });
 
 export interface WorkbenchTab {
   readonly id: string;
   readonly label: string;
-  readonly agent: "claude-code" | "codex" | "openclaw" | "shell";
+  readonly agent: "claude-code" | "codex" | "openclaw" | "opencode" | "shell";
   readonly viewport: ViewportSnapshot;
 }
 
@@ -20,6 +21,7 @@ export interface WorkbenchFrameInput {
   readonly activeTabId: string;
   readonly tabs: readonly WorkbenchTab[];
   readonly appbar: AppbarModel;
+  readonly notice?: string;
   readonly color?: boolean;
 }
 
@@ -56,12 +58,17 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
   const appbarRows = input.rows >= 5 ? 2 : 1;
   const viewportRows = input.rows - appbarRows;
   const lines = appbarRows === 2
-    ? [renderTabs(input.tabs, input.activeTabId, input.columns), renderTruth(input.appbar, input.columns)]
-    : [renderCompact(input.tabs, input.activeTabId, input.appbar, input.columns)];
+    ? [
+        renderTabs(input.tabs, input.activeTabId, input.columns),
+        input.notice === undefined ? renderTruth(input.appbar, input.columns) : truncate(` ${safeText(input.notice)}`, input.columns),
+      ]
+    : [input.notice === undefined
+        ? renderCompact(input.tabs, input.activeTabId, input.appbar, input.columns)
+        : truncate(` CUNA  ${safeText(input.notice)}`, input.columns)];
   const color = input.color !== false;
   let text = `${ESC}?25l${ESC}H`;
   for (let index = 0; index < lines.length; index += 1) {
-    const background = index === 0 ? RUNA_ORANGE : RUNA_ORANGE_DARK;
+    const background = index === 0 ? CUNA_ORANGE : CUNA_ORANGE_DARK;
     text += `${ESC}${index + 1};1H${color ? `${ESC}${background}m${ESC}${index === 0 ? WHITE : MUTED}m` : ""}`;
     text += padLine(lines[index] ?? "", input.columns);
     if (color) text += `${ESC}0m`;
@@ -87,7 +94,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
 }
 
 function renderTabs(tabs: readonly WorkbenchTab[], activeTabId: string, columns: number): string {
-  const parts = [" RUNA"];
+  const parts = [" CUNA"];
   for (let index = 0; index < tabs.length; index += 1) {
     const tab = tabs[index];
     if (tab === undefined) continue;
@@ -108,7 +115,7 @@ function renderTruth(model: AppbarModel, columns: number): string {
   ];
   if (model.cost !== undefined) values.push(metric("cost", model.cost, (value) => `$${value.toFixed(2)}`));
   if (model.tokensSaved !== undefined) values.push(metric("tokens saved", model.tokensSaved, String));
-  return truncate(` ${values.join("  ·  ")}`, columns);
+  return truncate(` ${values.join("  \u00b7  ")}`, columns);
 }
 
 function renderCompact(
@@ -119,7 +126,7 @@ function renderCompact(
 ): string {
   const active = tabs.find((tab) => tab.id === activeTabId);
   const identity = active === undefined ? "session" : `${agentLabel(active.agent)} ${safeText(active.label)}`;
-  return truncate(` RUNA  ${identity}  ·  ${projection("terminal", model.attachment)}  ·  ${projection("auth", model.providerAuthentication)}`, columns);
+  return truncate(` CUNA  ${identity}  \u00b7  ${projection("terminal", model.attachment)}  \u00b7  ${projection("auth", model.providerAuthentication)}`, columns);
 }
 
 function projection(label: string, value: TruthProjection<string>): string {
@@ -139,28 +146,64 @@ function agentLabel(agent: WorkbenchTab["agent"]): string {
     case "claude-code": return "Claude";
     case "codex": return "Codex";
     case "openclaw": return "OpenClaw";
+    case "opencode": return "OpenCode";
     case "shell": return "Shell";
   }
 }
 
 function safeText(value: string): string {
-  let safe = "";
-  for (const character of value.normalize("NFC")) {
-    const point = character.codePointAt(0);
-    if (point === undefined || point <= 0x1f || (point >= 0x7f && point <= 0x9f)) continue;
-    safe += character;
-  }
+  const safe = value.normalize("NFC").replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, "");
   return safe.replace(/\s+/gu, " ").trim();
 }
 
 function truncate(value: string, columns: number): string {
-  const characters = [...value];
-  return characters.length <= columns ? value : characters.slice(0, columns).join("");
+  let result = "";
+  let width = 0;
+  for (const item of GRAPHEME_SEGMENTER.segment(value)) {
+    const nextWidth = graphemeCellWidth(item.segment);
+    if (width + nextWidth > columns) break;
+    result += item.segment;
+    width += nextWidth;
+  }
+  return result;
 }
 
 function padLine(value: string, columns: number): string {
   const truncated = truncate(value, columns);
-  return truncated + " ".repeat(Math.max(0, columns - [...truncated].length));
+  return truncated + " ".repeat(Math.max(0, columns - displayCellWidth(truncated)));
+}
+
+function displayCellWidth(value: string): number {
+  let width = 0;
+  for (const item of GRAPHEME_SEGMENTER.segment(value)) width += graphemeCellWidth(item.segment);
+  return width;
+}
+
+function graphemeCellWidth(value: string): number {
+  if (/^[\p{M}\p{Cf}]*$/u.test(value)) return 0;
+  if (/\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u.test(value)) return 2;
+  for (const character of value) {
+    const point = character.codePointAt(0);
+    if (point !== undefined && isWideCodePoint(point)) return 2;
+  }
+  return 1;
+}
+
+function isWideCodePoint(point: number): boolean {
+  return (
+    point >= 0x1100 && (
+      point <= 0x115f ||
+      point === 0x2329 || point === 0x232a ||
+      (point >= 0x2e80 && point <= 0xa4cf && point !== 0x303f) ||
+      (point >= 0xac00 && point <= 0xd7a3) ||
+      (point >= 0xf900 && point <= 0xfaff) ||
+      (point >= 0xfe10 && point <= 0xfe19) ||
+      (point >= 0xfe30 && point <= 0xfe6f) ||
+      (point >= 0xff00 && point <= 0xff60) ||
+      (point >= 0xffe0 && point <= 0xffe6) ||
+      (point >= 0x20000 && point <= 0x3fffd)
+    )
+  );
 }
 
 function assertViewportCell(value: string, displayWidth: number, columns: number): void {

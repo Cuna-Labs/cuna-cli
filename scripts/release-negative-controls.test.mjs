@@ -1,27 +1,30 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { sha256File, validateEnvelope } from "./lib/release-evidence.mjs";
 import { syntheticReleaseInputs } from "./lib/release-test-fixture.mjs";
 import { releaseInputIdentities } from "./lib/release-inputs.mjs";
+import { validateSupportPolicy } from "./release-distribution-lib.mjs";
+import { TestResourceLedger } from "../test/support/test-resource-ledger.mjs";
 
 const execute = promisify(execFile);
 const repositoryRoot = path.resolve(new URL("..", import.meta.url).pathname.replace(/^\/(?:[A-Za-z]:)/, (value) => value.slice(1)));
+const resources = new TestResourceLedger();
+test.after(() => resources.cleanup());
 
 const valid = {
   schemaVersion: 2,
-  packageName: "@runa_laboratories/cli",
+  packageName: "@cuna_labs/cli",
   version: "1.2.3-preview.1",
   sourceCommit: "b".repeat(40),
-  repository: "Runa-Laboratories/runa-cli",
+  repository: "Cuna-Labs/cuna-cli",
   registry: "https://registry.npmjs.org",
   tarball: {
-    file: "runa.tgz",
-    url: "https://registry.npmjs.org/@runa_laboratories/cli/-/cli-1.2.3-preview.1.tgz",
+    file: "cuna.tgz",
+    url: "https://registry.npmjs.org/@cuna_labs/cli/-/cli-1.2.3-preview.1.tgz",
     sha256: "a".repeat(64),
     size: 1,
   },
@@ -48,7 +51,7 @@ const valid = {
 
 test("release envelope rejects a mutable source URL", () => {
   const candidate = structuredClone(valid);
-  candidate.tarball.url = "https://github.com/Runa-Laboratories/runa-cli/archive/refs/heads/main.tar.gz";
+  candidate.tarball.url = "https://github.com/Cuna-Labs/cuna-cli/archive/refs/heads/main.tar.gz";
   assert.throws(() => validateEnvelope(candidate), /canonical exact-version npm URL/);
 });
 
@@ -73,8 +76,21 @@ test("release envelope v1 is never admissible", () => {
   assert.throws(() => validateEnvelope(legacy), /Unsupported release-envelope schema/);
 });
 
+test("package verifier requires an explicit tarball instead of reading the repository directory", async () => {
+  await assert.rejects(
+    execute(process.execPath, ["scripts/verify-package-contents.mjs"], {
+      cwd: repositoryRoot,
+    }),
+    (error) => {
+      assert.match(String(error.stderr), /--tarball is required/u);
+      assert.doesNotMatch(String(error.stderr), /EISDIR/u);
+      return true;
+    },
+  );
+});
+
 test("digest changes when projection bytes are substituted", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "runa-digest-test-"));
+  const root = await resources.createTempDirectory("cuna-digest-test-");
   const file = path.join(root, "projection");
   await writeFile(file, "approved");
   const before = await sha256File(file);
@@ -90,22 +106,51 @@ test("curl template verifies before installing and suppresses lifecycle scripts"
   assert.doesNotMatch(template, /eval\s/);
 });
 
+test("CI cannot remove or bypass the Bun Windows cleanup block", async () => {
+  const policy = JSON.parse(await readFile(path.join(repositoryRoot, "packaging", "support-policy.json"), "utf8"));
+  assert.deepEqual(policy.channels.bun.platforms, ["linux-x64", "darwin-x64"]);
+  assert.equal(policy.channels.bun.blockedPlatforms[0].platform, "win32-x64");
+  assert.equal(policy.channels.bun.blockedPlatforms[0].fallbackChannel, "npm");
+  assert.ok(policy.channels.npm.platforms.includes("win32-x64"));
+
+  const erased = structuredClone(policy);
+  erased.channels.bun.blockedPlatforms = [];
+  assert.throws(
+    () => validateSupportPolicy(erased),
+    /Bun Windows block differs from the verified upstream defect and re-admission gate/,
+  );
+
+  const bypassed = structuredClone(policy);
+  bypassed.channels.bun.platforms.push("win32-x64");
+  assert.throws(
+    () => validateSupportPolicy(bypassed),
+    /cannot be both supported and blocked/,
+  );
+});
+
 test("all projections bind the envelope and reject later byte substitution", async () => {
-  const evidence = await mkdtemp(path.join(tmpdir(), "runa-projection-evidence-"));
-  const legacyOutput = await mkdtemp(path.join(tmpdir(), "runa-projection-legacy-"));
-  const authoritativeOutput = await mkdtemp(path.join(tmpdir(), "runa-projection-authoritative-"));
-  await writeFile(path.join(evidence, "runa.tgz"), "candidate");
+  const evidence = await resources.createTempDirectory("cuna-projection-evidence-");
+  const legacyOutput = await resources.createTempDirectory("cuna-projection-legacy-");
+  const authoritativeOutput = await resources.createTempDirectory("cuna-projection-authoritative-");
+  await writeFile(path.join(evidence, "cuna.tgz"), "candidate");
   await writeFile(path.join(evidence, "sbom.json"), `${JSON.stringify({
     bomFormat: "CycloneDX",
     specVersion: "1.6",
     version: 1,
-    metadata: { component: { type: "application", name: "@runa_laboratories/cli", version: valid.version } },
+    metadata: {
+      component: {
+        type: "application",
+        name: "@cuna_labs/cli",
+        version: valid.version,
+        purl: `pkg:npm/%40cuna_labs/cli@${valid.version}`,
+      },
+    },
   })}\n`);
   await writeFile(path.join(evidence, "support.json"), await readFile(path.join(repositoryRoot, "packaging", "support-policy.json")));
   const envelope = structuredClone(valid);
   const releaseInputs = syntheticReleaseInputs({ version: valid.version, sourceCommit: valid.sourceCommit });
   await writeFile(path.join(evidence, "release-inputs.json"), `${JSON.stringify(releaseInputs)}\n`);
-  envelope.tarball.sha256 = await sha256File(path.join(evidence, "runa.tgz"));
+  envelope.tarball.sha256 = await sha256File(path.join(evidence, "cuna.tgz"));
   envelope.tarball.size = 9;
   envelope.sbom.sha256 = await sha256File(path.join(evidence, "sbom.json"));
   envelope.supportPolicy.sha256 = await sha256File(path.join(evidence, "support.json"));
@@ -143,7 +188,7 @@ test("all projections bind the envelope and reject later byte substitution", asy
     "npm/install-command.txt",
     "bun/install-command.txt",
     "curl/install.sh",
-    "homebrew/runa.rb",
+    "homebrew/cuna.rb",
     "aur/PKGBUILD",
   ]) {
     assert.equal(

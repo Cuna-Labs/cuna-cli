@@ -1,20 +1,94 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runacode.io/schemas/runa-cli-distribution-receipt-v2.json",
-  "title": "Runa CLI installed-distribution receipt",
+  "$id": "https://getcuna.com/schemas/cuna-cli-distribution-receipt-v3.json",
+  "title": "Cuna CLI pre-publication typed distribution observation attestation",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "channel", "distributionManifestSha256", "candidate", "projectionSha256", "runtimeIdentity", "checks", "evidence", "observer", "observedAt"],
+  "required": ["schemaVersion", "attestation", "attestationSha256", "releaseEligible"],
   "properties": {
-    "schemaVersion": {"const": 2},
-    "channel": {"enum": ["npm", "bun", "curl", "homebrew", "aur"]},
-    "distributionManifestSha256": {"$ref": "#/$defs/sha256"},
+    "schemaVersion": {"const": 3},
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statement", "statementSha256", "signingEvidence"],
+      "properties": {
+        "statement": {"$ref": "#/$defs/statement"},
+        "statementSha256": {"$ref": "#/$defs/sha256"},
+        "signingEvidence": {"$ref": "#/$defs/signingEvidence"}
+      }
+    },
+    "attestationSha256": {"$ref": "#/$defs/sha256"},
+    "releaseEligible": {"const": false}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "statement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "predicateType", "issuer", "subject", "hostPolicy", "candidate", "runtimeIdentity", "execution", "observations", "observationsSha256", "observedAt"],
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "predicateType": {"const": "https://getcuna.com/attestations/cuna-cli-distribution-observation/v1"},
+        "issuer": {"$ref": "#/$defs/issuer"},
+        "subject": {"$ref": "#/$defs/subject"},
+        "hostPolicy": {"$ref": "#/$defs/hostPolicy"},
+        "candidate": {"$ref": "#/$defs/candidate"},
+        "runtimeIdentity": {"$ref": "#/$defs/runtimeIdentity"},
+        "execution": {"$ref": "#/$defs/execution"},
+        "observations": {"$ref": "#/$defs/observations"},
+        "observationsSha256": {"$ref": "#/$defs/sha256"},
+        "observedAt": {"type": "string", "format": "date-time"}
+      }
+    },
+    "issuer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "repository", "workflow", "workflowRef", "sourceRef", "sourceCommit", "runId", "runAttempt"],
+      "properties": {
+        "provider": {"const": "github-actions"},
+        "repository": {"const": "Cuna-Labs/cuna-cli"},
+        "workflow": {"const": ".github/workflows/release.yml"},
+        "workflowRef": {"const": "Cuna-Labs/cuna-cli/.github/workflows/release.yml@refs/heads/main"},
+        "sourceRef": {"type": "string", "pattern": "^refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"},
+        "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "runId": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "runAttempt": {"type": "integer", "minimum": 1}
+      }
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receiptId", "channel", "platform", "architecture", "node", "distributionManifestSha256", "candidatePayloadSha256", "projectionSha256"],
+      "properties": {
+        "receiptId": {"type": "string", "pattern": "^(npm|bun|curl|homebrew|aur)-(linux|darwin|win32)-x64-node(22\\.17\\.1|24\\.4\\.1)$"},
+        "channel": {"enum": ["npm", "bun", "curl", "homebrew", "aur"]},
+        "platform": {"enum": ["linux", "darwin", "win32"]},
+        "architecture": {"const": "x64"},
+        "node": {"enum": ["v22.17.1", "v24.4.1"]},
+        "distributionManifestSha256": {"$ref": "#/$defs/sha256"},
+        "candidatePayloadSha256": {"$ref": "#/$defs/sha256"},
+        "projectionSha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "hostPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "runnerImage", "platform", "architecture", "node", "supportPolicySha256"],
+      "properties": {
+        "kind": {"enum": ["github-hosted-runner", "policy-approved-real-host"]},
+        "runnerImage": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$"},
+        "platform": {"enum": ["linux", "darwin", "win32"]},
+        "architecture": {"const": "x64"},
+        "node": {"enum": ["v22.17.1", "v24.4.1"]},
+        "supportPolicySha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
     "candidate": {
       "type": "object",
       "additionalProperties": false,
       "required": ["packageName", "version", "sourceCommit", "tarballSha256", "sbomSha256", "releaseInputsSha256", "payloadSha256"],
       "properties": {
-        "packageName": {"const": "@runa_laboratories/cli"},
+        "packageName": {"const": "@cuna_labs/cli"},
         "version": {"type": "string", "minLength": 1},
         "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "tarballSha256": {"$ref": "#/$defs/sha256"},
@@ -23,69 +97,98 @@
         "payloadSha256": {"$ref": "#/$defs/sha256"}
       }
     },
-    "projectionSha256": {"$ref": "#/$defs/sha256"},
     "runtimeIdentity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["version", "buildDigest", "platform", "architecture", "artifactChannel", "installerOfRecord", "protocolRange"],
+      "required": ["version", "buildDigest", "platform", "architecture", "node", "artifactChannel", "installerOfRecord", "protocolRange"],
       "properties": {
         "version": {"type": "string", "minLength": 1},
         "buildDigest": {"$ref": "#/$defs/sha256"},
         "platform": {"enum": ["linux", "darwin", "win32"]},
         "architecture": {"const": "x64"},
+        "node": {"enum": ["v22.17.1", "v24.4.1"]},
         "artifactChannel": {"const": "npm"},
         "installerOfRecord": {"enum": ["npm", "bun", "homebrew", "pacman"]},
         "protocolRange": {
           "type": "object",
           "additionalProperties": false,
           "required": ["minimum", "maximum"],
-          "properties": {"minimum": {"type": "string"}, "maximum": {"type": "string"}}
+          "properties": {"minimum": {"const": "1"}, "maximum": {"const": "1"}}
         }
       }
     },
-    "checks": {
+    "execution": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["selfTest", "provenance", "supportPolicy", "uninstallCleanup", "rollbackOrFixedForward"],
+      "required": ["stableTestId", "packageManager", "candidateInvocation", "environmentPolicy", "publicShimResolution"],
       "properties": {
-        "selfTest": {"const": "PASS"},
-        "provenance": {"const": "PASS"},
-        "supportPolicy": {"const": "PASS"},
-        "uninstallCleanup": {"const": "PASS"},
-        "rollbackOrFixedForward": {"const": "PASS"}
+        "stableTestId": {"const": "CUNA-DISTRIBUTION-CHANNEL-TRANSACTION-V1"},
+        "packageManager": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version"],
+          "properties": {
+            "name": {"enum": ["npm", "bun", "homebrew", "pacman"]},
+            "version": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$"}
+          }
+        },
+        "candidateInvocation": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\r\\n\\u0000]+$"},
+        "environmentPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "networkPolicy", "userStateSentinels", "environmentId"],
+          "properties": {
+            "kind": {"const": "ephemeral-dedicated-prefix"},
+            "networkPolicy": {"const": "INSTALL_ONLY_THEN_OFFLINE"},
+            "userStateSentinels": {"const": true},
+            "environmentId": {"type": "string", "pattern": "^(npm|bun|curl|homebrew|aur)-(linux|darwin|win32)-x64-node(22\\.17\\.1|24\\.4\\.1)$"}
+          }
+        },
+        "publicShimResolution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command", "resolutionMethod", "resolvedPath", "internalModuleBypass"],
+          "properties": {
+            "command": {"const": "cuna"},
+            "resolutionMethod": {"const": "shell-path"},
+            "resolvedPath": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\r\\n\\u0000]+$"},
+            "internalModuleBypass": {"const": false}
+          }
+        }
       }
     },
-    "evidence": {
+    "observations": {
       "type": "object",
       "additionalProperties": false,
       "required": ["install", "selfTest", "version", "provenance", "uninstall", "recovery"],
       "properties": {
-        "install": {"$ref": "#/$defs/digestFile"},
-        "selfTest": {"$ref": "#/$defs/digestFile"},
-        "version": {"$ref": "#/$defs/digestFile"},
-        "provenance": {"$ref": "#/$defs/digestFile"},
-        "uninstall": {"$ref": "#/$defs/digestFile"},
-        "recovery": {"$ref": "#/$defs/digestFile"}
+        "install": {"allOf": [{"$ref": "#/$defs/typedObservation"}, {"properties": {"type": {"const": "INSTALL"}}}]},
+        "selfTest": {"allOf": [{"$ref": "#/$defs/typedObservation"}, {"properties": {"type": {"const": "SELF_TEST"}}}]},
+        "version": {"allOf": [{"$ref": "#/$defs/typedObservation"}, {"properties": {"type": {"const": "VERSION"}}}]},
+        "provenance": {"allOf": [{"$ref": "#/$defs/typedObservation"}, {"properties": {"type": {"const": "PROVENANCE"}}}]},
+        "uninstall": {"allOf": [{"$ref": "#/$defs/typedObservation"}, {"properties": {"type": {"const": "UNINSTALL"}}}]},
+        "recovery": {"allOf": [{"$ref": "#/$defs/typedObservation"}, {"properties": {"type": {"const": "RECOVERY"}}}]}
       }
     },
-    "observer": {
+    "typedObservation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "identity"],
+      "required": ["type", "file", "sha256"],
       "properties": {
-        "kind": {"enum": ["github-hosted-runner", "policy-approved-real-host"]},
-        "identity": {"type": "string", "minLength": 1}
+        "type": {"enum": ["INSTALL", "SELF_TEST", "VERSION", "PROVENANCE", "UNINSTALL", "RECOVERY"]},
+        "file": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\\.json$"},
+        "sha256": {"$ref": "#/$defs/sha256"}
       }
     },
-    "observedAt": {"type": "string", "format": "date-time"}
-  },
-  "$defs": {
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "digestFile": {
+    "signingEvidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["file", "sha256"],
-      "properties": {"file": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+      "required": ["type", "file", "sha256"],
+      "properties": {
+        "type": {"const": "GITHUB_OIDC_SIGNATURE_VERIFICATION"},
+        "file": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\\.json$"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
     }
   }
 }

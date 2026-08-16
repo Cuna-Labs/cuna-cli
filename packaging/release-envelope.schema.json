@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runacode.io/schemas/runa-cli-release-envelope-v2.json",
-  "title": "Runa CLI immutable candidate release envelope",
+  "$id": "https://getcuna.com/schemas/cuna-cli-release-envelope-v2.json",
+  "title": "Cuna CLI immutable candidate release envelope",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -21,10 +21,10 @@
   ],
   "properties": {
     "schemaVersion": {"const": 2},
-    "packageName": {"const": "@runa_laboratories/cli"},
+    "packageName": {"const": "@cuna_labs/cli"},
     "version": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"},
     "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-    "repository": {"const": "Runa-Laboratories/runa-cli"},
+    "repository": {"const": "Cuna-Labs/cuna-cli"},
     "registry": {"const": "https://registry.npmjs.org"},
     "tarball": {
       "type": "object",
@@ -32,7 +32,7 @@
       "required": ["file", "url", "sha256", "size"],
       "properties": {
         "file": {"type": "string", "pattern": "^[A-Za-z0-9._-]+\\.tgz$"},
-        "url": {"type": "string", "pattern": "^https://registry\\.npmjs\\.org/@runa_laboratories/cli/-/cli-[0-9A-Za-z.-]+\\.tgz$"},
+        "url": {"type": "string", "pattern": "^https://registry\\.npmjs\\.org/@cuna_labs/cli/-/cli-[0-9A-Za-z.-]+\\.tgz$"},
         "sha256": {"$ref": "#/$defs/sha256"},
         "size": {"type": "integer", "minimum": 1}
       }
