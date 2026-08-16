@@ -1,6 +1,7 @@
 import type { Writable } from "node:stream";
 
-import type { RunaError } from "../core/errors.js";
+import type { CunaError, SafeErrorScalar } from "../core/errors.js";
+import { containsCredentialValue } from "../core/namespace.js";
 import { OUTPUT_SCHEMA_VERSION } from "../version.js";
 
 export interface CliStreams {
@@ -8,12 +9,14 @@ export interface CliStreams {
   readonly stderr: Writable;
   readonly stdoutIsTTY: boolean;
   readonly stdinIsTTY: boolean;
+  /** Optional because injected test streams predate the preview link gate. */
+  readonly stderrIsTTY?: boolean;
 }
 
 export interface OutputWriter {
   readonly structured: boolean;
   success(command: string, data: unknown, human: string): void;
-  error(command: string, error: RunaError): void;
+  error(command: string, error: CunaError): void;
   text(value: string): void;
 }
 
@@ -23,7 +26,7 @@ function writeLine(stream: Writable, value: string): void {
 
 /**
  * Human terminal output is a trust boundary. Preserve only the two layout
- * controls emitted deliberately by Runa; render every other C0/C1/Unicode
+ * controls emitted deliberately by Cuna; render every other C0/C1/Unicode
  * format control visibly so API data and error text cannot execute ANSI/OSC,
  * alter the title/clipboard, or spoof text direction.
  */
@@ -52,6 +55,24 @@ export function sanitizeHumanTerminalOutput(value: string): string {
 
 function sanitizeSingleLineHumanOutput(value: string): string {
   return sanitizeHumanTerminalOutput(value).replaceAll("\n", "\\n").replaceAll("\t", "\\t");
+}
+
+/**
+ * Render one `details` entry for a human terminal.
+ *
+ * `details` distinguishes failures that otherwise print identically: thirteen
+ * distinct configuration faults share one message, and an HTTP 403 carries the
+ * `request_id` support asks for. JSON mode has always emitted it; human mode
+ * dropped it entirely, so the operator saw the same unactionable sentence.
+ *
+ * Values here originate partly from the service, so this is a print sink for
+ * service-controlled bytes and is held to the same rule as every other one.
+ */
+function renderErrorDetail(value: SafeErrorScalar | readonly SafeErrorScalar[]): string {
+  const rendered = Array.isArray(value)
+    ? value.map((item) => String(item)).join(", ")
+    : String(value as SafeErrorScalar);
+  return containsCredentialValue(rendered) ? "[redacted credential]" : rendered;
 }
 
 export function createOutputWriter(input: {
@@ -90,6 +111,9 @@ export function createOutputWriter(input: {
         );
       } else {
         writeLine(input.streams.stderr, sanitizeSingleLineHumanOutput(`Error [${error.code}]: ${error.message}`));
+        for (const [key, value] of Object.entries(error.details ?? {})) {
+          writeLine(input.streams.stderr, sanitizeSingleLineHumanOutput(`  ${key}: ${renderErrorDetail(value)}`));
+        }
         if (error.hint !== undefined) {
           writeLine(input.streams.stderr, sanitizeSingleLineHumanOutput(`Next: ${error.hint}`));
         }

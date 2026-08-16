@@ -150,8 +150,7 @@ export async function createWorkspaceManifest(input: {
   await walk(root, "");
   assertNoPortableCollisions(entries.map((entry) => entry.path), input.capabilities);
   entries.sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
-  const canonicalBytes = Buffer.from(entries.map(canonicalEntry).join("\n"), "utf8");
-  const manifestRoot = domainDigest("runa-manifest-v2", canonicalBytes);
+  const manifestRoot = publicProtocolManifestRoot(entries);
   return Object.freeze({
     schemaVersion: 2 as const,
     minimumReaderVersion: 1,
@@ -180,7 +179,7 @@ export async function* streamContentChunks(
         chunk: Object.freeze({
           index,
           byteLength: bytes.byteLength,
-          digest: domainDigest("runa-chunk-v1", bytes),
+          digest: createHash("sha256").update(bytes).digest("hex"),
         }),
       });
       index += 1;
@@ -223,7 +222,7 @@ async function hashStableFile(
     const opened = await handle.stat({ bigint: true });
     if (!sameIdentity(before, opened)) throw unstableFailure();
     beforeContentRead?.(wirePath);
-    const contentHash = createHash("sha256").update("runa-content-v1\0");
+    const contentHash = createHash("sha256").update("cuna-content-v1\0");
     const chunks: ContentChunk[] = [];
     let byteLength = 0;
     let overlap = Buffer.alloc(0);
@@ -236,7 +235,7 @@ async function hashStableFile(
       chunks.push(Object.freeze({
         index: chunks.length,
         byteLength: bytes.byteLength,
-        digest: domainDigest("runa-chunk-v1", bytes),
+        digest: createHash("sha256").update(bytes).digest("hex"),
       }));
       secretCategory ??= detectHighConfidenceSecret(Buffer.concat([overlap, bytes]));
       overlap = bytes.subarray(Math.max(0, bytes.byteLength - 128));
@@ -277,20 +276,31 @@ function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs;
 }
 
-function canonicalEntry(entry: ManifestEntry): string {
-  return JSON.stringify({
-    byteLength: entry.byteLength,
-    chunks: entry.chunks?.map((chunk) => [chunk.index, chunk.byteLength, chunk.digest]) ?? null,
-    contentDigest: entry.contentDigest ?? null,
-    executable: entry.executable,
-    kind: entry.kind,
-    linkTarget: entry.linkTarget ?? null,
-    path: entry.path,
-  });
-}
-
-function domainDigest(domain: string, content: Uint8Array): string {
-  return createHash("sha256").update(domain).update("\0").update(content).digest("hex");
+function publicProtocolManifestRoot(entries: readonly ManifestEntry[]): string {
+  const entryDigests = entries
+    .map((entry) => {
+      const canonical = JSON.stringify({
+        path: entry.path,
+        kind: entry.kind,
+        byte_length: entry.kind === "symlink" ? 0 : entry.byteLength,
+        executable: entry.executable,
+        chunks: entry.chunks?.map((chunk) => ({
+          digest: chunk.digest,
+          byte_length: chunk.byteLength,
+        })) ?? [],
+        link_target: entry.linkTarget ?? null,
+      });
+      return Object.freeze({
+        path: entry.path,
+        digest: createHash("sha256").update(canonical).digest("hex"),
+      });
+    })
+    .sort((left, right) =>
+      Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8"))
+    );
+  return createHash("sha256")
+    .update(entryDigests.map((entry) => entry.digest).join(""))
+    .digest("hex");
 }
 
 function increment(map: Map<string, number>, key: string): void {

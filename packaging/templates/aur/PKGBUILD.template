@@ -1,14 +1,14 @@
-# Generated from an admitted Runa CLI release envelope. Do not edit by hand.
-pkgname=runa-cli-bin
+# Generated from a candidate-bound Cuna CLI release envelope. Do not edit by hand.
+pkgname=cuna-cli-bin
 pkgver=@@AUR_VERSION@@
 pkgrel=1
-pkgdesc='Runa cloud-agent CLI'
+pkgdesc='Cuna cloud-agent CLI'
 arch=('x86_64')
-url='https://runacode.io'
+url='https://getcuna.com'
 license=('Apache-2.0')
-depends=('nodejs>=22')
+depends=('@@AUR_NODE_DEPENDENCY@@')
 makedepends=('npm')
-source=("runa-cli-${pkgver}.tgz::@@TARBALL_URL@@")
+source=("cuna-cli-${pkgver}.tgz::@@TARBALL_URL@@")
 sha256sums=('@@TARBALL_SHA256@@')
 
 package() {
@@ -17,8 +17,8 @@ package() {
   npm install --global --offline --ignore-scripts --no-audit --no-fund \
     --cache "$npm_cache" \
     --prefix "${pkgdir}/usr" \
-    "${srcdir}/runa-cli-${pkgver}.tgz"
+    "${srcdir}/cuna-cli-${pkgver}.tgz"
 
-  "${pkgdir}/usr/bin/runa" self-test --offline --json >/dev/null
-  "${pkgdir}/usr/bin/runa" version --json | grep -F '"version":"@@VERSION@@"' >/dev/null
+  "${pkgdir}/usr/bin/cuna" self-test --offline --json >/dev/null
+  "${pkgdir}/usr/bin/cuna" version --json | grep -F '"version":"@@VERSION@@"' >/dev/null
 }

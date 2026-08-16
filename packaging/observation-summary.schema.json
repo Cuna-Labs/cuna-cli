@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://getcuna.com/schemas/cuna-cli-observation-summary-v1.json",
+  "title": "Cuna CLI non-authorizing observation summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "releaseEnvelopeSha256",
+    "supportPolicySha256",
+    "expectedObservationIds",
+    "receivedObservationIds",
+    "verifiedObservationIds",
+    "missingObservationIds",
+    "rejected",
+    "admissionImpact",
+    "releaseEligible",
+    "generatedAt"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "releaseEnvelopeSha256": {"$ref": "#/$defs/sha256"},
+    "supportPolicySha256": {"$ref": "#/$defs/sha256"},
+    "expectedObservationIds": {"$ref": "#/$defs/idSet"},
+    "receivedObservationIds": {"$ref": "#/$defs/idSet"},
+    "verifiedObservationIds": {"$ref": "#/$defs/idSet"},
+    "missingObservationIds": {"$ref": "#/$defs/idSet"},
+    "rejected": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "reasonCode", "message"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "reasonCode": {"enum": ["UNEXPECTED_RECEIPT", "INVALID_JSON", "RECEIPT_VALIDATION_FAILED"]},
+          "message": {"type": "string", "minLength": 1, "maxLength": 512}
+        }
+      }
+    },
+    "admissionImpact": {"const": "NONE"},
+    "releaseEligible": {"const": false},
+    "generatedAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "idSet": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/id"}
+    }
+  }
+}

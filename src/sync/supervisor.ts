@@ -117,7 +117,7 @@ export interface SupervisorConfiguration {
 }
 
 export interface ConvergenceReceipt {
-  readonly authority: "runa_workspace_service";
+  readonly authority: "cuna_workspace_service";
   readonly bindingId: string;
   readonly bindingGeneration: number;
   readonly epoch: string;
@@ -220,7 +220,7 @@ export class LocalSyncSupervisor {
     const observedAt = Date.parse(receipt.observedAt);
     const expiresAt = Date.parse(receipt.expiresAt);
     if (
-      receipt.authority !== "runa_workspace_service" ||
+      receipt.authority !== "cuna_workspace_service" ||
       receipt.bindingId !== this.configuration.bindingId ||
       receipt.bindingGeneration !== this.configuration.bindingGeneration ||
       receipt.epoch !== this.configuration.epoch ||
@@ -290,7 +290,7 @@ export type ProgressStage =
   | "committed";
 
 export interface ProgressReceipt {
-  readonly authority: "local_manifest" | "runa_workspace_service";
+  readonly authority: "local_manifest" | "cuna_workspace_service";
   readonly stage: ProgressStage;
   readonly observedEntries: number;
   readonly observedBytes: number;
@@ -327,7 +327,7 @@ export function progressFromReceipt(receipt: ProgressReceipt): TruthfulProgress 
   if (
     committed &&
     (
-      receipt.authority !== "runa_workspace_service" ||
+      receipt.authority !== "cuna_workspace_service" ||
       receipt.canonicalRevision === undefined ||
       !/^[A-Za-z0-9._:-]{1,256}$/u.test(receipt.canonicalRevision) ||
       (receipt.totalEntries !== undefined && receipt.observedEntries !== receipt.totalEntries) ||

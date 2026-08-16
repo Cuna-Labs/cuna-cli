@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fileConstants } from "node:fs";
-import { chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, lstat, mkdir, open, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
+import { isAbsolute, join, parse, resolve } from "node:path";
 
 import { assertReadableSchema, assertWritableSchema, type DurableSchemaEnvelope } from "../workspace/schema.js";
 import { workspaceError } from "../workspace/errors.js";
@@ -42,6 +43,11 @@ interface LeaseRecord {
   readonly expiresAt: number;
 }
 
+interface WriterAuthority {
+  readonly server: Server;
+  close(): Promise<void>;
+}
+
 export interface JournalInspection {
   readonly metadata: JournalMetadata;
   readonly records: readonly JournalRecord[];
@@ -63,10 +69,12 @@ export class DurableSyncJournal {
   readonly #fence: number;
   readonly #leaseMs: number;
   readonly #clock: () => number;
+  readonly #authority: WriterAuthority;
   #metadata: JournalMetadata;
   #records: JournalRecord[];
   #tail: Promise<void> = Promise.resolve();
   #closed = false;
+  #lastObservedNow: number;
 
   private constructor(input: {
     readonly directory: string;
@@ -76,6 +84,8 @@ export class DurableSyncJournal {
     readonly metadata: JournalMetadata;
     readonly records: JournalRecord[];
     readonly clock: () => number;
+    readonly authority: WriterAuthority;
+    readonly observedAt: number;
   }) {
     this.#directory = input.directory;
     this.#ownerId = input.ownerId;
@@ -84,6 +94,8 @@ export class DurableSyncJournal {
     this.#metadata = input.metadata;
     this.#records = input.records;
     this.#clock = input.clock;
+    this.#authority = input.authority;
+    this.#lastObservedNow = input.observedAt;
   }
 
   static async open(input: {
@@ -92,38 +104,62 @@ export class DurableSyncJournal {
     readonly bindingGeneration: number;
     readonly ownerId: string;
     readonly leaseMs?: number;
-    readonly now?: number;
     readonly clock?: () => number;
   }): Promise<DurableSyncJournal> {
     const leaseMs = input.leaseMs ?? 30_000;
-    const now = input.now ?? Date.now();
+    const clock = input.clock ?? Date.now;
     if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) throw journalFailure("invalid_lease");
-    await mkdir(input.directory, { recursive: true, mode: 0o700 });
-    await chmod(input.directory, 0o700);
-    const metadataPath = join(input.directory, META_FILE);
-    let metadata = await readMetadata(metadataPath, input.bindingId, input.bindingGeneration);
-    assertWritableSchema(metadata);
-    const leasePath = join(input.directory, LEASE_FILE);
-    await acquireLeaseFile(leasePath, input.ownerId, metadata.lastFence + 1, now, leaseMs);
-    const fence = metadata.lastFence + 1;
-    metadata = Object.freeze({ ...metadata, lastFence: fence });
+    const directory = await prepareJournalDirectory(input.directory);
+    const authority = await acquireWriterAuthority(directory);
+    let leaseOwned = false;
+    let ownerFence = 0;
     try {
+      await assertDirectoryAuthority(directory);
+      const metadataPath = join(directory, META_FILE);
+      let metadata = await readMetadata(metadataPath, input.bindingId, input.bindingGeneration);
+      assertWritableSchema(metadata);
+      const leasePath = join(directory, LEASE_FILE);
+      const previousLease = await readOptionalJson<LeaseRecord>(leasePath, validLeaseRecord);
+      const previousFence = Math.max(metadata.lastFence, previousLease?.fence ?? 0);
+      const fence = safeIncrement(previousFence, "fence_overflow");
+      const observedAt = trustedNow(clock);
+      const expiresAt = safeAdd(observedAt, leaseMs, "lease_overflow");
+      await atomicWriteJson(leasePath, {
+        ownerId: input.ownerId,
+        fence,
+        expiresAt,
+      });
+      leaseOwned = true;
+      ownerFence = fence;
+      metadata = Object.freeze({ ...metadata, lastFence: fence });
       await atomicWriteJson(metadataPath, metadata);
-      const inspection = await inspectSyncJournal(input.directory);
+      const inspection = await inspectSyncJournal(directory);
       if (inspection.requiresReconciliation) {
         throw journalFailure(inspection.reason ?? "journal_untrusted");
       }
+      const readyAt = trustedNow(clock);
+      if (readyAt < observedAt) throw journalFailure("clock_rollback");
+      if (readyAt >= expiresAt) throw journalFailure("lease_expired_during_open");
       return new DurableSyncJournal({
-        directory: input.directory,
+        directory,
         ownerId: input.ownerId,
         fence,
         leaseMs,
         metadata,
         records: [...inspection.records],
-        clock: input.clock ?? Date.now,
+        clock,
+        authority,
+        observedAt: readyAt,
       });
     } catch (error) {
-      await releaseLeaseFile(leasePath, input.ownerId, fence);
+      const cleanupFailures: unknown[] = [];
+      if (leaseOwned) {
+        try { await releaseLeaseFile(join(directory, LEASE_FILE), input.ownerId, ownerFence); } catch (cleanupError) { cleanupFailures.push(cleanupError); }
+      }
+      try { await authority.close(); } catch (cleanupError) { cleanupFailures.push(cleanupError); }
+      if (cleanupFailures.length > 0) {
+        throw new AggregateError([error, ...cleanupFailures], "The journal failed to release writer authority after open failed.");
+      }
       throw error;
     }
   }
@@ -149,13 +185,14 @@ export class DurableSyncJournal {
     return Object.freeze([...this.#records]);
   }
 
-  async renew(now = Date.now()): Promise<void> {
+  async renew(): Promise<void> {
     await this.#serialized(async () => {
       await this.#assertLease();
+      const now = this.#trustedNow();
       await atomicWriteJson(join(this.#directory, LEASE_FILE), {
         ownerId: this.#ownerId,
         fence: this.#fence,
-        expiresAt: now + this.#leaseMs,
+        expiresAt: safeAdd(now, this.#leaseMs, "lease_overflow"),
       });
     });
   }
@@ -203,8 +240,11 @@ export class DurableSyncJournal {
 
   async close(): Promise<void> {
     await this.#serialized(async () => {
-      await releaseLeaseFile(join(this.#directory, LEASE_FILE), this.#ownerId, this.#fence);
+      const failures: unknown[] = [];
+      try { await releaseLeaseFile(join(this.#directory, LEASE_FILE), this.#ownerId, this.#fence); } catch (error) { failures.push(error); }
+      try { await this.#authority.close(); } catch (error) { failures.push(error); }
       this.#closed = true;
+      if (failures.length > 0) throw new AggregateError(failures, "The journal failed to release writer authority.");
     }, true);
   }
 
@@ -227,7 +267,8 @@ export class DurableSyncJournal {
       previousChecksum,
     };
     const record = Object.freeze({ ...body, checksum: hashRecord(body) });
-    const handle = await open(join(this.#directory, RECORD_FILE), fileConstants.O_APPEND | fileConstants.O_CREAT | fileConstants.O_WRONLY, 0o600);
+    await assertDirectoryAuthority(this.#directory);
+    const handle = await openSecureAppendFile(join(this.#directory, RECORD_FILE));
     try {
       await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
       await handle.sync();
@@ -240,15 +281,23 @@ export class DurableSyncJournal {
 
   async #assertLease(): Promise<void> {
     if (this.#closed) throw journalFailure("writer_closed");
-    const lease = await readJson<LeaseRecord>(join(this.#directory, LEASE_FILE));
+    await assertDirectoryAuthority(this.#directory);
+    const lease = await readJson<LeaseRecord>(join(this.#directory, LEASE_FILE), validLeaseRecord);
     if (
       lease.ownerId !== this.#ownerId ||
       lease.fence !== this.#fence ||
       !Number.isSafeInteger(lease.expiresAt) ||
-      lease.expiresAt <= this.#clock()
+      lease.expiresAt <= this.#trustedNow()
     ) {
       throw workspaceError("writer_fenced", "The journal writer lease has been fenced.", "conflict", "stale_fence");
     }
+  }
+
+  #trustedNow(): number {
+    const now = trustedNow(this.#clock);
+    if (now < this.#lastObservedNow) throw journalFailure("clock_rollback");
+    this.#lastObservedNow = now;
+    return now;
   }
 
   async #serialized(action: () => Promise<void>, allowClosed = false): Promise<void> {
@@ -261,8 +310,58 @@ export class DurableSyncJournal {
   }
 }
 
+async function prepareJournalDirectory(directory: string): Promise<string> {
+  if (!isAbsolute(directory) || directory.includes("\0")) throw journalFailure("directory_untrusted");
+  const requested = resolve(directory);
+  const parsed = parse(requested);
+  let current = parsed.root;
+  for (const component of requested.slice(parsed.root.length).split(/[\\/]+/u).filter(Boolean)) {
+    current = join(current, component);
+    try {
+      await assertPlainDirectory(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      try { await mkdir(current, { mode: 0o700 }); } catch (mkdirError) {
+        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+      }
+      await assertPlainDirectory(current);
+    }
+  }
+  const canonical = await realpath(requested);
+  if (!samePath(canonical, requested)) throw journalFailure("directory_untrusted");
+  await chmod(canonical, 0o700);
+  return canonical;
+}
+
+async function assertPlainDirectory(path: string): Promise<void> {
+  const entry = await lstat(path);
+  if (!entry.isDirectory() || entry.isSymbolicLink()) throw journalFailure("directory_untrusted");
+  const canonical = await realpath(path);
+  if (!samePath(canonical, resolve(path))) throw journalFailure("directory_untrusted");
+}
+
+async function assertDirectoryAuthority(directory: string): Promise<void> {
+  await assertPlainDirectory(directory);
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function trustedNow(clock: () => number): number {
+  const now = clock();
+  if (!Number.isSafeInteger(now) || now < 0) throw journalFailure("clock_untrusted");
+  return now;
+}
+
 export async function inspectSyncJournal(directory: string): Promise<JournalInspection> {
-  const metadata = await readJson<JournalMetadata>(join(directory, META_FILE));
+  const canonical = resolve(directory);
+  await assertDirectoryAuthority(canonical);
+  const metadata = await readJson<JournalMetadata>(join(canonical, META_FILE));
   try {
     assertReadableSchema(metadata);
   } catch {
@@ -276,7 +375,7 @@ export async function inspectSyncJournal(directory: string): Promise<JournalInsp
   }
   let text = "";
   try {
-    text = await readFile(join(directory, RECORD_FILE), "utf8");
+    text = await readSecureTextFile(join(canonical, RECORD_FILE));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
@@ -371,39 +470,9 @@ async function readMetadata(
   }
 }
 
-async function acquireLeaseFile(
-  path: string,
-  ownerId: string,
-  fence: number,
-  now: number,
-  leaseMs: number,
-): Promise<void> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const handle = await open(path, fileConstants.O_CREAT | fileConstants.O_EXCL | fileConstants.O_WRONLY, 0o600);
-      try {
-        await handle.writeFile(JSON.stringify({ ownerId, fence, expiresAt: now + leaseMs }), "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const current = await readJson<LeaseRecord>(path);
-      if (current.expiresAt > now || attempt > 0) {
-        throw workspaceError("workspace_busy", "Another process owns the workspace journal.", "conflict", "active_writer");
-      }
-      await unlink(path).catch((unlinkError: unknown) => {
-        if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") throw unlinkError;
-      });
-    }
-  }
-}
-
 async function releaseLeaseFile(path: string, ownerId: string, fence: number): Promise<void> {
   try {
-    const current = await readJson<LeaseRecord>(path);
+    const current = await readJson<LeaseRecord>(path, validLeaseRecord);
     if (current.ownerId !== ownerId || current.fence !== fence) return;
     await unlink(path);
   } catch (error) {
@@ -413,13 +482,154 @@ async function releaseLeaseFile(path: string, ownerId: string, fence: number): P
 
 async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, JSON.stringify(value), { encoding: "utf8", mode: 0o600, flag: "wx" });
-  await rename(temporary, path);
-  await chmod(path, 0o600);
+  await assertSafeExistingFile(path, true);
+  try {
+    await writeFile(temporary, JSON.stringify(value), { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await assertSafeExistingFile(temporary, false);
+    await rename(temporary, path);
+    await chmod(path, 0o600);
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined);
+    throw error;
+  }
 }
 
-async function readJson<T>(path: string): Promise<T> {
-  return JSON.parse(await readFile(path, "utf8")) as T;
+async function readJson<T>(path: string, validate?: (value: unknown) => value is T): Promise<T> {
+  const value = JSON.parse(await readSecureTextFile(path)) as unknown;
+  if (validate !== undefined && !validate(value)) throw journalFailure("file_shape_untrusted");
+  return value as T;
+}
+
+async function readOptionalJson<T>(path: string, validate: (value: unknown) => value is T): Promise<T | undefined> {
+  try { return await readJson(path, validate); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function readSecureTextFile(path: string): Promise<string> {
+  await assertSafeExistingFile(path, false);
+  const handle = await open(path, fileConstants.O_RDONLY | noFollowFlag());
+  try {
+    await assertSecureHandle(handle, path);
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function openSecureAppendFile(path: string) {
+  let handle;
+  try {
+    handle = await open(path, fileConstants.O_APPEND | fileConstants.O_CREAT | fileConstants.O_EXCL | fileConstants.O_WRONLY | noFollowFlag(), 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    await assertSafeExistingFile(path, false);
+    handle = await open(path, fileConstants.O_APPEND | fileConstants.O_WRONLY | noFollowFlag(), 0o600);
+  }
+  try {
+    await assertSecureHandle(handle, path);
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+async function assertSafeExistingFile(path: string, allowMissing: boolean): Promise<void> {
+  try {
+    const entry = await lstat(path);
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1) throw journalFailure("file_untrusted");
+  } catch (error) {
+    if (allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+}
+
+async function assertSecureHandle(handle: Awaited<ReturnType<typeof open>>, path: string): Promise<void> {
+  const entry = await handle.stat();
+  if (!entry.isFile() || entry.nlink !== 1) throw journalFailure("file_untrusted");
+  const linked = await lstat(path);
+  if (!linked.isFile() || linked.isSymbolicLink() || linked.nlink !== 1) throw journalFailure("file_untrusted");
+  if (typeof entry.dev === "number" && typeof linked.dev === "number" && (entry.dev !== linked.dev || entry.ino !== linked.ino)) {
+    throw journalFailure("file_identity_changed");
+  }
+}
+
+function noFollowFlag(): number {
+  return typeof fileConstants.O_NOFOLLOW === "number" ? fileConstants.O_NOFOLLOW : 0;
+}
+
+async function acquireWriterAuthority(directory: string): Promise<WriterAuthority> {
+  const canonicalIdentity = process.platform === "win32" ? directory.toLowerCase() : directory;
+  const digest = createHash("sha256")
+    .update("cuna-journal-authority-v2\0")
+    .update(canonicalIdentity)
+    .digest("hex");
+  // Windows reserves dynamic TCP port ranges for system services. Deriving a
+  // lock port from a directory hash can therefore fail with EACCES even when
+  // no peer owns the journal. A named pipe is kernel-owned, directory-scoped,
+  // and released automatically when the process exits.
+  const endpoint = process.platform === "win32"
+    ? `\\\\.\\pipe\\cuna-workspace-journal-${digest}`
+    : Object.freeze({
+      host: "127.0.0.1" as const,
+      port: 20_000 + Number.parseInt(digest.slice(0, 4), 16) % 40_000,
+      exclusive: true,
+    });
+  const server = createServer((socket) => socket.destroy());
+  try {
+    await new Promise<void>((resolveListen, rejectListen) => {
+      const onError = (error: NodeJS.ErrnoException): void => {
+        server.removeListener("listening", onListening);
+        rejectListen(error);
+      };
+      const onListening = (): void => {
+        server.removeListener("error", onError);
+        resolveListen();
+      };
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.listen(endpoint);
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+      throw workspaceError("workspace_busy", "Another process owns the workspace journal.", "conflict", "active_writer");
+    }
+    throw error;
+  }
+  let closed = false;
+  return Object.freeze({
+    server,
+    close: async (): Promise<void> => {
+      if (closed) return;
+      await new Promise<void>((resolveClose, rejectClose) => {
+        server.close((error) => error === undefined ? resolveClose() : rejectClose(error));
+      });
+      closed = true;
+    },
+  });
+}
+
+function validLeaseRecord(value: unknown): value is LeaseRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return keys.length === 3 && keys[0] === "expiresAt" && keys[1] === "fence" && keys[2] === "ownerId" &&
+    typeof record.ownerId === "string" && record.ownerId.length > 0 && record.ownerId.length <= 256 &&
+    Number.isSafeInteger(record.fence) && (record.fence as number) >= 1 &&
+    Number.isSafeInteger(record.expiresAt) && (record.expiresAt as number) >= 0;
+}
+
+function safeIncrement(value: number, reason: string): number {
+  return safeAdd(value, 1, reason);
+}
+
+function safeAdd(left: number, right: number, reason: string): number {
+  if (!Number.isSafeInteger(left) || !Number.isSafeInteger(right) || left < 0 || right < 0 || left > Number.MAX_SAFE_INTEGER - right) {
+    throw journalFailure(reason);
+  }
+  return left + right;
 }
 
 function validateIntent(intent: JournalIntent): void {
@@ -454,7 +664,7 @@ function recoveryAction(state: JournalOperationState): "send" | "query_outcome" 
 
 function hashIntent(intent: JournalIntent): string {
   return createHash("sha256")
-    .update("runa-journal-intent-v2\0")
+    .update("cuna-journal-intent-v2\0")
     .update(JSON.stringify({
       baseGeneration: intent.baseGeneration,
       byteLength: intent.byteLength,
@@ -485,7 +695,7 @@ function validRecordShape(record: JournalRecord): boolean {
 
 function hashRecord(body: Omit<JournalRecord, "checksum">): string {
   return createHash("sha256")
-    .update("runa-journal-record-v2\0")
+    .update("cuna-journal-record-v2\0")
     .update(JSON.stringify(body))
     .digest("hex");
 }

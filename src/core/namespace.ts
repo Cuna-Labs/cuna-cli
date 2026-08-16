@@ -1,0 +1,284 @@
+import { DEPLOYED_WIRE_COMPATIBILITY } from "./deployed-wire-compatibility.js";
+
+/**
+ * The single authority on every namespace this CLI accepts.
+ *
+ * A namespace is minted by the service and accepted by the client. When the two
+ * are written independently, a rename lands on one side only and the client
+ * starts rejecting values the service still issues — with no compile error and
+ * no test failure. That is exactly how the CLI came to reject every issued
+ * `runa_sk_` API key, throw on every stored key row, and silently discard every
+ * Problem document minted at `api.runacode.io`.
+ *
+ * Every accepted brand, credential family, service origin and configuration
+ * environment-variable name is therefore enumerated here exactly once, and
+ * every call site tests through a predicate exported from this module. Widening
+ * the product's acceptance is a one-line edit in this file; a one-sided edit
+ * somewhere else is no longer expressible.
+ *
+ * These lists may only ever GROW. Removing a brand, a family infix, or an
+ * origin silently rejects credentials and documents that are still live in
+ * production, and for the secret detector it silently starts uploading material
+ * that is blocked today.
+ */
+
+/**
+ * Every brand the product has minted credentials under. `cuna` is the current
+ * mint; `runa` predates the rename and remains valid indefinitely because keys
+ * issued under it were never revoked.
+ */
+export const CREDENTIAL_BRANDS = Object.freeze(["cuna", DEPLOYED_WIRE_COMPATIBILITY.credentialBrand] as const);
+
+export type CredentialBrand = (typeof CREDENTIAL_BRANDS)[number];
+
+/**
+ * Configuration names are Cuna-only except for `RUNA_API_KEY`, the published
+ * automation alias from the earlier CLI. The canonical name is first so its
+ * presence always wins, including when its value is empty or malformed; a
+ * broken canonical credential must never fall through to stale legacy
+ * authority. No other earlier-brand configuration name is admitted.
+ */
+export function brandedEnvironmentNames(suffix: string): readonly string[] {
+  return suffix === "API_KEY"
+    ? Object.freeze(["CUNA_API_KEY", DEPLOYED_WIRE_COMPATIBILITY.apiKeyEnvironment])
+    : Object.freeze([`CUNA_${suffix}`]);
+}
+
+/** One environment read, carrying the name that actually supplied the value. */
+export interface BrandedEnvironmentValue {
+  readonly name: string;
+  readonly value: string;
+}
+
+/**
+ * The value of `suffix` under the highest-precedence brand that sets it, with
+ * the variable name that supplied it. The name is returned rather than
+ * discarded so a diagnostic can tell the user which of the accepted spellings
+ * it actually read — with two live names, "correct your configuration" without
+ * a name is not actionable.
+ */
+export function readBrandedEnvironment(
+  environment: Readonly<Record<string, string | undefined>>,
+  suffix: string,
+): BrandedEnvironmentValue | undefined {
+  for (const name of brandedEnvironmentNames(suffix)) {
+    const value = environment[name];
+    if (value !== undefined) return Object.freeze({ name, value });
+  }
+  return undefined;
+}
+
+/**
+ * Every credential family infix the product has ever issued. Families without a
+ * wire validator below still belong here: the workspace secret detector is a
+ * denylist and must recognize all of them.
+ */
+export const CREDENTIAL_FAMILY_INFIXES = Object.freeze([
+  // sk secret key · at access token · rt refresh token · ct continuation
+  // tc terminal connect · se/sc session credentials · cb browser callback nonce
+  // cr browser continuation resume handle
+  //
+  // `cb` was absent while the service minted `cuna_cb_…` for every human
+  // sign-in, so the workspace secret detector uploaded it instead of blocking
+  // it — exactly the failure this module's header warns about.
+  //
+  // `cr` repeated that failure one family later, in a repository this module
+  // does not reach: the console mints `cuna_cr_…` from 32 random bytes as a
+  // continuation resume handle and puts it in localStorage, a BroadcastChannel
+  // name and a URL fragment. It is a bearer capability, so a resume link pasted
+  // into a synced workspace was uploaded rather than blocked.
+  "sk", "at", "rt", "ct", "tc", "se", "sc", "cb", "cr", "login",
+] as const);
+
+export type CredentialFamilyInfix = (typeof CREDENTIAL_FAMILY_INFIXES)[number];
+
+/**
+ * Every origin the service has minted absolute URLs under. `api.runacode.io` is
+ * what production mints today; `api.getcuna.com` is the renamed origin the
+ * contract declares. Both must decode.
+ */
+export const API_ORIGINS = Object.freeze([
+  "https://api.getcuna.com",
+  DEPLOYED_WIRE_COMPATIBILITY.apiOrigin,
+] as const);
+
+export type ApiOrigin = (typeof API_ORIGINS)[number];
+
+/** The same origins as WebSocket authorities, for stream URLs. */
+export const API_WEBSOCKET_ORIGINS = Object.freeze(
+  API_ORIGINS.map((origin) => `wss://${new URL(origin).host}`),
+);
+
+/** Opaque suffix of every 32-byte base64url secret the service mints. */
+const OPAQUE_SECRET = "[A-Za-z0-9_-]{43}";
+
+/**
+ * Wire grammar per validated family. The infix is drawn from
+ * `CREDENTIAL_FAMILY_INFIXES` so a family can never be validated under a
+ * spelling the detector does not also recognize.
+ */
+const CREDENTIAL_GRAMMAR = Object.freeze({
+  secretKey: Object.freeze({ infix: "sk", suffix: "[A-Za-z0-9_-]{16,256}" }),
+  accessToken: Object.freeze({ infix: "at", suffix: OPAQUE_SECRET }),
+  loginCode: Object.freeze({ infix: "login", suffix: OPAQUE_SECRET }),
+  terminalConnect: Object.freeze({ infix: "tc", suffix: OPAQUE_SECRET }),
+  browserCallbackNonce: Object.freeze({ infix: "cb", suffix: OPAQUE_SECRET }),
+  browserResumeHandle: Object.freeze({ infix: "cr", suffix: OPAQUE_SECRET }),
+  supervisorControl: Object.freeze({ infix: "sc", suffix: OPAQUE_SECRET }),
+}) satisfies Readonly<Record<string, { readonly infix: CredentialFamilyInfix; readonly suffix: string }>>;
+
+export type CredentialFamily = keyof typeof CREDENTIAL_GRAMMAR;
+
+/**
+ * Families that are minted but have no wire grammar here yet. This list is the
+ * reason the hand-rolled copies existed: `cb` was in the infix list with no
+ * grammar entry, so a call site that needed to validate a callback nonce had
+ * nothing to import and wrote its own regex. Every entry here is therefore a
+ * standing invitation to repeat that, and the accompanying test forces a family
+ * to be either validated or explicitly listed — never silently absent.
+ *
+ * `se` remains here because its minted suffix shape has not been observed. Do
+ * not guess one: a grammar narrower than the mint rejects live credentials.
+ */
+// `ct` remains a denylist-only historical family: detecting a leaked former
+// continuation credential is necessary, but this CLI no longer authenticates
+// or transports one.
+export const CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR = Object.freeze(["rt", "ct", "se"] as const);
+
+const BRAND_GROUP = `(?:${CREDENTIAL_BRANDS.join("|")})`;
+
+/**
+ * Unanchored source matching the brand and family opening of any credential the
+ * product issues. Exported for the workspace secret detector, which needs its
+ * own boundary guard around this fragment.
+ */
+export const CREDENTIAL_OPENING_SOURCE =
+  `${BRAND_GROUP}_(?:${CREDENTIAL_FAMILY_INFIXES.join("|")})`;
+
+function credentialPattern(...families: readonly CredentialFamily[]): RegExp {
+  const alternatives = families
+    .map((family) => `${CREDENTIAL_GRAMMAR[family].infix}_${CREDENTIAL_GRAMMAR[family].suffix}`)
+    .join("|");
+  return new RegExp(`^${BRAND_GROUP}_(?:${alternatives})$`, "u");
+}
+
+const SECRET_API_KEY = credentialPattern("secretKey");
+const TRANSPORT_CREDENTIAL = credentialPattern("secretKey", "accessToken");
+const ACCESS_TOKEN = credentialPattern("accessToken");
+const LOGIN_CODE = credentialPattern("loginCode");
+const TERMINAL_CONNECT_TOKEN = credentialPattern("terminalConnect");
+const BROWSER_CALLBACK_NONCE = credentialPattern("browserCallbackNonce");
+
+/**
+ * The non-secret display prefix stored on an API key row and returned by
+ * `key list`. Pre-rename rows carry `runa_sk_`; both spellings are live.
+ */
+const API_KEY_DISPLAY_PREFIX = new RegExp(
+  `^${BRAND_GROUP}_${CREDENTIAL_GRAMMAR.secretKey.infix}_[A-Za-z0-9_-]{0,12}$`,
+  "u",
+);
+
+/** A programmatic API key as the service mints it, in any brand. */
+export function isSecretApiKey(value: string): boolean {
+  return SECRET_API_KEY.test(value);
+}
+
+/** The non-secret `*_sk_` display prefix carried by a stored API key row. */
+export function isApiKeyDisplayPrefix(value: string): boolean {
+  return API_KEY_DISPLAY_PREFIX.test(value);
+}
+
+/** Any credential the HTTP transport may present as a bearer. */
+export function isTransportCredential(value: string): boolean {
+  return TRANSPORT_CREDENTIAL.test(value);
+}
+
+/** An interactive CLI access token. */
+export function isAccessToken(value: string): boolean {
+  return ACCESS_TOKEN.test(value);
+}
+
+/** Durable browser-issued CLI login credential; never a product API bearer. */
+export function isLoginCode(value: string): boolean {
+  return LOGIN_CODE.test(value) && value.startsWith("cuna_login_");
+}
+
+/** A one-use terminal connection token. */
+export function isTerminalConnectToken(value: string): boolean {
+  return TERMINAL_CONNECT_TOKEN.test(value);
+}
+
+/** The nonce the browser carries back from a human sign-in handoff. */
+export function isBrowserCallbackNonce(value: string): boolean {
+  return BROWSER_CALLBACK_NONCE.test(value) && value.startsWith("cuna_cb_");
+}
+
+const FAMILY_VALIDATORS: ReadonlyMap<string, RegExp> = new Map(
+  (Object.keys(CREDENTIAL_GRAMMAR) as readonly CredentialFamily[])
+    .map((family) => [CREDENTIAL_GRAMMAR[family].infix, credentialPattern(family)] as const),
+);
+
+/**
+ * The validator for one family infix, or `undefined` when that family has no
+ * wire grammar yet. Prefer the named predicates above at fixed call sites; this
+ * exists so a test can prove every minted family is either validated here or
+ * explicitly recorded as unvalidated.
+ */
+export function credentialFamilyValidator(infix: string): ((value: string) => boolean) | undefined {
+  const pattern = FAMILY_VALIDATORS.get(infix);
+  return pattern === undefined ? undefined : (value: string) => pattern.test(value);
+}
+
+/**
+ * Unanchored source matching a complete credential value of ANY brand and ANY
+ * family, with the shortest suffix a leaked secret could plausibly carry.
+ *
+ * This is the denylist half of the authority. It exists because the public
+ * response decoder previously carried its own hand-written copy of the family
+ * list that had gone stale at five of eight families — it did not know `se`,
+ * `sc` or `cb`, so an audit summary containing a live `runa_sc_…` supervisor
+ * bearer decoded cleanly and was printed to the operator's terminal and, under
+ * `--json`, into CI logs. A denylist assembled anywhere but here is the same
+ * bug waiting for the next family.
+ */
+export const CREDENTIAL_VALUE_SOURCE = `${CREDENTIAL_OPENING_SOURCE}_[A-Za-z0-9_-]{8,}`;
+
+const CREDENTIAL_VALUE = new RegExp(CREDENTIAL_VALUE_SOURCE, "u");
+
+/**
+ * Whether `value` contains a credential of any brand and any family, anywhere
+ * inside it. Use this — never a local regex — before printing, forwarding or
+ * persisting a string the service controls.
+ */
+export function containsCredentialValue(value: string): boolean {
+  return CREDENTIAL_VALUE.test(value);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+const ORIGIN_GROUP = `(?:${API_ORIGINS.map(escapeRegExp).join("|")})`;
+const PROBLEM_CODE_SOURCE = "[a-z][a-z0-9_]{2,63}";
+const PROBLEM_TYPE = new RegExp(`^${ORIGIN_GROUP}/problems/${PROBLEM_CODE_SOURCE}$`, "u");
+
+/**
+ * A canonical Problem `type` URI under any origin the service mints. A miss
+ * here discards `code`, `request_id` and `retryable` from a server error, so
+ * retry and backoff degrade with no signal — never narrow it.
+ */
+export function isProblemType(value: string): boolean {
+  return PROBLEM_TYPE.test(value);
+}
+
+/** The Problem `type` URI that exactly names `code`, under any minted origin. */
+export function isProblemTypeForCode(value: string, code: string): boolean {
+  return API_ORIGINS.some((origin) => value === `${origin}/problems/${code}`);
+}
+
+/** The terminal stream URL for `terminalSessionId`, under any minted origin. */
+export function isTerminalStreamUrl(value: string, terminalSessionId: string): boolean {
+  return API_WEBSOCKET_ORIGINS.some(
+    (origin) => value === `${origin}/v1/terminal-connections/${terminalSessionId}/stream`,
+  );
+}

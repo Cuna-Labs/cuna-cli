@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://getcuna.com/schemas/cuna-public-contract-authority-v1.json",
+  "title": "Cuna canonical public API contract authority",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "authority", "status", "producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "authority": {"const": "CUNA_CANONICAL_PUBLIC_API_CONTRACT"},
+    "status": {"const": "APPROVED"},
+        "producerRepository": {"const": "Cuna-Labs/infra"},
+    "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "contractSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "approvalAttestationSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

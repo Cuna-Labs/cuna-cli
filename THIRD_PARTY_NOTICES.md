@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Runa CLI depends on `@xterm/headless` version `6.0.0`, distributed under the
+Cuna CLI depends on `@xterm/headless` version `6.0.0`, distributed under the
 MIT License.
 
 - Copyright (c) 2017-2019, The xterm.js authors

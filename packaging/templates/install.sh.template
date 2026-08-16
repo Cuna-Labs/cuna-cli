@@ -1,26 +1,623 @@
 #!/bin/sh
 set -eu
 
-# Generated from an admitted Runa CLI release envelope. This template is not a
+# Generated from a candidate-bound Cuna CLI release envelope. This template is not a
 # live installer and must retain unresolved @@...@@ markers in source control.
-PACKAGE='@runa_laboratories/cli'
+PACKAGE='@cuna_labs/cli'
 VERSION='@@VERSION@@'
 TARBALL_URL='@@TARBALL_URL@@'
 TARBALL_SHA256='@@TARBALL_SHA256@@'
+PAYLOAD_SHA256='@@PAYLOAD_SHA256@@'
+MODE="${1:-install}"
 
 die() {
-  printf '%s\n' "runa installer: $*" >&2
+  printf '%s\n' "cuna installer: $*" >&2
   exit 1
 }
+
+case "$MODE" in
+  install|--uninstall) ;;
+  *) die 'Usage: install.sh [--uninstall]' ;;
+esac
+
+case "$VERSION" in
+  ''|.|..|*[!0-9A-Za-z._-]*) die 'The candidate-bound version is not path-safe.' ;;
+esac
+case "$PAYLOAD_SHA256" in
+  *[!0-9a-f]*|'') die 'The candidate-bound payload digest is invalid.' ;;
+esac
+[ "${#PAYLOAD_SHA256}" -eq 64 ] || die 'The candidate-bound payload digest is invalid.'
+
+[ -n "${HOME:-}" ] || die 'HOME is required.'
+case "$HOME" in /*) ;; *) die 'HOME must be an absolute path.' ;; esac
+data_base="${XDG_DATA_HOME:-$HOME/.local/share}"
+bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
+case "$data_base" in /*) ;; *) die 'XDG_DATA_HOME must be an absolute path.' ;; esac
+case "$bin_dir" in /*) ;; *) die 'XDG_BIN_HOME must be an absolute path.' ;; esac
+if LC_ALL=C printf '%s' "$data_base$bin_dir" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+  die 'Cuna install paths may not contain control characters.'
+fi
+
+data_root="$data_base/cuna"
+tmp_dir=''
+staging=''
+launcher_tmp=''
+journal_tmp=''
+owner_tmp=''
+lock_claim=''
+lock_owned=0
+cleanup_failed=0
+created_data_root=0
+created_bin_dir=0
+created_versions_dir=0
+created_ownership_marker=0
+created_version_dir=0
+install_committed=0
+
+cleanup_path() {
+  cleanup_target="$1"
+  cleanup_kind="$2"
+  [ -n "$cleanup_target" ] || return 0
+  case "$cleanup_kind" in
+    file)
+      if [ -e "$cleanup_target" ] || [ -L "$cleanup_target" ]; then
+        rm -f -- "$cleanup_target" || return 1
+      fi
+      ;;
+    directory)
+      if [ -e "$cleanup_target" ] || [ -L "$cleanup_target" ]; then
+        [ -d "$cleanup_target" ] && [ ! -L "$cleanup_target" ] || return 1
+        rm -rf -- "$cleanup_target" || return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+release_lock() {
+  [ "$lock_owned" -eq 1 ] || return 0
+  [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+  [ "$(cat "$lock_file")" = "$$" ] || return 1
+  rm -f -- "$lock_file" || return 1
+  lock_owned=0
+}
+
+cleanup() {
+  original_status=$?
+  trap - 0 1 2 15
+  cleanup_path "$launcher_tmp" file || cleanup_failed=1
+  cleanup_path "$journal_tmp" file || cleanup_failed=1
+  cleanup_path "$owner_tmp" file || cleanup_failed=1
+  cleanup_path "$lock_claim" file || cleanup_failed=1
+  cleanup_path "$staging" directory || cleanup_failed=1
+  cleanup_path "$tmp_dir" directory || cleanup_failed=1
+  if [ "$original_status" -ne 0 ] && [ "$install_committed" -eq 0 ]; then
+    if [ "$created_version_dir" -eq 1 ] && [ -n "${version_dir:-}" ]; then
+      cleanup_path "$version_dir" directory || cleanup_failed=1
+    fi
+    if [ "$created_versions_dir" -eq 1 ] && [ -d "${versions_dir:-}" ] && [ ! -L "${versions_dir:-}" ]; then
+      rmdir "$versions_dir" 2>/dev/null || cleanup_failed=1
+    fi
+    if [ "$created_ownership_marker" -eq 1 ]; then
+      cleanup_path "$ownership_marker" file || cleanup_failed=1
+    fi
+    if [ "$created_data_root" -eq 1 ] && [ -d "$data_root" ] && [ ! -L "$data_root" ]; then
+      rmdir "$data_root" 2>/dev/null || cleanup_failed=1
+    fi
+  fi
+  release_lock || cleanup_failed=1
+  if [ "$original_status" -ne 0 ] && [ "$install_committed" -eq 0 ] && [ "$created_bin_dir" -eq 1 ] &&
+     [ -d "$bin_dir" ] && [ ! -L "$bin_dir" ]; then
+    rmdir "$bin_dir" 2>/dev/null || cleanup_failed=1
+  fi
+  if [ "$cleanup_failed" -ne 0 ]; then
+    printf '%s\n' 'cuna installer: cleanup failed; inspect the Cuna install directories before retrying.' >&2
+    exit 1
+  fi
+  exit "$original_status"
+}
+trap cleanup 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 143' 15
+
+raw_data_root="$data_root"
+raw_bin_dir="$bin_dir"
+if [ "$MODE" = '--uninstall' ]; then
+  raw_launcher="$raw_bin_dir/cuna"
+  raw_launcher_owner="$raw_bin_dir/.cuna-launcher-owner-v1"
+  raw_activation_transaction="$raw_bin_dir/.cuna-activation-transaction-v1"
+  raw_uninstall_transaction="$raw_bin_dir/.cuna-uninstall-transaction-v1"
+  if [ ! -e "$raw_data_root" ] && [ ! -L "$raw_data_root" ] &&
+     [ ! -e "$raw_launcher" ] && [ ! -L "$raw_launcher" ] &&
+     [ ! -e "$raw_launcher_owner" ] && [ ! -L "$raw_launcher_owner" ] &&
+     [ ! -e "$raw_activation_transaction" ] && [ ! -L "$raw_activation_transaction" ] &&
+     [ ! -e "$raw_uninstall_transaction" ] && [ ! -L "$raw_uninstall_transaction" ]; then
+    printf '%s\n' 'Cuna CLI curl installation is already absent; no files were changed.'
+    exit 0
+  fi
+  [ -d "$raw_bin_dir" ] && [ ! -L "$raw_bin_dir" ] || die 'The Cuna bin directory is absent or unsafe.'
+  bin_dir="$(cd -P "$raw_bin_dir" && pwd)" || die 'Could not canonicalize the Cuna bin directory.'
+  if [ -e "$raw_data_root" ] || [ -L "$raw_data_root" ]; then
+    [ -d "$raw_data_root" ] && [ ! -L "$raw_data_root" ] || die 'The Cuna data root is unsafe.'
+    data_root="$(cd -P "$raw_data_root" && pwd)" || die 'Could not canonicalize the Cuna data root.'
+  fi
+else
+  if [ ! -e "$data_root" ] && [ ! -L "$data_root" ]; then created_data_root=1; fi
+  if [ ! -e "$bin_dir" ] && [ ! -L "$bin_dir" ]; then created_bin_dir=1; fi
+  mkdir -p "$data_root" "$bin_dir"
+  [ ! -L "$data_root" ] || die 'The Cuna data root may not be a symbolic link.'
+  [ ! -L "$bin_dir" ] || die 'The Cuna bin directory may not be a symbolic link.'
+  data_root="$(cd -P "$data_root" && pwd)" || die 'Could not canonicalize the Cuna data root.'
+  bin_dir="$(cd -P "$bin_dir" && pwd)" || die 'Could not canonicalize the Cuna bin directory.'
+fi
+
+versions_dir="$data_root/versions"
+ownership_marker="$data_root/installer-v1"
+launcher="$bin_dir/cuna"
+
+# The launcher, not XDG_DATA_HOME, is the shared lifecycle resource. All
+# installers that address this bin directory therefore contend on one lock.
+lock_file="$bin_dir/.cuna-install.lock"
+launcher_owner="$bin_dir/.cuna-launcher-owner-v1"
+transaction_file="$bin_dir/.cuna-activation-transaction-v1"
+uninstall_file="$bin_dir/.cuna-uninstall-transaction-v1"
+uninstall_launcher="$bin_dir/.cuna-uninstall-launcher-v1"
+uninstall_owner="$bin_dir/.cuna-uninstall-owner-v1"
+
+acquire_lock() {
+  lock_claim="$bin_dir/.cuna-install-lock-claim.$$"
+  [ ! -e "$lock_claim" ] && [ ! -L "$lock_claim" ] || die 'The private lifecycle claim path already exists.'
+  umask 077
+  printf '%s\n' "$$" >"$lock_claim" || die 'Could not prepare private lifecycle lock ownership.'
+  if ! ln "$lock_claim" "$lock_file" 2>/dev/null; then
+    [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || die 'The shared Cuna lifecycle lock is not a safe regular file.'
+    owner_pid="$(cat "$lock_file")"
+    case "$owner_pid" in
+      ''|*[!0-9]*)
+        die 'The shared Cuna lifecycle lock has no valid owner; recovery is fail-closed.'
+        ;;
+      *)
+        if kill -0 "$owner_pid" 2>/dev/null; then
+          die 'Another Cuna install or uninstall operation is active.'
+        fi
+        die 'A stale Cuna lifecycle lock requires explicit recovery after verifying no installer is active.'
+        ;;
+    esac
+  fi
+  lock_owned=1
+  rm -f -- "$lock_claim" || die 'Could not retire the private lifecycle claim.'
+  lock_claim=''
+}
+
+acquire_lock
+
+if [ "$MODE" != '--uninstall' ]; then
+  [ ! -L "$ownership_marker" ] || die 'The Cuna ownership marker may not be a symbolic link.'
+  if [ -e "$ownership_marker" ]; then
+    [ -f "$ownership_marker" ] || die 'The Cuna ownership marker is not a regular file.'
+    [ "$(cat "$ownership_marker")" = 'cuna-cli-installer-v1' ] || die 'The Cuna data root is not owned by this installer.'
+  else
+    [ ! -e "$versions_dir" ] || die 'Refusing to adopt an unmarked versions directory.'
+    printf '%s\n' 'cuna-cli-installer-v1' >"$ownership_marker"
+    created_ownership_marker=1
+  fi
+fi
+
+read_field() {
+  record_file="$1"
+  record_key="$2"
+  field_value="$(sed -n "s/^${record_key}=//p" "$record_file")"
+  field_count="$(grep -c "^${record_key}=" "$record_file" || true)"
+  [ "$field_count" -eq 1 ] || return 1
+  printf '%s\n' "$field_value"
+}
+
+validate_owned_target() {
+  owned_target="$1"
+  owned_data_root="$2"
+  owned_version="$3"
+  owned_payload="$4"
+  case "$owned_data_root" in /*) ;; *) return 1 ;; esac
+  case "$owned_version" in ''|.|..|*[!0-9A-Za-z._-]*) return 1 ;; esac
+  case "$owned_payload" in *[!0-9a-f]*|'') return 1 ;; esac
+  [ "${#owned_payload}" -eq 64 ] || return 1
+  if LC_ALL=C printf '%s' "$owned_target$owned_data_root" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+    return 1
+  fi
+  [ "$owned_target" = "$owned_data_root/versions/$owned_version/bin/cuna" ] || return 1
+  [ -d "$owned_data_root" ] && [ ! -L "$owned_data_root" ] || return 1
+  canonical_owned_root="$(cd -P "$owned_data_root" 2>/dev/null && pwd)" || return 1
+  [ "$canonical_owned_root" = "$owned_data_root" ] || return 1
+  [ -f "$owned_data_root/installer-v1" ] && [ ! -L "$owned_data_root/installer-v1" ] || return 1
+  [ "$(cat "$owned_data_root/installer-v1")" = 'cuna-cli-installer-v1' ] || return 1
+  [ -d "$owned_data_root/versions" ] && [ ! -L "$owned_data_root/versions" ] || return 1
+  owned_version_dir="$owned_data_root/versions/$owned_version"
+  owned_bin_dir="$owned_version_dir/bin"
+  [ -d "$owned_version_dir" ] && [ ! -L "$owned_version_dir" ] || return 1
+  [ "$(cd -P "$owned_version_dir" 2>/dev/null && pwd)" = "$owned_version_dir" ] || return 1
+  [ -d "$owned_bin_dir" ] && [ ! -L "$owned_bin_dir" ] || return 1
+  [ "$(cd -P "$owned_bin_dir" 2>/dev/null && pwd)" = "$owned_bin_dir" ] || return 1
+  [ -f "$owned_target" ] && [ ! -L "$owned_target" ] && [ -x "$owned_target" ] || return 1
+}
+
+load_owner_record_values() {
+  owner_file="$1"
+  [ -f "$owner_file" ] && [ ! -L "$owner_file" ] || return 1
+  [ "$(wc -l <"$owner_file" | tr -d ' ')" -eq 6 ] || return 1
+  [ "$(read_field "$owner_file" schema)" = 'cuna-cli-launcher-owner-v1' ] || return 1
+  OWNER_TARGET="$(read_field "$owner_file" target)" || return 1
+  OWNER_DATA_ROOT="$(read_field "$owner_file" data_root)" || return 1
+  OWNER_VERSION="$(read_field "$owner_file" version)" || return 1
+  OWNER_PAYLOAD="$(read_field "$owner_file" payload_sha256)" || return 1
+  [ "$(read_field "$owner_file" verified)" = '1' ] || return 1
+  case "$OWNER_DATA_ROOT" in /*) ;; *) return 1 ;; esac
+  case "$OWNER_VERSION" in ''|.|..|*[!0-9A-Za-z._-]*) return 1 ;; esac
+  case "$OWNER_PAYLOAD" in *[!0-9a-f]*|'') return 1 ;; esac
+  [ "${#OWNER_PAYLOAD}" -eq 64 ] || return 1
+  if LC_ALL=C printf '%s' "$OWNER_TARGET$OWNER_DATA_ROOT" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+    return 1
+  fi
+  [ "$OWNER_TARGET" = "$OWNER_DATA_ROOT/versions/$OWNER_VERSION/bin/cuna" ] || return 1
+}
+
+load_owner_record() {
+  load_owner_record_values "$1" || return 1
+  validate_owned_target "$OWNER_TARGET" "$OWNER_DATA_ROOT" "$OWNER_VERSION" "$OWNER_PAYLOAD"
+}
+
+write_owner_record() {
+  record_target="$1"
+  record_root="$2"
+  record_version="$3"
+  record_payload="$4"
+  validate_owned_target "$record_target" "$record_root" "$record_version" "$record_payload" || return 1
+  owner_tmp="$bin_dir/.cuna-launcher-owner-v1.new.$$"
+  [ ! -e "$owner_tmp" ] && [ ! -L "$owner_tmp" ] || return 1
+  umask 077
+  {
+    printf '%s\n' 'schema=cuna-cli-launcher-owner-v1'
+    printf 'target=%s\n' "$record_target"
+    printf 'data_root=%s\n' "$record_root"
+    printf 'version=%s\n' "$record_version"
+    printf 'payload_sha256=%s\n' "$record_payload"
+    printf '%s\n' 'verified=1'
+  } >"$owner_tmp" || return 1
+  mv -f "$owner_tmp" "$launcher_owner" || return 1
+  owner_tmp=''
+}
+
+verify_identity_values() {
+  executable="$1"
+  expected_version="$2"
+  expected_payload="$3"
+  identity="$("$executable" version --json)" || return 1
+  EXPECTED_VERSION="$expected_version" EXPECTED_PAYLOAD_SHA256="$expected_payload" node -e '
+    const fs = require("node:fs");
+    const record = JSON.parse(fs.readFileSync(0, "utf8"));
+    const data = record && record.data;
+    if (
+      record.schema_version !== "1" ||
+      record.type !== "result" ||
+      record.command !== "version" ||
+      !data ||
+      data.version !== process.env.EXPECTED_VERSION ||
+      data.buildDigest !== process.env.EXPECTED_PAYLOAD_SHA256 ||
+      data.platform !== process.platform ||
+      data.architecture !== process.arch ||
+      data.artifactChannel !== "npm" ||
+      !data.protocolRange ||
+      data.protocolRange.minimum !== "1" ||
+      data.protocolRange.maximum !== "1"
+    ) process.exit(1);
+  ' <<EOF
+$identity
+EOF
+}
+
+verify_owned_launcher() {
+  [ -L "$launcher" ] || return 1
+  load_owner_record "$launcher_owner" || return 1
+  [ "$(readlink "$launcher")" = "$OWNER_TARGET" ] || return 1
+  verify_identity_values "$OWNER_TARGET" "$OWNER_VERSION" "$OWNER_PAYLOAD"
+}
+
+verify_owned_launcher_structure() {
+  [ -L "$launcher" ] || return 1
+  load_owner_record "$launcher_owner" || return 1
+  [ "$(readlink "$launcher")" = "$OWNER_TARGET" ] || return 1
+}
+
+activate_launcher_target() {
+  activation_target="$1"
+  launcher_tmp="$bin_dir/.cuna.new.$$"
+  [ ! -e "$launcher_tmp" ] && [ ! -L "$launcher_tmp" ] || return 1
+  ln -s "$activation_target" "$launcher_tmp" || return 1
+  mv -f "$launcher_tmp" "$launcher" || return 1
+  launcher_tmp=''
+}
+
+restore_launcher_target() {
+  restoration_target="$1"
+  launcher_tmp="$bin_dir/.cuna.restore.$$"
+  [ ! -e "$launcher_tmp" ] && [ ! -L "$launcher_tmp" ] || return 1
+  ln -s "$restoration_target" "$launcher_tmp" || return 1
+  mv -f "$launcher_tmp" "$launcher" || return 1
+  launcher_tmp=''
+}
+
+write_transaction() {
+  transaction_new_target="$1"
+  transaction_new_root="$2"
+  transaction_new_version="$3"
+  transaction_new_payload="$4"
+  transaction_previous_present="$5"
+  transaction_previous_target="$6"
+  transaction_previous_root="$7"
+  transaction_previous_version="$8"
+  transaction_previous_payload="$9"
+  journal_tmp="$bin_dir/.cuna-activation-transaction-v1.new.$$"
+  [ ! -e "$journal_tmp" ] && [ ! -L "$journal_tmp" ] || return 1
+  umask 077
+  {
+    printf '%s\n' 'schema=cuna-cli-activation-transaction-v1'
+    printf 'new_target=%s\n' "$transaction_new_target"
+    printf 'new_data_root=%s\n' "$transaction_new_root"
+    printf 'new_version=%s\n' "$transaction_new_version"
+    printf 'new_payload_sha256=%s\n' "$transaction_new_payload"
+    printf 'previous_present=%s\n' "$transaction_previous_present"
+    printf 'previous_target=%s\n' "$transaction_previous_target"
+    printf 'previous_data_root=%s\n' "$transaction_previous_root"
+    printf 'previous_version=%s\n' "$transaction_previous_version"
+    printf 'previous_payload_sha256=%s\n' "$transaction_previous_payload"
+  } >"$journal_tmp" || return 1
+  mv -f "$journal_tmp" "$transaction_file" || return 1
+  journal_tmp=''
+}
+
+cleanup_stale_workspaces() {
+  [ -d "$data_root" ] && [ ! -L "$data_root" ] || die 'The Cuna data root is unsafe.'
+  [ "$(cd -P "$data_root" 2>/dev/null && pwd)" = "$data_root" ] || die 'The Cuna data root is not canonical.'
+  if [ -e "$versions_dir" ] || [ -L "$versions_dir" ]; then
+    [ -d "$versions_dir" ] && [ ! -L "$versions_dir" ] || die 'The versions root is not a safe directory.'
+    [ "$(cd -P "$versions_dir" 2>/dev/null && pwd)" = "$versions_dir" ] || die 'The versions root is not canonical.'
+  fi
+  stale_count=0
+  for stale_workspace in "$data_root"/.download.* "$versions_dir"/.staging-*; do
+    [ -e "$stale_workspace" ] || [ -L "$stale_workspace" ] || continue
+    stale_count=$((stale_count + 1))
+    [ "$stale_count" -le 32 ] || die 'Too many stale installer workspaces require manual inspection.'
+    [ -d "$stale_workspace" ] && [ ! -L "$stale_workspace" ] || die 'A stale installer workspace is not a safe directory.'
+  done
+  for stale_workspace in "$data_root"/.download.* "$versions_dir"/.staging-*; do
+    [ -e "$stale_workspace" ] || [ -L "$stale_workspace" ] || continue
+    cleanup_path "$stale_workspace" directory || die 'Could not remove a stale installer workspace.'
+  done
+}
+
+validate_uninstall_inventory() {
+  [ -d "$data_root" ] && [ ! -L "$data_root" ] || return 1
+  for inventory_entry in "$data_root"/* "$data_root"/.[!.]* "$data_root"/..?*; do
+    [ -e "$inventory_entry" ] || [ -L "$inventory_entry" ] || continue
+    inventory_name=${inventory_entry##*/}
+    case "$inventory_name" in
+      installer-v1|versions|.download.*) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+recover_pending_activation() {
+  recovery_verify_runtime="${1:-1}"
+  [ -e "$transaction_file" ] || [ -L "$transaction_file" ] || return 0
+  [ -f "$transaction_file" ] && [ ! -L "$transaction_file" ] || die 'The activation recovery journal is not a safe regular file.'
+  [ "$(wc -l <"$transaction_file" | tr -d ' ')" -eq 10 ] || die 'The activation recovery journal has unexpected fields.'
+  [ "$(read_field "$transaction_file" schema)" = 'cuna-cli-activation-transaction-v1' ] || die 'The activation recovery journal is invalid.'
+  NEW_TARGET="$(read_field "$transaction_file" new_target)" || die 'The activation recovery journal is incomplete.'
+  NEW_ROOT="$(read_field "$transaction_file" new_data_root)" || die 'The activation recovery journal is incomplete.'
+  NEW_VERSION="$(read_field "$transaction_file" new_version)" || die 'The activation recovery journal is incomplete.'
+  NEW_PAYLOAD="$(read_field "$transaction_file" new_payload_sha256)" || die 'The activation recovery journal is incomplete.'
+  PREVIOUS_PRESENT="$(read_field "$transaction_file" previous_present)" || die 'The activation recovery journal is incomplete.'
+  PREVIOUS_TARGET="$(read_field "$transaction_file" previous_target)" || die 'The activation recovery journal is incomplete.'
+  PREVIOUS_ROOT="$(read_field "$transaction_file" previous_data_root)" || die 'The activation recovery journal is incomplete.'
+  PREVIOUS_VERSION="$(read_field "$transaction_file" previous_version)" || die 'The activation recovery journal is incomplete.'
+  PREVIOUS_PAYLOAD="$(read_field "$transaction_file" previous_payload_sha256)" || die 'The activation recovery journal is incomplete.'
+  validate_owned_target "$NEW_TARGET" "$NEW_ROOT" "$NEW_VERSION" "$NEW_PAYLOAD" || die 'The activation recovery journal names an unsafe new runtime.'
+  case "$PREVIOUS_PRESENT" in
+    0)
+      [ -z "$PREVIOUS_TARGET$PREVIOUS_ROOT$PREVIOUS_VERSION$PREVIOUS_PAYLOAD" ] || die 'The activation recovery journal has ambiguous previous state.'
+      ;;
+    1)
+      validate_owned_target "$PREVIOUS_TARGET" "$PREVIOUS_ROOT" "$PREVIOUS_VERSION" "$PREVIOUS_PAYLOAD" || die 'The activation recovery journal names an unsafe previous runtime.'
+      ;;
+    *) die 'The activation recovery journal has an invalid previous-state flag.' ;;
+  esac
+
+  current_target=''
+  if [ -e "$launcher" ] || [ -L "$launcher" ]; then
+    [ -L "$launcher" ] || die 'The activation recovery journal conflicts with a non-symbolic launcher.'
+    current_target="$(readlink "$launcher")"
+  fi
+
+  # A new owner record is written only after post-activation verification. If it
+  # already agrees with the launcher, the transaction committed before the crash.
+  if [ "$current_target" = "$NEW_TARGET" ] && load_owner_record "$launcher_owner" &&
+     [ "$OWNER_TARGET" = "$NEW_TARGET" ] && [ "$OWNER_PAYLOAD" = "$NEW_PAYLOAD" ]; then
+    if [ "$recovery_verify_runtime" = '1' ]; then
+      verify_identity_values "$NEW_TARGET" "$NEW_VERSION" "$NEW_PAYLOAD" || die 'The committed runtime failed crash-recovery verification.'
+    fi
+    rm -f -- "$transaction_file" || die 'Could not retire the committed activation journal.'
+    return 0
+  fi
+
+  # No verified owner record exists for NEW_TARGET: restore exactly the last
+  # verified target, or remove the first-install launcher, before doing more work.
+  if [ "$current_target" = "$NEW_TARGET" ]; then
+    if [ "$PREVIOUS_PRESENT" = '1' ]; then
+      if [ "$recovery_verify_runtime" = '1' ]; then
+        verify_identity_values "$PREVIOUS_TARGET" "$PREVIOUS_VERSION" "$PREVIOUS_PAYLOAD" || die 'The last verified runtime is not healthy enough to restore.'
+      fi
+      restore_launcher_target "$PREVIOUS_TARGET" || die 'Could not atomically restore the previous launcher.'
+      write_owner_record "$PREVIOUS_TARGET" "$PREVIOUS_ROOT" "$PREVIOUS_VERSION" "$PREVIOUS_PAYLOAD" || die 'Could not restore verified launcher ownership.'
+    else
+      rm -f -- "$launcher" || die 'Could not remove an unverified first-install launcher.'
+      if [ -e "$launcher_owner" ] || [ -L "$launcher_owner" ]; then
+        [ -f "$launcher_owner" ] && [ ! -L "$launcher_owner" ] || die 'The launcher ownership evidence is unsafe.'
+        rm -f -- "$launcher_owner" || die 'Could not remove stale launcher ownership evidence.'
+      fi
+    fi
+  elif [ "$PREVIOUS_PRESENT" = '1' ] && [ "$current_target" = "$PREVIOUS_TARGET" ]; then
+    load_owner_record "$launcher_owner" || die 'The previous launcher lacks canonical ownership evidence.'
+    [ "$OWNER_TARGET" = "$PREVIOUS_TARGET" ] && [ "$OWNER_PAYLOAD" = "$PREVIOUS_PAYLOAD" ] || die 'The previous launcher ownership evidence does not match recovery state.'
+  elif [ "$PREVIOUS_PRESENT" = '0' ] && [ -z "$current_target" ]; then
+    [ ! -e "$launcher_owner" ] && [ ! -L "$launcher_owner" ] || die 'Unexpected launcher ownership evidence blocks recovery.'
+  else
+    die 'The launcher changed outside the pending activation transaction; recovery is fail-closed.'
+  fi
+  rm -f -- "$transaction_file" || die 'Could not retire the recovered activation journal.'
+  printf '%s\n' 'cuna installer: restored the last verified launcher after an interrupted activation.' >&2
+}
+
+if [ "$MODE" = '--uninstall' ]; then
+  recover_pending_activation 0
+else
+  recover_pending_activation 1
+fi
+
+if [ "$MODE" = '--uninstall' ]; then
+  write_uninstall_transaction() {
+    uninstall_present="$1"
+    uninstall_target_value="$2"
+    uninstall_version_value="$3"
+    uninstall_payload_value="$4"
+    journal_tmp="$bin_dir/.cuna-uninstall-transaction-v1.new.$$"
+    [ ! -e "$journal_tmp" ] && [ ! -L "$journal_tmp" ] || return 1
+    umask 077
+    {
+      printf '%s\n' 'schema=cuna-cli-uninstall-transaction-v1'
+      printf 'data_root=%s\n' "$data_root"
+      printf 'launcher_present=%s\n' "$uninstall_present"
+      printf 'target=%s\n' "$uninstall_target_value"
+      printf 'version=%s\n' "$uninstall_version_value"
+      printf 'payload_sha256=%s\n' "$uninstall_payload_value"
+    } >"$journal_tmp" || return 1
+    mv -f "$journal_tmp" "$uninstall_file" || return 1
+    journal_tmp=''
+  }
+
+  load_uninstall_transaction() {
+    [ -f "$uninstall_file" ] && [ ! -L "$uninstall_file" ] || return 1
+    [ "$(wc -l <"$uninstall_file" | tr -d ' ')" -eq 6 ] || return 1
+    [ "$(read_field "$uninstall_file" schema)" = 'cuna-cli-uninstall-transaction-v1' ] || return 1
+    UNINSTALL_ROOT="$(read_field "$uninstall_file" data_root)" || return 1
+    UNINSTALL_PRESENT="$(read_field "$uninstall_file" launcher_present)" || return 1
+    UNINSTALL_TARGET="$(read_field "$uninstall_file" target)" || return 1
+    UNINSTALL_VERSION="$(read_field "$uninstall_file" version)" || return 1
+    UNINSTALL_PAYLOAD="$(read_field "$uninstall_file" payload_sha256)" || return 1
+    [ "$UNINSTALL_ROOT" = "$data_root" ] || return 1
+    case "$UNINSTALL_PRESENT" in
+      0) [ -z "$UNINSTALL_TARGET$UNINSTALL_VERSION$UNINSTALL_PAYLOAD" ] || return 1 ;;
+      1)
+        case "$UNINSTALL_VERSION" in ''|.|..|*[!0-9A-Za-z._-]*) return 1 ;; esac
+        case "$UNINSTALL_PAYLOAD" in *[!0-9a-f]*|'') return 1 ;; esac
+        [ "${#UNINSTALL_PAYLOAD}" -eq 64 ] || return 1
+        [ "$UNINSTALL_TARGET" = "$UNINSTALL_ROOT/versions/$UNINSTALL_VERSION/bin/cuna" ] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+    if LC_ALL=C printf '%s' "$UNINSTALL_ROOT$UNINSTALL_TARGET" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+      return 1
+    fi
+  }
+
+  if [ ! -e "$uninstall_file" ] && [ ! -L "$uninstall_file" ]; then
+    [ ! -e "$uninstall_launcher" ] && [ ! -L "$uninstall_launcher" ] || die 'Unexpected uninstall launcher tombstone blocks removal.'
+    [ ! -e "$uninstall_owner" ] && [ ! -L "$uninstall_owner" ] || die 'Unexpected uninstall owner tombstone blocks removal.'
+    if [ -e "$data_root" ] || [ -L "$data_root" ]; then
+      [ -d "$data_root" ] && [ ! -L "$data_root" ] || die 'The Cuna data root is unsafe.'
+      [ -f "$ownership_marker" ] && [ ! -L "$ownership_marker" ] || die 'The Cuna data root lacks installer ownership evidence.'
+      [ "$(cat "$ownership_marker")" = 'cuna-cli-installer-v1' ] || die 'The Cuna data root is not owned by this installer.'
+      validate_uninstall_inventory || die 'The Cuna data root contains unknown entries; uninstall made no changes.'
+      cleanup_stale_workspaces
+      validate_uninstall_inventory || die 'The Cuna data root contains unknown entries; uninstall made no changes.'
+    fi
+    if [ -e "$launcher" ] || [ -L "$launcher" ] || [ -e "$launcher_owner" ] || [ -L "$launcher_owner" ]; then
+      [ -L "$launcher" ] || die 'Refusing to remove a non-Cuna launcher.'
+      verify_owned_launcher_structure || die 'Refusing to remove a launcher without canonical Cuna ownership evidence.'
+      [ "$OWNER_DATA_ROOT" = "$data_root" ] || die 'This data root does not own the active Cuna launcher.'
+      write_uninstall_transaction 1 "$OWNER_TARGET" "$OWNER_VERSION" "$OWNER_PAYLOAD" || die 'Could not persist the uninstall recovery journal.'
+    else
+      [ -d "$data_root" ] && [ ! -L "$data_root" ] || die 'No owned Cuna installation was found.'
+      write_uninstall_transaction 0 '' '' '' || die 'Could not persist the data-only uninstall recovery journal.'
+    fi
+  fi
+
+  load_uninstall_transaction || die 'The uninstall recovery journal is invalid.'
+  if [ "$UNINSTALL_PRESENT" = '1' ]; then
+    if [ -e "$launcher" ] || [ -L "$launcher" ]; then
+      [ ! -e "$uninstall_launcher" ] && [ ! -L "$uninstall_launcher" ] || die 'The uninstall launcher state is ambiguous.'
+      verify_owned_launcher_structure || die 'The launcher changed after uninstall was prepared.'
+      [ "$OWNER_TARGET" = "$UNINSTALL_TARGET" ] && [ "$OWNER_DATA_ROOT" = "$UNINSTALL_ROOT" ] &&
+        [ "$OWNER_VERSION" = "$UNINSTALL_VERSION" ] && [ "$OWNER_PAYLOAD" = "$UNINSTALL_PAYLOAD" ] ||
+        die 'The launcher ownership no longer matches the uninstall journal.'
+      mv "$launcher" "$uninstall_launcher" || die 'Could not atomically detach the Cuna launcher.'
+    else
+      [ -L "$uninstall_launcher" ] || die 'The uninstall launcher transition is incomplete.'
+      [ "$(readlink "$uninstall_launcher")" = "$UNINSTALL_TARGET" ] || die 'The uninstall launcher tombstone is invalid.'
+    fi
+
+    if [ -e "$launcher_owner" ] || [ -L "$launcher_owner" ]; then
+      [ ! -e "$uninstall_owner" ] && [ ! -L "$uninstall_owner" ] || die 'The uninstall owner state is ambiguous.'
+      load_owner_record "$launcher_owner" || die 'The launcher ownership changed after uninstall was prepared.'
+      [ "$OWNER_TARGET" = "$UNINSTALL_TARGET" ] && [ "$OWNER_DATA_ROOT" = "$UNINSTALL_ROOT" ] &&
+        [ "$OWNER_VERSION" = "$UNINSTALL_VERSION" ] && [ "$OWNER_PAYLOAD" = "$UNINSTALL_PAYLOAD" ] ||
+        die 'The launcher ownership no longer matches the uninstall journal.'
+      mv "$launcher_owner" "$uninstall_owner" || die 'Could not atomically detach launcher ownership evidence.'
+    else
+      load_owner_record_values "$uninstall_owner" || die 'The uninstall owner tombstone is invalid.'
+      [ "$OWNER_TARGET" = "$UNINSTALL_TARGET" ] && [ "$OWNER_DATA_ROOT" = "$UNINSTALL_ROOT" ] &&
+        [ "$OWNER_VERSION" = "$UNINSTALL_VERSION" ] && [ "$OWNER_PAYLOAD" = "$UNINSTALL_PAYLOAD" ] ||
+        die 'The uninstall owner tombstone does not match the journal.'
+    fi
+  else
+    [ ! -e "$launcher" ] && [ ! -L "$launcher" ] && [ ! -e "$launcher_owner" ] && [ ! -L "$launcher_owner" ] ||
+      die 'A data-only uninstall conflicts with shared launcher state.'
+  fi
+
+  if [ -e "$data_root" ] || [ -L "$data_root" ]; then
+    [ -d "$data_root" ] && [ ! -L "$data_root" ] || die 'The Cuna data root became unsafe during uninstall.'
+    validate_uninstall_inventory || die 'The Cuna data root changed after uninstall was prepared.'
+    if [ -e "$versions_dir" ] || [ -L "$versions_dir" ]; then
+      [ -d "$versions_dir" ] && [ ! -L "$versions_dir" ] || die 'The versions root is not a safe directory.'
+      rm -rf -- "$versions_dir" || die 'Could not remove installed Cuna versions.'
+    fi
+    if [ -e "$ownership_marker" ] || [ -L "$ownership_marker" ]; then
+      [ -f "$ownership_marker" ] && [ ! -L "$ownership_marker" ] || die 'The Cuna ownership marker became unsafe.'
+      [ "$(cat "$ownership_marker")" = 'cuna-cli-installer-v1' ] || die 'The Cuna ownership marker changed during uninstall.'
+      rm -f -- "$ownership_marker" || die 'Could not remove the Cuna data ownership marker.'
+    fi
+    rmdir "$data_root" || die 'Could not remove the Cuna installation data root.'
+  fi
+  cleanup_path "$uninstall_launcher" file || die 'Could not retire the uninstall launcher tombstone.'
+  cleanup_path "$uninstall_owner" file || die 'Could not retire the uninstall owner tombstone.'
+  cleanup_path "$uninstall_file" file || die 'Could not retire the uninstall recovery journal.'
+  release_lock || die 'Could not release the Cuna lifecycle lock.'
+  printf '%s\n' 'Cuna CLI curl installation removed; user configuration was preserved.'
+  exit 0
+fi
 
 command -v node >/dev/null 2>&1 || die 'Node.js is required.'
 command -v npm >/dev/null 2>&1 || die 'npm is required.'
 command -v curl >/dev/null 2>&1 || die 'curl is required.'
+command -v readlink >/dev/null 2>&1 || die 'readlink is required.'
 
-tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t runa-install)"
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
-tarball="$tmp_dir/runa-cli.tgz"
-stage_prefix="$tmp_dir/stage"
+[ -f "$ownership_marker" ] && [ ! -L "$ownership_marker" ] || die 'The Cuna ownership marker is unavailable.'
+cleanup_stale_workspaces
+if [ ! -e "$versions_dir" ] && [ ! -L "$versions_dir" ]; then created_versions_dir=1; fi
+mkdir -p "$versions_dir"
+[ ! -L "$versions_dir" ] || die 'The versions root may not be a symbolic link.'
+tmp_dir="$(mktemp -d "$data_root/.download.XXXXXX")" || die 'Could not create a private download directory.'
+tarball="$tmp_dir/cuna-cli.tgz"
 
 curl --proto '=https' --tlsv1.2 --fail --location --show-error \
   --output "$tarball" "$TARBALL_URL"
@@ -34,24 +631,78 @@ else
   die 'A SHA-256 verifier is required.'
 fi
 
-printf '%s\n' "Verifying ${PACKAGE}@${VERSION} before changing the global installation."
-npm install --global --ignore-scripts --offline --no-audit --no-fund --prefix "$stage_prefix" "$tarball"
-staged_runa="$stage_prefix/bin/runa"
-[ -x "$staged_runa" ] || die 'The staged runa executable is missing.'
-"$staged_runa" self-test --offline --json >/dev/null || die 'Staged installed-artifact self-test failed.'
-staged_identity="$("$staged_runa" version --json)"
-EXPECTED_VERSION="$VERSION" node -e '
-  const fs = require("node:fs");
-  const record = JSON.parse(fs.readFileSync(0, "utf8"));
-  const data = record && record.data;
-  if (!data || data.version !== process.env.EXPECTED_VERSION || !/^[0-9a-f]{64}$/.test(data.buildDigest) || data.updateChannel !== "npm") process.exit(1);
-' <<EOF || die 'Staged runtime identity does not match the admitted release.'
-$staged_identity
-EOF
+version_dir="$versions_dir/$VERSION"
+if [ -e "$version_dir" ]; then
+  [ -d "$version_dir" ] && [ ! -L "$version_dir" ] || die 'The candidate-bound version path is not a safe directory.'
+  staged_cuna="$version_dir/bin/cuna"
+  [ -x "$staged_cuna" ] || die 'The existing candidate-bound version is incomplete.'
+  "$staged_cuna" self-test --offline --json >/dev/null || die 'Existing installed-artifact self-test failed.'
+  verify_identity_values "$staged_cuna" "$VERSION" "$PAYLOAD_SHA256" || die 'Existing runtime identity differs from the candidate-bound release.'
+else
+  staging="$versions_dir/.staging-$VERSION-$$"
+  [ ! -e "$staging" ] || die 'The staging path already exists.'
+  mkdir "$staging"
+  npm install --global --ignore-scripts --offline --no-audit --no-fund --prefix "$staging" "$tarball"
+  staged_cuna="$staging/bin/cuna"
+  [ -x "$staged_cuna" ] || die 'The staged cuna executable is missing.'
+  "$staged_cuna" self-test --offline --json >/dev/null || die 'Staged installed-artifact self-test failed.'
+  verify_identity_values "$staged_cuna" "$VERSION" "$PAYLOAD_SHA256" || die 'Staged runtime identity differs from the candidate-bound release.'
+  mv "$staging" "$version_dir"
+  staging=''
+  created_version_dir=1
+  staged_cuna="$version_dir/bin/cuna"
+fi
 
-printf '%s\n' "Installing ${PACKAGE}@${VERSION} from verified npm bytes."
-npm install --global --ignore-scripts --offline --no-audit --no-fund "$tarball"
-runa self-test --offline --json >/dev/null || die 'Installed-artifact self-test failed.'
-active_identity="$(runa version --json)"
-[ "$active_identity" = "$staged_identity" ] || die 'Active runtime identity differs from the verified staged identity.'
-printf '%s\n' "$active_identity"
+# Download cleanup is part of the transaction, not a best-effort epilogue. A
+# failure here blocks activation and propagates a non-zero result.
+cleanup_path "$tmp_dir" directory || die 'Could not remove the verified download workspace.'
+tmp_dir=''
+
+previous_present=0
+previous_target=''
+previous_root=''
+previous_version=''
+previous_payload=''
+if [ -e "$launcher" ] || [ -L "$launcher" ]; then
+  [ -L "$launcher" ] || die 'Refusing to replace a non-Cuna launcher.'
+  verify_owned_launcher || die 'Refusing to replace a launcher without canonical Cuna ownership evidence.'
+  previous_present=1
+  previous_target="$OWNER_TARGET"
+  previous_root="$OWNER_DATA_ROOT"
+  previous_version="$OWNER_VERSION"
+  previous_payload="$OWNER_PAYLOAD"
+elif [ -e "$launcher_owner" ] || [ -L "$launcher_owner" ]; then
+  die 'Launcher ownership evidence exists without its launcher.'
+fi
+
+write_transaction \
+  "$staged_cuna" "$data_root" "$VERSION" "$PAYLOAD_SHA256" \
+  "$previous_present" "$previous_target" "$previous_root" "$previous_version" "$previous_payload" \
+  || die 'Could not persist the activation recovery journal.'
+
+activate_launcher_target "$staged_cuna" || die 'Could not atomically activate the candidate-bound launcher.'
+
+if ! "$launcher" self-test --offline --json >/dev/null || ! verify_identity_values "$launcher" "$VERSION" "$PAYLOAD_SHA256"; then
+  if [ "$previous_present" -eq 1 ]; then
+    restore_launcher_target "$previous_target" || die 'Activation failed and the previous launcher could not be restored.'
+    write_owner_record "$previous_target" "$previous_root" "$previous_version" "$previous_payload" || die 'Activation failed and verified ownership could not be restored.'
+  else
+    rm -f -- "$launcher" || die 'Activation failed and the unverified launcher could not be removed.'
+  fi
+  rm -f -- "$transaction_file" || die 'Activation failed and its recovery journal could not be retired.'
+  die 'Activation verification failed; the previous launcher was restored.'
+fi
+
+write_owner_record "$staged_cuna" "$data_root" "$VERSION" "$PAYLOAD_SHA256" || die 'The verified launcher ownership record could not be committed.'
+install_committed=1
+rm -f -- "$transaction_file" || die 'The committed activation journal could not be retired.'
+release_lock || die 'Could not release the Cuna lifecycle lock.'
+
+resolved_cuna="$(command -v cuna 2>/dev/null || true)"
+if [ "$resolved_cuna" = "$launcher" ]; then
+  printf '%s\n' "Cuna CLI is available on PATH at $launcher." >&2
+else
+  printf '%s\n' "cuna installer: installation succeeded, but 'cuna' does not resolve to $launcher on PATH." >&2
+  printf '%s\n' "cuna installer: add $bin_dir before other command directories in PATH." >&2
+fi
+"$launcher" version --json

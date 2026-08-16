@@ -86,10 +86,10 @@ export function deriveOnboardingDecision(evidence: OnboardingEvidence, now = Dat
     return decision("unfinished", "select_workspace", "workspace_assignment_required");
   }
   if (evidence.cliAuth.value === "reauthentication_required") {
-    return decision("unfinished", "reauthenticate", "runa_reauthentication_required");
+    return decision("unfinished", "reauthenticate", "cuna_reauthentication_required");
   }
   if (evidence.cliAuth.value !== "signed_in") {
-    return decision("unfinished", "start_login", "runa_login_required");
+    return decision("unfinished", "start_login", "cuna_login_required");
   }
   return decision("ready", "resume_intent", "all_authorities_fresh_and_satisfied");
 }

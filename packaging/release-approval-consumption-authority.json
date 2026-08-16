@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "status": "CONFIGURED",
+  "repository": "Cuna-Labs/cuna-cli",
+  "environment": "npm",
+  "protectedRef": "main",
+  "requiredReviewer": {"type": "User", "id": 67605416, "login": "superjava1"},
+  "rulesetName": "Protect Cuna release approval consumptions",
+  "rulesetId": 20698394,
+  "tagRefPrefix": "refs/tags/cuna-release-approval-consumption/",
+  "requiredRules": ["deletion", "non_fast_forward", "update"],
+  "requireNoBypassActors": true,
+  "requireAdminBypassDisabled": true,
+  "requirePreventSelfReview": true
+}

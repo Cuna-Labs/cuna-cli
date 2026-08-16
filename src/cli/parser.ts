@@ -18,6 +18,13 @@ const BOOLEAN_OPTIONS = new Set([
   "new",
   "new-session",
   "offline",
+  // `doctor` is offline by default. This opt-in is the only diagnostic that
+  // makes the anonymous browser-login bootstrap request.
+  "check-browser-login",
+  // `cuna help --all`. Absent from this set, the parser reads it as a
+  // value option, swallows the next token, and answers "Option --all requires
+  // a value" — a usage error about a flag that takes none.
+  "all",
 ]);
 
 function optionName(raw: string): string {
