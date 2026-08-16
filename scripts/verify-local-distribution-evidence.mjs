@@ -11,7 +11,7 @@ exactKeys(record, [
   "schemaVersion", "authority", "releaseEligible", "limitations", "repository", "sourceCommit", "sourceTreeStatus",
   "sourceStatusSha256", "package", "artifact", "sbom", "supportPolicy", "runtimeIdentity", "observations", "environment", "generatedAt",
 ], "local artifact evidence");
-invariant(record.schemaVersion === 1, "Unsupported local-artifact evidence schema");
+invariant(record.schemaVersion === 2, "Unsupported local-artifact evidence schema");
 invariant(record.authority === "LOCAL_NON_RELEASE_EVIDENCE", "Local evidence authority was elevated");
 invariant(record.releaseEligible === false, "Local evidence may not claim release eligibility");
 invariant(record.repository === REPOSITORY, "Local evidence repository mismatch");
@@ -56,7 +56,8 @@ invariant(version?.data?.version === record.package.version, "Recorded local run
 invariant(version?.data?.buildDigest === record.runtimeIdentity?.buildDigest, "Recorded local build identity mismatch");
 invariant(version?.data?.platform === record.environment?.platform, "Recorded local platform mismatch");
 invariant(version?.data?.architecture === record.environment?.architecture, "Recorded local architecture mismatch");
-invariant(version?.data?.updateChannel === "npm", "Recorded local artifact channel mismatch");
+invariant(version?.data?.artifactChannel === "npm", "Recorded local artifact channel mismatch");
+invariant(record.observations?.uninstallCleanup === "PASS", "Recorded local uninstall cleanup did not pass");
 invariant(!Number.isNaN(Date.parse(record.generatedAt)), "Local evidence timestamp is invalid");
 
 process.stdout.write(`${JSON.stringify({

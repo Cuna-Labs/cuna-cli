@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 2,
+  "artifact_file": "contracts/infra/cuna-api.openapi.json",
+  "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
+  "infra_openapi_raw_sha256": "b15c78aeffe2a34fd7cc0a94306cd23c56b06d2303b913255a02b595fe80ad34",
+  "infra_openapi_canonical_sha256": "f25a9f66253df538455e1f951f3ecdefc5f13d7d4d34b085a9b5da90df7cd700",
+  "producer_repository": "Cuna-Labs/infra",
+  "producer_content_state": "working_tree_product_delta",
+  "producer_base_revision": "735710bdf3f86255190001184715ae104c120dd5",
+  "producer_full_tree": null,
+  "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
+  "producer_projection_sha256": "e2ddff69aaeef19f333c85c73afd50e2d693bc32acf00412cf7392d337972bd3",
+  "producer_runtime_manifest_sha256": "c2e56e5bd0e20c0e1e3b9608a93b7b7883298135bb6950aa199ee69a02e8a9be",
+  "feature_contracts": {
+    "opencode_interactive_only": null
+  }
+}

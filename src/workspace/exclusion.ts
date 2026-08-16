@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { CREDENTIAL_OPENING_SOURCE } from "../core/namespace.js";
 import { normalizeWirePath, type FilesystemCapabilities } from "./paths.js";
 import { workspaceError } from "./errors.js";
 
@@ -17,7 +18,7 @@ export interface ExclusionDecision {
 }
 
 export interface ExclusionRuleSource {
-  readonly source: "gitignore" | "runaignore" | "cli";
+  readonly source: "gitignore" | "cunaignore" | "cli";
   readonly text: string;
 }
 
@@ -85,7 +86,7 @@ export function compileExclusionPolicy(
     source,
   }));
   const digest = createHash("sha256")
-    .update("runa-exclusion-policy-v1\0")
+    .update("cuna-exclusion-policy-v1\0")
     .update(JSON.stringify(canonicalRules))
     .digest("hex");
   return Object.freeze({
@@ -115,12 +116,25 @@ export function compileExclusionPolicy(
   });
 }
 
+/**
+ * Every credential namespace the product issues, in every brand, taken from the
+ * one authority in `core/namespace.ts` so this denylist can never fall behind
+ * the validators. `\b` is unusable as the leading guard because `_` is a word
+ * character, so `\bsk_` never matches inside `cuna_sk_…`; an explicit
+ * non-identifier boundary is required. Legacy `runa_*` values stay detected:
+ * they remain valid credentials.
+ */
+const SERVICE_TOKEN = new RegExp(
+  `(?:^|[^A-Za-z0-9_-])(?:${CREDENTIAL_OPENING_SOURCE}|sk)_[A-Za-z0-9_-]{20,}`,
+  "u",
+);
+
 export function detectHighConfidenceSecret(content: Uint8Array): string | undefined {
   if (content.byteLength > 2 * 1024 * 1024 || content.includes(0)) return undefined;
   const text = Buffer.from(content).toString("utf8");
   if (/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/u.test(text)) return "private_key";
   if (/\bAKIA[0-9A-Z]{16}\b/u.test(text)) return "cloud_access_key";
-  if (/\b(?:runa|sk)_[A-Za-z0-9_-]{20,}\b/u.test(text)) return "service_token";
+  if (SERVICE_TOKEN.test(text)) return "service_token";
   return undefined;
 }
 
@@ -132,7 +146,7 @@ function immutableDecision(
     return Object.freeze({ excluded: true, immutable: true, reason: "immutable_special_file" });
   }
   const components = wirePath.toLocaleLowerCase("en-US").split("/");
-  if (components.includes(".runa")) {
+  if (components.includes(".cuna")) {
     return Object.freeze({ excluded: true, immutable: true, reason: "immutable_metadata" });
   }
   if (

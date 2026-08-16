@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -36,6 +37,7 @@ import { AttachmentError, ExclusiveAttachmentSession } from "../dist/terminal/re
 import { ViewportIsolationError, ViewportRegistry } from "../dist/terminal/viewport.js";
 import { buildAppbarModel, projectTruth } from "../dist/terminal/appbar.js";
 import { HostTerminalLease, selectTerminalMode } from "../dist/terminal/mode.js";
+import { createNodeHostTerminalAdapter } from "../dist/pty/node-host-terminal.js";
 
 const text = new TextEncoder();
 const digestA = `sha256:${"a".repeat(64)}`;
@@ -221,6 +223,16 @@ test("terminal codec preserves binary bytes and rejects unknown, oversize, and i
   );
 });
 
+test("TC-055-16 terminal decoder handles adversarial one-byte fragmentation without buffer recopy", () => {
+  const payload = new Uint8Array(64 * 1024).fill(0x61);
+  const wire = encodeTerminalFrame({ type: "output", critical: true, sequence: 1n, payload });
+  const decoder = new TerminalFrameDecoder();
+  let frames = [];
+  for (const byte of wire) frames = decoder.push(Uint8Array.of(byte));
+  assert.equal(frames.length, 1);
+  assert.deepEqual(frames[0].payload, payload);
+});
+
 test("ready and acknowledgement control frames preserve PTY truth and non-execution semantics", () => {
   const readyWire = encodeTerminalControl("ready", 0n, {
     protocol: "runa.terminal.v1",
@@ -231,12 +243,54 @@ test("ready and acknowledgement control frames preserve PTY truth and non-execut
   });
   const ready = decodeTerminalFrame(readyWire);
   assert.equal(decodeTerminalControl(ready).processEpoch, "epoch-1");
+  const unfencedReady = encodeTerminalControl("ready", 0n, {
+    protocol: "runa.terminal.v1",
+    agentSessionId: "agent-1",
+    processEpoch: "epoch-1",
+    fencingGeneration: 0,
+    resizeCapability: "live",
+  });
+  assert.throws(
+    () => decodeTerminalControl(decodeTerminalFrame(unfencedReady)),
+    (error) => error instanceof TerminalProtocolError && error.code === "invalid_payload",
+  );
   const ackWire = encodeTerminalControl("acknowledgement", 4n, {
     clientSequence: "4",
     meaning: "durably_accepted_not_executed",
   });
   const ack = decodeTerminalControl(decodeTerminalFrame(ackWire));
   assert.equal(ack.meaning, "durably_accepted_not_executed");
+});
+
+test("terminal codec remains byte-identical to the cross-runtime golden oracle", async () => {
+  const fixture = JSON.parse(await readFile(
+    new URL("./fixtures/runa-terminal-v1-golden.json", import.meta.url),
+    "utf8",
+  ));
+  const vectors = fixture.vectors;
+  const output = encodeTerminalFrame({
+    type: "output",
+    critical: true,
+    sequence: BigInt(vectors.output.sequence),
+    payload: Uint8Array.from(Buffer.from(vectors.output.payload_hex, "hex")),
+  });
+  const heartbeat = encodeTerminalControl(
+    "heartbeat",
+    BigInt(vectors.heartbeat.sequence),
+    vectors.heartbeat.payload_json,
+  );
+  const ready = encodeTerminalControl(
+    "ready",
+    BigInt(vectors.ready.sequence),
+    vectors.ready.payload_json,
+  );
+  assert.equal(Buffer.from(output).toString("hex"), vectors.output.wire_hex);
+  assert.equal(Buffer.from(heartbeat).toString("hex"), vectors.heartbeat.wire_hex);
+  assert.equal(Buffer.from(ready).toString("hex"), vectors.ready.wire_hex);
+  assert.throws(
+    () => decodeTerminalFrame(Uint8Array.from(Buffer.from(fixture.rejected_legacy_wire_hex, "hex"))),
+    (error) => error instanceof TerminalProtocolError && error.code === "invalid_magic",
+  );
 });
 
 test("takeover fences delayed input, deduplicates replay, and never claims execution", () => {
@@ -381,6 +435,106 @@ test("rich mode is evidence-gated and host acquisition restores partial state on
     leaveRawMode() { calls.push("raw-off"); },
   };
   await assert.rejects(HostTerminalLease.acquire(adapter));
+  assert.deepEqual(calls, ["raw-on", "alt-on", "modes-off", "alt-off", "raw-off"]);
+});
+
+test("Node host terminal restoration returns stdin to its prior flow state", async () => {
+  let paused = true;
+  let raw = false;
+  const writes = [];
+  const stdin = {
+    isTTY: true,
+    get readableFlowing() { return paused ? false : true; },
+    isPaused: () => paused,
+    setRawMode(value) { raw = value; },
+    resume() { paused = false; return this; },
+    pause() { paused = true; return this; },
+  };
+  const stdout = {
+    isTTY: true,
+    once() { return this; },
+    removeListener() { return this; },
+    write(value, callback) { writes.push(value); callback?.(null); return true; },
+  };
+
+  const lease = await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout }));
+  assert.equal(raw, true);
+  assert.equal(paused, false);
+  await lease.restore();
+  assert.equal(raw, false);
+  assert.equal(paused, true);
+  assert.equal(writes.length, 3);
+
+  paused = false;
+  const flowingLease = await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout }));
+  await flowingLease.restore();
+  assert.equal(paused, false);
+});
+
+test("TC-055-18 host terminal restoration is retryable and does not mark partial cleanup complete", async () => {
+  const calls = [];
+  let rawFailures = 1;
+  const lease = await HostTerminalLease.acquire({
+    enterRawMode() { calls.push("raw-on"); },
+    enterAlternateScreen() { calls.push("alt-on"); },
+    disableRemoteModes() { calls.push("modes-off"); },
+    leaveAlternateScreen() { calls.push("alt-off"); },
+    leaveRawMode() {
+      calls.push("raw-off");
+      if (rawFailures-- > 0) throw new Error("transient raw restore failure");
+    },
+  });
+  await assert.rejects(lease.restore(), /restoration was incomplete/u);
+  await lease.restore();
+  await lease.restore();
+  assert.deepEqual(calls, ["raw-on", "alt-on", "modes-off", "alt-off", "raw-off", "modes-off", "raw-off"]);
+});
+
+test("TC-055-18 one host TTY cannot be acquired by two independent leases", async () => {
+  let paused = true;
+  const rawTransitions = [];
+  const stdin = {
+    isTTY: true,
+    get readableFlowing() { return paused ? false : true; },
+    setRawMode(value) { rawTransitions.push(value); },
+    resume() { paused = false; return this; },
+    pause() { paused = true; return this; },
+  };
+  const stdout = {
+    isTTY: true,
+    once() { return this; },
+    removeListener() { return this; },
+    write(_value, callback) { callback?.(null); return true; },
+  };
+  const first = await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout }));
+  await assert.rejects(
+    HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout })),
+    (error) => error?.code === "session_conflict",
+  );
+  assert.deepEqual(rawTransitions, [true]);
+  await first.restore();
+  const replacement = await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout }));
+  await replacement.restore();
+  assert.deepEqual(rawTransitions, [true, false, true, false]);
+});
+
+test("TC-055-18 concurrent restoration calls coalesce behind one cleanup transaction", async () => {
+  const calls = [];
+  let releaseCleanup;
+  const cleanupGate = new Promise((resolve) => { releaseCleanup = resolve; });
+  const lease = await HostTerminalLease.acquire({
+    enterRawMode() { calls.push("raw-on"); },
+    enterAlternateScreen() { calls.push("alt-on"); },
+    async disableRemoteModes() { calls.push("modes-off"); await cleanupGate; },
+    leaveAlternateScreen() { calls.push("alt-off"); },
+    leaveRawMode() { calls.push("raw-off"); },
+  });
+  const first = lease.restore();
+  const second = lease.restore();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.filter((item) => item === "modes-off").length, 1);
+  releaseCleanup();
+  await Promise.all([first, second]);
   assert.deepEqual(calls, ["raw-on", "alt-on", "modes-off", "alt-off", "raw-off"]);
 });
 
