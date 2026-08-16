@@ -46,13 +46,58 @@ export interface CommandResult {
   readonly human: string;
 }
 
+/**
+ * The API accepts a durable termination intent before a fenced supervisor can
+ * observe that the exact process is gone.  The CLI keeps its stronger command
+ * contract, but must give that independent producer a bounded opportunity to
+ * publish the terminal observation.
+ */
+export interface AgentSessionTerminationPoller {
+  readonly now: () => number;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+}
+
 export interface CommandContext {
   readonly parsed: ParsedInvocation;
   readonly config: EffectiveConfig;
   readonly client: CunaApiClient;
   readonly now: number;
+  /** Test seam; production uses the real wall-clock wait below. */
+  readonly agentSessionTerminationPoller?: AgentSessionTerminationPoller;
   readonly credentialMode?: "automation" | "interactive";
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
+}
+
+const AGENT_SESSION_TERMINATION_CONFIRMATION_TIMEOUT_MS = 15_000;
+const AGENT_SESSION_TERMINATION_POLL_INTERVAL_MS = 250;
+
+function productionAgentSessionTerminationPoller(): AgentSessionTerminationPoller {
+  return Object.freeze({
+    now: () => Date.now(),
+    sleep: (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
+  });
+}
+
+function agentSessionTerminationConfirmed(session: AgentSession): boolean {
+  return session.desiredState === "terminated" &&
+    session.requestState === "terminal" &&
+    session.processState === "terminated";
+}
+
+async function waitForAgentSessionTermination(
+  context: CommandContext,
+  id: string,
+): Promise<AgentSession> {
+  const poller = context.agentSessionTerminationPoller ?? productionAgentSessionTerminationPoller();
+  const deadline = poller.now() + AGENT_SESSION_TERMINATION_CONFIRMATION_TIMEOUT_MS;
+  let observed = await context.client.getAgentSession(id);
+  while (!agentSessionTerminationConfirmed(observed)) {
+    const remaining = deadline - poller.now();
+    if (remaining <= 0) return observed;
+    await poller.sleep(Math.min(AGENT_SESSION_TERMINATION_POLL_INTERVAL_MS, remaining));
+    observed = await context.client.getAgentSession(id);
+  }
+  return observed;
 }
 
 function requireCredential(context: CommandContext): void {
@@ -1247,15 +1292,13 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.terminate", now });
     await client.terminateAgentSession(id);
-    const observed = await client.getAgentSession(id);
-    if (
-      observed.id !== id || observed.desiredState !== "terminated" ||
-      observed.requestState !== "terminal" || observed.processState !== "terminated"
-    ) {
+    const observed = await waitForAgentSessionTermination(context, id);
+    if (observed.id !== id || !agentSessionTerminationConfirmed(observed)) {
       postconditionUnverified("AgentSession termination", {
         agent_session_id: id,
         observed_desired_state: observed.desiredState,
         observed_request_state: observed.requestState,
+        observed_process_state: observed.processState,
       });
     }
     return Object.freeze({ command: "agent-sessions.terminate", data: agentSessionRecord(observed), human: `AgentSession ${observed.id} is ${observed.requestState}/${observed.processState}.` });

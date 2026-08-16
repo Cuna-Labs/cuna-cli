@@ -9,7 +9,11 @@ import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } f
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import { assertApiKeyUsable, resolveConfig, type EffectiveConfig } from "../config/config.js";
 import { assertOpenCodeExecutionEnabled } from "../config/opencode-feature-gate.js";
-import { executeCommand, preflightInvocation } from "../commands/commands.js";
+import {
+  executeCommand,
+  preflightInvocation,
+  type AgentSessionTerminationPoller,
+} from "../commands/commands.js";
 import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
 import {
   CONSOLE_ORIGIN,
@@ -53,6 +57,11 @@ export interface RunCliDependencies {
   readonly streams?: CliStreams;
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
+  /**
+   * Test seam for the bounded read-only confirmation after an AgentSession
+   * termination request. Production always uses a wall-clock deadline.
+   */
+  readonly agentSessionTerminationPoller?: AgentSessionTerminationPoller;
   readonly clientFactory?: (config: EffectiveConfig, timeoutMs: number) => CunaApiClient;
   readonly humanAuth?: HumanAuthService;
   readonly credentialVault?: CredentialVault;
@@ -808,6 +817,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       config,
       client,
       now: dependencies.now?.() ?? Date.now(),
+      ...(dependencies.agentSessionTerminationPoller === undefined
+        ? {}
+        : { agentSessionTerminationPoller: dependencies.agentSessionTerminationPoller }),
       ...(credentialMode === undefined ? {} : { credentialMode }),
       ...(runtimeFeatures === undefined ? {} : { runtimeFeatures }),
     });

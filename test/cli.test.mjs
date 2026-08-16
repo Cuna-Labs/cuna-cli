@@ -1063,6 +1063,146 @@ function agentSession(overrides = {}) {
   };
 }
 
+test("AgentSession termination waits for a fenced supervisor terminal observation", async () => {
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  let now = 0;
+  let sleeps = 0;
+  let reads = 0;
+  let terminations = 0;
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      assert.equal(scope, "agent_session");
+      assert.equal(resourceId, sessionId);
+      return capabilitySnapshot([{
+        id: "agent_sessions.terminate",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "destructive",
+        surfaces: ["cli"],
+        requiredPermissions: ["agent_sessions:terminate"],
+      }], scope, resourceId);
+    },
+    async terminateAgentSession(id) {
+      assert.equal(id, sessionId);
+      terminations += 1;
+      return agentSession({
+        id,
+        desiredState: "terminated",
+        requestState: "termination_pending",
+        processState: "ready",
+      });
+    },
+    async getAgentSession(id) {
+      assert.equal(id, sessionId);
+      reads += 1;
+      return reads === 1
+        ? agentSession({
+          id,
+          desiredState: "terminated",
+          requestState: "termination_pending",
+          processState: "ready",
+        })
+        : agentSession({
+          id,
+          desiredState: "terminated",
+          requestState: "terminal",
+          processState: "terminated",
+        });
+    },
+  });
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "terminate", sessionId, "--yes",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    agentSessionTerminationPoller: {
+      now: () => now,
+      async sleep(milliseconds) {
+        sleeps += 1;
+        now += milliseconds;
+      },
+    },
+    clientFactory: () => client,
+  });
+  assert.equal(exit, EXIT_CODES.success);
+  assert.equal(terminations, 1);
+  assert.equal(reads, 2);
+  assert.equal(sleeps, 1);
+  const record = JSON.parse(streams.stdout());
+  assert.equal(record.data.request_state, "terminal");
+  assert.equal(record.data.process_state, "terminated");
+});
+
+test("AgentSession termination fails closed only when the terminal observation deadline expires", async () => {
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  let now = 0;
+  let sleeps = 0;
+  let reads = 0;
+  let terminations = 0;
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      assert.equal(scope, "agent_session");
+      assert.equal(resourceId, sessionId);
+      return capabilitySnapshot([{
+        id: "agent_sessions.terminate",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "destructive",
+        surfaces: ["cli"],
+        requiredPermissions: ["agent_sessions:terminate"],
+      }], scope, resourceId);
+    },
+    async terminateAgentSession(id) {
+      assert.equal(id, sessionId);
+      terminations += 1;
+      return agentSession({
+        id,
+        desiredState: "terminated",
+        requestState: "termination_pending",
+        processState: "ready",
+      });
+    },
+    async getAgentSession(id) {
+      assert.equal(id, sessionId);
+      reads += 1;
+      return agentSession({
+        id,
+        desiredState: "terminated",
+        requestState: "termination_pending",
+        processState: "ready",
+      });
+    },
+  });
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "terminate", sessionId, "--yes",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    agentSessionTerminationPoller: {
+      now: () => now,
+      async sleep(milliseconds) {
+        sleeps += 1;
+        now += milliseconds;
+      },
+    },
+    clientFactory: () => client,
+  });
+  assert.equal(exit, EXIT_CODES.conflict);
+  assert.equal(terminations, 1);
+  assert.equal(sleeps, 60);
+  assert.equal(reads, 61);
+  const record = JSON.parse(streams.stderr());
+  assert.equal(record.error.code, "cuna.remote.postcondition_unverified");
+  assert.equal(record.error.details.observed_desired_state, "terminated");
+  assert.equal(record.error.details.observed_request_state, "termination_pending");
+});
+
 test("AgentSession create keeps auth mode explicit and rename is capability-gated", async () => {
   const machineId = "22222222-2222-4222-8222-222222222222";
   const sessionId = "11111111-1111-4111-8111-111111111111";
