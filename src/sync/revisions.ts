@@ -120,7 +120,7 @@ export function classifyConflict(input: {
   const relation = compareVectorClocks(input.ours.clock, input.theirs.clock);
   if (relation !== "concurrent" && relation !== "equal") return Object.freeze({ disposition: "ordered" });
   const conflictClass = input.classHint ?? inferConflictClass(input.base, input.ours, input.theirs);
-  const conflictId = stableDigest("runa-conflict-v2", {
+  const conflictId = stableDigest("cuna-conflict-v2", {
     base: input.base,
     ours: input.ours,
     path: input.path,
@@ -426,8 +426,8 @@ export function createWorkspaceRevision(input: {
       .map(([path, version]) => [path, freezeVersion(version)]),
   ));
   const parentIds = Object.freeze([...new Set(input.parentIds)].sort());
-  const manifestRoot = stableDigest("runa-revision-tree-v2", tree);
-  const revisionId = stableDigest("runa-revision-v2", {
+  const manifestRoot = stableDigest("cuna-revision-tree-v2", tree);
+  const revisionId = stableDigest("cuna-revision-v2", {
     manifestRoot,
     policyDigest: input.policyDigest,
     workspaceId: input.workspaceId,

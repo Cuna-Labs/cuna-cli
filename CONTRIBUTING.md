@@ -1,6 +1,6 @@
-# Contributing to Runa CLI
+# Contributing to Cuna CLI
 
-Runa CLI is a cross-platform security-sensitive client. Contributions must
+Cuna CLI is a cross-platform security-sensitive client. Contributions must
 preserve user files, credentials, cloud resource ownership, terminal state, and
 public API compatibility across Windows, macOS, and Linux.
 
@@ -39,7 +39,7 @@ with short-lived OIDC identity. Maintainers must not create or reuse a persisten
 The canonical installation command will be:
 
 ```sh
-npm install -g @runa_laboratories/cli
+npm install -g @cuna_labs/cli
 ```
 
 Bun, curl, Homebrew, and paru/AUR are projections of the same immutable

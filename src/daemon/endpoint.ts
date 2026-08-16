@@ -39,7 +39,7 @@ function validateOwnerIdentity(value: string): void {
 }
 
 function ownerToken(ownerIdentity: string): string {
-  return createHash("sha256").update("runa-daemon-owner\0").update(ownerIdentity).digest("hex").slice(0, 24);
+  return createHash("sha256").update("cuna-daemon-owner\0").update(ownerIdentity).digest("hex").slice(0, 24);
 }
 
 export function deriveDaemonEndpoint(input: {
@@ -51,7 +51,7 @@ export function deriveDaemonEndpoint(input: {
   if (input.platform === "win32") {
     return {
       transport: "windows_named_pipe",
-      address: `\\\\.\\pipe\\runa-daemon-v1-${ownerToken(input.ownerIdentity)}`,
+      address: `\\\\.\\pipe\\cuna-daemon-v1-${ownerToken(input.ownerIdentity)}`,
       requiredAcl: "owner_only",
       ownerIdentity: input.ownerIdentity,
     };
@@ -62,7 +62,7 @@ export function deriveDaemonEndpoint(input: {
       "An absolute user-private runtime directory is required for Unix daemon IPC.",
     );
   }
-  const directory = path.join(input.runtimeDirectory, "runa");
+  const directory = path.join(input.runtimeDirectory, "cuna");
   const address = path.join(directory, "daemon-v1.sock");
   // sockaddr_un is commonly limited to roughly 104-108 bytes. Refuse an endpoint
   // that cannot be represented instead of silently moving it to a shared directory.

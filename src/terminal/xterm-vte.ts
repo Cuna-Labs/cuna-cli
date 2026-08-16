@@ -3,7 +3,7 @@ import xtermHeadless from "@xterm/headless";
 import type { Terminal as XtermTerminal } from "@xterm/headless";
 
 import { MAX_TERMINAL_FRAME_BYTES } from "./codec.js";
-import { ViewportRegistry, type ViewportBinding, type ViewportSnapshot } from "./viewport.js";
+import { MAX_VIEWPORT_CELLS, ViewportRegistry, type ViewportBinding, type ViewportSnapshot } from "./viewport.js";
 
 const { Terminal } = xtermHeadless as unknown as { readonly Terminal: typeof XtermTerminal };
 export const DEFAULT_XTERM_SCROLLBACK = 1_000;
@@ -15,11 +15,13 @@ export const MAX_XTERM_RESPONSE_BYTES_PER_WRITE = 4_096;
 export const MAX_XTERM_ACTIVE_VIEWPORTS = 4;
 export const MAX_XTERM_GLOBAL_BUFFER_CELLS = 2_000_000;
 export const MAX_XTERM_GLOBAL_PENDING_WRITE_BYTES = MAX_TERMINAL_FRAME_BYTES * 4;
+export const MAX_XTERM_CELL_EXTENDERS = 64;
 const MAX_XTERM_RESPONSE_EVENTS_PER_SECOND = 256;
 const MAX_XTERM_RESPONSE_BYTES_PER_SECOND = 16_384;
 const XTERM_WRITE_TIMEOUT_MS = 5_000;
 const DEFAULT_RESPONSE_DELIVERY_TIMEOUT_MS = 2_000;
 const CONTAINED_OSC_IDENTIFIERS = Object.freeze([0, 1, 2, 8, 52] as const);
+const CELL_EXTENDER = /\p{M}|\u200d/u;
 
 export interface XtermTerminalResponse {
   readonly tabId: string;
@@ -110,6 +112,7 @@ export class XtermViewportAdapter {
   readonly #registry: ViewportRegistry;
   readonly #terminal: XtermTerminal;
   readonly #encoder = new TextEncoder();
+  readonly #complexityDecoder = new TextDecoder();
   readonly #scrollback: number;
   readonly #onTerminalResponse: XtermViewportOptions["onTerminalResponse"];
   readonly #clock: () => number;
@@ -118,6 +121,7 @@ export class XtermViewportAdapter {
   readonly #responseAbort = new AbortController();
   #writeTail: Promise<void> = Promise.resolve();
   #pendingWriteBytes = 0;
+  #cellExtenderRun = 0;
   #responseBatch: XtermTerminalResponse[] | undefined;
   #responseBatchBytes = 0;
   #responseOverflow = false;
@@ -165,7 +169,7 @@ export class XtermViewportAdapter {
       throw error;
     }
     for (const identifier of CONTAINED_OSC_IDENTIFIERS) {
-      // Runa renders cells only. Consuming non-cell metadata prevents remote
+      // Cuna renders cells only. Consuming non-cell metadata prevents remote
       // title, hyperlink, and clipboard state from entering trusted host UI or
       // being retained in the headless VTE link service.
       this.#terminal.parser.registerOscHandler(identifier, () => true);
@@ -207,7 +211,15 @@ export class XtermViewportAdapter {
     const payload = bytes.slice();
     const releaseGlobalPending = this.#resourceBudget.reservePending(this.#tabId, payload.byteLength);
     this.#pendingWriteBytes += payload.byteLength;
-    const operation = this.#writeTail.then(() => this.#writeNow(payload, outputSequence, replayCursor));
+    const operation = this.#writeTail.then(async () => {
+      try {
+        this.#assertCellComplexity(payload);
+        return await this.#writeNow(payload, outputSequence, replayCursor);
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
+    });
     this.#writeTail = operation.then(() => undefined, () => undefined);
     try {
       return await operation;
@@ -217,9 +229,16 @@ export class XtermViewportAdapter {
     }
   }
 
-  resize(columns: number, rows: number): ViewportSnapshot {
+  async resize(columns: number, rows: number): Promise<ViewportSnapshot> {
     this.#assertOpen();
     assertBufferBudget(columns, rows, this.#scrollback);
+    const operation = this.#writeTail.then(() => this.#resizeNow(columns, rows));
+    this.#writeTail = operation.then(() => undefined, () => undefined);
+    return await operation;
+  }
+
+  #resizeNow(columns: number, rows: number): ViewportSnapshot {
+    this.#assertOpen();
     const previousCells = bufferCells(this.#terminal.cols, this.#terminal.rows, this.#scrollback);
     this.#resourceBudget.resize(this.#tabId, bufferCells(columns, rows, this.#scrollback));
     try {
@@ -230,7 +249,7 @@ export class XtermViewportAdapter {
       throw error;
     }
     const current = this.#registry.require(this.#tabId);
-    return this.#capture(current.outputSequence + 1n, current.replayCursor);
+    return this.#capture(current.outputSequence, current.replayCursor, true);
   }
 
   dispose(): void {
@@ -316,7 +335,21 @@ export class XtermViewportAdapter {
     }));
   }
 
-  #capture(outputSequence: bigint, replayCursor: bigint): ViewportSnapshot {
+  #assertCellComplexity(bytes: Uint8Array): void {
+    const decoded = this.#complexityDecoder.decode(bytes, { stream: true });
+    for (const character of decoded) {
+      if (CELL_EXTENDER.test(character)) {
+        this.#cellExtenderRun += 1;
+        if (this.#cellExtenderRun > MAX_XTERM_CELL_EXTENDERS) {
+          throw new RangeError(`Terminal output exceeds the ${MAX_XTERM_CELL_EXTENDERS}-extender cell complexity limit.`);
+        }
+      } else {
+        this.#cellExtenderRun = 0;
+      }
+    }
+  }
+
+  #capture(outputSequence: bigint, replayCursor: bigint, localReflow = false): ViewportSnapshot {
     const buffer = this.#terminal.buffer.active;
     const cells: string[] = [];
     const displayWidths: number[] = [];
@@ -335,7 +368,7 @@ export class XtermViewportAdapter {
       }
       displayWidths.push(visibleWidth);
     }
-    return this.#registry.applyRenderedFrame({
+    const frame = {
       tabId: this.#tabId,
       binding: this.#binding,
       outputSequence,
@@ -350,7 +383,10 @@ export class XtermViewportAdapter {
         alternateScreen: buffer.type === "alternate",
         cursorVisible: this.#cursorVisible,
       },
-    });
+    };
+    return localReflow
+      ? this.#registry.applyLocalReflow(frame)
+      : this.#registry.applyRenderedFrame(frame);
   }
 
   #assertOpen(): void {
@@ -364,6 +400,7 @@ function assertBufferBudget(columns: number, rows: number, scrollback: number): 
     !Number.isSafeInteger(rows) ||
     columns < 1 ||
     rows < 1 ||
+    columns * rows > MAX_VIEWPORT_CELLS ||
     bufferCells(columns, rows, scrollback) > MAX_XTERM_BUFFER_CELLS
   ) {
     throw new RangeError(`Terminal viewport and scrollback exceed the ${MAX_XTERM_BUFFER_CELLS}-cell memory budget.`);

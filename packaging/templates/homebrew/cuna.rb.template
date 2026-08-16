@@ -1,0 +1,32 @@
+class Cuna < Formula
+  desc "Cuna cloud-agent CLI"
+  homepage "https://getcuna.com"
+  url "@@TARBALL_URL@@"
+  version "@@VERSION@@"
+  sha256 "@@TARBALL_SHA256@@"
+  license "Apache-2.0"
+
+  depends_on arch: :x86_64
+  depends_on "@@HOMEBREW_NODE_FORMULA@@"
+
+  def install
+    node_formula = Formula["@@HOMEBREW_NODE_FORMULA@@"]
+    system node_formula.opt_bin/"npm", "install", "--global", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", "--prefix", libexec, cached_download
+    cli = libexec/"lib/node_modules/@cuna_labs/cli/dist/bin/cuna.js"
+    (bin/"cuna").write <<~SH
+      #!/bin/sh
+      exec "#{node_formula.opt_bin}/node" "#{cli}" "$@"
+    SH
+  end
+
+  test do
+    require "json"
+
+    self_test = JSON.parse(shell_output("#{bin}/cuna self-test --offline --json"))
+    assert_equal true, self_test.dig("data", "ok")
+    identity = JSON.parse(shell_output("#{bin}/cuna version --json"))
+    assert_equal "@@VERSION@@", identity.dig("data", "version")
+    assert_match(/\A[0-9a-f]{64}\z/, identity.dig("data", "buildDigest"))
+    assert_equal "npm", identity.dig("data", "artifactChannel")
+  end
+end

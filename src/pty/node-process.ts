@@ -107,8 +107,8 @@ function createHandle(child: ChildProcessWithoutNullStreams): PipeProcessHandle 
 }
 
 function validateRequest(request: PipeProcessRequest): void {
-  if (request.executable.length === 0 || request.executable.length > 4096 || request.executable.includes("\0")) {
-    throw runtimeFailure("process_invalid", "The process executable is invalid.");
+  if (!path.isAbsolute(request.executable) || request.executable.length > 4096 || request.executable.includes("\0")) {
+    throw runtimeFailure("process_invalid", "The process executable must be an absolute admitted path.");
   }
   if (request.args.length > 1024 || request.args.some((argument) => argument.length > 65_536 || argument.includes("\0"))) {
     throw runtimeFailure("process_invalid", "The process argument vector is outside supported bounds.");

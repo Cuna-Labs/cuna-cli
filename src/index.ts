@@ -1,34 +1,59 @@
 export {
-  createRunaApiClient,
+  createCunaApiClient,
   decideCapability,
   requireCapability,
   type AgentSessionCreateInput,
   type PageOptions,
   type CapabilityDecision,
   type MachineCreateInput,
-  type RunaApiClient,
+  type CunaApiClient,
+  type TerminalConnectionCreateInput,
 } from "./api/client.js";
 export {
   decodeAgentSessionItem,
   decodeAgentSessionPage,
+  decodeAgentSessionAuth,
+  decodeAgentSessionAuthLogout,
+  decodeApiKeyList,
+  decodeApiKeyCreation,
+  decodeAuditRecords,
   decodeCapabilitySnapshot,
+  decodeCredentialRules,
+  decodeOk,
   decodeMachineItem,
   decodeMachinePage,
+  decodeCunaIdentity,
+  decodeTerminalConnectionGrant,
   type AgentKind,
   type AgentAuthMode,
   type AgentSession,
+  type AgentSessionAuth,
+  type AgentSessionAuthEvidenceClass,
+  type AgentSessionAuthState,
   type AgentSessionDesiredState,
   type AgentSessionPage,
   type AgentSessionProcessState,
   type AgentSessionRequestState,
+  type ApiKeyMetadata,
+  type ApiKeyCreation,
+  type AuditRecord,
   type Capability,
   type CapabilityAvailability,
   type CapabilityInteraction,
   type CapabilityScope,
   type CapabilitySnapshot,
+  type CredentialRule,
+  type CredentialRuleTarget,
+  type JsonValue,
   type Machine,
   type MachinePage,
   type MutationClass,
+  type CunaIdentity,
+  TERMINAL_PROTOCOL,
+  type TerminalCapabilityAvailability,
+  type TerminalCapabilityName,
+  type TerminalConnectionCapability,
+  type TerminalConnectionGrant,
 } from "./api/contracts.js";
 export { createHttpTransport, type HttpRequest, type HttpTransport } from "./api/http.js";
 export { createPkceAuthorization, type PkceAuthorization } from "./auth/pkce.js";
@@ -43,23 +68,90 @@ export {
   type OnboardingNextAction,
   type WorkspaceState,
 } from "./auth/onboarding-state.js";
+export { createBrowserOpener, type BrowserOpener } from "./auth/browser.js";
+export { createHumanAuthClient, type HumanAuthClient } from "./auth/human-client.js";
 export {
-  startLoopbackCallback,
-  type LoopbackAuthorizationResult,
-  type LoopbackCallback,
-  type LoopbackHost,
-} from "./auth/loopback.js";
+  decodeCliAuthBootstrap,
+  decodeCliContinuationIssued,
+  decodeCliIdentityContext,
+  decodeCliSignupCapability,
+  decodeCliLoginCodeExchangeResult,
+  decodeRevocation,
+  type CliAuthBootstrap,
+  type CliContinuationIssued,
+  type CliIdentityContext,
+  type CliIntentClass,
+  type CliSignupCapability,
+  type CliLoginCodeExchangeResult,
+} from "./auth/human-contracts.js";
+export {
+  createHumanAuthService,
+  type HumanAuthResult,
+  type HumanAuthService,
+} from "./auth/human-session.js";
 export { runCli, memoryStreams, type RunCliDependencies } from "./cli/run.js";
 export { parseArgv, type ParsedInvocation } from "./cli/parser.js";
 export {
   DEFAULT_BASE_URL,
+  assertApiKeyUsable,
+  environmentCredentialState,
   publicConfig,
   resolveConfig,
   type ConfigOverrides,
   type ConfigSource,
   type EffectiveConfig,
+  type EnvironmentCredentialState,
 } from "./config/config.js";
-export { EXIT_CODES, RunaError, type ExitCode, type SafeErrorDetails } from "./core/errors.js";
+export {
+  ERROR_NAMESPACE,
+  EXIT_CODES,
+  CunaError,
+  type ExitCode,
+  type SafeErrorDetails,
+} from "./core/errors.js";
+export {
+  DOCUMENTED_EXIT_CODES,
+  exitCodeHelpSection,
+  exitCodeMarkdownTable,
+  type DocumentedExitCode,
+  type ExitCodeName,
+} from "./core/exit-codes.js";
+export {
+  API_KEYS_URL,
+  CONSOLE_ORIGIN,
+  INTERNAL_DEFECT_HINT,
+  OFF_CONTRACT_RESPONSE_HINT,
+  SUPPORT_URL,
+  automationCredentialHint,
+} from "./core/product-web.js";
+export { ContractViolation, contractViolation } from "./core/validation.js";
+export {
+  API_ORIGINS,
+  API_WEBSOCKET_ORIGINS,
+  CREDENTIAL_BRANDS,
+  CREDENTIAL_FAMILY_INFIXES,
+  CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR,
+  CREDENTIAL_OPENING_SOURCE,
+  CREDENTIAL_VALUE_SOURCE,
+  brandedEnvironmentNames,
+  containsCredentialValue,
+  credentialFamilyValidator,
+  isAccessToken,
+  isApiKeyDisplayPrefix,
+  isBrowserCallbackNonce,
+  isProblemType,
+  isProblemTypeForCode,
+  isSecretApiKey,
+  isTerminalConnectToken,
+  isTerminalStreamUrl,
+  isTransportCredential,
+  readBrandedEnvironment,
+  type ApiOrigin,
+  type BrandedEnvironmentValue,
+  type CredentialBrand,
+  type CredentialFamily,
+  type CredentialFamilyInfix,
+} from "./core/namespace.js";
 export {
   createPlatformAdapter,
   resolvePlatformKind,
@@ -72,6 +164,7 @@ export {
 } from "./platform/adapter.js";
 export {
   INITIAL_RUNTIME_GATES,
+  runtimeFeatureGates,
   type DaemonState,
   type RuntimeFeatureGate,
   type SyncSupervisorState,
@@ -85,6 +178,20 @@ export {
   type WorkbenchFrameInput,
   type WorkbenchTab,
 } from "./terminal/workbench.js";
+export {
+  ForegroundTerminalCoordinator,
+  MAX_FOREGROUND_PENDING_INPUT_BYTES,
+  type ForegroundTabIntent,
+  type ForegroundTerminalCoordinatorOptions,
+  type ForegroundTerminalHost,
+  type ForegroundTerminalRuntime,
+  type ForegroundTerminalState,
+} from "./terminal/foreground.js";
+export {
+  PassthroughTerminalCoordinator,
+  admitPassthroughDimensions,
+  type PassthroughTerminalCoordinatorOptions,
+} from "./terminal/passthrough.js";
 export {
   buildAppbarModel,
   projectTruth,
@@ -104,6 +211,7 @@ export {
   DEFAULT_XTERM_SCROLLBACK,
   MAX_XTERM_ACTIVE_VIEWPORTS,
   MAX_XTERM_BUFFER_CELLS,
+  MAX_XTERM_CELL_EXTENDERS,
   MAX_XTERM_GLOBAL_BUFFER_CELLS,
   MAX_XTERM_GLOBAL_PENDING_WRITE_BYTES,
   MAX_XTERM_PENDING_WRITE_BYTES,
@@ -116,3 +224,18 @@ export {
   type XtermViewportOptions,
 } from "./terminal/xterm-vte.js";
 export { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "./version.js";
+export {
+  planAgentSessionSelection,
+  planJourneySelection,
+  planMachineSelection,
+  type AgentSessionSelectionInput,
+  type AgentSessionSelectionObservation,
+  type AgentSessionSelectionPlan,
+  type JourneySelectionInput,
+  type JourneySelectionPlan,
+  type MachineSelectionInput,
+  type MachineSelectionObservation,
+  type MachineSelectionPlan,
+  type SafeAgentSessionCandidate,
+  type SafeMachineCandidate,
+} from "./journey/index.js";

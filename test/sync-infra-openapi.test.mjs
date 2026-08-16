@@ -1,0 +1,116 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+import { hasCommittedOpenCodeContractWitness } from "../dist/config/opencode-feature-gate.js";
+
+const repositoryRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const sourceContract = path.join(repositoryRoot, "contracts", "infra", "cuna-api.openapi.json");
+const sourceDigest = path.join(repositoryRoot, "contracts", "infra", "cuna-api.openapi.sha256");
+const syncSource = path.join(repositoryRoot, "scripts", "sync-infra-openapi.mjs");
+const witnessSource = path.join(repositoryRoot, "scripts", "lib", "infra-contract-witness.mjs");
+
+const fakeVerifier = `
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+  }
+  return value;
+}
+
+const bytes = await readFile(process.env.RUNA_CONTRACT_ARTIFACT);
+const contract = JSON.parse(bytes.toString("utf8"));
+process.stdout.write(JSON.stringify({
+  canonical_artifact_sha256: createHash("sha256").update(JSON.stringify(canonical(contract)), "utf8").digest("hex"),
+  contract_digest_semantics: "sha256(canonical-json:utf8;recursive-object-key-sort;array-order-preserved)",
+  operations: [],
+  sdk_operations: [],
+  projection_sha256: "a".repeat(64),
+  runtime_manifest_sha256: "b".repeat(64),
+}) + "\\n");
+`;
+
+function run(command, args, cwd, env = process.env) {
+  const result = spawnSync(command, args, { cwd, env, encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`${command} ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
+}
+
+function runSync(consumer, producerContract, allowWorktree = false) {
+  const environment = {
+    ...process.env,
+    CUNA_INFRA_OPENAPI_PATH: producerContract,
+    ...(allowWorktree ? { CUNA_INFRA_OPENAPI_ALLOW_WORKTREE: "1" } : {}),
+  };
+  return run(process.execPath, [path.join(consumer, "scripts", "sync-infra-openapi.mjs")], consumer, environment);
+}
+
+async function createConsumer(root) {
+  await mkdir(path.join(root, "scripts", "lib"), { recursive: true });
+  await mkdir(path.join(root, "contracts", "infra"), { recursive: true });
+  await mkdir(path.join(root, "src", "config"), { recursive: true });
+  await copyFile(syncSource, path.join(root, "scripts", "sync-infra-openapi.mjs"));
+  await copyFile(witnessSource, path.join(root, "scripts", "lib", "infra-contract-witness.mjs"));
+}
+
+async function createProducer(root) {
+  const contracts = path.join(root, "contracts");
+  await mkdir(path.join(contracts, "tools"), { recursive: true });
+  await copyFile(sourceContract, path.join(contracts, "runa-api.openapi.json"));
+  const [canonicalDigest] = (await readFile(sourceDigest, "utf8")).trim().split(/\s+/u);
+  await writeFile(path.join(contracts, "runa-api.openapi.sha256"), `${canonicalDigest} runa-api.openapi.json\n`, "utf8");
+  await writeFile(path.join(contracts, "tools", "verify-contract.mjs"), fakeVerifier, "utf8");
+  await writeFile(path.join(root, "README.md"), "fixture\n", "utf8");
+  run("git", ["init"], root);
+  run("git", ["config", "user.email", "contract-fixture@example.test"], root);
+  run("git", ["config", "user.name", "Contract Fixture"], root);
+  run("git", ["add", "."], root);
+  run("git", ["commit", "-m", "strict producer contract"], root);
+}
+
+test("sync binds a clean strict producer to an immutable OpenCode witness and keeps mutable inputs disabled", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cuna-infra-sync-"));
+  const producer = path.join(root, "producer");
+  const consumer = path.join(root, "consumer");
+  const producerContract = path.join(producer, "contracts", "runa-api.openapi.json");
+  try {
+    await createProducer(producer);
+    await createConsumer(consumer);
+
+    const cleanReceipt = JSON.parse(runSync(consumer, producerContract));
+    const cleanIdentity = JSON.parse(await readFile(path.join(consumer, "contracts", "infra", "cuna-api.openapi.identity.json"), "utf8"));
+    assert.equal(cleanReceipt.status, "synchronized_committed");
+    assert.equal(cleanIdentity.schemaVersion, 2);
+    assert.equal(cleanIdentity.producer_content_state, "committed");
+    assert.equal(cleanIdentity.producer_full_tree.commit, cleanIdentity.producer_revision);
+    assert.equal(cleanIdentity.feature_contracts.opencode_interactive_only.producer_tree, cleanIdentity.producer_full_tree.tree);
+    assert.equal(hasCommittedOpenCodeContractWitness(cleanIdentity), true);
+
+    const generatedSource = await readFile(path.join(consumer, "src", "config", "infra-contract-witness.ts"), "utf8");
+    assert.match(generatedSource, /Generated by scripts\/sync-infra-openapi\.mjs/u);
+    assert.match(generatedSource, /producer_content_state.*committed/us);
+
+    await writeFile(path.join(producer, "unrelated.txt"), "mutable\n", "utf8");
+    assert.throws(() => runSync(consumer, producerContract), /producer is mutable/u);
+    const mutableReceipt = JSON.parse(runSync(consumer, producerContract, true));
+    const mutableIdentity = JSON.parse(await readFile(path.join(consumer, "contracts", "infra", "cuna-api.openapi.identity.json"), "utf8"));
+    assert.equal(mutableReceipt.status, "synchronized_working_tree_product_delta");
+    assert.equal(mutableIdentity.producer_content_state, "working_tree_product_delta");
+    assert.equal(mutableIdentity.producer_full_tree, null);
+    assert.equal(mutableIdentity.feature_contracts.opencode_interactive_only, null);
+    assert.equal(hasCommittedOpenCodeContractWitness(mutableIdentity), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

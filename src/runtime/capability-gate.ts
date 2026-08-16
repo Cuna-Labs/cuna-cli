@@ -1,4 +1,5 @@
 import type { CapabilityScope, CapabilitySnapshot } from "../api/contracts.js";
+import { classifyCapabilitySnapshot } from "../api/capability-evidence.js";
 
 import { runtimeFailure } from "./errors.js";
 
@@ -25,6 +26,14 @@ export function admitCapability(
   requirement: CapabilityRequirement,
   now = Date.now(),
 ): CapabilityAdmission {
+  const validity = classifyCapabilitySnapshot(snapshot, now);
+  if (validity !== "valid") {
+    throw runtimeFailure(
+      validity === "expired" ? "capability_snapshot_expired" : "capability_unknown",
+      validity === "expired" ? "The capability snapshot expired before the operation." : "The capability snapshot has invalid authority evidence.",
+      { safeDetails: { reason: validity } },
+    );
+  }
   if (snapshot.subjectScope !== requirement.scope) {
     throw runtimeFailure("capability_scope_mismatch", "The capability snapshot belongs to another resource scope.");
   }
@@ -33,12 +42,6 @@ export function admitCapability(
   }
   const observedAt = Date.parse(snapshot.observedAt);
   const expiresAt = Date.parse(snapshot.expiresAt);
-  if (!Number.isFinite(observedAt) || !Number.isFinite(expiresAt) || expiresAt < observedAt) {
-    throw runtimeFailure("capability_unknown", "The capability snapshot has invalid freshness evidence.");
-  }
-  if (expiresAt <= now) {
-    throw runtimeFailure("capability_snapshot_expired", "The capability snapshot expired before the operation.");
-  }
   const matches = snapshot.capabilities.filter((candidate) => candidate.id === requirement.id);
   if (matches.length !== 1) {
     throw runtimeFailure("capability_unknown", "The required capability is absent or ambiguous.", {

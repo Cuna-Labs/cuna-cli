@@ -1,4 +1,4 @@
-import { EXIT_CODES, RunaError, type ExitCode } from "../core/errors.js";
+import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 
 export type WorkspaceFailureClass = "conflict" | "integrity" | "policy" | "unsupported";
 
@@ -14,9 +14,9 @@ export function workspaceError(
   message: string,
   failureClass: WorkspaceFailureClass,
   reason: string,
-): RunaError {
-  return new RunaError({
-    code: `runa.workspace.${code}`,
+): CunaError {
+  return new CunaError({
+    code: `cuna.workspace.${code}`,
     message,
     exitCode: EXIT_BY_CLASS[failureClass],
     details: { reason },

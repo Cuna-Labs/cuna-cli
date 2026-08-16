@@ -1,11 +1,20 @@
 import type { CapabilitySnapshot } from "../api/contracts.js";
+import type {
+  TerminalCapabilityName,
+  TerminalConnectionGrant,
+} from "../api/contracts.js";
+import { isTerminalConnectToken } from "../core/namespace.js";
 import { TERMINAL_PROTOCOL, type TerminalReadyPayload } from "../terminal/codec.js";
 
 import type { CapabilityAdmission } from "./capability-gate.js";
 import { runtimeFailure } from "./errors.js";
 
+const CANONICAL_TIMESTAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/u;
+const MAX_REMOTE_EVIDENCE_TTL_MS = 60_000;
+const MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS = 5_000;
+
 export interface RemoteAgentSessionEvidence {
-  readonly authority: "runa_agent_session_supervisor";
+  readonly authority: "cuna_agent_session_supervisor";
   readonly userId: string;
   readonly machineId: string;
   readonly agentSessionId: string;
@@ -16,24 +25,24 @@ export interface RemoteAgentSessionEvidence {
   readonly evidenceRevision: string;
 }
 
-export interface TerminalConnectionGrant {
-  readonly terminalConnectionId: string;
-  readonly resumeHandle: string;
-  readonly connectUrl: string;
-  readonly connectToken: string;
-  readonly protocol: typeof TERMINAL_PROTOCOL;
-  readonly issuedAt: string;
-  readonly expiresAt: string;
-  readonly userId: string;
-  readonly machineId: string;
-  readonly agentSessionId: string;
-  readonly processEpoch: string;
-  readonly attachmentGeneration: number;
+/**
+ * Immutable authority admitted before a terminal attach begins. The runtime
+ * revalidates this exact process generation and capability revision before and
+ * after issuing a one-use connection grant.
+ */
+export interface TerminalAttachmentAdmission {
+  readonly observation: RemoteAgentSessionEvidence;
+  readonly capability: CapabilityAdmission;
 }
 
+export type {
+  TerminalConnectionCapability,
+  TerminalConnectionGrant,
+} from "../api/contracts.js";
+
 export interface TerminalControlPlane {
-  discoverCapabilities(scope: "agent_session", resourceId: string): Promise<CapabilitySnapshot>;
-  observeAgentSession(agentSessionId: string): Promise<RemoteAgentSessionEvidence>;
+  discoverCapabilities(scope: "agent_session", resourceId: string, signal?: AbortSignal): Promise<CapabilitySnapshot>;
+  observeAgentSession(agentSessionId: string, signal?: AbortSignal): Promise<RemoteAgentSessionEvidence>;
   createTerminalConnection(input: {
     readonly agentSessionId: string;
     readonly protocol: typeof TERMINAL_PROTOCOL;
@@ -41,6 +50,7 @@ export interface TerminalControlPlane {
     readonly idempotencyKey: string;
     readonly capabilityEvidence: CapabilityAdmission;
     readonly resumeHandle?: string;
+    readonly signal?: AbortSignal;
   }): Promise<TerminalConnectionGrant>;
 }
 
@@ -64,7 +74,7 @@ export function createUnavailableTerminalControlPlane(): TerminalControlPlane {
   const unavailable = async (): Promise<never> => {
     throw runtimeFailure(
       "control_plane_unavailable",
-      "This Runa deployment does not expose the AgentSession terminal producer contract.",
+      "This Cuna deployment does not expose the AgentSession terminal producer contract.",
     );
   };
   return Object.freeze({
@@ -84,15 +94,21 @@ export function assertRemoteAgentSessionEvidence(input: {
   const observedAt = Date.parse(evidence.observedAt);
   const expiresAt = Date.parse(evidence.expiresAt);
   if (
-    evidence.authority !== "runa_agent_session_supervisor" ||
+    evidence.authority !== "cuna_agent_session_supervisor" ||
     evidence.agentSessionId !== input.expectedAgentSessionId ||
     evidence.userId.length === 0 ||
     evidence.machineId.length === 0 ||
     evidence.processEpoch.length === 0 ||
     evidence.evidenceRevision.length === 0 ||
+    !CANONICAL_TIMESTAMP.test(evidence.observedAt) ||
+    !CANONICAL_TIMESTAMP.test(evidence.expiresAt) ||
     !Number.isFinite(observedAt) ||
     !Number.isFinite(expiresAt) ||
+    new Date(observedAt).toISOString() !== evidence.observedAt ||
+    new Date(expiresAt).toISOString() !== evidence.expiresAt ||
+    observedAt > now + MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS ||
     expiresAt < observedAt ||
+    expiresAt - observedAt > MAX_REMOTE_EVIDENCE_TTL_MS ||
     expiresAt <= now ||
     (evidence.state !== "ready" && evidence.state !== "running")
   ) {
@@ -103,38 +119,42 @@ export function assertRemoteAgentSessionEvidence(input: {
 
 export function validateTerminalGrant(input: {
   readonly grant: TerminalConnectionGrant;
-  readonly observation: RemoteAgentSessionEvidence;
-  readonly allowedRunaOrigins: readonly string[];
+  readonly allowedCunaOrigins: readonly string[];
+  readonly requiredCapabilities?: readonly TerminalCapabilityName[];
   readonly now?: number;
 }): TerminalConnectionGrant {
   const now = input.now ?? Date.now();
   const grant = input.grant;
-  const issuedAt = Date.parse(grant.issuedAt);
   const expiresAt = Date.parse(grant.expiresAt);
   if (
     grant.protocol !== TERMINAL_PROTOCOL ||
-    !safeIdentifier(grant.terminalConnectionId) ||
-    !safeIdentifier(grant.resumeHandle) ||
-    grant.connectToken.length < 16 ||
-    grant.connectToken.length > 4096 ||
-    grant.connectToken.includes("\0") ||
-    !Number.isFinite(issuedAt) ||
+    !canonicalUuid(grant.terminalSessionId) ||
+    !canonicalUuid(grant.resumeHandle) ||
+    !isTerminalConnectToken(grant.connectToken) ||
     !Number.isFinite(expiresAt) ||
     expiresAt <= now ||
-    expiresAt <= issuedAt ||
-    expiresAt - issuedAt > 60_000 ||
-    !Number.isSafeInteger(grant.attachmentGeneration) ||
-    grant.attachmentGeneration < 1
+    expiresAt - now > 60_000
   ) {
     throw runtimeFailure(expiresAt <= now ? "grant_expired" : "grant_invalid", "The terminal ConnectionGrant is invalid or expired.");
   }
-  if (
-    grant.userId !== input.observation.userId ||
-    grant.machineId !== input.observation.machineId ||
-    grant.agentSessionId !== input.observation.agentSessionId ||
-    grant.processEpoch !== input.observation.processEpoch
-  ) {
-    throw runtimeFailure("grant_scope_mismatch", "The terminal ConnectionGrant targets another resource generation.");
+  const capabilityNames = new Set<TerminalCapabilityName>();
+  for (const capability of grant.capabilities) {
+    if (capabilityNames.has(capability.name)) {
+      throw runtimeFailure("grant_invalid", "The terminal ConnectionGrant capability set is ambiguous.");
+    }
+    capabilityNames.add(capability.name);
+  }
+  if (capabilityNames.size !== 5) {
+    throw runtimeFailure("grant_invalid", "The terminal ConnectionGrant capability set is incomplete.");
+  }
+  for (const required of input.requiredCapabilities ?? []) {
+    const matches = grant.capabilities.filter((capability) => capability.name === required);
+    if (matches.length !== 1 || matches[0]?.availability === "unknown") {
+      throw runtimeFailure("capability_unknown", `Cuna cannot prove terminal capability ${required}.`);
+    }
+    if (matches[0]?.availability !== "supported") {
+      throw runtimeFailure("capability_unsupported", `Terminal capability ${required} is unsupported.`);
+    }
   }
   let url: URL;
   try {
@@ -149,9 +169,10 @@ export function validateTerminalGrant(input: {
     url.search !== "" ||
     url.hash !== "" ||
     url.pathname.includes("..") ||
-    !input.allowedRunaOrigins.some((origin) => toWebSocketOrigin(origin) === url.origin)
+    url.pathname !== `/v1/terminal-connections/${grant.terminalSessionId}/stream` ||
+    !input.allowedCunaOrigins.some((origin) => toWebSocketOrigin(origin) === url.origin)
   ) {
-    throw runtimeFailure("grant_invalid", "The terminal connection URL is not an allowlisted Runa origin.");
+    throw runtimeFailure("grant_invalid", "The terminal connection URL is not an allowlisted Cuna origin.");
   }
   if (grant.connectUrl.includes(grant.connectToken)) {
     throw runtimeFailure("grant_invalid", "The terminal token must not be embedded in the connection URL.");
@@ -162,13 +183,13 @@ export function validateTerminalGrant(input: {
 export function assertReadyPayloadMatches(
   payload: Readonly<Record<string, unknown>>,
   observation: RemoteAgentSessionEvidence,
-  grant: TerminalConnectionGrant,
 ): asserts payload is Readonly<Record<string, unknown>> & TerminalReadyPayload {
   if (
     payload.protocol !== TERMINAL_PROTOCOL ||
     payload.agentSessionId !== observation.agentSessionId ||
     payload.processEpoch !== observation.processEpoch ||
-    payload.fencingGeneration !== grant.attachmentGeneration
+    !Number.isSafeInteger(payload.fencingGeneration) ||
+    Number(payload.fencingGeneration) < 1
   ) {
     throw runtimeFailure("grant_scope_mismatch", "Terminal readiness evidence targets another AgentSession generation.");
   }
@@ -187,6 +208,6 @@ function toWebSocketOrigin(value: string): string | undefined {
   }
 }
 
-function safeIdentifier(value: string): boolean {
-  return /^[A-Za-z0-9._:-]{1,256}$/u.test(value);
+function canonicalUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value);
 }

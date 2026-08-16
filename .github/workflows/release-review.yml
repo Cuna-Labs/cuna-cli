@@ -1,0 +1,115 @@
+name: Review npm preview release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact candidate SemVer
+        required: true
+        type: string
+      source_commit:
+        description: Exact protected-main source commit
+        required: true
+        type: string
+      candidate_run_id:
+        description: Successful main CI run containing release-review-candidate
+        required: true
+        type: string
+      candidate_sha256:
+        description: Exact candidate npm tarball SHA-256
+        required: true
+        type: string
+      candidate_envelope_sha256:
+        description: Exact release-envelope SHA-256
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: release-review-${{ inputs.source_commit }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    name: protected-candidate-review-fail-closed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release-review-npm-preview
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+      - name: Verify declared review authority against read-only GitHub state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-release-review-authority.mjs
+      - name: Bind dispatch to protected main and successful candidate producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        shell: bash
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          git fetch --no-tags origin main
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse origin/main)" = "$SOURCE_COMMIT"
+          CANDIDATE_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}" --jq '[.status,.conclusion,.head_sha,.event,.head_branch,.path] | join(" ")')"
+          test "$CANDIDATE_STATE" = "completed success ${SOURCE_COMMIT} push main .github/workflows/ci.yml"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-review-candidate
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+          path: admitted
+      - name: Verify exact candidate bytes and provenance
+        env:
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          CANDIDATE_ENVELOPE_SHA256: ${{ inputs.candidate_envelope_sha256 }}
+        shell: bash
+        run: |
+          [[ "$CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CANDIDATE_ENVELOPE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          node scripts/verify-release-envelope.mjs --root admitted/release-artifacts
+          node scripts/verify-release-distributions.mjs --root . --evidence admitted/release-artifacts --distributions admitted/release-artifacts/distributions
+          test "$(sha256sum admitted/release-artifacts/release-envelope.json | cut -d' ' -f1)" = "$CANDIDATE_ENVELOPE_SHA256"
+          TARBALL_FILE="$(node -p "require('./admitted/release-artifacts/release-envelope.json').tarball.file")"
+          [[ "$TARBALL_FILE" =~ ^[A-Za-z0-9._-]+\.tgz$ ]]
+          test "$(sha256sum "admitted/release-artifacts/$TARBALL_FILE" | cut -d' ' -f1)" = "$CANDIDATE_SHA256"
+          node - <<'NODE'
+          const inputs = require('./admitted/release-artifacts/release-inputs.json');
+          if (inputs.contractSet?.releaseAuthority !== 'UNRESOLVED_BLOCKING') {
+            throw new Error('Unexpected contract authority state requires re-audit before release review.');
+          }
+          NODE
+      - name: Verify GitHub provenance of exact candidate bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: >-
+          gh attestation verify admitted/release-artifacts/*.tgz
+          --repo "$GITHUB_REPOSITORY"
+          --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"
+      - name: Block lease minting until independent authorities exist
+        shell: bash
+        run: |
+          echo "::error title=Release review authority unavailable::RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED"
+          echo "::error title=Approval event evidence unavailable::ACTUAL_ENVIRONMENT_APPROVAL_EVENT_NOT_OBSERVABLE_BY_WORKFLOW_TOKEN"
+          echo "::error title=Contract authority unavailable::CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE"
+          echo "::error title=Observation authority unavailable::CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE"
+          echo "::error title=Candidate contract unresolved::CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED"
+          exit 1

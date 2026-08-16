@@ -1,0 +1,33 @@
+{
+  "$comment": [
+    "The status checks the GitHub branch ruleset requires before a pull request can merge.",
+    "This file is the repository-side half of a contract whose other half lives in GitHub's",
+    "ruleset API, which nothing in the tree can read at build time. The two were written",
+    "independently and compared by nobody, so the ruleset came to require a check named",
+    "'source-quality-gates' while the only job that could plausibly emit it was a matrix named",
+    "'source-quality-node-${{ matrix.node }}'. With zero bypass actors configured, that made",
+    "every pull request permanently unmergeable, and no test, lint or typecheck could notice.",
+    "",
+    "scripts/verify-ci-contract.mjs asserts that every name below is emitted by exactly one",
+    "workflow job whose name is a literal (a name containing a ${{ }} expression is a matrix",
+    "name and can never equal a required check), and that the emitting workflow runs on",
+    "pull_request. Adding a required check to the ruleset without adding it here does not fail",
+    "the build -- only the owner can read the ruleset -- so when the ruleset changes, this file",
+    "changes in the same pull request.",
+    "",
+    "Measured against ruleset 'Protect main' (id 20598397, enforcement active, bypass_actors",
+    "null) on 2026-08-10."
+  ],
+  "ruleset": "Protect main",
+  "branches": [
+    "~DEFAULT_BRANCH",
+    "refs/heads/development/full-platform-implementation"
+  ],
+  "requiredStatusChecks": [
+    "dependency-review",
+    "installed-tree-audit",
+    "public-repository-controls",
+    "release-admission",
+    "source-quality-gates"
+  ]
+}

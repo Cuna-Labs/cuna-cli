@@ -58,6 +58,7 @@ export class HostTerminalLease {
   #raw = false;
   #alternate = false;
   #restored = false;
+  #restorePromise: Promise<void> | undefined;
 
   private constructor(adapter: HostTerminalAdapter) {
     this.#adapter = adapter;
@@ -73,14 +74,27 @@ export class HostTerminalLease {
       await adapter.enterAlternateScreen();
       return lease;
     } catch (error) {
-      await lease.restore();
+      try {
+        await lease.restore();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "Host terminal acquisition and cleanup both failed.");
+      }
       throw error;
     }
   }
 
   async restore(): Promise<void> {
     if (this.#restored) return;
-    this.#restored = true;
+    if (this.#restorePromise !== undefined) return await this.#restorePromise;
+    this.#restorePromise = this.#restoreNow();
+    try {
+      await this.#restorePromise;
+    } finally {
+      this.#restorePromise = undefined;
+    }
+  }
+
+  async #restoreNow(): Promise<void> {
     const failures: unknown[] = [];
     try {
       await this.#adapter.disableRemoteModes();
@@ -90,6 +104,7 @@ export class HostTerminalLease {
     if (this.#alternate) {
       try {
         await this.#adapter.leaveAlternateScreen();
+        this.#alternate = false;
       } catch (error) {
         failures.push(error);
       }
@@ -97,10 +112,12 @@ export class HostTerminalLease {
     if (this.#raw) {
       try {
         await this.#adapter.leaveRawMode();
+        this.#raw = false;
       } catch (error) {
         failures.push(error);
       }
     }
     if (failures.length > 0) throw new AggregateError(failures, "Host terminal restoration was incomplete.");
+    this.#restored = true;
   }
 }
