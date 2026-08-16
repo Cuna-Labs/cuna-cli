@@ -1196,6 +1196,7 @@ test("AgentSession termination fails closed only when the terminal observation d
   assert.equal(exit, EXIT_CODES.conflict);
   assert.equal(terminations, 1);
   assert.equal(sleeps, 60);
+  assert.equal(now, 15_000);
   assert.equal(reads, 61);
   const record = JSON.parse(streams.stderr());
   assert.equal(record.error.code, "cuna.remote.postcondition_unverified");
