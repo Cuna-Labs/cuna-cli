@@ -1360,12 +1360,12 @@ function runNode(args, options) {
 }
 
 async function runNpm(args, options) {
-  const npmCommand = process.platform === "win32" ? "where.exe" : "which";
-  const located = await run(npmCommand, [process.platform === "win32" ? "npm.cmd" : "npm"], { cwd: options.cwd, timeout: 10_000 });
-  const npm = located.stdout.split(/\r?\n/u).map((value) => value.trim()).find(Boolean);
-  assert.ok(npm);
-  const npmCli = path.join(path.dirname(npm), "node_modules", "npm", "bin", "npm-cli.js");
-  return run(process.execPath, [npmCli, ...args], options);
+  // Invoke the platform executable through PATH.  Reconstructing npm-cli.js
+  // below `bin/node_modules` only works for the Windows Node distribution;
+  // hosted POSIX runners install npm under `lib/node_modules`, so that
+  // guessed path exits before npm can report a pack/install result.
+  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  return run(npmCommand, args, options);
 }
 
 function run(command, args, { cwd, env = process.env, timeout, input }) {
