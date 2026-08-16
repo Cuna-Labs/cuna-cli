@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFile, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -373,6 +375,34 @@ test("fenced journal admits exactly one concurrent writer", async (t) => {
   const winners = attempts.filter((result) => result.status === "fulfilled");
   assert.equal(winners.length, 1);
   await winners[0].value.close();
+});
+
+test("journal retries a positively identified foreign TCP-port collision without bypassing its own writer fence", async (t) => {
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const root = await temporaryDirectory(t);
+    const directory = join(root, "journal");
+    await mkdir(directory);
+    const digest = createHash("sha256")
+      .update("cuna-journal-authority-v2\0")
+      .update(directory)
+      .digest("hex");
+    const port = 20_000 + Number.parseInt(digest.slice(0, 4), 16) % 40_000;
+    const foreign = createServer((socket) => socket.end("b".repeat(64)));
+    try {
+      await new Promise((resolveListen, rejectListen) => {
+        foreign.once("error", rejectListen);
+        foreign.listen({ host: "127.0.0.1", port, exclusive: true }, resolveListen);
+      });
+    } catch (error) {
+      if (error.code === "EADDRINUSE") continue;
+      throw error;
+    }
+    t.after(() => new Promise((resolveClose, rejectClose) => foreign.close((error) => error === undefined ? resolveClose() : rejectClose(error))));
+    const journal = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" });
+    await journal.close();
+    return;
+  }
+  assert.fail("could not reserve a collision port for the journal authority test");
 });
 
 test("journal replay is idempotent and unknown outcome requires an authoritative query", async (t) => {
