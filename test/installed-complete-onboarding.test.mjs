@@ -538,8 +538,16 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
       assert.equal(installed.code, 0, `installed E2E npm install failed after ${installed.durationMs}ms`);
     });
 
-    const installedEntrypoint = path.join(prefix, "node_modules", "@cuna_labs", "cli", "dist", "bin", "cuna.js");
-    const installedRoot = path.join(prefix, "node_modules", "@cuna_labs", "cli");
+    // npm's global prefix layout is platform-specific: Windows uses
+    // <prefix>/node_modules, while hosted POSIX runners use
+    // <prefix>/lib/node_modules. Keep the assertion bound to the isolated
+    // prefix and resolve the platform's canonical layout instead of guessing
+    // an npm-cli.js location or treating a valid POSIX install as missing.
+    const installedModulesRoot = process.platform === "win32"
+      ? path.join(prefix, "node_modules")
+      : path.join(prefix, "lib", "node_modules");
+    const installedEntrypoint = path.join(installedModulesRoot, "@cuna_labs", "cli", "dist", "bin", "cuna.js");
+    const installedRoot = path.join(installedModulesRoot, "@cuna_labs", "cli");
     const env = {
       ...process.env,
       APPDATA: path.join(user, "appdata"),

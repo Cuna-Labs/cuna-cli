@@ -1722,6 +1722,20 @@ test("doctor keeps the local encrypted-store probe separate from the unprobed re
       streams: streams.streams,
       platform: { ...platform, kind },
       env: {},
+      doctorCredentialBackend: {
+        backendId: "cuna-local-aes256gcm-v1",
+        async probe() {
+          return {
+            protocol: CREDENTIAL_BACKEND_PROTOCOL,
+            backendId: "cuna-local-aes256gcm-v1",
+            platform: "windows",
+            status: "verified",
+            observedAt: Date.parse("2026-08-08T00:00:00.000Z"),
+            expiresAt: Date.parse("2026-08-08T00:01:00.000Z"),
+            source: "encrypted_local_file",
+          };
+        },
+      },
       fetch: async () => {
         remoteCalls += 1;
         throw new Error("default doctor must not make a network request");
