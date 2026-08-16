@@ -62,7 +62,7 @@ function tabs() {
   ];
 }
 
-test("rich workbench keeps a persistent orange Runa appbar above the selected isolated viewport", () => {
+test("rich workbench keeps a persistent orange Cuna appbar above the selected isolated viewport", () => {
   const frame = renderWorkbenchFrame({
     columns: 80,
     rows: 24,
@@ -73,7 +73,8 @@ test("rich workbench keeps a persistent orange Runa appbar above the selected is
   assert.equal(frame.appbarRows, 2);
   assert.equal(frame.viewportRows, 22);
   assert.match(frame.text, /48;2;235;86;37m/);
-  assert.match(frame.text, /RUNA.*Claude primary.*\[2:Codex review\]/s);
+  assert.match(frame.text, /CUNA.*Claude primary.*\[2:Codex review\]/s);
+  assert.doesNotMatch(frame.text, /\bRUNA\b/u);
   assert.match(frame.text, /auth authenticated/);
   assert.match(frame.text, /3;1H.*codex viewport/s);
   assert.doesNotMatch(frame.text, /claude viewport/);
@@ -128,6 +129,29 @@ test("tab labels and viewport cells cannot inject host terminal controls", () =>
   }), WorkbenchRenderError);
 });
 
+test("trusted appbar removes bidi controls and truncates by terminal cell width", () => {
+  const unsafeTabs = tabs();
+  unsafeTabs[0] = { ...unsafeTabs[0], label: "safe\u202Eevil 界界 🚀 e\u0301" };
+  const frame = renderWorkbenchFrame({
+    columns: 20,
+    rows: 3,
+    activeTabId: "tab-claude",
+    tabs: unsafeTabs,
+    appbar: model(),
+    color: false,
+  });
+  assert.equal(frame.text.includes("\u202E"), false);
+  const appbar = frame.text.slice(frame.text.indexOf("\u001b[1;1H") + 6, frame.text.indexOf("\u001b[2;1H"));
+  let width = 0;
+  for (const character of appbar.normalize("NFC")) {
+    const point = character.codePointAt(0);
+    width += /[\p{M}\p{Cf}]/u.test(character) ? 0
+      : /\p{Extended_Pictographic}/u.test(character) || (point >= 0x1100 && point <= 0x3fffd) ? 2
+      : 1;
+  }
+  assert.equal(width, 20);
+});
+
 test("small admitted terminals collapse to one truthful appbar row without fabricated progress", () => {
   const frame = renderWorkbenchFrame({
     columns: 30,
@@ -140,7 +164,23 @@ test("small admitted terminals collapse to one truthful appbar row without fabri
   assert.equal(frame.appbarRows, 1);
   assert.equal(frame.viewportRows, 2);
   assert.doesNotMatch(frame.text, /48;2;/);
-  assert.match(frame.text, /RUNA  Claude primary/);
+  assert.match(frame.text, /CUNA  Claude primary/);
+  assert.doesNotMatch(frame.text, /\bRUNA\b/u);
+});
+
+test("compact notices keep the Cuna brand while sanitizing untrusted text", () => {
+  const frame = renderWorkbenchFrame({
+    columns: 40,
+    rows: 2,
+    activeTabId: "tab-claude",
+    tabs: tabs(),
+    appbar: model(),
+    notice: "Preparing\u001b[2J workspace",
+    color: false,
+  });
+  assert.match(frame.text, /CUNA  Preparing\[2J workspace/u);
+  assert.doesNotMatch(frame.text, /\bRUNA\b/u);
+  assert.equal(frame.text.includes("\u001b[2J workspace"), false);
 });
 
 test("workbench restores the selected remote cursor below the appbar without forcing visibility", () => {

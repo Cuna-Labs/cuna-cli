@@ -3,10 +3,12 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+/native/target/
 
 # Candidate, release, and verification evidence
 release-artifacts/
 evidence/
+/local-release-candidate*/
 *.tgz
 npm-pack.json
 sbom.cdx.json
@@ -70,6 +72,8 @@ tmp/
 /packaging/DISTRIBUTION-READINESS.md
 /packaging/EXTERNAL-SETUP.md
 /test/governance-requirement-traceability.test.mjs
+/scripts/verify-repository-governance.mjs
+/scripts/scaffolding-negative-controls.test.mjs
 /.agents/
 /.claude/
 /.codex/
@@ -79,3 +83,7 @@ tmp/
 /internal/
 /plans/
 /reviews/
+
+# Cross-chat coordination mailbox — local only, never published
+_buzon/
+buzon/

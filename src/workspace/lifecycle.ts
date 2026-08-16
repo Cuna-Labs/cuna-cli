@@ -72,7 +72,7 @@ export function exportSafeLocalState(input: {
     createdAt: (input.now ?? new Date()).toISOString(),
     records,
   };
-  return Object.freeze({ ...body, digest: digest("runa-local-export-v1", body) });
+  return Object.freeze({ ...body, digest: digest("cuna-local-export-v1", body) });
 }
 
 export async function deleteLocalState(input: {
@@ -89,7 +89,7 @@ export async function deleteLocalState(input: {
   }
   validateInventory(input.stateRoot, input.workspaceId, input.records);
   const now = input.now ?? new Date();
-  const inventoryDigest = digest("runa-local-inventory-v1", input.records.map((record) => ({
+  const inventoryDigest = digest("cuna-local-inventory-v1", input.records.map((record) => ({
     class: record.class,
     dataId: record.dataId,
     location: relative(resolve(input.stateRoot), resolve(record.absoluteLocation)).split(sep).join("/"),
@@ -168,4 +168,3 @@ function validateInventory(stateRoot: string, workspaceId: string, records: read
 function digest(domain: string, value: unknown): string {
   return createHash("sha256").update(domain).update("\0").update(JSON.stringify(value)).digest("hex");
 }
-

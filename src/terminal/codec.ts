@@ -1,6 +1,7 @@
 import { TextDecoder, TextEncoder } from "node:util";
+import { DEPLOYED_WIRE_COMPATIBILITY } from "../core/deployed-wire-compatibility.js";
 
-export const TERMINAL_PROTOCOL = "runa.terminal.v1" as const;
+export const TERMINAL_PROTOCOL = DEPLOYED_WIRE_COMPATIBILITY.terminalProtocol;
 export const TERMINAL_PROTOCOL_VERSION = 1 as const;
 export const MAX_TERMINAL_FRAME_BYTES = 1024 * 1024;
 export const MAX_TERMINAL_BUFFER_BYTES = MAX_TERMINAL_FRAME_BYTES * 2;
@@ -180,29 +181,67 @@ export function decodeTerminalFrame(bytes: Uint8Array): TerminalFrame | undefine
 }
 
 export class TerminalFrameDecoder {
-  #buffer = new Uint8Array(0);
+  readonly #chunks: Uint8Array[] = [];
+  #headIndex = 0;
+  #headOffset = 0;
+  #bufferedBytes = 0;
 
   push(chunk: Uint8Array): readonly TerminalFrame[] {
-    if (this.#buffer.byteLength + chunk.byteLength > MAX_TERMINAL_BUFFER_BYTES) {
+    if (this.#bufferedBytes + chunk.byteLength > MAX_TERMINAL_BUFFER_BYTES) {
       throw new TerminalProtocolError("buffer_limit", "The terminal receive buffer limit was exceeded.");
     }
-    const joined = new Uint8Array(this.#buffer.byteLength + chunk.byteLength);
-    joined.set(this.#buffer);
-    joined.set(chunk, this.#buffer.byteLength);
-    this.#buffer = joined;
+    if (chunk.byteLength > 0) {
+      this.#chunks.push(chunk.slice());
+      this.#bufferedBytes += chunk.byteLength;
+    }
     const frames: TerminalFrame[] = [];
-    while (this.#buffer.byteLength >= HEADER_BYTES) {
-      const header = parseHeader(this.#buffer);
+    while (this.#bufferedBytes >= HEADER_BYTES) {
+      const header = parseHeader(this.#copy(HEADER_BYTES, false));
       const size = HEADER_BYTES + header.payloadLength;
-      if (this.#buffer.byteLength < size) break;
-      const frame = decodeTerminalFrame(this.#buffer.slice(0, size));
-      this.#buffer = this.#buffer.slice(size);
+      if (this.#bufferedBytes < size) break;
+      const frame = decodeTerminalFrame(this.#copy(size, true));
       if (frame !== undefined) frames.push(frame);
       if (frames.length > MAX_TERMINAL_QUEUED_FRAMES) {
         throw new TerminalProtocolError("queue_limit", "Too many terminal frames were decoded in one batch.");
       }
     }
     return frames;
+  }
+
+  #copy(size: number, consume: boolean): Uint8Array {
+    const result = new Uint8Array(size);
+    let targetOffset = 0;
+    let chunkIndex = this.#headIndex;
+    let chunkOffset = this.#headOffset;
+    while (targetOffset < size) {
+      const chunk = this.#chunks[chunkIndex];
+      if (chunk === undefined) {
+        throw new TerminalProtocolError("malformed_frame", "The terminal receive buffer became inconsistent.");
+      }
+      const available = chunk.byteLength - chunkOffset;
+      const length = Math.min(available, size - targetOffset);
+      result.set(chunk.subarray(chunkOffset, chunkOffset + length), targetOffset);
+      targetOffset += length;
+      chunkOffset += length;
+      if (chunkOffset === chunk.byteLength) {
+        chunkIndex += 1;
+        chunkOffset = 0;
+      }
+    }
+    if (consume) {
+      this.#headIndex = chunkIndex;
+      this.#headOffset = chunkOffset;
+      this.#bufferedBytes -= size;
+      if (this.#bufferedBytes === 0) {
+        this.#chunks.length = 0;
+        this.#headIndex = 0;
+        this.#headOffset = 0;
+      } else if (this.#headIndex >= 1_024 && this.#headIndex * 2 >= this.#chunks.length) {
+        this.#chunks.splice(0, this.#headIndex);
+        this.#headIndex = 0;
+      }
+    }
+    return result;
   }
 }
 
@@ -255,6 +294,7 @@ function validateControlPayload(type: TerminalFrameType, value: Record<string, u
         !isIdentifier(value.agentSessionId) ||
         !isIdentifier(value.processEpoch) ||
         !Number.isSafeInteger(value.fencingGeneration) ||
+        Number(value.fencingGeneration) < 1 ||
         (value.resizeCapability !== "live" && value.resizeCapability !== "initial_resize_only")
       ) throwInvalidPayload();
       return;
@@ -271,7 +311,11 @@ function validateControlPayload(type: TerminalFrameType, value: Record<string, u
       if (!isIdentifier(value.code) || typeof value.retryable !== "boolean" || !isIdentifier(value.safeReason)) throwInvalidPayload();
       return;
     case "acknowledgement":
-      if (!/^\d+$/u.test(String(value.clientSequence)) || value.meaning !== "durably_accepted_not_executed") throwInvalidPayload();
+      if (
+        !/^[1-9][0-9]*$/u.test(String(value.clientSequence)) ||
+        BigInt(String(value.clientSequence)) > 18_446_744_073_709_551_615n ||
+        value.meaning !== "durably_accepted_not_executed"
+      ) throwInvalidPayload();
       return;
     case "heartbeat":
     case "resume":

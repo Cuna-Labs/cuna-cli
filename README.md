@@ -1,48 +1,57 @@
-# Runa CLI
+# Cuna CLI
 
-[![CI](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/Runa-Laboratories/runa-cli/actions/workflows/codeql.yml)
+[![CI](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D22-339933?logo=node.js&logoColor=white)](package.json)
+[![Node.js](https://img.shields.io/badge/node-22.17.1%2B%20%7C%2024.4.1%2B-339933?logo=node.js&logoColor=white)](package.json)
 
-Run cloud development agents from a local terminal through Runa's public,
+Run cloud development agents from a local terminal through Cuna's public,
 policy-enforced control plane.
 
-Runa CLI is designed to make Claude Code, Codex, OpenClaw, and future agents
+Cuna CLI is designed to make Claude Code, Codex, OpenClaw, and future agents
 feel local while their processes, durable sessions, and isolated workspaces run
-on Runa cloud machines. The CLI keeps machine lifecycle, synchronization,
+on Cuna cloud machines. The CLI keeps machine lifecycle, synchronization,
 authorizations, and runtime evidence explicit instead of hiding them behind an
 opaque remote shell.
 
 > [!WARNING]
-> Runa CLI is under active implementation and is not GA. The npm, Bun, curl,
+> Cuna CLI is under active implementation and is not GA. The npm, Bun, curl,
 > Homebrew, and AUR commands below are the approved distribution interfaces;
 > this repository does not claim that every channel is live yet.
 
 ## Current capabilities
 
 - Versioned human and JSON output with stable error and exit-code categories.
-- Exact public Runa API-origin validation and bounded authenticated transport.
+- Exact public Cuna API-origin validation and bounded authenticated transport.
+- Browser sign-in with PKCE, a high-entropy durable `cuna_login_` credential,
+  AES-256-GCM local persistence, and memory-only short-lived access tokens.
 - Capability discovery that treats absent, stale, contradictory, or unknown
   evidence as unauthorized for mutation.
-- Machine and AgentSession command foundations over public Runa contracts.
+- Machine and AgentSession command foundations over public Cuna contracts.
 - Explicit Windows, macOS, and Linux path/configuration adapters.
 - Network-free installed-artifact identity and self-test.
 - Fail-closed gates for features whose producer contract or runtime is not yet
   available.
 
-Browser authentication, cloud terminal attachment, daemon integration,
-workspace synchronization, and the local companion remain pre-release work.
-Source code or a documented interface is not evidence that a capability is
-deployed.
+Foreground terminal attachment is implemented as a capability-gated preview and
+fails before terminal ownership unless the server proves a current
+AgentSession terminal producer. Daemon integration, workspace synchronization, and
+the local companion remain pre-release work. Browser authentication is
+implemented against the local public 1.5.0 candidate contract. Its immutable
+contract gitlink and provenance approval remain release-blocked.
+Canonical contract approval and producer deployment remain blocked. Source
+code or a documented interface is not evidence that a capability is deployed.
 
 ## Quick start for contributors
 
-Node.js 22 or newer is required.
+Node.js 22.17.1+ on the Node 22 line or Node.js 24.4.1+ on the Node 24 line is
+required. The npm payload is architecture-neutral for x64 and arm64. The
+release-admitted distribution matrix remains x64 until the non-authorizing
+arm64 installed-artifact lanes produce reviewable receipts.
 
 ```sh
-git clone https://github.com/Runa-Laboratories/runa-cli.git
-cd runa-cli
+git clone https://github.com/Cuna-Labs/cuna-cli.git
+cd cuna-cli
 npm ci --ignore-scripts
 npm run lint
 npm run typecheck
@@ -52,68 +61,162 @@ npm test
 Inspect the local build without making a network request:
 
 ```sh
-node dist/bin/runa.js self-test --offline --json
-node dist/bin/runa.js version --json
+node dist/bin/cuna.js self-test --offline --json
+node dist/bin/cuna.js version --json
 ```
 
 ## Installation interfaces
 
 | Surface | Command | Platform | Current status |
 | --- | --- | --- | --- |
-| npm | `npm install -g @runa_laboratories/cli` | Windows, macOS, Linux | Canonical package; publication remains gated |
-| Bun | `bun add --global @runa_laboratories/cli` | Windows, macOS, Linux | Same npm artifact; compatibility evidence pending |
-| curl | `curl -fsSL https://runacode.io/install \| sh` | macOS, Linux | Digest-bound installer projection; endpoint pending |
-| Homebrew | `brew install Runa-Laboratories/tap/runa` | macOS, Linux | Formula projection; tap pending |
-| paru/AUR | `paru -S runa-cli-bin` | Arch Linux | PKGBUILD projection; AUR ownership pending |
+| npm | `npm install -g @cuna_labs/cli` | Architecture-neutral payload; Windows, macOS, and Linux arm64 remain observational | Not live; canonical publication is gated and x64 is the release-admitted matrix |
+| Bun | `bun add --global @cuna_labs/cli` | Linux x64 and Intel macOS x64; Windows x64 is explicitly blocked | Not live; Windows must use the npm command until Bun proves clean global uninstall |
+| curl | `curl -fsSL https://getcuna.com/install \| sh` | Intel macOS x64, Linux x64 | Not live; endpoint and recovery evidence are pending |
+| Homebrew | `brew install Cuna-Labs/tap/cuna` | Intel macOS x64, Linux x64 | Not live; tap and installed-product evidence are pending |
+| paru/AUR | `paru -S cuna-cli-bin` | Arch Linux x64 | Not live; AUR ownership and installed-product evidence are pending |
 
 Every projection must install the exact admitted npm tarball. No channel may
 rebuild, patch, or independently version the CLI.
+
+Windows remains a Tier-1 Cuna platform through npm. Bun 1.3.14 removes the
+global package record and package directory on Windows but leaves its generated
+`cuna.exe` and `cuna.bunx` shims behind. Cuna does not claim ownership of those
+package-manager paths and will not delete them from a lifecycle script. The Bun
+Windows projection remains release-blocked until a supported Bun release proves
+isolated install, public-shim execution, uninstall, and zero remaining managed
+paths on every admitted Windows Node lane. Use
+`npm install -g @cuna_labs/cli` on Windows.
 
 ## Command surface
 
 The current foundation exposes:
 
 ```text
-runa capabilities
-runa machines list
-runa machines create --name NAME --idempotency-key KEY --yes
-runa machines start|pause|resume|stop ID --yes
-runa machines delete ID --yes
-runa agent-sessions list --machine ID
-runa agent-sessions create --machine ID --agent claude-code --idempotency-key KEY --yes
-runa config get
-runa self-test --offline --json
-runa version --json
+cuna capabilities
+cuna login
+cuna whoami
+cuna logout
+cuna machines list
+cuna machines create --name NAME --idempotency-key KEY --yes
+cuna machines start|pause|resume|stop ID --yes
+cuna machines delete ID --yes
+cuna agent-sessions list --machine ID
+cuna agent-sessions create --machine ID --agent claude-code --idempotency-key KEY --yes
+cuna config get
+cuna self-test --offline --json
+cuna version --json
 ```
 
 Commands that depend on an unavailable producer or runtime return a stable
-unsupported/capability error and do not simulate a machine, session, login, or
+unsupported/capability error and do not simulate a machine, session, or
 successful mutation.
+
+### Foreground terminal keys
+
+When the foreground terminal capability becomes available, `Ctrl+]` is Cuna's
+local escape prefix. `Ctrl+] ?` toggles trusted in-terminal help; `Ctrl+] 1`…
+`4` selects a tab, `Ctrl+] n` selects the next tab, `Ctrl+] d` detaches the
+local view, and `Ctrl+] Ctrl+]` sends a literal prefix to the cloud session.
+These keys are ignored as Cuna commands inside bracketed paste. Ordinary
+`Ctrl+C` and `Ctrl+Z` continue to the selected cloud session.
+
+## Exit codes
+
+The exit code is the entire contract for a caller that is not a human, and this
+build is used almost exclusively that way. `3`, `7` and `8` all mean "the command
+did not do what you asked" and each demands a different response: replace the
+credential, treat the answer as untrustworthy, or stop asking this deployment for
+this operation. Reading them as one undifferentiated failure loses that.
+
+The table is projected from the `EXIT_CODES` map in `src/core/errors.ts`; the
+descriptions live beside it in `src/core/exit-codes.ts`, and
+`test/exit-code-contract.test.mjs` pins every number against a literal so a code
+cannot change meaning without a named test failing.
+
+<!-- BEGIN GENERATED: exit-codes -->
+| Exit code | Name | Meaning | One reachable path |
+| --- | --- | --- | --- |
+| `0` | `success` | The command completed and the record it printed is authoritative. | `cuna self-test --offline` verifies the installed artifact without a network request and returns. |
+| `2` | `usage` | The invocation or the resolved configuration is invalid. | `cuna nonsense` fails the command preflight with `cuna.usage.invalid`. Nothing is sent to the server. |
+| `3` | `auth` | No usable credential, a rejected credential, or an auth-mode conflict. | `cuna whoami` while `CUNA_API_KEY` is set mints `cuna.auth.mode_conflict`. A credential the server refuses arrives as `cuna.auth.rejected` from HTTP 401. |
+| `4` | `policy` | Understood and refused by policy, including a required confirmation. | `cuna machines delete ID` without `--yes` mints `cuna.confirmation.required`. A server refusal arrives as `cuna.policy.denied` from HTTP 403. |
+| `5` | `network` | No authoritative answer arrived: timeout, cancellation, 429, or 5xx. | a request exceeding `--timeout-ms` mints `cuna.network.timeout`. HTTP 429 and 5xx arrive as `cuna.network.rate_limited` and `cuna.network.service_unavailable`. |
+| `6` | `conflict` | Current state contradicts the change; repeating it unchanged repeats this. | HTTP 409 mints `cuna.remote.conflict`. A foreground attach to a session already held mints `cuna.runtime.session_conflict`. |
+| `7` | `remote` | The server answered, but not in a way the published contract allows. | `cuna account show` against a deployment whose body fails contract decoding mints `cuna.remote.malformed_response`. A 404 that does carry a JSON body is an absent resource and lands here as `cuna.remote.not_found`. |
+| `8` | `unsupported` | This deployment does not serve or does not advertise the capability. | `cuna records list` against a deployment with no route for it mints `cuna.remote.operation_not_served`: HTTP 404 whose body is not JSON, which only a layer in front of the API writes. |
+| `70` | `internal` | The CLI itself failed; no server outcome is implied. | any throw that is not a `CunaError` reaching the top of `runCli` is normalized to `cuna.internal.unexpected`. |
+<!-- END GENERATED: exit-codes -->
+
+Three properties a script may rely on:
+
+- **The set is closed.** `runCli` returns the `ExitCode` union and catches every
+  error before returning; anything that is not already a `CunaError` is
+  normalized to `internal` first. A status outside this table did not come from
+  the CLI's own handler.
+- **`5` never proves the request was not applied.** A timeout or transport
+  failure cannot establish whether a mutation reached the authority, so the CLI
+  fails closed and does not retry a mutation on its own. Reconcile before
+  repeating one.
+- **`8` is not a transient condition.** It reports the deployed server contract,
+  not load. Retrying the same call against the same deployment returns `8` again.
+
+Every code is also listed under `Exit codes:` in `cuna --help`.
 
 ## Configuration and authentication
 
 Configuration precedence is flag, environment, selected user profile, then the
-canonical default. Production requests use exactly `https://api.runacode.io`.
+canonical default. Production requests use exactly `https://api.getcuna.com`.
 Custom origins require an explicit development profile; repository content is
 never a configuration authority.
 
-`RUNA_API_KEY` is supported only as an explicit automation credential in the
-current build. It is never persisted automatically. Browser login and secure
-OS-vault refresh credentials will become available only with their accepted
-identity/continuation contracts and runtime evidence.
+Every canonical configuration environment variable uses the `CUNA_` prefix. The published
+`RUNA_API_KEY` name remains accepted as a deprecated compatibility alias for
+existing automation; migrate new and existing scripts to `CUNA_API_KEY`. When
+both names are present, `CUNA_API_KEY` always wins. An empty or malformed
+canonical value fails instead of falling through to the legacy credential.
+Other earlier-brand environment-variable names and local paths are not accepted.
+
+`CUNA_OPENCODE_ENABLED=true` is the only local CLI opt-in for OpenCode creation
+and automatic attachment; it is exact and case-sensitive. The default, unset,
+empty, or any other value is disabled. This is a consumer safety gate, not a
+release authority: it cannot enable Edge, override the release manifest, or
+inject/copy any Cuna, Codex, OpenAI, or OpenCode credential. Existing OpenCode
+rows remain readable and an exact `--agent-session` attachment remains
+available while the local creation gate is off. `cuna config get --json`
+reports the non-secret gate state and source.
+
+`CUNA_API_KEY` and its deprecated `RUNA_API_KEY` alias are explicit automation
+credentials and are never persisted automatically. An automation
+credential that is set but unusable is refused rather than ignored, and it is
+refused only for commands that select a credential authority — `doctor`,
+`self-test --offline` and `config get` still run and report it. Interactive
+`cuna login` uses the browser continuation contract without a local HTTP
+listener. Approve the browser flow and paste the exact high-entropy
+`cuna_login_` value shown once. The CLI encrypts it with AES-256-GCM in a
+profile-scoped session file; the separate random key and ciphertext files are
+restricted to the current user. Each fresh process exchanges the login code for
+a short-lived access token and never sends the code as a product API bearer.
+Logout revokes the server family before deleting both local files. This layer
+does not protect a copied profile containing both files, and compromise of the
+same OS account can read both files and defeats it. Automation and
+interactive credential authorities never fall back to each other.
 
 Never place API keys in command-line arguments, repository files, issue reports,
 terminal captures, or diagnostics.
+
+Keep endpoint protection enabled while installing or running Cuna. A security
+detection blocks release and should be reported with the artifact digest and
+product log; Cuna does not require antivirus exclusions.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  User["Local developer terminal"] --> CLI["Runa CLI"]
+  User["Local developer terminal"] --> CLI["Cuna CLI"]
   CLI --> Daemon["Per-user local daemon"]
-  CLI --> API["Public Runa API"]
+  CLI --> API["Public Cuna API"]
   Daemon --> Sync["Workspace sync supervisor"]
-  API --> Machine["Runa cloud machine"]
+  API --> Machine["Cuna cloud machine"]
   Machine --> Sessions["Independent AgentSessions"]
   CLI --> Viewports["Isolated terminal viewports"]
   Viewports --> Sessions
@@ -144,7 +247,7 @@ change must update producer and consumers through an expand-contract campaign.
 
 ## License
 
-Copyright 2026 Runa Laboratories. Licensed under the
+Copyright 2026 Cuna Labs. Licensed under the
 [Apache License 2.0](LICENSE). See [`NOTICE`](NOTICE) for attribution.
 
 ## Project status

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Exact admitted SemVer to publish
+        description: Exact release-review SemVer to publish
         required: true
         type: string
       source_commit:
@@ -12,11 +12,27 @@ on:
         required: true
         type: string
       candidate_run_id:
-        description: Successful main CI run containing admitted-release-candidate
+        description: Successful main CI run containing release-review-candidate
         required: true
         type: string
       candidate_sha256:
-        description: Exact admitted npm tarball SHA-256
+        description: Exact release-review npm tarball SHA-256
+        required: true
+        type: string
+      candidate_envelope_sha256:
+        description: Exact immutable release-envelope v2 SHA-256
+        required: true
+        type: string
+      approval_run_id:
+        description: Successful protected release-review run containing the signed approval lease
+        required: true
+        type: string
+      approval_lease_sha256:
+        description: Exact signed release-approval lease SHA-256
+        required: true
+        type: string
+      approval_expectation_sha256:
+        description: Exact release-approval expectation SHA-256
         required: true
         type: string
 
@@ -33,10 +49,18 @@ jobs:
     name: immutable-preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    environment: npm
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    outputs:
+      source_commit: ${{ steps.validate.outputs.source_commit }}
+      version: ${{ steps.validate.outputs.version }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: main
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -45,11 +69,31 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@11.19.0
       - name: Require source commit to remain protected main HEAD
+        id: validate
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          CANDIDATE_ENVELOPE_SHA256: ${{ inputs.candidate_envelope_sha256 }}
+          APPROVAL_RUN_ID: ${{ inputs.approval_run_id }}
+          APPROVAL_LEASE_SHA256: ${{ inputs.approval_lease_sha256 }}
+          APPROVAL_EXPECTATION_SHA256: ${{ inputs.approval_expectation_sha256 }}
         shell: bash
         run: |
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CANDIDATE_ENVELOPE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$APPROVAL_LEASE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_EXPECTATION_SHA256" =~ ^[0-9a-f]{64}$ ]]
           git fetch --no-tags origin main
-          test "$(git rev-parse HEAD)" = "${{ inputs.source_commit }}"
-          test "$(git rev-parse origin/main)" = "${{ inputs.source_commit }}"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse origin/main)" = "$SOURCE_COMMIT"
+          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: Verify selected CI run identity
         env:
           GH_TOKEN: ${{ github.token }}
@@ -57,11 +101,11 @@ jobs:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
         shell: bash
         run: |
-          RUN_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq '[.status,.conclusion,.head_sha,.event] | join(" ")')"
-          test "$RUN_STATE" = "completed success ${SOURCE_COMMIT} push"
+          RUN_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq '[.status,.conclusion,.head_sha,.event,.head_branch,.path] | join(" ")')"
+          test "$RUN_STATE" = "completed success ${SOURCE_COMMIT} push main .github/workflows/ci.yml"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: admitted-release-candidate
+          name: release-review-candidate
           run-id: ${{ inputs.candidate_run_id }}
           github-token: ${{ github.token }}
           path: admitted
@@ -71,21 +115,97 @@ jobs:
           node scripts/verify-release-envelope.mjs --root admitted/release-artifacts
           node - <<'NODE'
           const fs = require('node:fs');
-          const envelope = JSON.parse(fs.readFileSync('admitted/release-artifacts/release-envelope.json'));
+          const crypto = require('node:crypto');
+          const envelopeFile = 'admitted/release-artifacts/release-envelope.json';
+          const envelopeBytes = fs.readFileSync(envelopeFile);
+          const envelope = JSON.parse(envelopeBytes);
           const admission = JSON.parse(fs.readFileSync('admitted/evidence/admission.json'));
+          const envelopeSha256 = crypto.createHash('sha256').update(envelopeBytes).digest('hex');
+          if (envelope.schemaVersion !== 2 || admission.schemaVersion !== 3) process.exit(1);
           if (envelope.version !== process.env.VERSION || envelope.sourceCommit !== process.env.SOURCE_COMMIT || envelope.tarball.sha256 !== process.env.CANDIDATE_SHA256) process.exit(1);
-          if (admission.candidateSha256 !== envelope.tarball.sha256 || admission.sourceCommit !== envelope.sourceCommit) process.exit(1);
+          if (envelopeSha256 !== process.env.CANDIDATE_ENVELOPE_SHA256 || admission.releaseEnvelopeSha256 !== envelopeSha256) process.exit(1);
+          if (admission.candidateSha256 !== envelope.tarball.sha256 || admission.sourceCommit !== envelope.sourceCommit || admission.releaseInputsSha256 !== envelope.releaseInputs.sha256) process.exit(1);
+          if (JSON.stringify(admission.identities) !== JSON.stringify(envelope.identities)) process.exit(1);
+          if (admission.decision !== 'CANDIDATE_ADMITTED_FOR_EXTERNAL_RELEASE_REVIEW' || admission.releaseEligible !== true) {
+            throw new Error('Publication blocked: installed-platform evidence is not authenticated semantic release authorization.');
+          }
           NODE
         env:
           VERSION: ${{ inputs.version }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          CANDIDATE_ENVELOPE_SHA256: ${{ inputs.candidate_envelope_sha256 }}
+      - name: Require canonical contract authority before publication
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const inputs = JSON.parse(fs.readFileSync('admitted/release-artifacts/release-inputs.json'));
+          if (inputs.contractSet.releaseAuthority === 'UNRESOLVED_BLOCKING') {
+            throw new Error('Publication blocked: the release envelope is not bound to the canonical Cuna API contract authority.');
+          }
+          NODE
       - name: Verify GitHub build provenance for the exact tarball
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: gh attestation verify admitted/release-artifacts/*.tgz --repo "$GITHUB_REPOSITORY"
-      - run: node scripts/verify-registry-version-absent.mjs --envelope admitted/release-artifacts/release-envelope.json --version "${{ inputs.version }}"
+        run: >-
+          gh attestation verify admitted/release-artifacts/*.tgz
+          --repo "$GITHUB_REPOSITORY"
+          --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"
+      - name: Verify protected release-review run identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL_RUN_ID: ${{ inputs.approval_run_id }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        shell: bash
+        run: |
+          APPROVAL_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${APPROVAL_RUN_ID}" --jq '[.status,.conclusion,.head_sha,.event,.head_branch,.path] | join(" ")')"
+          test "$APPROVAL_STATE" = "completed success ${SOURCE_COMMIT} workflow_dispatch main .github/workflows/release-review.yml"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-approval-lease
+          run-id: ${{ inputs.approval_run_id }}
+          github-token: ${{ github.token }}
+          path: admitted/approval
+      - name: Verify approval lease identity and semantic binding
+        env:
+          APPROVAL_LEASE_SHA256: ${{ inputs.approval_lease_sha256 }}
+          APPROVAL_EXPECTATION_SHA256: ${{ inputs.approval_expectation_sha256 }}
+        shell: bash
+        run: |
+          test "$(sha256sum admitted/approval/release-approval-lease.json | cut -d' ' -f1)" = "$APPROVAL_LEASE_SHA256"
+          test "$(sha256sum admitted/approval/release-approval-expectation.json | cut -d' ' -f1)" = "$APPROVAL_EXPECTATION_SHA256"
+          node scripts/verify-release-approval-lease.mjs \
+            --root admitted/approval \
+            --lease release-approval-lease.json \
+            --expectation release-approval-expectation.json
+      - name: Verify cryptographic provenance of the exact approval lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: >-
+          gh attestation verify admitted/approval/release-approval-lease.json
+          --repo "$GITHUB_REPOSITORY"
+          --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-review.yml"
+      - name: Atomically consume the one-use approval nonce
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_SOURCE_COMMIT: ${{ inputs.source_commit }}
+        shell: bash
+        run: |
+          cp packaging/release-approval-consumption-authority.json admitted/approval/release-approval-consumption-authority.json
+          node scripts/consume-release-approval-nonce.mjs \
+            --root admitted/approval \
+            --lease release-approval-lease.json \
+            --expectation release-approval-expectation.json \
+            --authority release-approval-consumption-authority.json \
+            > admitted/approval/release-approval-consumption.json
+          node -e 'const r=require("./admitted/approval/release-approval-consumption.json"); if(r.status!=="CONSUMED") process.exit(1)'
+      - name: Require exact registry version to be absent
+        env:
+          VERSION: ${{ inputs.version }}
+        run: node scripts/verify-registry-version-absent.mjs --envelope admitted/release-artifacts/release-envelope.json --version "$VERSION"
 
   publish-preview:
     name: trusted-publisher-preview
@@ -95,12 +215,13 @@ jobs:
     environment: npm
     permissions:
       actions: read
+      attestations: read
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: ${{ needs.preflight.outputs.source_commit }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -109,24 +230,33 @@ jobs:
       - run: npm install --global npm@11.19.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: admitted-release-candidate
+          name: release-review-candidate
           run-id: ${{ inputs.candidate_run_id }}
           github-token: ${{ github.token }}
           path: admitted
       - run: node scripts/verify-release-envelope.mjs --root admitted/release-artifacts
-      - name: Publish exact admitted bytes with short-lived OIDC identity
-        run: >-
-          npm publish
-          "admitted/release-artifacts/$(node -p "require('./admitted/release-artifacts/release-envelope.json').tarball.file")"
-          --provenance
-          --access public
-          --registry https://registry.npmjs.org/
-          --tag preview
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-approval-lease
+          run-id: ${{ inputs.approval_run_id }}
+          github-token: ${{ github.token }}
+          path: admitted/approval
+      - name: Revalidate fresh approval and publish exact admitted bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          APPROVAL_LEASE_SHA256: ${{ inputs.approval_lease_sha256 }}
+          APPROVAL_EXPECTATION_SHA256: ${{ inputs.approval_expectation_sha256 }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: node scripts/publish-npm-preview.mjs
       - name: Verify downloaded registry bytes and preview tag
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
         run: >-
           node scripts/verify-postpublish.mjs
           --envelope admitted/release-artifacts/release-envelope.json
-          --version "${{ inputs.version }}"
+          --version "$VERSION"
           --tag preview
           --receipt admitted/evidence/npm-preview-receipt.json
       - if: always()

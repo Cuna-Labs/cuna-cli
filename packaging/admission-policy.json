@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "mode": "gatekeeper",
-  "canonicalPackage": "@runa_laboratories/cli",
+  "canonicalPackage": "@cuna_labs/cli",
   "canonicalRegistry": "https://registry.npmjs.org",
   "allowedLicenses": ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "CC0-1.0"],
   "blockedDependencySources": ["git", "file", "http"],

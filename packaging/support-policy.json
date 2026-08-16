@@ -1,32 +1,119 @@
 {
-  "schemaVersion": 1,
-  "packageName": "@runa_laboratories/cli",
+  "schemaVersion": 2,
+  "packageName": "@cuna_labs/cli",
   "canonicalRegistry": "https://registry.npmjs.org",
-  "architectures": ["x64"],
+  "architectures": ["x64", "arm64"],
   "node": {
     "minimum": "22.17.1",
+    "supportedLines": ["22.17.1", "24.4.1"],
     "tested": ["22.17.1", "24.4.1"]
   },
+  "protocolRange": {
+    "minimum": "1",
+    "maximum": "1"
+  },
+  "approvedRealHosts": [],
   "ciMatrix": [
     {"id": "linux-ubuntu-22-node22-x64", "runner": "ubuntu-22.04", "platform": "linux", "architecture": "x64", "node": "22.17.1"},
     {"id": "linux-ubuntu-24-node24-x64", "runner": "ubuntu-24.04", "platform": "linux", "architecture": "x64", "node": "24.4.1"},
     {"id": "windows-server-2022-node22-x64", "runner": "windows-2022", "platform": "win32", "architecture": "x64", "node": "22.17.1"},
     {"id": "windows-server-2025-node24-x64", "runner": "windows-2025", "platform": "win32", "architecture": "x64", "node": "24.4.1"},
+    {"id": "linux-ubuntu-24-node22-arm64-observation", "runner": "ubuntu-24.04-arm", "platform": "linux", "architecture": "arm64", "node": "22.17.1", "claim": "observation-only"},
+    {"id": "linux-ubuntu-24-node24-arm64-observation", "runner": "ubuntu-24.04-arm", "platform": "linux", "architecture": "arm64", "node": "24.4.1", "claim": "observation-only"},
+    {"id": "windows-11-node22-arm64-observation", "runner": "windows-11-arm", "platform": "win32", "architecture": "arm64", "node": "22.17.1", "claim": "observation-only"},
+    {"id": "windows-11-node24-arm64-observation", "runner": "windows-11-arm", "platform": "win32", "architecture": "arm64", "node": "24.4.1", "claim": "observation-only"},
     {"id": "macos-14-node22-arm64-observation", "runner": "macos-14", "platform": "darwin", "architecture": "arm64", "node": "22.17.1", "claim": "observation-only"},
+    {"id": "macos-14-node24-arm64-observation", "runner": "macos-14", "platform": "darwin", "architecture": "arm64", "node": "24.4.1", "claim": "observation-only"},
+    {"id": "macos-15-intel-node22-x64", "runner": "macos-15-intel", "platform": "darwin", "architecture": "x64", "node": "22.17.1"},
     {"id": "macos-15-intel-node24-x64", "runner": "macos-15-intel", "platform": "darwin", "architecture": "x64", "node": "24.4.1"}
   ],
   "preGaExternalEvidence": [
     "Windows 11 x64 installed-artifact receipt",
+    "Windows installed-artifact AES-256-GCM profile-store receipt proving owner-only permissions, decryptability in a new shell, and cleanup on logout",
+    "non-authorizing Linux, Windows, and macOS arm64 installed-artifact observations for every supported Node line",
     "interactive terminal behavior on physical or policy-approved virtual Windows, macOS, and Linux hosts",
-    "npm and Bun global-install receipts on every Tier-1 platform",
+    "npm global-install and clean-uninstall receipts on every Tier-1 platform",
+    "Bun global-install and clean-uninstall receipts on supported POSIX platforms, plus a clean Windows re-admission receipt from a supported Bun release after the upstream shim-cleanup defect is fixed",
     "curl and Homebrew receipts on supported macOS and Linux hosts",
     "paru/AUR receipt on supported Arch Linux"
   ],
+  "channelOrder": ["npm", "bun", "curl", "homebrew", "aur"],
   "channels": {
-    "npm": "canonical",
-    "bun": "projection",
-    "curl": "template-not-live",
-    "homebrew": "template-not-live",
-    "aur": "template-not-live"
+    "npm": {
+      "role": "canonical-artifact",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "npm",
+      "platforms": ["linux-x64", "darwin-x64", "win32-x64"],
+      "blockedPlatforms": [],
+      "projectionFile": "npm/install-command.txt",
+      "publicCommand": "npm install -g @cuna_labs/cli",
+      "candidateInvocationPolicy": "npm-exact-version",
+      "testedNodeVersions": ["22.17.1", "24.4.1"],
+      "runtimeDependency": "node:^22.17.1 || ^24.4.1"
+    },
+    "bun": {
+      "role": "registry-projection",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "bun",
+      "platforms": ["linux-x64", "darwin-x64"],
+      "blockedPlatforms": [
+        {
+          "platform": "win32-x64",
+          "availability": "RELEASE_BLOCKED",
+          "reasonCode": "BUN_WINDOWS_GLOBAL_UNINSTALL_LEAVES_SHIMS",
+          "verifiedAffectedVersions": ["1.3.14"],
+          "upstreamRepository": "oven-sh/bun",
+          "upstreamCommit": "0d9b296af33f2b851fcbf4df3e9ec89751734ba4",
+          "fallbackChannel": "npm",
+          "readmissionGate": "A supported Bun release must prove isolated global install, public-shim execution, global uninstall, and zero remaining package-managed paths on every Windows Tier-1 Node lane."
+        }
+      ],
+      "projectionFile": "bun/install-command.txt",
+      "publicCommand": "bun add --global @cuna_labs/cli",
+      "candidateInvocationPolicy": "bun-exact-version",
+      "testedNodeVersions": ["22.17.1", "24.4.1"],
+      "runtimeDependency": "node:^22.17.1 || ^24.4.1"
+    },
+    "curl": {
+      "role": "bootstrap-projection",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "npm",
+      "platforms": ["linux-x64", "darwin-x64"],
+      "blockedPlatforms": [],
+      "projectionFile": "curl/install.sh",
+      "publicCommand": "curl -fsSL https://getcuna.com/install | sh",
+      "candidateInvocationPolicy": "verified-projection",
+      "testedNodeVersions": ["22.17.1", "24.4.1"],
+      "runtimeDependency": "node+npm"
+    },
+    "homebrew": {
+      "role": "formula-projection",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "homebrew",
+      "platforms": ["linux-x64", "darwin-x64"],
+      "blockedPlatforms": [],
+      "projectionFile": "homebrew/cuna.rb",
+      "publicCommand": "brew install Cuna-Labs/tap/cuna",
+      "candidateInvocationPolicy": "verified-projection",
+      "testedNodeVersions": ["22.17.1"],
+      "runtimeDependency": "node@22"
+    },
+    "aur": {
+      "role": "package-projection",
+      "availability": "PROJECTED_NOT_PUBLISHED",
+      "artifactChannel": "npm",
+      "installerOfRecord": "pacman",
+      "platforms": ["linux-x64"],
+      "blockedPlatforms": [],
+      "projectionFile": "aur/PKGBUILD",
+      "publicCommand": "paru -S cuna-cli-bin",
+      "candidateInvocationPolicy": "verified-projection",
+      "testedNodeVersions": ["22.17.1"],
+      "runtimeDependency": "nodejs-lts-jod>=22.17.1"
+    }
   }
 }
