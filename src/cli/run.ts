@@ -125,19 +125,24 @@ export function createTerminalBrowserHandoffReporter(output: Writable): BrowserH
   const line = (value: string): void => {
     output.write(`${sanitizeHumanTerminalOutput(value)}\n`);
   };
+  // Three facts, one line each: where to go, what to do there, and — only when
+  // it happened — what went wrong. Everything the longer copy added was
+  // description of the link ("single-use") or of the mechanism ("in your
+  // browser", "automatically"), which the person is not deciding anything with
+  // while a terminal waits on them.
   const reporter: BrowserHandoffReporter = {
     continuationUrl(url) {
       line("");
-      line("Sign in to Cuna in your browser. Open this single-use link:");
+      line("Sign in to Cuna:");
       line("");
       line(`  ${url}`);
       line("");
     },
     browserOpened() {
-      line("Opened your default browser. Approve the sign-in there, then return here.");
+      line("Opened your browser. Approve there, then paste the code below.");
     },
     browserOpenFailed() {
-      line("Could not open a browser automatically. Open the link above yourself.");
+      line("Could not open a browser. Open the link above, then paste the code below.");
     },
   };
   return Object.freeze(reporter);
@@ -155,6 +160,32 @@ function loginCodeInputError(code: "unavailable" | "cancelled" | "too_long", mes
 }
 
 /**
+ * The control sequences several terminals wrap a paste in while raw mode is
+ * active. They are input framing, not pasted content: `finish` strips them from
+ * the value and `maskedLength` excludes them from the echo, so the number of
+ * mask characters on screen equals the number of credential bytes accepted.
+ */
+const BRACKETED_PASTE_START = `${String.fromCharCode(0x1b)}[200~`;
+const BRACKETED_PASTE_END = `${String.fromCharCode(0x1b)}[201~`;
+
+/** One mask character stands for one accepted byte. */
+const LOGIN_CODE_MASK = "*";
+
+/**
+ * How many accepted bytes the person should currently see masked — the buffer
+ * length minus whichever bracketed-paste markers are present. Derived from the
+ * same buffer `finish` reads, so the count on screen cannot drift from the
+ * value that will be submitted.
+ */
+function maskedLength(bytes: readonly number[]): number {
+  const raw = Buffer.from(bytes).toString("binary");
+  let length = bytes.length;
+  if (raw.startsWith(BRACKETED_PASTE_START)) length -= BRACKETED_PASTE_START.length;
+  if (raw.endsWith(BRACKETED_PASTE_END)) length -= BRACKETED_PASTE_END.length;
+  return length < 0 ? 0 : length;
+}
+
+/**
  * Read the reusable browser login code without writing its bytes to terminal
  * output. `readline.question` echoes pasted text, which is unacceptable for a
  * credential retained in the encrypted local session store. Raw TTY input is
@@ -162,6 +193,16 @@ function loginCodeInputError(code: "unavailable" | "cancelled" | "too_long", mes
  *
  * This intentionally refuses pipes and terminals without `setRawMode`: a
  * process that cannot suppress echo must not accept the durable code at all.
+ *
+ * Suppressing the bytes is not the same as suppressing all feedback. For a
+ * TYPED password an empty prompt is correct, because the person knows what they
+ * pressed. For a PASTED high-entropy code it is a dead end: nothing on screen
+ * distinguishes "the clipboard was empty", "the paste arrived", and "the paste
+ * arrived twice", so the only way to find out is to submit and read the error.
+ * So each accepted byte echoes one mask character and a backspace erases one,
+ * which keeps the display a truthful count of what will be submitted. That
+ * reveals the code's LENGTH and nothing else, and the length is already fixed
+ * and public in the `cuna_login_` format.
  */
 export async function readHiddenLoginCode(
   input: NodeJS.ReadStream,
@@ -176,9 +217,22 @@ export async function readHiddenLoginCode(
   const wasRaw = input.isRaw === true;
   const bytes: number[] = [];
   const maxBytes = 256;
+  let masked = 0;
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    /**
+     * Reconcile the echo with the buffer instead of emitting per keystroke. A
+     * paste can be split across chunks and its closing marker only becomes
+     * recognizable on the last one, so the mask count is recomputed from the
+     * whole buffer rather than incremented as bytes arrive.
+     */
+    const renderMask = () => {
+      const target = maskedLength(bytes);
+      if (target > masked) output.write(LOGIN_CODE_MASK.repeat(target - masked));
+      else if (target < masked) output.write("\b \b".repeat(masked - target));
+      masked = target;
+    };
     const cleanup = () => {
       input.off("data", onData);
       input.off("error", onError);
@@ -197,15 +251,12 @@ export async function readHiddenLoginCode(
     };
     const finish = () => {
       const raw = Buffer.from(bytes).toString("utf8");
-      // Several terminals wrap a paste in these control sequences while raw
-      // mode is active. Accept exactly the pair, never arbitrary escapes.
-      const bracketedPasteStart = `${String.fromCharCode(0x1b)}[200~`;
-      const bracketedPasteEnd = `${String.fromCharCode(0x1b)}[201~`;
-      const withoutPasteStart = raw.startsWith(bracketedPasteStart)
-        ? raw.slice(bracketedPasteStart.length)
+      // Accept exactly the bracketed-paste pair, never arbitrary escapes.
+      const withoutPasteStart = raw.startsWith(BRACKETED_PASTE_START)
+        ? raw.slice(BRACKETED_PASTE_START.length)
         : raw;
-      const value = withoutPasteStart.endsWith(bracketedPasteEnd)
-        ? withoutPasteStart.slice(0, -bracketedPasteEnd.length)
+      const value = withoutPasteStart.endsWith(BRACKETED_PASTE_END)
+        ? withoutPasteStart.slice(0, -BRACKETED_PASTE_END.length)
         : withoutPasteStart;
       settle({ value });
     };
@@ -217,7 +268,14 @@ export async function readHiddenLoginCode(
       for (const byte of data) {
         if (byte === 0x03) return onAbort(); // Ctrl+C
         if (byte === 0x04) return onEnd(); // Ctrl+D
-        if (byte === 0x0d || byte === 0x0a) return finish();
+        // Render before finishing. A clipboard whose contents end in a newline
+        // delivers the code and the Enter in ONE chunk, so returning straight
+        // into `finish` here would submit a paste that was never drawn — the
+        // exact no-feedback case this mask exists to remove.
+        if (byte === 0x0d || byte === 0x0a) {
+          renderMask();
+          return finish();
+        }
         if (byte === 0x08 || byte === 0x7f) {
           bytes.pop();
           continue;
@@ -227,11 +285,17 @@ export async function readHiddenLoginCode(
         }
         bytes.push(byte);
       }
+      renderMask();
     };
 
     try {
       input.setRawMode(true);
-      output.write("Paste the cuna_login_ code shown by app.getcuna.com (input hidden): ");
+      // The host and the `cuna_login_` prefix were both already on screen —
+      // the host in the link three lines up, the prefix in the code the person
+      // is holding in their clipboard. "(input hidden)" stays because it is
+      // still true and still the thing worth saying: the mask below shows the
+      // length, never the bytes.
+      output.write("Paste the login code (input hidden): ");
       input.on("data", onData);
       input.once("error", onError);
       input.once("end", onEnd);
