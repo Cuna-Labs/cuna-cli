@@ -75,7 +75,17 @@ test("a value with no offset is refused, because guessing one is worse than fail
   const naive = "2026-08-18T20:49:24.458909";
   assert.equal(instantOrNull(naive), null);
   assert.equal(sameInstant(naive, PRODUCTION_INSTANT), false);
-  assert.notEqual(Date.parse(naive), PRODUCTION_EPOCH_MS);
+
+  // The refusal comes from the ENCODING gate, never from unparseability: the
+  // host parses this string perfectly well, and we decline to use the answer.
+  // That is the whole property, and it is the only form of it that holds
+  // everywhere — the previous line here asserted `Date.parse(naive) !==
+  // PRODUCTION_EPOCH_MS`, which is TRUE on this author's UTC-6 host and FALSE on
+  // a CI runner at UTC, where the two encodings name the same instant. It failed
+  // in CI and passed locally, which is the shape this repository already records
+  // for test counts: a result that needs its host stated is not a property.
+  assert.equal(Number.isFinite(Date.parse(naive)), true, "the host can parse it");
+  assert.equal(instantOrNull(naive), null, "and we refuse it anyway");
 });
 
 test("non-instants are refused, and never equal themselves", () => {
