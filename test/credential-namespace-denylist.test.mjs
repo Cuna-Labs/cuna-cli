@@ -9,6 +9,10 @@ import {
   decodeAuditRecords,
   isBrowserCallbackNonce,
 } from "../dist/index.js";
+// `isLoginCode` is not on the public index surface, and that absence is why the
+// `login` family had no mint oracle while its sibling `isBrowserCallbackNonce`
+// did. Reach for it directly rather than widening the published surface.
+import { isLoginCode } from "../dist/core/namespace.js";
 import { detectHighConfidenceSecret } from "../dist/workspace/index.js";
 
 /**
@@ -35,6 +39,38 @@ const REQUIRED_CREDENTIAL_FAMILY_INFIXES = [
   "sc", // supervisor control bearer, live on the production edge today
   "cb", // browser callback nonce
   "cr", // browser continuation resume handle, minted by the console
+  // `login` is the durable 30-day browser-issued CLI login credential, and it
+  // was missing from this floor while it sat in CREDENTIAL_FAMILY_INFIXES —
+  // the third time this file's own header describes, after `cb` and `cr`.
+  // Losing it stops `detectHighConfidenceSecret` matching `cuna_login_…`, so
+  // the CLI uploads a live credential into a synced workspace instead of
+  // blocking it. It is stored on disk by `cuna login`, which is exactly the
+  // kind of file that ends up inside a workspace directory.
+  "login", // durable browser-issued CLI login credential
+];
+
+/**
+ * The families that MUST carry a wire grammar in the authority.
+ *
+ * The companion test below decides "validated or explicitly unvalidated" by
+ * reading `CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR` — the implementation's own
+ * list. That makes it invariant under the regression it exists to catch:
+ * deleting a family's grammar and adding the family to that list is green, and
+ * `every validated family accepts its own mint` then skips the family entirely
+ * via its `validator === undefined` guard. Coverage silently drops to zero for a
+ * validator that guards live credentials.
+ *
+ * This literal floor is the authority for that half. A family may be added, but
+ * a validated family may never quietly become an unvalidated one.
+ */
+const REQUIRED_VALIDATED_CREDENTIAL_FAMILIES = [
+  "sk", // isSecretApiKey — the programmatic bearer
+  "at", // isAccessToken — the interactive bearer
+  "tc", // isTerminalConnectToken
+  "cb", // isBrowserCallbackNonce
+  "cr", // browser continuation resume handle
+  "sc", // supervisor control bearer, matched on the production wire today
+  "login", // isLoginCode
 ];
 
 const OPAQUE_SUFFIX = "A".repeat(43);
@@ -47,6 +83,11 @@ test("the credential namespace authority never loses a brand or a family", () =>
   for (const infix of REQUIRED_CREDENTIAL_FAMILY_INFIXES) {
     assert.equal(CREDENTIAL_FAMILY_INFIXES.includes(infix), true, infix);
   }
+  // A literal oracle on the mint itself. Every assertion above is membership,
+  // so reordering the brands satisfies all of them while inverting which brand
+  // the product presents as current. `cuna` is what we mint; `runa` is only
+  // what we still accept.
+  assert.equal(CREDENTIAL_BRANDS[0], "cuna", "cuna must remain the minted brand");
 });
 
 test("the workspace secret detector blocks every brand and family it must", () => {
@@ -146,6 +187,25 @@ test("no credential brand or family can reach stdout through an audit record", (
  * unvalidated. Adding one and forgetting the grammar now fails; so does listing
  * an exception that has since acquired a grammar.
  */
+test("every family that must be validated still has a wire grammar", () => {
+  // The literal oracle for the grammar half. Reading only
+  // CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR lets a deletion move a family from
+  // validated to unvalidated and stay green; this cannot, because the floor
+  // does not move when the implementation does.
+  for (const infix of REQUIRED_VALIDATED_CREDENTIAL_FAMILIES) {
+    assert.notEqual(
+      credentialFamilyValidator(infix),
+      undefined,
+      `${infix} must keep a wire grammar; it is a validated family, not an exception`,
+    );
+    assert.equal(
+      CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR.includes(infix),
+      false,
+      `${infix} must not be recorded as unvalidated`,
+    );
+  }
+});
+
 test("every minted family is either validated by the authority or recorded as unvalidated", () => {
   const unvalidated = new Set(CREDENTIAL_FAMILIES_WITHOUT_WIRE_GRAMMAR);
   for (const infix of new Set([...REQUIRED_CREDENTIAL_FAMILY_INFIXES, ...CREDENTIAL_FAMILY_INFIXES])) {
@@ -190,6 +250,27 @@ test("the browser callback nonce admits only the current Cuna callback flow", ()
     `prefix_cuna_cb_${OPAQUE_SUFFIX}`, // must stay anchored
   ]) {
     assert.equal(isBrowserCallbackNonce(rejected), false, rejected);
+  }
+});
+
+/**
+ * `isLoginCode` had no test anywhere in this repository, while its exact
+ * sibling `isBrowserCallbackNonce` had the case above. Both are anchored,
+ * both hard-require the current `cuna_` mint, and both guard a durable
+ * credential — the login code for thirty days. An untested predicate is how a
+ * family becomes invisible to the deletion detector in the first place.
+ */
+test("the CLI login code admits only the current Cuna sign-in flow", () => {
+  assert.equal(isLoginCode(`cuna_login_${OPAQUE_SUFFIX}`), true);
+  for (const rejected of [
+    `runa_login_${OPAQUE_SUFFIX}`, // former login values remain denylist-only
+    `cuna_login_${"A".repeat(42)}`, // one character short of the minted suffix
+    `cuna_login_${"A".repeat(44)}`, // one character long
+    `cuna_at_${OPAQUE_SUFFIX}`, // a different family must not authenticate as login
+    `nope_login_${OPAQUE_SUFFIX}`, // an unminted brand
+    `prefix_cuna_login_${OPAQUE_SUFFIX}`, // must stay anchored
+  ]) {
+    assert.equal(isLoginCode(rejected), false, rejected);
   }
 });
 
