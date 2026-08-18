@@ -67,6 +67,37 @@ follow [Semantic Versioning](https://semver.org/).
 - Initial fail-closed TypeScript CLI, public API client, cross-platform adapters,
   offline installed-artifact identity, and release-admission scaffolding.
 
+### Fixed
+
+- `cuna login` now prints the browser continuation URL to the terminal before
+  it tries to open a browser, so the sign-in can be completed even when no
+  browser can be spawned — a headless host, an SSH session, WSL, or a desktop
+  with no registered default browser. Previously the command only attempted the
+  spawn and then asked the user to paste a code from a page they had no way to
+  reach: the console's `/cli/continue` page takes its continuation proof from
+  the URL fragment, refuses to fall back to an older one, and has no other
+  entry point, and the CLI was the sole holder of that fragment. The command
+  was therefore not completable by any means on a host where the spawn did
+  nothing.
+- A browser that cannot be opened no longer fails the sign-in. The printed URL
+  is a complete affordance, so the spawn is now a convenience whose failure is
+  reported (`Could not open a browser automatically.`) rather than propagated.
+  Announcing and opening are one function, `handOffContinuationToBrowser`, so
+  the two cannot drift apart into a build that opens without telling anyone.
+- `cuna login` reads the sign-in completion mode from `GET
+  /v1/cli-auth/bootstrap` instead of assuming it, and refuses with
+  `cuna.auth.completion_mode_unsupported` when the service advertises a mode
+  this build cannot drive — rather than silently running the paste flow against
+  a service that is not going to show the user a code. The dispatch is an
+  exhaustive switch, so teaching the decoder a second mode without teaching
+  `login` to complete it is a compile error.
+
+  All handoff output goes to stderr, which `run` already refuses unless stdin,
+  stdout and stderr are all TTYs, so the continuation fragment cannot reach a
+  pipe, a file or `$(cuna login)`. The one-time login code is unaffected: it is
+  still read with echo suppressed and never printed, logged, written to a file,
+  or placed in any URL the CLI constructs.
+
 ### Security
 
 - Exact Cuna API-origin validation, bounded responses, redacted errors,
