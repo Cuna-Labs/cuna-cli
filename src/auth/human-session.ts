@@ -8,11 +8,13 @@ import { CredentialBoundaryError } from "../credentials/errors.js";
 import { SecretMaterial } from "../credentials/secret-material.js";
 import { CredentialVault } from "../credentials/vault.js";
 import type { BrowserOpener } from "./browser.js";
+import { handOffContinuationToBrowser, type BrowserHandoffReporter } from "./browser-handoff.js";
 import type { HumanAuthClient } from "./human-client.js";
 import {
   assertProfile,
   assertUuid,
   decodeCliIdentityContext,
+  type CliAuthBootstrap,
   type CliIdentityContext,
   type CliIntentClass,
   type CliLoginCodeExchangeResult,
@@ -87,6 +89,27 @@ function authError(code: string, message: string, options: {
   readonly details?: Readonly<Record<string, string | number | boolean | null>>;
 } = {}): CunaError {
   return new CunaError({ code, message, exitCode: EXIT_CODES.auth, ...options });
+}
+
+/**
+ * The service advertised a sign-in completion mode this build cannot drive.
+ *
+ * Reached only through the exhaustive switch in `login`, so the parameter is
+ * `never`: adding a mode to the decoded bootstrap without teaching `login` how
+ * to complete it fails the build here rather than silently falling through to
+ * the paste path. Refusing loudly is the point — a CLI that quietly runs the
+ * wrong completion tells the user to paste a code the service is not going to
+ * show them.
+ */
+function unsupportedCompletionMode(mode: never): CunaError {
+  return authError(
+    "cuna.auth.completion_mode_unsupported",
+    "Cuna advertised a sign-in completion mode this CLI version does not support.",
+    {
+      hint: "Update the Cuna CLI to the latest version, then run `cuna login` again.",
+      details: { completion_mode: String(mode) },
+    },
+  );
 }
 
 function binding(config: EffectiveConfig): CredentialBinding {
@@ -302,6 +325,12 @@ export function createHumanAuthService(input: {
   readonly client: HumanAuthClient;
   readonly vault: CredentialVault;
   readonly browser: BrowserOpener;
+  /**
+   * Required, never defaulted. A default would make "the user was never sent
+   * anywhere" the silent behaviour of a caller that forgot one field, which is
+   * the exact defect this seam exists to close.
+   */
+  readonly browserHandoff: BrowserHandoffReporter;
   readonly readLoginCode: (signal?: AbortSignal) => Promise<string>;
   readonly clock?: () => number;
   readonly random?: RandomSource;
@@ -514,7 +543,24 @@ export function createHumanAuthService(input: {
       if (Date.parse(issued.expiresAt) <= now()) {
         throw authError("cuna.auth.continuation_expired", "Cuna issued an already-expired sign-in continuation.");
       }
-      await input.browser.open(issued.browserUrl);
+      // How this sign-in completes is the service's decision, read from the
+      // bootstrap it just served — never assumed here. The switch is
+      // exhaustive on purpose: widening `CliAuthBootstrap["completionMode"]`
+      // when the service starts advertising a second mode is a compile error
+      // in this function, which is the only control that makes "the CLI
+      // hard-coded a mode" unexpressible rather than merely discouraged.
+      const completionMode: CliAuthBootstrap["completionMode"] = bootstrap.completionMode;
+      switch (completionMode) {
+        case "paste_login_code":
+          break;
+        default:
+          throw unsupportedCompletionMode(completionMode);
+      }
+      await handOffContinuationToBrowser({
+        url: issued.browserUrl,
+        opener: input.browser,
+        reporter: input.browserHandoff,
+      });
       const loginCode = (await readLoginCodeBeforeExpiry(issued.expiresAt, request.signal)).trim();
       if (!isLoginCode(loginCode)) {
         throw authError("cuna.auth.login_code_invalid", "The pasted Cuna login code is invalid.", {

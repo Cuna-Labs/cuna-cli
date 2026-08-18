@@ -4,6 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
 import { createHttpTransport, type HttpRequest } from "../api/http.js";
 import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
+import type { BrowserHandoffReporter } from "../auth/browser-handoff.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
@@ -46,7 +47,7 @@ import {
 } from "../runtime/node-foreground-session.js";
 import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
-import { createOutputWriter, type CliStreams } from "./output.js";
+import { createOutputWriter, sanitizeHumanTerminalOutput, type CliStreams } from "./output.js";
 import { booleanOption, parseArgv, stringOption } from "./parser.js";
 import { rejectUnknownOptions } from "./parser.js";
 import type { ParsedInvocation } from "./parser.js";
@@ -100,6 +101,46 @@ async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw" 
   } finally {
     prompt.close();
   }
+}
+
+/**
+ * Render the browser handoff onto the interactive terminal.
+ *
+ * Everything here goes to **stderr**, deliberately and for two reasons.
+ *
+ * It is prompt text, not a command result, so `stdout` stays clean for the
+ * structured result the command still owes its caller. And the continuation
+ * fragment is a bearer proof: on stderr it stays out of `$(cuna login)`,
+ * pipelines and redirected logs, while `run` already refuses the whole command
+ * unless stdin, stdout **and** stderr are all TTYs — so this print cannot reach
+ * a file or a pipe without that refusal firing first.
+ *
+ * Every line is passed through the same human-output sanitizer as the rest of
+ * the CLI. The URL is already constrained by `decodeCliContinuationIssued` and
+ * by `isBoundedHttpsBrowserUrl`, so this is defence in depth rather than the
+ * only control, but a print sink for service-controlled bytes is held to the
+ * same rule everywhere else in this file.
+ */
+export function createTerminalBrowserHandoffReporter(output: Writable): BrowserHandoffReporter {
+  const line = (value: string): void => {
+    output.write(`${sanitizeHumanTerminalOutput(value)}\n`);
+  };
+  const reporter: BrowserHandoffReporter = {
+    continuationUrl(url) {
+      line("");
+      line("Sign in to Cuna in your browser. Open this single-use link:");
+      line("");
+      line(`  ${url}`);
+      line("");
+    },
+    browserOpened() {
+      line("Opened your default browser. Approve the sign-in there, then return here.");
+    },
+    browserOpenFailed() {
+      line("Could not open a browser automatically. Open the link above yourself.");
+    },
+  };
+  return Object.freeze(reporter);
 }
 
 function loginCodeInputError(code: "unavailable" | "cancelled" | "too_long", message: string): CunaError {
@@ -577,6 +618,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
         }),
         browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
+        // Bound to the real stderr the command was given, never to an injected
+        // seam. A test that stubs `browser` still sees the URL it would have
+        // printed to a user, so "the browser opened" and "the user was told
+        // where to go" cannot be proven independently of each other.
+        browserHandoff: createTerminalBrowserHandoffReporter(streams.stderr),
         readLoginCode: dependencies.readLoginCode ?? promptLoginCode,
         ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
       });
