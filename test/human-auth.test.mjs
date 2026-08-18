@@ -160,17 +160,23 @@ function fixture(overrides = {}) {
   const vault = new CredentialVault({ backend, clock, platform: "linux" });
   const client = overrides.client ?? fakeClient();
   const opened = [];
+  const handoff = [];
   const service = createHumanAuthService({
     config,
     client,
     vault,
-    browser: { async open(url) { opened.push(url); } },
+    browser: overrides.browser ?? { async open(url) { opened.push(url); } },
+    browserHandoff: {
+      continuationUrl(url) { handoff.push(["url", url]); },
+      browserOpened() { handoff.push(["opened"]); },
+      browserOpenFailed() { handoff.push(["open_failed"]); },
+    },
     clock,
     random: (size) => new Uint8Array(size).fill(7),
     uuid: () => UUID_A,
     readLoginCode: overrides.readLoginCode ?? (async () => LOGIN),
   });
-  return { backend, vault, client, opened, service };
+  return { backend, vault, client, opened, handoff, service };
 }
 
 test("login persists durable exchange authority but no access token", async () => {
@@ -186,6 +192,63 @@ test("login persists durable exchange authority but no access token", async () =
   const protectedBytes = Buffer.concat([...subject.backend.values.values()].map((value) => Buffer.from(value))).toString("utf8");
   assert.equal(protectedBytes.includes(AT), false);
   assert.equal(protectedBytes.includes("code_verifier"), true);
+});
+
+test("login announces the continuation URL it hands to the browser, in that order", async () => {
+  const subject = fixture();
+  await subject.service.login();
+  // Derived from the state the service actually sent, never restated here: an
+  // expectation rebuilt from the fixture's own constants would follow a
+  // mutation that changed the state instead of catching it.
+  const sentState = subject.client.calls.find(([name]) => name === "create")[1].state;
+  const issued = `https://app.getcuna.com/cli/continue#continuation=${UUID_A}&nonce=cuna_cb_${"n".repeat(43)}&state=${sentState}`;
+  // One URL, delivered to the user and to the opener, and the user first.
+  assert.deepEqual(subject.opened, [issued]);
+  assert.deepEqual(subject.handoff, [["url", issued], ["opened"]]);
+  // Literal oracle on the approved origin. A brand-order mutation moves these
+  // exact bytes rather than moving the expectation with them.
+  assert.equal(new URL(subject.handoff[0][1]).origin, "https://app.getcuna.com");
+});
+
+test("login still announces the continuation URL when the browser cannot be opened", async () => {
+  const subject = fixture({
+    browser: { async open() { throw new Error("spawn xdg-open ENOENT"); } },
+  });
+  const result = await subject.service.login();
+  assert.equal(result.sessionId, UUID_B);
+  assert.equal(subject.handoff[0][0], "url");
+  assert.deepEqual(subject.handoff[1], ["open_failed"]);
+});
+
+test("login refuses a completion mode it cannot drive instead of running the paste flow", async () => {
+  // The server is the authority on how a sign-in completes. A CLI that ignores
+  // the advertised mode tells the user to paste a code the service will never
+  // show them, so this must refuse before any browser or prompt effect.
+  let promptCalls = 0;
+  const subject = fixture({
+    client: fakeClient({
+      async bootstrap() {
+        this.calls.push(["bootstrap"]);
+        return {
+          enabled: true,
+          completionMode: "poll",
+          pkceMethod: "S256",
+          continuationTtlSeconds: 600,
+          accessTokenTtlSeconds: 600,
+          browserOrigin: "https://app.getcuna.com",
+        };
+      },
+    }),
+    readLoginCode: async () => { promptCalls += 1; return LOGIN; },
+  });
+  await assert.rejects(
+    subject.service.login(),
+    (error) => error instanceof CunaError && error.code === "cuna.auth.completion_mode_unsupported",
+  );
+  assert.equal(promptCalls, 0);
+  assert.deepEqual(subject.handoff, []);
+  assert.deepEqual(subject.opened, []);
+  assert.equal(subject.client.calls.some(([name]) => name === "exchange"), false);
 });
 
 test("waitlist-only signup stores a restricted session and permits one pinned admission transition", async () => {

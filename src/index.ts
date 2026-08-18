@@ -69,6 +69,11 @@ export {
   type WorkspaceState,
 } from "./auth/onboarding-state.js";
 export { createBrowserOpener, type BrowserOpener } from "./auth/browser.js";
+export {
+  handOffContinuationToBrowser,
+  type BrowserHandoffOutcome,
+  type BrowserHandoffReporter,
+} from "./auth/browser-handoff.js";
 export { createHumanAuthClient, type HumanAuthClient } from "./auth/human-client.js";
 export {
   decodeCliAuthBootstrap,
