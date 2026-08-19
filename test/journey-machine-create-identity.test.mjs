@@ -312,7 +312,7 @@ test("a journey that never dispatches a create carries no create-request identit
       scope: { userId: USER, workspaceId: WORKSPACE },
       signal: controller.signal,
       effects: {
-        onPhase(phase) { if (phase === "observe-machines") controller.abort(new Error("interrupted")); },
+        onPhase(event) { if (event.type === "started" && event.phase === "observe-machines") controller.abort(new Error("interrupted")); },
         async inspectWorkspace() { return { canonicalLocalRoot: ROOT }; },
         async observeMachines() { return []; },
         async createMachine() { throw new Error("unexpected create"); },

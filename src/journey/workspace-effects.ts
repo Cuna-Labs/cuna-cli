@@ -87,7 +87,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         ...(inspected.local === undefined ? {} : { projectMachineId: inspected.local.record.machineId }),
       });
     },
-    async synchronizeWorkspace({ machineId, localPath, syncMode, signal }) {
+    async synchronizeWorkspace({ machineId, localPath, syncMode, signal, onProgress }) {
       const inspected = await inspect(localPath);
       let authority;
       if (inspected.local !== undefined) {
@@ -142,6 +142,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         checkpointRoot,
         filesystemCapabilities: input.filesystemCapabilities,
         signal,
+        ...(onProgress === undefined ? {} : { onProgress }),
       });
       const committedAuthority = await input.client.getWorkspaceBinding(authority.bindingId, {
         workspaceId: input.workspaceId,

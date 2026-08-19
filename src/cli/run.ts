@@ -50,6 +50,7 @@ import {
 import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
 import { createOutputWriter, sanitizeHumanTerminalOutput, type CliStreams } from "./output.js";
+import { createJourneyPresentation } from "./presentation.js";
 import { booleanOption, parseArgv, stringOption } from "./parser.js";
 import { rejectUnknownOptions } from "./parser.js";
 import type { ParsedInvocation } from "./parser.js";
@@ -890,14 +891,19 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
       }
+      const presentation = createJourneyPresentation({
+        stderr: streams.stderr,
+        stderrIsTTY: streams.stderrIsTTY === true,
+        json: writer.structured,
+        color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+        ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+      });
       const existingOnPhase = effects.onPhase;
       effects = {
         ...effects,
-        onPhase(phase) {
-          existingOnPhase?.(phase);
-          if (!writer.structured && streams.stderrIsTTY === true) {
-            streams.stderr.write(`Cuna: ${phase}\n`);
-          }
+        onPhase(event) {
+          existingOnPhase?.(event);
+          presentation.onPhase(event);
         },
       };
       try {
@@ -908,6 +914,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
         });
       } finally {
+        presentation.close();
         await stopJourneyWorkspace?.();
       }
       return EXIT_CODES.success;

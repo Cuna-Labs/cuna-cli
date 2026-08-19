@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { AgentAuthMode, AgentKind } from "../api/contracts.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import type { WorkspaceSyncProgress } from "../sync/workspace-sync-coordinator.js";
 import { deriveMachineCreateIdentity } from "./derived-identity.js";
 import type { ReconciledAgentJourneyIntent } from "./intent.js";
 import {
@@ -23,6 +24,21 @@ export type AgentJourneyPhase =
   | "create-agent-session"
   | "ready-agent-session"
   | "attach";
+/**
+ * The orchestrator is the sole source of journey state. Presentation observers
+ * receive lifecycle facts, never a second hand-maintained list of steps.
+ */
+export type AgentJourneyPhaseEvent =
+  | Readonly<{ readonly type: "started"; readonly phase: AgentJourneyPhase }>
+  | Readonly<{ readonly type: "completed"; readonly phase: AgentJourneyPhase }>
+  | Readonly<{ readonly type: "failed"; readonly phase: AgentJourneyPhase }>
+  | Readonly<{ readonly type: "cancelled"; readonly phase: AgentJourneyPhase }>
+  | Readonly<{
+    readonly type: "progress";
+    readonly phase: "synchronize-workspace";
+    readonly progress: WorkspaceSyncProgress;
+  }>;
+
 
 export interface JourneyMachine {
   readonly id: string;
@@ -117,6 +133,7 @@ export interface AgentJourneyEffects {
     readonly localPath: string;
     readonly syncMode: ReconciledAgentJourneyIntent["syncMode"];
     readonly signal: AbortSignal;
+    readonly onProgress?: (progress: WorkspaceSyncProgress) => void;
   }): Promise<JourneyWorkspaceReceipt>;
   observeAgentSessions(input: {
     readonly machineId: string;
@@ -144,7 +161,7 @@ export interface AgentJourneyEffects {
     readonly ledger: JourneyResourceLedger;
     readonly signal: AbortSignal;
   }): Promise<void>;
-  onPhase?(phase: AgentJourneyPhase): void;
+  onPhase?(event: AgentJourneyPhaseEvent): void;
 }
 
 export interface AgentJourneyResult {
@@ -259,12 +276,30 @@ async function boundary<T>(input: {
   readonly action: () => Promise<T>;
 }): Promise<T> {
   if (input.signal.aborted) throw cancelled();
-  input.effects.onPhase?.(input.phase);
+  notifyPhase(input.effects, { type: "started", phase: input.phase });
   if (input.signal.aborted) throw cancelled();
-  const value = await input.action();
-  if (input.signal.aborted) throw cancelled();
-  input.ledger.lastCompletedPhase = input.phase;
-  return value;
+  try {
+    const value = await input.action();
+    if (input.signal.aborted) throw cancelled();
+    input.ledger.lastCompletedPhase = input.phase;
+    notifyPhase(input.effects, { type: "completed", phase: input.phase });
+    return value;
+  } catch (error) {
+    notifyPhase(input.effects, {
+      type: input.signal.aborted ? "cancelled" : "failed",
+      phase: input.phase,
+    });
+    throw error;
+  }
+}
+
+/** Presentation is advisory: a broken observer must not change journey semantics. */
+function notifyPhase(effects: AgentJourneyEffects, event: AgentJourneyPhaseEvent): void {
+  try {
+    effects.onPhase?.(event);
+  } catch {
+    // Rendering is never an authority for provisioning, synchronization, or attach.
+  }
 }
 
 /**
@@ -393,6 +428,11 @@ export async function orchestrateAgentJourney(input: {
         localPath,
         syncMode: input.intent.syncMode,
         signal,
+        onProgress: (progress) => notifyPhase(input.effects, {
+          type: "progress",
+          phase: "synchronize-workspace",
+          progress,
+        }),
       }),
     });
     ledger.synchronizedBindingId = workspace.bindingId;
