@@ -92,12 +92,29 @@ export interface SelectAgentSessionPlan {
   readonly agentSession: SafeAgentSessionCandidate;
 }
 
-export interface CreateRequiredPlan {
+export type MachineCreateReason =
+  | "forced"
+  | "no-machines"
+  | "foreign-machines"
+  | "unsupported-agent"
+  | "stopped-machine"
+  | "no-reusable-machine";
+
+export interface CreateRequiredMachinePlan {
   readonly kind: "create-required";
-  readonly target: "machine" | "agent-session";
-  readonly machineId?: string;
+  readonly target: "machine";
+  readonly reason: MachineCreateReason;
+  readonly stoppedMachineId?: string;
+}
+
+export interface CreateRequiredAgentSessionPlan {
+  readonly kind: "create-required";
+  readonly target: "agent-session";
+  readonly machineId: string;
   readonly reason: "forced" | "no-compatible-candidate";
 }
+
+export type CreateRequiredPlan = CreateRequiredMachinePlan | CreateRequiredAgentSessionPlan;
 
 export interface AmbiguousMachinePlan {
   readonly kind: "ambiguous";
@@ -156,7 +173,7 @@ export interface UnavailablePlan {
 
 export type MachineSelectionPlan =
   | SelectMachinePlan
-  | CreateRequiredPlan
+  | CreateRequiredMachinePlan
   | AmbiguousMachinePlan
   | StaleBindingPlan
   | IncompatiblePlan
@@ -164,7 +181,7 @@ export type MachineSelectionPlan =
 
 export type AgentSessionSelectionPlan =
   | SelectAgentSessionPlan
-  | CreateRequiredPlan
+  | CreateRequiredAgentSessionPlan
   | AmbiguousAgentSessionPlan
   | IncompatiblePlan
   | UnavailablePlan;
@@ -218,7 +235,6 @@ const REUSABLE_MACHINE_STATES = new Set<MachineSelectionState>([
   "running",
   "paused",
   "suspended",
-  "stopped",
 ]);
 const AGENTS = new Set<AgentKind>(["claude-code", "codex", "openclaw", "opencode"]);
 const AUTH_MODES = new Set<AgentAuthMode>(["interactive_login", "credential_binding"]);
@@ -532,10 +548,32 @@ export function planMachineSelection(input: MachineSelectionInput): MachineSelec
       candidates: sortMachines(eligible),
     });
   }
+  if (input.machines.length === 0) {
+    return freezePlan({ kind: "create-required", target: "machine", reason: "no-machines" });
+  }
+  const owned = input.machines.filter((machine) => machine.ownership === "owned");
+  if (owned.length === 0) {
+    return freezePlan({ kind: "create-required", target: "machine", reason: "foreign-machines" });
+  }
+  const ownedAndSupported = owned.filter((machine) => machine.requestedAgentSupport === "supported");
+  if (ownedAndSupported.length === 0) {
+    return freezePlan({ kind: "create-required", target: "machine", reason: "unsupported-agent" });
+  }
+  const stopped = ownedAndSupported
+    .filter((machine) => machine.state === "stopped")
+    .sort((left, right) => left.id.localeCompare(right.id))[0];
+  if (stopped !== undefined) {
+    return freezePlan({
+      kind: "create-required",
+      target: "machine",
+      reason: "stopped-machine",
+      stoppedMachineId: stopped.id,
+    });
+  }
   return freezePlan({
     kind: "create-required",
     target: "machine",
-    reason: "no-compatible-candidate",
+    reason: "no-reusable-machine",
   });
 }
 

@@ -9,6 +9,7 @@ import {
   planMachineSelection,
   type AgentSessionSelectionObservation,
   type MachineSelectionObservation,
+  type MachineCreateReason,
 } from "./selection.js";
 
 export type AgentJourneyPhase =
@@ -26,6 +27,13 @@ export type AgentJourneyPhase =
 export interface JourneyMachine {
   readonly id: string;
   readonly state: MachineSelectionObservation["state"];
+}
+
+export interface MachineCreateAuthorization {
+  readonly requestedAgent: AgentKind;
+  readonly reason: MachineCreateReason;
+  readonly stoppedMachineId?: string;
+  readonly signal: AbortSignal;
 }
 
 export interface JourneyWorkspaceReceipt {
@@ -86,11 +94,9 @@ export interface AgentJourneyEffects {
     readonly requestedAgent: AgentKind;
     readonly signal: AbortSignal;
   }): Promise<readonly MachineSelectionObservation[]>;
-  createMachine(input: {
-    readonly requestedAgent: AgentKind;
+  createMachine(input: MachineCreateAuthorization & {
     readonly idempotencyKey: string;
     readonly requestId: string;
-    readonly signal: AbortSignal;
   }): Promise<JourneyMachine>;
   /**
    * Reconcile a create whose response was not authoritative. `unreconcilable`
@@ -334,6 +340,8 @@ export async function orchestrateAgentJourney(input: {
             // a request identity to reconcile against.
             ledger.machineCreateRequestId = requestId;
             return input.effects.createMachine({
+              reason: machinePlan.reason,
+              ...(machinePlan.reason === "stopped-machine" ? { stoppedMachineId: machinePlan.stoppedMachineId } : {}),
               requestedAgent: input.intent.agent,
               idempotencyKey: createIdentity.idempotencyKey,
               requestId,

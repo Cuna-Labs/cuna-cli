@@ -1627,6 +1627,9 @@ test("valid automatic agent intents execute the effects-fenced journey and exact
     assert.deepEqual(attached, { id: FOREGROUND_SESSION_C, agent: argv[0] === "claude" ? "claude-code" : argv[0] });
     assert.equal(phases[0], "inspect-workspace");
     assert.equal(phases.at(-1), "attach");
+    assert.match(streams.stderr(), /Cuna: inspect-workspace/u);
+    assert.match(streams.stderr(), /Cuna: attach/u);
+    assert.doesNotMatch(streams.stdout(), /Cuna:/u);
   }
 });
 

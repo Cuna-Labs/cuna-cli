@@ -35,6 +35,7 @@ import {
   preflightAgentJourneyInvocation,
   type AgentJourneyEffects,
   type ReconciledAgentJourneyIntent,
+  type MachineCreateAuthorization,
 } from "../journey/index.js";
 import { createPlatformAdapter, type PlatformAdapter } from "../platform/adapter.js";
 import { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "../version.js";
@@ -88,14 +89,31 @@ export interface RunCliDependencies {
     readonly credentialMode: "automation" | "interactive";
     readonly signal?: AbortSignal;
   }) => AgentJourneyEffects;
-  readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal) => Promise<boolean>;
+  readonly authorizeMachineCreate?: (input: MachineCreateAuthorization) => Promise<boolean>;
 }
 
-async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal): Promise<boolean> {
-  if (signal.aborted) return false;
+export function machineCreatePrompt(input: Pick<MachineCreateAuthorization, "requestedAgent" | "reason" | "stoppedMachineId">): string {
+  switch (input.reason) {
+    case "forced":
+      return `Create a new machine for ${input.requestedAgent}? [y/N] `;
+    case "no-machines":
+      return `You have no machines. Create one for ${input.requestedAgent}? [y/N] `;
+    case "foreign-machines":
+      return `The available machines belong to another account. Create one for ${input.requestedAgent}? [y/N] `;
+    case "unsupported-agent":
+      return `Your machines do not support ${input.requestedAgent}. Create one? [y/N] `;
+    case "stopped-machine":
+      return `Machine ${input.stoppedMachineId ?? "<unknown>"} is stopped. Start it with \`cuna machines start ${input.stoppedMachineId ?? "ID"}\`, or create a new machine for ${input.requestedAgent}? [y/N] `;
+    case "no-reusable-machine":
+      return `No reusable machine supports ${input.requestedAgent}. Create one? [y/N] `;
+  }
+}
+
+async function confirmMachineCreate(input: MachineCreateAuthorization): Promise<boolean> {
+  if (input.signal.aborted) return false;
   const prompt = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
   try {
-    const answer = await prompt.question(`No compatible machine is available. Create one for ${agent}? [y/N] `, { signal });
+    const answer = await prompt.question(machineCreatePrompt(input), { signal: input.signal });
     return answer.trim().toLocaleLowerCase("en-US") === "y" || answer.trim().toLocaleLowerCase("en-US") === "yes";
   } catch {
     return false;
@@ -849,8 +867,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           client,
           inspectWorkspace: workspace.inspectWorkspace,
           synchronizeWorkspace: workspace.synchronizeWorkspace,
-          authorizeMachineCreate: async ({ requestedAgent, signal }) =>
-            (dependencies.authorizeMachineCreate ?? confirmMachineCreate)(requestedAgent, signal),
+          authorizeMachineCreate: async (input) =>
+            (dependencies.authorizeMachineCreate ?? confirmMachineCreate)(input),
           attach: async ({ agentSessionId, expectedAgent, signal }) => {
             const presentationMode = selectNodeForegroundPresentation({
               platform: nodePlatform(platform.kind),
@@ -872,6 +890,16 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
       }
+      const existingOnPhase = effects.onPhase;
+      effects = {
+        ...effects,
+        onPhase(phase) {
+          existingOnPhase?.(phase);
+          if (!writer.structured && streams.stderrIsTTY === true) {
+            streams.stderr.write(`Cuna: ${phase}\n`);
+          }
+        },
+      };
       try {
         await orchestrateAgentJourney({
           intent: journeyIntent,

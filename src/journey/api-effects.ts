@@ -7,6 +7,7 @@ import type {
   AgentJourneyEffects,
   JourneyResourceLedger,
   JourneyWorkspaceReceipt,
+  MachineCreateAuthorization,
 } from "./orchestrator.js";
 
 const MACHINE_POLL_LIMIT = 60;
@@ -17,10 +18,7 @@ export interface ApiAgentJourneyEffectsInput {
   readonly inspectWorkspace: AgentJourneyEffects["inspectWorkspace"];
   readonly synchronizeWorkspace: AgentJourneyEffects["synchronizeWorkspace"];
   readonly attach: AgentJourneyEffects["attach"];
-  readonly authorizeMachineCreate: (input: {
-    readonly requestedAgent: "claude-code" | "codex" | "openclaw" | "opencode";
-    readonly signal: AbortSignal;
-  }) => Promise<boolean>;
+  readonly authorizeMachineCreate: (input: MachineCreateAuthorization) => Promise<boolean>;
   readonly reconcileCancellation?: (input: {
     readonly ledger: JourneyResourceLedger;
     readonly signal: AbortSignal;
@@ -133,9 +131,14 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         });
       }));
     },
-    async createMachine({ requestedAgent, idempotencyKey, requestId, signal }) {
+    async createMachine({ requestedAgent, reason, stoppedMachineId, idempotencyKey, requestId, signal }) {
       await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create", now: now(), signal });
-      if (!await input.authorizeMachineCreate({ requestedAgent, signal })) {
+      if (!await input.authorizeMachineCreate({
+        requestedAgent,
+        reason,
+        ...(stoppedMachineId === undefined ? {} : { stoppedMachineId }),
+        signal,
+      })) {
         throw fail(
           "cuna.journey.machine_create_not_authorized",
           "Machine creation was not authorized.",
