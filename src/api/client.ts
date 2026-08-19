@@ -838,13 +838,13 @@ export async function requireCapability(input: {
   try {
     snapshot = await input.client.discoverCapabilities(input.scope, input.resourceId, input.signal);
   } catch (error) {
-    // `cuna.remote.operation_not_served` is the code a deployment without the
-    // route now produces. Before the transport read the status before the body,
-    // that case arrived as `cuna.remote.malformed_response` and this branch was
-    // unreachable against the one deployment that exists.
+    // Only an unserved operation proves the discovery route is absent. An
+    // API-authored `cuna.remote.not_found` instead proves the requested resource
+    // is absent; rewriting that as a deployment defect sends the operator to
+    // repair the wrong system.
     if (
       error instanceof CunaError &&
-      (error.code === "cuna.remote.not_found" || error.code === "cuna.remote.operation_not_served")
+      error.code === "cuna.remote.operation_not_served"
     ) {
       throw new CunaError({
         code: "cuna.capability.discovery_unavailable",

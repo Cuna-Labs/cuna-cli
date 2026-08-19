@@ -1612,7 +1612,7 @@ test("valid automatic agent intents execute the effects-fenced journey and exact
           return [{ id: FOREGROUND_SESSION_A, name: "review", agent: "unknown", requestedAgentSupport: "supported", state: "running", ownership: "owned", freshness: "fresh", recency: "recent", resources: {}, costStatus: "known" }];
         },
         async createMachine() { return { id: FOREGROUND_SESSION_A, state: "running" }; },
-        async reconcileMachineCreate() { return "unreconcilable"; },
+        async reconcileMachineCreate() { return { kind: "unreconcilable" }; },
         async ensureMachineReady({ machineId }) { return { id: machineId, state: "running" }; },
         async synchronizeWorkspace() { return { bindingId: FOREGROUND_SESSION_B, workspaceIdentity: FOREGROUND_SESSION_B, generation: 1, remoteCwd: "/workspace/projects/project" }; },
         async observeAgentSessions() { return []; },

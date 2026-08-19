@@ -159,7 +159,7 @@ try {
         async inspectWorkspace() { return { canonicalLocalRoot: process.cwd() }; },
         async observeMachines() { return [{ id: "10000000-0000-4000-8000-000000000001", name: "matrix-machine", agent: "unknown", requestedAgentSupport: "supported", state: "running", ownership: "owned", freshness: "fresh", recency: "recent", resources: {}, costStatus: "known" }]; },
         async createMachine() { return { id: "10000000-0000-4000-8000-000000000001", state: "running" }; },
-        async reconcileMachineCreate() { return "unreconcilable"; },
+        async reconcileMachineCreate() { return { kind: "unreconcilable" }; },
         async ensureMachineReady({ machineId }) { return { id: machineId, state: "running" }; },
         async synchronizeWorkspace() { return { bindingId: "60000000-0000-4000-8000-000000000006", workspaceIdentity: "60000000-0000-4000-8000-000000000006", generation: 1, remoteCwd: "/workspace" }; },
         async observeAgentSessions() { return []; },

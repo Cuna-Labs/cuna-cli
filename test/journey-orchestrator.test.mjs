@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { CunaError, EXIT_CODES } from "../dist/index.js";
 import { orchestrateAgentJourney } from "../dist/journey/orchestrator.js";
 
 const MACHINE = "10000000-0000-4000-8000-000000000001";
@@ -50,7 +51,7 @@ function effects(overrides = {}) {
     async inspectWorkspace() { calls.push("inspect-workspace"); return { canonicalLocalRoot: "C:\\work" }; },
     async observeMachines() { calls.push("observe-machines"); return [machine()]; },
     async createMachine(input) { calls.push(["create-machine", input]); return { id: MACHINE, state: "creating" }; },
-    async reconcileMachineCreate(input) { calls.push(["reconcile-create", input]); return { id: MACHINE, state: "creating" }; },
+    async reconcileMachineCreate(input) { calls.push(["reconcile-create", input]); return { kind: "reconciled", machine: { id: MACHINE, state: "creating" } }; },
     async ensureMachineReady(input) { calls.push(["ready-machine", input]); return { id: input.machineId, state: "running" }; },
     async synchronizeWorkspace(input) {
       calls.push(["sync", input]);
@@ -101,7 +102,7 @@ test("unknown create outcome reconciles with the exact caller-known request ID",
     async reconcileMachineCreate(input) {
       reconciledRequestId = input.requestId;
       fx.calls.push("reconciled");
-      return { id: MACHINE, state: "creating" };
+      return { kind: "reconciled", machine: { id: MACHINE, state: "creating" } };
     },
   });
   await orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE });
@@ -112,16 +113,42 @@ test("unknown create outcome reconciles with the exact caller-known request ID",
 
 test("unreconcilable create outcome fails closed without duplicate creation", async () => {
   let creates = 0;
+  const createError = new Error("lost response");
   const fx = effects({
     async observeMachines() { return []; },
-    async createMachine() { creates += 1; throw new Error("lost response"); },
-    async reconcileMachineCreate() { return "unreconcilable"; },
+    async createMachine() { creates += 1; throw createError; },
+    async reconcileMachineCreate() { return { kind: "unreconcilable" }; },
   });
   await assert.rejects(
     orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE }),
-    (error) => error.code === "cuna.journey.machine_create_outcome_unreconcilable" && error.retryable === false,
+    (error) =>
+      error.code === "cuna.journey.machine_create_outcome_unreconcilable" &&
+      error.retryable === false &&
+      error.cause === createError,
   );
   assert.equal(creates, 1);
+});
+
+test("a throwing machine-create reconciliation preserves the original create failure", async () => {
+  const createError = new Error("producer refused machine creation");
+  const reconcileError = new CunaError({
+    code: "cuna.remote.not_found",
+    message: "machine-create request was not found",
+    exitCode: EXIT_CODES.remote,
+  });
+  const fx = effects({
+    async observeMachines() { return []; },
+    async createMachine() { throw createError; },
+    async reconcileMachineCreate() { throw reconcileError; },
+  });
+
+  await assert.rejects(
+    orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE }),
+    (error) =>
+      error === reconcileError &&
+      error.code === "cuna.remote.not_found" &&
+      error.cause === createError,
+  );
 });
 
 test("exhausted AgentSession create recovery fails closed before attach", async () => {

@@ -1,7 +1,7 @@
 import type { AgentSession, Machine } from "../api/contracts.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
-import { isObservationBudgetCode } from "../core/observation-budget.js";
+import { isObservationBudgetCode, observationBudgetElapsed } from "../core/observation-budget.js";
 import type { MachineSelectionState } from "./selection.js";
 import type {
   AgentJourneyEffects,
@@ -11,6 +11,21 @@ import type {
 
 const MACHINE_POLL_LIMIT = 60;
 const CHILD_POLL_LIMIT = 90;
+
+function pollDelayMilliseconds(attempt: number): number {
+  return Math.min(2_000, 100 * 2 ** Math.min(attempt, 4));
+}
+
+function pollBudgetMilliseconds(limit: number): number {
+  let total = 0;
+  for (let attempt = 0; attempt < limit; attempt += 1) {
+    total += pollDelayMilliseconds(attempt);
+  }
+  return total;
+}
+
+const MACHINE_READY_OBSERVATION_BUDGET_MS = pollBudgetMilliseconds(MACHINE_POLL_LIMIT);
+const AGENT_SESSION_READY_OBSERVATION_BUDGET_MS = pollBudgetMilliseconds(CHILD_POLL_LIMIT);
 
 export interface ApiAgentJourneyEffectsInput {
   readonly client: CunaApiClient;
@@ -157,14 +172,17 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         }
         if (request.state === "settled" || request.state === "provider_succeeded") {
           const machine = await input.client.getMachine(request.machineId, signal);
-          return Object.freeze({ id: machine.id, state: machineState(machine.state) });
+          return Object.freeze({
+            kind: "reconciled",
+            machine: Object.freeze({ id: machine.id, state: machineState(machine.state) }),
+          });
         }
         if (request.state === "terminal_failed" || request.action === "none") {
           throw fail("cuna.journey.machine_create_failed", "Machine creation reached an authoritative failure.");
         }
-        await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
+        await sleep(pollDelayMilliseconds(attempt), signal);
       }
-      return "unreconcilable";
+      return Object.freeze({ kind: "unreconcilable" });
     },
     async ensureMachineReady({ machineId, observedState, signal }) {
       let state = observedState;
@@ -182,9 +200,15 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         if (state === "deleted" || state === "error" || state === "unknown") {
           throw fail("cuna.journey.machine_not_ready", "The machine did not reach running state.");
         }
-        await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
+        await sleep(pollDelayMilliseconds(attempt), signal);
       }
-      throw fail("cuna.journey.machine_ready_timeout", "Machine readiness remained unproven.", EXIT_CODES.network);
+      throw observationBudgetElapsed({
+        kind: "convergence",
+        operation: "machine readiness",
+        settleWith: "cuna machines list",
+        budgetMs: MACHINE_READY_OBSERVATION_BUDGET_MS,
+        details: { machine_id: machineId },
+      });
     },
     synchronizeWorkspace: input.synchronizeWorkspace,
     async observeAgentSessions({ machineId, signal }) {
@@ -273,9 +297,15 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         if (["exited", "failed", "terminated"].includes(session.processState)) {
           throw fail("cuna.journey.agent_session_failed", "The AgentSession reached a terminal state before attach.");
         }
-        await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
+        await sleep(pollDelayMilliseconds(attempt), signal);
       }
-      throw fail("cuna.journey.agent_session_ready_timeout", "AgentSession readiness remained unproven.", EXIT_CODES.network);
+      throw observationBudgetElapsed({
+        kind: "convergence",
+        operation: "AgentSession readiness",
+        settleWith: `cuna agent-sessions get ${agentSessionId}`,
+        budgetMs: AGENT_SESSION_READY_OBSERVATION_BUDGET_MS,
+        details: { agent_session_id: agentSessionId },
+      });
     },
     attach: input.attach,
     async reconcileCancellation({ ledger, signal }) {

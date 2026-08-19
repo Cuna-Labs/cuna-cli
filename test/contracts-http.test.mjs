@@ -1283,3 +1283,20 @@ test("a deployment without capability discovery is named as such before any muta
   );
   assert.equal(discoveries, 1);
 });
+
+test("a missing capability subject remains a resource 404, not a deployment defect", async () => {
+  const missing = new CunaError({
+    code: "cuna.remote.not_found",
+    message: "The requested machine does not exist.",
+    exitCode: 7,
+    details: { resource: "machine", resource_id: "missing-machine" },
+  });
+  const client = {
+    async discoverCapabilities() { throw missing; },
+  };
+
+  await assert.rejects(
+    requireCapability({ client, scope: "machine", resourceId: "missing-machine", capabilityId: "agent_sessions.create" }),
+    (error) => error === missing && error.code === "cuna.remote.not_found" && error.exitCode === 7,
+  );
+});

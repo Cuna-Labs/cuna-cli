@@ -28,6 +28,10 @@ export interface JourneyMachine {
   readonly state: MachineSelectionObservation["state"];
 }
 
+export type MachineCreateReconciliation =
+  | { readonly kind: "reconciled"; readonly machine: JourneyMachine }
+  | { readonly kind: "unreconcilable" };
+
 export interface JourneyWorkspaceReceipt {
   readonly bindingId: string;
   readonly workspaceIdentity: string;
@@ -98,9 +102,8 @@ export interface AgentJourneyEffects {
    */
   reconcileMachineCreate(input: {
     readonly requestId: string;
-    readonly cause: unknown;
     readonly signal: AbortSignal;
-  }): Promise<JourneyMachine | "unreconcilable">;
+  }): Promise<MachineCreateReconciliation>;
   ensureMachineReady(input: {
     readonly machineId: string;
     readonly observedState: JourneyMachine["state"];
@@ -240,6 +243,22 @@ function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
   });
 }
 
+/**
+ * The single authority for a failure raised while handling an earlier failure.
+ * The later failure remains the surfaced error; the earlier one is reachable
+ * through the standard Error `cause` chain.
+ */
+function withCause(failure: unknown, cause: unknown): Error {
+  const error = failure instanceof Error
+    ? failure
+    : new Error(`A recovery step threw a non-Error value: ${String(failure)}`);
+  Object.defineProperty(error, "cause", {
+    configurable: true,
+    value: cause,
+  });
+  return error;
+}
+
 function defaultAuthMode(intent: ReconciledAgentJourneyIntent): AgentAuthMode {
   if (intent.authMode !== undefined) return intent.authMode;
   return intent.agent === "openclaw" ? "credential_binding" : "interactive_login";
@@ -344,16 +363,17 @@ export async function orchestrateAgentJourney(input: {
         ledger.createdMachineId = machine.id;
       } catch (createError) {
         if (signal.aborted) throw createError;
-        const reconciled = await boundary({
-          phase: "reconcile-machine-create", signal, effects: input.effects, ledger,
-          action: () => input.effects.reconcileMachineCreate({
-            requestId,
-            cause: createError,
-            signal,
-          }),
-        });
-        if (reconciled === "unreconcilable") throw unreconcilableCreate(createError);
-        machine = reconciled;
+        let reconciliation: MachineCreateReconciliation;
+        try {
+          reconciliation = await boundary({
+            phase: "reconcile-machine-create", signal, effects: input.effects, ledger,
+            action: () => input.effects.reconcileMachineCreate({ requestId, signal }),
+          });
+        } catch (reconcileError) {
+          throw withCause(reconcileError, createError);
+        }
+        if (reconciliation.kind === "unreconcilable") throw unreconcilableCreate(createError);
+        machine = reconciliation.machine;
         ledger.createdMachineId = machine.id;
       }
     } else {

@@ -125,3 +125,54 @@ test("recovered AgentSession with substituted authority is rejected before attac
       error.code === "cuna.journey.agent_session_create_authority_mismatch",
   );
 });
+
+test("machine readiness exhaustion is a retryable observation-budget outcome", async () => {
+  let reads = 0;
+  const client = {
+    async getMachine(id) {
+      reads += 1;
+      return { id, name: "dev", state: "creating" };
+    },
+  };
+
+  await assert.rejects(
+    effects(client).ensureMachineReady({
+      machineId: MACHINE_ID,
+      observedState: "creating",
+      signal: new AbortController().signal,
+    }),
+    (error) =>
+      error instanceof CunaError &&
+      error.code === "cuna.client.convergence_budget_elapsed" &&
+      error.retryable === true &&
+      error.details.budget_ms === 91_100 &&
+      error.details.settle_with === "cuna machines list" &&
+      error.details.remote_outcome === "unobserved",
+  );
+  assert.equal(reads, 60);
+});
+
+test("AgentSession readiness exhaustion is a retryable observation-budget outcome", async () => {
+  let reads = 0;
+  const client = {
+    async getAgentSession() {
+      reads += 1;
+      return recoveredSession({ processState: "unknown" });
+    },
+  };
+
+  await assert.rejects(
+    effects(client).ensureAgentSessionReady({
+      agentSessionId: SESSION_ID,
+      signal: new AbortController().signal,
+    }),
+    (error) =>
+      error instanceof CunaError &&
+      error.code === "cuna.client.convergence_budget_elapsed" &&
+      error.retryable === true &&
+      error.details.budget_ms === 139_100 &&
+      error.details.settle_with === `cuna agent-sessions get ${SESSION_ID}` &&
+      error.details.remote_outcome === "unobserved",
+  );
+  assert.equal(reads, 90);
+});
