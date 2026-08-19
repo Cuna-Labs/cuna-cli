@@ -1,6 +1,7 @@
 import type { AgentSession, Machine } from "../api/contracts.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
+import { isObservationBudgetCode } from "../core/observation-budget.js";
 import type { MachineSelectionState } from "./selection.js";
 import type {
   AgentJourneyEffects,
@@ -219,9 +220,12 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           signal,
         );
       } catch (error) {
+        // "Uncertain" means no authoritative answer reached us. Read the
+        // authority rather than a literal so a third budget kind cannot leave
+        // this recovery path behind.
         const uncertain =
           error instanceof CunaError &&
-          (error.code === "cuna.network.timeout" || error.code === "cuna.network.failed");
+          (isObservationBudgetCode(error.code) || error.code === "cuna.network.failed");
         if (!uncertain || signal.aborted) throw error;
         try {
           session = await input.client.inspectAgentSessionCreate(idempotencyKey, signal);

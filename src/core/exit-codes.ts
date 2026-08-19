@@ -80,8 +80,8 @@ const EXIT_CODE_PROSE = Object.freeze({
     reachablePath: "`cuna machines delete ID` without `--yes` mints `cuna.confirmation.required`. A server refusal arrives as `cuna.policy.denied` from HTTP 403.",
   }),
   network: Object.freeze({
-    meaning: "No authoritative answer arrived: timeout, cancellation, 429, or 5xx.",
-    reachablePath: "a request exceeding `--timeout-ms` mints `cuna.network.timeout`. HTTP 429 and 5xx arrive as `cuna.network.rate_limited` and `cuna.network.service_unavailable`.",
+    meaning: "No authoritative answer arrived, including when the CLI stopped waiting for one.",
+    reachablePath: "a request exceeding its observation budget mints `cuna.client.response_budget_elapsed`, and a bounded read-back that has not converged mints `cuna.client.convergence_budget_elapsed`; both are retryable and name the read to run. HTTP 429 and 5xx arrive as `cuna.network.rate_limited` and `cuna.network.service_unavailable`.",
   }),
   conflict: Object.freeze({
     meaning: "Current state contradicts the change; repeating it unchanged repeats this.",

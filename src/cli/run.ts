@@ -13,9 +13,10 @@ import { assertOpenCodeExecutionEnabled } from "../config/opencode-feature-gate.
 import {
   executeCommand,
   preflightInvocation,
-  type AgentSessionTerminationPoller,
+  type ConvergencePoller,
 } from "../commands/commands.js";
 import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
+import { DEFAULT_REQUEST_BUDGET_MS } from "../core/observation-budget.js";
 import {
   CONSOLE_ORIGIN,
   INTERNAL_DEFECT_HINT,
@@ -59,10 +60,10 @@ export interface RunCliDependencies {
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
   /**
-   * Test seam for the bounded read-only confirmation after an AgentSession
-   * termination request. Production always uses a wall-clock deadline.
+   * Test seam for every bounded read-back that waits for an accepted mutation to
+   * become visible. Production always uses a wall-clock deadline.
    */
-  readonly agentSessionTerminationPoller?: AgentSessionTerminationPoller;
+  readonly convergencePoller?: ConvergencePoller;
   readonly clientFactory?: (config: EffectiveConfig, timeoutMs: number) => CunaApiClient;
   readonly humanAuth?: HumanAuthService;
   readonly credentialVault?: CredentialVault;
@@ -326,8 +327,19 @@ function defaultStreams(): CliStreams {
   });
 }
 
-function parseTimeout(raw: string | undefined): number {
-  if (raw === undefined) return 15_000;
+/**
+ * The caller's explicit per-request budget, or `undefined` when they gave none.
+ *
+ * This used to return the literal `15_000` for an absent flag, which erased the
+ * difference between "the user chose 15 seconds" and "the user chose nothing" —
+ * and with it any possibility of an operation declaring a budget of its own.
+ * `machines create` waits ~50 s on the producer and was cut off at 15 s by a
+ * default nobody had asked for, then told the user the network had timed out.
+ * The default now lives in `core/observation-budget.ts` and is applied by the
+ * transport, after a per-operation budget has had its chance.
+ */
+function parseTimeout(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
   return integerArgument(raw, "timeout-ms", 100, 120_000);
 }
 
@@ -604,12 +616,15 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }
     }
 
-    let timeoutMs: number;
+    let timeoutMs: number | undefined;
     try {
       timeoutMs = parseTimeout(stringOption(parsed, "timeout-ms"));
     } catch {
       throw usageError("Option --timeout-ms must be an integer from 100 through 120000.");
     }
+    // Seams and probes that never carry a per-operation budget still need one
+    // number, and it is the same number, read from the same constant.
+    const effectiveTimeoutMs = timeoutMs ?? DEFAULT_REQUEST_BUDGET_MS;
     const profile = stringOption(parsed, "profile");
     const baseUrl = stringOption(parsed, "base-url");
     const configFile = stringOption(parsed, "config-file");
@@ -660,7 +675,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       if (humanAuth !== undefined) return humanAuth;
       const transportOptions = {
         baseUrl: config.baseUrl,
-        timeoutMs,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
         ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
       };
       const humanClient = createHumanAuthClient({
@@ -768,10 +783,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       baseUrl: config.baseUrl,
       ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
       ...(bearerToken === undefined ? {} : { bearerToken }),
-      timeoutMs,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     }) : undefined;
-    const client = dependencies.clientFactory?.(config, timeoutMs) ?? createCunaApiClient(httpTransport!);
+    const client = dependencies.clientFactory?.(config, effectiveTimeoutMs) ?? createCunaApiClient(httpTransport!);
     if (journeyIntent?.target === "reconcile") {
       if (credentialMode === undefined) {
         throw new CunaError({
@@ -905,7 +920,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       const browserLoginRemote = booleanOption(parsed, "check-browser-login")
         ? await probeBrowserLoginRemote({
           config,
-          timeoutMs,
+          timeoutMs: effectiveTimeoutMs,
           ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
         })
@@ -927,9 +942,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       config,
       client,
       now: dependencies.now?.() ?? Date.now(),
-      ...(dependencies.agentSessionTerminationPoller === undefined
+      ...(dependencies.convergencePoller === undefined
         ? {}
-        : { agentSessionTerminationPoller: dependencies.agentSessionTerminationPoller }),
+        : { convergencePoller: dependencies.convergencePoller }),
       ...(credentialMode === undefined ? {} : { credentialMode }),
       ...(runtimeFeatures === undefined ? {} : { runtimeFeatures }),
     });
