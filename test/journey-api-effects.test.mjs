@@ -65,7 +65,7 @@ test("uncertain AgentSession create recovers by the exact original idempotency k
     async createAgentSession() {
       calls.push("create");
       throw new CunaError({
-        code: "cuna.network.timeout",
+        code: "cuna.client.response_budget_elapsed",
         message: "unknown dispatch",
         exitCode: EXIT_CODES.network,
       });
