@@ -3,13 +3,13 @@ import type {
   TerminalCapabilityName,
   TerminalConnectionGrant,
 } from "../api/contracts.js";
+import { instantOrNull } from "../core/instant.js";
 import { isTerminalConnectToken } from "../core/namespace.js";
 import { TERMINAL_PROTOCOL, type TerminalReadyPayload } from "../terminal/codec.js";
 
 import type { CapabilityAdmission } from "./capability-gate.js";
 import { runtimeFailure } from "./errors.js";
 
-const CANONICAL_TIMESTAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/u;
 const MAX_REMOTE_EVIDENCE_TTL_MS = 60_000;
 const MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS = 5_000;
 
@@ -91,8 +91,15 @@ export function assertRemoteAgentSessionEvidence(input: {
 }): RemoteAgentSessionEvidence {
   const evidence = input.evidence;
   const now = input.now ?? Date.now();
-  const observedAt = Date.parse(evidence.observedAt);
-  const expiresAt = Date.parse(evidence.expiresAt);
+  // The service renders these; the CLI only reads them. `runtime_observed_at`
+  // and `runtime_expires_at` are forwarded out of Postgres verbatim
+  // (`infra edge/src/agent-sessions.ts:235-240`), so they arrive as
+  // `2026-08-18T20:49:24.458909+00:00` — six fractional digits and an explicit
+  // zero offset. The check here used to be `/\.[0-9]{3}Z$/` plus a
+  // `toISOString()` round-trip, which no production value has ever satisfied,
+  // and it sits directly in front of the terminal attach.
+  const observedAt = instantOrNull(evidence.observedAt);
+  const expiresAt = instantOrNull(evidence.expiresAt);
   if (
     evidence.authority !== "cuna_agent_session_supervisor" ||
     evidence.agentSessionId !== input.expectedAgentSessionId ||
@@ -100,12 +107,8 @@ export function assertRemoteAgentSessionEvidence(input: {
     evidence.machineId.length === 0 ||
     evidence.processEpoch.length === 0 ||
     evidence.evidenceRevision.length === 0 ||
-    !CANONICAL_TIMESTAMP.test(evidence.observedAt) ||
-    !CANONICAL_TIMESTAMP.test(evidence.expiresAt) ||
-    !Number.isFinite(observedAt) ||
-    !Number.isFinite(expiresAt) ||
-    new Date(observedAt).toISOString() !== evidence.observedAt ||
-    new Date(expiresAt).toISOString() !== evidence.expiresAt ||
+    observedAt === null ||
+    expiresAt === null ||
     observedAt > now + MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS ||
     expiresAt < observedAt ||
     expiresAt - observedAt > MAX_REMOTE_EVIDENCE_TTL_MS ||
