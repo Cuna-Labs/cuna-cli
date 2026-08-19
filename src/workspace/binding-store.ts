@@ -14,6 +14,7 @@ import { createConnection, createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
+import { instantOrNull, sameInstant } from "../core/instant.js";
 import { assertPublicId } from "../core/validation.js";
 import {
   assertCanonicalWorkspaceRootUnchanged,
@@ -401,8 +402,11 @@ function assertExpectedAuthority(
     record.remoteRoot !== expected.remoteRoot ||
     record.policyDigest !== expected.policyDigest ||
     record.generation !== expected.generation ||
-    record.bindingCreatedAt !== expected.bindingCreatedAt ||
-    record.bindingUpdatedAt !== expected.bindingUpdatedAt ||
+    // Instants, not bytes: the left side was copied out of a service response
+    // and written to disk, the right side is a fresh service response. They are
+    // the same moment rendered twice, and nothing guarantees one renderer.
+    !sameInstant(record.bindingCreatedAt, expected.bindingCreatedAt) ||
+    !sameInstant(record.bindingUpdatedAt, expected.bindingUpdatedAt) ||
     (expected.bindingId !== undefined && record.bindingId !== expected.bindingId)
   ) {
     throw ownerMismatch();
@@ -440,7 +444,7 @@ function assertStableBindingIdentity(
     current.localInstanceId !== next.localInstanceId ||
     current.machineId !== next.machineId ||
     current.remoteRoot !== next.remoteRoot ||
-    current.bindingCreatedAt !== next.bindingCreatedAt ||
+    !sameInstant(current.bindingCreatedAt, next.bindingCreatedAt) ||
     Date.parse(next.bindingUpdatedAt) < Date.parse(current.bindingUpdatedAt) ||
     next.generation < current.generation
   ) {
@@ -842,9 +846,31 @@ function exactInteger(value: unknown, minimum: number, maximum: number): number 
   return result;
 }
 
+/**
+ * An instant in any encoding a conforming service may emit.
+ *
+ * This used to require `new Date(text).toISOString() === text`, which is not a
+ * validity check — it is an equality against ONE encoding, the one JavaScript
+ * happens to render. `bindingCreatedAt` and `bindingUpdatedAt` are the
+ * service's, forwarded out of Postgres verbatim, so they arrive with up to six
+ * fractional digits and an explicit `+00:00`. Measured against production
+ * 2026-08-18:
+ *
+ *   bindingCreatedAt  2026-08-18T19:55:47.437071+00:00   six digits
+ *   bindingUpdatedAt  2026-08-18T20:01:57.89766+00:00    five, trailing zero trimmed
+ *
+ * The check could therefore never pass on a server-minted value, and
+ * `cuna claude` failed for every user, every time, with
+ * `binding_corrupt / draft_invalid` — a message that accuses the LOCAL record
+ * of corruption when the local record was a faithful copy of what the service
+ * sent.
+ *
+ * Still rejected: anything unparseable, and anything with no explicit offset,
+ * which `Date.parse` would silently read in the host's local zone.
+ */
 function timestamp(value: unknown): string {
   const text = nonempty(value);
-  if (!Number.isFinite(Date.parse(text)) || new Date(text).toISOString() !== text) throw new TypeError("timestamp");
+  if (instantOrNull(text) === null) throw new TypeError("timestamp");
   return text;
 }
 
