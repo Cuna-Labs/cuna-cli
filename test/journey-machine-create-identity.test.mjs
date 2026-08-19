@@ -148,7 +148,7 @@ function producer() {
         admitted.set(requestId, id);
       }
       // The response never reaches this client. The effect is committed anyway.
-      throw lost("cuna.network.timeout");
+      throw lost("cuna.client.response_budget_elapsed");
     },
     async getMachineCreateRequest(id) {
       calls.push(["get-machine-create", id]);

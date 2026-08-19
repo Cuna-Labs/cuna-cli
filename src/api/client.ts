@@ -1,4 +1,5 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { MACHINE_CREATE_REQUEST_BUDGET_MS } from "../core/observation-budget.js";
 import { OFF_CONTRACT_RESPONSE_HINT } from "../core/product-web.js";
 import {
   ContractViolation,
@@ -444,6 +445,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         method: "POST",
         path: "/v1/api-keys",
         idempotencyKey,
+        settleWith: "cuna api-keys list",
         body: {
           name: input.name,
           ...(input.expiresAt === undefined ? {} : { expires_at: input.expiresAt }),
@@ -453,7 +455,10 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
     },
     async revokeApiKey(id) {
       const safeId = encodeCanonicalUuid(id, "API key ID");
-      return fetchDecoded({ method: "DELETE", path: `/v1/api-keys/${safeId}` }, decodeOk);
+      return fetchDecoded(
+        { method: "DELETE", path: `/v1/api-keys/${safeId}`, settleWith: "cuna api-keys list" },
+        decodeOk,
+      );
     },
     async createMachine(input, idempotencyKey, requestId, signal) {
       validateMachineCreate(input, idempotencyKey);
@@ -471,6 +476,11 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
           path: "/v1/sessions",
           body,
           idempotencyKey,
+          // The producer provisions a real machine inside this request, so the
+          // budget that suits a list is not the budget that suits this. D1: the
+          // value is a named constant, not a literal repeated here.
+          budgetMs: MACHINE_CREATE_REQUEST_BUDGET_MS,
+          settleWith: "cuna machines list",
           ...(requestId === undefined ? {} : { machineCreateRequestId: requestId }),
           ...(signal === undefined ? {} : { signal }),
         },
@@ -508,6 +518,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const request: HttpRequest = {
         method: "POST",
         path: `/v1/sessions/${safeId}/${action}`,
+        settleWith: "cuna machines list",
         ...(signal === undefined ? {} : { signal }),
       };
       const machine = await fetchDecoded(request, decodeMachineItem);
@@ -518,7 +529,11 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
     },
     async deleteMachine(id) {
       const safeId = encodeMachineId(id);
-      return transport.request({ method: "DELETE", path: `/v1/sessions/${safeId}` });
+      return transport.request({
+        method: "DELETE",
+        path: `/v1/sessions/${safeId}`,
+        settleWith: "cuna machines list",
+      });
     },
     async createWorkspaceBinding(input, idempotencyKey, signal) {
       validateWorkspaceBindingIdentity(input);
@@ -606,6 +621,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const request: HttpRequest = {
         method: "POST",
         path: `/v1/sessions/${safeId}/agent-sessions`,
+        settleWith: `cuna agent-sessions list --machine ${machineId}`,
         body: {
           ...(input.name === undefined ? {} : { name: input.name }),
           agent: input.agent,
@@ -707,6 +723,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const request: HttpRequest = {
         method: "PATCH",
         path: `/v1/agent-sessions/${safeId}`,
+        settleWith: `cuna agent-sessions show ${id}`,
         body: { name },
       };
       return assertAgentSessionBinding(
@@ -720,6 +737,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const request: HttpRequest = {
         method: "POST",
         path: `/v1/agent-sessions/${safeId}/terminate`,
+        settleWith: `cuna agent-sessions show ${id}`,
       };
       return assertAgentSessionBinding(
         await fetchDecoded(request, decodeAgentSessionItem),

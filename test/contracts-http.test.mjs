@@ -947,7 +947,23 @@ test("pre-aborted HTTP requests perform no fetch effect", async () => {
   assert.equal(calls, 0);
 });
 
-test("HTTP timeout retryability fails closed for requests with ambiguous side effects", async () => {
+/**
+ * REPLACES "HTTP timeout retryability fails closed for requests with ambiguous
+ * side effects", which asserted `cuna.network.timeout` with `retryable: false`
+ * for POST and DELETE.
+ *
+ * That test was green on the defect. Measured 2026-08-19 against Fly release
+ * v93: `cuna machines create --yes` printed exactly that record while the
+ * machine reached `running` five seconds later. The assertion was not wrong
+ * about what the code did; it was wrong about what the code should do, because
+ * the detector that fired was this process's own `setTimeout` and the code it
+ * minted named the network.
+ *
+ * Fail-closed retryability has not been abandoned — it has been moved to the
+ * detector it actually belongs to, `cuna.network.failed`, which is asserted in
+ * `test/observation-budget.test.mjs`.
+ */
+test("an elapsed request budget is reported as the CLI's budget, for every method", async () => {
   const fetch = async (_url, init) => new Promise((_resolve, reject) => {
     init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
   });
@@ -960,17 +976,15 @@ test("HTTP timeout retryability fails closed for requests with ambiguous side ef
   for (const request of [
     { method: "POST", path: "/v1/sessions", body: { name: "dev" }, idempotencyKey: "operation-1" },
     { method: "DELETE", path: "/v1/sessions/m_1" },
+    { method: "GET", path: "/v1/sessions" },
   ]) {
     await assert.rejects(
       transport.request(request),
-      (error) => error instanceof CunaError && error.code === "cuna.network.timeout" && error.retryable === false,
+      (error) => error instanceof CunaError &&
+        error.code === "cuna.client.response_budget_elapsed" &&
+        error.retryable === true,
     );
   }
-
-  await assert.rejects(
-    transport.request({ method: "GET", path: "/v1/sessions" }),
-    (error) => error instanceof CunaError && error.code === "cuna.network.timeout" && error.retryable === true,
-  );
 });
 
 test("HTTP errors expose only stable safe metadata", async () => {
