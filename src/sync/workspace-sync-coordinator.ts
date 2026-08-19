@@ -5,6 +5,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { isObservationBudgetCode } from "../core/observation-budget.js";
 import { assertCanonicalUuid } from "../core/validation.js";
 import { assertLexicallyInsideRoot } from "../workspace/paths.js";
 import type { WorkspaceManifest } from "../workspace/manifest.js";
@@ -657,7 +658,7 @@ function boundedInteger(value: unknown, minimum: number, maximum: number, reason
 }
 
 function isAmbiguousOrRetryable(error: unknown): boolean {
-  return error instanceof CunaError && (error.retryable || error.code === "cuna.network.failed" || error.code === "cuna.network.timeout" || error.code === "cuna.network.service_unavailable");
+  return error instanceof CunaError && (error.retryable || isObservationBudgetCode(error.code) || error.code === "cuna.network.failed" || error.code === "cuna.network.service_unavailable");
 }
 
 function isAuthoritativeConflict(error: unknown): boolean {

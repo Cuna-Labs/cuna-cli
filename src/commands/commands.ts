@@ -20,6 +20,11 @@ import {
   resolveOpenCodeFeatureGate,
 } from "../config/opencode-feature-gate.js";
 import { EXIT_CODES, CunaError, unsupportedError, usageError, type SafeErrorDetails } from "../core/errors.js";
+import {
+  REMOTE_CONVERGENCE_BUDGET_MS,
+  REMOTE_CONVERGENCE_POLL_INTERVAL_MS,
+  observationBudgetElapsed,
+} from "../core/observation-budget.js";
 import { OFF_CONTRACT_RESPONSE_HINT, SUPPORT_URL, automationCredentialHint } from "../core/product-web.js";
 import {
   assertCanonicalUuid,
@@ -47,12 +52,18 @@ export interface CommandResult {
 }
 
 /**
- * The API accepts a durable termination intent before a fenced supervisor can
- * observe that the exact process is gone.  The CLI keeps its stronger command
- * contract, but must give that independent producer a bounded opportunity to
- * publish the terminal observation.
+ * The clock a bounded read-back runs on.
+ *
+ * WHY IT IS ONE SEAM AND NOT SEVERAL. The API accepts a durable intent before an
+ * independent producer can publish the matching observation — that is true of an
+ * AgentSession termination, and it is equally true of a machine deletion and of
+ * every machine lifecycle transition. This used to be
+ * `AgentSessionTerminationPoller`, wired into exactly one command, while the
+ * three others read back ONCE, immediately, and called the answer a failed
+ * postcondition. Measured 2026-08-19: a deleted machine was still `present` on
+ * that immediate read and gone from `cuna machines list` six seconds later.
  */
-export interface AgentSessionTerminationPoller {
+export interface ConvergencePoller {
   readonly now: () => number;
   readonly sleep: (milliseconds: number) => Promise<void>;
 }
@@ -63,41 +74,72 @@ export interface CommandContext {
   readonly client: CunaApiClient;
   readonly now: number;
   /** Test seam; production uses the real wall-clock wait below. */
-  readonly agentSessionTerminationPoller?: AgentSessionTerminationPoller;
+  readonly convergencePoller?: ConvergencePoller;
   readonly credentialMode?: "automation" | "interactive";
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
 }
 
-const AGENT_SESSION_TERMINATION_CONFIRMATION_TIMEOUT_MS = 15_000;
-const AGENT_SESSION_TERMINATION_POLL_INTERVAL_MS = 250;
-
-function productionAgentSessionTerminationPoller(): AgentSessionTerminationPoller {
+function productionConvergencePoller(): ConvergencePoller {
   return Object.freeze({
     now: () => Date.now(),
     sleep: (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
   });
 }
 
+interface ConvergenceProbe<T> {
+  /** True once the observation satisfies the postcondition. */
+  readonly settled: boolean;
+  readonly observation: T;
+  /** What to report if the budget elapses first. Never a secret. */
+  readonly details: SafeErrorDetails;
+}
+
+/**
+ * Read back until an accepted mutation is visible, or until OUR budget elapses.
+ *
+ * D2, and the whole difference between the two answers this fixes. A single
+ * immediate read cannot distinguish "the change did not happen" from "the change
+ * has not arrived yet", and the CLI was reporting the first for the second with
+ * `retryable: false` — telling the user not to retry AND implying the mutation
+ * had not landed, both false, for a deletion that had already succeeded.
+ *
+ * On elapse this raises the budget refusal from `core/observation-budget.ts`,
+ * which is retryable and names the read-only command that settles it. It is NOT
+ * `postcondition_unverified`: that code is reserved for an observation that
+ * CONTRADICTS the write and that no amount of waiting repairs.
+ */
+async function convergeOnRemoteState<T>(
+  context: CommandContext,
+  input: {
+    readonly operation: string;
+    readonly settleWith: string;
+    readonly probe: () => Promise<ConvergenceProbe<T>>;
+  },
+): Promise<T> {
+  const poller = context.convergencePoller ?? productionConvergencePoller();
+  const deadline = poller.now() + REMOTE_CONVERGENCE_BUDGET_MS;
+  let probe = await input.probe();
+  while (!probe.settled) {
+    const remaining = deadline - poller.now();
+    if (remaining <= 0) {
+      throw observationBudgetElapsed({
+        kind: "convergence",
+        operation: input.operation,
+        settleWith: input.settleWith,
+        budgetMs: REMOTE_CONVERGENCE_BUDGET_MS,
+        details: probe.details,
+      });
+    }
+    await poller.sleep(Math.min(REMOTE_CONVERGENCE_POLL_INTERVAL_MS, remaining));
+    probe = await input.probe();
+  }
+  return probe.observation;
+}
+
 function agentSessionTerminationConfirmed(session: AgentSession): boolean {
   return session.desiredState === "terminated" &&
     session.requestState === "terminal" &&
     session.processState === "terminated";
-}
-
-async function waitForAgentSessionTermination(
-  context: CommandContext,
-  id: string,
-): Promise<AgentSession> {
-  const poller = context.agentSessionTerminationPoller ?? productionAgentSessionTerminationPoller();
-  const deadline = poller.now() + AGENT_SESSION_TERMINATION_CONFIRMATION_TIMEOUT_MS;
-  let observed = await context.client.getAgentSession(id);
-  while (!agentSessionTerminationConfirmed(observed)) {
-    const remaining = deadline - poller.now();
-    if (remaining <= 0) return observed;
-    await poller.sleep(Math.min(AGENT_SESSION_TERMINATION_POLL_INTERVAL_MS, remaining));
-    observed = await context.client.getAgentSession(id);
-  }
-  return observed;
 }
 
 function requireCredential(context: CommandContext): void {
@@ -180,6 +222,17 @@ function requireConfirmation(parsed: ParsedInvocation, command: string): void {
   });
 }
 
+/**
+ * The read-back CONTRADICTED the write, and waiting will not repair it.
+ *
+ * Narrowed 2026-08-19. This used to be raised for two unrelated observations:
+ * a genuine contradiction (a rename that observed a different name, a create
+ * that observed a different id — an identity the producer can never converge
+ * to), and a state that had simply not arrived yet. Only the first belongs
+ * here. The second goes through `convergeOnRemoteState` and, if the CLI's own
+ * budget runs out first, reports that as the CLI's budget rather than as the
+ * server's failure.
+ */
 function postconditionUnverified(operation: string, details: SafeErrorDetails): never {
   throw new CunaError({
     code: "cuna.remote.postcondition_unverified",
@@ -1153,15 +1206,31 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     // that the producer never advertises.
     await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.lifecycle", now });
     const machine = await client.transitionMachine(id, action);
-    const observed = await client.getMachine(id);
-    const expectedState = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
-    if (machine.id !== id || observed.id !== id || observed.state !== expectedState) {
-      postconditionUnverified(`machine ${action}`, {
-        machine_id: id,
-        expected_state: expectedState,
-        observed_state: observed.state,
-      });
+    if (machine.id !== id) {
+      // An identity contradiction: the producer answered about a different
+      // machine. No amount of waiting converges that.
+      postconditionUnverified(`machine ${action}`, { machine_id: id, observed_id: machine.id });
     }
+    const expectedState = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
+    // A lifecycle transition is asynchronous on the producer, so the state the
+    // very next read returns is usually the state BEFORE the transition. Read
+    // back until it converges or until the CLI's own budget elapses.
+    const observed = await convergeOnRemoteState(context, {
+      operation: `machine ${action}`,
+      settleWith: "cuna machines list",
+      probe: async () => {
+        const machineNow = await client.getMachine(id);
+        return Object.freeze({
+          settled: machineNow.id === id && machineNow.state === expectedState,
+          observation: machineNow,
+          details: Object.freeze({
+            machine_id: id,
+            expected_state: expectedState,
+            observed_state: machineNow.state,
+          }),
+        });
+      },
+    });
     return Object.freeze({
       command: `machines.${action}`,
       data: machineRecord(observed),
@@ -1175,12 +1244,34 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
     await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.delete", now });
     await client.deleteMachine(id);
-    try {
-      await client.getMachine(id);
-      postconditionUnverified("machine deletion", { machine_id: id, observed_state: "present" });
-    } catch (error) {
-      if (!(error instanceof CunaError) || error.code !== "cuna.remote.not_found") throw error;
-    }
+    // MEASURED 2026-08-19: the immediate read that used to stand here saw
+    // `present` and the command reported `cuna.remote.postcondition_unverified`,
+    // `retryable: false`, for a machine that `cuna machines list` showed gone six
+    // seconds later. The producer accepts a durable delete before the resource
+    // disappears from reads; the CLI has to let it.
+    await convergeOnRemoteState(context, {
+      operation: "machine deletion",
+      settleWith: "cuna machines list",
+      probe: async () => {
+        try {
+          const observed = await client.getMachine(id);
+          return Object.freeze({
+            settled: observed.state === "deleted",
+            observation: undefined,
+            details: Object.freeze({ machine_id: id, observed_state: observed.state }),
+          });
+        } catch (error) {
+          if (error instanceof CunaError && error.code === "cuna.remote.not_found") {
+            return Object.freeze({
+              settled: true,
+              observation: undefined,
+              details: Object.freeze({ machine_id: id, observed_state: "absent" }),
+            });
+          }
+          throw error;
+        }
+      },
+    });
     return Object.freeze({ command: "machines.delete", data: { id, acknowledged: true }, human: `Delete acknowledged for ${id}.` });
   }
   throw usageError(`Unknown machines action ${action}.`);
@@ -1292,15 +1383,23 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.terminate", now });
     await client.terminateAgentSession(id);
-    const observed = await waitForAgentSessionTermination(context, id);
-    if (observed.id !== id || !agentSessionTerminationConfirmed(observed)) {
-      postconditionUnverified("AgentSession termination", {
-        agent_session_id: id,
-        observed_desired_state: observed.desiredState,
-        observed_request_state: observed.requestState,
-        observed_process_state: observed.processState,
-      });
-    }
+    const observed = await convergeOnRemoteState(context, {
+      operation: "AgentSession termination",
+      settleWith: `cuna agent-sessions show ${id}`,
+      probe: async () => {
+        const session = await client.getAgentSession(id);
+        return Object.freeze({
+          settled: session.id === id && agentSessionTerminationConfirmed(session),
+          observation: session,
+          details: Object.freeze({
+            agent_session_id: id,
+            observed_desired_state: session.desiredState,
+            observed_request_state: session.requestState,
+            observed_process_state: session.processState,
+          }),
+        });
+      },
+    });
     return Object.freeze({ command: "agent-sessions.terminate", data: agentSessionRecord(observed), human: `AgentSession ${observed.id} is ${observed.requestState}/${observed.processState}.` });
   }
   if (action === "rename") {

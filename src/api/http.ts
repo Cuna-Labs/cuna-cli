@@ -11,6 +11,10 @@ import {
   isTransportCredential,
 } from "../core/namespace.js";
 import { isObject, safeReasonCode } from "../core/validation.js";
+import {
+  DEFAULT_REQUEST_BUDGET_MS,
+  observationBudgetElapsed,
+} from "../core/observation-budget.js";
 import { CLI_VERSION } from "../version.js";
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -48,6 +52,24 @@ export interface HttpRequest {
   readonly idempotencyKey?: string;
   readonly machineCreateRequestId?: string;
   readonly signal?: AbortSignal;
+  /**
+   * How long THIS operation is worth observing, when the caller has not named a
+   * budget with `--timeout-ms`.
+   *
+   * A create that waits on a provider and a list that reads one table do not
+   * share a duration, and pretending they do is what made `machines create`
+   * report a network timeout for a machine that came up. Declared per operation
+   * in `api/client.ts`, from a named constant in `core/observation-budget.ts`;
+   * an explicit `--timeout-ms` still wins, because a budget the user typed is
+   * the user's decision and not ours.
+   */
+  readonly budgetMs?: number;
+  /**
+   * The read-only command that settles this operation's outcome, named in the
+   * refusal when the budget elapses. Without it the CLI can only tell the user
+   * that something is unknown, which is a dead end.
+   */
+  readonly settleWith?: string;
 }
 
 export interface HttpTransport {
@@ -337,10 +359,15 @@ function parseJson(bytes: Uint8Array, request: Pick<HttpRequest, "method" | "pat
 }
 
 function isRetryableAfterUnknownDispatch(request: HttpRequest): boolean {
-  // A transport timeout or failure cannot prove whether a mutating request
-  // reached the authority. An idempotency key alone is not reconciliation
-  // evidence, so mutations remain fail-closed until a producer contract
-  // explicitly exposes authoritative operation-status reconciliation.
+  // A transport FAILURE — connection refused, TLS error, DNS — cannot prove
+  // whether a mutating request reached the authority. An idempotency key alone
+  // is not reconciliation evidence, so mutations stay fail-closed until a
+  // producer contract exposes authoritative operation-status reconciliation.
+  //
+  // This no longer governs the timeout arm, and that separation is the fix.
+  // A budget elapsing is not a transport failure: nothing failed, the CLI
+  // stopped waiting. `core/observation-budget.ts` owns that answer and makes it
+  // retryable at a single site.
   return request.method === "GET";
 }
 
@@ -348,6 +375,14 @@ export function createHttpTransport(input: {
   readonly baseUrl: string;
   readonly apiKey?: string;
   readonly bearerToken?: string;
+  /**
+   * The caller's EXPLICIT budget for every request, from `--timeout-ms`.
+   *
+   * Absent means "the caller did not decide", not "the caller chose 15 000".
+   * The difference is the whole of D1: while this was eagerly defaulted in
+   * `cli/run.ts`, a per-operation budget could never take effect, because the
+   * default was indistinguishable from a typed flag by the time it arrived here.
+   */
   readonly timeoutMs?: number;
   readonly fetch?: typeof globalThis.fetch;
 }): HttpTransport {
@@ -364,7 +399,11 @@ export function createHttpTransport(input: {
     throw new TypeError("HTTP transport credential is invalid.");
   }
   const fetcher = input.fetch ?? globalThis.fetch;
-  const timeoutMs = input.timeoutMs ?? 15_000;
+  // Precedence, in one expression so it cannot be spelled differently twice:
+  // what the user typed, then what the operation declares it is worth, then the
+  // one default.
+  const budgetFor = (request: HttpRequest): number =>
+    input.timeoutMs ?? request.budgetMs ?? DEFAULT_REQUEST_BUDGET_MS;
   return Object.freeze({
     async request(request: HttpRequest): Promise<unknown> {
       if (request.signal?.aborted === true) {
@@ -409,7 +448,8 @@ export function createHttpTransport(input: {
         if (value !== undefined) target.searchParams.set(key, value);
       }
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), timeoutMs);
+      const budgetMs = budgetFor(request);
+      const timeout = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), budgetMs);
       const onAbort = () => controller.abort(request.signal?.reason);
       request.signal?.addEventListener("abort", onAbort, { once: true });
       let body: BodyInit | undefined;
@@ -504,15 +544,36 @@ export function createHttpTransport(input: {
       } catch (error) {
         if (error instanceof CunaError) throw error;
         if (controller.signal.aborted) {
-          const cancelledByCaller = request.signal?.aborted ?? false;
-          throw new CunaError({
-            code: cancelledByCaller ? "cuna.network.cancelled" : "cuna.network.timeout",
-            message: cancelledByCaller ? "The Cuna request was cancelled." : "The Cuna request timed out.",
-            exitCode: EXIT_CODES.network,
-            hint: cancelledByCaller
-              ? "No authoritative answer was received, so a mutating request may still have been applied."
-              : "Raise --timeout-ms, or check connectivity to the API origin. A mutating request may still have been applied.",
-            retryable: !cancelledByCaller && isRetryableAfterUnknownDispatch(request),
+          // TWO DIFFERENT DETECTORS ARRIVE AT THIS ONE BRANCH, and collapsing
+          // them is the defect. The caller pressing Ctrl-C is a decision by a
+          // person; this process's own `setTimeout` firing is a decision by
+          // this process's configuration. Only the first is `cancelled`.
+          //
+          // Read through a binding rather than compared inline: the pre-dispatch
+          // guard above narrowed `request.signal?.aborted` to `false | undefined`
+          // for the rest of the function, and the whole point here is that it may
+          // have become `true` in the meantime.
+          const cancelledByCaller: boolean = request.signal?.aborted ?? false;
+          if (cancelledByCaller) {
+            throw new CunaError({
+              code: "cuna.network.cancelled",
+              message: "The Cuna request was cancelled.",
+              exitCode: EXIT_CODES.network,
+              hint: "No authoritative answer was received, so a mutating request may still have been applied.",
+              retryable: false,
+              cause: error,
+            });
+          }
+          // Named `cuna.network.timeout` until 2026-08-19, which named the
+          // network. The network was fine: `cuna machines create` reported it
+          // for a machine that reached `running` five seconds later. What
+          // elapsed was this budget.
+          throw observationBudgetElapsed({
+            kind: "response",
+            operation: `${request.method} ${request.path}`,
+            budgetMs,
+            ...(request.settleWith === undefined ? {} : { settleWith: request.settleWith }),
+            details: { method: request.method, path: request.path },
             cause: error,
           });
         }
