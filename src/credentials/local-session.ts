@@ -9,7 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { performance } from "node:perf_hooks";
 
 import { CREDENTIAL_BACKEND_PROTOCOL, type CredentialBackendEvidence, type SecureCredentialBackend } from "./contracts.js";
-import { CredentialBoundaryError, credentialFailure } from "./errors.js";
+import { CredentialBoundaryError, credentialFailure, credentialProcessFailure } from "./errors.js";
 
 const KEY_BYTES = 32;
 const NONCE_BYTES = 12;
@@ -198,7 +198,9 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
         }
       });
       return evidence(this, now, "verified");
-    } catch {
+    } catch (error) {
+      const processFailure = credentialProcessFailure(error);
+      if (processFailure !== undefined) throw processFailure;
       return evidence(this, now, "unavailable", "encrypted_session_permissions_unverified");
     }
   }
@@ -487,13 +489,8 @@ function validateExpectedDigest(value: string | null): void {
  */
 function localSessionReadFailure(subject: "ciphertext" | "key", error: unknown): CredentialBoundaryError {
   if (error instanceof CredentialBoundaryError) return error;
-  if (isBoundedWindowsAclTimeout(error)) {
-    return credentialFailure(
-      "credential_backend_failure",
-      `The encrypted local session ${subject} could not be verified before the bounded ACL check expired.`,
-      { retryable: true, safeDetails: { reason: "windows_acl_inspection_timeout" }, cause: error },
-    );
-  }
+  const processFailure = credentialProcessFailure(error);
+  if (processFailure !== undefined) return processFailure;
   if (isTransientFilesystemFailure(error)) {
     return credentialFailure(
       "credential_backend_failure",
@@ -506,11 +503,6 @@ function localSessionReadFailure(subject: "ciphertext" | "key", error: unknown):
     `The encrypted local session ${subject} could not be verified safely.`,
     { safeDetails: { reason: `encrypted_session_${subject}_security_unverified` }, cause: error },
   );
-}
-
-function isBoundedWindowsAclTimeout(error: unknown): boolean {
-  const record = error as { readonly code?: unknown; readonly killed?: unknown; readonly signal?: unknown } | undefined;
-  return record?.code === "ETIMEDOUT" || (record?.killed === true && typeof record.signal === "string" && record.signal.length > 0);
 }
 
 function isTransientFilesystemFailure(error: unknown): boolean {

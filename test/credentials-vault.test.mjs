@@ -522,6 +522,22 @@ test("absence of an approved secure backend fails closed before any plaintext fa
   secret.dispose();
 });
 
+test("vault preserves a nested backend process timeout instead of renaming it as unavailable credentials", async () => {
+  const backend = new MemorySecureBackend();
+  const timeout = new CredentialBoundaryError({
+    code: "credential_process_timeout",
+    message: "The credential helper exceeded its bounded deadline.",
+    retryable: true,
+  });
+  backend.probe = async () => { throw new Error("backend adapter failed", { cause: timeout }); };
+  const vault = new CredentialVault({ backend, clock: () => NOW });
+  await assert.rejects(
+    vault.load(BINDING),
+    (error) => error === timeout,
+    "the process failure must survive the vault probe boundary",
+  );
+});
+
 test("self-reported or cross-platform vault evidence cannot authorize credential access", async () => {
   const backend = new MemorySecureBackend("linux");
   backend.probe = async () => ({

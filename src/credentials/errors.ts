@@ -43,3 +43,51 @@ export function credentialFailure(
 ): CredentialBoundaryError {
   return new CredentialBoundaryError({ code, message, ...options });
 }
+
+const MAXIMUM_CAUSE_DEPTH = 16;
+
+/**
+ * Recover the process failure carried anywhere in a bounded `Error.cause`
+ * chain. Adapters may add context, but they must not rename a killed or timed
+ * out credential helper as missing credentials merely because it crossed a
+ * second boundary.
+ */
+export function credentialProcessFailure(error: unknown): CredentialBoundaryError | undefined {
+  const seen = new Set<Error>();
+  let current = error;
+  for (let depth = 0; depth < MAXIMUM_CAUSE_DEPTH && current instanceof Error; depth += 1) {
+    if (seen.has(current)) return undefined;
+    seen.add(current);
+    if (
+      current instanceof CredentialBoundaryError &&
+      (current.code === "credential_process_timeout" || current.code === "credential_process_failed")
+    ) {
+      return current;
+    }
+    const process = current as Error & {
+      readonly cmd?: unknown;
+      readonly code?: unknown;
+      readonly killed?: unknown;
+      readonly signal?: unknown;
+      readonly syscall?: unknown;
+    };
+    const timedOut = process.code === "ETIMEDOUT" ||
+      (process.killed === true && typeof process.signal === "string" && process.signal.length > 0);
+    if (timedOut) {
+      return credentialFailure(
+        "credential_process_timeout",
+        "The credential security helper exceeded its bounded deadline.",
+        { retryable: true, safeDetails: { reason: "credential_process_timeout" }, cause: current },
+      );
+    }
+    if (typeof process.cmd === "string" || process.syscall === "spawn") {
+      return credentialFailure(
+        "credential_process_failed",
+        "The credential security helper failed before completing its check.",
+        { safeDetails: { reason: "credential_process_failed" }, cause: current },
+      );
+    }
+    current = current.cause;
+  }
+  return undefined;
+}

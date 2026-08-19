@@ -9,7 +9,7 @@ import {
   type CredentialStatus,
   type SecureCredentialBackend,
 } from "./contracts.js";
-import { CredentialBoundaryError, credentialFailure } from "./errors.js";
+import { CredentialBoundaryError, credentialFailure, credentialProcessFailure } from "./errors.js";
 import { SecretMaterial } from "./secret-material.js";
 
 const ENVELOPE_MAGIC = new TextEncoder().encode("CUNACRED");
@@ -484,6 +484,8 @@ export class CredentialVault {
     try {
       evidence = await this.#backend.probe();
     } catch (cause) {
+      const processFailure = credentialProcessFailure(cause);
+      if (processFailure !== undefined) throw processFailure;
       throw credentialFailure(
         "credential_backend_unavailable",
         "The secure credential store could not be verified.",
