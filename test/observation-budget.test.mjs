@@ -343,14 +343,28 @@ test("an explicit --timeout-ms outranks a per-operation budget", async () => {
     timeoutMs: 5,
     fetch: neverAnswers,
   });
-  await assert.rejects(
-    // A budget the operation would never reach inside this test's runtime. If
-    // the per-operation value won, this call would hang until the suite timeout.
-    explicit.request({ method: "POST", path: "/v1/sessions", budgetMs: 3_600_000 }),
-    (error) => error instanceof CunaError &&
-      error.code === "cuna.client.response_budget_elapsed" &&
-      error.details.budget_ms === 5,
+  // RACED, NOT AWAITED, and the operation budget is seconds rather than hours.
+  //
+  // Both details are load-bearing and were learned by breaking this. Awaiting a
+  // request whose budget wins under the mutation does not fail the test — it
+  // HANGS the runner: `--test-timeout` abandons the test but the transport's
+  // pending `setTimeout` keeps the event loop alive, so the process never
+  // exits. A mutation battery then stalls instead of reporting RED, which is
+  // exactly the failure `scripts/run-build-operation.mjs` documents at the top.
+  // Racing against a short real timer names the outcome in 200 ms, and a 5 s
+  // operation budget means the abandoned handle clears seconds later rather
+  // than never.
+  const outcome = await Promise.race([
+    explicit.request({ method: "POST", path: "/v1/sessions", budgetMs: 5_000 })
+      .then(() => "resolved", (error) => error),
+    new Promise((resolve) => { setTimeout(() => resolve("still-waiting"), 200); }),
+  ]);
+  assert.ok(
+    outcome instanceof CunaError,
+    `The 5 ms flag did not outrank the 5 000 ms operation budget: ${String(outcome)}`,
   );
+  assert.equal(outcome.code, "cuna.client.response_budget_elapsed");
+  assert.equal(outcome.details.budget_ms, 5);
 
   const declared = createHttpTransport({ baseUrl: "https://api.getcuna.com", fetch: neverAnswers });
   await assert.rejects(
