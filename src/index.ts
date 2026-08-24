@@ -122,6 +122,17 @@ export {
   type ExitCodeName,
 } from "./core/exit-codes.js";
 export {
+  DEFAULT_REQUEST_BUDGET_MS,
+  MACHINE_CREATE_REQUEST_BUDGET_MS,
+  OBSERVATION_BUDGET_CODES,
+  REMOTE_CONVERGENCE_BUDGET_MS,
+  REMOTE_CONVERGENCE_POLL_INTERVAL_MS,
+  isObservationBudgetCode,
+  observationBudgetElapsed,
+  type ObservationBudgetElapsedInput,
+  type ObservationBudgetKind,
+} from "./core/observation-budget.js";
+export {
   API_KEYS_URL,
   CONSOLE_ORIGIN,
   INTERNAL_DEFECT_HINT,

@@ -997,11 +997,21 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
 });
 
 test("mutations fail closed when independent readback contradicts the write response", async () => {
+  // TWO ANSWERS, DELIBERATELY DIFFERENT, and the difference is the fix.
+  //
+  // A machine that has not reached the requested state yet is a state the
+  // producer may still be converging to, so the CLI reads back until its own
+  // budget elapses and then reports THAT -- `cuna.client.convergence_budget_elapsed`,
+  // exit 5, retryable. An API key still listed as active after revocation is
+  // read from a list the producer answered authoritatively in the same breath,
+  // and stays a postcondition contradiction at exit 6.
   const cases = [
     {
       argv: ["machines", "pause", MACHINE_ID, "--yes", "--json"],
       capability: "machines.lifecycle",
       scope: "machine",
+      exit: EXIT_CODES.network,
+      code: "cuna.client.convergence_budget_elapsed",
       client: {
         async transitionMachine(id) { return { id, name: "dev", state: "paused" }; },
         async getMachine(id) { return { id, name: "dev", state: "running" }; },
@@ -1012,6 +1022,8 @@ test("mutations fail closed when independent readback contradicts the write resp
       capability: "api_keys.manage",
       scope: "account",
       authority: "interactive",
+      exit: EXIT_CODES.conflict,
+      code: "cuna.remote.postcondition_unverified",
       client: {
         async revokeApiKey() { return true; },
         async listApiKeys() { return [{ id: "11111111-1111-4111-8111-111111111111", name: "still-active", prefix: "cuna_sk_", lastFour: "WXYZ", createdAt: "2026-08-08T00:00:00.000Z", expiresAt: null, lastUsedAt: null, revokedAt: null }]; },
@@ -1032,14 +1044,19 @@ test("mutations fail closed when independent readback contradicts the write resp
           humanAuth: { async acquireAccessToken() { return `cuna_at_${"b".repeat(43)}`; } },
         }
       : { env: { CUNA_API_KEY: API_KEY } };
+    let convergenceClock = 0;
     assert.equal(await runCli(candidate.argv, {
       streams: streams.streams,
       platform,
       ...authority,
       now: () => Date.parse("2026-08-08T00:00:00Z"),
+      convergencePoller: {
+        now: () => convergenceClock,
+        async sleep(milliseconds) { convergenceClock += milliseconds; },
+      },
       clientFactory: () => client,
-    }), EXIT_CODES.conflict);
-    assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.remote.postcondition_unverified");
+    }), candidate.exit);
+    assert.equal(JSON.parse(streams.stderr()).error.code, candidate.code);
   }
 });
 
@@ -1118,7 +1135,7 @@ test("AgentSession termination waits for a fenced supervisor terminal observatio
     platform,
     env: { CUNA_API_KEY: API_KEY },
     now: () => Date.parse("2026-08-08T00:00:00Z"),
-    agentSessionTerminationPoller: {
+    convergencePoller: {
       now: () => now,
       async sleep(milliseconds) {
         sleeps += 1;
@@ -1184,7 +1201,7 @@ test("AgentSession termination fails closed only when the terminal observation d
     platform,
     env: { CUNA_API_KEY: API_KEY },
     now: () => Date.parse("2026-08-08T00:00:00Z"),
-    agentSessionTerminationPoller: {
+    convergencePoller: {
       now: () => now,
       async sleep(milliseconds) {
         sleeps += 1;
@@ -1193,15 +1210,20 @@ test("AgentSession termination fails closed only when the terminal observation d
     },
     clientFactory: () => client,
   });
-  assert.equal(exit, EXIT_CODES.conflict);
+  // The CLI's own convergence budget elapsed. That is not the producer failing
+  // and not a state contradiction, so it is exit 5 and retryable, naming the
+  // read that settles it -- not exit 6 with `retryable: false`.
+  assert.equal(exit, EXIT_CODES.network);
   assert.equal(terminations, 1);
   assert.equal(sleeps, 60);
-  assert.equal(now, 15_000);
+  assert.equal(now, 30_000);
   assert.equal(reads, 61);
   const record = JSON.parse(streams.stderr());
-  assert.equal(record.error.code, "cuna.remote.postcondition_unverified");
+  assert.equal(record.error.code, "cuna.client.convergence_budget_elapsed");
+  assert.equal(record.error.retryable, true);
   assert.equal(record.error.details.observed_desired_state, "terminated");
   assert.equal(record.error.details.observed_request_state, "termination_pending");
+  assert.equal(record.error.details.settle_with, `cuna agent-sessions show ${sessionId}`);
 });
 
 test("AgentSession create keeps auth mode explicit and rename is capability-gated", async () => {

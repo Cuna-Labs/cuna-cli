@@ -8,6 +8,36 @@ follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The CLI no longer reports a failure for an operation that succeeded.** Two
+  commands were measured on 2026-08-19 against Fly release v93 returning a hard
+  `retryable: false` error for work the server completed: `machines create`
+  returned `cuna.network.timeout` for a machine that reached `running` five
+  seconds later, and `machines delete` returned
+  `cuna.remote.postcondition_unverified` with `observed_state: "present"` for a
+  machine that `machines list` showed gone six seconds later. Both were the
+  CLI's own observation budget being shorter than the operation, reported as
+  though the operation had failed.
+
+  A refusal caused by the CLI's budget now carries its own codes, minted in one
+  place, always `retryable: true`, and always naming the read-only command that
+  settles the question:
+
+  | Before | After |
+  | --- | --- |
+  | `cuna.network.timeout` (exit 5, `retryable: false` for mutations) | `cuna.client.response_budget_elapsed` (exit 5, `retryable: true`) |
+  | `cuna.remote.postcondition_unverified` (exit 6) for a state that had not converged yet | `cuna.client.convergence_budget_elapsed` (exit 5, `retryable: true`) |
+
+  `cuna.network.timeout` is retired. `cuna.remote.postcondition_unverified`
+  remains, narrowed to what it always meant: a read-back that CONTRADICTS the
+  write and that waiting cannot repair. `cuna.network.failed` is unchanged,
+  including its fail-closed retryability for mutations — there the network
+  really did fail.
+
+  `machines delete` and the four `machines` lifecycle transitions now read back
+  until the change is visible or the budget elapses, instead of judging on one
+  immediate read. `POST /v1/sessions` carries a 90 s budget of its own instead
+  of the 15 s global default; an explicit `--timeout-ms` still outranks it. No
+  exit code changed its number, and no new exit code was added.
 - Every error code the CLI emits now uses the `cuna.*` namespace instead of
   `runa.*`, in both `--json` records (`error.code`) and human output
   (`Error [code]: …`). Nothing is published yet, so no released consumer is
