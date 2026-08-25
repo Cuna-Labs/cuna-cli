@@ -216,6 +216,13 @@ export async function readHiddenLoginCode(
   if (signal?.aborted) throw loginCodeInputError("cancelled", "Cuna sign-in was cancelled.");
 
   const wasRaw = input.isRaw === true;
+  // Captured for the same reason as `wasRaw`, and read from `readableFlowing`
+  // rather than `isPaused()` on purpose. A stdin nobody has read yet reports
+  // `isPaused() === false` while `readableFlowing` is still `null`, so the
+  // convenient predicate would classify the exact pre-login state as "already
+  // flowing" and skip the restoration below. Only `true` means the stream is
+  // flowing and its libuv handle is referenced.
+  const wasFlowing = input.readableFlowing === true;
   const bytes: number[] = [];
   const maxBytes = 256;
   let masked = 0;
@@ -240,6 +247,31 @@ export async function readHiddenLoginCode(
       input.off("end", onEnd);
       signal?.removeEventListener("abort", onAbort);
       try { input.setRawMode?.(wasRaw); } catch { /* best-effort terminal restoration */ }
+      // Detaching the listeners above does not unreference the stream. The
+      // `resume()` that started this read put stdin in flowing mode and
+      // referenced its libuv handle, and a referenced handle keeps the event
+      // loop alive: `cuna login` printed its success line and then sat there
+      // until the operator pressed Ctrl+C (exit 0xC000013A). Flow state is
+      // restored here exactly as `wasRaw` restores raw mode -- paused only if
+      // this reader is the one that started the flow.
+      //
+      // Deferred by one tick, and that is load-bearing rather than tidiness.
+      // `cleanup` usually runs inside the `data` emit, and `Readable.pause()`
+      // emits `"pause"` -- the event whose stdin handler calls `readStop()` --
+      // ONLY when `flowing !== false`. Pausing from inside the emit flips
+      // `flowing` to false, then the same `read()` call re-arms the handle
+      // through `_read()`, and every later `pause()` is a silent no-op because
+      // the flag it checks is already false. Measured on Node 24 over a real
+      // pipe: pausing inside the handler leaves the process alive forever,
+      // including when a second pause is scheduled afterwards; pausing only
+      // from a deferred tick releases the handle. `process.nextTick` drains
+      // before promise microtasks, so the awaiting caller still observes a
+      // paused stream.
+      if (!wasFlowing) {
+        process.nextTick(() => {
+          try { input.pause(); } catch { /* best-effort stream restoration */ }
+        });
+      }
       output.write("\n");
       bytes.fill(0);
     };
@@ -747,14 +779,28 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const result = await (await getHumanAuth()).login(
           dependencies.signal === undefined ? {} : { signal: dependencies.signal },
         );
+        const alreadySignedIn = result.alreadySignedIn === true;
         const data = Object.freeze({
           ...humanResult(result),
           storage_mode: "encrypted-local" as const,
+          // The domain code survives for machine readers even though this is a
+          // `type: "result"` record. A script that needs to tell "signed in
+          // just now" from "was already signed in" reads this; a person does
+          // not have to read an error to be told nothing was wrong.
+          ...(alreadySignedIn
+            ? { already_signed_in: true as const, code: "cuna.auth.already_signed_in" as const }
+            : {}),
         });
         writer.success(
           "login",
           data,
-          `Signed in to Cuna profile ${result.profile} using the encrypted local session store.`,
+          alreadySignedIn
+            // Name the profile, because that is the argument `cuna logout`
+            // acts on, and say the one thing worth doing next. The storage
+            // backend is not on this line: on a success line it answers a
+            // question nobody asked.
+            ? `Already signed in to Cuna profile ${result.profile}.\nTo use another account, run \`cuna logout\` first.`
+            : `Signed in to Cuna profile ${result.profile}.`,
         );
       } else if (parsed.command === "whoami" || parsed.command === "access") {
         const result = await (await getHumanAuth()).whoami(dependencies.signal);

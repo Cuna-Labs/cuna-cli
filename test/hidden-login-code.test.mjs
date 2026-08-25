@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
 
@@ -164,6 +168,149 @@ test("hidden login-code input rejects non-TTY and cancellation without echoing a
   await assert.rejects(cancelled, (error) => error?.code === "cuna.auth.login_code_input_cancelled");
   assert.deepEqual(rawModes, [true, false]);
   assert.doesNotMatch(output.text(), new RegExp(LOGIN_CODE.slice(0, 12), "u"));
+});
+
+/**
+ * Releasing the stream, and why asserting the returned code cannot prove it.
+ *
+ * The reader calls `input.resume()` to start reading. Its cleanup removed the
+ * listeners, restored raw mode, wrote a newline and zeroed the buffer -- and
+ * left the stream flowing. Detaching a listener does not unreference a stream,
+ * so `cuna login` printed its success line and then hung with a referenced
+ * stdin handle holding the event loop open; the operator's only exit was
+ * Ctrl+C (0xC000013A).
+ *
+ * Every assertion already in this file passes in that state, because the code
+ * IS returned and the mask IS correct -- the process simply never ends
+ * afterwards. So these two assert the separate property: the reader gives the
+ * stream back in the state it borrowed it.
+ */
+/**
+ * One turn of the event loop.
+ *
+ * The reader releases the flow from a deferred tick, because releasing it from
+ * inside the `data` emit does not work: `Readable.pause()` only emits the
+ * `"pause"` event that stops the underlying handle while `flowing !== false`,
+ * so a pause issued inside the emit flips the flag, gets its handle re-armed by
+ * the same `read()` call, and turns every later pause into a no-op. "Released"
+ * is therefore a property of the next turn, not of the same one, and these wait
+ * for that turn rather than pretending the release is synchronous.
+ */
+const settled = () => new Promise((resolve) => { setImmediate(resolve); });
+
+test("the reader stops the flow it started, and leaves an already-flowing stream alone", async () => {
+  const { input } = terminalInput();
+  const output = capturedOutput();
+  // A fresh stream: `readableFlowing` is null, and `isPaused()` reports false
+  // even though nothing is flowing. Pinned here because a fix written against
+  // `isPaused()` would read this exact state as "already flowing" and skip the
+  // restoration entirely.
+  assert.equal(input.readableFlowing, null);
+  assert.equal(input.isPaused(), false);
+
+  const reading = readHiddenLoginCode(input, output.output);
+  assert.equal(input.readableFlowing, true, "the reader must start the flow it needs");
+  input.write(`${LOGIN_CODE}\r`);
+  assert.equal(await reading, LOGIN_CODE);
+  await settled();
+  assert.notEqual(input.readableFlowing, true, "the reader must not leave the stream flowing");
+  assert.equal(input.isPaused(), true);
+
+  // The other direction, so the fix cannot be "always pause": a caller that
+  // handed over a stream it was already reading gets it back still flowing.
+  const borrowed = terminalInput();
+  borrowed.input.resume();
+  assert.equal(borrowed.input.readableFlowing, true);
+  const borrowedOutput = capturedOutput();
+  const borrowedRead = readHiddenLoginCode(borrowed.input, borrowedOutput.output);
+  borrowed.input.write(`${LOGIN_CODE}\r`);
+  assert.equal(await borrowedRead, LOGIN_CODE);
+  await settled();
+  assert.equal(borrowed.input.readableFlowing, true, "a stream that arrived flowing must stay flowing");
+});
+
+test("the reader releases the flow on cancellation too, not only on success", async () => {
+  const { input } = terminalInput();
+  const output = capturedOutput();
+  const controller = new AbortController();
+  const cancelled = readHiddenLoginCode(input, output.output, controller.signal);
+  input.write(LOGIN_CODE.slice(0, 12));
+  controller.abort();
+  await assert.rejects(cancelled, (error) => error?.code === "cuna.auth.login_code_input_cancelled");
+  await settled();
+  assert.equal(input.isPaused(), true);
+  assert.notEqual(input.readableFlowing, true);
+});
+
+/**
+ * The end-to-end control for the same defect: a real OS process, a real pipe
+ * handle, and no `process.exit()` anywhere.
+ *
+ * The in-process assertions above read a flag. This one reads the consequence
+ * the owner actually reported. `process.stdin` over a pipe owns a libuv handle
+ * that `resume()` references and `pause()` releases, so a child that has
+ * finished reading either drains its event loop and exits on its own or does
+ * not exit at all. The parent deliberately keeps the pipe OPEN: closing stdin
+ * would end the stream and let even the unfixed reader exit, which would make
+ * this test pass for the wrong reason.
+ *
+ * Failure mode without the fix: the child never exits, the timeout below kills
+ * it, and the assertion reports a signal instead of a clean exit.
+ */
+test("a process that finished reading a login code exits by itself", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "cuna-hidden-reader-exit-"));
+  const script = join(directory, "read-once.mjs");
+  const runUrl = new URL("../dist/cli/run.js", import.meta.url).href;
+  await writeFile(
+    script,
+    [
+      `import { Writable } from "node:stream";`,
+      `import { readHiddenLoginCode } from ${JSON.stringify(runUrl)};`,
+      `const sink = new Writable({ write(_chunk, _encoding, callback) { callback(); } });`,
+      // Present the pipe as the TTY the reader requires. The handle underneath
+      // is a real one; only the two capability flags are supplied.
+      `process.stdin.isTTY = true;`,
+      `process.stdin.setRawMode = () => process.stdin;`,
+      `const code = await readHiddenLoginCode(process.stdin, sink);`,
+      `process.stdout.write(code);`,
+      // No process.exit(). Exiting on purpose is precisely the behaviour under
+      // test, so forcing it here would erase the defect.
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  try {
+    const child = spawn(process.execPath, [script], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.resume();
+    child.stdin.write(`${LOGIN_CODE}\r`);
+
+    let timer;
+    const exited = new Promise((resolve) => {
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    const outcome = await Promise.race([
+      exited,
+      new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), 10_000); }),
+    ]);
+    clearTimeout(timer);
+    if (outcome === "timeout") {
+      child.kill("SIGKILL");
+      await exited;
+    }
+    // stdin is still open here, and stays open: the child must have exited
+    // without needing EOF.
+    child.stdin.destroy();
+
+    assert.notEqual(outcome, "timeout", "the CLI process must exit after reading the login code, not wait for Ctrl+C");
+    assert.equal(outcome.signal, null, "the process must end on its own, never on a signal");
+    assert.equal(outcome.code, 0);
+    assert.equal(stdout, LOGIN_CODE, "the code must still be delivered; exiting early would be the wrong fix");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("hidden login-code input observes cancellation that races with raw-mode setup", async () => {
