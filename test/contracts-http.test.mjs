@@ -1066,6 +1066,72 @@ test("HTTP errors preserve retryability only from a closed canonical Problem", a
   );
 });
 
+// `detail` is the only field that says WHY in words. It was validated here and
+// then dropped, so a catch-all `code` reached the user with its cause deleted --
+// measured 2026-08-26 against production: four `machine_create_authority_unavailable`
+// 502s whose real upstream reason the service had already put on the wire.
+const problemWithDetail = (detail, status = 503) => createHttpTransport({
+  baseUrl: "https://api.getcuna.com",
+  fetch: async () => new Response(JSON.stringify({
+    type: "https://api.getcuna.com/problems/request_failed",
+    title: "Request failed",
+    status,
+    code: "request_failed",
+    request_id: "88888888-8888-4888-8888-888888888888",
+    retryable: false,
+    detail,
+  }), { status, headers: { "content-type": "application/problem+json" } }),
+});
+
+test("a Problem detail reaches the user instead of being validated and discarded", async () => {
+  await assert.rejects(
+    problemWithDetail("provider refused the reservation: no capacity in yyz").request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => error instanceof CunaError &&
+      error.details?.detail === "provider refused the reservation: no capacity in yyz" &&
+      // `reason` says which bucket, `detail` says why. Both, not either.
+      error.details?.reason === "request_failed",
+  );
+});
+
+// Extends "HTTP errors expose only stable safe metadata" to the field this
+// change adds. That test's fixture is not a valid Problem, so its secret sits in
+// `message` and never had a path to `details`; a credential inside a VALID
+// Problem's `detail` does. The service scrubs this before sending, but that
+// guarantee is one `replace` call on the server side and a branch deleting it
+// exists, so the client does not rely on it.
+test("a credential inside a Problem detail is redacted before it reaches details", async () => {
+  const secret = `cuna_sk_${"q".repeat(43)}`;
+  await assert.rejects(
+    problemWithDetail(`upstream rejected token ${secret} for tenant`).request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => {
+      const rendered = JSON.stringify(error.details);
+      assert.ok(!rendered.includes(secret), "details must not echo a credential-shaped value");
+      assert.ok(rendered.includes("[redacted credential]"), rendered);
+      // The surrounding explanation survives -- redaction must not cost the
+      // diagnosis, or the field is worth nothing.
+      assert.ok(error.details.detail.includes("upstream rejected token"), error.details.detail);
+      assert.ok(error.details.detail.includes("for tenant"), error.details.detail);
+      return true;
+    },
+  );
+});
+
+test("a bearer header leaked into a Problem detail is redacted too", async () => {
+  await assert.rejects(
+    problemWithDetail("retry sent Bearer eyJhbGciOiJIUzI1NiJ9.abc-def_ghi upstream").request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => {
+      assert.ok(!JSON.stringify(error.details).includes("eyJhbGciOiJIUzI1NiJ9"), error.details.detail);
+      return true;
+    },
+  );
+});
+
 test("workspace sync Problems preserve only the negotiated protocol and canonical capability vector", async () => {
   const requestId = "77777777-7777-4777-8777-777777777777";
   const capabilities = [
