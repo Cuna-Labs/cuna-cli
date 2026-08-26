@@ -6,6 +6,7 @@ import {
   automationCredentialHint,
 } from "../core/product-web.js";
 import {
+  CREDENTIAL_VALUE_SOURCE,
   isProblemType,
   isProblemTypeForCode,
   isTransportCredential,
@@ -102,15 +103,37 @@ export interface HttpTransport {
  */
 const CREDENTIAL_SHAPE = new RegExp(
   [
-    // Authorization header value, however it was embedded.
-    String.raw`\bBearer\s+[A-Za-z0-9._~+/-]+=*`,
-    // This product's own key brands.
-    String.raw`\b(?:cuna|runa)_(?:at|sc|se|sk)_[A-Za-z0-9_-]{16,}\b`,
-    // Supabase's newer key format, which the service also handles.
-    String.raw`\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{16,}\b`,
-    // A bare JWT. Three base64url segments starting with the standard `{"alg"`
-    // header prefix -- this is the shape a service-role key takes, and neither
-    // scrubber previously matched it unless it followed `Bearer `.
+    /*
+     * THIS PRODUCT'S CREDENTIALS COME FROM THE AUTHORITY, NOT FROM HERE.
+     *
+     * An earlier version of this constant carried a hand-written family list
+     * covering `at|sc|se|sk` -- four of the ten families in
+     * `CREDENTIAL_FAMILY_INFIXES`. It silently missed `rt`, `ct`, `tc`, `cb`,
+     * `cr` and `login`, and `cr` is a bearer capability. `namespace.ts` records
+     * this exact bug happening once already: a decoder's own stale copy let a
+     * live `runa_sc_…` reach a terminal and, under `--json`, CI logs. Its
+     * conclusion is the reason for this line: "A denylist assembled anywhere but
+     * here is the same bug waiting for the next family."
+     */
+    CREDENTIAL_VALUE_SOURCE,
+    /*
+     * Authorization header value. The token is required to be LONG.
+     *
+     * The previous form was `[A-Za-z0-9._~+/-]+`, which with the `i` flag turned
+     * the ordinary sentence "The bearer token has expired." into
+     * "The [redacted credential] has expired." -- redacting nothing while
+     * deleting the diagnosis, and telling the reader a secret was present when
+     * none was. A bearer token is not five characters.
+     */
+    String.raw`\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*`,
+    /*
+     * FOREIGN shapes -- credentials this product does not mint, which can appear
+     * in an upstream error message the service's own scrubber has no rule for.
+     * `sb_publishable_` is deliberately absent: it is public by design, and
+     * redacting it would delete which project the failure came from.
+     */
+    String.raw`\bsb_secret_[A-Za-z0-9_-]{16,}\b`,
+    // A bare JWT -- the shape a service-role key takes.
     String.raw`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`,
     // GitHub tokens: personal, OAuth, server, user, refresh.
     String.raw`\bgh[pousr]_[A-Za-z0-9]{20,}\b`,

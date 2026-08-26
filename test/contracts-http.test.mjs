@@ -5,6 +5,8 @@ import {
   API_ORIGINS,
   API_WEBSOCKET_ORIGINS,
   CREDENTIAL_BRANDS,
+  CREDENTIAL_FAMILY_INFIXES,
+  containsCredentialValue,
   createHttpTransport,
   createCunaApiClient,
   decodeApiKeyCreation,
@@ -1166,6 +1168,88 @@ for (const [name, secret] of [
 // explanation this field exists to carry, and it would do so silently. Ordinary
 // operational prose -- including bare hex, uuids, hostnames and version strings --
 // must pass through untouched.
+// EVERY family the product mints, generated FROM the authority rather than
+// listed here. A hand-written copy of this list is what broke: the redactor
+// covered 4 of 10 families and missed `cr`, a bearer capability. namespace.ts
+// records the same bug happening once before, leaking a live `runa_sc_…` to a
+// terminal and to CI logs under --json. If a family is ever added there, this
+// test fails until the redactor covers it -- which a literal list cannot do.
+test("every minted credential family is redacted out of a Problem detail", async () => {
+  for (const brand of CREDENTIAL_BRANDS) {
+    for (const infix of CREDENTIAL_FAMILY_INFIXES) {
+      const secret = `${brand}_${infix}_${"a1B2c3D4".repeat(4)}`;
+      assert.ok(containsCredentialValue(secret), `fixture must be a real credential shape: ${infix}`);
+      await assert.rejects(
+        problemWithDetail(`upstream rejected ${secret} while provisioning`).request({
+          method: "POST", path: "/v1/sessions",
+        }),
+        (error) => {
+          const rendered = JSON.stringify(error.details);
+          assert.ok(!rendered.includes(secret), `${brand}_${infix}_ leaked: ${error.details.detail}`);
+          // The authority itself is the oracle: after redaction it must not
+          // detect a credential. This is the property, not a string match.
+          assert.equal(containsCredentialValue(error.details.detail), false, error.details.detail);
+          assert.ok(error.details.detail.includes("while provisioning"), error.details.detail);
+          return true;
+        },
+      );
+    }
+  }
+});
+
+// The `--json` / non-TTY sink. EVERY previous detail test stopped at the
+// transport, which is exactly why the leak was invisible: output.ts emits
+// `details` raw when stdout is not a TTY, so a piped or CI invocation is the
+// unguarded path. cli-surface-regressions covers only the interactive arm.
+test("a credential cannot reach the structured error record", async () => {
+  const secret = `cuna_cr_${"z9Y8x7W6".repeat(4)}`;
+  await assert.rejects(
+    problemWithDetail(`resume handle ${secret} was refused`).request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => {
+      // The exact bytes a non-TTY invocation writes.
+      const record = JSON.stringify({ schema_version: "1", type: "error", error: {
+        code: error.code, message: error.message, details: error.details,
+      } });
+      assert.ok(!record.includes(secret), record);
+      assert.equal(containsCredentialValue(record), false, record);
+      return true;
+    },
+  );
+});
+
+test("prose containing the word bearer is not mangled", async () => {
+  // The previous `Bearer\s+[A-Za-z0-9._~+/-]+` turned this into
+  // "The [redacted credential] has expired." -- redacting nothing, deleting the
+  // cause, and asserting a secret was present when none was.
+  for (const prose of [
+    "The bearer token has expired.",
+    'upstream returned WWW-Authenticate: Bearer realm="cuna", error="invalid_token"',
+  ]) {
+    await assert.rejects(
+      problemWithDetail(prose).request({ method: "POST", path: "/v1/sessions" }),
+      (error) => {
+        assert.equal(error.details.detail, prose);
+        return true;
+      },
+    );
+  }
+});
+
+test("a publishable key is NOT redacted -- it is public and names the project", async () => {
+  const publishable = `sb_publishable_${"kL3mN4pQ".repeat(3)}`;
+  await assert.rejects(
+    problemWithDetail(`project ${publishable} rejected the request`).request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => {
+      assert.ok(error.details.detail.includes(publishable), error.details.detail);
+      return true;
+    },
+  );
+});
+
 test("ordinary detail prose is not redacted", async () => {
   const prose = "provider refused reservation 7f3a9c in region yyz for image sha256:abcd1234 after 3 attempts";
   await assert.rejects(
