@@ -85,15 +85,40 @@ export interface HttpTransport {
 }
 
 /**
- * Credential shapes this product mints, plus a bearer header, as they would
- * appear inside a server-supplied `detail` string.
+ * Credential shapes as they would appear inside a server-supplied `detail`.
  *
- * Deliberately unanchored at the front for `Bearer`, and `\b`-anchored for the
- * key shapes only where a boundary genuinely exists. Redacting more is the safe
- * direction for a redaction boundary.
+ * The first draft of this covered only `Bearer` and this product's own
+ * `cuna_/runa_` keys — which is EXACTLY the set the service-side scrubber already
+ * covers. A second layer that knows the same shapes as the first defends only
+ * against the first being deleted; it adds no coverage. The shapes below were
+ * added because a `detail` is written to a terminal AND to `--json`, and the text
+ * originates upstream of this service, where a foreign credential can appear in
+ * an error message that our own scrubber has no rule for.
+ *
+ * Redacting more is the safe direction for a redaction boundary. Each pattern is
+ * anchored tightly enough not to eat ordinary prose — the tests pin that the
+ * surrounding explanation survives, because redaction that costs the diagnosis
+ * defeats the field's purpose.
  */
-const CREDENTIAL_SHAPE =
-  /(?:\bBearer\s+[A-Za-z0-9._~+/-]+=*)|(?:\b(?:cuna|runa)_(?:at|sc|se|sk)_[A-Za-z0-9_-]{16,}\b)/giu;
+const CREDENTIAL_SHAPE = new RegExp(
+  [
+    // Authorization header value, however it was embedded.
+    String.raw`\bBearer\s+[A-Za-z0-9._~+/-]+=*`,
+    // This product's own key brands.
+    String.raw`\b(?:cuna|runa)_(?:at|sc|se|sk)_[A-Za-z0-9_-]{16,}\b`,
+    // Supabase's newer key format, which the service also handles.
+    String.raw`\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{16,}\b`,
+    // A bare JWT. Three base64url segments starting with the standard `{"alg"`
+    // header prefix -- this is the shape a service-role key takes, and neither
+    // scrubber previously matched it unless it followed `Bearer `.
+    String.raw`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`,
+    // GitHub tokens: personal, OAuth, server, user, refresh.
+    String.raw`\bgh[pousr]_[A-Za-z0-9]{20,}\b`,
+    // AWS access key id.
+    String.raw`\bAKIA[0-9A-Z]{16}\b`,
+  ].join("|"),
+  "giu",
+);
 
 /**
  * Second line of defence on a string we are about to print to a terminal.

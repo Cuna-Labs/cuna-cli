@@ -1132,6 +1132,51 @@ test("a bearer header leaked into a Problem detail is redacted too", async () =>
   );
 });
 
+// FOREIGN credential shapes. The first draft of the client redactor knew only
+// `Bearer` and this product's own key brands -- exactly the set the service-side
+// scrubber already covers, so it defended against that scrubber being deleted and
+// added no coverage. A `detail` originates UPSTREAM of the service, where a
+// foreign credential can appear in an error message our own scrubber has no rule
+// for. Each of these is a shape that previously reached the terminal verbatim.
+for (const [name, secret] of [
+  ["a bare JWT (no Bearer prefix)", "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.QWxsWW91ckJhc2VBcmVCZWxvbmc"],
+  ["a GitHub token", `ghp_${"A1b2C3d4E5f6G7h8I9j0".repeat(1)}`],
+  ["an AWS access key id", "AKIA1234567890ABCDEF"],
+  ["a Supabase secret key", `sb_secret_${"xY9".repeat(8)}`],
+]) {
+  test(`${name} in a Problem detail is redacted`, async () => {
+    await assert.rejects(
+      problemWithDetail(`upstream rejected ${secret} while provisioning`).request({
+        method: "POST", path: "/v1/sessions",
+      }),
+      (error) => {
+        const rendered = JSON.stringify(error.details);
+        assert.ok(!rendered.includes(secret), `${name} must not reach details: ${error.details.detail}`);
+        assert.ok(rendered.includes("[redacted credential]"), error.details.detail);
+        // The diagnosis must survive the redaction.
+        assert.ok(error.details.detail.includes("upstream rejected"), error.details.detail);
+        assert.ok(error.details.detail.includes("while provisioning"), error.details.detail);
+        return true;
+      },
+    );
+  });
+}
+
+// FALSE-POSITIVE CONTROL. Over-broad redaction is its own defect: it destroys the
+// explanation this field exists to carry, and it would do so silently. Ordinary
+// operational prose -- including bare hex, uuids, hostnames and version strings --
+// must pass through untouched.
+test("ordinary detail prose is not redacted", async () => {
+  const prose = "provider refused reservation 7f3a9c in region yyz for image sha256:abcd1234 after 3 attempts";
+  await assert.rejects(
+    problemWithDetail(prose).request({ method: "POST", path: "/v1/sessions" }),
+    (error) => {
+      assert.equal(error.details.detail, prose);
+      return true;
+    },
+  );
+});
+
 test("workspace sync Problems preserve only the negotiated protocol and canonical capability vector", async () => {
   const requestId = "77777777-7777-4777-8777-777777777777";
   const capabilities = [
