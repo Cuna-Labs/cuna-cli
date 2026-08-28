@@ -451,6 +451,8 @@ export interface AgentSessionPage {
 export interface AgentSessionAuth {
   readonly observationId: string;
   readonly agentSessionId: string;
+  /** The provider observed by the supervisor for this exact process epoch. */
+  readonly agent: AgentKind;
   readonly processEpoch: string | null;
   readonly authMode: AgentAuthMode;
   readonly agentVersion: string;
@@ -605,6 +607,7 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
   const allowed = new Set([
     "observation_id",
     "agent_session_id",
+    "agent",
     "process_epoch",
     "auth_mode",
     "agent_version",
@@ -668,6 +671,7 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
   return Object.freeze({
     observationId: canonicalUuid(value, "observation_id"),
     agentSessionId: canonicalUuid(value, "agent_session_id"),
+    agent: enumField(value, "agent", AGENTS),
     processEpoch,
     authMode,
     agentVersion,

@@ -1160,12 +1160,12 @@ function createContractAuthority() {
         if (request.method === "PATCH" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}`) { state.agentName = body.name; return send(200, { ...agentSession(), row_version: 1 }); }
         if (request.method === "POST" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/terminate`) { state.agentTerminated = true; return send(200, agentSession(true)); }
         if (request.method === "POST" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/agent-auth/logout`) return send(200, { observation_id: "80000000-0000-4000-8000-000000000008", agent_session_id: AGENT_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent: "codex", agent_version: "1.0.0", adapter_version: "runa.agent-auth.v1", observed_at: "2026-08-14T00:00:02.000Z", outcome: "logout_confirmed" });
-        if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/agent-auth`) return send(200, { observation_id: "81000000-0000-4000-8000-000000000008", agent_session_id: AGENT_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent_version: "1.0.0", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_login_status", observed_at: "2026-08-14T00:00:02.000Z", valid_until: "2026-08-14T00:00:32.000Z", state: "login_required" });
+        if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/agent-auth`) return send(200, { observation_id: "81000000-0000-4000-8000-000000000008", agent_session_id: AGENT_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "codex", auth_mode: "interactive_login", agent_version: "1.0.0", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_login_status", observed_at: "2026-08-14T00:00:02.000Z", valid_until: "2026-08-14T00:00:32.000Z", state: "login_required" });
         if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${OPENCODE_SESSION_ID}/agent-auth`) {
           const observationTime = Date.now();
           const observedAt = new Date(observationTime - 100).toISOString();
           const validUntil = new Date(observationTime + 10_000).toISOString();
-          return send(200, { observation_id: "82000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_credential_presence", observed_at: observedAt, valid_until: validUntil, state: "login_required" });
+          return send(200, { observation_id: "82000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "opencode", auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_credential_presence", observed_at: observedAt, valid_until: validUntil, state: "login_required" });
         }
         if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${OPENCODE_AUTH_MISSING_SESSION_ID}/agent-auth`) {
           state.openCodeAgentAuth404Requests += 1;
@@ -1176,14 +1176,14 @@ function createContractAuthority() {
           const observationTime = Date.now();
           const observedAt = new Date(observationTime - 100).toISOString();
           const validUntil = new Date(observationTime + 10_000).toISOString();
-          return send(200, { observation_id: "83000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_AUTH_INVALID_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_login_status", observed_at: observedAt, valid_until: validUntil, state: "authenticated" });
+          return send(200, { observation_id: "83000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_AUTH_INVALID_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "opencode", auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_login_status", observed_at: observedAt, valid_until: validUntil, state: "authenticated" });
         }
         if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${OPENCODE_AUTH_CONFIGURED_SESSION_ID}/agent-auth`) {
           state.openCodeAgentAuthConfiguredRequests += 1;
           const observationTime = Date.now();
           const observedAt = new Date(observationTime - 100).toISOString();
           const validUntil = new Date(observationTime + 10_000).toISOString();
-          return send(200, { observation_id: "84000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_AUTH_CONFIGURED_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_credential_presence", observed_at: observedAt, valid_until: validUntil, state: "configured" });
+          return send(200, { observation_id: "84000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_AUTH_CONFIGURED_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "opencode", auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_credential_presence", observed_at: observedAt, valid_until: validUntil, state: "configured" });
         }
         if (request.method === "POST" && url.pathname === "/v1/api-keys") {
           assert.match(request.headers["idempotency-key"] ?? "", /^cuna-api-key-create-[0-9a-f-]{36}$/u);

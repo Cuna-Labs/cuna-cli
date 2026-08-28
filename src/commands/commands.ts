@@ -1046,6 +1046,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       const observedAuth = await client.getAgentSessionAuth(id);
       if (
         observedAuth.agentSessionId !== id ||
+        observedAuth.agent !== session.agent ||
         observedAuth.processEpoch !== session.processEpoch ||
         observedAuth.state !== "login_required"
       ) {

@@ -8,7 +8,6 @@ import {
 } from "../api/contracts.js";
 import type { CunaApiClient } from "../api/client.js";
 import type { BrowserOpener } from "../auth/browser.js";
-import { CunaError } from "../core/errors.js";
 import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import {
   ForegroundTerminalCoordinator,
@@ -35,15 +34,12 @@ import {
 } from "./terminal-transport.js";
 
 const TERMINAL_CAPABILITY_ID = "terminal_connections.create";
-// A first interactive OpenCode session has no credential state yet. Older
-// production deployments either return a resource 404 or do not serve the
-// observation route at all. Neither response is proof of a provider
-// credential, but a fresh supervisor process and the one-use terminal grant
-// are sufficient authority to enter that provider's login TUI.
-const MISSING_OPENCODE_AUTH_OBSERVATION_CODES = new Set([
-  "cuna.remote.not_found",
-  "cuna.remote.operation_not_served",
-]);
+// A first interactive OpenCode session has no credential state yet. Provider
+// auth is an advisory display observation: it may be absent, temporarily
+// unreachable, or unavailable on an older deployment. A fresh supervisor
+// process plus the one-use terminal grant remain the attach authority. This
+// fallback never asserts that the provider is configured; it only permits the
+// provider's own login TUI to ask the person to authenticate.
 
 export interface ForegroundSessionRunnerInput {
   readonly client: CunaApiClient;
@@ -406,19 +402,19 @@ async function observeProviderAuthentication(input: Readonly<{
     status = await input.client.getAgentSessionAuth(input.session.id, input.signal);
   } catch (error) {
     throwIfAborted(input.signal);
+    if (mayEnterOpenCodeLogin(input.session, input.observation, input.now())) {
+      return Object.freeze({
+        value: "login_required",
+        source: `${input.observation.authority}:interactive_login_pending`,
+        observedAt: Date.parse(input.observation.observedAt),
+        expiresAt: Date.parse(input.observation.expiresAt),
+        correlationId: input.observation.evidenceRevision,
+      });
+    }
     if (input.session.agent === "opencode") {
-      if (isMissingOpenCodeAuthObservation(error, input.session, input.observation, input.now())) {
-        return Object.freeze({
-          value: "login_required",
-          source: `${input.observation.authority}:interactive_login_pending`,
-          observedAt: Date.parse(input.observation.observedAt),
-          expiresAt: Date.parse(input.observation.expiresAt),
-          correlationId: input.observation.evidenceRevision,
-        });
-      }
       throw runtimeFailure(
         "remote_state_unproven",
-        "OpenCode foreground admission requires a current provider credential observation.",
+        "OpenCode foreground admission requires current process evidence before interactive login.",
         { cause: error },
       );
     }
@@ -434,6 +430,7 @@ async function observeProviderAuthentication(input: Readonly<{
     : status.evidenceClass !== "provider_cli_credential_presence";
   if (
     status.agentSessionId !== input.session.id ||
+    status.agent !== input.session.agent ||
     status.authMode !== input.session.authMode ||
     status.processEpoch === null ||
     status.processEpoch !== input.session.processEpoch ||
@@ -462,15 +459,14 @@ async function observeProviderAuthentication(input: Readonly<{
   });
 }
 
-function isMissingOpenCodeAuthObservation(
-  error: unknown,
+function mayEnterOpenCodeLogin(
   session: AgentSession,
   observation: ReturnType<typeof assertRemoteAgentSessionEvidence>,
   now: number,
 ): boolean {
-  if (!(error instanceof CunaError) || !MISSING_OPENCODE_AUTH_OBSERVATION_CODES.has(error.code)) return false;
   const expiresAt = Date.parse(observation.expiresAt);
-  return session.authMode === "interactive_login" &&
+  return session.agent === "opencode" &&
+    session.authMode === "interactive_login" &&
     (observation.state === "ready" || observation.state === "running") &&
     Number.isFinite(expiresAt) &&
     expiresAt > now;

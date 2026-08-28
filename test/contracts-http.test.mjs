@@ -418,6 +418,7 @@ function agentSessionAuth(overrides = {}) {
   return {
     observation_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     agent_session_id: "11111111-1111-4111-8111-111111111111",
+    agent: "claude-code",
     process_epoch: "33333333-3333-4333-8333-333333333333",
     auth_mode: "interactive_login",
     agent_version: "2.1.226",
@@ -433,11 +434,15 @@ function agentSessionAuth(overrides = {}) {
 test("AgentSession authentication evidence is closed, fresh, and process-scoped", () => {
   const decoded = decodeAgentSessionAuth(agentSessionAuth());
   assert.equal(decoded.agentSessionId, "11111111-1111-4111-8111-111111111111");
+  assert.equal(decoded.agent, "claude-code");
   assert.equal(decoded.processEpoch, "33333333-3333-4333-8333-333333333333");
   assert.equal(decoded.state, "authenticated");
   assert.equal(decoded.validUntil, "2026-08-08T00:00:31.000Z");
   assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({ state: "signed_in" })));
   assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({ process_epoch: "not-an-epoch" })));
+  const { agent: _agent, ...withoutAgent } = agentSessionAuth();
+  assert.throws(() => decodeAgentSessionAuth(withoutAgent));
+  assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({ agent: "unknown-agent" })));
   assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({ valid_until: "2026-08-07T23:59:59.000Z" })));
   assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({ valid_until: "2026-08-08T00:00:31.001Z" })));
   assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({ adapter_version: "runa.agent-auth.v1-local" })));

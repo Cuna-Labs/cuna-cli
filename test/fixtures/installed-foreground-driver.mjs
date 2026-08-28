@@ -167,7 +167,14 @@ try {
         async ensureAgentSessionReady() { return { id: automaticSessionId, machineId: "10000000-0000-4000-8000-000000000001" }; },
         async attach(input) {
           automatic.attached = { id: input.agentSessionId, agent: input.expectedAgent };
-          await foregroundTerminalRunner({ client, baseUrl: config.baseUrl, agentSessionIds: [input.agentSessionId], expectedAgentKinds: [input.expectedAgent], presentationMode: "plain" });
+          await foregroundTerminalRunner({
+            client,
+            baseUrl: config.baseUrl,
+            agentSessionIds: [input.agentSessionId],
+            expectedAgentKinds: [input.expectedAgent],
+            presentationMode: "plain",
+            opencodeEnabled: intent.agent === "opencode",
+          });
         },
         async reconcileCancellation() {},
       };
