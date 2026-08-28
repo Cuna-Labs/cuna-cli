@@ -6,11 +6,11 @@
   "infra_openapi_canonical_sha256": "ef07617065aa4c4c0c86df39336ce4a56120b47c0525d9de26eb700a25919d71",
   "producer_repository": "Cuna-Labs/infra",
   "producer_content_state": "committed",
-  "producer_revision": "25daebaa0a32b1dbe44d520f29e60c6657f936de",
+  "producer_revision": "c624cad9e28b02b2cb056231bb6d16e2a7c5e430",
   "producer_full_tree": {
     "object_format": "sha1",
-    "commit": "25daebaa0a32b1dbe44d520f29e60c6657f936de",
-    "tree": "0fbd8f293b5ff3b446aebb5eb54f44aa07d646ca",
+    "commit": "c624cad9e28b02b2cb056231bb6d16e2a7c5e430",
+    "tree": "265be3896f820fd2704c742b48db617a1de4dd12",
     "contract_blob": "7101560bde56a57f671d3b216c0cfae86bf24b15"
   },
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
@@ -20,8 +20,8 @@
     "opencode_interactive_only": {
       "openapi_raw_sha256": "c3e1a4b54d6c1523ab647c62aabdba252765941a5c70ef249de000acb6b080ed",
       "openapi_canonical_sha256": "ef07617065aa4c4c0c86df39336ce4a56120b47c0525d9de26eb700a25919d71",
-      "producer_commit": "25daebaa0a32b1dbe44d520f29e60c6657f936de",
-      "producer_tree": "0fbd8f293b5ff3b446aebb5eb54f44aa07d646ca",
+      "producer_commit": "c624cad9e28b02b2cb056231bb6d16e2a7c5e430",
+      "producer_tree": "265be3896f820fd2704c742b48db617a1de4dd12",
       "producer_contract_blob": "7101560bde56a57f671d3b216c0cfae86bf24b15"
     }
   }
