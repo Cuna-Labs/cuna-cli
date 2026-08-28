@@ -174,6 +174,7 @@ async function waitUntil(predicate, failure, evidence, timeoutMs = 5_000) {
 
 async function runConptyCase({ testId, args, environment = {}, drive, oracle }) {
   const terminal = new Terminal({ allowProposedApi: true, cols: 96, rows: 24, scrollback: 1_000 });
+  const launchedAt = Date.now();
   let transcript = "";
   let transcriptBytes = 0;
   let transcriptOverflow;
@@ -195,7 +196,7 @@ async function runConptyCase({ testId, args, environment = {}, drive, oracle }) 
   });
   const exited = new Promise((resolve) => child.onExit((event) => { childState = "exited"; exitResult = event; resolve(event); }));
   const context = {
-    child, terminal, observations, transcript: () => transcript, screen: () => decodedState(terminal, childState, exitResult).screen, state: () => decodedState(terminal, childState, exitResult), exited,
+    child, terminal, observations, launchedAt, transcript: () => transcript, screen: () => decodedState(terminal, childState, exitResult).screen, state: () => decodedState(terminal, childState, exitResult), exited,
     resize(columns, rows) { terminal.resize(columns, rows); child.resize(columns, rows); },
     waitUntil: (predicate, failure, timeoutMs) => waitUntil(() => {
       if (transcriptOverflow !== undefined) throw transcriptOverflow;
@@ -440,6 +441,80 @@ try {
       const foregroundStart = transcript().lastIndexOf("\u001b[?1049h");
       const foregroundEnd = transcript().lastIndexOf("\u001b[?1049l");
       assert.doesNotMatch(transcript().slice(foregroundStart, foregroundEnd), /Attaching to Claude Code/u, "attach spinner painted over the foreground PTY");
+    },
+  }));
+
+  results.push(await runConptyCase({
+    testId: "T14.3-WIN-OPENCODE-DIRECT", args: [machinesToForegroundFixture, configFile, "--opencode"], environment: cliEnvironment,
+    async drive(context) {
+      await context.waitUntil(
+        () => context.transcript().includes("Connecting to OpenCode") || context.transcript().includes("Attaching to OpenCode"),
+        "cuna opencode did not render immediate provider-specific feedback",
+      );
+      context.observations.processLaunchToFeedbackMs = Date.now() - context.launchedAt;
+      assert.ok(
+        context.observations.processLaunchToFeedbackMs < 4_000,
+        `OpenCode feedback exceeded four seconds after cold ConPTY launch (${context.observations.processLaunchToFeedbackMs}ms)`,
+      );
+      context.observations.command = "cuna opencode --agent-session <session-id>";
+      await context.waitUntil(
+        () => context.screen().includes("CUNA") && context.screen().includes("OPENCODE_TUI_ANSI256") && context.screen().includes("OpenCode cloud session 界 🦊"),
+        "cuna opencode did not compose the Cuna appbar with the OpenCode provider viewport",
+      );
+      const transition = context.transcript();
+      assert.match(transition, /Attaching to OpenCode/u, "OpenCode attach progress did not identify the provider");
+      assert.ok(
+        transition.indexOf("Attaching to OpenCode") < transition.indexOf("OPENCODE_TUI_ANSI256"),
+        "OpenCode feedback first appeared only after foreground ownership",
+      );
+      assert.match(transition, /◐/u, "OpenCode attach did not render the first loading frame");
+      const attachFrames = ["◐", "◓", "◑", "◒"].filter((frame) => transition.includes(frame));
+      assert.ok(attachFrames.length >= 2, "OpenCode attach loading indicator did not animate");
+      context.observations.attachFrames = attachFrames.join(" → ");
+      assert.match(transition, /\u001b\[48;2;235;86;37m/u, "OpenCode foreground did not render the Cuna truecolor appbar");
+      assert.match(
+        transition,
+        /\u001b\[(?:0;)?(?:(?:1|2|3|4|5|7|8|9|53);)*38;5;208m(?:\u001b\[49m)?OPENCODE_TUI_ANSI256/u,
+        "OpenCode ANSI-256 provider styling did not survive ConPTY composition",
+      );
+      assert.match(context.screen(), /❯ Continue/u, "OpenCode provider menu did not begin on its first option");
+      context.child.write("\u001b[B");
+      await context.waitUntil(() => context.screen().includes("❯ Connect provider"), "Down arrow did not move inside the OpenCode provider TUI");
+      context.child.write("\u001b[A");
+      await context.waitUntil(() => context.screen().includes("❯ Continue"), "Up arrow did not move inside the OpenCode provider TUI");
+      context.observations.arrowNavigation = "Continue → Connect provider → Continue";
+      context.resize(64, 16);
+      await context.waitUntil(
+        () => context.screen().includes("CUNA") && context.screen().includes("OPENCODE_TUI_ANSI256") && context.screen().includes("RESIZED_64x14"),
+        "OpenCode provider viewport did not repaint after ConPTY resize",
+      );
+      assert.equal(context.terminal.cols, 64, "OpenCode decoded terminal did not adopt the resized width");
+      assert.equal(context.terminal.rows, 16, "OpenCode decoded terminal did not adopt the resized height");
+      assert.match(context.screen(), /OpenCode cloud session 界 🦊/u, "OpenCode Unicode output was corrupted after resize");
+      context.observations.resize = "64x16 host / 64x14 provider";
+      const interruptAt = Date.now();
+      context.child.write("\u0003");
+      await context.waitUntil(
+        () => context.screen().includes("CUNA") && /[✦✧] Disconnecting\.\.\./u.test(context.screen()),
+        "one Ctrl-C did not render OpenCode closing feedback",
+      );
+      context.observations.ctrlCToClosingMs = Date.now() - interruptAt;
+      assert.ok(context.observations.ctrlCToClosingMs < 500, "OpenCode closing feedback was not immediate");
+      await context.waitUntil(
+        () => context.screen().includes("CUNA") && context.screen().includes("✓ Disconnected."),
+        "OpenCode detach did not render confirmation",
+      );
+      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("one Ctrl-C did not exit cuna opencode within two seconds")), 2_000))]);
+      context.observations.singleCtrlC = true;
+      context.observations.colors = "Cuna truecolor + provider ANSI-256";
+      context.observations.unicode = "界 🦊";
+    },
+    async oracle({ finalState, transcript }) {
+      assert.equal(finalState.exitCode, 0, "cuna opencode ConPTY flow exited nonzero");
+      assert.equal(finalState.activeScreen, "normal", "cuna opencode did not restore the normal screen");
+      assert.match(transcript(), /Attaching to OpenCode/u, "cuna opencode did not preserve its provider-specific attach label");
+      assert.match(transcript(), /\u001b\[\?1049h/u, "cuna opencode never entered the alternate screen");
+      assert.match(transcript(), /\u001b\[\?1049l/u, "cuna opencode did not leave the alternate screen");
     },
   }));
 

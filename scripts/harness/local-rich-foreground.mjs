@@ -2,17 +2,26 @@ import { ForegroundTerminalCoordinator } from "../../dist/index.js";
 import { createNodeForegroundTerminalHost } from "../../dist/pty/node-host-terminal.js";
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 const DEFAULT_SESSION_ID = "11111111-1111-4111-8111-111111111111";
 
 export async function runLocalRichForeground(input = {}) {
   const sessionId = input.agentSessionId ?? DEFAULT_SESSION_ID;
   const marker = input.marker ?? "REMOTE_ANSI256";
+  const agent = input.agent ?? "claude-code";
+  const providerLabel = input.providerLabel ?? agent;
+  const tabId = input.tabId ?? (agent === "claude-code" ? "claude" : agent);
   const intent = Object.freeze({
-    tabId: "claude",
+    tabId,
     agentSessionId: sessionId,
-    label: "claude-code",
-    agent: "claude-code",
+    label: providerLabel,
+    agent,
   });
+  let selectedMenuIndex = 0;
+  let inputBuffer = "";
+  const providerFrame = (suffix = "provider viewport ready") => input.interactiveMenu === true
+    ? `\u001b[2J\u001b[H\u001b[38;5;208m${marker}\u001b[0m  OpenCode cloud session 界 🦊\r\n\r\n${selectedMenuIndex === 0 ? "\u001b[38;5;45m❯ Continue\u001b[0m" : "  Continue"}\r\n${selectedMenuIndex === 1 ? "\u001b[38;5;45m❯ Connect provider\u001b[0m" : "  Connect provider"}\r\n\r\n${suffix}`
+    : `\u001b[2J\u001b[H\u001b[38;5;208m${marker}\u001b[0m\r\n${suffix}`;
   const snapshot = () => {
     const now = Date.now();
     return Object.freeze({
@@ -65,7 +74,7 @@ export async function runLocalRichForeground(input = {}) {
       outputSequence += 1n;
       await callbacks.onTerminalOutput(outputEvent(
         outputSequence,
-        `\u001b[2J\u001b[H\u001b[38;5;208m${marker}\u001b[0m\r\nprovider viewport ready`,
+        providerFrame(),
       ));
       return ready;
     },
@@ -76,13 +85,28 @@ export async function runLocalRichForeground(input = {}) {
       if (input.detachFailure === true) throw new Error("LOCAL_DETACH_FAILURE");
     },
     async reconnect() { return snapshot(); },
-    async sendInput() {},
+    async sendInput(bytes) {
+      if (input.interactiveMenu !== true) return;
+      inputBuffer += decoder.decode(bytes, { stream: true });
+      let changed = false;
+      while (inputBuffer.includes("\u001b[B") || inputBuffer.includes("\u001b[A")) {
+        const down = inputBuffer.indexOf("\u001b[B");
+        const up = inputBuffer.indexOf("\u001b[A");
+        const next = down >= 0 && (up < 0 || down < up) ? down : up;
+        selectedMenuIndex = next === down ? 1 : 0;
+        inputBuffer = inputBuffer.slice(next + 3);
+        changed = true;
+      }
+      if (!changed) return;
+      outputSequence += 1n;
+      await callbacks.onTerminalOutput(outputEvent(outputSequence, providerFrame("↑↓ provider navigation ready")));
+    },
     async resize(columns, rows) {
       if (columns !== 64 || rows !== 14) return;
       outputSequence += 1n;
       await callbacks.onTerminalOutput(outputEvent(
         outputSequence,
-        `\u001b[2J\u001b[H\u001b[38;5;208m${marker}\u001b[0m\r\nRESIZED_64x14`,
+        providerFrame("RESIZED_64x14"),
       ));
     },
     switchActive() { return snapshot(); },
