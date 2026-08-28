@@ -403,13 +403,7 @@ async function observeProviderAuthentication(input: Readonly<{
   } catch (error) {
     throwIfAborted(input.signal);
     if (mayEnterOpenCodeLogin(input.session, input.observation, input.now())) {
-      return Object.freeze({
-        value: "login_required",
-        source: `${input.observation.authority}:interactive_login_pending`,
-        observedAt: Date.parse(input.observation.observedAt),
-        expiresAt: Date.parse(input.observation.expiresAt),
-        correlationId: input.observation.evidenceRevision,
-      });
+      return openCodeInteractiveLoginPending(input.observation);
     }
     if (input.session.agent === "opencode") {
       throw runtimeFailure(
@@ -428,6 +422,20 @@ async function observeProviderAuthentication(input: Readonly<{
       status.evidenceClass === "provider_cli_credential_presence" &&
       (status.state === "login_required" || status.state === "configured")
     : status.evidenceClass !== "provider_cli_credential_presence";
+  // `unavailable/insufficient` is an explicit server abstention: its zero TTL
+  // makes it unusable as authentication evidence, but it is not proof that the
+  // exact, freshly supervisor-observed OpenCode PTY is unsafe to open.  The
+  // terminal-connection endpoint repeats the exact readiness check before it
+  // mints a one-use grant.  Preserve the distinction by showing only the
+  // conservative interactive-login-pending state, never configured/authenticated.
+  if (isCurrentOpenCodeAuthenticationAbstention(
+    input.session,
+    input.observation,
+    status,
+    now,
+  )) {
+    return openCodeInteractiveLoginPending(input.observation);
+  }
   if (
     status.agentSessionId !== input.session.id ||
     status.agent !== input.session.agent ||
@@ -470,6 +478,35 @@ function mayEnterOpenCodeLogin(
     (observation.state === "ready" || observation.state === "running") &&
     Number.isFinite(expiresAt) &&
     expiresAt > now;
+}
+
+function isCurrentOpenCodeAuthenticationAbstention(
+  session: AgentSession,
+  observation: ReturnType<typeof assertRemoteAgentSessionEvidence>,
+  status: AgentSessionAuth,
+  now: number,
+): boolean {
+  return mayEnterOpenCodeLogin(session, observation, now) &&
+    status.agentSessionId === session.id &&
+    status.agent === "opencode" &&
+    status.authMode === "interactive_login" &&
+    status.processEpoch !== null &&
+    status.processEpoch === session.processEpoch &&
+    status.processEpoch === observation.processEpoch &&
+    status.state === "unavailable" &&
+    status.evidenceClass === "insufficient";
+}
+
+function openCodeInteractiveLoginPending(
+  observation: ReturnType<typeof assertRemoteAgentSessionEvidence>,
+): ForegroundTabIntent["providerAuthentication"] {
+  return Object.freeze({
+    value: "login_required",
+    source: `${observation.authority}:interactive_login_pending`,
+    observedAt: Date.parse(observation.observedAt),
+    expiresAt: Date.parse(observation.expiresAt),
+    correlationId: observation.evidenceRevision,
+  });
 }
 
 function safeSessionLabel(session: AgentSession): string {

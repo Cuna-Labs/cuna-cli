@@ -967,6 +967,50 @@ test("OpenCode login admission rejects credential binding and an unavailable aut
   }
 });
 
+test("OpenCode matching unavailable auth abstention enters the current PTY as login required", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) {
+        return session(id, { agent: "opencode" });
+      },
+      async getAgentSessionAuth(id) {
+        return {
+          observationId: "abababab-abab-4bab-8bab-abababababab",
+          agentSessionId: id,
+          agent: "opencode",
+          processEpoch: `epoch-${id}`,
+          authMode: "interactive_login",
+          agentVersion: "unavailable",
+          adapterVersion: "cuna.opencode-auth.v1",
+          evidenceClass: "insufficient",
+          observedAt: new Date(NOW).toISOString(),
+          validUntil: new Date(NOW).toISOString(),
+          state: "unavailable",
+        };
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    expectedAgentKinds: ["opencode"],
+    opencodeEnabled: true,
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+
+  await waitUntil(() => events.includes("wire:connected"), "matching auth abstention must not block terminal authority");
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+});
+
 test("OpenCode login admission rejects a provider auth observation for another agent", async () => {
   const events = [];
   const host = new FakeHost(events);
