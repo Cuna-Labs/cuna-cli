@@ -5,6 +5,7 @@ import {
   runNodeForegroundSessions,
   selectNodeForegroundPresentation,
 } from "../dist/runtime/node-foreground-session.js";
+import { CunaError, EXIT_CODES } from "../dist/core/errors.js";
 import { encodeTerminalControl, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
 import { runtimeFailure } from "../dist/runtime/errors.js";
 
@@ -773,6 +774,145 @@ test("OpenCode direct attach reaches the PTY only with the compiled gate and exa
   host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   assert.equal(host.restored, 1);
+});
+
+test("OpenCode missing auth observation enters a current ready PTY for interactive login", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) {
+        events.push(`get:${id}`);
+        return session(id, { agent: "opencode" });
+      },
+      async getAgentSessionAuth(id) {
+        events.push(`auth:${id}`);
+        throw new CunaError({
+          code: "cuna.remote.not_found",
+          message: "No provider auth observation exists yet.",
+          exitCode: EXIT_CODES.remote,
+        });
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    expectedAgentKinds: ["opencode"],
+    opencodeEnabled: true,
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+
+  await waitUntil(() => events.includes("wire:connected"), "missing auth evidence should reach the login PTY");
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+});
+
+test("OpenCode missing auth observation still rejects stale or unavailable process readiness", async () => {
+  for (const [label, processState, evidence] of [
+    ["unavailable", "failed", { state: "failed" }],
+    ["stale", "running", {
+      observedAt: new Date(NOW - 60_000).toISOString(),
+      expiresAt: new Date(NOW - 1).toISOString(),
+    }],
+  ]) {
+    const events = [];
+    const host = new FakeHost(events);
+    const system = terminalSystem(events);
+    system.controlPlane.observeAgentSession = async (id) => {
+      events.push(`observe:${id}`);
+      return observation(id, evidence);
+    };
+    await assert.rejects(
+      runSupportedForegroundSessions({
+        client: fakeClient(events, {
+          async getAgentSession(id) {
+            events.push(`get:${id}`);
+            return session(id, { agent: "opencode", processState });
+          },
+          async getAgentSessionAuth() {
+            throw new CunaError({
+              code: "cuna.remote.not_found",
+              message: "No provider auth observation exists yet.",
+              exitCode: EXIT_CODES.remote,
+            });
+          },
+        }),
+        baseUrl: "https://api.getcuna.com",
+        agentSessionIds: [SESSION_A],
+        expectedAgentKinds: ["opencode"],
+        opencodeEnabled: true,
+      }, {
+        host,
+        controlPlane: system.controlPlane,
+        terminalConnector: system.terminalConnector,
+        clock: () => NOW,
+      }),
+      (error) => error?.code === "remote_state_unproven",
+      `${label} process evidence must fail closed`,
+    );
+    assert.equal(events.some((event) => event.startsWith("grant:")), false);
+    assert.equal(host.acquired, 0);
+  }
+});
+
+test("OpenCode login admission rejects credential binding and an unavailable auth observation", async () => {
+  for (const [label, authMode, authStatus] of [
+    ["credential-binding", "credential_binding", undefined],
+    ["auth-unavailable", "interactive_login", {
+      observationId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      agentSessionId: SESSION_A,
+      processEpoch: null,
+      authMode: "interactive_login",
+      agentVersion: "unavailable",
+      adapterVersion: "cuna.opencode-auth.v1",
+      evidenceClass: "insufficient",
+      observedAt: new Date(NOW).toISOString(),
+      validUntil: new Date(NOW).toISOString(),
+      state: "unavailable",
+    }],
+  ]) {
+    const events = [];
+    const host = new FakeHost(events);
+    const system = terminalSystem(events);
+    await assert.rejects(
+      runSupportedForegroundSessions({
+        client: fakeClient(events, {
+          async getAgentSession(id) {
+            events.push(`get:${id}`);
+            return session(id, { agent: "opencode", authMode });
+          },
+          async getAgentSessionAuth() {
+            if (authStatus !== undefined) return authStatus;
+            throw new CunaError({
+              code: "cuna.remote.not_found",
+              message: "No provider auth observation exists yet.",
+              exitCode: EXIT_CODES.remote,
+            });
+          },
+        }),
+        baseUrl: "https://api.getcuna.com",
+        agentSessionIds: [SESSION_A],
+        expectedAgentKinds: ["opencode"],
+        opencodeEnabled: true,
+      }, {
+        host,
+        controlPlane: system.controlPlane,
+        terminalConnector: system.terminalConnector,
+        clock: () => NOW,
+      }),
+      (error) => error?.code === "remote_state_unproven",
+      `${label} must fail closed`,
+    );
+    assert.equal(events.some((event) => event.startsWith("grant:")), false);
+    assert.equal(host.acquired, 0);
+  }
 });
 
 test("TC-009-02/05 plain mode binds one exact session without painting an appbar", async () => {

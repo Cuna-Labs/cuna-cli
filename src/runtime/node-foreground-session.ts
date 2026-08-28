@@ -8,6 +8,7 @@ import {
 } from "../api/contracts.js";
 import type { CunaApiClient } from "../api/client.js";
 import type { BrowserOpener } from "../auth/browser.js";
+import { CunaError } from "../core/errors.js";
 import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import {
   ForegroundTerminalCoordinator,
@@ -397,6 +398,15 @@ async function observeProviderAuthentication(input: Readonly<{
   } catch (error) {
     throwIfAborted(input.signal);
     if (input.session.agent === "opencode") {
+      if (isMissingOpenCodeAuthObservation(error, input.session, input.observation, input.now())) {
+        return Object.freeze({
+          value: "login_required",
+          source: `${input.observation.authority}:interactive_login_pending`,
+          observedAt: Date.parse(input.observation.observedAt),
+          expiresAt: Date.parse(input.observation.expiresAt),
+          correlationId: input.observation.evidenceRevision,
+        });
+      }
       throw runtimeFailure(
         "remote_state_unproven",
         "OpenCode foreground admission requires a current provider credential observation.",
@@ -441,6 +451,20 @@ async function observeProviderAuthentication(input: Readonly<{
     expiresAt: validUntil,
     correlationId: status.observationId,
   });
+}
+
+function isMissingOpenCodeAuthObservation(
+  error: unknown,
+  session: AgentSession,
+  observation: ReturnType<typeof assertRemoteAgentSessionEvidence>,
+  now: number,
+): boolean {
+  if (!(error instanceof CunaError) || error.code !== "cuna.remote.not_found") return false;
+  const expiresAt = Date.parse(observation.expiresAt);
+  return session.authMode === "interactive_login" &&
+    (observation.state === "ready" || observation.state === "running") &&
+    Number.isFinite(expiresAt) &&
+    expiresAt > now;
 }
 
 function safeSessionLabel(session: AgentSession): string {

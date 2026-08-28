@@ -773,6 +773,7 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     await runPhase(receipt, "installed-opencode-foreground", installedE2ePhaseTimeout("installed-opencode-foreground"), async () => {
       for (const [id, argv] of [
         ["login-required", ["opencode", "--agent-session", OPENCODE_SESSION_ID]],
+        ["login-required-missing-observation", ["opencode", "--agent-session", OPENCODE_AUTH_MISSING_SESSION_ID]],
         ["configured", ["opencode", "--agent-session", OPENCODE_AUTH_CONFIGURED_SESSION_ID]],
         ["automatic", ["opencode", ".", "--new-session"]],
       ]) {
@@ -783,13 +784,13 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
         assert.equal(result.receipt.events.includes("wire:close"), true, `OpenCode ${id} leaked its terminal wire`);
         assert.equal(result.receipt.child_closed, true, `OpenCode ${id} left its transport child open`);
       }
-      for (const [id, sessionId] of [["404", OPENCODE_AUTH_MISSING_SESSION_ID], ["semantic-invalid", OPENCODE_AUTH_INVALID_SESSION_ID]]) {
+      for (const [id, sessionId] of [["semantic-invalid", OPENCODE_AUTH_INVALID_SESSION_ID]]) {
         const result = await invokeInstalledForeground(["opencode", "--agent-session", sessionId], env, sandbox);
         assert.notEqual(result.code, 0, `OpenCode ${id} auth evidence must fail closed`);
         assert.equal(result.receipt.events.includes("host:acquire"), false, `OpenCode ${id} reached terminal ownership`);
         assert.equal(Object.hasOwn(result.receipt, "child_pid"), false, `OpenCode ${id} reached terminal child creation`);
       }
-      assert.ok(authority.state.openCodeSessionRequests >= 4, "OpenCode did not bind exact AgentSession authority");
+      assert.ok(authority.state.openCodeSessionRequests >= 5, "OpenCode did not bind exact AgentSession authority");
       assert.equal(authority.state.openCodeAgentAuth404Requests, 1, "OpenCode did not inspect missing auth evidence exactly once");
       assert.equal(authority.state.openCodeAgentAuthInvalidEvidenceRequests, 1, "OpenCode did not inspect invalid auth evidence exactly once");
       assert.equal(authority.state.openCodeAgentAuthConfiguredRequests, 1, "OpenCode did not inspect configured auth evidence exactly once");
