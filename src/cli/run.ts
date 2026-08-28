@@ -663,6 +663,12 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   let inlineRootProgress: Readonly<InlineProgress> | undefined;
   let interactiveRootUi = false;
   let interactiveRootColor = false;
+  // Root discovery, an explicit foreground attach, and an automatic provider
+  // journey all own the terminal interactively.  They must share the same
+  // one-Ctrl-C close affordance; restricting it to bare `cuna` leaked a raw
+  // journey cancellation error from `cuna opencode` before it reached the PTY.
+  let interactiveCloseUi = false;
+  let interactiveCloseColor = false;
   try {
     const parsed = parseArgv(argv);
     if (!booleanOption(parsed, "help") && (booleanOption(parsed, "version") || parsed.command === "version")) {
@@ -786,6 +792,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         "Foreground AgentSession attachment requires an interactive terminal and does not support JSON output.",
         "Run this command directly in an interactive terminal without --json or output redirection.",
       );
+    }
+    if ((journeyIntent !== undefined || foreground !== undefined) &&
+      !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY && streams.stderrIsTTY) {
+      interactiveCloseUi = true;
+      interactiveCloseColor = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
     }
     if (journeyIntent !== undefined) {
       // This is deliberately before config, credential, and network work: it
@@ -1031,6 +1042,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     if (interactiveRoot) {
       const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
       interactiveRootColor = color;
+      interactiveCloseUi = true;
+      interactiveCloseColor = color;
       if (streams.stderrIsTTY === true) {
         inlineRootProgress = startInlineProgress(streams.stderr, color, "Finding a machine or AgentSession");
       } else {
@@ -1417,8 +1430,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       : unknownError instanceof RuntimeBoundaryError
         ? runtimeError(unknownError)
       : normalizeError(unknownError);
-    if (interactiveRootUi && dependencies.signal?.aborted === true && streams.stderrIsTTY === true) {
-      await animateInlineClose(streams.stderr, interactiveRootColor);
+    if (interactiveCloseUi && streams.stderrIsTTY === true &&
+      (dependencies.signal?.aborted === true || error.code === "cuna.journey.cancelled")) {
+      await animateInlineClose(streams.stderr, interactiveCloseColor);
       return EXIT_CODES.success;
     }
     if (interactiveRootUi && streams.stderrIsTTY === true && isTerminalResumeHandleConflict(error)) {

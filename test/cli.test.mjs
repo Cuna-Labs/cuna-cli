@@ -399,6 +399,41 @@ test("Ctrl-C while bare cuna is attaching closes visibly and returns success", a
   assert.doesNotMatch(visible, /Error \[/u);
 });
 
+test("Ctrl-C during an OpenCode automatic journey closes visibly instead of printing a journey error", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const controller = new AbortController();
+  const exit = await runCli(["opencode", ".", "--new", "--no-sync"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY, TERM: "xterm-256color" },
+    signal: controller.signal,
+    clientFactory: () => fakeClient(),
+    automaticJourneyEffectsFactory: () => ({
+      onPhase() {},
+      async inspectWorkspace() {
+        controller.abort(new Error("Cuna was interrupted by SIGINT."));
+        return { canonicalLocalRoot: "C:\\work\\project" };
+      },
+      async observeMachines() { throw new Error("unreachable"); },
+      async createMachine() { throw new Error("unreachable"); },
+      async reconcileMachineCreate() { return "unreconcilable"; },
+      async ensureMachineReady() { throw new Error("unreachable"); },
+      async synchronizeWorkspace() { throw new Error("unreachable"); },
+      async observeAgentSessions() { throw new Error("unreachable"); },
+      async createAgentSession() { throw new Error("unreachable"); },
+      async ensureAgentSessionReady() { throw new Error("unreachable"); },
+      async attach() { throw new Error("unreachable"); },
+      async reconcileCancellation() {},
+    }),
+  });
+
+  assert.equal(exit, EXIT_CODES.success);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /✦ Closing Cuna/u);
+  assert.match(visible, /✓ Closed/u);
+  assert.doesNotMatch(visible, /cuna\.journey\.cancelled|Error \[/u);
+});
+
 test("bare cuna signs in before it claims to search machines", async () => {
   const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
   let signedIn = false;
