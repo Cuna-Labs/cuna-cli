@@ -368,6 +368,52 @@ test("OpenCode counts and a live OpenCode child are visible and attachable when 
   assert.equal(host.restored, 1);
 });
 
+test("bare explorer offers machine creation when every observed machine is unusable", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "failed-open", state: "error", agent: "opencode" }] };
+      },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities() {
+        return {
+          schemaVersion: "1.0",
+          subjectScope: "machine",
+          subjectId: MACHINE_ID,
+          observedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30_000).toISOString(),
+          etag: "runtime-unavailable",
+          capabilities: [{
+            id: "agent_sessions.create",
+            availability: "temporarily_unavailable",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reason: "opencode_runtime_unverified",
+          }],
+        };
+      },
+    },
+    opencodeEnabled: true,
+  }, { host });
+
+  await waitUntil(
+    () => host.writes.some((write) => stripAnsi(write).includes("No available machine can open an AgentSession")),
+    "unusable inventory should expose global creation choices",
+  );
+  const frame = stripAnsi(host.writes.at(-1));
+  assert.match(frame, /failed-open\s+error/u);
+  assert.match(frame, /Create OpenCode machine/u);
+
+  host.emitInput([0x1b, 0x5b, 0x42]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("❯ Create OpenCode machine"), "Down should select OpenCode creation");
+  host.emitInput([0x0d]);
+  assert.deepEqual(await operation, { kind: "launch", agent: "opencode" });
+  assert.equal(host.restored, 1);
+});
+
 test("Right on an attachable child opens that exact session instead of the provider creation menu", async () => {
   const host = new FakeHost();
   const operation = runNodeMachinesExplorer({

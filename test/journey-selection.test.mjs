@@ -198,6 +198,24 @@ test("duplicate machine IDs, stale bindings, unknown authority and incompatible 
   });
 });
 
+test("terminal machines with unavailable provider evidence do not block automatic creation", () => {
+  for (const state of ["error", "deleted"]) {
+    assert.deepEqual(
+      planMachineSelection(machineInput([
+        machine({ state, requestedAgentSupport: "unknown", recency: "unknown" }),
+      ], { requestedAgent: "opencode" })),
+      { kind: "create-required", target: "machine", reason: "no-compatible-candidate" },
+      `${state} must not poison a new OpenCode machine selection`,
+    );
+  }
+
+  const creating = planMachineSelection(machineInput([
+    machine({ state: "creating", requestedAgentSupport: "unknown", recency: "unknown" }),
+  ], { requestedAgent: "opencode" }));
+  assert.equal(creating.kind, "unavailable");
+  assert.equal(creating.reason, "authority-observation-stale");
+});
+
 test("PRD-033 legacy machine agent never blocks a different supported child agent", () => {
   const plan = planMachineSelection(machineInput([
     machine({ agent: "claude-code", requestedAgentSupport: "supported" }),

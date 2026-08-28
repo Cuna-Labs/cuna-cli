@@ -682,6 +682,7 @@ function renderMachinesExplorer(input: {
   if (input.navigation.screen.kind !== "machines") return renderContextScreen(input);
   const lines = [machineHeader("Machines"), " Your machines and the agents running inside them.", ""];
   let selectedLine: number | undefined;
+  const offerGlobalCreation = shouldOfferGlobalCreation(input.rows, input.now, input.opencodeEnabled);
   if (input.loadingPhase === "machines" && input.rows.length === 0) {
     lines.push(loaderLine("Discovering machines", input.animationFrame));
   } else if (input.rows.length === 0) {
@@ -732,6 +733,15 @@ function renderMachinesExplorer(input: {
       });
       lines.push(`${sessionSelected ? "❯" : " "}   ${branch} ${providerDisplayName(session.agent)} · ${safeLine(session.name)}  ${displaySessionActionability(actionability)}`);
       lines.push(`       ${session.id} · ${safeLine(session.cwd)}`);
+    }
+  }
+  if (input.rows.length > 0 && offerGlobalCreation) {
+    lines.push("", "No available machine can open an AgentSession. Create a supported machine:");
+    for (const agent of providerCreationOrder(input.opencodeEnabled)) {
+      const key: SelectionKey = `create:${agent}`;
+      const selected = input.selectedKey === key;
+      if (selected) selectedLine = lines.length;
+      lines.push(`${selected ? "❯" : " "} Create ${providerDisplayName(agent)} machine`);
     }
   }
   if (input.loadingPhase === "sessions" && input.rows.length > 0) {
@@ -846,6 +856,20 @@ function uniqueOpenableSession(row: MachineRow, now: number, opencodeEnabled: bo
   return openable.length === 1 ? openable[0] : undefined;
 }
 
+function shouldOfferGlobalCreation(
+  rows: readonly MachineRow[],
+  now: number,
+  opencodeEnabled: boolean,
+): boolean {
+  if (rows.length === 0) return true;
+  return rows.every((row) => {
+    if (row.sessionsLoading === true) return false;
+    return !machineContextActions(row, now, opencodeEnabled).some(
+      (action) => action.kind === "start" || action.kind === "provider" || action.kind === "new-session",
+    ) && uniqueOpenableSession(row, now, opencodeEnabled) === undefined;
+  });
+}
+
 function overviewFooter(
   rows: readonly MachineRow[],
   selectedKey: SelectionKey | undefined,
@@ -906,17 +930,18 @@ function selectableKeys(
           now,
         }).map(providerActionSelectionKey));
   }
-  if (rows.length === 0) return Object.freeze(
-    providerCreationOrder(opencodeEnabled).map((agent): SelectionKey => `create:${agent}`),
-  );
-  return Object.freeze(rows.flatMap((row): SelectionKey[] => [
+  const machineKeys = rows.flatMap((row): SelectionKey[] => [
     `machine:${row.machine.id}`,
     ...(expanded.has(row.machine.id)
       ? row.sessions
           .filter((session) => isActionableProvider(session.agent, opencodeEnabled))
           .map((session): SelectionKey => `session:${session.id}`)
       : []),
-  ]));
+  ]);
+  const creationKeys = shouldOfferGlobalCreation(rows, now, opencodeEnabled)
+    ? providerCreationOrder(opencodeEnabled).map((agent): SelectionKey => `create:${agent}`)
+    : [];
+  return Object.freeze([...machineKeys, ...creationKeys]);
 }
 
 function machineActionSelectionKey(action: MachineContextAction): SelectionKey {

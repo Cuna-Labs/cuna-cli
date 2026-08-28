@@ -501,7 +501,10 @@ export function planMachineSelection(input: MachineSelectionInput): MachineSelec
   );
   if (
     input.machines.some(
-      (machine) => machine.ownership !== "foreign" && machine.requestedAgentSupport === "unknown",
+      (machine) =>
+        machine.ownership !== "foreign" &&
+        machine.requestedAgentSupport === "unknown" &&
+        (machine.state === "unknown" || REUSABLE_MACHINE_STATES.has(machine.state)),
     ) ||
     plausiblyCompatible.some(
       (machine) =>
