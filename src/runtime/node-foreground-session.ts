@@ -35,6 +35,15 @@ import {
 } from "./terminal-transport.js";
 
 const TERMINAL_CAPABILITY_ID = "terminal_connections.create";
+// A first interactive OpenCode session has no credential state yet. Older
+// production deployments either return a resource 404 or do not serve the
+// observation route at all. Neither response is proof of a provider
+// credential, but a fresh supervisor process and the one-use terminal grant
+// are sufficient authority to enter that provider's login TUI.
+const MISSING_OPENCODE_AUTH_OBSERVATION_CODES = new Set([
+  "cuna.remote.not_found",
+  "cuna.remote.operation_not_served",
+]);
 
 export interface ForegroundSessionRunnerInput {
   readonly client: CunaApiClient;
@@ -459,7 +468,7 @@ function isMissingOpenCodeAuthObservation(
   observation: ReturnType<typeof assertRemoteAgentSessionEvidence>,
   now: number,
 ): boolean {
-  if (!(error instanceof CunaError) || error.code !== "cuna.remote.not_found") return false;
+  if (!(error instanceof CunaError) || !MISSING_OPENCODE_AUTH_OBSERVATION_CODES.has(error.code)) return false;
   const expiresAt = Date.parse(observation.expiresAt);
   return session.authMode === "interactive_login" &&
     (observation.state === "ready" || observation.state === "running") &&

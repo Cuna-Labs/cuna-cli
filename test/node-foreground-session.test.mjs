@@ -776,7 +776,8 @@ test("OpenCode direct attach reaches the PTY only with the compiled gate and exa
   assert.equal(host.restored, 1);
 });
 
-test("OpenCode missing auth observation enters a current ready PTY for interactive login", async () => {
+for (const missingAuthCode of ["cuna.remote.not_found", "cuna.remote.operation_not_served"]) {
+test(`OpenCode ${missingAuthCode} enters a current ready PTY for interactive login`, async () => {
   const events = [];
   const host = new FakeHost(events);
   host.columns = 160;
@@ -790,7 +791,7 @@ test("OpenCode missing auth observation enters a current ready PTY for interacti
       async getAgentSessionAuth(id) {
         events.push(`auth:${id}`);
         throw new CunaError({
-          code: "cuna.remote.not_found",
+          code: missingAuthCode,
           message: "No provider auth observation exists yet.",
           exitCode: EXIT_CODES.remote,
         });
@@ -813,6 +814,7 @@ test("OpenCode missing auth observation enters a current ready PTY for interacti
   await operation;
   assert.equal(host.restored, 1);
 });
+}
 
 test("OpenCode missing auth observation still rejects stale or unavailable process readiness", async () => {
   for (const [label, processState, evidence] of [
