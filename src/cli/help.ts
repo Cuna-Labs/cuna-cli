@@ -1,6 +1,7 @@
 import { exitCodeHelpSection } from "../core/exit-codes.js";
 import { brandedEnvironmentNames } from "../core/namespace.js";
 import { API_KEYS_URL } from "../core/product-web.js";
+import { CLI_ROUTE_REGISTRY } from "./parser.js";
 
 // Help is the only place most users learn a variable name, so it is derived
 // from the same authority the resolver reads. A hand-written name here would go
@@ -42,50 +43,68 @@ const EXIT_CODES_SECTION = exitCodeHelpSection();
  * configured deployment. `cuna doctor` measures local encrypted storage, and
  * its opt-in remote probe measures the browser-login bootstrap separately.
  */
-export const SHORT_HELP = `Cuna CLI
+const PROVIDER_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  claude: "Open Claude Code in a machine",
+  codex: "Open Codex in a machine",
+  opencode: "Open OpenCode in a machine",
+});
 
-Run cloud development agents from your local command line.
+const CURRENT_PROVIDER_COMMANDS = Object.freeze(
+  CLI_ROUTE_REGISTRY
+    .map((route) => route.key)
+    .filter((key) => Object.hasOwn(PROVIDER_LABELS, key)),
+);
 
-Usage:
-  cuna <command> [options]
+/** Commands printed by first-run help, ending in the guided root journey. */
+export const FIRST_RUN_TRANSCRIPT: readonly (readonly string[])[] = Object.freeze([
+  Object.freeze(["login"]),
+  Object.freeze([]),
+]);
+
+/**
+ * Render primary discovery from supported command capabilities. A producer
+ * claim cannot advertise a provider whose command route is absent from this
+ * build, which keeps OpenCode hidden until both halves actually exist.
+ */
+export function renderShortHelp(
+  supportedProviderCommands: readonly string[] = CURRENT_PROVIDER_COMMANDS,
+): string {
+  const supported = new Set(supportedProviderCommands);
+  const providerLines = CURRENT_PROVIDER_COMMANDS
+    .filter((command) => supported.has(command))
+    .map((command) => `  cuna ${command} [PATH]${" ".repeat(Math.max(1, 18 - command.length))}${PROVIDER_LABELS[command]}`)
+    .join("\n");
+  return `Cuna CLI
+
+Open a machine, pick an agent, keep working.
+
+Start here:
+  cuna                    Choose a machine, agent, and session
+  cuna machines           Browse machines and the sessions inside them
+${providerLines}
 
 First run:
-  1. Run \`cuna doctor\` and confirm encrypted local session storage
-  2. Run \`cuna login\`, approve in the browser, and paste the displayed login code
-  3. Continue with \`cuna whoami\` or \`cuna machines list\` from a fresh shell
+  1. Run \`cuna login\`, approve in the browser, and paste the displayed login code
+  2. Run \`cuna\` to enter an attached provider terminal
 
-Works with no network:
-  doctor                Report platform, runtime, and encrypted local session-store state
-  version               Show the CLI version, build digest, and protocol range
-  config get            Show effective, redacted configuration
-  self-test --offline   Verify the installed CLI without network access
+Diagnose this installation:
+  cuna doctor                Report platform, runtime, and encrypted local session-store state
+  cuna version               Show the CLI version, build digest, and protocol range
+  cuna config get            Show effective, redacted configuration
+  cuna self-test --offline   Verify the installed CLI without network access
 
-Works with an automation credential:
-  account show          Show the public account identity
-  workspace show        Show assignment or waitlist state
-  usage show            Show authoritative workspace estimates
-  machines list         List owned Cuna machines
-  records list          List redacted account activity records
-  capabilities          Inspect what this deployment actually serves
-  claude [PATH]         Synchronize, select or create, and attach Claude Code
-  codex [PATH]          Synchronize, select or create, and attach Codex
-  openclaw [PATH]       Synchronize, select or create, and attach OpenClaw
-  opencode [PATH]       OpenCode (requires CUNA_OPENCODE_ENABLED=true and a committed Infra witness)
-  connect SESSION_ID    Attach one exact AgentSession in this terminal
-
-Requires an interactive Cuna session:
-  api-keys create       Create an API key and print its secret once
-  api-keys list         List API-key metadata without secret values
-  api-keys revoke ID    Revoke one API key
-
-Not available in this build:
-  background daemon, local companion
-  Run \`cuna doctor\` to see what this platform and build actually provide.
-
-More:
+Advanced and automation:
   cuna help --all          Every command, option, and exit code
   cuna <command> --help    Help for one command
 `;
+}
+
+export const SHORT_HELP = renderShortHelp();
+
+/** One generated line per semantic parser route; tests parse these markers. */
+export const COMPLETE_COMMAND_REFERENCE = CLI_ROUTE_REGISTRY
+  .map((route) => `  [${route.classification}] ${route.key} :: cuna ${route.syntax}\n      ${route.summary}`)
+  .join("\n");
 
 export const FULL_HELP = `Cuna CLI
 
@@ -102,6 +121,7 @@ Available now:
   logout                               Revoke the login-code family server-first;
                                        reuse the encrypted session automatically
   capabilities                         Inspect current server capability truth
+  machines                             Browse machines and their AgentSessions
   machines list                        List owned Cuna machines
   machines create [options]            Create a machine when server-advertised
   machines start|pause|resume|stop ID  Change lifecycle when server-advertised
@@ -130,12 +150,11 @@ Capability-gated foreground preview:
   agent logout --agent-session ID      Sign Claude Code or Codex out of one exact AgentSession
   claude --agent-session SESSION_ID    Attach one exact Claude Code child
   codex --agent-session SESSION_ID     Attach one exact Codex child
-  openclaw --agent-session SESSION_ID  Attach one exact OpenClaw child
+  opencode --agent-session SESSION_ID  Attach one exact OpenCode child
   The server must prove current terminal capability. JSON and redirected output
   fail closed. Nested SSH/tmux and TERM=dumb use a one-session byte-preserving plain
   fallback with no appbar; set CUNA_TERMINAL_MODE=plain for accessibility or diagnosis.
-  cuna agent logout does not log out OpenCode; use OpenCode's own interactive
-  provider flow.
+  Ctrl+C detaches locally in one press. Use Ctrl+] c to send Ctrl+C to the agent.
   Background daemon and local companion behavior remain unavailable.
 
 Automatic local-to-cloud journey:
@@ -145,9 +164,6 @@ Automatic local-to-cloud journey:
   codex [PATH] [--machine NAME | --new] [--no-sync] [--new-session]
         [--auth-mode interactive_login|credential_binding]
         [--credential-binding ID]
-  openclaw [PATH] [--machine NAME | --new] [--new-session]
-           [--auth-mode interactive_login|credential_binding]
-           [--credential-binding ID]
   opencode [PATH] [--machine NAME | --new] [--no-sync] [--new-session]
            [--auth-mode interactive_login]
   Cuna validates the complete command before effects, selects only from fresh
@@ -157,21 +173,22 @@ Automatic local-to-cloud journey:
   Ambiguous, stale, cancelled, or unknown outcomes fail closed without silently
   choosing a target or retrying with a second identity.
   --credential-binding ID is required exactly when --auth-mode is credential_binding.
-  OpenCode is interactive-only. On a remote Cuna machine, use OpenCode /connect,
-  select OpenAI, then ChatGPT Pro/Plus (headless). Its provider credentials remain
-  isolated from Codex sessions on the same machine.
-  OpenCode execution, including exact --agent-session attachment, is locally OFF
-  unless CUNA_OPENCODE_ENABLED=true exactly and this installed CLI contains an
-  exact committed Infra OpenCode-contract witness. This consumer guard does not
-  activate Edge, does not override the release manifest, and does not copy or
-  inject credentials. A mutable producer worktree cannot reach remote, host, or
-  child-process effects.
+  OpenCode is interactive-only: use /connect inside its terminal. Provider credentials
+  remain in that AgentSession and are never copied from Codex or another provider store.
   Use --agent-session SESSION_ID to bypass reconciliation and attach one exact child;
   it cannot be combined with PATH, --machine, --new, --new-session, --no-sync,
   --auth-mode, or --credential-binding.
 
 Reserved and fail-closed in this build:
   shell, background daemon, local companion
+
+Complete command reference:
+${COMPLETE_COMMAND_REFERENCE}
+
+Compatibility aliases (advanced only):
+  cuna --help             Alias for primary help
+  cuna --help --all       Alias for complete help
+  cuna --version          Alias for cuna version
 
 Global options:
   --json              Emit versioned JSON records
@@ -201,7 +218,7 @@ Authentication:
   service has issued; the first one that is SET wins, even when its value is unusable.
 
 Canonical install:
-  npm install -g @cuna_labs/cli
+  npm install --global ./cuna_labs-cli-0.1.0.tgz
 `;
 
 /**

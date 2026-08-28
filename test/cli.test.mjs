@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
+import { CunaError, EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
 import { CREDENTIAL_BACKEND_PROTOCOL } from "../dist/credentials/contracts.js";
 
 const API_KEY = "cuna_sk_abcdefghijklmnop";
@@ -17,6 +17,12 @@ const FOREGROUND_SESSION_A = "11111111-1111-4111-8111-111111111111";
 const FOREGROUND_SESSION_B = "22222222-2222-4222-8222-222222222222";
 const FOREGROUND_SESSION_C = "33333333-3333-4333-8333-333333333333";
 const FOREGROUND_SESSION_D = "44444444-4444-4444-8444-444444444444";
+const ESCAPE = String.fromCharCode(27);
+const ANSI_PATTERN = new RegExp(`${ESCAPE}\\[[0-?]*[ -/]*[@-~]`, "gu");
+
+function stripAnsi(value) {
+  return value.replaceAll(ANSI_PATTERN, "");
+}
 
 const platform = {
   kind: "linux",
@@ -49,6 +55,7 @@ function fakeClient(overrides = {}) {
     },
     async discoverCapabilities() { return capabilitySnapshot([]); },
     async listMachines() { return { items: [] }; },
+    async getMachine(id) { return { id, name: "fixture-machine", state: "running", agent: "claude-code" }; },
     async listRecords() { return []; },
     async listAuthorizations() { return []; },
     async listApiKeys() { return []; },
@@ -73,6 +80,377 @@ test("parser keeps subcommands separate from options and rejects duplicates", ()
   assert.deepEqual(parsed.operands, ["create"]);
   assert.deepEqual(parsed.options, { name: "dev", yes: true, json: true });
   assert.throws(() => parseArgv(["machines", "--json", "--json"]));
+});
+
+test("bare machines opens the TTY explorer while JSON returns the nested read-only inventory", async () => {
+  let explorerCalls = 0;
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  assert.equal(await runCli(["machines"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    machinesExplorerRunner: async ({ client }) => {
+      explorerCalls += 1;
+      assert.equal(typeof client.listMachines, "function");
+    },
+  }), EXIT_CODES.success);
+  assert.equal(explorerCalls, 1);
+  assert.equal(interactive.stdout(), "");
+
+  const machine = { id: MACHINE_ID, name: "goal0", state: "running", agent: "claude-code" };
+  const session = (id, agent, processState, overrides = {}) => ({
+    id,
+    machineId: MACHINE_ID,
+    name: `${agent}-${processState}`,
+    agent,
+    cwd: "/workspace",
+    authMode: "interactive_login",
+    desiredState: "running",
+    requestState: "launched",
+    processState,
+    processEpoch: `epoch-${id}`,
+    runtimeObservedAt: "2026-08-27T01:00:00.000Z",
+    runtimeExpiresAt: "2026-08-27T01:01:00.000Z",
+    rowVersion: 1,
+    createdAt: "2026-08-27T01:00:00.000Z",
+    updatedAt: "2026-08-27T01:00:00.000Z",
+    ...overrides,
+  });
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "--json"], {
+    streams: json.streams,
+    platform,
+    now: () => Date.parse("2026-08-27T01:00:30.000Z"),
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async listMachines() { return { items: [machine] }; },
+      async listAgentSessions() {
+        return { items: [
+          session(FOREGROUND_SESSION_A, "claude-code", "running"),
+          session(FOREGROUND_SESSION_B, "claude-code", "ready"),
+          session(FOREGROUND_SESSION_C, "codex", "running"),
+          session(FOREGROUND_SESSION_D, "claude-code", "running", { desiredState: "terminated" }),
+          session("55555555-5555-4555-8555-555555555555", "codex", "running", { requestState: "termination_pending" }),
+          session("66666666-6666-4666-8666-666666666666", "opencode", "running"),
+        ] };
+      },
+    }),
+  }), EXIT_CODES.success);
+  const record = JSON.parse(json.stdout());
+  assert.equal(record.command, "machines.overview");
+  assert.deepEqual(record.data.items[0].session_counts.claude, { running: 1, total: 2 });
+  assert.deepEqual(record.data.items[0].session_counts.codex, { running: 0, total: 1 });
+  assert.deepEqual(record.data.items[0].session_counts.opencode, { running: 0, total: 1 });
+  assert.deepEqual(Object.keys(record.data.items[0].session_counts), ["claude", "codex", "opencode"]);
+  assert.equal(record.data.items[0].agent_sessions.length, 4);
+  assert.equal(record.data.items[0].agent_sessions.some((item) => item.desired_state === "terminated"), false);
+  assert.equal(record.data.items[0].agent_sessions.some((item) => item.request_state === "termination_pending"), false);
+  const visibleOpenCode = record.data.items[0].agent_sessions.find((item) => item.agent === "opencode");
+  assert.equal(visibleOpenCode.can_attach, false);
+  assert.equal(visibleOpenCode.base_state, "unsupported");
+  assert.equal(visibleOpenCode.reason_code, "provider_mismatch");
+  assert.deepEqual(record.data.items[0].provider_availability, {
+    declared_id: "claude-code",
+    display_name: "Claude",
+    usability: "declared-installed",
+    actionable: true,
+  });
+  assert.equal(record.data.items[0].agent_sessions.find((item) => item.agent === "codex").base_state, "unsupported");
+});
+
+test("machines overview keeps OpenCode observations visible and actionable on a compatible machine", async () => {
+  const machine = { id: MACHINE_ID, name: "legacy-opencode", state: "running", agent: "opencode", updatedAt: "provider-v4" };
+  const client = fakeClient({
+    async listMachines() { return { items: [machine] }; },
+    async listAgentSessions() { return { items: [agentSession({
+      machineId: MACHINE_ID,
+      agent: "opencode",
+      name: "observed-opencode",
+      requestState: "launched",
+      processState: "running",
+      processEpoch: "open-epoch",
+      runtimeObservedAt: "2026-08-07T23:59:59.000Z",
+      runtimeExpiresAt: "2026-08-08T00:00:30.000Z",
+    })] }; },
+  });
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "--json"], {
+    streams: json.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  const item = JSON.parse(json.stdout()).data.items[0];
+  assert.deepEqual(item.provider_availability, {
+    declared_id: "opencode",
+    display_name: "OpenCode",
+    usability: "declared-installed",
+    actionable: true,
+    observation_version: "provider-v4",
+  });
+  assert.equal(item.agent_sessions[0].agent, "opencode");
+  assert.equal(item.agent_sessions[0].can_attach, true);
+  assert.equal(item.agent_sessions[0].base_state, "attachable");
+
+  const human = memoryStreams({ stdoutIsTTY: true });
+  assert.equal(await runCli(["machines"], {
+    streams: human.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  assert.match(human.stdout(), /OpenCode declared-installed/u);
+  assert.match(human.stdout(), /observed-opencode  attachable/u);
+  assert.ok(human.stdout().indexOf("OpenCode 1/1 running") < human.stdout().indexOf("Claude 0/0 running"));
+});
+
+test("machines overview degrades one AgentSession child-read failure without losing inventory", async () => {
+  const failedId = MACHINE_ID;
+  const healthyId = "44444444-4444-4444-8444-444444444444";
+  const client = fakeClient({
+    async listMachines() {
+      return { items: [
+        { id: failedId, name: "partial", state: "running", agent: "claude-code" },
+        { id: healthyId, name: "healthy", state: "running", agent: "codex" },
+      ] };
+    },
+    async listAgentSessions(machineId) {
+      if (machineId === failedId) throw new Error("private upstream failure");
+      return { items: [agentSession({ id: FOREGROUND_SESSION_B, machineId: healthyId, agent: "codex", name: "healthy-codex" })] };
+    },
+  });
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "--json"], {
+    streams: json.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  const items = JSON.parse(json.stdout()).data.items;
+  assert.equal(items.length, 2);
+  assert.equal(items.find((item) => item.id === failedId).agent_sessions_error, "sessions_unavailable");
+  assert.deepEqual(items.find((item) => item.id === failedId).agent_sessions, []);
+  assert.equal(items.find((item) => item.id === healthyId).agent_sessions[0].name, "healthy-codex");
+  assert.doesNotMatch(json.stdout(), /private upstream failure/u);
+
+  const human = memoryStreams({ stdoutIsTTY: true });
+  assert.equal(await runCli(["machines"], {
+    streams: human.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  assert.match(human.stdout(), /partial[\s\S]*AgentSessions unavailable/u);
+  assert.match(human.stdout(), /healthy[\s\S]*healthy-codex/u);
+});
+
+test("machines explorer selection attaches through the shared foreground runner", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const attached = [];
+  assert.equal(await runCli(["machines"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    machinesExplorerRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async (input) => { attached.push(input); },
+  }), EXIT_CODES.success);
+  assert.equal(attached.length, 1);
+  assert.deepEqual(attached[0].agentSessionIds, [FOREGROUND_SESSION_A]);
+  assert.deepEqual(attached[0].expectedAgentKinds, ["claude-code"]);
+  assert.match(stripAnsi(interactive.stderr()), /Attaching to Claude Code/u);
+});
+
+test("machine lifecycle recursion preserves --no-color for explorer and progress", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  let explorerCalls = 0;
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      return capabilitySnapshot([{
+        id: "machines.lifecycle",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["machines:write"],
+      }], scope, resourceId);
+    },
+    async transitionMachine(id) { return { id, name: "paused-dev", state: "starting", agent: "claude-code" }; },
+    async getMachine(id) { return { id, name: "paused-dev", state: "running", agent: "claude-code" }; },
+  });
+  assert.equal(await runCli(["machines", "--no-color"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+    machinesExplorerRunner: async (input) => {
+      explorerCalls += 1;
+      assert.equal(input.color, false);
+      return explorerCalls === 1
+        ? { kind: "lifecycle", action: "start", machineId: MACHINE_ID }
+        : undefined;
+    },
+  }), EXIT_CODES.success);
+  assert.equal(explorerCalls, 2, "successful lifecycle should reopen the same no-color explorer");
+  assert.match(interactive.stderr(), /Starting machine/u);
+  assert.equal(interactive.stderr().includes("\u001b[38;"), false);
+  assert.equal(interactive.stderr().includes("\u001b[48;"), false);
+});
+
+test("no-args remains help off-TTY but a real TTY infers and attaches the selected AgentSession", async () => {
+  const redirected = memoryStreams();
+  assert.equal(await runCli([], { streams: redirected.streams }), EXIT_CODES.success);
+  assert.match(JSON.parse(redirected.stdout()).data.help, /cuna machines/u);
+
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const attached = [];
+  assert.equal(await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async (input) => { attached.push(input); },
+  }), EXIT_CODES.success);
+  assert.equal(attached.length, 1);
+  assert.deepEqual(attached[0].agentSessionIds, [FOREGROUND_SESSION_A]);
+  assert.deepEqual(attached[0].expectedAgentKinds, ["claude-code"]);
+  assert.match(stripAnsi(interactive.stderr()), /Finding a machine or AgentSession/u);
+  assert.equal(interactive.stderr().includes(`${ESCAPE}[38;5;202m`), true, "the root journey should use the Cuna flare accent");
+  const progressOutput = stripAnsi(interactive.stderr());
+  assert.match(progressOutput, /◐ Finding a machine or AgentSession  ━╺━━━━/u);
+  assert.match(progressOutput, /◐ Attaching to Claude Code  ━╺━━━━/u);
+  assert.doesNotMatch(progressOutput, /Cuna: attaching to Claude/u);
+});
+
+test("bare cuna explains a replaced terminal link without exposing resume-handle internals", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.remote.conflict",
+        message: "Cuna could not apply the operation because current state conflicts with it.",
+        exitCode: EXIT_CODES.conflict,
+        details: {
+          http_status: 409,
+          request_id: "11111111-1111-4111-8111-111111111111",
+          reason: "terminal_connection_resume_handle_conflict",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.conflict);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  Terminal connection changed/u);
+  assert.match(visible, /previous terminal link was already replaced/u);
+  assert.match(visible, /Cuna did not stop the remote AgentSession/u);
+  assert.match(visible, /Run `cuna` again to reconnect/u);
+  assert.doesNotMatch(visible, /terminal_connection_resume_handle_conflict|request_id|Re-read the resource/u);
+});
+
+test("Ctrl-C while bare cuna is attaching closes visibly and returns success", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const controller = new AbortController();
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    signal: controller.signal,
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async () => {
+      controller.abort(new Error("Cuna was interrupted by SIGINT."));
+      throw controller.signal.reason;
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.success);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /✦ Closing Cuna/u);
+  assert.match(visible, /✓ Closed/u);
+  assert.doesNotMatch(visible, /Error \[/u);
+});
+
+test("bare cuna signs in before it claims to search machines", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  let signedIn = false;
+  let loginCalls = 0;
+  let rootCalls = 0;
+  const authResult = {
+    profile: "default",
+    sessionId: "00000000-0000-4000-8000-000000000002",
+    context: {
+      requiredTermsVersion: "2026-08-01",
+      identity: "active",
+      admission: "admitted",
+      workspace: { state: "assigned", id: "00000000-0000-4000-8000-000000000003" },
+    },
+  };
+  const humanAuth = {
+    async acquireAccessToken() {
+      if (!signedIn) {
+        throw new CunaError({
+          code: "cuna.auth.required",
+          message: "No interactive Cuna session is stored.",
+          exitCode: EXIT_CODES.auth,
+        });
+      }
+      return `cuna_at_${"g".repeat(43)}`;
+    },
+    async login() {
+      loginCalls += 1;
+      signedIn = true;
+      return authResult;
+    },
+  };
+
+  assert.equal(await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: {},
+    humanAuth,
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => {
+      rootCalls += 1;
+      assert.equal(signedIn, true, "machine discovery must begin only after login succeeds");
+      return undefined;
+    },
+  }), EXIT_CODES.success);
+  assert.equal(loginCalls, 1);
+  assert.equal(rootCalls, 1);
+  const output = interactive.stderr();
+  assert.match(output, /let's sign you in first/u);
+  assert.match(output, /signed in\. Continuing/u);
+  assert.ok(output.indexOf("signed in. Continuing") < output.indexOf("Finding a machine or AgentSession"));
+  assert.doesNotMatch(output, /Error \[cuna\.auth\.required\]/u);
 });
 
 test("non-TTY help and version are versioned JSON records", async () => {
@@ -549,6 +927,13 @@ test("login defaults to encrypted local storage and authenticated commands reuse
   assert.deepEqual(loginRequest, {});
   assert.equal(JSON.parse(loginStreams.stdout()).data.storage_mode, "encrypted-local");
 
+  const humanLoginStreams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  assert.equal(
+    await runCli(["login"], { streams: humanLoginStreams.streams, platform, env: {}, humanAuth }),
+    EXIT_CODES.success,
+  );
+  assert.equal(humanLoginStreams.stdout(), "Signed in to Cuna.\n");
+
   let observedAuthorization;
   const commandStreams = memoryStreams();
   assert.equal(
@@ -817,11 +1202,18 @@ test("interactive bearer authenticates cloud commands without exposing or persis
 
 test("interactive capabilities use memory bearer without opening login, and auth errors remain secret-free", async () => {
   const accessToken = `runa_at_${"z".repeat(43)}`;
+  const refreshedAccessToken = `runa_at_${"y".repeat(43)}`;
   let acquires = 0;
+  let refreshes = 0;
   let logins = 0;
   const humanAuth = {
     async login() { logins += 1; throw new Error("unexpected browser login"); },
     async acquireAccessToken() { acquires += 1; return accessToken; },
+    async refreshRejectedAccessToken(rejectedToken) {
+      assert.equal(rejectedToken, accessToken);
+      refreshes += 1;
+      return refreshedAccessToken;
+    },
     async whoami() { throw new Error("unexpected"); },
     async logout() { throw new Error("unexpected"); },
   };
@@ -852,8 +1244,11 @@ test("interactive capabilities use memory bearer without opening login, and auth
     fetch: async () => new Response(JSON.stringify({ code: "cli_auth_rejected", detail: accessToken }), { status: 401 }),
   }), EXIT_CODES.auth);
   assert.equal(rejected.stderr().includes(accessToken), false);
-  assert.match(JSON.parse(rejected.stderr()).error.hint, /cuna login/u);
+  assert.equal(rejected.stderr().includes(refreshedAccessToken), false);
+  assert.doesNotMatch(JSON.parse(rejected.stderr()).error.hint, /cuna login|reauthenticate/iu);
+  assert.match(JSON.parse(rejected.stderr()).error.hint, /fresh token from the encrypted local session/iu);
   assert.equal(logins, 0);
+  assert.equal(refreshes, 1);
 });
 
 test("machine list calls the real public legacy Machine projection", async () => {
@@ -1223,7 +1618,7 @@ test("AgentSession termination fails closed only when the terminal observation d
   assert.equal(record.error.retryable, true);
   assert.equal(record.error.details.observed_desired_state, "terminated");
   assert.equal(record.error.details.observed_request_state, "termination_pending");
-  assert.equal(record.error.details.settle_with, `cuna agent-sessions show ${sessionId}`);
+  assert.equal(record.error.details.settle_with, `cuna agent-sessions get ${sessionId}`);
 });
 
 test("AgentSession create keeps auth mode explicit and rename is capability-gated", async () => {
@@ -1233,6 +1628,7 @@ test("AgentSession create keeps auth mode explicit and rename is capability-gate
   const workspaceBindingId = "33333333-3333-4333-8333-333333333333";
   const calls = [];
   const client = fakeClient({
+    async getMachine(id) { return { id, name: "codex-machine", state: "running", agent: "codex" }; },
     async discoverCapabilities(scope, resourceId) {
       const id = scope === "machine" ? "agent_sessions.create" : "agent_sessions.rename";
       return capabilitySnapshot([{
@@ -1312,9 +1708,37 @@ test("AgentSession create keeps auth mode explicit and rename is capability-gate
   assert.equal(JSON.parse(renameStreams.stdout()).data.name, "renamed");
 });
 
-test("OpenCode AgentSession creation remains blocked by a mutable producer witness even when env is exact true", async () => {
+test("AgentSession create rejects a provider not installed on the machine before capability discovery or mutation", async () => {
+  let capabilityReads = 0;
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "44444444-4444-4444-8444-444444444444",
+    "--workspace-generation", "1", "--agent", "codex", "--yes", "--json",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getMachine(id) { return { id, name: "claude-only", state: "running", agent: "claude-code" }; },
+      async discoverCapabilities() { capabilityReads += 1; return capabilitySnapshot([]); },
+      async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(capabilityReads, 0);
+  assert.equal(creates, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.agent.provider_not_installed");
+  assert.match(error.message, /Codex is unavailable on machine claude-only.*Declared installed provider: Claude/u);
+  assert.match(error.hint, /machines create --agent codex/u);
+});
+
+test("OpenCode AgentSession creation defaults to interactive login on a compatible machine", async () => {
   let effects = 0;
   const client = fakeClient({
+    async getMachine(id) { return { id, name: "open-dev", state: "running", agent: "opencode" }; },
     async discoverCapabilities(scope, resourceId) {
       effects += 1;
       return capabilitySnapshot([{
@@ -1359,12 +1783,14 @@ test("OpenCode AgentSession creation remains blocked by a mutable producer witne
     now: () => Date.parse("2026-08-08T00:00:00Z"),
     clientFactory: () => { effects += 1; return client; },
   });
-  assert.equal(exit, EXIT_CODES.policy);
-  assert.match(streams.stderr(), /immutable_contract_witness_required/u);
-  assert.equal(effects, 0);
+  assert.equal(exit, EXIT_CODES.success);
+  const record = JSON.parse(streams.stdout());
+  assert.equal(record.data.agent, "opencode");
+  assert.equal(record.data.auth_mode, "interactive_login");
+  assert.ok(effects > 0);
 });
 
-test("OpenCode AgentSession creation rejects credential bindings before capability or mutation effects", async () => {
+test("OpenCode AgentSession creation rejects credential-binding auth before effects", async () => {
   let effects = 0;
   const client = fakeClient({
     async discoverCapabilities() { effects += 1; return capabilitySnapshot([]); },
@@ -1393,51 +1819,30 @@ test("OpenCode AgentSession creation rejects credential bindings before capabili
   assert.equal(effects, 0);
 });
 
-test("OpenCode mutable producer identity blocks env true before configuration, credentials, API, host, or terminal effects", async () => {
-  const cases = [
-    ["machines", "create", "--name", "opencode-machine", "--agent", "opencode", "--yes"],
-    [
-      "agent-sessions", "create", "--machine", MACHINE_ID,
-      "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
-      "--workspace-generation", "7", "--agent", "opencode", "--yes",
-    ],
-    ["opencode", ".", "--new-session"],
-    ["opencode", "--agent-session", FOREGROUND_SESSION_A],
-  ];
+test("OpenCode fails closed before API or terminal effects without a committed producer witness", async () => {
+  const cases = [["opencode", ".", "--new-session"], ["opencode", "--agent-session", FOREGROUND_SESSION_A]];
   for (const argv of cases) {
     let effects = 0;
     const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
     const exit = await runCli(argv, {
       streams: streams.streams,
-      platform: {
-        ...platform,
-        async readSafeConfig() { effects += 1; return { exists: false }; },
-      },
-      // A valid automation credential and a provider-shaped value must not be
-      // selected, copied, or injected when the local gate refuses the command.
-      env: {
-        CUNA_API_KEY: API_KEY,
-        CUNA_OPENCODE_ENABLED: "true",
-        OPENAI_API_KEY: "must-not-be-read",
-      },
-      humanAuth: {
-        async acquireAccessToken() { effects += 1; return "must-not-be-read"; },
-      },
+      platform,
+      env: { CUNA_API_KEY: API_KEY, OPENAI_API_KEY: "must-not-be-read" },
+      opencodeFeatureGate: { state: "disabled", source: "compiled_contract", reason: "immutable_contract_witness_required" },
       clientFactory: () => { effects += 1; return fakeClient(); },
       automaticJourneyEffectsFactory: () => { effects += 1; throw new Error("unreachable"); },
       foregroundTerminalRunner: async () => { effects += 1; },
     });
     assert.equal(exit, EXIT_CODES.policy, argv.join(" "));
     assert.match(streams.stderr(), /cuna\.feature\.opencode_disabled/u);
-    assert.match(streams.stderr(), /CUNA_OPENCODE_ENABLED=true/u);
-    assert.match(streams.stderr(), /immutable_contract_witness_required/u);
     assert.equal(effects, 0, `${argv.join(" ")} must stop before protected effects`);
   }
 });
 
-test("OpenCode mutable producer identity blocks before a remotely downgraded auth mode can be observed", async () => {
+test("OpenCode create rejects a remotely downgraded auth mode after authoritative readback", async () => {
   let effects = 0;
   const client = fakeClient({
+    async getMachine(id) { return { id, name: "open-dev", state: "running", agent: "opencode" }; },
     async discoverCapabilities(scope, resourceId) {
       effects += 1;
       return capabilitySnapshot([{
@@ -1470,9 +1875,9 @@ test("OpenCode mutable producer identity blocks before a remotely downgraded aut
     now: () => Date.parse("2026-08-08T00:00:00Z"),
     clientFactory: () => { effects += 1; return client; },
   });
-  assert.equal(exit, EXIT_CODES.policy);
-  assert.match(streams.stderr(), /immutable_contract_witness_required/u);
-  assert.equal(effects, 0);
+  assert.equal(exit, EXIT_CODES.conflict);
+  assert.match(streams.stderr(), /postcondition|does not match|authority/iu);
+  assert.ok(effects > 0);
 });
 
 test("agent logout binds confirmation to one exact AgentSession generation", async () => {
@@ -1592,7 +1997,6 @@ test("valid automatic agent intents execute the effects-fenced journey and exact
       "--auth-mode", "credential_binding", "--credential-binding", "44444444-4444-4444-8444-444444444444",
     ],
     ["codex", ".", "--new", "--auth-mode", "interactive_login"],
-    ["openclaw", "tools", "--new-session"],
   ];
   for (const argv of cases) {
     const phases = [];
@@ -1634,7 +2038,6 @@ test("TC-004-01 explicit agent shorthand binds one AgentSession and its expected
   const expectations = [
     ["claude", "claude-code"],
     ["codex", "codex"],
-    ["openclaw", "openclaw"],
   ];
   for (const [command, expectedAgent] of expectations) {
     let observed;
@@ -1650,7 +2053,15 @@ test("TC-004-01 explicit agent shorthand binds one AgentSession and its expected
     assert.deepEqual(observed.agentSessionIds, [FOREGROUND_SESSION_A]);
     assert.deepEqual(observed.expectedAgentKinds, [expectedAgent]);
     assert.equal(streams.stdout(), "");
-    assert.equal(streams.stderr(), "");
+    const display = expectedAgent === "claude-code" ? "Claude Code" : expectedAgent === "codex" ? "Codex" : "OpenClaw";
+    const progress = streams.stderr();
+    const visible = stripAnsi(progress).replaceAll("\r", "");
+    assert.match(visible, new RegExp(`Preparing ${display}`, "u"));
+    assert.match(visible, new RegExp(`Connecting to ${display}`, "u"));
+    assert.match(visible, new RegExp(`Attaching to ${display}`, "u"));
+    assert.match(progress, /[◐◓◑◒]/u, "the journey should show an immediate spinner");
+    assert.match(progress, /[━╺╸]{6}/u, "the journey should show animated progress");
+    assert.equal(progress.includes(`${ESCAPE}[38;5;202m`), true, "the spinner should use the Cuna flare accent");
   }
 });
 
@@ -1673,6 +2084,25 @@ test("explicit agent shorthand rejects ambiguous or misleading input before effe
     assert.equal(exit, EXIT_CODES.usage);
     assert.equal(effects, 0);
   }
+});
+
+test("agent shorthand shows truthful preparation feedback before configuration or network work completes", async () => {
+  let releaseConfig;
+  const configGate = new Promise((resolve) => { releaseConfig = resolve; });
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const execution = runCli(["claude", "--agent-session", FOREGROUND_SESSION_A], {
+    streams: streams.streams,
+    platform: { ...platform, async readSafeConfig() { await configGate; return { exists: false }; } },
+    env: { CUNA_API_KEY: API_KEY, TERM: "xterm-256color" },
+    clientFactory: () => fakeClient(),
+    foregroundTerminalRunner: async () => {},
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const immediate = streams.stderr();
+  assert.match(stripAnsi(immediate), /Preparing Claude Code/u);
+  assert.match(immediate, /[◐◓◑◒]/u, "feedback should animate before configuration resolves");
+  releaseConfig();
+  assert.equal(await execution, EXIT_CODES.success);
 });
 
 test("invalid automatic agent intents fail before config, auth, API, or terminal effects", async () => {
@@ -1727,7 +2157,10 @@ test("TC-055-01 connect and AgentSession attach dispatch only explicit session I
     });
     assert.equal(exit, EXIT_CODES.success);
     assert.equal(streams.stdout(), "");
-    assert.equal(streams.stderr(), "");
+    const visibleProgress = stripAnsi(streams.stderr()).replaceAll("\r", "");
+    const sessionCount = argv[0] === "agent-sessions" ? argv.length - 2 : argv.length - 1;
+    const expectedLabel = sessionCount === 1 ? "Attaching to AgentSession" : `Attaching to ${sessionCount} AgentSessions`;
+    assert.match(visibleProgress, new RegExp(expectedLabel, "u"));
   }
   assert.deepEqual(calls.map((call) => call.agentSessionIds), [
     [FOREGROUND_SESSION_A, FOREGROUND_SESSION_B],
@@ -1765,7 +2198,7 @@ test("TC-055-11 non-TTY and JSON foreground requests fail before auth, configura
   }
 });
 
-test("TC-055-07/11 terminal admission selects truthful plain fallback and preserves NO_COLOR", async () => {
+test("TC-055-07/11 terminal admission keeps Windows rich while selecting truthful fallbacks and preserving NO_COLOR", async () => {
   for (const kind of ["linux", "macos"]) {
     for (const env of [{}, { TERM: "" }, { TERM: "   " }, { TERM: "dumb" }]) {
       let observed;
@@ -1810,14 +2243,18 @@ test("TC-055-07/11 terminal admission selects truthful plain fallback and preser
   }), EXIT_CODES.success);
   assert.equal(windowsObserved.hostPlatform, "win32");
   assert.equal(windowsObserved.terminalKind, "dumb");
-  assert.equal(windowsObserved.presentationMode, "rich");
+  assert.equal(
+    windowsObserved.presentationMode,
+    "rich",
+    "Windows ConPTY stays capable even when an inherited TERM=dumb value is present",
+  );
 
   let observed;
   const noColor = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
   assert.equal(await runCli(["connect", FOREGROUND_SESSION_A], {
     streams: noColor.streams,
     platform,
-    env: { CUNA_API_KEY: API_KEY, NO_COLOR: "1", TERM: "xterm-256color" },
+    env: { CUNA_API_KEY: API_KEY, NO_COLOR: "1", TERM: "xterm-256color", CUNA_TERMINAL_MODE: "rich" },
     clientFactory: () => fakeClient(),
     foregroundTerminalRunner: async (input) => { observed = input; },
   }), EXIT_CODES.success);

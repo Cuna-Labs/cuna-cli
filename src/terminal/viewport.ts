@@ -14,6 +14,32 @@ export interface ViewportModes {
   readonly cursorVisible: boolean;
 }
 
+export interface ViewportCellColor {
+  readonly mode: "palette" | "rgb";
+  readonly value: number;
+}
+
+export interface ViewportCellStyle {
+  readonly bold: boolean;
+  readonly dim: boolean;
+  readonly italic: boolean;
+  readonly underline: boolean;
+  readonly blink: boolean;
+  readonly inverse: boolean;
+  readonly invisible: boolean;
+  readonly strikethrough: boolean;
+  readonly overline: boolean;
+  readonly foreground: ViewportCellColor | null;
+  readonly background: ViewportCellColor | null;
+}
+
+/** A locally parsed run of terminal cells. Remote escape bytes never enter it. */
+export interface ViewportRenderRun {
+  readonly text: string;
+  readonly width: number;
+  readonly style: ViewportCellStyle;
+}
+
 export interface ViewportSnapshot {
   readonly tabId: string;
   readonly binding: ViewportBinding;
@@ -22,6 +48,8 @@ export interface ViewportSnapshot {
   readonly outputSequence: bigint;
   readonly replayCursor: bigint;
   readonly cells: readonly string[];
+  /** Safe, structured SGR state recovered by the local VTE for each visible row. */
+  readonly renderRows?: readonly (readonly ViewportRenderRun[])[];
   /** Display columns occupied by each rendered row, as measured by the VTE. */
   readonly displayWidths: readonly number[];
   readonly cursorX: number;
@@ -84,6 +112,7 @@ export class ViewportRegistry {
     readonly outputSequence: bigint;
     readonly replayCursor: bigint;
     readonly cells: readonly string[];
+    readonly renderRows?: readonly (readonly ViewportRenderRun[])[];
     readonly displayWidths?: readonly number[];
     readonly cursorX?: number;
     readonly cursorY?: number;
@@ -109,11 +138,13 @@ export class ViewportRegistry {
     ) {
       throw new ViewportIsolationError("viewport_limit", "Rendered cells exceed their isolated viewport bounds.");
     }
+    if (input.renderRows !== undefined) validateRenderRows(input.renderRows, input.cells, displayWidths, current.columns);
     const next = freezeSnapshot({
       ...current,
       outputSequence: input.outputSequence,
       replayCursor: input.replayCursor,
       cells: Object.freeze([...input.cells]),
+      ...(input.renderRows === undefined ? {} : { renderRows: freezeRenderRows(input.renderRows) }),
       displayWidths: Object.freeze([...displayWidths]),
       cursorX,
       cursorY,
@@ -128,8 +159,11 @@ export class ViewportRegistry {
     const current = this.require(tabId);
     const cells = current.cells.slice(0, rows).map((row) => [...row].slice(0, columns).join(""));
     const displayWidths = current.displayWidths.slice(0, rows).map((width) => Math.min(width, columns));
+    // Styled runs are terminal-column based. Drop them until the owning VTE
+    // supplies its authoritative local reflow for the new dimensions.
+    const { renderRows: _renderRows, ...withoutRenderRows } = current;
     const next = freezeSnapshot({
-      ...current,
+      ...withoutRenderRows,
       columns,
       rows,
       cells: Object.freeze(cells),
@@ -147,6 +181,7 @@ export class ViewportRegistry {
     readonly outputSequence: bigint;
     readonly replayCursor: bigint;
     readonly cells: readonly string[];
+    readonly renderRows?: readonly (readonly ViewportRenderRun[])[];
     readonly displayWidths: readonly number[];
     readonly cursorX: number;
     readonly cursorY: number;
@@ -180,6 +215,7 @@ export class ViewportRegistry {
     current: ViewportSnapshot,
     input: {
       readonly cells: readonly string[];
+      readonly renderRows?: readonly (readonly ViewportRenderRun[])[];
       readonly displayWidths: readonly number[];
       readonly cursorX: number;
       readonly cursorY: number;
@@ -196,9 +232,11 @@ export class ViewportRegistry {
     ) {
       throw new ViewportIsolationError("viewport_limit", "Rendered cells exceed their isolated viewport bounds.");
     }
+    if (input.renderRows !== undefined) validateRenderRows(input.renderRows, input.cells, input.displayWidths, current.columns);
     const next = freezeSnapshot({
       ...current,
       cells: Object.freeze([...input.cells]),
+      ...(input.renderRows === undefined ? {} : { renderRows: freezeRenderRows(input.renderRows) }),
       displayWidths: Object.freeze([...input.displayWidths]),
       cursorX: input.cursorX,
       cursorY: input.cursorY,
@@ -255,7 +293,58 @@ function freezeSnapshot(snapshot: ViewportSnapshot): ViewportSnapshot {
     ...snapshot,
     binding: Object.freeze({ ...snapshot.binding }),
     cells: Object.freeze([...snapshot.cells]),
+    ...(snapshot.renderRows === undefined ? {} : { renderRows: freezeRenderRows(snapshot.renderRows) }),
     displayWidths: Object.freeze([...snapshot.displayWidths]),
     modes: Object.freeze({ ...snapshot.modes }),
   });
+}
+
+function validateRenderRows(
+  rows: readonly (readonly ViewportRenderRun[])[],
+  cells: readonly string[],
+  displayWidths: readonly number[],
+  columns: number,
+): void {
+  if (rows.length !== cells.length) {
+    throw new ViewportIsolationError("viewport_limit", "Styled viewport rows do not match the rendered cells.");
+  }
+  for (const [rowIndex, row] of rows.entries()) {
+    let width = 0;
+    for (const run of row) {
+      if (!Number.isSafeInteger(run.width) || run.width < 1 || containsHostControl(run.text)) {
+        throw new ViewportIsolationError("viewport_limit", "A styled viewport run is invalid.");
+      }
+      validateStyle(run.style);
+      width += run.width;
+    }
+    const renderedText = row.map((run) => run.text).join("");
+    if (renderedText !== cells[rowIndex]) {
+      throw new ViewportIsolationError("viewport_limit", "Styled viewport text does not match the VTE cells.");
+    }
+    if (width !== (displayWidths[rowIndex] ?? -1) || width > columns) {
+      throw new ViewportIsolationError("viewport_limit", "Styled viewport width does not match the VTE observation.");
+    }
+  }
+}
+
+function validateStyle(style: ViewportCellStyle): void {
+  for (const color of [style.foreground, style.background]) {
+    if (color === null) continue;
+    const maximum = color.mode === "palette" ? 0xff : color.mode === "rgb" ? 0xff_ffff : -1;
+    if (!Number.isSafeInteger(color.value) || color.value < 0 || color.value > maximum) {
+      throw new ViewportIsolationError("viewport_limit", "A viewport color is outside its admitted range.");
+    }
+  }
+}
+
+function freezeRenderRows(rows: readonly (readonly ViewportRenderRun[])[]): readonly (readonly ViewportRenderRun[])[] {
+  return Object.freeze(rows.map((row) => Object.freeze(row.map((run) => Object.freeze({
+    text: run.text,
+    width: run.width,
+    style: Object.freeze({
+      ...run.style,
+      ...(run.style.foreground === null ? {} : { foreground: Object.freeze({ ...run.style.foreground }) }),
+      ...(run.style.background === null ? {} : { background: Object.freeze({ ...run.style.background }) }),
+    }),
+  })))));
 }

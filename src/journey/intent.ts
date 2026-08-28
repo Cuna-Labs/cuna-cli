@@ -3,7 +3,7 @@ import { parseArgv, type OptionValue, type ParsedInvocation } from "../cli/parse
 import { usageError } from "../core/errors.js";
 import { assertCanonicalUuid, assertSafeDisplayText } from "../core/validation.js";
 
-export type AgentJourneyCommand = "claude" | "codex" | "openclaw" | "opencode";
+export type AgentJourneyCommand = "claude" | "codex" | "opencode";
 export type AgentJourneySyncMode = "enabled" | "disabled" | "not-applicable";
 
 export type MachineJourneySelection =
@@ -82,13 +82,11 @@ function commandAgent(command: string | undefined): {
       return Object.freeze({ command, agent: "claude-code" });
     case "codex":
       return Object.freeze({ command, agent: "codex" });
-    case "openclaw":
-      return Object.freeze({ command, agent: "openclaw" });
     case "opencode":
       return Object.freeze({ command, agent: "opencode" });
     default:
       throw usageError(
-        `Agent journey command must be claude, codex, openclaw, or opencode; received ${command ?? "<none>"}.`,
+        `Agent journey command must be claude, codex, or opencode; received ${command ?? "<none>"}.`,
       );
   }
 }
@@ -205,14 +203,20 @@ export function preflightAgentJourneyInvocation(parsed: ParsedInvocation): Agent
   const newSession = booleanOption(parsed, "new-session");
   const noSync = booleanOption(parsed, "no-sync");
   const machineName = stringOption(parsed, "machine");
-  const authMode = normalizedAuthMode(parsed);
+  const requestedAuthMode = normalizedAuthMode(parsed);
   const rawCredentialBindingId = stringOption(parsed, "credential-binding");
-  if (identity.agent === "opencode" && (authMode === "credential_binding" || rawCredentialBindingId !== undefined)) {
+  if (
+    identity.agent === "opencode" &&
+    (requestedAuthMode === "credential_binding" || rawCredentialBindingId !== undefined)
+  ) {
     throw usageError(
       "OpenCode supports interactive_login only; credential bindings are not accepted.",
-      "Configure a provider interactively with OpenCode, then retry without --credential-binding.",
+      "Use OpenCode's interactive provider flow and omit --credential-binding.",
     );
   }
+  const authMode = identity.agent === "opencode"
+    ? "interactive_login"
+    : requestedAuthMode;
   if (authMode === "credential_binding" && rawCredentialBindingId === undefined) {
     throw usageError(
       "Option --credential-binding is required for credential_binding auth mode.",
@@ -240,13 +244,6 @@ export function preflightAgentJourneyInvocation(parsed: ParsedInvocation): Agent
       "A new machine necessarily requires a new AgentSession.",
     );
   }
-  if (identity.command === "openclaw" && noSync) {
-    throw usageError(
-      "Option --no-sync is not available for openclaw.",
-      "Use the default synchronized OpenClaw journey.",
-    );
-  }
-
   const localPath = parsed.operands[0];
   const machine: MachineJourneySelection = forceNew
     ? Object.freeze({ kind: "new" })

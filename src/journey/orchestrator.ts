@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 
 import type { AgentAuthMode, AgentKind } from "../api/contracts.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
@@ -201,7 +202,9 @@ function selectionFailure(
       : `Cuna could not prove a safe ${target} selection.`,
     exitCode: plan.kind === "ambiguous" ? EXIT_CODES.conflict : EXIT_CODES.policy,
     hint: target === "machine"
-      ? "Select an exact machine with --machine NAME."
+      ? plan.reason === "agent-mismatch"
+        ? "Choose or create a machine configured for this provider (`cuna machines create --agent claude-code|codex|opencode ...`)."
+        : "Select an exact machine with --machine NAME."
       : "Select an exact child with --agent-session ID or request --new-session.",
     details: {
       target: target === "machine" ? "machine" : "agent_session",
@@ -284,7 +287,7 @@ export async function orchestrateAgentJourney(input: {
     idempotencyKey: input.idempotencyKey ?? `cuna-journey-${randomUUID()}`,
   };
   try {
-    const localPath = input.intent.localPath ?? process.cwd();
+    const localPath = resolve(input.intent.localPath ?? process.cwd());
     const workspaceInspection = await boundary({
       phase: "inspect-workspace", signal, effects: input.effects, ledger,
       action: () => input.effects.inspectWorkspace({

@@ -10,13 +10,19 @@ import {
 } from "../sync/supervisor.js";
 import {
   TERMINAL_PROTOCOL,
+  TERMINAL_LOCAL_ACTION_KINDS,
   TerminalFrameDecoder,
   TerminalProtocolError,
   assertTerminalFrameLegal,
   decodeTerminalControl,
+  decodeTerminalFrame,
   encodeTerminalControl,
   encodeTerminalFrame,
+  isLocalActionFrameType,
+  negotiateTerminalLocalActions,
   type TerminalFrame,
+  type TerminalLocalActionKind,
+  type TerminalLocalActionProtocolAcceptance,
 } from "../terminal/codec.js";
 
 import { admitCapability } from "./capability-gate.js";
@@ -73,6 +79,8 @@ export interface RuntimeTerminalSnapshot {
   readonly viewId: string;
   readonly userId: string;
   readonly machineId: string;
+  readonly workspaceBindingId: string | null;
+  readonly workspaceBindingGeneration: number | null;
   readonly agentSessionId: string;
   readonly processEpoch: string;
   readonly state: RuntimeTerminalState;
@@ -129,6 +137,12 @@ export interface RuntimeBoundaryOptions {
     readonly signal: AbortSignal;
   }) => void | Promise<void>;
   readonly onTerminalState?: (snapshot: RuntimeTerminalSnapshot) => void;
+  readonly localActionKinds?: readonly TerminalLocalActionKind[];
+  readonly onLocalActionFrame?: (event: {
+    readonly tabId: string;
+    readonly frame: TerminalFrame;
+    readonly payload: Readonly<Record<string, unknown>>;
+  }) => void | Promise<void>;
 }
 
 interface TerminalEntry {
@@ -150,11 +164,14 @@ interface TerminalEntry {
   outputContinuity: RuntimeTerminalSnapshot["outputContinuity"];
   lastHeartbeatAt: number;
   resumeHandle: string;
+  localActionsNegotiated: boolean;
+  localActionAcceptance: TerminalLocalActionProtocolAcceptance | undefined;
   reason?: string;
   pump?: Promise<void>;
   sendTail: Promise<void>;
   connectionRevision: number;
   heartbeatSequence: bigint;
+  heartbeatSendPending: boolean;
   heartbeatTimer?: NodeJS.Timeout;
   outputAbort: AbortController;
   reconnectIdempotencyKey?: string;
@@ -363,9 +380,12 @@ export class CunaRuntimeBoundary {
         outputContinuity: "unknown",
         lastHeartbeatAt: this.#clock(),
         resumeHandle: grant.resumeHandle,
+        localActionsNegotiated: false,
+        localActionAcceptance: undefined,
         sendTail: Promise.resolve(),
         connectionRevision: 1,
         heartbeatSequence: 0n,
+        heartbeatSendPending: false,
         outputAbort: new AbortController(),
       };
       const iterator = connection.receive()[Symbol.asyncIterator]();
@@ -375,6 +395,7 @@ export class CunaRuntimeBoundary {
       entry.heartbeatSequence = 0n;
       entry.fencingGeneration = ready.payload.fencingGeneration;
       entry.resizeCapability = ready.payload.resizeCapability;
+      entry.localActionAcceptance = this.#localActionAcceptance(ready.payload.localActionProtocol);
       entry.viewId = viewId(input.tabId, ready.payload.fencingGeneration);
       this.#views.open({
         viewId: entry.viewId,
@@ -393,6 +414,31 @@ export class CunaRuntimeBoundary {
       entry.outputContinuity = "complete";
       this.#terminals.set(input.tabId, entry);
       this.#activeTabId ??= input.tabId;
+      // READY proves that the PTY exists; it does not prove that its default
+      // geometry matches this host. Establish the admitted dimensions before
+      // requesting retained output: provider TUIs may have rendered that
+      // output for the old geometry, and replay-before-resize makes a wide
+      // local terminal deterministically display the stale wrapping.
+      this.#requireGrantCapability(entry, "live_resize");
+      if (entry.resizeCapability !== "live") {
+        throw runtimeFailure("capability_unsupported", "This terminal cannot establish its initial dimensions.");
+      }
+      entry.wireSequence += 1n;
+      await connection.send(encodeTerminalControl("resize", entry.wireSequence, {
+        columns: input.columns,
+        rows: input.rows,
+      }));
+      // The supervisor starts and drains the provider PTY before a terminal
+      // client necessarily attaches. READY proves the live binding but does
+      // not include retained output, so request replay only after the ordered
+      // resize has reached the same fenced attachment generation.
+      entry.wireSequence += 1n;
+      await connection.send(encodeTerminalControl("resume", entry.wireSequence, {
+        resumeHandle: entry.resumeHandle,
+        afterOutputSequence: entry.outputSequence.toString(),
+        ...(entry.localActionAcceptance === undefined ? {} : { localActionProtocol: entry.localActionAcceptance }),
+      }));
+      entry.localActionsNegotiated = entry.localActionAcceptance !== undefined;
       await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs()));
       this.#assertOpen();
       for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
@@ -528,6 +574,49 @@ export class CunaRuntimeBoundary {
     });
   }
 
+  async sendLocalActionControl(
+    type: "local_action_result" | "local_stream_open" | "local_stream_data" | "local_stream_close" | "local_stream_window_update",
+    payload: Readonly<Record<string, unknown>>,
+    tabId = this.#activeTabId,
+  ): Promise<void> {
+    const entry = this.#requireActiveTerminal(tabId);
+    if (!entry.localActionsNegotiated) {
+      throw runtimeFailure("capability_unsupported", "This attachment did not negotiate local actions.");
+    }
+    assertTerminalFrameLegal("attached", "client_to_server", type, true);
+    await this.#enqueueTerminalSend(entry, async (authority) => {
+      const sequence = entry.wireSequence + 1n;
+      const wire = encodeTerminalControl(type, sequence, payload);
+      const decoded = decodeTerminalFrame(wire);
+      if (decoded === undefined) throw runtimeFailure("terminal_protocol_error", "The local action frame could not be decoded.");
+      const validated = decodeTerminalControl(decoded);
+      if (type === "local_action_result") {
+        if (validated.message !== "outcome") {
+          throw runtimeFailure("terminal_protocol_error", "The CLI may send only local action outcomes.");
+        }
+        const result = validated.result as Readonly<Record<string, unknown>>;
+        const identity = result.identity as Readonly<Record<string, unknown>>;
+        if (
+          identity.userId !== entry.observation.userId ||
+          identity.machineId !== entry.observation.machineId ||
+          identity.workspaceBindingId !== entry.observation.workspaceBindingId ||
+          identity.workspaceBindingGeneration !== entry.observation.workspaceBindingGeneration ||
+          identity.agentSessionId !== entry.observation.agentSessionId ||
+          identity.processEpoch !== entry.observation.processEpoch ||
+          identity.fencingGeneration !== entry.fencingGeneration ||
+          !entry.localActionAcceptance?.acceptedKinds.includes(result.kind as TerminalLocalActionKind)
+        ) throw runtimeFailure("grant_scope_mismatch", "The local action outcome targets another attachment authority.");
+      }
+      if (
+        entry.connection !== authority.connection ||
+        entry.connectionRevision !== authority.connectionRevision ||
+        entry.fencingGeneration !== authority.fencingGeneration
+      ) throw runtimeFailure("terminal_disconnected", "The local action attachment authority changed before send.");
+      entry.wireSequence = sequence;
+      await authority.connection.send(wire);
+    });
+  }
+
   async #enqueueTerminalSend(
     entry: TerminalEntry,
     operation: (authority: {
@@ -603,6 +692,8 @@ export class CunaRuntimeBoundary {
       if (
         admitted.observation.userId !== entry.observation.userId ||
         admitted.observation.machineId !== entry.observation.machineId ||
+        admitted.observation.workspaceBindingId !== entry.observation.workspaceBindingId ||
+        admitted.observation.workspaceBindingGeneration !== entry.observation.workspaceBindingGeneration ||
         admitted.observation.agentSessionId !== entry.observation.agentSessionId ||
         admitted.observation.processEpoch !== entry.observation.processEpoch
       ) {
@@ -617,10 +708,16 @@ export class CunaRuntimeBoundary {
       const grant = await this.#createGrant(
         admitted.observation,
         admitted.capability,
-        entry.resumeHandle,
+        undefined,
         entry.reconnectIdempotencyKey,
         reconnectAbort.signal,
       );
+      // A ConnectionGrant is one-use. Once the control plane has returned a
+      // replacement grant, retrying that mutation key after the WebSocket has
+      // consumed it can only return idempotency_consumed. A reconnect gets a
+      // fresh grant-scoped resume handle; retained output remains scoped to the
+      // same AgentSession and is selected by afterOutputSequence below.
+      delete entry.reconnectIdempotencyKey;
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
       const revalidated = await this.#admitRemoteTerminal(entry.observation.agentSessionId, reconnectAbort.signal);
       this.#assertAttachmentAdmissionContinuity(admitted, revalidated, "post_grant");
@@ -659,10 +756,14 @@ export class CunaRuntimeBoundary {
         resumeHandle: grant.resumeHandle,
         lastHeartbeatAt: this.#clock(),
         heartbeatSequence: 0n,
+        heartbeatSendPending: false,
         outputAbort: new AbortController(),
+        localActionsNegotiated: false,
+        localActionAcceptance: undefined,
       };
       const ready = await this.#awaitReady(candidate, iterator, reconnectAbort.signal);
       candidate.lastHeartbeatAt = this.#clock();
+      candidate.localActionAcceptance = this.#localActionAcceptance(ready.payload.localActionProtocol);
       if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
         throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded by detach or shutdown.");
       }
@@ -670,15 +771,25 @@ export class CunaRuntimeBoundary {
         throw runtimeFailure("grant_invalid", "The reconnect readiness frame did not advance the attachment fence.");
       }
       const nextViewId = viewId(entry.tabId, ready.payload.fencingGeneration);
-      const resumeSequence = entry.wireSequence + 1n;
+      this.#requireGrantCapability(candidate, "live_resize");
+      if (candidate.resizeCapability !== "live") {
+        throw runtimeFailure("capability_unsupported", "The reconnected terminal cannot restore its dimensions.");
+      }
+      const previous = this.#views.require(previousViewId);
+      const resizeSequence = entry.wireSequence + 1n;
+      await connection.send(encodeTerminalControl("resize", resizeSequence, {
+        columns: previous.columns,
+        rows: previous.rows,
+      }));
+      const resumeSequence = resizeSequence + 1n;
       await connection.send(encodeTerminalControl("resume", resumeSequence, {
         resumeHandle: grant.resumeHandle,
         afterOutputSequence: entry.outputSequence.toString(),
+        ...(candidate.localActionAcceptance === undefined ? {} : { localActionProtocol: candidate.localActionAcceptance }),
       }));
       if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
         throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded by detach or shutdown.");
       }
-      const previous = this.#views.require(previousViewId);
       try { this.#views.detach(previousViewId); } catch { /* the prior view may already be detached */ }
       this.#views.open({
         viewId: nextViewId,
@@ -702,13 +813,15 @@ export class CunaRuntimeBoundary {
       entry.resizeCapability = ready.payload.resizeCapability;
       entry.viewId = nextViewId;
       entry.resumeHandle = grant.resumeHandle;
+      entry.localActionAcceptance = candidate.localActionAcceptance;
+      entry.localActionsNegotiated = candidate.localActionAcceptance !== undefined;
       entry.wireSequence = resumeSequence;
       entry.heartbeatSequence = 0n;
+      entry.heartbeatSendPending = false;
       entry.outputAbort = candidate.outputAbort;
       entry.lastHeartbeatAt = candidate.lastHeartbeatAt;
       entry.state = "active";
       entry.outputContinuity = "unknown";
-      delete entry.reconnectIdempotencyKey;
       await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs()));
       for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
       this.#scheduleHeartbeatWatchdog(entry, connection, reconnectRevision);
@@ -1012,6 +1125,8 @@ export class CunaRuntimeBoundary {
       expected.authority !== actual.authority ||
       expected.userId !== actual.userId ||
       expected.machineId !== actual.machineId ||
+      expected.workspaceBindingId !== actual.workspaceBindingId ||
+      expected.workspaceBindingGeneration !== actual.workspaceBindingGeneration ||
       expected.agentSessionId !== actual.agentSessionId ||
       expected.processEpoch !== actual.processEpoch
     ) {
@@ -1041,9 +1156,7 @@ export class CunaRuntimeBoundary {
     return validateTerminalGrant({
       grant,
       allowedCunaOrigins: this.#options.allowedCunaOrigins,
-      requiredCapabilities: resumeHandle === undefined
-        ? ["acknowledgement", "heartbeat"]
-        : ["acknowledgement", "heartbeat", "resume"],
+      requiredCapabilities: ["acknowledgement", "heartbeat", "resume", "live_resize"],
       now: this.#clock(),
     });
   }
@@ -1142,7 +1255,31 @@ export class CunaRuntimeBoundary {
   }
 
   async #handleAttachedFrame(entry: TerminalEntry, frame: TerminalFrame): Promise<void> {
-    assertTerminalFrameLegal("attached", "server_to_client", frame.type);
+    assertTerminalFrameLegal("attached", "server_to_client", frame.type, entry.localActionsNegotiated);
+    if (isLocalActionFrameType(frame.type)) {
+      const payload = decodeTerminalControl(frame);
+      if (frame.type === "local_action_request") {
+        const request = payload.request as Readonly<Record<string, unknown>>;
+        const identity = request.identity as Readonly<Record<string, unknown>>;
+        if (
+          identity.userId !== entry.observation.userId ||
+          identity.machineId !== entry.observation.machineId ||
+          identity.workspaceBindingId !== entry.observation.workspaceBindingId ||
+          identity.workspaceBindingGeneration !== entry.observation.workspaceBindingGeneration ||
+          identity.agentSessionId !== entry.observation.agentSessionId ||
+          identity.processEpoch !== entry.observation.processEpoch ||
+          identity.fencingGeneration !== entry.fencingGeneration ||
+          !entry.localActionAcceptance?.acceptedKinds.includes(request.kind as TerminalLocalActionKind)
+        ) {
+          throw runtimeFailure("grant_scope_mismatch", "The local action request targets another attachment authority.");
+        }
+      }
+      if (this.#options.onLocalActionFrame === undefined) {
+        throw runtimeFailure("terminal_protocol_error", "A local action frame arrived without a local broker consumer.");
+      }
+      await this.#options.onLocalActionFrame({ tabId: entry.tabId, frame, payload });
+      return;
+    }
     if (frame.type === "output") {
       if (frame.sequence <= entry.outputSequence) {
         throw runtimeFailure("terminal_protocol_error", "Terminal output sequence regressed or duplicated.");
@@ -1241,6 +1378,14 @@ export class CunaRuntimeBoundary {
     this.#options.onTerminalState?.(snapshot(entry, this.#heartbeatTimeoutMs()));
   }
 
+  #localActionAcceptance(offer: unknown): TerminalLocalActionProtocolAcceptance | undefined {
+    if (this.#options.onLocalActionFrame === undefined) return undefined;
+    const configured = this.#options.localActionKinds ?? [];
+    const valid = configured.filter((kind): kind is TerminalLocalActionKind =>
+      (TERMINAL_LOCAL_ACTION_KINDS as readonly string[]).includes(kind));
+    return negotiateTerminalLocalActions(offer, new Set(valid));
+  }
+
   #requireTerminal(tabId: string): TerminalEntry {
     const entry = this.#terminals.get(tabId);
     if (entry === undefined) throw runtimeFailure("session_unknown", "The local terminal tab does not exist.");
@@ -1275,19 +1420,42 @@ export class CunaRuntimeBoundary {
     connectionRevision: number,
   ): void {
     this.#clearHeartbeatWatchdog(entry);
-    const remaining = Math.max(1, entry.lastHeartbeatAt + this.#heartbeatTimeoutMs() - this.#clock() + 1);
-    entry.heartbeatTimer = setTimeout(() => {
+    const interval = Math.max(250, Math.min(10_000, Math.floor(this.#heartbeatTimeoutMs() / 3)));
+    entry.heartbeatTimer = setInterval(() => {
       if (
         entry.connection !== connection ||
         entry.connectionRevision !== connectionRevision ||
         entry.state !== "active"
-      ) return;
-      if (this.#clock() - entry.lastHeartbeatAt <= this.#heartbeatTimeoutMs()) {
-        this.#scheduleHeartbeatWatchdog(entry, connection, connectionRevision);
+      ) {
+        this.#clearHeartbeatWatchdog(entry);
         return;
       }
-      this.#expireHeartbeat(entry, connection, connectionRevision);
-    }, remaining);
+      if (this.#clock() - entry.lastHeartbeatAt > this.#heartbeatTimeoutMs()) {
+        this.#expireHeartbeat(entry, connection, connectionRevision);
+        return;
+      }
+      if (entry.heartbeatSendPending) return;
+      entry.heartbeatSendPending = true;
+      void this.#enqueueTerminalSend(entry, async (authority) => {
+        entry.wireSequence += 1n;
+        await authority.connection.send(encodeTerminalControl("heartbeat", entry.wireSequence, {}));
+      }).catch((error: unknown) => {
+        if (
+          entry.connection !== connection ||
+          entry.connectionRevision !== connectionRevision ||
+          entry.state !== "active"
+        ) return;
+        this.#clearHeartbeatWatchdog(entry);
+        entry.outputAbort.abort(error);
+        entry.state = "interrupted";
+        entry.outputContinuity = "unknown";
+        entry.reason = "heartbeat_send_failed";
+        this.#publish(entry);
+        void connection.close({ code: 1001, reason: "cuna_heartbeat_send_failed" }).catch(() => undefined);
+      }).finally(() => {
+        entry.heartbeatSendPending = false;
+      });
+    }, interval);
     entry.heartbeatTimer.unref();
   }
 
@@ -1367,6 +1535,8 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000): RuntimeTer
     viewId: entry.viewId,
     userId: entry.observation.userId,
     machineId: entry.observation.machineId,
+    workspaceBindingId: entry.observation.workspaceBindingId,
+    workspaceBindingGeneration: entry.observation.workspaceBindingGeneration,
     agentSessionId: entry.observation.agentSessionId,
     processEpoch: entry.observation.processEpoch,
     state: entry.state,

@@ -56,13 +56,17 @@ export function encodeMachineId(value: string): string {
 }
 
 export function assertIdempotencyKey(value: string): string {
-  if (!IDEMPOTENCY_KEY.test(value)) {
+  if (!isIdempotencyKey(value)) {
     throw usageError(
       "Invalid idempotency key.",
       "Idempotency key must contain 8 through 128 printable ASCII characters.",
     );
   }
   return value;
+}
+
+export function isIdempotencyKey(value: string): boolean {
+  return IDEMPOTENCY_KEY.test(value);
 }
 
 // Exactly a base-10 integer: no sign, no radix prefix, no exponent, no

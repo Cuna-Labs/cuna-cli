@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { EffectiveConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { automationCredentialHint } from "../core/product-web.js";
-import { isLoginCode } from "../core/namespace.js";
+import { isAccessToken, isLoginCode } from "../core/namespace.js";
 import type { CredentialBinding } from "../credentials/contracts.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { SecretMaterial } from "../credentials/secret-material.js";
@@ -55,6 +55,7 @@ export interface HumanAuthService {
   login(input?: { readonly intentClass?: CliIntentClass; readonly signal?: AbortSignal }): Promise<HumanAuthResult>;
   signup(input?: { readonly signal?: AbortSignal }): Promise<HumanAuthResult>;
   acquireAccessToken(signal?: AbortSignal): Promise<string>;
+  refreshRejectedAccessToken(rejectedAccessToken: string, signal?: AbortSignal): Promise<string>;
   whoami(signal?: AbortSignal): Promise<HumanAuthResult>;
   logout(signal?: AbortSignal): Promise<{ readonly revoked: true }>;
 }
@@ -774,6 +775,27 @@ export function createHumanAuthService(input: {
     return cachedAccessToken();
   }
 
+  async function refreshRejectedAccessToken(rejectedAccessToken: string, signal?: AbortSignal): Promise<string> {
+    assertNotCancelled(signal);
+    if (!isAccessToken(rejectedAccessToken)) {
+      throw authError("cuna.auth.reexchange_unknown", "Cuna refused an invalid rejected-token refresh request.");
+    }
+    // A concurrent request may already have replaced the rejected bearer. In
+    // that case return the newer authority instead of rotating the family a
+    // second time. The rejected string already exists at the HTTP boundary;
+    // it is never persisted or included in an error.
+    if (access !== undefined) {
+      const currentAccessToken = access.material.withBytes((bytes) =>
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+      if (currentAccessToken !== rejectedAccessToken && access.expiresAt - now() > 30_000) {
+        return currentAccessToken;
+      }
+    }
+    access?.material.dispose();
+    access = undefined;
+    return acquireAccessToken(signal);
+  }
+
   async function whoami(signal?: AbortSignal): Promise<HumanAuthResult> {
     const token = await acquireAccessToken(signal);
     const session = access;
@@ -886,6 +908,7 @@ export function createHumanAuthService(input: {
     signup: (request: { readonly signal?: AbortSignal } = {}) =>
       login({ intentClass: "signup", ...request }),
     acquireAccessToken,
+    refreshRejectedAccessToken,
     whoami,
     logout,
   });

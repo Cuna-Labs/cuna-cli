@@ -117,39 +117,27 @@ test("only the published API-key alias survives the configuration rename", async
   assert.equal(file.configFile, "/explicit/config.json");
 });
 
-test("OpenCode local consumer admission requires exact env true and an immutable producer witness", async () => {
+test("OpenCode local consumer admission is compiled from the immutable producer witness", async () => {
   const defaultGate = await resolveConfig({ platform: fakePlatform(), env: {} });
   assert.deepEqual(defaultGate.opencodeFeatureGate, {
-    state: "disabled",
-    source: "default",
-    variable: "CUNA_OPENCODE_ENABLED",
-    reason: "environment_not_enabled",
+    state: "enabled",
+    source: "compiled_contract",
+    reason: "enabled",
   });
 
-  for (const value of ["", "TRUE", "1", " true "]) {
+  for (const value of ["", "TRUE", "1", " true ", "false", "true"]) {
     const gate = await resolveConfig({
       platform: fakePlatform(),
       env: { CUNA_OPENCODE_ENABLED: value },
     });
     assert.deepEqual(gate.opencodeFeatureGate, {
-      state: "disabled",
-      source: "environment",
-      variable: "CUNA_OPENCODE_ENABLED",
-      reason: "environment_not_enabled",
+      state: "enabled",
+      source: "compiled_contract",
+      reason: "enabled",
     }, JSON.stringify(value));
   }
 
-  const mutableProducer = await resolveConfig({
-    platform: fakePlatform(),
-    env: { CUNA_OPENCODE_ENABLED: "true" },
-  });
-  assert.deepEqual(mutableProducer.opencodeFeatureGate, {
-    state: "disabled",
-    source: "environment",
-    variable: "CUNA_OPENCODE_ENABLED",
-    reason: "immutable_contract_witness_required",
-  });
-  assert.deepEqual(publicConfig(mutableProducer), {
+  assert.deepEqual(publicConfig(defaultGate), {
     profile: "default",
     profile_source: "default",
     base_url: DEFAULT_BASE_URL,
@@ -158,9 +146,9 @@ test("OpenCode local consumer admission requires exact env true and an immutable
     api_key: "absent",
     api_key_source: "absent",
     api_key_variable: null,
-    opencode_feature: "disabled",
-    opencode_feature_source: "environment",
-    opencode_feature_variable: "CUNA_OPENCODE_ENABLED",
+    opencode_feature: "enabled",
+    opencode_feature_source: "compiled_contract",
+    opencode_feature_reason: "enabled",
     config_file: "/home/test/.config/cuna/config.json",
   });
 });

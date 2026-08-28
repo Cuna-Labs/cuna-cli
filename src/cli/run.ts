@@ -1,21 +1,27 @@
 import { Writable } from "node:stream";
 import { createInterface } from "node:readline/promises";
+import { mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { join, resolve } from "node:path";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
-import { createHttpTransport, type HttpRequest } from "../api/http.js";
+import { createHttpTransport, type BearerRefreshRequest, type HttpRequest } from "../api/http.js";
 import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import type { BrowserHandoffReporter } from "../auth/browser-handoff.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import { assertApiKeyUsable, resolveConfig, type EffectiveConfig } from "../config/config.js";
-import { assertOpenCodeExecutionEnabled } from "../config/opencode-feature-gate.js";
+import {
+  assertOpenCodeExecutionEnabled,
+  type OpenCodeFeatureGate,
+} from "../config/opencode-feature-gate.js";
 import {
   executeCommand,
   preflightInvocation,
   type ConvergencePoller,
 } from "../commands/commands.js";
-import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
+import { EXIT_CODES, normalizeError, CunaError, unsupportedError, usageError, type ExitCode } from "../core/errors.js";
 import { DEFAULT_REQUEST_BUDGET_MS } from "../core/observation-budget.js";
 import {
   CONSOLE_ORIGIN,
@@ -34,8 +40,14 @@ import {
   orchestrateAgentJourney,
   preflightAgentJourneyInvocation,
   type AgentJourneyEffects,
+  type AgentJourneyPhase,
   type ReconciledAgentJourneyIntent,
 } from "../journey/index.js";
+import {
+  rootJourneyArgv,
+  runNodeRootJourney,
+  type RootJourneyRunner,
+} from "../journey/root-entry.js";
 import { createPlatformAdapter, type PlatformAdapter } from "../platform/adapter.js";
 import { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "../version.js";
 import { runtimeFeatureGates, type RuntimeFeatureGate } from "../runtime/contracts.js";
@@ -46,6 +58,7 @@ import {
   type ForegroundSessionRunner,
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
+import { runNodeMachinesExplorer, type MachinesExplorerRunner } from "../machines/explorer.js";
 import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
 import { createOutputWriter, sanitizeHumanTerminalOutput, type CliStreams } from "./output.js";
@@ -79,7 +92,13 @@ export interface RunCliDependencies {
    */
   readonly doctorCredentialBackend?: Pick<SecureCredentialBackend, "backendId" | "probe">;
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
+  /** Test/embedding seam; production uses the gate derived by resolveConfig. */
+  readonly opencodeFeatureGate?: OpenCodeFeatureGate;
   readonly foregroundTerminalRunner?: ForegroundSessionRunner;
+  readonly machinesExplorerRunner?: MachinesExplorerRunner;
+  readonly rootJourneyRunner?: RootJourneyRunner;
+  /** Internal root-UI hint; never parsed from or printed to user input. */
+  readonly managedWorkspaceMachineId?: string;
   readonly automaticJourneyEffectsFactory?: (input: {
     readonly client: CunaApiClient;
     readonly intent: ReconciledAgentJourneyIntent;
@@ -216,6 +235,10 @@ export async function readHiddenLoginCode(
   if (signal?.aborted) throw loginCodeInputError("cancelled", "Cuna sign-in was cancelled.");
 
   const wasRaw = input.isRaw === true;
+  // `resume()` below refs the terminal handle. Remember whether another
+  // consumer was already flowing so a completed login does not leave stdin
+  // keeping the whole CLI process alive after the success message.
+  const wasFlowing = input.readableFlowing === true;
   const bytes: number[] = [];
   const maxBytes = 256;
   let masked = 0;
@@ -240,6 +263,7 @@ export async function readHiddenLoginCode(
       input.off("end", onEnd);
       signal?.removeEventListener("abort", onAbort);
       try { input.setRawMode?.(wasRaw); } catch { /* best-effort terminal restoration */ }
+      if (!wasFlowing) input.pause();
       output.write("\n");
       bytes.fill(0);
     };
@@ -383,7 +407,7 @@ function needsRemoteCredential(command: string | undefined, foreground: Foregrou
     command === "agent" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
     command === "account" || command === "workspace" || command === "usage" ||
-    command === "claude" || command === "codex" || command === "openclaw" || command === "opencode" || foreground !== undefined;
+    command === "claude" || command === "codex" || command === "opencode" || foreground !== undefined;
 }
 
 function managesInteractiveSession(command: string | undefined): boolean {
@@ -421,11 +445,13 @@ function foregroundSelection(parsed: ParsedInvocation): ForegroundSelection | un
   if (parsed.command === "agent-sessions" && parsed.operands[0] === "attach") {
     return Object.freeze({ agentSessionIds: parsed.operands.slice(1) });
   }
-  const expectedAgent: "claude-code" | "codex" | "openclaw" | "opencode" | undefined = parsed.command === "claude"
+  const expectedAgent: "claude-code" | "codex" | "opencode" | undefined = parsed.command === "claude"
     ? "claude-code"
-    : parsed.command === "codex" || parsed.command === "openclaw" || parsed.command === "opencode"
-      ? parsed.command
-      : undefined;
+    : parsed.command === "codex"
+      ? "codex"
+      : parsed.command === "opencode"
+        ? "opencode"
+        : undefined;
   const agentSessionId = stringOption(parsed, "agent-session");
   if (expectedAgent !== undefined && agentSessionId !== undefined) {
     return Object.freeze({
@@ -438,6 +464,41 @@ function foregroundSelection(parsed: ParsedInvocation): ForegroundSelection | un
 
 function nodePlatform(kind: PlatformAdapter["kind"]): NodeJS.Platform {
   return kind === "windows" ? "win32" : kind === "macos" ? "darwin" : "linux";
+}
+
+function platformHomeDirectory(
+  environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): string | undefined {
+  const candidate = platform === "win32" ? environment.USERPROFILE : environment.HOME;
+  return typeof candidate === "string" && candidate.trim() !== "" ? candidate : undefined;
+}
+
+function sameHostPath(left: string, right: string, platform: NodeJS.Platform): boolean {
+  const canonicalLeft = resolve(left);
+  const canonicalRight = resolve(right);
+  return platform === "win32"
+    ? canonicalLeft.toLocaleLowerCase("en-US") === canonicalRight.toLocaleLowerCase("en-US")
+    : canonicalLeft === canonicalRight;
+}
+
+function managedWorkspaceScope(intent: ReconciledAgentJourneyIntent, machineId?: string): string {
+  if (machineId !== undefined) {
+    const digest = createHash("sha256").update(machineId, "utf8").digest("hex").slice(0, 16);
+    return `machine-${digest}`;
+  }
+  if (intent.machine.kind === "exact-name") {
+    const digest = createHash("sha256").update(intent.machine.name, "utf8").digest("hex").slice(0, 16);
+    return `machine-${digest}`;
+  }
+  return `${intent.agent}-${intent.machine.kind}`;
+}
+
+function agentDisplayName(agent: string): string {
+  return agent === "claude-code" ? "Claude Code"
+    : agent === "codex" ? "Codex"
+    : agent === "opencode" ? "OpenCode"
+    : "OpenClaw";
 }
 
 type BrowserLoginRemoteProbe = Readonly<{
@@ -498,10 +559,110 @@ function runtimeError(error: RuntimeBoundaryError): CunaError {
   });
 }
 
+interface InlineProgress {
+  update(label: string): void;
+  stop(): void;
+}
+
+const INLINE_CLOSE_FRAME_MS = 90;
+const INLINE_CLOSE_FRAMES = Object.freeze(["✦ Closing Cuna...", "✧ Closing Cuna...", "✓ Closed."]);
+
+function waitForUiFrame(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function animateInlineClose(stream: Writable, color: boolean): Promise<void> {
+  for (const [index, frame] of INLINE_CLOSE_FRAMES.entries()) {
+    const styled = color
+      ? index === INLINE_CLOSE_FRAMES.length - 1
+        ? `\u001b[38;5;42m\u001b[1m${frame}\u001b[0m`
+        : `\u001b[38;5;202m${frame}\u001b[0m`
+      : frame;
+    stream.write(`\r\u001b[2K${styled}`);
+    await waitForUiFrame(INLINE_CLOSE_FRAME_MS);
+  }
+  stream.write("\n");
+}
+
+function isTerminalResumeHandleConflict(error: CunaError): boolean {
+  return error.code === "cuna.remote.conflict" &&
+    error.details?.reason === "terminal_connection_resume_handle_conflict";
+}
+
+function writeTerminalReconnectConflict(stream: Writable, color: boolean): void {
+  const accent = (value: string): string => color ? `\u001b[38;5;202m\u001b[1m${value}\u001b[0m` : value;
+  const success = (value: string): string => color ? `\u001b[38;5;42m${value}\u001b[0m` : value;
+  stream.write(`${accent("◆ CUNA")}  Terminal connection changed\n`);
+  stream.write("The previous terminal link was already replaced.\n");
+  stream.write(`${success("Cuna did not stop the remote AgentSession.")}\n`);
+  stream.write("Run `cuna` again to reconnect.\n");
+}
+
+function startInlineProgress(stream: Writable, color: boolean, initialLabel = "Loading machines"): Readonly<InlineProgress> {
+  const frames = ["◐", "◓", "◑", "◒"];
+  const bars = ["━╺━━━━", "━━╺━━━", "━━━╺━━", "━━━━╺━", "━━━━━╺", "━━━━╸━", "━━━╸━━", "━━╸━━━"];
+  let frame = 0;
+  let label = initialLabel;
+  let stopped = false;
+  const paint = (): void => {
+    const text = `${frames[frame % frames.length]} ${label}  ${bars[frame % bars.length]}`;
+    const styled = color
+      ? `\u001b[38;5;202m${frames[frame % frames.length]}\u001b[0m \u001b[38;5;255m\u001b[1m${label}\u001b[0m  \u001b[38;5;208m${bars[frame % bars.length]}\u001b[0m`
+      : text;
+    stream.write(`\r\u001b[2K${styled}`);
+    frame += 1;
+  };
+  paint();
+  const timer = setInterval(paint, 90);
+  timer.unref();
+  return Object.freeze({
+    update(nextLabel: string) {
+      if (stopped || nextLabel === label) return;
+      label = nextLabel;
+      paint();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      stream.write("\r\u001b[2K");
+    },
+  });
+}
+
+function writeJourneyDiscovery(stream: Writable, color: boolean): void {
+  if (!color) {
+    stream.write("Cuna: finding a machine or AgentSession to open...\n");
+    return;
+  }
+  stream.write(`\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;255mFinding a machine or AgentSession\u001b[0m\n`);
+}
+
+function journeyPhaseLabel(phase: AgentJourneyPhase, agent: "claude-code" | "codex" | "opencode"): string {
+  const display = agentDisplayName(agent);
+  switch (phase) {
+    case "inspect-workspace": return "Inspecting workspace";
+    case "observe-machines": return "Finding a compatible machine";
+    case "create-machine": return "Creating machine";
+    case "reconcile-machine-create": return "Confirming machine creation";
+    case "ready-machine": return "Starting machine";
+    case "synchronize-workspace": return "Syncing workspace";
+    case "observe-agent-sessions": return `Finding a ${display} session`;
+    case "create-agent-session": return `Creating ${display} session`;
+    case "ready-agent-session": return `Starting ${display}`;
+    case "attach": return `Opening ${display}`;
+  }
+}
+
 export async function runCli(argv: readonly string[], dependencies: RunCliDependencies = {}): Promise<ExitCode> {
   const streams = dependencies.streams ?? defaultStreams();
   const writer = createOutputWriter({ streams, json: argv.includes("--json") });
   const label = commandLabel(argv);
+  let inlineMachinesProgress: Readonly<InlineProgress> | undefined;
+  let inlineJourneyProgress: Readonly<InlineProgress> | undefined;
+  let inlineRootProgress: Readonly<InlineProgress> | undefined;
+  let interactiveRootUi = false;
+  let interactiveRootColor = false;
   try {
     const parsed = parseArgv(argv);
     if (!booleanOption(parsed, "help") && (booleanOption(parsed, "version") || parsed.command === "version")) {
@@ -537,6 +698,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       const topic = parsed.command === "help" || parsed.command === undefined
         ? undefined
         : parsed.command;
+      if (topic === "openclaw") {
+        throw usageError(`Unknown command ${topic}.`, "Run `cuna --help`.");
+      }
       // `--all` widens the ROOT topic only. On a command topic the per-command
       // help is already the complete surface for that command, so there is
       // nothing to widen and the flag would promise something it cannot do.
@@ -571,7 +735,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       const invalidRootOption = Object.keys(parsed.options).find((name) => !allowedRootOptions.has(name));
       if (invalidRootOption !== undefined) throw usageError(`Option --${invalidRootOption} requires a command.`);
     }
-    if (parsed.command === undefined) {
+    const interactiveRoot = parsed.command === undefined &&
+      !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY;
+    interactiveRootUi = interactiveRoot;
+    if (parsed.command === undefined && !interactiveRoot) {
       if (writer.structured) {
         writer.success("help", { version: CLI_VERSION, output_schema_version: OUTPUT_SCHEMA_VERSION, help: ROOT_HELP }, ROOT_HELP);
       } else {
@@ -586,11 +753,31 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // process-level value.
     const effectiveEnvironment: NodeJS.ProcessEnv = { ...(dependencies.env ?? process.env) };
     Object.freeze(effectiveEnvironment);
-    preflightInvocation(parsed, effectiveEnvironment);
+    if (parsed.command !== undefined) preflightInvocation(parsed);
 
-    const journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "openclaw" || parsed.command === "opencode"
+    let journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "opencode"
       ? preflightAgentJourneyInvocation(parsed)
       : undefined;
+    if (journeyIntent?.target === "reconcile" && journeyIntent.localPath === undefined) {
+      const homeDirectory = platformHomeDirectory(effectiveEnvironment, process.platform);
+      if (homeDirectory !== undefined && sameHostPath(process.cwd(), homeDirectory, process.platform)) {
+        // Keep HOME safe without forcing every machine to share one local
+        // binding. Exact machine selections get a stable private root; the
+        // automatic root remains stable so its committed binding can guide
+        // later automatic selection.
+        // Do not nest these roots under the former single-root `~/Cuna`.
+        // Workspace binding discovery intentionally walks ancestors, so a
+        // child below that already-bound root would inherit its record and
+        // then fail the child-root compare-and-swap.
+        const managedWorkspace = join(
+          homeDirectory,
+          "Cuna Workspaces",
+          managedWorkspaceScope(journeyIntent, dependencies.managedWorkspaceMachineId),
+        );
+        await mkdir(managedWorkspace, { recursive: true });
+        journeyIntent = Object.freeze({ ...journeyIntent, localPath: managedWorkspace });
+      }
+    }
 
     const foreground = foregroundSelection(parsed);
     if ((foreground !== undefined || journeyIntent?.target === "reconcile") &&
@@ -600,12 +787,21 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         "Run this command directly in an interactive terminal without --json or output redirection.",
       );
     }
+    if (journeyIntent !== undefined) {
+      // This is deliberately before config, credential, and network work: it
+      // tells the truth immediately without claiming that attach has begun.
+      const display = agentDisplayName(journeyIntent.agent);
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, `Preparing ${display}`);
+      else streams.stderr.write(`Cuna: preparing ${display}...\n`);
+    }
     const platform = dependencies.platform ?? createPlatformAdapter({ env: effectiveEnvironment });
     let foregroundPresentation: ForegroundPresentationMode | undefined;
     if (foreground !== undefined) {
       foregroundPresentation = selectNodeForegroundPresentation({
         platform: nodePlatform(platform.kind),
         environment: effectiveEnvironment,
+        sessionCount: foreground.agentSessionIds.length,
         ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
       });
       if (foregroundPresentation === "plain" && foreground.agentSessionIds.length !== 1) {
@@ -637,18 +833,13 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(configFile === undefined ? {} : { configFile }),
       },
     });
-    // Re-admit every executable OpenCode journey from the immutable, resolved
-    // configuration. This prevents a mutable embedding environment from
-    // passing preflight under one value and reaching remote, host, or child
-    // effects after it has changed under another.
-    if (journeyIntent?.agent === "opencode") {
-      assertOpenCodeExecutionEnabled(config.opencodeFeatureGate);
-    }
+    const opencodeFeatureGate = dependencies.opencodeFeatureGate ?? config.opencodeFeatureGate;
+    if (parsed.command === "opencode") assertOpenCodeExecutionEnabled(opencodeFeatureGate);
     // Fail closed before any authority is selected, and only for a command that
     // selects one. Empty or malformed still never means absent: an unusable
     // `*_API_KEY` refuses the command rather than silently demoting automation
     // mode to an interactive browser sign-in.
-    if (usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
+    if (interactiveRoot || usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
     const sessionPaths = localEncryptedSessionPaths(platform.paths.configDirectory, config.profile);
     if (config.apiKey !== undefined && (parsed.command === "login" || parsed.command === "signup")) {
       throw new CunaError({
@@ -708,6 +899,49 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       return humanAuth;
     };
 
+    // The primary human entry points own authentication as part of their
+    // journey. A person who runs `cuna`, `cuna machines`, `cuna claude`, or
+    // `cuna codex` should never see machine-discovery feedback followed by an
+    // instruction to discover a separate login command. Establish or recover
+    // the interactive session first, then begin the product action.
+    const guidedInteractiveEntry = config.apiKey === undefined && (
+      interactiveRoot ||
+      (parsed.command === "machines" && parsed.operands.length === 0 &&
+        !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY) ||
+      journeyIntent?.target === "reconcile"
+    );
+    if (guidedInteractiveEntry) {
+      const guidedAuth = await getHumanAuth();
+      try {
+        await guidedAuth.acquireAccessToken(dependencies.signal);
+      } catch (error) {
+        if (!(error instanceof CunaError) ||
+          (error.code !== "cuna.auth.required" && error.code !== "cuna.auth.reauthentication_required")) {
+          throw error;
+        }
+        streams.stderr.write("Cuna: let's sign you in first...\n");
+        await guidedAuth.login(dependencies.signal === undefined ? {} : { signal: dependencies.signal });
+        streams.stderr.write("Cuna: signed in. Continuing...\n");
+      }
+    }
+
+    // Progress starts only after authentication is usable. This ordering is
+    // observable UX: it must not claim to search machines while login is the
+    // actual operation in progress.
+    if (journeyIntent !== undefined) {
+      const display = agentDisplayName(journeyIntent.agent);
+      if (inlineJourneyProgress !== undefined) inlineJourneyProgress.update(`Connecting to ${display}`);
+      else streams.stderr.write(`Cuna: connecting to ${display}...\n`);
+    }
+    if (
+      parsed.command === "machines" && parsed.operands.length === 0 &&
+      !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY
+    ) {
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      if (streams.stderrIsTTY === true) inlineMachinesProgress = startInlineProgress(streams.stderr, color);
+      else streams.stderr.write("Cuna: loading machines...\n");
+    }
+
     if (
       parsed.command === "signup" ||
       parsed.command === "login" ||
@@ -754,7 +988,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         writer.success(
           "login",
           data,
-          `Signed in to Cuna profile ${result.profile} using the encrypted local session store.`,
+          "Signed in to Cuna.",
         );
       } else if (parsed.command === "whoami" || parsed.command === "access") {
         const result = await (await getHumanAuth()).whoami(dependencies.signal);
@@ -771,23 +1005,118 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       return EXIT_CODES.success;
     }
 
-    let bearerToken: string | undefined;
+    let bearerTokenProvider: ((signal?: AbortSignal, refresh?: BearerRefreshRequest) => Promise<string>) | undefined;
     let credentialMode: "automation" | "interactive" | undefined = config.apiKey === undefined ? undefined : "automation";
-    if (config.apiKey === undefined && needsRemoteCredential(parsed.command, foreground)) {
+    if (config.apiKey === undefined && (interactiveRoot || needsRemoteCredential(parsed.command, foreground))) {
       if (dependencies.clientFactory === undefined || dependencies.humanAuth !== undefined) {
-        bearerToken = await (await getHumanAuth()).acquireAccessToken(dependencies.signal);
+        const humanAuth = await getHumanAuth();
+        if (dependencies.clientFactory === undefined) {
+          bearerTokenProvider = (signal, refresh) => refresh === undefined
+            ? humanAuth.acquireAccessToken(signal)
+            : humanAuth.refreshRejectedAccessToken(refresh.rejectedToken, signal);
+        } else {
+          await humanAuth.acquireAccessToken(dependencies.signal);
+        }
         credentialMode = "interactive";
       }
     }
     const httpTransport = dependencies.clientFactory === undefined ? createHttpTransport({
       baseUrl: config.baseUrl,
       ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
-      ...(bearerToken === undefined ? {} : { bearerToken }),
+      ...(bearerTokenProvider === undefined ? {} : { bearerTokenProvider }),
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     }) : undefined;
     const client = dependencies.clientFactory?.(config, effectiveTimeoutMs) ?? createCunaApiClient(httpTransport!);
+    if (interactiveRoot) {
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      interactiveRootColor = color;
+      if (streams.stderrIsTTY === true) {
+        inlineRootProgress = startInlineProgress(streams.stderr, color, "Finding a machine or AgentSession");
+      } else {
+        writeJourneyDiscovery(streams.stderr, false);
+      }
+      const rootRunner = dependencies.rootJourneyRunner ?? runNodeRootJourney;
+      let selection: Awaited<ReturnType<RootJourneyRunner>>;
+      try {
+        selection = await rootRunner({
+          client,
+          color,
+          opencodeEnabled: opencodeFeatureGate.state === "enabled",
+          onBeforeTerminalOwnership: () => {
+            inlineRootProgress?.stop();
+            inlineRootProgress = undefined;
+          },
+          ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+        }, dependencies.now === undefined ? {} : { now: dependencies.now });
+      } finally {
+        inlineRootProgress?.stop();
+        inlineRootProgress = undefined;
+      }
+      if (selection === undefined) {
+        if (dependencies.signal?.aborted === true && streams.stderrIsTTY === true) {
+          await animateInlineClose(streams.stderr, color);
+        }
+        return EXIT_CODES.success;
+      }
+      if (selection.kind === "attach") {
+        const display = agentDisplayName(selection.agent);
+        if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, `Attaching to ${display}`);
+        else streams.stderr.write(`Cuna: attaching to ${display}...\n`);
+        const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
+        try {
+          await runner({
+            client,
+            baseUrl: config.baseUrl,
+            browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
+            agentSessionIds: [selection.agentSessionId],
+            expectedAgentKinds: [selection.agent],
+            color,
+            hostPlatform: nodePlatform(platform.kind),
+            presentationMode: selectNodeForegroundPresentation({
+              platform: nodePlatform(platform.kind),
+              environment: effectiveEnvironment,
+              sessionCount: 1,
+              ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+            }),
+            opencodeEnabled: opencodeFeatureGate.state === "enabled",
+            onBeforeTerminalOwnership: () => {
+              inlineRootProgress?.stop();
+              inlineRootProgress = undefined;
+            },
+            ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+            ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+          });
+        } finally {
+          inlineRootProgress?.stop();
+          inlineRootProgress = undefined;
+        }
+        return EXIT_CODES.success;
+      }
+      if (selection.kind === "lifecycle") {
+        const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+        const progress = startInlineProgress(streams.stderr, !noColor, selection.action === "start" ? "Starting machine" : "Stopping machine");
+        const exit = await runCli([
+          "machines", selection.action, selection.machineId, "--yes",
+          ...(noColor ? ["--no-color"] : []),
+        ], dependencies);
+        progress.stop();
+        return exit === EXIT_CODES.success
+          ? await runCli(noColor ? ["--no-color"] : [], dependencies)
+          : exit;
+      }
+      return await runCli(rootJourneyArgv(selection, { noColor: booleanOption(parsed, "no-color") }), {
+        ...dependencies,
+        ...(selection.machineId === undefined ? {} : { managedWorkspaceMachineId: selection.machineId }),
+        ...(humanAuth === undefined ? {} : { humanAuth }),
+      });
+    }
     if (journeyIntent?.target === "reconcile") {
+      if (journeyIntent.agent === "opencode") assertOpenCodeExecutionEnabled(opencodeFeatureGate);
+      if (journeyIntent.agent === "openclaw") {
+        throw unsupportedError("openclaw", "provider_route_unavailable");
+      }
+      const journeyAgent = journeyIntent.agent;
       if (credentialMode === undefined) {
         throw new CunaError({
           code: "cuna.auth.required",
@@ -847,6 +1176,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
         effects = createApiAgentJourneyEffects({
           client,
+          requestedAgent: journeyAgent,
           inspectWorkspace: workspace.inspectWorkspace,
           synchronizeWorkspace: workspace.synchronizeWorkspace,
           authorizeMachineCreate: async ({ requestedAgent, signal }) =>
@@ -855,16 +1185,23 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
             const presentationMode = selectNodeForegroundPresentation({
               platform: nodePlatform(platform.kind),
               environment: effectiveEnvironment,
+              sessionCount: 1,
               ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
             });
             await runner({
               client,
               baseUrl: config.baseUrl,
+              browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
               agentSessionIds: [agentSessionId],
               expectedAgentKinds: [expectedAgent],
               color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
               hostPlatform: nodePlatform(platform.kind),
               presentationMode,
+              opencodeEnabled: opencodeFeatureGate.state === "enabled",
+              onBeforeTerminalOwnership: () => {
+                inlineJourneyProgress?.stop();
+                inlineJourneyProgress = undefined;
+              },
               ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
               signal,
             });
@@ -872,6 +1209,23 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
       }
+      const baseEffects = effects;
+      effects = Object.freeze({
+        ...baseEffects,
+        onPhase(phase: AgentJourneyPhase) {
+          baseEffects.onPhase?.(phase);
+          inlineJourneyProgress?.update(journeyPhaseLabel(phase, journeyAgent));
+        },
+        async attach(input: Parameters<AgentJourneyEffects["attach"]>[0]) {
+          inlineJourneyProgress?.update(`Attaching to ${agentDisplayName(journeyAgent)}`);
+          try {
+            await baseEffects.attach(input);
+          } finally {
+            inlineJourneyProgress?.stop();
+            inlineJourneyProgress = undefined;
+          }
+        },
+      });
       try {
         await orchestrateAgentJourney({
           intent: journeyIntent,
@@ -880,25 +1234,50 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
         });
       } finally {
+        inlineJourneyProgress?.stop();
+        inlineJourneyProgress = undefined;
         await stopJourneyWorkspace?.();
       }
       return EXIT_CODES.success;
     }
     if (foreground !== undefined) {
+      const expectedAgent = foreground.expectedAgentKinds?.length === 1
+        ? foreground.expectedAgentKinds[0]
+        : undefined;
+      const attachLabel = expectedAgent === undefined
+        ? foreground.agentSessionIds.length === 1
+          ? "Attaching to AgentSession"
+          : `Attaching to ${foreground.agentSessionIds.length} AgentSessions`
+        : `Attaching to ${agentDisplayName(expectedAgent)}`;
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      if (inlineJourneyProgress !== undefined) inlineJourneyProgress.update(attachLabel);
+      else if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, attachLabel);
+      else streams.stderr.write(`Cuna: ${attachLabel.toLowerCase()}...\n`);
       const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
-      await runner({
-        client,
-        baseUrl: config.baseUrl,
-        agentSessionIds: foreground.agentSessionIds,
-        ...(foreground.expectedAgentKinds === undefined
-          ? {}
-          : { expectedAgentKinds: foreground.expectedAgentKinds }),
-        color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
-        hostPlatform: nodePlatform(platform.kind),
-        ...(foregroundPresentation === undefined ? {} : { presentationMode: foregroundPresentation }),
-        ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
-        ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
-      });
+      try {
+        await runner({
+          client,
+          baseUrl: config.baseUrl,
+          browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
+          agentSessionIds: foreground.agentSessionIds,
+          ...(foreground.expectedAgentKinds === undefined
+            ? {}
+            : { expectedAgentKinds: foreground.expectedAgentKinds }),
+          color,
+          hostPlatform: nodePlatform(platform.kind),
+          ...(foregroundPresentation === undefined ? {} : { presentationMode: foregroundPresentation }),
+          opencodeEnabled: opencodeFeatureGate.state === "enabled",
+          onBeforeTerminalOwnership: () => {
+            inlineJourneyProgress?.stop();
+            inlineJourneyProgress = undefined;
+          },
+          ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+          ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+        });
+      } finally {
+        inlineJourneyProgress?.stop();
+        inlineJourneyProgress = undefined;
+      }
       return EXIT_CODES.success;
     }
     let runtimeFeatures = dependencies.runtimeFeatures;
@@ -937,11 +1316,80 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         browserLoginRemoteReason: browserLoginRemote.reason,
       });
     }
+    if (
+      parsed.command === "machines" && parsed.operands.length === 0 &&
+      !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY
+    ) {
+      inlineMachinesProgress?.stop();
+      inlineMachinesProgress = undefined;
+      const runner = dependencies.machinesExplorerRunner ?? runNodeMachinesExplorer;
+      const selection = await runner({
+        client,
+        color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+        opencodeEnabled: opencodeFeatureGate.state === "enabled",
+        ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+      }, dependencies.now === undefined ? {} : { now: dependencies.now });
+      if (selection !== undefined) {
+        if (selection.kind === "attach") {
+          const display = agentDisplayName(selection.agent);
+          const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+          if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, `Attaching to ${display}`);
+          else streams.stderr.write(`Cuna: attaching to ${display}...\n`);
+          const foregroundRunner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
+          try {
+            await foregroundRunner({
+              client,
+              baseUrl: config.baseUrl,
+              browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
+              agentSessionIds: [selection.agentSessionId],
+              expectedAgentKinds: [selection.agent],
+              color,
+              hostPlatform: nodePlatform(platform.kind),
+              presentationMode: selectNodeForegroundPresentation({
+                platform: nodePlatform(platform.kind),
+                environment: effectiveEnvironment,
+                sessionCount: 1,
+                ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+              }),
+              opencodeEnabled: opencodeFeatureGate.state === "enabled",
+              onBeforeTerminalOwnership: () => {
+                inlineRootProgress?.stop();
+                inlineRootProgress = undefined;
+              },
+              ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+              ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+            });
+          } finally {
+            inlineRootProgress?.stop();
+            inlineRootProgress = undefined;
+          }
+        } else if (selection.kind === "launch") {
+          return await runCli(rootJourneyArgv(selection, { noColor: booleanOption(parsed, "no-color") }), {
+            ...dependencies,
+            ...(selection.machineId === undefined ? {} : { managedWorkspaceMachineId: selection.machineId }),
+          });
+        } else {
+          const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+          const progress = startInlineProgress(streams.stderr, !noColor, selection.action === "start" ? "Starting machine" : "Stopping machine");
+          const exit = await runCli([
+            "machines", selection.action, selection.machineId, "--yes",
+            ...(noColor ? ["--no-color"] : []),
+          ], dependencies);
+          progress.stop();
+          return exit === EXIT_CODES.success
+            ? await runCli(["machines", ...(noColor ? ["--no-color"] : [])], dependencies)
+            : exit;
+        }
+      }
+      return EXIT_CODES.success;
+    }
+    const commandClock = dependencies.now ?? Date.now;
     const result = await executeCommand({
       parsed,
       config,
       client,
-      now: dependencies.now?.() ?? Date.now(),
+      now: commandClock(),
+      capabilityClock: commandClock,
       ...(dependencies.convergencePoller === undefined
         ? {}
         : { convergencePoller: dependencies.convergencePoller }),
@@ -951,6 +1399,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     writer.success(result.command, result.data, result.human);
     return EXIT_CODES.success;
   } catch (unknownError) {
+    inlineMachinesProgress?.stop();
+    inlineJourneyProgress?.stop();
+    inlineRootProgress?.stop();
     const error = unknownError instanceof CredentialBoundaryError
       ? new CunaError({
           code: `cuna.auth.${unknownError.code}`,
@@ -966,6 +1417,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       : unknownError instanceof RuntimeBoundaryError
         ? runtimeError(unknownError)
       : normalizeError(unknownError);
+    if (interactiveRootUi && dependencies.signal?.aborted === true && streams.stderrIsTTY === true) {
+      await animateInlineClose(streams.stderr, interactiveRootColor);
+      return EXIT_CODES.success;
+    }
+    if (interactiveRootUi && streams.stderrIsTTY === true && isTerminalResumeHandleConflict(error)) {
+      writeTerminalReconnectConflict(streams.stderr, interactiveRootColor);
+      return error.exitCode;
+    }
     writer.error(label, error);
     return error.exitCode;
   }

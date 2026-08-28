@@ -290,7 +290,7 @@ export function publicConfig(config: EffectiveConfig): Readonly<Record<string, u
     api_key_variable: config.apiKeyVariable ?? null,
     opencode_feature: config.opencodeFeatureGate.state,
     opencode_feature_source: config.opencodeFeatureGate.source,
-    opencode_feature_variable: config.opencodeFeatureGate.variable,
+    opencode_feature_reason: config.opencodeFeatureGate.reason,
     config_file: config.configFile,
   });
 }

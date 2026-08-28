@@ -830,6 +830,7 @@
           "machine_not_running",
           "agent_session_not_ready",
           "terminal_connection_idempotency_conflict",
+          "terminal_connection_resume_handle_conflict",
           "invalid_terminal_connection_request",
           "terminal_connection_authority_unavailable"
         ],
@@ -2988,7 +2989,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "pattern": "^https://api\\.runacode\\.io/problems/[a-z][a-z0-9_]{2,63}$"
+            "pattern": "^https://(?:api\\.getcuna\\.com|api\\.runacode\\.io)/problems/[a-z][a-z0-9_]{2,63}$"
           },
           "title": {
             "type": "string",
@@ -3043,7 +3044,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "pattern": "^https://api\\.runacode\\.io/problems/workspace_sync_[a-z0-9_]{2,48}$"
+            "pattern": "^https://(?:api\\.getcuna\\.com|api\\.runacode\\.io)/problems/workspace_sync_[a-z0-9_]{2,48}$"
           },
           "title": {
             "type": "string",

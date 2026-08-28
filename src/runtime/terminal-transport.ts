@@ -10,7 +10,6 @@ import { TERMINAL_PROTOCOL, type TerminalReadyPayload } from "../terminal/codec.
 import type { CapabilityAdmission } from "./capability-gate.js";
 import { runtimeFailure } from "./errors.js";
 
-const MAX_REMOTE_EVIDENCE_TTL_MS = 60_000;
 const MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS = 5_000;
 
 export interface RemoteAgentSessionEvidence {
@@ -19,6 +18,8 @@ export interface RemoteAgentSessionEvidence {
   readonly machineId: string;
   readonly agentSessionId: string;
   readonly processEpoch: string;
+  readonly workspaceBindingId: string | null;
+  readonly workspaceBindingGeneration: number | null;
   readonly state: "starting" | "ready" | "running" | "exited" | "failed" | "terminating" | "terminated" | "unknown";
   readonly observedAt: string;
   readonly expiresAt: string;
@@ -90,7 +91,11 @@ export function assertRemoteAgentSessionEvidence(input: {
   readonly now?: number;
 }): RemoteAgentSessionEvidence {
   const evidence = input.evidence;
-  const now = input.now ?? Date.now();
+  // Test doubles and rollback peers predating WorkspaceBinding projection are
+  // normalized to the explicit legacy identity. They can still attach a PTY,
+  // but READY cannot negotiate workspace-scoped local actions for them.
+  const workspaceBindingId = evidence.workspaceBindingId ?? null;
+  const workspaceBindingGeneration = evidence.workspaceBindingGeneration ?? null;
   // The service renders these; the CLI only reads them. `runtime_observed_at`
   // and `runtime_expires_at` are forwarded out of Postgres verbatim
   // (`infra edge/src/agent-sessions.ts:235-240`), so they arrive as
@@ -106,18 +111,23 @@ export function assertRemoteAgentSessionEvidence(input: {
     evidence.userId.length === 0 ||
     evidence.machineId.length === 0 ||
     evidence.processEpoch.length === 0 ||
+    (workspaceBindingId === null) !== (workspaceBindingGeneration === null) ||
+    (workspaceBindingId !== null && !canonicalUuid(workspaceBindingId)) ||
+    (workspaceBindingGeneration !== null &&
+      (!Number.isSafeInteger(workspaceBindingGeneration) || workspaceBindingGeneration < 1)) ||
     evidence.evidenceRevision.length === 0 ||
     observedAt === null ||
     expiresAt === null ||
-    observedAt > now + MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS ||
     expiresAt < observedAt ||
-    expiresAt - observedAt > MAX_REMOTE_EVIDENCE_TTL_MS ||
-    expiresAt <= now ||
-    (evidence.state !== "ready" && evidence.state !== "running")
+    observedAt > (input.now ?? Date.now()) + MAX_REMOTE_EVIDENCE_FUTURE_SKEW_MS
   ) {
-    throw runtimeFailure("remote_state_unproven", "The AgentSession is not freshly proven ready for terminal attachment.");
+    throw runtimeFailure("remote_state_unproven", "The AgentSession identity evidence is malformed.");
   }
-  return evidence;
+  return Object.freeze({
+    ...evidence,
+    workspaceBindingId,
+    workspaceBindingGeneration,
+  });
 }
 
 export function validateTerminalGrant(input: {
@@ -195,6 +205,25 @@ export function assertReadyPayloadMatches(
     Number(payload.fencingGeneration) < 1
   ) {
     throw runtimeFailure("grant_scope_mismatch", "Terminal readiness evidence targets another AgentSession generation.");
+  }
+  const readyIdentityFields = [
+    payload.machineId,
+    payload.machineGeneration,
+    payload.workspaceBindingId,
+    payload.workspaceBindingGeneration,
+  ];
+  const readyIdentityFieldCount = readyIdentityFields.filter((value) => value !== undefined).length;
+  const hasReadyIdentity = readyIdentityFieldCount > 0;
+  if (hasReadyIdentity && (
+    readyIdentityFieldCount !== readyIdentityFields.length ||
+    payload.machineId !== observation.machineId ||
+    payload.workspaceBindingId !== observation.workspaceBindingId ||
+    payload.workspaceBindingGeneration !== observation.workspaceBindingGeneration
+  )) {
+    throw runtimeFailure("grant_scope_mismatch", "Terminal readiness evidence targets another WorkspaceBinding generation.");
+  }
+  if (payload.localActionProtocol !== undefined && !hasReadyIdentity) {
+    throw runtimeFailure("grant_scope_mismatch", "Local actions require exact WorkspaceBinding readiness evidence.");
   }
 }
 

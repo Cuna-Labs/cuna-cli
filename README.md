@@ -8,7 +8,7 @@
 Run cloud development agents from a local terminal through Cuna's public,
 policy-enforced control plane.
 
-Cuna CLI is designed to make Claude Code, Codex, OpenClaw, and future agents
+Cuna CLI is designed to make Claude Code, Codex, OpenCode, and future agents
 feel local while their processes, durable sessions, and isolated workspaces run
 on Cuna cloud machines. The CLI keeps machine lifecycle, synchronization,
 authorizations, and runtime evidence explicit instead of hiding them behind an
@@ -41,6 +41,23 @@ implemented against the local public 1.5.0 candidate contract. Its immutable
 contract gitlink and provenance approval remain release-blocked.
 Canonical contract approval and producer deployment remain blocked. Source
 code or a documented interface is not evidence that a capability is deployed.
+
+## Use Cuna from a local package
+
+Install the locally built package, sign in once, then let the guided entrypoint
+choose a machine, provider, and AgentSession. The normal journey requires no
+resource IDs.
+
+```powershell
+npm install --global C:\path\to\cuna_labs-cli-0.1.0.tgz
+cuna login
+cuna
+```
+
+To choose a supported provider directly, use `cuna claude [PATH]`,
+`cuna codex [PATH]`, or `cuna opencode [PATH]`. Use `cuna machines` to browse machines and the sessions
+inside them. Exact resource commands and compatibility aliases are documented
+under `cuna help --all`.
 
 ## Quick start for contributors
 
@@ -98,10 +115,13 @@ cuna whoami
 cuna logout
 cuna machines list
 cuna machines create --name NAME --idempotency-key KEY --yes
+cuna machines create --name NAME --agent opencode --yes
 cuna machines start|pause|resume|stop ID --yes
 cuna machines delete ID --yes
 cuna agent-sessions list --machine ID
 cuna agent-sessions create --machine ID --agent claude-code --idempotency-key KEY --yes
+cuna opencode [PATH]
+cuna opencode --agent-session SESSION_ID
 cuna config get
 cuna self-test --offline --json
 cuna version --json
@@ -116,9 +136,11 @@ successful mutation.
 When the foreground terminal capability becomes available, `Ctrl+]` is Cuna's
 local escape prefix. `Ctrl+] ?` toggles trusted in-terminal help; `Ctrl+] 1`…
 `4` selects a tab, `Ctrl+] n` selects the next tab, `Ctrl+] d` detaches the
-local view, and `Ctrl+] Ctrl+]` sends a literal prefix to the cloud session.
-These keys are ignored as Cuna commands inside bracketed paste. Ordinary
-`Ctrl+C` and `Ctrl+Z` continue to the selected cloud session.
+local view, `Ctrl+] c` sends a remote `Ctrl+C`, and `Ctrl+] Ctrl+]` sends a
+literal prefix to the cloud session. These keys are ignored as Cuna commands
+inside bracketed paste. Ordinary `Ctrl+C` detaches the local Cuna view in one
+press; it does not terminate the remote AgentSession. `Ctrl+Z` continues to the
+selected cloud session.
 
 ## Exit codes
 
@@ -176,14 +198,14 @@ both names are present, `CUNA_API_KEY` always wins. An empty or malformed
 canonical value fails instead of falling through to the legacy credential.
 Other earlier-brand environment-variable names and local paths are not accepted.
 
-`CUNA_OPENCODE_ENABLED=true` is the only local CLI opt-in for OpenCode creation
-and automatic attachment; it is exact and case-sensitive. The default, unset,
-empty, or any other value is disabled. This is a consumer safety gate, not a
-release authority: it cannot enable Edge, override the release manifest, or
-inject/copy any Cuna, Codex, OpenAI, or OpenCode credential. Existing OpenCode
-rows remain readable and an exact `--agent-session` attachment remains
-available while the local creation gate is off. `cuna config get --json`
-reports the non-secret gate state and source.
+OpenCode creation and attachment are admitted only when this CLI was built from
+the committed Infra contract that declares interactive-only OpenCode support.
+No environment variable can invent or suppress that producer truth. Each live
+operation still requires current server capability evidence, a compatible
+machine, and exact AgentSession authority. OpenCode uses `interactive_login`
+only: choose `/connect` inside its remote terminal. Cuna never copies Codex,
+OpenAI, local-keychain, or other provider credentials into OpenCode. `cuna
+config get --json` reports the non-secret compiled gate state and reason.
 
 `CUNA_API_KEY` and its deprecated `RUNA_API_KEY` alias are explicit automation
 credentials and are never persisted automatically. An automation

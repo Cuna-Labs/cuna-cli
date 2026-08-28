@@ -75,12 +75,12 @@ test("rich workbench keeps a persistent orange Cuna appbar above the selected is
   assert.match(frame.text, /48;2;235;86;37m/);
   assert.match(frame.text, /CUNA.*Claude primary.*\[2:Codex review\]/s);
   assert.doesNotMatch(frame.text, /\bRUNA\b/u);
-  assert.match(frame.text, /auth authenticated/);
+  assert.match(frame.text, /Codex auth authenti/);
   assert.match(frame.text, /3;1H.*codex viewport/s);
   assert.doesNotMatch(frame.text, /claude viewport/);
 });
 
-test("unknown, stale, and unavailable truth is labeled and never rendered as zero or success", () => {
+test("foreground appbar omits auxiliary stale truth and never renders unknown metrics as success", () => {
   const frame = renderWorkbenchFrame({
     columns: 140,
     rows: 8,
@@ -98,8 +98,8 @@ test("unknown, stale, and unavailable truth is labeled and never rendered as zer
       tokensSaved: [],
     }),
   });
-  assert.match(frame.text, /auth unknown/);
-  assert.match(frame.text, /sync stale/);
+  assert.match(frame.text, /Claude auth unknown/);
+  assert.doesNotMatch(frame.text, /machine |session |sync /u);
   assert.match(frame.text, /tokens saved unknown/);
   assert.doesNotMatch(frame.text, /tokens saved 0|signed in|100%/i);
 });
@@ -204,4 +204,36 @@ test("workbench restores the selected remote cursor below the appbar without for
   });
   assert.equal(frame.text.endsWith("\u001b[5;5H\u001b[?25l"), true);
   assert.equal(frame.text.endsWith("\u001b[?25h"), false);
+});
+
+test("workbench safely re-emits VTE-parsed palette and RGB styles", () => {
+  const registry = new ViewportRegistry();
+  registry.open("styled", binding("styled"), 80, 4);
+  const baseStyle = {
+    bold: false, dim: false, italic: false, underline: false, blink: false,
+    inverse: false, invisible: false, strikethrough: false, overline: false,
+    foreground: null, background: null,
+  };
+  registry.applyRenderedFrame({
+    tabId: "styled",
+    binding: binding("styled"),
+    outputSequence: 1n,
+    replayCursor: 1n,
+    cells: ["orange rgb"],
+    displayWidths: [10],
+    renderRows: [[
+      { text: "orange", width: 6, style: { ...baseStyle, foreground: { mode: "palette", value: 208 } } },
+      { text: " rgb", width: 4, style: { ...baseStyle, bold: true, foreground: { mode: "rgb", value: 0x0a141e } } },
+    ]],
+    modes: { bracketedPaste: false, mouse: false, alternateScreen: false, cursorVisible: true },
+  });
+  const tab = { id: "styled", label: "styled", agent: "claude-code", viewport: registry.require("styled") };
+
+  const colored = renderWorkbenchFrame({ columns: 80, rows: 6, activeTabId: "styled", tabs: [tab], appbar: model() });
+  assert.equal(colored.text.includes("\u001b[0;38;5;208morange"), true);
+  assert.equal(colored.text.includes("\u001b[0;1;38;2;10;20;30m rgb"), true);
+
+  const plain = renderWorkbenchFrame({ columns: 80, rows: 6, activeTabId: "styled", tabs: [tab], appbar: model(), color: false });
+  assert.match(plain.text, /orange rgb/u);
+  assert.doesNotMatch(plain.text, /38;5;208|38;2;10;20;30/u);
 });

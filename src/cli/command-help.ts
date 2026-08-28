@@ -1,4 +1,5 @@
 import { ROOT_HELP } from "./help.js";
+import { CLI_ROUTE_REGISTRY } from "./parser.js";
 
 /**
  * Help for one command, and for one action within a command.
@@ -62,9 +63,13 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     ].join("\n"),
   ),
   machines: topic(
-    "Usage:\n  cuna machines <list|create|start|pause|resume|stop|delete> [options]",
+    "Usage:\n  cuna machines\n  cuna machines <list|create|start|pause|resume|stop|delete> [options]",
     [
       "Manage owned Cuna machines. Add --help after an action for that action.",
+      "",
+      "Interactive view:",
+      "  machines                    Browse machines and their AgentSessions",
+      "                              (↑/↓ move, Enter open, r refresh, q quit)",
       "",
       "Actions:",
       "  list                        List owned machines",
@@ -87,7 +92,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  --yes               Confirm this mutating operation",
       "",
       "Options:",
-      "  --agent KIND        claude-code, codex, openclaw, or opencode",
+      "  --agent KIND        claude-code, codex, or opencode",
       "  --vcpus N           Base-10 integer, 1 through 8",
       "  --memory-mib N      Base-10 integer, 512 through 16384",
       "  --background        Do not wait for the machine to become ready",
@@ -201,7 +206,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  --workspace-generation N  Base-10 integer, 1 or greater. This is a fencing",
       "                            token compared exactly, so an exponent or hex form",
       "                            is rejected rather than quietly coerced.",
-      "  --agent KIND              claude-code, codex, openclaw, or opencode",
+      "  --agent KIND              claude-code, codex, or opencode",
       "  --yes                     Confirm this mutating operation",
       "",
       "Options:",
@@ -210,11 +215,6 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  --auth-mode MODE          interactive_login or credential_binding",
       "  --credential-binding ID   Required exactly when --auth-mode is",
       "                            credential_binding, and rejected otherwise",
-      "  OpenCode                  Always sends interactive_login; credential bindings",
-      "                            are rejected",
-      "                            Execution is locally OFF unless",
-      "                            CUNA_OPENCODE_ENABLED=true exactly and this",
-      "                            installed CLI contains a committed Infra witness.",
       "  --idempotency-key K       Generated per invocation when omitted",
     ].join("\n"),
   ),
@@ -232,7 +232,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   ),
   agent: topic(
     "Usage:\n  cuna agent logout --agent-session SESSION_ID --yes",
-    "Sign Claude Code or Codex out of one exact AgentSession. This command does not\nlog out OpenCode; use OpenCode's own interactive provider flow.\n\nRequired:\n  --agent-session ID  Canonical lowercase Cuna UUID\n  --yes               Confirm this mutating operation",
+    "Sign Claude Code or Codex out of one exact AgentSession.\n\nRequired:\n  --agent-session ID  Canonical lowercase Cuna UUID\n  --yes               Confirm this mutating operation",
   ),
   connect: topic(
     "Usage:\n  cuna connect SESSION_ID [SESSION_ID...]",
@@ -241,6 +241,10 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   config: topic(
     "Usage:\n  cuna config get",
     "Show effective, redacted configuration. Configuration writes are not implemented\nin this build. No command options.",
+  ),
+  "config set": topic(
+    "Usage:\n  cuna config set",
+    "Compatibility-reserved command. Configuration mutation is not implemented in this build.",
   ),
   doctor: topic(
     "Usage:\n  cuna doctor [--check-browser-login] [--json]",
@@ -254,21 +258,28 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "Usage:\n  cuna version",
     "Show the CLI version, build digest, platform, and protocol range. No operands\nand no command options.",
   ),
+  shell: topic(
+    "Usage:\n  cuna shell",
+    "Compatibility-reserved command. This build has no standalone shell runtime; use a provider terminal through `cuna`, `cuna claude`, `cuna codex`, or `cuna opencode`.",
+  ),
+  sync: topic(
+    "Usage:\n  cuna sync",
+    "Compatibility-reserved command. Workspace synchronization is composed into supported provider journeys and is not exposed as a standalone command.",
+  ),
+  companion: topic(
+    "Usage:\n  cuna companion",
+    "Compatibility-reserved command. This build has no local companion process.",
+  ),
 });
 
-function agentHelp(command: "claude" | "codex" | "openclaw" | "opencode"): string {
-  const sync = command === "openclaw" ? "" : "\n  --no-sync                 Bind without synchronizing workspace contents";
-  const syncExclusion = command === "openclaw" ? "" : " --no-sync,";
+function agentHelp(command: "claude" | "codex" | "opencode"): string {
+  const sync = "\n  --no-sync                 Bind without synchronizing workspace contents";
   const authOptions = command === "opencode"
     ? [
-        "  --auth-mode MODE          OpenCode accepts interactive_login only",
-        "  OpenAI subscription: in OpenCode choose /connect, OpenAI, then",
-        "  ChatGPT Pro/Plus (headless) for a remote Cuna machine.",
-        "  OpenCode owns its OAuth tokens; Cuna never copies Codex credentials.",
-        "  Execution, including exact --agent-session attach, is locally OFF by",
-        "  default. Set CUNA_OPENCODE_ENABLED=true only after this installed CLI",
-        "  contains a committed Infra OpenCode-contract witness; this local",
-        "  consumer gate does not enable Edge or inject credentials.",
+        "  --auth-mode MODE          interactive_login only (the default)",
+        "  Provider sign-in          Choose /connect inside OpenCode; credentials",
+        "                            remain in that remote AgentSession.",
+        "  Credential bindings       Not accepted for OpenCode.",
       ]
     : [
         "  --auth-mode MODE          interactive_login or credential_binding",
@@ -294,12 +305,10 @@ function agentHelp(command: "claude" | "codex" | "openclaw" | "opencode"): strin
       ...authOptions,
       "  --agent-session ID        Attach one exact child and skip reconciliation.",
       "                            Cannot be combined with PATH, --machine, --new,",
-      `                            --new-session,${syncExclusion} --auth-mode or --credential-binding.`,
-      ...(command === "opencode"
-        ? ["                            Exact --agent-session attachment remains available while the local creation gate is OFF."]
-        : []),
+      "                            --new-session, --no-sync, --auth-mode or --credential-binding.",
       "",
       "Requires an interactive terminal; JSON and redirected output fail closed.",
+      "Ctrl+C detaches locally in one press. Use Ctrl+] c to send Ctrl+C to the agent.",
     ].join("\n"),
   );
 }
@@ -309,14 +318,18 @@ export const HELP_TOPICS: readonly string[] = Object.freeze([
   ...Object.keys(COMMAND_HELP),
   "claude",
   "codex",
-  "openclaw",
   "opencode",
 ]);
+
+/** Semantic leaves represented by complete help, derived from parser discovery. */
+export const HELP_ROUTE_KEYS: readonly string[] = Object.freeze(
+  CLI_ROUTE_REGISTRY.map((route) => route.key),
+);
 
 /** Help for `command` plus its action operands, falling back to the root help. */
 export function commandHelp(command: string | undefined, operands: readonly string[]): string {
   if (command === undefined) return ROOT_HELP;
-  if (command === "claude" || command === "codex" || command === "openclaw" || command === "opencode") return agentHelp(command);
+  if (command === "claude" || command === "codex" || command === "opencode") return agentHelp(command);
   const action = operands[0];
   if (action !== undefined) {
     const specific = COMMAND_HELP[`${command} ${action}`];

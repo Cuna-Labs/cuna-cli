@@ -9,6 +9,7 @@ import { conservativeFilesystemCapabilities, createWorkspaceJourneyEffects } fro
 const USER = "10000000-0000-4000-8000-000000000001";
 const WORKSPACE = "20000000-0000-4000-8000-000000000001";
 const MACHINE = "30000000-0000-4000-8000-000000000001";
+const OTHER_MACHINE = "30000000-0000-4000-8000-000000000002";
 
 async function roots(t) {
   const base = await mkdtemp(join(tmpdir(), "cuna-journey-workspace-"));
@@ -50,6 +51,28 @@ test("workspace create retry reuses the exact durable identity tuple and idempot
   assert.deepEqual(creates[1], creates[0]);
   assert.match(creates[0].input.projectId, /^[0-9a-f-]{36}$/u);
   assert.match(creates[0].input.localInstanceId, /^[0-9a-f-]{36}$/u);
+  assert.match(creates[0].key, /^cuna-workspace-binding-v2-[0-9a-f]{64}$/u);
+});
+
+test("workspace create idempotency changes when the request body selects another machine", async (t) => {
+  const { project, state } = await roots(t);
+  const creates = [];
+  const client = {
+    async createWorkspaceBinding(input, key) {
+      creates.push(structuredClone({ input, key }));
+      throw new Error("stop after create boundary");
+    },
+  };
+  for (const machineId of [MACHINE, OTHER_MACHINE]) {
+    await assert.rejects(
+      effects(client, state).synchronizeWorkspace({ machineId, localPath: project, syncMode: "enabled", signal: new AbortController().signal }),
+      /stop after create boundary/u,
+    );
+  }
+  assert.equal(creates.length, 2);
+  assert.notEqual(creates[0].key, creates[1].key);
+  assert.equal(creates[0].input.machineId, MACHINE);
+  assert.equal(creates[1].input.machineId, OTHER_MACHINE);
 });
 
 test("--no-sync without a committed local binding performs no producer mutation", async (t) => {

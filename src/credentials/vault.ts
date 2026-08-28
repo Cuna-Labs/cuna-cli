@@ -172,7 +172,12 @@ export class CredentialVault {
     if (flight === undefined) {
       const created: RefreshFlight = {
         waiters: 0,
-        promise: this.#exclusive(target, async () => this.#performRefresh(normalized, target, refresher)),
+        promise: this.#exclusive(target, async () => {
+          const perform = async () => await this.#performRefresh(normalized, target, refresher);
+          return this.#backend.withRefreshLock === undefined
+            ? await perform()
+            : await this.#backend.withRefreshLock(target, perform);
+        }),
       };
       this.#refreshes.set(target, created);
       flight = created;

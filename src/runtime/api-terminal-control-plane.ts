@@ -6,9 +6,6 @@ import type {
   TerminalControlPlane,
 } from "./terminal-transport.js";
 
-const MAX_SUPERVISOR_LEASE_MS = 60_000;
-const MAX_FUTURE_SKEW_MS = 5_000;
-
 export function createApiTerminalControlPlane(input: {
   readonly client: CunaApiClient;
   readonly clock?: () => number;
@@ -27,28 +24,11 @@ export function createApiTerminalControlPlane(input: {
         !identity.workspaceAssigned ||
         session.processEpoch === undefined ||
         session.runtimeObservedAt === undefined ||
-        session.runtimeExpiresAt === undefined ||
-        (session.processState !== "ready" && session.processState !== "running")
+        session.runtimeExpiresAt === undefined
       ) {
         throw runtimeFailure(
           "remote_state_unproven",
-          "The AgentSession is not freshly proven ready for terminal attachment.",
-        );
-      }
-      const now = clock();
-      const observedAt = Date.parse(session.runtimeObservedAt);
-      const expiresAt = Date.parse(session.runtimeExpiresAt);
-      if (
-        !Number.isFinite(observedAt) ||
-        !Number.isFinite(expiresAt) ||
-        observedAt > now + MAX_FUTURE_SKEW_MS ||
-        expiresAt <= observedAt ||
-        expiresAt - observedAt > MAX_SUPERVISOR_LEASE_MS ||
-        expiresAt <= now
-      ) {
-        throw runtimeFailure(
-          "remote_state_unproven",
-          "The AgentSession supervisor observation has invalid or expired lease authority.",
+          "The AgentSession has no process identity for terminal attachment.",
         );
       }
       return Object.freeze({
@@ -57,6 +37,8 @@ export function createApiTerminalControlPlane(input: {
         machineId: session.machineId,
         agentSessionId: session.id,
         processEpoch: session.processEpoch,
+        workspaceBindingId: session.workspaceBindingId ?? null,
+        workspaceBindingGeneration: session.workspaceGeneration ?? null,
         state: session.processState,
         observedAt: session.runtimeObservedAt,
         expiresAt: session.runtimeExpiresAt,

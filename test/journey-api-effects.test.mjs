@@ -49,6 +49,7 @@ function capability() {
 function effects(client) {
   return createApiAgentJourneyEffects({
     client,
+    requestedAgent: "claude-code",
     async inspectWorkspace() { return { canonicalLocalRoot: "C:\\work\\project" }; },
     async synchronizeWorkspace() { throw new Error("unused"); },
     async attach() { throw new Error("unused"); },
@@ -57,6 +58,27 @@ function effects(client) {
     async sleep() {},
   });
 }
+
+test("machine observation rejects a provider mismatch before capability discovery", async () => {
+  let capabilityReads = 0;
+  const observed = await createApiAgentJourneyEffects({
+    client: {
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "claude-only", state: "running", agent: "claude-code" }] };
+      },
+      async discoverCapabilities() { capabilityReads += 1; return capability(); },
+    },
+    requestedAgent: "codex",
+    async inspectWorkspace() { throw new Error("unused"); },
+    async synchronizeWorkspace() { throw new Error("unused"); },
+    async attach() { throw new Error("unused"); },
+    async authorizeMachineCreate() { return false; },
+    now: () => NOW,
+  }).observeMachines({ signal: new AbortController().signal });
+  assert.equal(capabilityReads, 0);
+  assert.equal(observed[0].requestedAgentSupport, "unsupported");
+  assert.equal(observed[0].agent, "claude-code");
+});
 
 test("uncertain AgentSession create recovers by the exact original idempotency key", async () => {
   const calls = [];

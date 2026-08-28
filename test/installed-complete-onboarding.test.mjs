@@ -69,7 +69,7 @@ const INSTALLED_E2E_PHASE_TIMEOUTS = Object.freeze({
   "installed-agent-session-command-matrix": 5 * INSTALLED_COMMAND_TIMEOUT_MS + CLEANUP_TIMEOUT_MS,
   "installed-stale-supervisor-evidence-negative": 45_000,
   "installed-explicit-foreground-command-matrix": 120_000,
-  "installed-opencode-mutable-witness-gate": 90_000,
+  "installed-opencode-foreground": 90_000,
   "installed-automatic-foreground-command-matrix": 120_000,
   "installed-session-api-key-and-logout": INSTALLED_SESSION_API_KEY_AND_LOGOUT_PHASE_TIMEOUT_MS,
   "contract-server-teardown": CLEANUP_TIMEOUT_MS,
@@ -740,11 +740,14 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
         sandbox,
         { authorityScenario: "stale-supervisor-evidence" },
       );
-      assert.equal(staleEvidence.code, 4, staleEvidence.stderr);
-      assert.match(staleEvidence.stderr, /cuna\.runtime\.remote_state_unproven/u);
-      assert.equal(Object.hasOwn(staleEvidence.receipt, "child_pid"), false, "stale supervisor evidence reached terminal child creation");
-      assert.equal(staleEvidence.receipt.events.includes("host:acquire"), false, "stale supervisor evidence reached terminal ownership");
-      assert.equal(staleEvidence.receipt.events.some((event) => event.startsWith("child:spawn") || event.startsWith("wire:")), false, "stale supervisor evidence opened terminal transport");
+      // A cached observation whose lease has elapsed is not attach authority.
+      // This fixture's POST terminal-connections accepts the session, so the
+      // installed CLI must proceed and let that backend decision win.
+      assert.equal(staleEvidence.code, 0, staleEvidence.stderr);
+      assert.equal(staleEvidence.receipt.child_closed, true);
+      assert.equal(staleEvidence.receipt.events.includes("host:acquire"), true);
+      assert.equal(staleEvidence.receipt.events.includes("child:ready"), true);
+      assert.equal(staleEvidence.receipt.events.includes("wire:close"), true);
     });
 
     await runPhase(receipt, "installed-explicit-foreground-command-matrix", installedE2ePhaseTimeout("installed-explicit-foreground-command-matrix"), async () => {
@@ -753,7 +756,6 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
       ["agent-sessions.attach", ["agent-sessions", "attach", AGENT_SESSION_ID]],
       ["claude", ["claude", "--agent-session", CLAUDE_SESSION_ID]],
       ["codex", ["codex", "--agent-session", AGENT_SESSION_ID]],
-      ["openclaw", ["openclaw", "--agent-session", OPENCLAW_SESSION_ID]],
     ]) {
       const result = await invokeInstalledForeground(argv, env, sandbox);
       assert.equal(result.code, 0, `installed foreground matrix failed for ${id}: ${safeErrorCode(result.stderr)} ${result.stderr.slice(0, 500)}`);
@@ -768,35 +770,33 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     }
     });
 
-    await runPhase(receipt, "installed-opencode-mutable-witness-gate", installedE2ePhaseTimeout("installed-opencode-mutable-witness-gate"), async () => {
+    await runPhase(receipt, "installed-opencode-foreground", installedE2ePhaseTimeout("installed-opencode-foreground"), async () => {
       for (const [id, argv] of [
         ["login-required", ["opencode", "--agent-session", OPENCODE_SESSION_ID]],
-        ["404", ["opencode", "--agent-session", OPENCODE_AUTH_MISSING_SESSION_ID]],
-        ["semantic-invalid", ["opencode", "--agent-session", OPENCODE_AUTH_INVALID_SESSION_ID]],
         ["configured", ["opencode", "--agent-session", OPENCODE_AUTH_CONFIGURED_SESSION_ID]],
         ["automatic", ["opencode", ".", "--new-session"]],
       ]) {
-        const result = await invokeInstalledForeground(
-          argv,
-          { ...env, CUNA_OPENCODE_ENABLED: "true" },
-          sandbox,
-        );
-        assert.equal(result.code, 4, `OpenCode ${id} must fail closed on a mutable producer witness: ${result.stderr}`);
-        assert.match(result.stderr, /cuna\.feature\.opencode_disabled/u);
-        assert.match(result.stderr, /immutable_contract_witness_required/u);
-        assert.deepEqual(result.receipt.automatic, { phases: [] });
-        assert.equal(Object.hasOwn(result.receipt, "child_pid"), false, `OpenCode ${id} reached terminal child creation`);
-        assert.equal(result.receipt.events.includes("host:acquire"), false, `OpenCode ${id} reached terminal ownership`);
-        assert.equal(result.receipt.events.some((event) => event.startsWith("child:spawn") || event.startsWith("wire:")), false, `OpenCode ${id} opened terminal transport`);
+        const result = await invokeInstalledForeground(argv, env, sandbox);
+        assert.equal(result.code, 0, `OpenCode ${id} failed: ${safeErrorCode(result.stderr)} ${result.stderr.slice(0, 500)}`);
+        assert.equal(result.receipt.events.includes("host:acquire"), true, `OpenCode ${id} never acquired the terminal`);
+        assert.equal(result.receipt.events.includes("child:ready"), true, `OpenCode ${id} never reached PTY readiness`);
+        assert.equal(result.receipt.events.includes("wire:close"), true, `OpenCode ${id} leaked its terminal wire`);
+        assert.equal(result.receipt.child_closed, true, `OpenCode ${id} left its transport child open`);
       }
-      assert.equal(authority.state.openCodeSessionRequests, 0, "mutable OpenCode witness reached any AgentSession read");
-      assert.equal(authority.state.openCodeAgentAuth404Requests, 0, "mutable OpenCode witness reached 404 auth evidence");
-      assert.equal(authority.state.openCodeAgentAuthInvalidEvidenceRequests, 0, "mutable OpenCode witness reached invalid auth evidence");
-      assert.equal(authority.state.openCodeAgentAuthConfiguredRequests, 0, "mutable OpenCode witness reached configured auth evidence");
+      for (const [id, sessionId] of [["404", OPENCODE_AUTH_MISSING_SESSION_ID], ["semantic-invalid", OPENCODE_AUTH_INVALID_SESSION_ID]]) {
+        const result = await invokeInstalledForeground(["opencode", "--agent-session", sessionId], env, sandbox);
+        assert.notEqual(result.code, 0, `OpenCode ${id} auth evidence must fail closed`);
+        assert.equal(result.receipt.events.includes("host:acquire"), false, `OpenCode ${id} reached terminal ownership`);
+        assert.equal(Object.hasOwn(result.receipt, "child_pid"), false, `OpenCode ${id} reached terminal child creation`);
+      }
+      assert.ok(authority.state.openCodeSessionRequests >= 4, "OpenCode did not bind exact AgentSession authority");
+      assert.equal(authority.state.openCodeAgentAuth404Requests, 1, "OpenCode did not inspect missing auth evidence exactly once");
+      assert.equal(authority.state.openCodeAgentAuthInvalidEvidenceRequests, 1, "OpenCode did not inspect invalid auth evidence exactly once");
+      assert.equal(authority.state.openCodeAgentAuthConfiguredRequests, 1, "OpenCode did not inspect configured auth evidence exactly once");
     });
 
     await runPhase(receipt, "installed-automatic-foreground-command-matrix", installedE2ePhaseTimeout("installed-automatic-foreground-command-matrix"), async () => {
-    for (const [command, expectedAgent, expectedSessionId] of [["claude", "claude-code", CLAUDE_SESSION_ID], ["codex", "codex", AGENT_SESSION_ID], ["openclaw", "openclaw", OPENCLAW_SESSION_ID]]) {
+    for (const [command, expectedAgent, expectedSessionId] of [["claude", "claude-code", CLAUDE_SESSION_ID], ["codex", "codex", AGENT_SESSION_ID]]) {
       const result = await invokeInstalledForeground(
         [command, ".", "--new-session"],
         env,
@@ -869,10 +869,10 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     assert.equal(authority.state.continuationPollRequests, 0, "installed CLI must never fetch continuation status after paste-code onboarding");
     assert.equal(authority.state.legacyContinuationRequests, 0, "installed CLI must never call a retired continuation cancellation route");
     assert.equal(authority.state.retiredCodeRenewalRequests, 0, "installed CLI must never call the retired code-renewal route");
-    assert.equal(authority.state.openCodeSessionRequests, 0, "mutable OpenCode witness made an AgentSession request");
-    assert.equal(authority.state.openCodeAgentAuth404Requests, 0, "mutable OpenCode witness made a 404 auth request");
-    assert.equal(authority.state.openCodeAgentAuthInvalidEvidenceRequests, 0, "mutable OpenCode witness made an invalid auth request");
-    assert.equal(authority.state.openCodeAgentAuthConfiguredRequests, 0, "mutable OpenCode witness made a configured auth request");
+    assert.ok(authority.state.openCodeSessionRequests >= 4, "OpenCode foreground matrix did not read AgentSession authority");
+    assert.equal(authority.state.openCodeAgentAuth404Requests, 1, "OpenCode missing-auth negative was not exercised exactly once");
+    assert.equal(authority.state.openCodeAgentAuthInvalidEvidenceRequests, 1, "OpenCode invalid-auth negative was not exercised exactly once");
+    assert.equal(authority.state.openCodeAgentAuthConfiguredRequests, 1, "OpenCode configured-auth path was not exercised exactly once");
     assert.equal(authority.state.machineDeleted, true, "machine sandbox cleanup was not verified");
     assert.equal(authority.state.agentTerminated, true, "AgentSession sandbox cleanup was not verified");
     });
@@ -913,8 +913,8 @@ const INSTALLED_HELP_TOPICS = Object.freeze([
   "account", "workspace", "usage", "api-keys", "api-keys create", "api-keys list",
   "api-keys revoke", "agent-sessions", "agent-sessions list", "agent-sessions get",
   "agent-sessions create", "agent-sessions rename", "agent-sessions terminate",
-  "agent-sessions attach", "agent", "connect", "config", "doctor", "self-test",
-  "version", "claude", "codex", "openclaw", "opencode",
+  "agent-sessions attach", "agent", "connect", "config", "config set", "doctor", "self-test",
+  "version", "claude", "codex", "opencode", "shell", "sync", "companion",
 ]);
 
 const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
@@ -923,9 +923,9 @@ const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
   "records", "authorizations", "account", "workspace", "usage",
   "api-keys create", "api-keys list", "api-keys revoke",
   "agent-sessions list", "agent-sessions get", "agent-sessions create", "agent-sessions rename", "agent-sessions terminate", "agent-sessions attach",
-  "agent", "connect", "config", "doctor", "self-test", "version", "claude", "codex", "openclaw", "opencode",
+  "agent", "connect", "doctor", "self-test", "version", "claude", "codex", "opencode",
 ]);
-const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze([]);
+const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "sync", "companion"]);
 
 const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "signup/usage", argv: ["signup", "extra", "--json"], exit: 2, code: "cuna.usage.invalid" },
@@ -951,9 +951,7 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "claude/non-tty", argv: ["claude", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "codex/non-tty", argv: ["codex", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "openclaw/non-tty", argv: ["openclaw", "--json"], exit: 2, code: "cuna.usage.invalid" },
-  // A disabled feature is rejected before terminal eligibility, with no
-  // automatic attach, credential, remote, or terminal side effect.
-  { id: "opencode/feature-off-non-tty", argv: ["opencode", "--json"], exit: 4, code: "cuna.feature.opencode_disabled" },
+  { id: "opencode/unavailable", argv: ["opencode", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "sync/reserved", argv: ["sync", "--json"], exit: 8, code: "cuna.capability.unsupported" },
   { id: "shell/reserved", argv: ["shell", "--json"], exit: 8, code: "cuna.capability.unsupported" },
   { id: "companion/reserved", argv: ["companion", "--json"], exit: 8, code: "cuna.capability.unsupported" },
@@ -963,7 +961,7 @@ function createContractAuthority() {
   const continuations = new Map();
   const accessContexts = new Map();
   const state = { continuationCounter: 0, continuationPollRequests: 0, legacyContinuationRequests: 0, retiredCodeRenewalRequests: 0, tokenCounter: 0, createdApiKeys: 0, revokedApiKeys: 0, logoutReceipts: 0, idempotencyKeys: [], loginRevoked: false, machineDeleted: false, machineStatus: "running", agentTerminated: false, agentName: "matrix-agent", apiKeyRevoked: false, openCodeSessionRequests: 0, openCodeAgentAuth404Requests: 0, openCodeAgentAuthInvalidEvidenceRequests: 0, openCodeAgentAuthConfiguredRequests: 0 };
-  const machine = (status = state.machineStatus) => ({ id: ID, name: "matrix-machine", status, memory_mib: 512, vcpus: 1, url: "https://machine.invalid" });
+  const machine = (status = state.machineStatus) => ({ id: ID, name: "matrix-machine", status, agent: "codex", memory_mib: 512, vcpus: 1, url: "https://machine.invalid" });
   const agentSession = (terminated = state.agentTerminated) => ({ id: AGENT_SESSION_ID, machine_id: ID, workspace_binding_id: WORKSPACE_BINDING_ID, workspace_generation: 1, name: state.agentName, agent: "codex", cwd: "/workspace", auth_mode: "interactive_login", desired_state: terminated ? "terminated" : "running", request_state: terminated ? "terminal" : "launched", process_state: terminated ? "terminated" : "running", process_epoch: PROCESS_EPOCH, runtime_observed_at: "2026-08-14T00:00:01.000Z", runtime_expires_at: "2030-08-14T00:00:01.000Z", row_version: terminated ? 1 : 0, created_at: "2026-08-14T00:00:00.000Z", updated_at: "2026-08-14T00:00:00.000Z" });
   const foregroundAgentSession = (id) => {
     const observationTime = Date.now();

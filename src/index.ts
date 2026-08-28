@@ -209,6 +209,45 @@ export {
   type PassthroughTerminalCoordinatorOptions,
 } from "./terminal/passthrough.js";
 export {
+  runNodeMachinesExplorer,
+  type MachinesExplorerDependencies,
+  type MachinesExplorerInput,
+  type MachinesExplorerRunner,
+} from "./machines/explorer.js";
+export {
+  INITIAL_MACHINE_FIRST_STATE,
+  canAutoContinueMachineFirst,
+  reduceMachineFirstNavigation,
+  resolveMachineContextActions,
+  resolveProviderContextActions,
+  shouldShowRemoteWaitProgress,
+  type MachineContextAction,
+  type MachineFirstNavigationEvent,
+  type MachineFirstNavigationState,
+  type MachineFirstScreen,
+  type ProviderContextAction,
+} from "./machines/machine-first.js";
+export {
+  machineProviderAvailability,
+  machineSupportsProvider,
+  providerAuthLabel,
+  providerDisplayName,
+  type ActionableProvider,
+  type MachineProviderAvailability,
+  type ProviderUsability,
+} from "./machines/provider-availability.js";
+export {
+  classifySessionActionability,
+  displaySessionActionability,
+  mergeSessionActionabilityObservation,
+  type SessionActionability,
+  type SessionActionReasonCode,
+  type SessionActionabilityInput,
+  type SessionBaseState,
+  type SessionRecoveryAction,
+  type SessionRefreshStatus,
+} from "./machines/session-actionability.js";
+export {
   buildAppbarModel,
   projectTruth,
   type AppbarModel,
@@ -220,7 +259,10 @@ export {
   ViewportIsolationError,
   ViewportRegistry,
   type ViewportBinding,
+  type ViewportCellColor,
+  type ViewportCellStyle,
   type ViewportModes,
+  type ViewportRenderRun,
   type ViewportSnapshot,
 } from "./terminal/viewport.js";
 export {
@@ -240,6 +282,7 @@ export {
   type XtermViewportOptions,
 } from "./terminal/xterm-vte.js";
 export { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "./version.js";
+export * from "./local-actions/index.js";
 export {
   planAgentSessionSelection,
   planJourneySelection,

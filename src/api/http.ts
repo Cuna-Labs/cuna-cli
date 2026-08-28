@@ -1,4 +1,5 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { CredentialBoundaryError } from "../credentials/errors.js";
 import {
   INTERNAL_DEFECT_HINT,
   OFF_CONTRACT_RESPONSE_HINT,
@@ -6,11 +7,12 @@ import {
   automationCredentialHint,
 } from "../core/product-web.js";
 import {
+  isAccessToken,
   isProblemType,
   isProblemTypeForCode,
   isTransportCredential,
 } from "../core/namespace.js";
-import { isObject, safeReasonCode } from "../core/validation.js";
+import { isIdempotencyKey, isObject, safeReasonCode } from "../core/validation.js";
 import {
   DEFAULT_REQUEST_BUDGET_MS,
   observationBudgetElapsed,
@@ -74,6 +76,11 @@ export interface HttpRequest {
 
 export interface HttpTransport {
   request(input: HttpRequest): Promise<unknown>;
+}
+
+export interface BearerRefreshRequest {
+  readonly reason: "unauthorized";
+  readonly rejectedToken: string;
 }
 
 function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata | undefined {
@@ -199,7 +206,7 @@ function apiError(input: {
       // automation credential" and name no source, which is the same dead end
       // the sign-in path had. It now shares the one sentence that does.
       hint: credentialKind === "interactive"
-        ? "Run `cuna login` to reauthenticate this interactive session."
+        ? "The access token was refused. Retry the command so Cuna can obtain a fresh token from the encrypted local session."
         : credentialKind === "api_key"
           ? `The current automation credential was refused. ${automationCredentialHint()}`
           : `Run \`cuna login\`, or provide an automation credential. ${automationCredentialHint()}`,
@@ -375,6 +382,10 @@ export function createHttpTransport(input: {
   readonly baseUrl: string;
   readonly apiKey?: string;
   readonly bearerToken?: string;
+  readonly bearerTokenProvider?: (
+    signal?: AbortSignal,
+    refresh?: BearerRefreshRequest,
+  ) => Promise<string>;
   /**
    * The caller's EXPLICIT budget for every request, from `--timeout-ms`.
    *
@@ -386,13 +397,18 @@ export function createHttpTransport(input: {
   readonly timeoutMs?: number;
   readonly fetch?: typeof globalThis.fetch;
 }): HttpTransport {
-  if (input.apiKey !== undefined && input.bearerToken !== undefined) {
+  const credentialAuthorities = [
+    input.apiKey,
+    input.bearerToken,
+    input.bearerTokenProvider,
+  ].filter((value) => value !== undefined).length;
+  if (credentialAuthorities > 1) {
     throw new TypeError("HTTP transport accepts exactly one credential authority.");
   }
   const credential = input.apiKey ?? input.bearerToken;
   const credentialKind = input.apiKey !== undefined
     ? "api_key" as const
-    : input.bearerToken !== undefined
+    : input.bearerToken !== undefined || input.bearerTokenProvider !== undefined
       ? "interactive" as const
       : "anonymous" as const;
   if (credential !== undefined && !isTransportCredential(credential)) {
@@ -447,11 +463,7 @@ export function createHttpTransport(input: {
       for (const [key, value] of Object.entries(request.query ?? {})) {
         if (value !== undefined) target.searchParams.set(key, value);
       }
-      const controller = new AbortController();
       const budgetMs = budgetFor(request);
-      const timeout = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), budgetMs);
-      const onAbort = () => controller.abort(request.signal?.reason);
-      request.signal?.addEventListener("abort", onAbort, { once: true });
       let body: BodyInit | undefined;
       let contentType: HttpRequest["contentType"] | undefined;
       let contentLength: number | undefined;
@@ -503,46 +515,98 @@ export function createHttpTransport(input: {
           hint: INTERNAL_DEFECT_HINT,
         });
       }
+      const controller = new AbortController();
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const onAbort = () => controller.abort(request.signal?.reason);
+      request.signal?.addEventListener("abort", onAbort, { once: true });
       try {
-        const response = await fetcher(target, {
-          method: request.method,
-          headers: {
-            Accept: "application/json, application/problem+json",
-            ...(credential === undefined ? {} : { Authorization: `Bearer ${credential}` }),
-            "User-Agent": `cuna-cli/${CLI_VERSION}`,
-            ...(contentType === undefined ? {} : { "Content-Type": contentType }),
-            ...(contentLength === undefined ? {} : { "Content-Length": String(contentLength) }),
-            ...(request.idempotencyKey === undefined ? {} : { "Idempotency-Key": request.idempotencyKey }),
-            ...(request.machineCreateRequestId === undefined
-              ? {}
-              : { "X-Cuna-Machine-Create-Request-Id": request.machineCreateRequestId }),
-          },
-          ...(body === undefined ? {} : { body }),
-          signal: controller.signal,
-          redirect: "error",
-        });
-        const bytes = await readLimited(response);
-        if (!response.ok) {
-          // The status is read BEFORE the body is required to parse. Parsing
-          // first made every unparseable error body — a proxy's plain-text 404,
-          // an HTML 502, a gateway's 503 page — surface as
-          // `cuna.remote.malformed_response`, discarding the one fact the
-          // client already held authoritatively: the status.
-          const decoded = decodeJson(bytes);
-          throw apiError({
-            status: response.status,
-            requestId: response.headers.get("x-request-id") ?? undefined,
-            body: decoded.decoded ? decoded.value : undefined,
-            apiEncodedBody: decoded.decoded && isObject(decoded.value),
-            credentialKind,
-            method: request.method,
-            path: request.path,
-            origin: input.baseUrl,
+        const requestCredential = input.bearerTokenProvider === undefined
+          ? credential
+          : await input.bearerTokenProvider(controller.signal);
+        if (
+          requestCredential !== undefined &&
+          (input.bearerTokenProvider === undefined
+            ? !isTransportCredential(requestCredential)
+            : !isAccessToken(requestCredential))
+        ) {
+          throw new CunaError({
+            code: "cuna.internal.invalid_transport_credential",
+            message: "Cuna refused an invalid HTTP credential authority.",
+            exitCode: EXIT_CODES.internal,
+            hint: INTERNAL_DEFECT_HINT,
           });
         }
-        return parseJson(bytes, request);
+        // The response-observation budget starts at dispatch. Credential
+        // acquisition is a distinct local security boundary and may wait for
+        // another healthy CLI process to finish a revision-fenced refresh.
+        // The caller's AbortSignal remains live throughout both phases.
+        timeout = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), budgetMs);
+        const dispatch = async (bearer: string | undefined): Promise<unknown> => {
+          const response = await fetcher(target, {
+            method: request.method,
+            headers: {
+              Accept: "application/json, application/problem+json",
+              ...(bearer === undefined ? {} : { Authorization: `Bearer ${bearer}` }),
+              "User-Agent": `cuna-cli/${CLI_VERSION}`,
+              ...(contentType === undefined ? {} : { "Content-Type": contentType }),
+              ...(contentLength === undefined ? {} : { "Content-Length": String(contentLength) }),
+              ...(request.idempotencyKey === undefined ? {} : { "Idempotency-Key": request.idempotencyKey }),
+              ...(request.machineCreateRequestId === undefined
+                ? {}
+                : { "X-Cuna-Machine-Create-Request-Id": request.machineCreateRequestId }),
+            },
+            ...(body === undefined ? {} : { body }),
+            signal: controller.signal,
+            redirect: "error",
+          });
+          const bytes = await readLimited(response);
+          if (!response.ok) {
+            const decoded = decodeJson(bytes);
+            throw apiError({
+              status: response.status,
+              requestId: response.headers.get("x-request-id") ?? undefined,
+              body: decoded.decoded ? decoded.value : undefined,
+              apiEncodedBody: decoded.decoded && isObject(decoded.value),
+              credentialKind,
+              method: request.method,
+              path: request.path,
+              origin: input.baseUrl,
+            });
+          }
+          return parseJson(bytes, request);
+        };
+        try {
+          return await dispatch(requestCredential);
+        } catch (error) {
+          const canRetryUnauthorized = error instanceof CunaError &&
+            error.code === "cuna.auth.rejected" &&
+            input.bearerTokenProvider !== undefined &&
+            requestCredential !== undefined &&
+            (request.method === "GET" ||
+              (request.idempotencyKey !== undefined && isIdempotencyKey(request.idempotencyKey)));
+          if (!canRetryUnauthorized) throw error;
+          const refreshedCredential = await input.bearerTokenProvider(controller.signal, {
+            reason: "unauthorized",
+            rejectedToken: requestCredential,
+          });
+          if (!isAccessToken(refreshedCredential)) {
+            throw new CunaError({
+              code: "cuna.internal.invalid_transport_credential",
+              message: "Cuna refused an invalid refreshed HTTP credential authority.",
+              exitCode: EXIT_CODES.internal,
+              hint: INTERNAL_DEFECT_HINT,
+            });
+          }
+          // Deliberately outside a retry loop: a second 401 is authoritative.
+          // The same serialized body and Idempotency-Key are reused verbatim.
+          return await dispatch(refreshedCredential);
+        }
       } catch (error) {
         if (error instanceof CunaError) throw error;
+        // Token acquisition is a local credential boundary, not a network
+        // dispatch. Preserve its typed failure so the CLI can name the exact
+        // authentication repair instead of misreporting connectivity.
+        if (error instanceof CredentialBoundaryError) throw error;
         if (controller.signal.aborted) {
           // TWO DIFFERENT DETECTORS ARRIVE AT THIS ONE BRANCH, and collapsing
           // them is the defect. The caller pressing Ctrl-C is a decision by a
@@ -586,7 +650,7 @@ export function createHttpTransport(input: {
           cause: error,
         });
       } finally {
-        clearTimeout(timeout);
+        if (timeout !== undefined) clearTimeout(timeout);
         request.signal?.removeEventListener("abort", onAbort);
       }
     },

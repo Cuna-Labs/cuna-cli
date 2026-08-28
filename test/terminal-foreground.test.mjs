@@ -2,13 +2,27 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 
-import { ForegroundTerminalCoordinator, MAX_FOREGROUND_PENDING_INPUT_BYTES } from "../dist/index.js";
+import { digestLocalActionArguments, ForegroundTerminalCoordinator, MAX_FOREGROUND_PENDING_INPUT_BYTES } from "../dist/index.js";
 import { createNodeForegroundTerminalHost } from "../dist/pty/node-host-terminal.js";
+import { runtimeFailure } from "../dist/runtime/errors.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const SESSION_A = "11111111-1111-4111-8111-111111111111";
 const SESSION_B = "22222222-2222-4222-8222-222222222222";
+
+async function waitForGateOrAbort(gate, signal) {
+  if (gate === undefined) return;
+  await new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    gate.then(
+      () => { signal.removeEventListener("abort", onAbort); resolve(); },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+  });
+}
 
 class FakeHost {
   columns = 80;
@@ -18,6 +32,7 @@ class FakeHost {
   writes = [];
   acquired = 0;
   restored = 0;
+  writesAtRestore;
   removedInput = 0;
   removedResize = 0;
   failWrite = false;
@@ -33,7 +48,11 @@ class FakeHost {
     this.acquired += 1;
     if (this.acquireGate !== undefined) await this.acquireGate;
     this.onAcquire?.();
-    return { restore: async () => { this.restored += 1; if (this.failRestore) throw new Error("host restore failed"); } };
+    return { restore: async () => {
+      this.writesAtRestore = this.writes.length;
+      this.restored += 1;
+      if (this.failRestore) throw new Error("host restore failed");
+    } };
   }
   async write(bytes) {
     this.writeAttempts += 1;
@@ -59,6 +78,8 @@ function snapshot(intent, generation = 1) {
     viewId: `${intent.tabId}:attachment:${generation}`,
     userId: "user-1",
     machineId: "machine-1",
+    workspaceBindingId: null,
+    workspaceBindingGeneration: null,
     agentSessionId: intent.agentSessionId,
     processEpoch: `epoch-${intent.agentSessionId}`,
     state: "active",
@@ -98,7 +119,7 @@ function harness(options = {}) {
     ...options.coordinatorOptions,
   });
   const callbacks = coordinator.runtimeCallbacks();
-  const calls = { attach: [], detach: [], reconnect: [], input: [], inputAuthorities: [], resize: [], switch: [], responses: [] };
+  const calls = { attach: [], detach: [], reconnect: [], input: [], inputAuthorities: [], repaint: [], resize: [], switch: [], responses: [], localActionControls: [] };
   const intents = [
     { tabId: "tab-a", agentSessionId: SESSION_A, label: "primary", agent: "claude-code" },
     { tabId: "tab-b", agentSessionId: SESSION_B, label: "review", agent: "codex" },
@@ -107,13 +128,23 @@ function harness(options = {}) {
     activeTabId: undefined,
     async attach(input) {
       calls.attach.push(input);
+      await waitForGateOrAbort(options.attachGate, input.signal);
       const intent = intents.find((item) => item.tabId === input.tabId);
       const ready = snapshot(intent);
       await callbacks.onTerminalReady(ready);
       runtime.activeTabId ??= input.tabId;
       return ready;
     },
-    async detach(tabId) { calls.detach.push(tabId); },
+    async detach(tabId) {
+      calls.detach.push(tabId);
+      if (options.detachGate !== undefined) await options.detachGate;
+      if (options.detachError !== undefined) throw options.detachError;
+      const intent = intents.find((item) => item.tabId === tabId);
+      for (const state of options.detachStateSequence ?? []) {
+        callbacks.onTerminalState({ ...snapshot(intent), state });
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    },
     async reconnect(input) {
       calls.reconnect.push(input.tabId);
       const intent = intents.find((item) => item.tabId === input.tabId);
@@ -123,12 +154,18 @@ function harness(options = {}) {
       return ready;
     },
     async sendInput(bytes, tabId, authority) {
+      if (bytes.length === 1 && bytes[0] === 0x0c) {
+        calls.repaint.push({ tabId, authority });
+        return;
+      }
       calls.inputAuthorities.push(authority);
       calls.input.push({ tabId, text: decoder.decode(bytes) });
+      if (options.inputGate !== undefined) await options.inputGate;
     },
     async resize(columns, rows, tabId) { calls.resize.push({ columns, rows, tabId }); },
     switchActive(tabId) { runtime.activeTabId = tabId; calls.switch.push(tabId); return snapshot(intents.find((item) => item.tabId === tabId)); },
     async sendTerminalResponse(response) { calls.responses.push(response); },
+    async sendLocalActionControl(type, payload, tabId) { calls.localActionControls.push({ type, payload, tabId }); },
   };
   coordinator.bindRuntime(runtime);
   return { coordinator, callbacks, calls, host, intents, runtime };
@@ -156,6 +193,13 @@ test("foreground coordinator owns host restoration and renders isolated cloud ta
 
   await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("cloud output")));
   assert.match(decoder.decode(host.writes.at(-1)), /cloud output/);
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\r\n\u001b[38;5;208;1mstyled cloud\u001b[0m")));
+  const styledFrame = decoder.decode(host.writes.at(-1));
+  assert.equal(
+    styledFrame.includes("\u001b[0;1;38;5;208mstyled cloud"),
+    true,
+    "VTE-parsed remote styling should survive rich composition",
+  );
 
   await coordinator.stop();
   assert.equal(coordinator.state, "stopped");
@@ -163,6 +207,247 @@ test("foreground coordinator owns host restoration and renders isolated cloud ta
   assert.equal(host.restored, 1);
   assert.equal(host.removedInput, 1);
   assert.equal(host.removedResize, 1);
+});
+
+test("rich attach forces one bounded provider repaint after replay", async () => {
+  const { coordinator, calls, host, intents } = harness();
+  await coordinator.start(intents.slice(0, 1));
+  assert.deepEqual(calls.resize, [
+    { columns: 80, rows: 21, tabId: "tab-a" },
+    { columns: 80, rows: 22, tabId: "tab-a" },
+  ]);
+  assert.equal(calls.repaint.length, 1);
+  assert.equal(calls.repaint[0].tabId, "tab-a");
+  assert.deepEqual(calls.repaint[0].authority, {
+    userId: "user-1",
+    machineId: "machine-1",
+    agentSessionId: SESSION_A,
+    processEpoch: `epoch-${SESSION_A}`,
+    fencingGeneration: 1,
+  });
+  await coordinator.stop();
+  assert.equal(host.restored, 1);
+});
+
+test("rich Ctrl+C cancels a pending initial attach and restores immediately", async () => {
+  let releaseAttach;
+  const attachGate = new Promise((resolve) => { releaseAttach = resolve; });
+  const { coordinator, calls, host, intents } = harness({ attachGate });
+  const starting = coordinator.start(intents.slice(0, 1));
+  await waitUntil(() => calls.attach.length === 1 && host.input !== undefined, "rich terminal should own input while attach is pending");
+  host.emitInput(Uint8Array.of(0x03));
+  await starting;
+  await coordinator.waitForStop();
+  assert.equal(coordinator.state, "stopped");
+  assert.equal(host.restored, 1);
+  assert.deepEqual(calls.detach, []);
+  assert.deepEqual(calls.input, []);
+  releaseAttach();
+});
+
+test("disconnect feedback cadence is bounded to one second total", () => {
+  const host = new FakeHost();
+  assert.throws(
+    () => new ForegroundTerminalCoordinator({ host, disconnectFrameMs: 251 }),
+    /disconnect frame duration must be between 1 and 250 milliseconds/u,
+  );
+});
+
+test("Claude OAuth opens once on the local machine only after explicit Cuna approval", async () => {
+  const opened = [];
+  const { coordinator, callbacks, calls, host, intents } = harness({
+    coordinatorOptions: {
+      browser: { async open(url) { opened.push(url); } },
+      clock: () => 1_000,
+    },
+  });
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+  assert.match(decoder.decode(host.writes.at(-1)), /Claude Code requests browser authentication/u);
+  assert.deepEqual(opened, [], "remote output alone must never execute a local action");
+
+  host.emitInput(Uint8Array.of(0x0d));
+  await waitUntil(() => opened.length === 1, "local browser approval should settle");
+  assert.deepEqual(opened, [url]);
+  assert.deepEqual(calls.input, [], "approval input must not enter the remote PTY");
+  assert.match(decoder.decode(host.writes.at(-1)), /Browser opened locally/u);
+
+  host.emitInput(encoder.encode("\u001b[200~opaque-code\r\n\u001b[201~"));
+  await waitUntil(() => calls.input.length === 1, "approved code paste should commit to the provider");
+  assert.deepEqual(calls.input[0], { tabId: "tab-a", text: "opaque-code\r" });
+
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(`${url}\r\n`)));
+  host.emitInput(Uint8Array.of(0x0d));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(opened.length, 1, "replayed provider output must not reopen the browser");
+  await coordinator.stop();
+});
+
+test("negotiated remote browser request stays awaiting until provider observation or cancellation", async () => {
+  const opened = [];
+  const { coordinator, callbacks, calls, host, intents } = harness({
+    coordinatorOptions: {
+      browser: { async open(url) { opened.push(url); } },
+      deviceId: "device-1",
+      clock: () => 1_000,
+    },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  assert.deepEqual(callbacks.localActionKinds, ["browser.open"]);
+  const url = "https://platform.claude.com/oauth/authorize?code=true&state=remote";
+  const args = Object.freeze({ url });
+  const request = Object.freeze({
+    version: 1,
+    id: "remote-browser-1",
+    identity: Object.freeze({
+      userId: "user-1",
+      deviceId: "device-1",
+      machineId: "machine-1",
+      workspaceBindingId: null,
+      workspaceBindingGeneration: null,
+      agentSessionId: SESSION_A,
+      processEpoch: `epoch-${SESSION_A}`,
+      fencingGeneration: 1,
+    }),
+    provider: "claude-code",
+    kind: "browser.open",
+    arguments: args,
+    argumentsDigest: digestLocalActionArguments(args),
+    requestedScope: "provider-auth",
+    createdAt: 1_000,
+    expiresAt: 61_000,
+    nonce: "remote-nonce-1",
+  });
+  await callbacks.onLocalActionFrame({
+    tabId: "tab-a",
+    frame: { type: "local_action_request" },
+    payload: { request },
+  });
+  assert.match(decoder.decode(host.writes.at(-1)), /Claude Code requests browser authentication/u);
+  assert.deepEqual(opened, []);
+
+  host.emitInput(Uint8Array.of(0x0d));
+  await waitUntil(() => opened.length === 1, "local browser should open after approval");
+  assert.deepEqual(opened, [url]);
+  assert.equal(calls.localActionControls.length, 0, "opening a browser must not claim provider completion");
+  await coordinator.stop();
+  assert.equal(calls.localActionControls.length, 1, "foreground stop returns one fenced cancellation");
+  assert.equal(calls.localActionControls[0].type, "local_action_result");
+  assert.equal(calls.localActionControls[0].tabId, "tab-a");
+  assert.equal(calls.localActionControls[0].payload.result.status, "cancelled");
+});
+
+test("denied and cross-provider browser URLs never execute locally", async () => {
+  const opened = [];
+  const { coordinator, callbacks, host, intents } = harness({
+    coordinatorOptions: { browser: { async open(url) { opened.push(url); } } },
+  });
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  await callbacks.onTerminalOutput(outputEvent(
+    intents[0], 1n, encoder.encode("https://auth.openai.com/codex/device\r\n"),
+  ));
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  await callbacks.onTerminalOutput(outputEvent(
+    intents[0], 2n, encoder.encode("https://platform.claude.com/oauth/authorize?state=deny\r\n"),
+  ));
+  host.emitInput(Uint8Array.of(0x64));
+  await waitUntil(() => /authentication denied/u.test(decoder.decode(host.writes.at(-1))), "deny should render");
+  assert.deepEqual(opened, []);
+  await coordinator.stop();
+});
+
+test("provider code beginning with d remains byte-exact PTY data instead of a deny decision", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness();
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  await callbacks.onTerminalOutput(outputEvent(
+    intents[0], 1n,
+    encoder.encode("https://platform.claude.com/oauth/authorize?code=true&state=opaque\r\n"),
+  ));
+  const codePaste = encoder.encode("\u001b[200~d-code-is-opaque\u001b[201~");
+  host.emitInput(codePaste);
+  await waitUntil(() => calls.input.length === 1, "opaque provider code should reach the PTY");
+  assert.deepEqual(calls.input[0], { tabId: "tab-a", text: decoder.decode(codePaste) });
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /authentication denied/u);
+  await coordinator.stop();
+});
+
+test("single-byte provider code input is PTY data while a browser action is pending", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness({
+    coordinatorOptions: { browser: { open: async () => undefined } },
+  });
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  await callbacks.onTerminalOutput(outputEvent(
+    intents[0],
+    1n,
+    encoder.encode("https://platform.claude.com/oauth/authorize?code=true&state=opaque\r\n"),
+  ));
+
+  host.emitInput(encoder.encode("x"));
+  await waitUntil(() => calls.input.length === 1, "a typed provider-code character should reach the PTY");
+  assert.deepEqual(calls.input[0], { tabId: "tab-a", text: "x" });
+  await coordinator.stop();
+});
+
+test("pasting the Claude sign-in URL is blocked with a corrective prompt while the actual code passes", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness();
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+
+  const urlPaste = encoder.encode(`\u001b[200~${url}\u001b[201~`);
+  host.emitInput(urlPaste.subarray(0, 11));
+  host.emitInput(urlPaste.subarray(11));
+  await waitUntil(
+    () => /sign-in link, not the code/u.test(decoder.decode(host.writes.at(-1))),
+    "the URL paste should produce local corrective feedback",
+  );
+  assert.deepEqual(calls.input, [], "the OAuth URL must not enter the hidden provider-code prompt");
+
+  const codePaste = encoder.encode("\u001b[200~valid-code-123\u001b[201~");
+  host.emitInput(codePaste);
+  await waitUntil(() => calls.input.length === 1, "the actual provider code should reach the PTY");
+  assert.deepEqual(calls.input[0], { tabId: "tab-a", text: decoder.decode(codePaste) });
+  await coordinator.stop();
+});
+
+test("one Ctrl-C detaches even when a bracketed paste never receives its end marker", async () => {
+  const { coordinator, calls, host, intents } = harness();
+  await coordinator.start(intents.slice(0, 1));
+  host.emitInput(encoder.encode("\u001b[200~partial"));
+  await waitUntil(() => calls.input.length === 1, "partial paste should enter the bounded terminal path");
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+});
+
+test("a hanging browser opener never blocks one-Ctrl-C detach", async () => {
+  let releaseBrowser;
+  let browserStarted = false;
+  const { coordinator, callbacks, calls, host, intents } = harness({
+    coordinatorOptions: {
+      browser: { open: async () => {
+        browserStarted = true;
+        await new Promise((resolve) => { releaseBrowser = resolve; });
+      } },
+    },
+  });
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  await callbacks.onTerminalOutput(outputEvent(
+    intents[0], 1n, encoder.encode("https://platform.claude.com/oauth/authorize?code=true&state=hanging\r\n"),
+  ));
+  host.emitInput(Uint8Array.of(0x0d));
+  await waitUntil(() => browserStarted, "browser action should start");
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  releaseBrowser?.();
 });
 
 test("TC-055-02 invalid dimensions cause zero host acquisition", async () => {
@@ -181,6 +466,35 @@ test("TC-055-02 a legitimate resize during ownership acquisition uses the newest
   await coordinator.start(intents.slice(0, 1));
   assert.equal(calls.attach[0].columns, 100);
   assert.equal(calls.attach[0].rows, 28);
+  await coordinator.stop();
+});
+
+test("a resize while initial attach is pending reconciles the fenced VTE and remote geometry", async () => {
+  const host = new FakeHost();
+  host.columns = 120;
+  host.rows = 30;
+  const { coordinator, callbacks, calls, intents, runtime } = harness({ host });
+  runtime.attach = async (input) => {
+    calls.attach.push(input);
+    host.columns = 74;
+    host.rows = 20;
+    host.emitResize();
+    const ready = snapshot(intents[0]);
+    await callbacks.onTerminalReady(ready);
+    runtime.activeTabId = input.tabId;
+    return ready;
+  };
+
+  await coordinator.start(intents.slice(0, 1));
+
+  assert.equal(calls.attach[0].columns, 120);
+  assert.equal(calls.attach[0].rows, 28);
+  assert.deepEqual(calls.resize, [
+    { columns: 74, rows: 17, tabId: "tab-a" },
+    { columns: 74, rows: 18, tabId: "tab-a" },
+  ]);
+  assert.equal(calls.repaint.length, 1, "initial replay should still request exactly one provider redraw");
+  assert.equal(coordinator.state, "active");
   await coordinator.stop();
 });
 
@@ -211,16 +525,16 @@ test("TC-055-18 failed host restoration retains authority for an explicit cleanu
   assert.equal(host.restored, 2);
 });
 
-test("terminal attachment evidence never impersonates AgentSession supervisor truth", async () => {
+test("foreground appbar shows live attachment truth without unresolved lifecycle noise", async () => {
   const { coordinator, host, intents } = harness({ coordinatorOptions: { clock: () => 150 } });
   await coordinator.start(intents.slice(0, 1));
   const frame = decoder.decode(host.writes.at(-1));
-  assert.match(frame, /session unknown/u);
+  assert.doesNotMatch(frame, /machine unknown|session unknown|sync unknown/u);
   assert.match(frame, /terminal attached/u);
   await coordinator.stop();
 });
 
-test("supervisor lifecycle evidence is projected independently and expires without hiding terminal health", async () => {
+test("expired auxiliary observations never replace live foreground attachment truth", async () => {
   let now = 150;
   const host = new FakeHost();
   host.columns = 120;
@@ -244,18 +558,17 @@ test("supervisor lifecycle evidence is projected independently and expires witho
   };
   await coordinator.start([authoritativeIntent]);
   let frame = decoder.decode(host.writes.at(-1));
-  assert.match(frame, /session running/u);
+  assert.doesNotMatch(frame, /machine |session |sync /u);
   assert.match(frame, /terminal attached/u);
-  assert.match(frame, /auth authenticated/u);
-  assert.match(frame, /sync unknown/u);
+  assert.match(frame, /Claude auth authenticated/u);
 
   now = 180;
   callbacks.onTerminalState(snapshot(authoritativeIntent));
-  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("session stale"), "expired supervisor evidence should render stale");
+  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Claude auth stale"), "expired provider evidence should render stale");
   frame = decoder.decode(host.writes.at(-1));
-  assert.match(frame, /session stale/u);
+  assert.doesNotMatch(frame, /machine |session |sync /u);
   assert.match(frame, /terminal attached/u);
-  assert.match(frame, /auth stale/u);
+  assert.match(frame, /Claude auth stale/u);
   await coordinator.stop();
 });
 
@@ -283,6 +596,7 @@ test("queued input retains its receipt-time tab and generation across asynchrono
   const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
   let firstEntered = false;
   runtime.sendInput = async (bytes, tabId, authority) => {
+    if (bytes.length === 1 && bytes[0] === 0x0c) return;
     calls.inputAuthorities.push(authority);
     calls.input.push({ tabId, text: decoder.decode(bytes) });
     if (!firstEntered) {
@@ -312,6 +626,7 @@ test("queued input never inherits a replacement generation that became ready aft
   const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
   let firstEntered = false;
   runtime.sendInput = async (bytes, tabId, authority) => {
+    if (bytes.length === 1 && bytes[0] === 0x0c) return;
     calls.inputAuthorities.push(authority);
     calls.input.push({ tabId, text: decoder.decode(bytes) });
     if (!firstEntered) {
@@ -384,27 +699,174 @@ test("replacement readiness waits for prior-generation host rendering and fences
   await coordinator.stop();
 });
 
-test("TC-055-07/08 escape help and tab chords stay local while Ctrl-C/Z and payload remain remote input", async () => {
+test("TC-055-07/08 escape help and tab chords stay local while Ctrl+] c sends a remote interrupt", async () => {
   const { coordinator, calls, host, intents } = harness();
   await coordinator.start(intents);
-  host.emitInput(Uint8Array.of(0x03, 0x1a, 0x41));
+  host.emitInput(Uint8Array.of(0x1a, 0x41));
   await waitUntil(() => calls.input.length === 1, "ordinary raw input should reach the initial tab");
-  assert.deepEqual(calls.input[0], { tabId: "tab-a", text: "\u0003\u001aA" });
+  assert.deepEqual(calls.input[0], { tabId: "tab-a", text: "\u001aA" });
+
+  host.emitInput(Uint8Array.of(0x1d, 0x63));
+  await waitUntil(() => calls.input.length === 2, "the explicit remote interrupt chord should reach the active tab");
+  assert.deepEqual(calls.input[1], { tabId: "tab-a", text: "\u0003" });
 
   host.emitInput(Uint8Array.of(0x1d, 0x3f));
-  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+] ? help"), "trusted appbar should show local escape help");
+  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+C detach"), "trusted appbar should show local escape help");
 
   host.emitInput(Uint8Array.of(0x1d));
   host.emitInput(Uint8Array.of(0x32, 0x42));
-  await waitUntil(() => calls.input.length === 2, "payload after a tab chord should reach the selected tab");
+  await waitUntil(() => calls.input.length === 3, "payload after a tab chord should reach the selected tab");
   assert.deepEqual(calls.switch, ["tab-b"]);
-  assert.deepEqual(calls.input[1], { tabId: "tab-b", text: "B" });
+  assert.deepEqual(calls.input[2], { tabId: "tab-b", text: "B" });
 
   host.emitInput(Uint8Array.of(0x1d, 0x1d));
-  await waitUntil(() => calls.input.length === 3, "double prefix should send one literal prefix");
-  assert.equal(calls.input[2].tabId, "tab-b");
-  assert.equal(calls.input[2].text.charCodeAt(0), 0x1d);
+  await waitUntil(() => calls.input.length === 4, "double prefix should send one literal prefix");
+  assert.equal(calls.input[3].tabId, "tab-b");
+  assert.equal(calls.input[3].text.charCodeAt(0), 0x1d);
   await coordinator.stop();
+});
+
+test("Ctrl+S cannot silently XOFF the remote PTY and explicit escape chords preserve raw flow control", async () => {
+  const { coordinator, calls, host, intents } = harness();
+  await coordinator.start(intents.slice(0, 1));
+
+  host.emitInput(Uint8Array.of(0x13));
+  await waitUntil(() => calls.input.length === 1, "local Ctrl+S should proactively send XON");
+  assert.equal(calls.input[0].text, "\u0011");
+  assert.match(decoder.decode(host.writes.at(-1)), /Terminal output kept active/u);
+
+  host.emitInput(Uint8Array.of(0x1d, 0x73, 0x1d, 0x71));
+  await waitUntil(() => calls.input.length >= 3, "explicit flow-control chords should reach the PTY");
+  assert.equal(calls.input.slice(1).map((item) => item.text).join(""), "\u0013\u0011");
+  await coordinator.stop();
+});
+
+test("Ctrl+C keeps the Cuna frame visible through deterministic disconnect feedback before restore", async () => {
+  let releaseDetach;
+  const detachGate = new Promise((resolve) => { releaseDetach = resolve; });
+  const { coordinator, calls, host, intents } = harness({
+    detachGate,
+    detachStateSequence: ["interrupted", "detached"],
+    coordinatorOptions: { disconnectFrameMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  const baselineWrites = host.writes.length;
+  host.emitInput(Uint8Array.of(0x03));
+  await waitUntil(
+    () => host.writes.slice(baselineWrites).some((bytes) => decoder.decode(bytes).includes("Disconnecting...")),
+    "Ctrl-C should acknowledge closing before a blocked detach resolves",
+  );
+  const pendingFrames = host.writes.slice(baselineWrites).map((bytes) => decoder.decode(bytes));
+  assert.equal(pendingFrames.every((frame) => frame.includes("CUNA")), true);
+  assert.equal(pendingFrames.some((frame) => frame.includes("Disconnected.")), false);
+  assert.equal(host.restored, 0);
+  releaseDetach();
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  assert.deepEqual(calls.input, []);
+  const closingFrames = host.writes.slice(baselineWrites).map((bytes) => decoder.decode(bytes));
+  assert.equal(closingFrames.some((frame) => frame.includes("✦ Disconnecting...")), true);
+  assert.equal(closingFrames.some((frame) => frame.includes("✧ Disconnecting...")), true);
+  assert.equal(closingFrames.some((frame) => frame.includes("✓ Disconnected.")), true);
+  assert.equal(host.restored, 1);
+  assert.equal(host.writesAtRestore, host.writes.length, "restore must follow the final closing frame");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(host.writes.length, host.writesAtRestore, "no closing frame may write after restore");
+  assert.equal(coordinator.failure, undefined);
+});
+
+test("rich no-color keeps disconnect feedback while emitting no color SGR", async () => {
+  const { coordinator, host, intents } = harness({
+    coordinatorOptions: { color: false, disconnectFrameMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  const baselineWrites = host.writes.length;
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  const closing = Buffer.concat(host.writes.slice(baselineWrites).map((bytes) => Buffer.from(bytes))).toString();
+  assert.match(closing, /Disconnecting\.\.\./u);
+  assert.match(closing, /Disconnected\./u);
+  const colorSgr = new RegExp(`${String.fromCharCode(27)}\\[(?:3[0-9]|4[0-9]|9[0-7]|38|48)(?:;|m)`, "u");
+  assert.equal(colorSgr.test(closing), false);
+});
+
+test("a detach failure never paints Disconnected or becomes a successful rich close", async () => {
+  const detachError = new Error("remote detach rejected");
+  const { coordinator, host, intents } = harness({
+    detachError,
+    coordinatorOptions: { disconnectFrameMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  const baselineWrites = host.writes.length;
+  host.emitInput(Uint8Array.of(0x03));
+  await assert.rejects(coordinator.waitForStop(), /cleanup was incomplete/u);
+  const closing = Buffer.concat(host.writes.slice(baselineWrites).map((bytes) => Buffer.from(bytes))).toString();
+  assert.match(closing, /Disconnecting\.\.\./u);
+  assert.doesNotMatch(closing, /Disconnected\./u);
+  assert.equal(coordinator.failure, detachError);
+  assert.equal(host.restored, 1);
+});
+
+test("closing animation is best-effort when one decorative host frame fails", async () => {
+  const { coordinator, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+  await coordinator.start(intents.slice(0, 1));
+  host.failWriteAt = host.writeAttempts + 1;
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  assert.equal(coordinator.failure, undefined);
+  assert.equal(host.restored, 1);
+  assert.equal(host.writes.some((bytes) => decoder.decode(bytes).includes("Disconnected.")), true);
+});
+
+test("rich Ctrl+C intent wins a transport close before its queued detach executes", async () => {
+  let releaseInput;
+  const inputGate = new Promise((resolve) => { releaseInput = resolve; });
+  const { coordinator, callbacks, calls, host, intents } = harness({
+    inputGate,
+    coordinatorOptions: { disconnectFrameMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  host.emitInput(Uint8Array.of(0x41));
+  await waitUntil(() => calls.input.length === 1, "the earlier rich input should hold the serialized tail");
+
+  host.emitInput(Uint8Array.of(0x03));
+  await waitUntil(
+    () => host.writes.some((bytes) => decoder.decode(bytes).includes("Disconnecting...")),
+    "receipt-time close feedback should not wait behind prior remote input",
+  );
+  assert.deepEqual(calls.detach, [], "the serialized detach should still wait behind admitted input");
+  callbacks.onTerminalState({
+    ...snapshot(intents[0]),
+    state: "interrupted",
+    reason: "transport_closed_without_terminal_exit",
+  });
+  releaseInput();
+
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  assert.equal(coordinator.failure, undefined);
+  assert.equal(coordinator.state, "stopped");
+  assert.equal(host.restored, 1);
+});
+
+test("Ctrl+C on one rich tab returns to its sibling without restoring the workbench", async () => {
+  const { coordinator, calls, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+  await coordinator.start(intents);
+  const baselineWrites = host.writes.length;
+  host.emitInput(Uint8Array.of(0x03));
+  await waitUntil(() => calls.switch.includes("tab-b"), "the sibling should become active after local close");
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  assert.equal(host.restored, 0);
+  assert.equal(coordinator.state, "active");
+  assert.equal(host.writes.slice(baselineWrites).some((bytes) => decoder.decode(bytes).includes("Disconnecting...")), true);
+  assert.equal(decoder.decode(host.writes.at(-1)).includes("Disconnecting..."), false);
+  assert.match(decoder.decode(host.writes.at(-1)), /Codex review/u);
+  host.emitInput(encoder.encode("B"));
+  await waitUntil(() => calls.input.some((item) => item.tabId === "tab-b" && item.text === "B"), "the sibling should remain operable");
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a", "tab-b"]);
+  assert.equal(host.restored, 1);
 });
 
 test("escape-chord bytes inside split bracketed paste remain literal remote content", async () => {
@@ -425,14 +887,52 @@ test("escape-chord bytes inside split bracketed paste remain literal remote cont
 test("resize storms coalesce to the latest active-tab dimensions without inventing output", async () => {
   const { coordinator, calls, host, intents } = harness();
   await coordinator.start(intents.slice(0, 1));
+  const baseline = calls.resize.length;
   for (let index = 0; index < 100; index += 1) {
     host.columns = 90 + index;
     host.rows = 30 + index;
     host.emitResize();
   }
-  await waitUntil(() => calls.resize.length === 1, "resize storm should coalesce to one remote mutation");
-  assert.deepEqual(calls.resize[0], { columns: 189, rows: 127, tabId: "tab-a" });
+  await waitUntil(() => calls.resize.length === baseline + 1, "resize storm should coalesce to one remote mutation");
+  assert.deepEqual(calls.resize.at(-1), { columns: 189, rows: 127, tabId: "tab-a" });
   await coordinator.stop();
+});
+
+test("remote fullscreen output waits for VTE resize before composing a narrower host frame", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness({
+    coordinatorOptions: { resizeCoalesceMs: 50 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  const baselineResizes = calls.resize.length;
+  const baselineWrites = host.writes.length;
+
+  host.columns = 40;
+  host.rows = 12;
+  host.emitResize();
+  await callbacks.onTerminalOutput(outputEvent(
+    intents[0],
+    1n,
+    encoder.encode(`\u001b[?1049h\u001b[H\u001b[38;5;208m${"provider-frame-".repeat(6)}\u001b[0m`),
+  ));
+
+  assert.equal(
+    host.writes.length,
+    baselineWrites,
+    "the stale 80-column VTE must not be composed into the observed 40-column host",
+  );
+  await waitUntil(
+    () => calls.resize.length === baselineResizes + 1 && host.writes.length > baselineWrites,
+    "the coalesced resize should publish one complete replacement frame",
+  );
+  const frame = decoder.decode(host.writes.at(-1));
+  assert.match(frame, /CUNA/u);
+  assert.match(frame, /provider-frame/u);
+  assert.equal(coordinator.state, "active");
+
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  assert.equal(host.restored, 1);
+  assert.equal(coordinator.failure, undefined);
 });
 
 test("terminal state storms coalesce to bounded latest-state rendering", async () => {
@@ -506,6 +1006,110 @@ test("an interrupted foreground tab reconnects with a bounded composed retry", a
   await coordinator.stop();
 });
 
+test("input during interrupted recovery is explicitly withheld instead of silently discarded", async () => {
+  let releaseReconnect;
+  const reconnectGate = new Promise((resolve) => { releaseReconnect = resolve; });
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness();
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    await reconnectGate;
+    const ready = snapshot(intents[0], 2);
+    await callbacks.onTerminalReady(ready);
+    callbacks.onTerminalState(ready);
+    return ready;
+  };
+  await coordinator.start(intents.slice(0, 1));
+  const baselineResizes = calls.resize.length;
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  await waitUntil(() => calls.reconnect.length === 1, "recovery should own the interrupted tab");
+
+  host.emitInput(encoder.encode("must-not-drop"));
+  await waitUntil(
+    () => decoder.decode(host.writes.at(-1)).includes("input was not sent"),
+    "the user should receive explicit delivery status",
+  );
+  assert.deepEqual(calls.input, []);
+
+  releaseReconnect();
+  await waitUntil(() => calls.resize.length > baselineResizes, "the replacement should restore input authority");
+  host.emitInput(encoder.encode("after-reconnect"));
+  await waitUntil(() => calls.input.length === 1, "post-reconnect input should use the new fence");
+  assert.equal(calls.input[0].text, "after-reconnect");
+  await coordinator.stop();
+});
+
+test("input fenced after active receipt is reported as unsent and never retried", async () => {
+  let releaseReconnect;
+  const reconnectGate = new Promise((resolve) => { releaseReconnect = resolve; });
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness();
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    await reconnectGate;
+    const ready = snapshot(intents[0], 2);
+    await callbacks.onTerminalReady(ready);
+    callbacks.onTerminalState(ready);
+    return ready;
+  };
+  await coordinator.start(intents.slice(0, 1));
+  const healthySendInput = runtime.sendInput;
+  runtime.sendInput = async () => {
+    throw runtimeFailure("terminal_disconnected", "The old terminal fence is closed.", { retryable: true });
+  };
+
+  host.emitInput(encoder.encode("race-window"));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  await waitUntil(
+    () => decoder.decode(host.writes.at(-1)).includes("input was not sent"),
+    "a pre-wire fencing race should receive explicit delivery feedback",
+  );
+  assert.deepEqual(calls.input, [], "the rejected bytes must never be retried or reported as delivered");
+
+  runtime.sendInput = healthySendInput;
+  releaseReconnect();
+  await coordinator.stop();
+});
+
+test("a resize whose debounce expires during reconnect is reconciled after the new fence becomes active", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 1, reconnectBaseDelayMs: 1, resizeCoalesceMs: 5 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  const baselineResizes = calls.resize.length;
+  const baselineRepaints = calls.repaint.length;
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    const beforeReconnectingRender = host.writes.length;
+    callbacks.onTerminalState({ ...snapshot(intents[0]), state: "reconnecting" });
+    await waitUntil(
+      () => host.writes.length > beforeReconnectingRender,
+      "the reconnecting state should settle before the resize",
+    );
+    const beforeResizeRender = host.writes.length;
+    host.columns = 74;
+    host.rows = 20;
+    host.emitResize();
+    await waitUntil(
+      () => host.writes.length > beforeResizeRender,
+      "the coalesced local resize should finish while the remote fence is reconnecting",
+    );
+    const ready = snapshot(intents[0], 2);
+    await callbacks.onTerminalReady(ready);
+    callbacks.onTerminalState(ready);
+    return ready;
+  };
+
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  await waitUntil(() => calls.resize.length === baselineResizes + 1, "reconnect should publish the final current geometry");
+
+  assert.deepEqual(calls.resize.slice(baselineResizes), [
+    { columns: 74, rows: 18, tabId: "tab-a" },
+  ]);
+  assert.equal(calls.repaint.length, baselineRepaints, "reconnect geometry must not add another Ctrl+L redraw");
+  assert.deepEqual(calls.reconnect, ["tab-a"]);
+  assert.equal(coordinator.state, "active");
+  await coordinator.stop();
+});
+
 test("reconnect exhaustion isolates the failed tab without tearing down healthy foreground ownership", async () => {
   const { coordinator, callbacks, calls, host, intents, runtime } = harness({
     coordinatorOptions: { reconnectAttempts: 2, reconnectBaseDelayMs: 1 },
@@ -523,6 +1127,7 @@ test("reconnect exhaustion isolates the failed tab without tearing down healthy 
   assert.equal(host.restored, 0);
   assert.deepEqual(calls.detach, []);
   assert.match(coordinator.failure?.message ?? "", /replacement unavailable/u);
+  assert.match(decoder.decode(host.writes.at(-1)), /Reconnect failed/u);
   runtime.reconnect = healthyReconnect;
   host.emitInput(Uint8Array.of(0x1d, 0x72));
   await waitUntil(() => calls.reconnect.length === 3, "manual retry should reattach the interrupted active tab");
@@ -557,15 +1162,16 @@ test("a replacement ready callback cannot resurrect a viewport after stop", asyn
 test("resize reflows every tab before switching to an inactive viewport", async () => {
   const { coordinator, callbacks, calls, host, intents } = harness();
   await coordinator.start(intents);
+  const baseline = calls.resize.length;
   await callbacks.onTerminalOutput(outputEvent(intents[1], 1n, encoder.encode("x".repeat(70))));
   host.columns = 40;
   host.rows = 12;
   host.emitResize();
-  await waitUntil(() => calls.resize.length === 2, "both cloud PTYs should receive the resized dimensions");
+  await waitUntil(() => calls.resize.length === baseline + 2, "both cloud PTYs should receive the resized dimensions");
   host.emitInput(Uint8Array.of(0x1d, 0x32));
   await waitUntil(() => calls.switch.length === 1, "inactive tab should become selected");
   assert.equal(coordinator.state, "active");
-  assert.deepEqual(calls.resize, [
+  assert.deepEqual(calls.resize.slice(baseline), [
     { columns: 40, rows: 10, tabId: "tab-a" },
     { columns: 40, rows: 10, tabId: "tab-b" },
   ]);

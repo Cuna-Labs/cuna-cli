@@ -10,9 +10,11 @@ import { createServer } from "node:net";
 import { promisify } from "node:util";
 
 import {
+  CredentialVault,
   isolateWindowsAclChildEnvironment,
   LocalEncryptedSessionBackend,
   localEncryptedSessionPaths,
+  SecretMaterial,
   WINDOWS_ACL_COMMAND_PROGRAMS,
 } from "../dist/credentials/index.js";
 
@@ -96,10 +98,11 @@ function casChild(directory, profile, mode, candidate = Buffer.alloc(0)) {
 async function lockAuthority(sessionFile) {
   const physicalDirectory = await realpath(path.dirname(sessionFile));
   const physicalSession = path.resolve(physicalDirectory, path.basename(sessionFile));
-  const digest = createHash("sha256").update(process.platform === "win32" ? physicalSession.toLocaleLowerCase("en-US") : physicalSession, "utf8").digest();
+  const canonical = process.platform === "win32" ? physicalSession.toLocaleLowerCase("en-US") : physicalSession;
+  const digest = createHash("sha256").update(`storage\0${canonical}`, "utf8").digest();
   return process.platform === "win32"
-    ? `\\\\.\\pipe\\cuna-session-${digest.toString("hex").slice(0, 40)}`
-    : { host: "127.0.0.1", port: 49_152 + digest.readUInt16BE(0) % 16_384 };
+    ? `\\\\.\\pipe\\cuna-session-storage-${digest.toString("hex").slice(0, 40)}`
+    : { host: "127.0.0.1", port: 49_152 + digest.readUInt16BE(0) % 8_192 };
 }
 
 async function listen(server, authority) {
@@ -426,6 +429,49 @@ test("two independent processes produce exactly one encrypted-session CAS winner
     const final = Buffer.from(await backend.read("ignored"));
     assert.equal(candidates.some((candidate) => candidate.equals(final)), true);
     final.fill(0);
+  } finally {
+    for (const child of children) child.kill();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("seven independent processes serialize encrypted-local refresh across the remote callback", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cuna-local-session-refresh-"));
+  const profile = "multiprocess-refresh";
+  const binding = Object.freeze({ profileId: profile, accountId: "https://api.getcuna.com", workspaceId: "cli-human-auth", kind: "login-code-session-v1" });
+  const children = [];
+  try {
+    const backend = new LocalEncryptedSessionBackend({ ...localEncryptedSessionPaths(directory, profile), platform: process.platform });
+    const vault = new CredentialVault({ backend, platform: process.platform });
+    const material = SecretMaterial.fromUtf8("renewable-session-fixture");
+    try { await vault.rotate({ binding, material }); } finally { material.dispose(); }
+    const fixture = path.resolve("test/fixtures/local-session-refresh-child.mjs");
+    children.push(...["a", "b", "c", "d", "e", "f", "g"].map((label) => fork(fixture, [directory, profile, label], {
+      cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe", "ipc"],
+    })));
+    await Promise.all(children.map((child) => waitForChild(child, "ready")));
+    const entered = [];
+    const enteredWaiters = [];
+    for (const child of children) child.on("message", (message) => {
+      if (message?.phase !== "entered") return;
+      const waiter = enteredWaiters.shift();
+      if (waiter === undefined) entered.push({ child, message });
+      else waiter({ child, message });
+    });
+    const nextEntered = () => entered.shift() ?? new Promise((resolve) => enteredWaiters.push(resolve));
+    for (const child of children) child.send("go");
+    const observed = new Set();
+    for (let index = 0; index < children.length; index += 1) {
+      const current = await nextEntered();
+      assert.equal(observed.has(current.child.pid), false);
+      observed.add(current.child.pid);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(entered.length, 0, "no sibling process may enter while the current refresh owns its authority");
+      const result = waitForChild(current.child, "result");
+      current.child.send("release");
+      await result;
+    }
+    assert.equal(observed.size, 7);
   } finally {
     for (const child of children) child.kill();
     await rm(directory, { recursive: true, force: true });

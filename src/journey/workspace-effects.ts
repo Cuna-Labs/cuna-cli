@@ -34,6 +34,31 @@ function bindingKey(workspaceId: string, userId: string, canonicalRoot: string):
   return createHash("sha256").update(`${workspaceId}\0${userId}\0${canonicalRoot}`, "utf8").digest("hex");
 }
 
+function workspaceBindingCreateKey(request: {
+  readonly workspaceId: string;
+  readonly projectId: string;
+  readonly localInstanceId: string;
+  readonly machineId: string;
+  readonly exclusionPolicyDigest: string;
+  readonly excludedPrefixes: readonly string[];
+}): string {
+  // Version the namespace as well as hashing the complete producer body. Old
+  // builds keyed only the local root, so a later machine selection could reuse
+  // a key already bound to another request and fail forever with
+  // workspace_binding_idempotency_conflict. A v2 key can adopt an existing
+  // canonical binding without colliding with those spent legacy keys.
+  const canonicalIntent = JSON.stringify({
+    workspace_id: request.workspaceId,
+    project_id: request.projectId,
+    local_instance_id: request.localInstanceId,
+    machine_id: request.machineId,
+    exclusion_policy_digest: request.exclusionPolicyDigest,
+    excluded_prefixes: request.excludedPrefixes,
+  });
+  const digest = createHash("sha256").update(canonicalIntent, "utf8").digest("hex");
+  return `cuna-workspace-binding-v2-${digest}`;
+}
+
 /** Local binding facts are only hints until the complete tuple is re-read from the API. */
 export interface WorkspaceJourneyEffects extends Pick<AgentJourneyEffects, "inspectWorkspace" | "synchronizeWorkspace"> {
   readonly continuousSyncSnapshot: () => ContinuousSyncSnapshot | undefined;
@@ -112,15 +137,19 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         // retries the identical tuple and idempotency key, never a duplicate.
         const projectId = stableUuid("cuna.workspace.project.v1", intentDigest);
         const localInstanceId = stableUuid("cuna.workspace.local-instance.v1", `${intentDigest}\0${input.stateDirectory}`);
-        const createKey = `cuna-workspace-${intentDigest}`;
-        authority = await input.client.createWorkspaceBinding({
+        const createRequest = Object.freeze({
           workspaceId: input.workspaceId,
           projectId,
           localInstanceId,
           machineId,
           exclusionPolicyDigest: inspected.policy.exclusionPolicyDigest,
-          excludedPrefixes: [],
-        }, createKey, signal);
+          excludedPrefixes: Object.freeze([] as string[]),
+        });
+        authority = await input.client.createWorkspaceBinding(
+          createRequest,
+          workspaceBindingCreateKey(createRequest),
+          signal,
+        );
       }
 
       if (syncMode === "disabled") {

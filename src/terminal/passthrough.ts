@@ -13,6 +13,12 @@ import { MAX_FOREGROUND_PENDING_INPUT_BYTES, admitForegroundSessionIds } from ".
 import type { HostTerminalLease } from "./mode.js";
 
 const ESCAPE_PREFIX = 0x1d;
+const INTERRUPT = 0x03;
+const FLOW_RESUME = 0x11;
+const FLOW_PAUSE = 0x13;
+const REMOTE_INTERRUPT = 0x63;
+const REMOTE_FLOW_RESUME = 0x71;
+const REMOTE_FLOW_PAUSE = 0x73;
 const DETACH = 0x64;
 const RESIZE_COALESCE_MS = 50;
 const BRACKETED_PASTE_START = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e);
@@ -49,10 +55,15 @@ export class PassthroughTerminalCoordinator {
   #pasteEndMatch = 0;
   #remotePasteDisableMatch = 0;
   #detachChordTrusted = true;
+  #localDetachTabId: string | undefined;
   #failure: unknown;
   #stopPromise: Promise<void> | undefined;
   readonly #stopStarted: Promise<void>;
   readonly #resolveStopStarted: () => void;
+  readonly #initialReady: Promise<void>;
+  readonly #resolveInitialReady: () => void;
+  readonly #lifetimeAbort = new AbortController();
+  #startupDetached = false;
 
   constructor(options: PassthroughTerminalCoordinatorOptions) {
     const resizeCoalesceMs = options.resizeCoalesceMs ?? RESIZE_COALESCE_MS;
@@ -63,6 +74,9 @@ export class PassthroughTerminalCoordinator {
     let resolveStopStarted = (): void => undefined;
     this.#stopStarted = new Promise<void>((resolve) => { resolveStopStarted = resolve; });
     this.#resolveStopStarted = resolveStopStarted;
+    let resolveInitialReady = (): void => undefined;
+    this.#initialReady = new Promise<void>((resolve) => { resolveInitialReady = resolve; });
+    this.#resolveInitialReady = resolveInitialReady;
   }
 
   get state(): ForegroundTerminalState {
@@ -130,6 +144,9 @@ export class PassthroughTerminalCoordinator {
       this.#removeInput = this.#options.host.onInput((bytes) => this.#queueInput(bytes));
       this.#removeResize = this.#options.host.onResize(() => this.#queueResize());
       const dimensions = admitPassthroughDimensions(this.#options.host.dimensions());
+      const attachSignal = signal === undefined
+        ? this.#lifetimeAbort.signal
+        : AbortSignal.any([signal, this.#lifetimeAbort.signal]);
       const snapshot = await runtime.attach({
         tabId: intent.tabId,
         agentSessionId: intent.agentSessionId,
@@ -138,20 +155,27 @@ export class PassthroughTerminalCoordinator {
         ...(intent.attachmentAdmission === undefined
           ? {}
           : { expectedAdmission: intent.attachmentAdmission }),
-        ...(signal === undefined ? {} : { signal }),
+        signal: attachSignal,
       });
+      if (this.#startupDetached || this.#state !== "starting") {
+        await runtime.detach(snapshot.tabId);
+        return;
+      }
       if (!sameIntent(intent, snapshot)) {
         throw runtimeFailure("grant_scope_mismatch", "Passthrough readiness targets a different AgentSession.");
       }
       this.#snapshot = snapshot;
+      await this.#repaintAfterReplay(snapshot, dimensions);
       this.#state = "active";
     } catch (error) {
-      this.#state = "failed";
+      const startupDetached = this.#startupDetached;
+      if (!startupDetached) this.#state = "failed";
       try {
         await this.stop();
       } catch (cleanupError) {
         throw new AggregateError([error, cleanupError], "Passthrough startup and cleanup both failed.");
       }
+      if (startupDetached) return;
       throw error;
     }
   }
@@ -180,6 +204,7 @@ export class PassthroughTerminalCoordinator {
   async #stopNow(): Promise<void> {
     if (this.#state === "stopped") return;
     this.#state = "stopping";
+    this.#lifetimeAbort.abort(new Error("Passthrough terminal detached locally."));
     this.#removeAbort?.();
     this.#removeAbort = undefined;
     if (this.#resizeTimer !== undefined) clearTimeout(this.#resizeTimer);
@@ -188,6 +213,9 @@ export class PassthroughTerminalCoordinator {
     this.#removeResize?.();
     this.#removeInput = undefined;
     this.#removeResize = undefined;
+    // Release any input that arrived before readiness so cleanup cannot wait
+    // on a promise that only cleanup itself would otherwise resolve.
+    this.#resolveInitialReady();
     const failures: unknown[] = [];
     const snapshot = this.#snapshot;
     if (snapshot !== undefined && snapshot.state !== "closed" && snapshot.state !== "detached") {
@@ -219,6 +247,7 @@ export class PassthroughTerminalCoordinator {
       throw runtimeFailure("terminal_disconnected", "Passthrough readiness arrived after terminal ownership ended.");
     }
     this.#snapshot = snapshot;
+    this.#resolveInitialReady();
   }
 
   async #queueOutput(event: {
@@ -247,6 +276,15 @@ export class PassthroughTerminalCoordinator {
   #terminalState(snapshot: RuntimeTerminalSnapshot): void {
     const intent = this.#intent;
     if (intent === undefined || !sameIntent(intent, snapshot)) return;
+    if (
+      this.#localDetachTabId === snapshot.tabId &&
+      (snapshot.state === "failed" || snapshot.state === "interrupted")
+    ) {
+      // Closing the local attachment can synchronously surface the transport's
+      // interrupted state before detach() publishes/resolves its detached
+      // state. That teardown edge is expected and must not become a CLI error.
+      return;
+    }
     this.#snapshot = snapshot;
     if (snapshot.state === "failed" || snapshot.state === "interrupted") {
       this.#failure ??= runtimeFailure("terminal_disconnected", "The passthrough terminal connection ended.");
@@ -261,6 +299,11 @@ export class PassthroughTerminalCoordinator {
 
   #queueInput(bytes: Uint8Array): void {
     if (bytes.byteLength < 1) return;
+    if (this.#state === "starting" && bytes.includes(INTERRUPT)) {
+      this.#startupDetached = true;
+      void this.stop().catch(() => { this.#state = "failed"; });
+      return;
+    }
     if (bytes.byteLength > MAX_FOREGROUND_PENDING_INPUT_BYTES || this.#pendingInputBytes + bytes.byteLength > MAX_FOREGROUND_PENDING_INPUT_BYTES) {
       this.#failure ??= runtimeFailure("terminal_protocol_error", "Passthrough input exceeded its bounded queue.");
       void this.stop().catch(() => { this.#state = "failed"; });
@@ -279,9 +322,43 @@ export class PassthroughTerminalCoordinator {
             fencingGeneration: this.#snapshot.fencingGeneration,
           }),
         });
+    if (
+      payload.byteLength === 1 &&
+      payload[0] === INTERRUPT &&
+      !this.#pasteActive &&
+      !this.#prefixPending &&
+      receiptTarget !== undefined
+    ) {
+      // The user's detach decision is authoritative from input receipt, not
+      // only once its serialized input operation reaches runtime.detach(). A
+      // concurrent WebSocket close in that window is expected teardown.
+      this.#localDetachTabId = receiptTarget.tabId;
+    }
     this.#pendingInputBytes += payload.byteLength;
     const operation = this.#inputTail.then(async () => {
-      try { await this.#routeInput(payload, receiptTarget); } finally { this.#pendingInputBytes -= payload.byteLength; }
+      let admittedTarget = receiptTarget;
+      if (admittedTarget === undefined && this.#state === "starting") {
+        // Raw mode is acquired before the remote terminal can prove readiness.
+        // Input arriving in that window belongs to this one exact intent; wait
+        // for its first fenced binding instead of treating a normal early key
+        // press as a terminal failure. Once ready, later input still captures
+        // its generation at receipt time and cannot cross a reconnect fence.
+        await this.#initialReady;
+        const ready = this.#snapshot;
+        if (ready !== undefined && ready.state === "active") {
+          admittedTarget = Object.freeze({
+            tabId: ready.tabId,
+            binding: Object.freeze({
+              userId: ready.userId,
+              machineId: ready.machineId,
+              agentSessionId: ready.agentSessionId,
+              processEpoch: ready.processEpoch,
+              fencingGeneration: ready.fencingGeneration,
+            }),
+          });
+        }
+      }
+      try { await this.#routeInput(payload, admittedTarget); } finally { this.#pendingInputBytes -= payload.byteLength; }
     });
     this.#inputTail = operation.catch((error) => {
       this.#failure ??= error;
@@ -322,7 +399,13 @@ export class PassthroughTerminalCoordinator {
         continue;
       }
       if (!this.#prefixPending) {
-        if (byte === ESCAPE_PREFIX) {
+        if (byte === FLOW_PAUSE) {
+          remote.push(FLOW_RESUME);
+        } else if (byte === INTERRUPT) {
+          await flush();
+          await this.#detachLocal(snapshot);
+          return;
+        } else if (byte === ESCAPE_PREFIX) {
           await flush();
           this.#prefixPending = true;
         } else {
@@ -333,17 +416,36 @@ export class PassthroughTerminalCoordinator {
       this.#prefixPending = false;
       if (byte === ESCAPE_PREFIX) {
         remote.push(ESCAPE_PREFIX);
+      } else if (byte === REMOTE_INTERRUPT) {
+        remote.push(INTERRUPT);
+      } else if (byte === REMOTE_FLOW_PAUSE) {
+        remote.push(FLOW_PAUSE);
+      } else if (byte === REMOTE_FLOW_RESUME) {
+        remote.push(FLOW_RESUME);
       } else if (byte === DETACH && this.#detachChordTrusted) {
         await flush();
-        await this.#requireRuntime().detach(snapshot.tabId);
-        if (this.#snapshot === snapshot) this.#snapshot = Object.freeze({ ...snapshot, state: "detached" });
-        void this.stop().catch(() => { this.#state = "failed"; });
+        await this.#detachLocal(snapshot);
         return;
       } else {
         remote.push(ESCAPE_PREFIX, byte);
       }
     }
     await flush();
+  }
+
+  async #detachLocal(snapshot: RuntimeTerminalSnapshot): Promise<void> {
+    this.#localDetachTabId = snapshot.tabId;
+    try {
+      await this.#requireRuntime().detach(snapshot.tabId);
+    } catch (error) {
+      this.#localDetachTabId = undefined;
+      throw error;
+    }
+    if (this.#snapshot === snapshot) {
+      this.#snapshot = Object.freeze({ ...snapshot, state: "detached" });
+    }
+    this.#localDetachTabId = undefined;
+    void this.stop().catch(() => { this.#state = "failed"; });
   }
 
   #observeRemoteModeOutput(bytes: Uint8Array): void {
@@ -379,6 +481,20 @@ export class PassthroughTerminalCoordinator {
     const snapshot = this.#snapshot;
     if (snapshot === undefined || snapshot.state !== "active" || snapshot.resizeCapability !== "live") return;
     const dimensions = admitPassthroughDimensions(this.#options.host.dimensions());
+    await this.#requireRuntime().resize(dimensions.columns, dimensions.rows, snapshot.tabId);
+  }
+
+  async #repaintAfterReplay(
+    snapshot: RuntimeTerminalSnapshot,
+    dimensions: { readonly columns: number; readonly rows: number },
+  ): Promise<void> {
+    if (snapshot.state !== "active" || snapshot.resizeCapability !== "live") return;
+    // A fullscreen TUI may have painted its base frame before this client
+    // attached, leaving replay with cursor-relative deltas only. Force one
+    // real size transition and restore the admitted host size so the remote
+    // application receives SIGWINCH and emits a complete current frame.
+    const bounceColumns = dimensions.columns === 1 ? 2 : dimensions.columns - 1;
+    await this.#requireRuntime().resize(bounceColumns, dimensions.rows, snapshot.tabId);
     await this.#requireRuntime().resize(dimensions.columns, dimensions.rows, snapshot.tabId);
   }
 

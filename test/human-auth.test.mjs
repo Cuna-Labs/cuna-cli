@@ -9,6 +9,7 @@ import {
 } from "../dist/credentials/index.js";
 import {
   createHumanAuthService,
+  createHttpTransport,
   decodeCliAuthBootstrap,
   decodeCliContinuationIssued,
   decodeCliSignupCapability,
@@ -567,6 +568,175 @@ test("re-exchange races coalesce, retain the durable code once, and keep access 
   assert.equal(await later.service.acquireAccessToken(), AT_3);
   assert.equal(laterClient.calls.filter(([name]) => name === "exchange").length, 1);
   assert.equal(laterClient.calls.find(([name]) => name === "exchange")[1].loginCode, LOGIN);
+});
+
+test("one long-lived HTTP transport reacquires an interactive bearer after the 600 second access TTL", async () => {
+  let now = NOW;
+  let exchanges = 0;
+  const backend = new MemoryBackend();
+  backend.probe = async () => ({
+    protocol: CREDENTIAL_BACKEND_PROTOCOL,
+    backendId: backend.backendId,
+    platform: backend.platform,
+    status: "verified",
+    observedAt: now,
+    expiresAt: now + 60_000,
+    source: "live_round_trip",
+  });
+  const client = fakeClient({
+    async exchange(input) {
+      this.calls.push(["exchange", input]);
+      exchanges += 1;
+      return exchangeResult({
+        accessToken: exchanges === 1 ? AT : AT_2,
+        accessExpiresAt: new Date(now + 600_000).toISOString(),
+      });
+    },
+  });
+  const subject = fixture({ backend, client, clock: () => now });
+  await subject.service.login();
+
+  const authorizations = [];
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    bearerTokenProvider: (signal) => subject.service.acquireAccessToken(signal),
+    fetch: async (_url, init) => {
+      authorizations.push(init.headers.Authorization);
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    },
+  });
+  await transport.request({ method: "GET", path: "/v1/context" });
+  now += 601_000;
+  await transport.request({ method: "GET", path: "/v1/context" });
+
+  assert.deepEqual(authorizations, [`Bearer ${AT}`, `Bearer ${AT_2}`]);
+  assert.equal(exchanges, 2, "login plus one expiry-driven re-exchange");
+  assert.equal(backend.values.size, 1, "refreshing an access bearer retains the durable login code");
+});
+
+test("response timeout begins after interprocess credential acquisition, not while waiting for it", async () => {
+  let fetches = 0;
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    timeoutMs: 20,
+    bearerTokenProvider: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return AT;
+    },
+    fetch: async () => {
+      fetches += 1;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    },
+  });
+  assert.deepEqual(await transport.request({ method: "GET", path: "/v1/context" }), { ok: true });
+  assert.equal(fetches, 1);
+});
+
+test("a protected GET 401 forces one bearer rotation, retries once, and retains the durable login code", async () => {
+  const subject = fixture();
+  await subject.service.login();
+  let fetches = 0;
+  const authorizations = [];
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    bearerTokenProvider: (signal, refresh) => refresh === undefined
+      ? subject.service.acquireAccessToken(signal)
+      : subject.service.refreshRejectedAccessToken(refresh.rejectedToken, signal),
+    fetch: async (_url, init) => {
+      fetches += 1;
+      authorizations.push(init.headers.Authorization);
+      if (fetches === 2) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return new Response(JSON.stringify({
+        type: "https://api.getcuna.com/problems/unauthenticated",
+        title: "Authentication required",
+        status: 401,
+        code: "unauthenticated",
+        request_id: UUID_C,
+        retryable: false,
+        action: "sign_in",
+      }), { status: 401, headers: { "content-type": "application/problem+json" } });
+    },
+  });
+
+  assert.deepEqual(await transport.request({ method: "GET", path: "/v1/context" }), { ok: true });
+  assert.equal(fetches, 2, "401 permits exactly one safe replay");
+  assert.deepEqual(authorizations, [`Bearer ${AT}`, `Bearer ${AT_2}`]);
+  assert.equal(subject.backend.values.size, 1, "an access-token rejection does not revoke durable login");
+});
+
+test("401 retry is bounded to GET or a valid idempotency key and preserves mutation identity", async () => {
+  for (const request of [
+    { method: "POST", path: "/v1/write", body: { value: 1 } },
+    { method: "POST", path: "/v1/write", body: { value: 1 }, idempotencyKey: "bad" },
+  ]) {
+    let fetches = 0;
+    let refreshes = 0;
+    const transport = createHttpTransport({
+      baseUrl: "https://api.getcuna.com",
+      bearerTokenProvider: async (_signal, refresh) => {
+        if (refresh !== undefined) refreshes += 1;
+        return AT;
+      },
+      fetch: async () => {
+        fetches += 1;
+        return new Response(JSON.stringify({ error: "unauthenticated" }), { status: 401 });
+      },
+    });
+    await assert.rejects(transport.request(request), (error) => error.code === "cuna.auth.rejected");
+    assert.equal(fetches, 1);
+    assert.equal(refreshes, 0);
+  }
+
+  const attempts = [];
+  let providerCalls = 0;
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    bearerTokenProvider: async (_signal, refresh) => {
+      providerCalls += 1;
+      if (refresh !== undefined) {
+        assert.equal(refresh.reason, "unauthorized");
+        assert.equal(refresh.rejectedToken, AT);
+        return AT_2;
+      }
+      return AT;
+    },
+    fetch: async (_url, init) => {
+      attempts.push({ authorization: init.headers.Authorization, key: init.headers["Idempotency-Key"], body: init.body });
+      return new Response(JSON.stringify(attempts.length === 1 ? { error: "unauthenticated" } : { ok: true }), {
+        status: attempts.length === 1 ? 401 : 200,
+      });
+    },
+  });
+  assert.deepEqual(await transport.request({
+    method: "POST",
+    path: "/v1/write",
+    body: { value: 1 },
+    idempotencyKey: "stable-operation-1",
+  }), { ok: true });
+  assert.equal(providerCalls, 2);
+  assert.deepEqual(attempts, [
+    { authorization: `Bearer ${AT}`, key: "stable-operation-1", body: JSON.stringify({ value: 1 }) },
+    { authorization: `Bearer ${AT_2}`, key: "stable-operation-1", body: JSON.stringify({ value: 1 }) },
+  ]);
+});
+
+test("a second 401 is authoritative and never starts a retry loop", async () => {
+  let fetches = 0;
+  let providerCalls = 0;
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    bearerTokenProvider: async (_signal, refresh) => {
+      providerCalls += 1;
+      return refresh === undefined ? AT : AT_2;
+    },
+    fetch: async () => {
+      fetches += 1;
+      return new Response(JSON.stringify({ error: "unauthenticated" }), { status: 401 });
+    },
+  });
+  await assert.rejects(transport.request({ method: "GET", path: "/v1/context" }), (error) => error.code === "cuna.auth.rejected");
+  assert.equal(fetches, 2);
+  assert.equal(providerCalls, 2);
 });
 
 test("fresh whoami reuses identity validated by re-exchange instead of rereading the encrypted session", async () => {

@@ -30,6 +30,10 @@
     "lint": "oxlint --deny-warnings src test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node scripts/run-build-operation.mjs test",
+    "acceptance:windows-conpty": "npm run build && npm --prefix test/windows-conpty install --ignore-scripts=false --no-audit --no-fund && node scripts/test-windows-conpty.mjs",
+    "acceptance:linux-pty": "npm run build && node scripts/test-linux-pty.mjs",
+    "acceptance:macos-pty": "node scripts/test-macos-pty.mjs",
+    "model-check:local-actions": "node scripts/model-check-local-actions.mjs",
     "contract:sync:infra": "node scripts/sync-infra-openapi.mjs",
     "candidate:local": "node scripts/build-local-release-candidate.mjs",
     "prepack": "npm run build"
@@ -53,7 +57,8 @@
     "cli",
     "cloud-development",
     "claude-code",
-    "codex"
+    "codex",
+    "opencode"
   ],
   "devDependencies": {
     "@types/node": "^22.15.0",

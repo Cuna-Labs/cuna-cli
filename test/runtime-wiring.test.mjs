@@ -100,16 +100,20 @@ class AsyncByteQueue {
 }
 
 class FakeWireConnection {
-  constructor(id, initialBytes) {
+  constructor(id, initialBytes, onSend) {
     this.connectionId = id;
     this.incoming = new AsyncByteQueue();
     this.sent = [];
     this.closeCalls = [];
+    this.onSend = onSend;
     if (initialBytes !== undefined) this.incoming.push(initialBytes);
   }
 
   receive() { return this.incoming; }
-  async send(bytes) { this.sent.push(bytes); }
+  async send(bytes) {
+    this.sent.push(bytes);
+    await this.onSend?.(bytes);
+  }
   async close(input) {
     this.closeCalls.push(input);
     this.incoming.close();
@@ -126,6 +130,7 @@ class FakeTerminalSystem {
     this.generation = 0;
     this.outputOnReady = new Map();
     this.outputSequenceOnReady = new Map();
+    this.retainedOutputOnResume = new Map();
     this.connectionsWithoutReady = new Set();
     this.connector = {
       connect: async (input) => {
@@ -154,7 +159,18 @@ class FakeTerminalSystem {
             initial.set(frame, ready.byteLength);
           }
         }
-        const connection = new FakeWireConnection(grant.terminalSessionId, initial);
+        let connection;
+        connection = new FakeWireConnection(grant.terminalSessionId, initial, async (bytes) => {
+          if (decodeTerminalFrame(bytes)?.type !== "resume") return;
+          const retained = this.retainedOutputOnResume.get(grant.agentSessionId);
+          if (retained === undefined) return;
+          connection.incoming.push(encodeTerminalFrame({
+            type: "output",
+            critical: true,
+            sequence: 1n,
+            payload: retained,
+          }));
+        });
         this.connections.push(connection);
         return connection;
       },
@@ -168,9 +184,12 @@ class FakeTerminalSystem {
         const observed = observation(input.agentSessionId, this.epochs.get(input.agentSessionId));
         const terminalSessionId = `00000000-0000-4000-8000-${String(this.generation).padStart(12, "0")}`;
         const token = `runa_tc_${"A".repeat(40)}${String(this.generation).padStart(3, "0")}`;
+        const resumeHandle = this.generation === 1
+          ? "66666666-6666-4666-8666-666666666666"
+          : `66666666-6666-4666-8666-${String(this.generation).padStart(12, "0")}`;
         const grant = {
           terminalSessionId,
-          resumeHandle: "66666666-6666-4666-8666-666666666666",
+          resumeHandle,
           connectUrl: `wss://api.getcuna.com/v1/terminal-connections/${terminalSessionId}/stream`,
           connectToken: token,
           protocol: TERMINAL_PROTOCOL,
@@ -368,6 +387,35 @@ test("runtime multiplexes AgentSessions without cross-routing input and preserve
   await runtime.shutdown();
 });
 
+test("a new attachment requests retained PTY output before the user provides input", async () => {
+  const system = new FakeTerminalSystem();
+  system.retainedOutputOnResume.set("agent-a", new TextEncoder().encode("retained Claude screen"));
+  const { runtime, outputs } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+
+  const resumeWire = system.connections[0].sent.find(
+    (bytes) => decodeTerminalFrame(bytes)?.type === "resume",
+  );
+  assert.ok(resumeWire, "initial attach must request the supervisor replay buffer");
+  const resume = decodeTerminalControl(decodeTerminalFrame(resumeWire));
+  assert.equal(resume.resumeHandle, "66666666-6666-4666-8666-666666666666");
+  assert.equal(resume.afterOutputSequence, "0");
+  const initialResize = system.connections[0].sent
+    .map(decodeTerminalFrame)
+    .find((frame) => frame?.type === "resize");
+  assert.deepEqual(decodeTerminalControl(initialResize), { columns: 80, rows: 24 });
+  assert.equal(
+    system.connections[0].sent.some((bytes) => decodeTerminalFrame(bytes)?.type === "input"),
+    false,
+  );
+
+  await waitUntil(
+    () => outputs.some((item) => new TextDecoder().decode(item.bytes) === "retained Claude screen"),
+    "retained output should reach the terminal without synthetic keyboard input",
+  );
+  await runtime.shutdown();
+});
+
 test("TC-055-17 input acknowledgement tracks only input frames and exposes unacknowledged delivery as uncertain", async () => {
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);
@@ -376,13 +424,13 @@ test("TC-055-17 input acknowledgement tracks only input frames and exposes unack
   await runtime.sendInput(new TextEncoder().encode("first"), "tab-a");
   await runtime.resize(81, 24, "tab-a");
   await runtime.sendInput(new TextEncoder().encode("second"), "tab-a");
-  assert.equal(runtime.listTerminals()[0].inputSequence, 3n);
+  assert.equal(runtime.listTerminals()[0].inputSequence, 5n);
   assert.equal(runtime.listTerminals()[0].inputContinuity, "uncertain");
   system.connections[0].incoming.push(encodeTerminalControl("acknowledgement", 2n, {
-    clientSequence: "3",
+    clientSequence: "5",
     meaning: "durably_accepted_not_executed",
   }));
-  await waitUntil(() => runtime.listTerminals()[0]?.acknowledgedInputSequence === 3n, "input ACK should commit the cumulative input cursor");
+  await waitUntil(() => runtime.listTerminals()[0]?.acknowledgedInputSequence === 5n, "input ACK should commit the cumulative input cursor");
   assert.equal(runtime.listTerminals()[0].inputContinuity, "complete");
   await runtime.shutdown();
 
@@ -392,7 +440,7 @@ test("TC-055-17 input acknowledgement tracks only input frames and exposes unack
   await invalidRuntime.sendInput(new TextEncoder().encode("first"), "tab-a");
   await invalidRuntime.resize(81, 24, "tab-a");
   invalidSystem.connections[0].incoming.push(encodeTerminalControl("acknowledgement", 2n, {
-    clientSequence: "2",
+    clientSequence: "4",
     meaning: "durably_accepted_not_executed",
   }));
   await waitUntil(() => invalidRuntime.listTerminals()[0]?.state === "failed", "a control-frame sequence cannot impersonate an input ACK");
@@ -700,6 +748,34 @@ test("heartbeat expiry fences input while a fresh heartbeat extends the attachme
   await runtime.shutdown();
 });
 
+test("an idle CLI emits the client heartbeat the gateway requires and accepts its echo", async () => {
+  const system = new FakeTerminalSystem();
+  let now = NOW;
+  const { runtime } = createRuntime(system, {
+    clock: () => now,
+    heartbeatTimeoutMs: 1_000,
+  });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await waitUntil(
+    () => system.connections[0].sent.some((bytes) => decodeTerminalFrame(bytes)?.type === "heartbeat"),
+    "an idle attachment should send a heartbeat before the gateway deadline",
+  );
+  const heartbeatWire = system.connections[0].sent.find(
+    (bytes) => decodeTerminalFrame(bytes)?.type === "heartbeat",
+  );
+  assert.ok(heartbeatWire);
+  const heartbeat = decodeTerminalFrame(heartbeatWire);
+  assert.equal(heartbeat.type, "heartbeat");
+  now += 300;
+  system.connections[0].incoming.push(heartbeatWire);
+  await waitUntil(
+    () => runtime.listTerminals()[0]?.heartbeatObservedAt === now,
+    "the supervisor heartbeat echo should renew local attachment evidence",
+  );
+  assert.equal(runtime.listTerminals()[0].state, "active");
+  await runtime.shutdown();
+});
+
 test("heartbeat watchdog interrupts an idle dead terminal without waiting for user input", async () => {
   const system = new FakeTerminalSystem();
   let now = NOW;
@@ -768,8 +844,8 @@ test("concurrent terminal input, resize, and signal writes remain serialized and
 
   const frames = connection.sent.map(decodeTerminalFrame);
   assert.equal(peakInFlight, 1);
-  assert.deepEqual(frames.map((frame) => frame.sequence), [1n, 2n, 3n]);
-  assert.deepEqual(frames.map((frame) => frame.type), ["input", "resize", "signal"]);
+  assert.deepEqual(frames.map((frame) => frame.sequence), [1n, 2n, 3n, 4n, 5n]);
+  assert.deepEqual(frames.map((frame) => frame.type), ["resize", "resume", "input", "resize", "signal"]);
   await runtime.shutdown();
 });
 
@@ -957,9 +1033,21 @@ test("runtime reconnect obtains a fresh grant, preserves process epoch, and neve
   assert.equal(reconnected.state, "active");
   assert.equal(reconnected.outputContinuity, "unknown", "continuity remains unknown until producer resume evidence arrives");
   assert.equal(system.createCalls.length, 2);
-  assert.equal(system.createCalls[1].resumeHandle, "66666666-6666-4666-8666-666666666666");
+  assert.equal(system.createCalls[1].resumeHandle, undefined, "a replacement grant must mint a fresh grant-scoped handle");
   assert.notEqual(system.connections[0].connectionId, system.connections[1].connectionId);
   assert.equal(system.connectCalls.length, 2);
+  const reconnectHandshake = system.connections[1].sent.map(decodeTerminalFrame);
+  assert.deepEqual(
+    reconnectHandshake.slice(0, 2).map((frame) => frame.type),
+    ["resize", "resume"],
+    "reconnect must restore PTY geometry before requesting retained output",
+  );
+  assert.deepEqual(decodeTerminalControl(reconnectHandshake[0]), { columns: 80, rows: 24 });
+  assert.equal(
+    decodeTerminalControl(reconnectHandshake[1]).resumeHandle,
+    "66666666-6666-4666-8666-000000000002",
+    "resume must use the replacement grant's handle",
+  );
   await runtime.shutdown();
 });
 
@@ -1133,10 +1221,10 @@ test("a transient reconnect handshake timeout preserves the old view authority f
   assert.notEqual(retried.viewId, attached.viewId);
   assert.equal(retried.outputContinuity, "unknown");
   assert.equal(system.createCalls.length, 3);
-  assert.equal(
+  assert.notEqual(
     system.createCalls[1].idempotencyKey,
     system.createCalls[2].idempotencyKey,
-    "an ambiguous reconnect retry must preserve one logical mutation identity",
+    "a consumed replacement grant cannot be retried with its old mutation identity",
   );
   await runtime.shutdown();
 });
@@ -1246,7 +1334,7 @@ test("API terminal control plane derives fresh public observation and sends only
   }]);
 });
 
-test("API terminal control plane never fabricates missing or invalid supervisor lease expiry", async () => {
+test("API terminal control plane preserves structural identity but does not preempt backend attach authority", async () => {
   const base = {
     id: "agent-a",
     machineId: "22222222-2222-4222-8222-222222222222",
@@ -1256,19 +1344,12 @@ test("API terminal control plane never fabricates missing or invalid supervisor 
     runtimeExpiresAt: new Date(NOW + 30_000).toISOString(),
     rowVersion: 7,
   };
-  const invalid = [
+  const missingIdentity = [
+    { ...base, processEpoch: undefined },
+    { ...base, runtimeObservedAt: undefined },
     { ...base, runtimeExpiresAt: undefined },
-    { ...base, runtimeExpiresAt: new Date(NOW).toISOString() },
-    { ...base, runtimeExpiresAt: new Date(NOW - 2_000).toISOString() },
-    { ...base, runtimeExpiresAt: new Date(NOW + 60_000).toISOString() },
-    {
-      ...base,
-      runtimeObservedAt: new Date(NOW + 6_000).toISOString(),
-      runtimeExpiresAt: new Date(NOW + 7_000).toISOString(),
-    },
-    { ...base, runtimeExpiresAt: "not-a-date" },
   ];
-  for (const session of invalid) {
+  for (const session of missingIdentity) {
     const controlPlane = createApiTerminalControlPlane({
       clock: () => NOW,
       client: {
@@ -1283,6 +1364,48 @@ test("API terminal control plane never fabricates missing or invalid supervisor 
       (error) => error instanceof RuntimeBoundaryError && error.code === "remote_state_unproven",
     );
   }
+
+  const expired = {
+    ...base,
+    runtimeObservedAt: new Date(NOW - 60_000).toISOString(),
+    runtimeExpiresAt: new Date(NOW - 30_000).toISOString(),
+  };
+  const controlPlane = createApiTerminalControlPlane({
+    clock: () => NOW,
+    client: {
+      async getIdentity() {
+        return { id: "11111111-1111-4111-8111-111111111111", workspaceAssigned: true };
+      },
+      async getAgentSession() { return expired; },
+    },
+  });
+  const evidence = await controlPlane.observeAgentSession("agent-a");
+  assert.equal(evidence.observedAt, expired.runtimeObservedAt);
+  assert.equal(evidence.expiresAt, expired.runtimeExpiresAt);
+});
+
+test("API terminal control plane accepts a backend-current lease renewed after an older observation", async () => {
+  const session = {
+    id: "agent-a",
+    machineId: "22222222-2222-4222-8222-222222222222",
+    processState: "running",
+    processEpoch: "33333333-3333-4333-8333-333333333333",
+    runtimeObservedAt: new Date(NOW - 20 * 60_000).toISOString(),
+    runtimeExpiresAt: new Date(NOW + 30_000).toISOString(),
+    rowVersion: 9,
+  };
+  const controlPlane = createApiTerminalControlPlane({
+    clock: () => NOW,
+    client: {
+      async getIdentity() {
+        return { id: "11111111-1111-4111-8111-111111111111", workspaceAssigned: true };
+      },
+      async getAgentSession() { return session; },
+    },
+  });
+  const evidence = await controlPlane.observeAgentSession("agent-a");
+  assert.equal(evidence.observedAt, session.runtimeObservedAt);
+  assert.equal(evidence.expiresAt, session.runtimeExpiresAt);
 });
 
 test("PTY adapter is usable only with current platform-bound live evidence", async () => {

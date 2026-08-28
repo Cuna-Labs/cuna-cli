@@ -15,10 +15,7 @@ import type {
 } from "../api/contracts.js";
 import type { EffectiveConfig } from "../config/config.js";
 import { DEFAULT_BASE_URL, environmentCredentialState, publicConfig } from "../config/config.js";
-import {
-  assertOpenCodeExecutionEnabled,
-  resolveOpenCodeFeatureGate,
-} from "../config/opencode-feature-gate.js";
+import { assertOpenCodeExecutionEnabled } from "../config/opencode-feature-gate.js";
 import { EXIT_CODES, CunaError, unsupportedError, usageError, type SafeErrorDetails } from "../core/errors.js";
 import {
   REMOTE_CONVERGENCE_BUDGET_MS,
@@ -35,10 +32,15 @@ import {
   integerArgument,
 } from "../core/validation.js";
 import { preflightAgentJourneyInvocation } from "../journey/intent.js";
+import { listAllMachines } from "../machines/pagination.js";
+import { machineProviderAvailability, machineSupportsProvider, providerDisplayName } from "../machines/provider-availability.js";
+import { classifySessionActionability, displaySessionActionability } from "../machines/session-actionability.js";
+import { isAgentSessionIntendedActive } from "../machines/session-visibility.js";
 import { INITIAL_RUNTIME_GATES, type RuntimeFeatureGate } from "../runtime/contracts.js";
 import { evaluateRuntimeSupport } from "../platform/support.js";
 import { CLI_VERSION } from "../version.js";
 import {
+  assertRegisteredCliRoute,
   booleanOption,
   rejectUnknownOptions,
   stringOption,
@@ -73,6 +75,8 @@ export interface CommandContext {
   readonly config: EffectiveConfig;
   readonly client: CunaApiClient;
   readonly now: number;
+  /** Sampled by capability admission only after its HTTP response arrives. */
+  readonly capabilityClock?: () => number;
   /** Test seam; production uses the real wall-clock wait below. */
   readonly convergencePoller?: ConvergencePoller;
   readonly credentialMode?: "automation" | "interactive";
@@ -175,14 +179,13 @@ function agentOption(parsed: ParsedInvocation, required: boolean): AgentKind | u
     if (required) throw usageError("Option --agent is required.");
     return undefined;
   }
-  if (raw !== "claude-code" && raw !== "codex" && raw !== "openclaw" && raw !== "opencode") {
-    throw usageError("Option --agent must be claude-code, codex, openclaw, or opencode.");
+  if (raw !== "claude-code" && raw !== "codex" && raw !== "opencode") {
+    throw usageError("Option --agent must be claude-code, codex, or opencode.");
   }
   return raw;
 }
 
 function normalizedAgentSessionAuthMode(
-  agent: AgentKind,
   rawAuthMode: string | undefined,
   credentialBinding: string | undefined,
 ): AgentAuthMode | undefined {
@@ -195,14 +198,6 @@ function normalizedAgentSessionAuthMode(
     throw usageError("Option --auth-mode must be interactive_login or credential_binding.");
   }
 
-  if (agent === "opencode") {
-    if (authMode === "credential_binding" || credentialBinding !== undefined) {
-      throw usageError("OpenCode AgentSessions support interactive_login only.");
-    }
-    // The flag is optional for ergonomics, but the wire intent is never
-    // optional: OpenCode has no server-default authentication mode.
-    return "interactive_login";
-  }
   if (authMode === "credential_binding" && credentialBinding === undefined) {
     throw usageError("Option --credential-binding is required for credential_binding auth mode.");
   }
@@ -279,6 +274,7 @@ function idempotencyKey(parsed: ParsedInvocation): string {
 }
 
 function machineRecord(machine: Machine): Readonly<Record<string, unknown>> {
+  const provider = machineProviderAvailability(machine);
   return Object.freeze({
     id: machine.id,
     name: machine.name,
@@ -288,10 +284,21 @@ function machineRecord(machine: Machine): Readonly<Record<string, unknown>> {
     ...(machine.memoryMiB === undefined ? {} : { memory_mib: machine.memoryMiB }),
     ...(machine.createdAt === undefined ? {} : { created_at: machine.createdAt }),
     ...(machine.updatedAt === undefined ? {} : { updated_at: machine.updatedAt }),
+    provider_availability: Object.freeze({
+      ...(provider.declaredId === undefined ? {} : { declared_id: provider.declaredId }),
+      display_name: provider.displayName,
+      usability: provider.usability,
+      actionable: provider.actionable,
+      ...(provider.reasonCode === undefined ? {} : { reason_code: provider.reasonCode }),
+      ...(provider.observationVersion === undefined ? {} : { observation_version: provider.observationVersion }),
+    }),
   });
 }
 
-function agentSessionRecord(session: AgentSession): Readonly<Record<string, unknown>> {
+function agentSessionRecord(session: AgentSession, machine?: Machine, now?: number): Readonly<Record<string, unknown>> {
+  const actionability = machine === undefined || now === undefined
+    ? undefined
+    : classifySessionActionability({ session, machine, now });
   return Object.freeze({
     id: session.id,
     machine_id: session.machineId,
@@ -317,7 +324,94 @@ function agentSessionRecord(session: AgentSession): Readonly<Record<string, unkn
     row_version: session.rowVersion,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
+    ...(actionability === undefined ? {} : {
+      base_state: actionability.baseState,
+      refresh_status: actionability.refreshStatus,
+      can_attach: actionability.canAttach,
+      recovery_action: actionability.recoveryAction,
+      reason_code: actionability.reasonCode,
+      observation_revision: actionability.observationRevision,
+    }),
   });
+}
+
+function agentDisplayName(agent: AgentKind): string {
+  return providerDisplayName(agent);
+}
+
+function machineSessionCounts(machine: Machine, sessions: readonly AgentSession[], now: number): Readonly<Record<string, unknown>> {
+  const count = (agent: AgentKind): Readonly<Record<string, number>> => {
+    const matching = sessions.filter((session) => session.agent === agent);
+    return Object.freeze({
+      running: matching.filter((session) => session.processState === "running" &&
+        classifySessionActionability({ session, machine, now }).canAttach).length,
+      total: matching.length,
+    });
+  };
+  return Object.freeze({
+    claude: count("claude-code"),
+    codex: count("codex"),
+    opencode: count("opencode"),
+  });
+}
+
+async function listAllMachineAgentSessions(
+  client: CunaApiClient,
+  machineId: string,
+): Promise<readonly AgentSession[]> {
+  const items: AgentSession[] = [];
+  const cursors = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await client.listAgentSessions(machineId, {
+      limit: 100,
+      ...(cursor === undefined ? {} : { cursor }),
+    });
+    items.push(...page.items);
+    cursor = page.nextCursor;
+    if (cursor !== undefined && cursors.has(cursor)) {
+      throw new Error("AgentSession pagination repeated a cursor.");
+    }
+    if (cursor !== undefined) cursors.add(cursor);
+  } while (cursor !== undefined);
+  return Object.freeze(items);
+}
+
+interface MachineOverviewRow {
+  readonly machine: Machine;
+  readonly sessions: readonly AgentSession[];
+  readonly sessionsError?: "sessions_unavailable";
+}
+
+function renderMachineOverview(
+  items: readonly MachineOverviewRow[],
+  now: number,
+  opencodePreferred: boolean,
+): string {
+  if (items.length === 0) return "No machines found.";
+  return items.flatMap(({ machine, sessions, sessionsError }) => {
+    const counts = machineSessionCounts(machine, sessions, now) as {
+      readonly claude: { readonly running: number; readonly total: number };
+      readonly codex: { readonly running: number; readonly total: number };
+      readonly opencode: { readonly running: number; readonly total: number };
+    };
+    const provider = machineProviderAvailability(machine);
+    const claude = `Claude ${counts.claude.running}/${counts.claude.total} running`;
+    const codex = `Codex ${counts.codex.running}/${counts.codex.total} running`;
+    const opencode = `OpenCode ${counts.opencode.running}/${counts.opencode.total} running`;
+    const providerCounts = opencodePreferred ? `${opencode} · ${claude} · ${codex}` : `${claude} · ${codex} · ${opencode}`;
+    const header = `▾ ${machine.name}  ${machine.state}  ${provider.displayName} ${provider.usability}  ${providerCounts}`;
+    if (sessionsError !== undefined) return [header, "  └─ AgentSessions unavailable"];
+    if (sessions.length === 0) return [header, "  └─ No AgentSessions"];
+    return [
+      header,
+      ...sessions.map((session, index) => {
+        const branch = index === sessions.length - 1 ? "└─" : "├─";
+        const actionability = classifySessionActionability({ session, machine, now });
+        return `  ${branch} ${agentDisplayName(session.agent)}  ${session.name}  ${displaySessionActionability(actionability)}  ${session.id}`;
+      }),
+    ];
+  }).join("\n");
 }
 
 function capabilityRecord(snapshot: CapabilitySnapshot): Readonly<Record<string, unknown>> {
@@ -342,8 +436,8 @@ function capabilityRecord(snapshot: CapabilitySnapshot): Readonly<Record<string,
 
 export function preflightInvocation(
   parsed: ParsedInvocation,
-  environment: Readonly<Record<string, string | undefined>> = process.env,
 ): void {
+  assertRegisteredCliRoute(parsed);
   switch (parsed.command) {
     case "config":
       rejectUnknownOptions(parsed, []);
@@ -366,7 +460,7 @@ export function preflightInvocation(
       return;
     }
     case "machines":
-      preflightMachines(parsed, environment);
+      preflightMachines(parsed);
       return;
     case "records":
       rejectUnknownOptions(parsed, []);
@@ -420,7 +514,7 @@ export function preflightInvocation(
       throw usageError(`Unknown api-keys action ${action}.`);
     }
     case "agent-sessions":
-      preflightAgentSessions(parsed, environment);
+      preflightAgentSessions(parsed);
       return;
     case "agent": {
       rejectUnknownOptions(parsed, ["agent-session", "yes"]);
@@ -452,12 +546,8 @@ export function preflightInvocation(
       return;
     case "claude":
     case "codex":
-    case "openclaw":
     case "opencode": {
-      const intent = preflightAgentJourneyInvocation(parsed);
-      if (intent.agent === "opencode") {
-        assertOpenCodeExecutionEnabled(resolveOpenCodeFeatureGate(environment));
-      }
+      preflightAgentJourneyInvocation(parsed);
       return;
     }
     case "shell":
@@ -500,10 +590,11 @@ export function preflightInvocation(
   }
 }
 
-function preflightMachines(
-  parsed: ParsedInvocation,
-  environment: Readonly<Record<string, string | undefined>>,
-): void {
+function preflightMachines(parsed: ParsedInvocation): void {
+  if (parsed.operands.length === 0) {
+    rejectUnknownOptions(parsed, []);
+    return;
+  }
   const action = requireOperand(parsed.operands, 0, "machines action");
   if (action === "list") {
     rejectUnknownOptions(parsed, []);
@@ -519,12 +610,9 @@ function preflightMachines(
     if (rawName === undefined) throw usageError("Option --name is required.");
     const name = assertSafeDisplayText(rawName, "machine name");
     if (name.length < 1 || name.length > 80) throw usageError("Option --name must contain 1 through 80 characters.");
-    const agent = agentOption(parsed, false);
+    agentOption(parsed, false);
     integerOption(parsed, "vcpus", 1, 8);
     integerOption(parsed, "memory-mib", 512, 16_384);
-    if (agent === "opencode") {
-      assertOpenCodeExecutionEnabled(resolveOpenCodeFeatureGate(environment));
-    }
     return;
   }
   if (action === "start" || action === "pause" || action === "resume" || action === "stop" || action === "delete") {
@@ -537,10 +625,7 @@ function preflightMachines(
   throw usageError(`Unknown machines action ${action}.`);
 }
 
-function preflightAgentSessions(
-  parsed: ParsedInvocation,
-  environment: Readonly<Record<string, string | undefined>>,
-): void {
+function preflightAgentSessions(parsed: ParsedInvocation): void {
   const action = requireOperand(parsed.operands, 0, "agent-sessions action");
   if (action === "list") {
     rejectUnknownOptions(parsed, ["machine", "limit", "cursor"]);
@@ -585,12 +670,16 @@ function preflightAgentSessions(
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
     const binding = stringOption(parsed, "credential-binding");
-    normalizedAgentSessionAuthMode(agent, stringOption(parsed, "auth-mode"), binding);
+    const rawAuthMode = stringOption(parsed, "auth-mode");
+    if (agent === "opencode" && (rawAuthMode === "credential_binding" || binding !== undefined)) {
+      throw usageError(
+        "OpenCode supports interactive_login only; credential bindings are not accepted.",
+        "Use OpenCode's interactive provider flow and omit --credential-binding.",
+      );
+    }
+    normalizedAgentSessionAuthMode(rawAuthMode, binding);
     if (binding !== undefined) assertPublicId(binding, "credential binding ID");
     idempotencyKey(parsed);
-    if (agent === "opencode") {
-      assertOpenCodeExecutionEnabled(resolveOpenCodeFeatureGate(environment));
-    }
     return;
   }
   if (action === "terminate" || action === "rename") {
@@ -657,7 +746,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         client,
         scope: "account",
         capabilityId: "records.list",
-        now: context.now,
+        now: context.capabilityClock ?? context.now,
         allowedInteractions: ["read_only"],
       });
       const records = await client.listRecords();
@@ -687,7 +776,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         scope: "machine",
         resourceId: machineId,
         capabilityId: "authorizations.list",
-        now: context.now,
+        now: context.capabilityClock ?? context.now,
         allowedInteractions: ["read_only"],
       });
       const rules = await client.listAuthorizations(machineId);
@@ -766,7 +855,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
           hint: "Unset the automation credential, run `cuna login`, then repeat this command.",
         });
       }
-      await requireCapability({ client, scope: "account", capabilityId: "api_keys.manage", now: context.now });
+      await requireCapability({ client, scope: "account", capabilityId: "api_keys.manage", now: context.capabilityClock ?? context.now });
       if (action === "list") {
         const keys = await client.listApiKeys();
         const data = Object.freeze({
@@ -925,7 +1014,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         scope: "agent_session",
         resourceId: id,
         capabilityId: "agent_sessions.auth_logout",
-        now: context.now,
+        now: context.capabilityClock ?? context.now,
       });
       const receipt = await client.logoutAgentSessionAuth(id, session.processEpoch);
       if (
@@ -989,7 +1078,6 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       throw unsupportedError("browser authentication", "browser_auth_dispatch_unavailable");
     case "claude":
     case "codex":
-    case "openclaw":
     case "opencode":
     case "connect":
       // Public process dispatch is owned by runCli, which composes exact attach
@@ -1080,7 +1168,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       if (!ok) {
         throw new CunaError({
           code: "cuna.self_test.failed",
-      hint: `The installed CLI does not match its own build record. Reinstall with \`npm install -g @cuna_labs/cli\`, and report it at ${SUPPORT_URL} if it recurs.`,
+      hint: `The installed CLI does not match its own build record. Reinstall the local Cuna .tgz package, and report it at ${SUPPORT_URL} if it recurs.`,
           message: "The installed Cuna CLI failed an offline integrity check.",
           exitCode: EXIT_CODES.internal,
           details: {
@@ -1136,7 +1224,39 @@ async function verifyVirtualTerminalInterop(): Promise<boolean> {
 async function executeMachines(context: CommandContext): Promise<CommandResult> {
   const { parsed, client, now } = context;
   requireCredential(context);
-  const action = requireOperand(parsed.operands, 0, "machines action");
+  const action = parsed.operands[0] ?? "overview";
+  if (action === "overview") {
+    rejectUnknownOptions(parsed, []);
+    const machines = await listAllMachines(client);
+    const overview = await Promise.all(machines.map(async (machine): Promise<MachineOverviewRow> => {
+      try {
+        const sessions = (await listAllMachineAgentSessions(client, machine.id))
+          .filter(isAgentSessionIntendedActive)
+          .slice()
+          .sort((left, right) => left.agent.localeCompare(right.agent) || left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+        return Object.freeze({ machine, sessions: Object.freeze(sessions) });
+      } catch {
+        return Object.freeze({
+          machine,
+          sessions: Object.freeze([]),
+          sessionsError: "sessions_unavailable" as const,
+        });
+      }
+    }));
+    overview.sort((left, right) => left.machine.name.localeCompare(right.machine.name) || left.machine.id.localeCompare(right.machine.id));
+    return Object.freeze({
+      command: "machines.overview",
+      data: Object.freeze({
+        items: Object.freeze(overview.map(({ machine, sessions, sessionsError }) => Object.freeze({
+          ...machineRecord(machine),
+          session_counts: machineSessionCounts(machine, sessions, now),
+          agent_sessions: Object.freeze(sessions.map((session) => agentSessionRecord(session, machine, now))),
+          ...(sessionsError === undefined ? {} : { agent_sessions_error: sessionsError }),
+        }))),
+      }),
+      human: renderMachineOverview(overview, now, context.config.opencodeFeatureGate.state === "enabled"),
+    });
+  }
   if (action === "list") {
     rejectUnknownOptions(parsed, []);
     if (parsed.operands.length !== 1) throw usageError("machines list accepts no operands.");
@@ -1162,12 +1282,10 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
     const agent = agentOption(parsed, false);
+    if (agent === "opencode") assertOpenCodeExecutionEnabled(context.config.opencodeFeatureGate);
     const vcpus = integerOption(parsed, "vcpus", 1, 8);
     const memoryMiB = integerOption(parsed, "memory-mib", 512, 16_384);
-    if (agent === "opencode") {
-      assertOpenCodeExecutionEnabled(context.config.opencodeFeatureGate);
-    }
-    await requireCapability({ client, scope: "account", capabilityId: "machines.create", now });
+    await requireCapability({ client, scope: "account", capabilityId: "machines.create", now: context.capabilityClock ?? now });
     const input: MachineCreateInput = {
       name,
       ...(agent === undefined ? {} : { agent }),
@@ -1204,7 +1322,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     // lifecycle transitions under one semantic authority. The operation path
     // still binds the exact action; discovery must not invent per-action IDs
     // that the producer never advertises.
-    await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.lifecycle", now });
+    await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.lifecycle", now: context.capabilityClock ?? now });
     const machine = await client.transitionMachine(id, action);
     if (machine.id !== id) {
       // An identity contradiction: the producer answered about a different
@@ -1242,7 +1360,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     if (parsed.operands.length !== 2) throw usageError("machines delete requires exactly one machine ID.");
     requireConfirmation(parsed, "machines.delete");
     const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
-    await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.delete", now });
+    await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.delete", now: context.capabilityClock ?? now });
     await client.deleteMachine(id);
     // MEASURED 2026-08-19: the immediate read that used to stand here saw
     // `present` and the command reported `cuna.remote.postcondition_unverified`,
@@ -1291,7 +1409,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
       ...(limit === undefined ? {} : { limit }),
       ...(cursor === undefined ? {} : { cursor }),
     });
-    const items = page.items.map(agentSessionRecord);
+    const items = page.items.map((session) => agentSessionRecord(session));
     return Object.freeze({
       command: "agent-sessions.list",
       data: { items, ...(page.nextCursor === undefined ? {} : { next_cursor: page.nextCursor }) },
@@ -1330,6 +1448,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     }
     const agent = agentOption(parsed, true);
     if (agent === undefined) throw usageError("Option --agent is required.");
+    if (agent === "opencode") assertOpenCodeExecutionEnabled(context.config.opencodeFeatureGate);
     const cwd = assertSafeDisplayText(stringOption(parsed, "cwd") ?? "/workspace", "workspace path");
     if (!cwd.startsWith("/workspace") || cwd.split("/").includes("..") || cwd.length > 1024) {
       throw usageError("Option --cwd must be a safe absolute path inside /workspace.");
@@ -1340,15 +1459,34 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
     const credentialBinding = stringOption(parsed, "credential-binding");
-    const authMode = normalizedAgentSessionAuthMode(
-      agent,
-      stringOption(parsed, "auth-mode"),
-      credentialBinding,
-    );
-    if (agent === "opencode") {
-      assertOpenCodeExecutionEnabled(context.config.opencodeFeatureGate);
+    const rawAuthMode = stringOption(parsed, "auth-mode");
+    if (
+      agent === "opencode" &&
+      (rawAuthMode === "credential_binding" || credentialBinding !== undefined)
+    ) {
+      throw usageError(
+        "OpenCode supports interactive_login only; credential bindings are not accepted.",
+        "Use OpenCode's interactive provider flow and omit --credential-binding.",
+      );
     }
-    await requireCapability({ client, scope: "machine", resourceId: machineId, capabilityId: "agent_sessions.create", now });
+    const requestedAuthMode = normalizedAgentSessionAuthMode(rawAuthMode, credentialBinding);
+    const authMode = agent === "opencode" ? "interactive_login" : requestedAuthMode;
+    const machine = await client.getMachine(machineId);
+    if (!machineSupportsProvider(machine, agent)) {
+      const installed = machineProviderAvailability(machine);
+      throw new CunaError({
+        code: "cuna.agent.provider_not_installed",
+        message: `${providerDisplayName(agent)} is unavailable on machine ${machine.name}. Declared installed provider: ${installed.displayName}.`,
+        exitCode: EXIT_CODES.unsupported,
+        hint: `Choose a machine whose installed provider is ${providerDisplayName(agent)}, or create one with \`cuna machines create --agent ${agent} ...\`.`,
+        details: {
+          machine_id: machine.id,
+          requested_provider: agent,
+          installed_provider: installed.declaredId ?? "unknown",
+        },
+      });
+    }
+    await requireCapability({ client, scope: "machine", resourceId: machineId, capabilityId: "agent_sessions.create", now: context.capabilityClock ?? now });
     const session = await client.createAgentSession(machineId, {
       ...(name === undefined ? {} : { name }),
       agent,
@@ -1381,11 +1519,11 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     if (parsed.operands.length !== 2) throw usageError("agent-sessions terminate requires exactly one AgentSession ID.");
     requireConfirmation(parsed, "agent-sessions.terminate");
     const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
-    await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.terminate", now });
+    await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.terminate", now: context.capabilityClock ?? now });
     await client.terminateAgentSession(id);
     const observed = await convergeOnRemoteState(context, {
       operation: "AgentSession termination",
-      settleWith: `cuna agent-sessions show ${id}`,
+      settleWith: `cuna agent-sessions get ${id}`,
       probe: async () => {
         const session = await client.getAgentSession(id);
         return Object.freeze({
@@ -1412,7 +1550,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     if (name === undefined || name.length < 1 || name.length > 80) {
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
-    await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.rename", now });
+    await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.rename", now: context.capabilityClock ?? now });
     await client.renameAgentSession(id, name);
     const observed = await client.getAgentSession(id);
     if (observed.id !== id || observed.name !== name) {

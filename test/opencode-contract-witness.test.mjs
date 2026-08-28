@@ -42,12 +42,13 @@ test("compiled OpenCode witness is mechanically generated from the vendored iden
   const identityText = await readFile(new URL("../contracts/infra/cuna-api.openapi.identity.json", import.meta.url), "utf8");
   const sourceText = await readFile(new URL("../src/config/infra-contract-witness.ts", import.meta.url), "utf8");
   assert.equal(sourceText, renderInfraContractWitness(JSON.parse(identityText)));
-  assert.equal(INFRA_OPENAPI_CONTRACT_IDENTITY.producer_content_state, "working_tree_product_delta");
+  assert.equal(INFRA_OPENAPI_CONTRACT_IDENTITY.producer_content_state, "committed");
+  assert.equal(hasCommittedOpenCodeContractWitness(INFRA_OPENAPI_CONTRACT_IDENTITY), true);
 });
 
-test("OpenCode gate requires a tree-bound committed strict-contract witness in addition to exact env true", () => {
+test("OpenCode gate requires a tree-bound committed strict-contract witness and ignores local env claims", () => {
   for (const value of [undefined, "", "false", "TRUE", "1", " true", "true "]) {
-    assert.equal(resolveOpenCodeFeatureGate({ CUNA_OPENCODE_ENABLED: value }, committedWitness).state, "disabled");
+    assert.equal(resolveOpenCodeFeatureGate({ CUNA_OPENCODE_ENABLED: value }, committedWitness).state, "enabled");
   }
 
   for (const invalid of [
@@ -72,18 +73,16 @@ test("OpenCode gate requires a tree-bound committed strict-contract witness in a
   assert.equal(hasCommittedOpenCodeContractWitness(committedWitness), true);
   assert.deepEqual(resolveOpenCodeFeatureGate({ CUNA_OPENCODE_ENABLED: "true" }, committedWitness), {
     state: "enabled",
-    source: "environment",
-    variable: "CUNA_OPENCODE_ENABLED",
+    source: "compiled_contract",
     reason: "enabled",
   });
 });
 
-test("the current mutable producer identity cannot enable OpenCode even with exact env true", () => {
-  assert.equal(hasCommittedOpenCodeContractWitness(INFRA_OPENAPI_CONTRACT_IDENTITY), false);
+test("the current committed producer identity enables OpenCode without a mutable override", () => {
+  assert.equal(hasCommittedOpenCodeContractWitness(INFRA_OPENAPI_CONTRACT_IDENTITY), true);
   assert.deepEqual(resolveOpenCodeFeatureGate({ CUNA_OPENCODE_ENABLED: "true" }), {
-    state: "disabled",
-    source: "environment",
-    variable: "CUNA_OPENCODE_ENABLED",
-    reason: "immutable_contract_witness_required",
+    state: "enabled",
+    source: "compiled_contract",
+    reason: "enabled",
   });
 });

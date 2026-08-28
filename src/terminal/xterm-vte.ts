@@ -1,9 +1,17 @@
 import xtermHeadless from "@xterm/headless";
 
-import type { Terminal as XtermTerminal } from "@xterm/headless";
+import type { IBufferCell, Terminal as XtermTerminal } from "@xterm/headless";
 
 import { MAX_TERMINAL_FRAME_BYTES } from "./codec.js";
-import { MAX_VIEWPORT_CELLS, ViewportRegistry, type ViewportBinding, type ViewportSnapshot } from "./viewport.js";
+import {
+  MAX_VIEWPORT_CELLS,
+  ViewportRegistry,
+  type ViewportBinding,
+  type ViewportCellColor,
+  type ViewportCellStyle,
+  type ViewportRenderRun,
+  type ViewportSnapshot,
+} from "./viewport.js";
 
 const { Terminal } = xtermHeadless as unknown as { readonly Terminal: typeof XtermTerminal };
 export const DEFAULT_XTERM_SCROLLBACK = 1_000;
@@ -353,20 +361,44 @@ export class XtermViewportAdapter {
     const buffer = this.#terminal.buffer.active;
     const cells: string[] = [];
     const displayWidths: number[] = [];
+    const renderRows: ViewportRenderRun[][] = [];
     for (let row = 0; row < this.#terminal.rows; row += 1) {
       const line = buffer.getLine(buffer.viewportY + row);
-      cells.push(line?.translateToString(true) ?? "");
       let visibleWidth = 0;
       if (line !== undefined) {
         for (let column = 0; column < this.#terminal.cols; column += 1) {
           const cell = line.getCell(column);
           const characters = cell?.getChars() ?? "";
-          if (characters !== "" && characters !== " ") {
+          // An explicit space is content and may be the final glyph before a
+          // split UTF-8 sequence. Only untouched empty cells are invisible.
+          if (characters !== "" || cell?.isAttributeDefault() === false) {
             visibleWidth = column + Math.max(1, cell?.getWidth() ?? 1);
           }
         }
       }
+      // Bound the plain-text projection to the same authoritative terminal
+      // columns as the styled runs. `trimRight=true` would discard a real
+      // trailing space while a split UTF-8 sequence is pending, and would also
+      // erase background-only cells that are visually significant.
+      cells.push(line?.translateToString(false, 0, visibleWidth) ?? "");
       displayWidths.push(visibleWidth);
+      const runs: ViewportRenderRun[] = [];
+      if (line !== undefined) {
+        for (let column = 0; column < visibleWidth; column += 1) {
+          const cell = line.getCell(column);
+          const width = cell?.getWidth() ?? 1;
+          if (width === 0) continue;
+          const text = cell?.getChars() || " ";
+          const style = cell === undefined ? DEFAULT_CELL_STYLE : cellStyle(cell);
+          const previous = runs.at(-1);
+          if (previous !== undefined && sameCellStyle(previous.style, style)) {
+            runs[runs.length - 1] = { text: `${previous.text}${text}`, width: previous.width + width, style: previous.style };
+          } else {
+            runs.push({ text, width, style });
+          }
+        }
+      }
+      renderRows.push(runs);
     }
     const frame = {
       tabId: this.#tabId,
@@ -374,6 +406,7 @@ export class XtermViewportAdapter {
       outputSequence,
       replayCursor,
       cells,
+      renderRows,
       displayWidths,
       cursorX: buffer.cursorX,
       cursorY: buffer.cursorY,
@@ -392,6 +425,68 @@ export class XtermViewportAdapter {
   #assertOpen(): void {
     if (this.#disposed) throw new Error("The xterm viewport adapter is disposed.");
   }
+}
+
+const DEFAULT_CELL_STYLE: ViewportCellStyle = Object.freeze({
+  bold: false,
+  dim: false,
+  italic: false,
+  underline: false,
+  blink: false,
+  inverse: false,
+  invisible: false,
+  strikethrough: false,
+  overline: false,
+  foreground: null,
+  background: null,
+});
+
+function cellStyle(cell: IBufferCell | undefined): ViewportCellStyle {
+  if (cell === undefined || cell.isAttributeDefault()) return DEFAULT_CELL_STYLE;
+  return {
+    bold: cell.isBold() !== 0,
+    dim: cell.isDim() !== 0,
+    italic: cell.isItalic() !== 0,
+    underline: cell.isUnderline() !== 0,
+    blink: cell.isBlink() !== 0,
+    inverse: cell.isInverse() !== 0,
+    invisible: cell.isInvisible() !== 0,
+    strikethrough: cell.isStrikethrough() !== 0,
+    overline: cell.isOverline() !== 0,
+    foreground: cellColor(cell, "foreground"),
+    background: cellColor(cell, "background"),
+  };
+}
+
+function cellColor(
+  cell: IBufferCell,
+  layer: "foreground" | "background",
+): ViewportCellColor | null {
+  const rgb = layer === "foreground" ? cell.isFgRGB() : cell.isBgRGB();
+  const palette = layer === "foreground" ? cell.isFgPalette() : cell.isBgPalette();
+  if (!rgb && !palette) return null;
+  return {
+    mode: rgb ? "rgb" : "palette",
+    value: layer === "foreground" ? cell.getFgColor() : cell.getBgColor(),
+  };
+}
+
+function sameCellStyle(left: ViewportCellStyle, right: ViewportCellStyle): boolean {
+  return left.bold === right.bold &&
+    left.dim === right.dim &&
+    left.italic === right.italic &&
+    left.underline === right.underline &&
+    left.blink === right.blink &&
+    left.inverse === right.inverse &&
+    left.invisible === right.invisible &&
+    left.strikethrough === right.strikethrough &&
+    left.overline === right.overline &&
+    sameCellColor(left.foreground, right.foreground) &&
+    sameCellColor(left.background, right.background);
+}
+
+function sameCellColor(left: ViewportCellColor | null, right: ViewportCellColor | null): boolean {
+  return left === right || (left !== null && right !== null && left.mode === right.mode && left.value === right.value);
 }
 
 function assertBufferBudget(columns: number, rows: number, scrollback: number): void {

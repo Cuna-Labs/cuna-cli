@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import test from "node:test";
 
 import { orchestrateAgentJourney } from "../dist/journey/orchestrator.js";
@@ -79,6 +80,24 @@ test("automatic journey composes selection, sync, AgentSession creation and exac
     "inspect-workspace", "observe-machines", "ready-machine", "sync", "observe-sessions", "create-session", "ready-session", "attach",
   ]);
   assert.equal(fx.calls.find((call) => Array.isArray(call) && call[0] === "create-session")[1].machineId, MACHINE);
+});
+
+test("explicit relative workspace paths are resolved before workspace inspection", async () => {
+  let observedLocalPath;
+  const fx = effects({
+    async inspectWorkspace(input) {
+      fx.calls.push("inspect-workspace");
+      observedLocalPath = input.localPath;
+      return { canonicalLocalRoot: resolve("project") };
+    },
+  });
+  await orchestrateAgentJourney({
+    intent: intent({ localPath: "project" }),
+    effects: fx,
+    scope: SCOPE,
+    idempotencyKey: "cuna-journey-relative-path",
+  });
+  assert.equal(observedLocalPath, resolve("project"));
 });
 
 test("ambiguous machine authority performs no mutation", async () => {

@@ -2,6 +2,7 @@ import type { AgentSession, Machine } from "../api/contracts.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import { isObservationBudgetCode } from "../core/observation-budget.js";
+import { machineProviderAvailability } from "../machines/provider-availability.js";
 import type { MachineSelectionState } from "./selection.js";
 import type {
   AgentJourneyEffects,
@@ -14,6 +15,8 @@ const CHILD_POLL_LIMIT = 90;
 
 export interface ApiAgentJourneyEffectsInput {
   readonly client: CunaApiClient;
+  /** The only provider executable this journey may select a machine for. */
+  readonly requestedAgent: "claude-code" | "codex" | "opencode";
   readonly inspectWorkspace: AgentJourneyEffects["inspectWorkspace"];
   readonly synchronizeWorkspace: AgentJourneyEffects["synchronizeWorkspace"];
   readonly attach: AgentJourneyEffects["attach"];
@@ -89,6 +92,24 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       }
       return Promise.all(page.items.map(async (machine) => {
         let support: "supported" | "unsupported" | "unknown" = "unknown";
+        const provider = machineProviderAvailability(machine);
+        if (!provider.actionable || provider.agent !== input.requestedAgent) {
+          return Object.freeze({
+            id: machine.id,
+            name: machine.name,
+            agent: provider.agent ?? "unknown" as const,
+            requestedAgentSupport: "unsupported" as const,
+            state: machineState(machine.state),
+            ownership: "owned" as const,
+            freshness: "fresh" as const,
+            recency: recency(machine, now()),
+            resources: Object.freeze({
+              ...(machine.vcpus === undefined ? {} : { vcpus: machine.vcpus }),
+              ...(machine.memoryMiB === undefined ? {} : { memoryMiB: machine.memoryMiB }),
+            }),
+            costStatus: "unknown" as const,
+          });
+        }
         try {
           const snapshot = await input.client.discoverCapabilities("machine", machine.id, signal);
           if (snapshot.subjectScope !== "machine" || snapshot.subjectId !== machine.id) {
@@ -117,9 +138,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         return Object.freeze({
           id: machine.id,
           name: machine.name,
-          agent: machine.agent === "claude-code" || machine.agent === "codex" || machine.agent === "openclaw" || machine.agent === "opencode"
-            ? machine.agent
-            : "unknown" as const,
+          agent: provider.agent ?? "unknown" as const,
           requestedAgentSupport: support,
           state: machineState(machine.state),
           ownership: "owned" as const,
@@ -134,7 +153,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       }));
     },
     async createMachine({ requestedAgent, idempotencyKey, requestId, signal }) {
-      await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create", now: now(), signal });
+      await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create", now, signal });
       if (!await input.authorizeMachineCreate({ requestedAgent, signal })) {
         throw fail(
           "cuna.journey.machine_create_not_authorized",
@@ -200,7 +219,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         scope: "machine",
         resourceId: machineId,
         capabilityId: "agent_sessions.create",
-        now: now(),
+        now,
         signal,
       });
       const createInput = {

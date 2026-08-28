@@ -224,6 +224,7 @@ function journey(client, attached) {
     scope: { userId: USER, workspaceId: WORKSPACE },
     effects: createApiAgentJourneyEffects({
       client,
+      requestedAgent: "claude-code",
       async inspectWorkspace() { return { canonicalLocalRoot: ROOT }; },
       async synchronizeWorkspace() {
         return {

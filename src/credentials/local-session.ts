@@ -290,6 +290,10 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
     return await this.#withProcessLock(async () => this.#deleteFiles([this.#sessionFile, this.#keyFile]));
   }
 
+  async withRefreshLock<T>(_target: string, operation: () => Promise<T>): Promise<T> {
+    return await this.#withNamedProcessLock("refresh", operation);
+  }
+
   async #deleteFiles(files: readonly string[]): Promise<"deleted" | "absent"> {
     let deleted = false;
     let failure: unknown;
@@ -316,11 +320,15 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
   }
 
   async #withProcessLock<T>(operation: () => Promise<T>): Promise<T> {
+    return await this.#withNamedProcessLock("storage", operation);
+  }
+
+  async #withNamedProcessLock<T>(namespace: "storage" | "refresh", operation: () => Promise<T>): Promise<T> {
     // Canonicalize only after the directory exists and its no-reparse/ACL
     // boundary has been checked. Lexical aliases (junctions, symlinks, 8.3
     // names) must never create a second lock namespace for the same bytes.
     await this.#ensureDirectory({ verifyExistingWindowsAcl: false });
-    const authority = await processLockAuthority(this.#sessionFile, this.platform);
+    const authority = await processLockAuthority(this.#sessionFile, this.platform, namespace);
     const deadline = performance.now() + this.#lockTimeoutMs;
     let server: Server | undefined;
     for (;;) {
@@ -345,7 +353,7 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
       // loading follows immediately, while atomic replacement retains its
       // own final boundary check before changing ciphertext.
       await this.#ensureDirectory();
-      if (!sameProcessLockAuthority(authority, await processLockAuthority(this.#sessionFile, this.platform))) {
+      if (!sameProcessLockAuthority(authority, await processLockAuthority(this.#sessionFile, this.platform, namespace))) {
         throw credentialFailure(
           "credential_backend_failure",
           "The encrypted local session path changed while acquiring its lock.",
@@ -519,15 +527,21 @@ function isTransientFilesystemFailure(error: unknown): boolean {
     code === "EMFILE" || code === "ENFILE" || code === "ENODEV" || code === "ENXIO" || code === "ESTALE";
 }
 
-async function processLockAuthority(sessionFile: string, platform: NodeJS.Platform): Promise<string | { readonly host: "127.0.0.1"; readonly port: number }> {
+async function processLockAuthority(
+  sessionFile: string,
+  platform: NodeJS.Platform,
+  namespace: "storage" | "refresh" = "storage",
+): Promise<string | { readonly host: "127.0.0.1"; readonly port: number }> {
   const physicalDirectory = await realpath(dirname(sessionFile));
   const physicalSession = resolve(physicalDirectory, basename(sessionFile));
-  const digest = createHash("sha256").update(platform === "win32" ? physicalSession.toLocaleLowerCase("en-US") : physicalSession, "utf8").digest();
-  if (platform === "win32") return `\\\\.\\pipe\\cuna-session-${digest.toString("hex").slice(0, 40)}`;
+  const canonical = platform === "win32" ? physicalSession.toLocaleLowerCase("en-US") : physicalSession;
+  const digest = createHash("sha256").update(`${namespace}\0${canonical}`, "utf8").digest();
+  if (platform === "win32") return `\\\\.\\pipe\\cuna-session-${namespace}-${digest.toString("hex").slice(0, 40)}`;
   // A loopback listener is kernel-owned and disappears on process death. A
   // hash collision or unrelated listener only causes a bounded fail-closed
   // refusal; it can never permit two writers.
-  return { host: "127.0.0.1", port: 49_152 + digest.readUInt16BE(0) % 16_384 };
+  const namespaceBase = namespace === "storage" ? 49_152 : 57_344;
+  return { host: "127.0.0.1", port: namespaceBase + digest.readUInt16BE(0) % 8_192 };
 }
 
 function sameProcessLockAuthority(

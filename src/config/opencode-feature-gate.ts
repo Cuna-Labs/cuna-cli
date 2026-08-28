@@ -1,5 +1,4 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
-import { brandedEnvironmentNames } from "../core/namespace.js";
 import { INFRA_OPENAPI_CONTRACT_IDENTITY } from "./infra-contract-witness.js";
 
 /**
@@ -11,15 +10,12 @@ import { INFRA_OPENAPI_CONTRACT_IDENTITY } from "./infra-contract-witness.js";
  * rollout is incomplete. It reads no credential and is never propagated to a
  * remote request, provider process, or terminal child.
  */
-export const OPENCODE_FEATURE_ENVIRONMENT_VARIABLE = brandedEnvironmentNames("OPENCODE_ENABLED")[0]!;
-
 export type OpenCodeFeatureState = "enabled" | "disabled";
-export type OpenCodeFeatureGateReason = "environment_not_enabled" | "immutable_contract_witness_required" | "enabled";
+export type OpenCodeFeatureGateReason = "immutable_contract_witness_required" | "enabled";
 
 export interface OpenCodeFeatureGate {
   readonly state: OpenCodeFeatureState;
-  readonly source: "environment" | "default";
-  readonly variable: typeof OPENCODE_FEATURE_ENVIRONMENT_VARIABLE;
+  readonly source: "compiled_contract";
   readonly reason: OpenCodeFeatureGateReason;
 }
 
@@ -80,29 +76,22 @@ export function hasCommittedOpenCodeContractWitness(value: unknown): boolean {
 }
 
 /**
- * Resolve the local consumer gate from exactly one canonical environment name.
+ * Resolve the local consumer gate from the compiled producer contract witness.
  *
- * Only the exact lower-case string `true` plus a compiled, committed strict
- * producer witness admits OpenCode. Any mutable, missing, malformed, or
- * differently-cased input remains disabled before credentials, network, host,
- * or child-process effects.
+ * OpenCode is a normal public provider once the vendored producer contract is
+ * bound to one committed tree. Runtime capability discovery remains the
+ * authority for each concrete create/attach operation; no local environment
+ * variable can invent producer support or unnecessarily hide current support.
  */
 export function resolveOpenCodeFeatureGate(
-  environment: Readonly<Record<string, string | undefined>> = process.env,
+  _environment: Readonly<Record<string, string | undefined>> = process.env,
   contractIdentity: unknown = INFRA_OPENAPI_CONTRACT_IDENTITY,
 ): OpenCodeFeatureGate {
-  const configured = environment[OPENCODE_FEATURE_ENVIRONMENT_VARIABLE];
-  const environmentEnabled = configured === "true";
   const committedWitness = hasCommittedOpenCodeContractWitness(contractIdentity);
   return Object.freeze({
-    state: environmentEnabled && committedWitness ? "enabled" : "disabled",
-    source: configured === undefined ? "default" : "environment",
-    variable: OPENCODE_FEATURE_ENVIRONMENT_VARIABLE,
-    reason: !environmentEnabled
-      ? "environment_not_enabled"
-      : committedWitness
-        ? "enabled"
-        : "immutable_contract_witness_required",
+    state: committedWitness ? "enabled" : "disabled",
+    source: "compiled_contract",
+    reason: committedWitness ? "enabled" : "immutable_contract_witness_required",
   });
 }
 
@@ -113,12 +102,11 @@ export function assertOpenCodeExecutionEnabled(gate: OpenCodeFeatureGate): void 
     code: "cuna.feature.opencode_disabled",
     message: "OpenCode is disabled in this Cuna CLI until its strict producer contract is immutable.",
     exitCode: EXIT_CODES.policy,
-    hint: `Set ${gate.variable}=true only after this installed CLI contains an exact committed Infra OpenCode contract witness. A mutable working-tree contract cannot enable remote, host, or child-process effects.`,
+    hint: "Install a local CLI package built from the current committed Infra OpenCode contract. Runtime capability discovery must also advertise the requested operation.",
     details: {
       feature: "opencode",
       gate: gate.state,
       source: gate.source,
-      environment_variable: gate.variable,
       reason: gate.reason,
     },
   });

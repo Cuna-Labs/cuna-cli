@@ -7,6 +7,7 @@ import {
   type AgentSessionAuth,
 } from "../api/contracts.js";
 import type { CunaApiClient } from "../api/client.js";
+import type { BrowserOpener } from "../auth/browser.js";
 import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import {
   ForegroundTerminalCoordinator,
@@ -24,7 +25,7 @@ import {
 import { createApiTerminalControlPlane } from "./api-terminal-control-plane.js";
 import { CunaRuntimeBoundary } from "./boundary.js";
 import { admitCapability } from "./capability-gate.js";
-import { runtimeFailure } from "./errors.js";
+import { RuntimeBoundaryError, runtimeFailure } from "./errors.js";
 import { createNodeWebSocketConnector } from "./node-websocket-connector.js";
 import {
   assertRemoteAgentSessionEvidence,
@@ -44,6 +45,11 @@ export interface ForegroundSessionRunnerInput {
   readonly terminalKind?: string;
   readonly hostPlatform?: NodeJS.Platform;
   readonly presentationMode?: ForegroundPresentationMode;
+  /** OpenCode effects are admitted only after the local producer witness gate. */
+  readonly opencodeEnabled?: boolean;
+  readonly browser?: BrowserOpener;
+  /** Clears caller-owned progress UI before raw/alternate-screen terminal ownership. */
+  readonly onBeforeTerminalOwnership?: () => void;
 }
 
 export type ForegroundPresentationMode = "rich" | "plain";
@@ -69,6 +75,30 @@ export async function runNodeForegroundSessions(
   input: ForegroundSessionRunnerInput,
   dependencies: NodeForegroundSessionDependencies = {},
 ): Promise<void> {
+  try {
+    await runNodeForegroundSessionsOnce(input, dependencies);
+  } catch (error) {
+    if (!retryableEarlyTerminalFailure(error) || input.signal?.aborted) throw error;
+    // A newly issued one-use ticket can reach the public gateway just before
+    // the machine supervisor observes it. Retry the complete, already-cleaned
+    // foreground composition exactly once; this mints fresh one-use authority
+    // and never repeats user input or an established terminal interaction.
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    await runNodeForegroundSessionsOnce(input, dependencies);
+  }
+}
+
+function retryableEarlyTerminalFailure(error: unknown): boolean {
+  if (!(error instanceof RuntimeBoundaryError) || error.code !== "terminal_disconnected") return false;
+  return (error.retryable && /before negotiation completed/u.test(error.message)) ||
+    error.message === "The passthrough terminal connection ended." ||
+    error.message === "The terminal tab is not connected.";
+}
+
+async function runNodeForegroundSessionsOnce(
+  input: ForegroundSessionRunnerInput,
+  dependencies: NodeForegroundSessionDependencies,
+): Promise<void> {
   const clock = dependencies.clock ?? Date.now;
   const sessionIds = admitForegroundSessionIds(input.agentSessionIds);
   if (
@@ -88,6 +118,7 @@ export async function runNodeForegroundSessions(
   const presentationMode = input.presentationMode ?? selectNodeForegroundPresentation({
     platform,
     environment,
+    sessionCount: sessionIds.length,
     ...(terminalKind === undefined ? {} : { terminalKind }),
   });
   if (presentationMode === "rich") {
@@ -100,6 +131,7 @@ export async function runNodeForegroundSessions(
   }
   const allowedOrigin = admitApiOrigin(input.baseUrl);
   const host = dependencies.host ?? createNodeForegroundTerminalHost();
+  const clientInstanceId = dependencies.clientInstanceId?.() ?? `cli:${randomUUID()}`;
 
   // TTY authority and dimensions are admitted before any control-plane read or
   // one-use terminal grant. Acquiring raw/alternate-screen ownership remains a
@@ -118,6 +150,18 @@ export async function runNodeForegroundSessions(
     if (agentSessionId === undefined) continue;
     throwIfAborted(input.signal);
     const session = await input.client.getAgentSession(agentSessionId, input.signal);
+    if (session.agent === "opencode" && input.opencodeEnabled !== true) {
+      throw runtimeFailure(
+        "capability_unsupported",
+        "OpenCode is not enabled by this CLI's producer contract witness.",
+      );
+    }
+    if (session.agent !== "claude-code" && session.agent !== "codex" && session.agent !== "opencode") {
+      throw runtimeFailure(
+        "capability_unsupported",
+        `The ${session.agent} provider is unavailable for direct CLI attachment.`,
+      );
+    }
     const expectedAgent = input.expectedAgentKinds?.[index];
     if (expectedAgent !== undefined && session.agent !== expectedAgent) {
       throw runtimeFailure(
@@ -161,6 +205,13 @@ export async function runNodeForegroundSessions(
       agentSessionId,
       label: safeSessionLabel(session),
       agent: session.agent,
+      ...(session.workspaceBindingId === undefined
+        ? {}
+        : {
+            workspaceBindingId: session.workspaceBindingId,
+            workspaceGeneration: session.workspaceGeneration,
+          }),
+      localBrowserActions: session.authMode === "interactive_login",
       attachmentAdmission: Object.freeze({
         observation: Object.freeze({ ...observation }),
         capability: Object.freeze({ ...capability }),
@@ -177,12 +228,15 @@ export async function runNodeForegroundSessions(
   }
   throwIfAborted(input.signal);
 
+  input.onBeforeTerminalOwnership?.();
   const coordinator = presentationMode === "rich"
     ? new ForegroundTerminalCoordinator({
         ...dependencies.coordinatorOptions,
         host,
+        ...(input.browser === undefined ? {} : { browser: input.browser }),
         clock,
         color: input.color ?? true,
+        deviceId: clientInstanceId,
       })
     : new PassthroughTerminalCoordinator({
         host,
@@ -197,7 +251,7 @@ export async function runNodeForegroundSessions(
     terminalConnector: dependencies.terminalConnector ?? createNodeWebSocketConnector(),
     allowedCunaOrigins: [allowedOrigin],
     terminalCapabilityId: TERMINAL_CAPABILITY_ID,
-    clientInstanceId: dependencies.clientInstanceId?.() ?? `cli:${randomUUID()}`,
+    clientInstanceId,
     clock,
     ...callbacks,
   });
@@ -251,6 +305,7 @@ export function selectNodeForegroundPresentation(input: {
   readonly platform: NodeJS.Platform;
   readonly terminalKind?: string;
   readonly environment: NodeJS.ProcessEnv;
+  readonly sessionCount?: number;
 }): ForegroundPresentationMode {
   const requested = input.environment.CUNA_TERMINAL_MODE?.trim().toLowerCase();
   if (requested !== undefined && requested !== "" && requested !== "auto" && requested !== "rich" && requested !== "plain") {
@@ -267,6 +322,10 @@ export function selectNodeForegroundPresentation(input: {
     });
     return "rich";
   }
+  // A capable host gets the isolated workbench even for one AgentSession. The
+  // remote PTY owns only the rows below Cuna's persistent chrome, so provider
+  // redraws and SIGWINCH cannot erase or scroll the appbar. Explicit `plain`
+  // and genuinely non-enriched/nested terminals retain byte passthrough.
   const terminalKind = input.terminalKind?.trim().toLowerCase();
   if (
     input.environment.TMUX !== undefined ||
@@ -312,6 +371,8 @@ function admitSessionIdentity(
   if (
     session.id !== expectedAgentSessionId ||
     session.machineId !== observation.machineId ||
+    (session.workspaceBindingId ?? null) !== observation.workspaceBindingId ||
+    (session.workspaceGeneration ?? null) !== observation.workspaceBindingGeneration ||
     session.processEpoch === undefined ||
     session.processEpoch !== observation.processEpoch ||
     session.processState !== observation.state

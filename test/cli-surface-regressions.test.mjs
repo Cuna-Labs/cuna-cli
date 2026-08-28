@@ -39,11 +39,11 @@ test("--help resolves the command it was typed after, not the root help", async 
     { argv: ["machines", "--help"], topic: "machines", must: ["cuna machines <list|create"] },
     { argv: ["machines", "create", "--help"], topic: "machines create", must: ["--name NAME", "--yes", "--vcpus N"] },
     { argv: ["machines", "list", "--help"], topic: "machines list", must: ["cuna machines list"] },
-    { argv: ["agent-sessions", "create", "--help"], topic: "agent-sessions create", must: ["--workspace-binding-id", "--workspace-generation", "Always sends interactive_login"] },
-    { argv: ["agent", "--help"], topic: "agent", must: ["does not\nlog out OpenCode", "own interactive provider flow"] },
+    { argv: ["agent-sessions", "create", "--help"], topic: "agent-sessions create", must: ["--workspace-binding-id", "--workspace-generation", "claude-code, codex, or opencode"] },
+    { argv: ["agent", "--help"], topic: "agent", must: ["Sign Claude Code or Codex out"] },
     { argv: ["doctor", "--help"], topic: "doctor", must: ["encrypted local\nsession-store state", "--check-browser-login"] },
     { argv: ["claude", "--help"], topic: "claude", must: ["--agent-session ID", "--no-sync"] },
-    { argv: ["opencode", "--help"], topic: "opencode", must: ["--agent-session ID", "--no-sync", "ChatGPT Pro/Plus (headless)", "interactive_login only"] },
+    { argv: ["opencode", "--help"], topic: "opencode", must: ["interactive_login only", "--agent-session ID"] },
   ];
   for (const { argv, topic, must } of cases) {
     const { exit, record } = await runJson([...argv, "--json"]);
@@ -357,6 +357,45 @@ test("each capability snapshot fault reports its own reason", async () => {
   // The control: a valid snapshot still authorizes the mutation.
   const ok = await pauseWith(gatedSnapshot());
   assert.equal(ok.exit, EXIT_CODES.success);
+});
+
+test("capability freshness is validated when the delayed response is received", async () => {
+  let clock = NOW;
+  let deletes = 0;
+  const { exit, record } = await runJson([
+    "machines", "delete", MACHINE_ID, "--yes", "--json",
+  ], {
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => clock,
+    clientFactory: () => ({
+      async discoverCapabilities() {
+        clock += 6_000;
+        return gatedSnapshot({
+          observedAt: new Date(clock).toISOString(),
+          expiresAt: new Date(clock + 30_000).toISOString(),
+          capabilities: [{
+            id: "machines.delete",
+            availability: "supported",
+            interaction: "native",
+            mutationClass: "destructive",
+            surfaces: ["cli"],
+            requiredPermissions: ["machines:delete"],
+          }],
+        });
+      },
+      async deleteMachine() { deletes += 1; },
+      async getMachine() {
+        throw new CunaError({
+          code: "cuna.remote.not_found",
+          message: "gone",
+          exitCode: EXIT_CODES.remote,
+        });
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, JSON.stringify(record));
+  assert.equal(record.command, "machines.delete");
+  assert.equal(deletes, 1);
 });
 
 test("a permanent snapshot fault is never advertised as retryable", async () => {

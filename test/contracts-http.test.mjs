@@ -254,6 +254,22 @@ test("machine get binds the exact public machine authority before selection", as
   );
 });
 
+test("machine list uses the public unpaginated route without invented query parameters", async () => {
+  const requests = [];
+  const client = createCunaApiClient({
+    async request(request) {
+      requests.push(request);
+      return [];
+    },
+  });
+  const page = await client.listMachines();
+  assert.deepEqual(page.items, []);
+  assert.deepEqual(requests, [{
+    method: "GET",
+    path: "/v1/sessions",
+  }]);
+});
+
 test("TC-037-05 API-key metadata is closed and never accepts a plaintext secret", async () => {
   const metadata = {
     id: "11111111-1111-4111-8111-111111111111",

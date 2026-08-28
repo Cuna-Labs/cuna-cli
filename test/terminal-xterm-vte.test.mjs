@@ -60,6 +60,29 @@ test("VTE reports Unicode display-cell width and the remote cursor state", async
   viewport.dispose();
 });
 
+test("VTE preserves trusted cell styling without retaining remote ANSI bytes", async () => {
+  const { viewport } = adapter();
+  const snapshot = await viewport.write(encoder.encode([
+    "\u001b[38;5;208morange ",
+    "\u001b[1;38;2;10;20;30mbold-rgb",
+    "\u001b[0m plain",
+  ].join("")), 1n, 1n);
+
+  assert.equal(snapshot.cells[0], "orange bold-rgb plain");
+  assert.equal(snapshot.cells[0].includes("\u001b"), false);
+  assert.deepEqual(snapshot.renderRows?.map((row) => row.map((run) => ({
+    text: run.text,
+    width: run.width,
+    bold: run.style.bold,
+    foreground: run.style.foreground,
+  })))[0], [
+    { text: "orange ", width: 7, bold: false, foreground: { mode: "palette", value: 208 } },
+    { text: "bold-rgb", width: 8, bold: true, foreground: { mode: "rgb", value: 0x0a141e } },
+    { text: " plain", width: 6, bold: false, foreground: null },
+  ]);
+  viewport.dispose();
+});
+
 test("TC-055-16 VTE rejects pathological cell extenders across split output frames", async () => {
   const { viewport, registry } = adapter();
   await viewport.write(encoder.encode(`a${"\u0301".repeat(MAX_XTERM_CELL_EXTENDERS - 1)}`), 1n, 1n);

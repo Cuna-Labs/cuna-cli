@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { instantOrNull, sameInstant } from "../dist/core/instant.js";
-import { assertRemoteAgentSessionEvidence } from "../dist/runtime/terminal-transport.js";
+import { assertReadyPayloadMatches, assertRemoteAgentSessionEvidence } from "../dist/runtime/terminal-transport.js";
 import {
   loadWorkspaceBinding,
   persistWorkspaceBinding,
@@ -153,6 +153,43 @@ test("terminal attach still admits a canonical JavaScript rendering", () => {
   assert.equal(admitted.observedAt, JAVASCRIPT_INSTANT);
 });
 
+test("local-action READY must match the exact AgentSession WorkspaceBinding", () => {
+  const workspaceBindingId = "00000000-0000-4000-8000-000000000777";
+  const admitted = assertRemoteAgentSessionEvidence({
+    evidence: evidence({ workspaceBindingId, workspaceBindingGeneration: 3 }),
+    expectedAgentSessionId: "agent_session_1",
+    now: PRODUCTION_EPOCH_MS + 1_000,
+  });
+  const ready = {
+    protocol: "runa.terminal.v1",
+    machineId: admitted.machineId,
+    machineGeneration: "42",
+    workspaceBindingId,
+    workspaceBindingGeneration: 3,
+    agentSessionId: admitted.agentSessionId,
+    processEpoch: admitted.processEpoch,
+    fencingGeneration: 7,
+    resizeCapability: "live",
+    localActionProtocol: {
+      name: "cuna.local-actions.v1",
+      maxRequestBytes: 65_536,
+      maxResultBytes: 65_536,
+      streamWindowBytes: 1_048_576,
+      kinds: ["browser.open"],
+    },
+  };
+  assert.doesNotThrow(() => assertReadyPayloadMatches(ready, admitted));
+  assert.throws(
+    () => assertReadyPayloadMatches({ ...ready, workspaceBindingGeneration: 4 }, admitted),
+    (error) => error.code === "grant_scope_mismatch",
+  );
+  const { machineGeneration: _omitted, ...partialReady } = ready;
+  assert.throws(
+    () => assertReadyPayloadMatches(partialReady, admitted),
+    (error) => error.code === "grant_scope_mismatch",
+  );
+});
+
 test("terminal attach refuses evidence whose timestamps carry no offset", () => {
   assert.throws(
     () =>
@@ -165,16 +202,13 @@ test("terminal attach refuses evidence whose timestamps carry no offset", () => 
   );
 });
 
-test("widening the encoding did not widen the freshness rules", () => {
+test("widening the encoding preserves identity, ordering, and attribution rules", () => {
   const cases = [
-    // Expired, in the production encoding.
-    [{ expiresAt: "2026-08-18T20:49:25.000000+00:00" }, PRODUCTION_EPOCH_MS + 60_000],
+    // Expiry before observation is malformed even though expiry-at-now is now
+    // decided by POST terminal-connections rather than this cached snapshot.
+    [{ expiresAt: "2026-08-18T20:49:23.000000+00:00" }, PRODUCTION_EPOCH_MS + 1_000],
     // Observed too far in the future.
     [{ observedAt: "2026-08-18T20:59:24.458909+00:00" }, PRODUCTION_EPOCH_MS],
-    // Lease longer than the 60 s ceiling.
-    [{ expiresAt: "2026-08-18T20:59:24.458909+00:00" }, PRODUCTION_EPOCH_MS + 1_000],
-    // Wrong process state.
-    [{ state: "starting" }, PRODUCTION_EPOCH_MS + 1_000],
     // Wrong authority.
     [{ authority: "somebody_else" }, PRODUCTION_EPOCH_MS + 1_000],
     // The evidence is not attributable to a process generation or a row. These

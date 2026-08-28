@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { TextDecoder, TextEncoder } from "node:util";
 import { DEPLOYED_WIRE_COMPATIBILITY } from "../core/deployed-wire-compatibility.js";
 
@@ -6,6 +7,30 @@ export const TERMINAL_PROTOCOL_VERSION = 1 as const;
 export const MAX_TERMINAL_FRAME_BYTES = 1024 * 1024;
 export const MAX_TERMINAL_BUFFER_BYTES = MAX_TERMINAL_FRAME_BYTES * 2;
 export const MAX_TERMINAL_QUEUED_FRAMES = 4096;
+export const LOCAL_ACTION_PROTOCOL = "cuna.local-actions.v1" as const;
+export const MAX_LOCAL_ACTION_CONTROL_BYTES = 64 * 1024;
+export const MAX_LOCAL_STREAM_WINDOW_BYTES = 1024 * 1024;
+
+export const TERMINAL_LOCAL_ACTION_KINDS = Object.freeze([
+  "browser.open",
+  "auth.device.present",
+  "auth.callback.relay",
+  "auth.result.observe",
+  "clipboard.write",
+  "port.forward",
+  "file.select",
+  "attachment.import",
+  "artifact.save",
+  "preview.open",
+  "diff.open",
+  "editor.open",
+  "notification.show",
+  "git.sign",
+  "local_service.request",
+  "device.select",
+] as const);
+
+export type TerminalLocalActionKind = typeof TERMINAL_LOCAL_ACTION_KINDS[number];
 
 const HEADER_BYTES = 20;
 const MAGIC = Uint8Array.of(0x52, 0x54, 0x50, 0x31); // RTP1
@@ -22,6 +47,12 @@ export const TERMINAL_FRAME_TYPES = Object.freeze({
   error: 8,
   acknowledgement: 9,
   resume: 10,
+  local_action_request: 11,
+  local_action_result: 12,
+  local_stream_open: 13,
+  local_stream_data: 14,
+  local_stream_close: 15,
+  local_stream_window_update: 16,
 } as const);
 
 export type TerminalFrameType = keyof typeof TERMINAL_FRAME_TYPES;
@@ -37,10 +68,34 @@ export interface TerminalFrame {
 
 export interface TerminalReadyPayload {
   readonly protocol: typeof TERMINAL_PROTOCOL;
+  readonly machineId?: string;
+  readonly machineGeneration?: string;
+  readonly workspaceBindingId?: string | null;
+  readonly workspaceBindingGeneration?: number | null;
   readonly agentSessionId: string;
   readonly processEpoch: string;
   readonly fencingGeneration: number;
   readonly resizeCapability: "live" | "initial_resize_only";
+  readonly localActionProtocol?: TerminalLocalActionProtocolOffer;
+}
+
+export interface TerminalLocalActionProtocolOffer {
+  readonly name: typeof LOCAL_ACTION_PROTOCOL;
+  readonly maxRequestBytes: number;
+  readonly maxResultBytes: number;
+  readonly streamWindowBytes: number;
+  readonly kinds: readonly TerminalLocalActionKind[];
+}
+
+export interface TerminalLocalActionProtocolAcceptance {
+  readonly name: typeof LOCAL_ACTION_PROTOCOL;
+  readonly acceptedKinds: readonly TerminalLocalActionKind[];
+}
+
+export interface TerminalResumePayload {
+  readonly resumeHandle: string;
+  readonly afterOutputSequence: string;
+  readonly localActionProtocol?: TerminalLocalActionProtocolAcceptance;
 }
 
 export interface TerminalResizePayload {
@@ -75,6 +130,15 @@ export type TerminalControlPayload =
   | TerminalExitPayload
   | TerminalErrorPayload
   | TerminalAcknowledgementPayload;
+
+const LOCAL_ACTION_FRAME_TYPES: ReadonlySet<TerminalFrameType> = new Set([
+  "local_action_request",
+  "local_action_result",
+  "local_stream_open",
+  "local_stream_data",
+  "local_stream_close",
+  "local_stream_window_update",
+]);
 
 export class TerminalProtocolError extends Error {
   readonly code:
@@ -263,8 +327,17 @@ export function assertTerminalFrameLegal(
   state: TerminalConnectionState,
   direction: TerminalFrameDirection,
   type: TerminalFrameType,
+  localActionsNegotiated = false,
 ): void {
-  if (!LEGAL_FRAMES[state][direction].has(type)) {
+  const localActionLegal = localActionsNegotiated && state === "attached" && (
+    type === "local_action_request" ? direction === "server_to_client" :
+    type === "local_action_result" ||
+    type === "local_stream_open" ||
+    type === "local_stream_data" ||
+    type === "local_stream_close" ||
+    type === "local_stream_window_update"
+  );
+  if (!LEGAL_FRAMES[state][direction].has(type) && !localActionLegal) {
     throw new TerminalProtocolError("illegal_state", `${type} is illegal while the terminal is ${state}.`);
   }
 }
@@ -273,6 +346,13 @@ export function decodeTerminalControl(frame: TerminalFrame): Readonly<Record<str
   if (frame.type === "input" || frame.type === "output") {
     throw new TerminalProtocolError("invalid_payload", "Terminal byte frames are opaque and have no JSON control payload.");
   }
+  if (isLocalActionFrameType(frame.type) && !frame.critical) {
+    throw new TerminalProtocolError("invalid_payload", "Negotiated local action frames must be critical.");
+  }
+  if (
+    (frame.type === "local_action_request" || frame.type === "local_action_result") &&
+    frame.payload.byteLength > MAX_LOCAL_ACTION_CONTROL_BYTES
+  ) throw new TerminalProtocolError("invalid_payload", "The local action control payload exceeds its negotiated bound.");
   let value: unknown;
   try {
     value = JSON.parse(decoder.decode(frame.payload));
@@ -297,6 +377,13 @@ function validateControlPayload(type: TerminalFrameType, value: Record<string, u
         Number(value.fencingGeneration) < 1 ||
         (value.resizeCapability !== "live" && value.resizeCapability !== "initial_resize_only")
       ) throwInvalidPayload();
+      assertKeys(
+        value,
+        ["protocol", "agentSessionId", "processEpoch", "fencingGeneration", "resizeCapability"],
+        ["machineId", "machineGeneration", "workspaceBindingId", "workspaceBindingGeneration", "localActionProtocol"],
+      );
+      validateReadyIdentity(value);
+      if (value.localActionProtocol !== undefined) validateLocalActionOffer(value.localActionProtocol);
       return;
     case "resize":
       if (!isDimension(value.columns) || !isDimension(value.rows)) throwInvalidPayload();
@@ -318,7 +405,51 @@ function validateControlPayload(type: TerminalFrameType, value: Record<string, u
       ) throwInvalidPayload();
       return;
     case "heartbeat":
+      assertKeys(value, []);
+      return;
     case "resume":
+      assertKeys(value, ["resumeHandle", "afterOutputSequence"], ["localActionProtocol"]);
+      if (!isIdentifier(value.resumeHandle) || !isUint64String(value.afterOutputSequence)) throwInvalidPayload();
+      if (value.localActionProtocol !== undefined) validateLocalActionAcceptance(value.localActionProtocol);
+      return;
+    case "local_action_request":
+      validateLocalActionRequestFrame(value);
+      return;
+    case "local_action_result":
+      validateLocalActionResultFrame(value);
+      return;
+    case "local_stream_open":
+      assertKeys(value, ["streamId", "requestId", "direction", "initialCreditBytes"]);
+      if (
+        !isIdentifier(value.streamId) || !isIdentifier(value.requestId) ||
+        (value.direction !== "local_to_remote" && value.direction !== "remote_to_local") ||
+        !isBoundedPositiveInteger(value.initialCreditBytes, MAX_LOCAL_STREAM_WINDOW_BYTES)
+      ) throwInvalidPayload();
+      return;
+    case "local_stream_data":
+      assertKeys(value, ["streamId", "offset", "bytesBase64url", "decodedLength", "chunkSha256"]);
+      if (
+        !isIdentifier(value.streamId) || !isUint64Number(value.offset) ||
+        typeof value.bytesBase64url !== "string" || !BASE64URL.test(value.bytesBase64url) ||
+        !isBoundedNonnegativeInteger(value.decodedLength, MAX_LOCAL_ACTION_CONTROL_BYTES) ||
+        decodedBase64urlLength(value.bytesBase64url) !== value.decodedLength ||
+        !SHA256.test(String(value.chunkSha256)) ||
+        sha256Base64url(value.bytesBase64url) !== value.chunkSha256
+      ) throwInvalidPayload();
+      return;
+    case "local_stream_close":
+      assertKeys(value, ["streamId", "finalOffset", "reason"]);
+      if (
+        !isIdentifier(value.streamId) || !isUint64Number(value.finalOffset) ||
+        !new Set(["completed", "cancelled", "failed", "expired"]).has(String(value.reason))
+      ) throwInvalidPayload();
+      return;
+    case "local_stream_window_update":
+      assertKeys(value, ["streamId", "acknowledgedOffset", "creditBytes"]);
+      if (
+        !isIdentifier(value.streamId) || !isUint64Number(value.acknowledgedOffset) ||
+        !isBoundedPositiveInteger(value.creditBytes, MAX_LOCAL_STREAM_WINDOW_BYTES)
+      ) throwInvalidPayload();
       return;
     case "input":
     case "output":
@@ -326,11 +457,185 @@ function validateControlPayload(type: TerminalFrameType, value: Record<string, u
   }
 }
 
+export function isLocalActionFrameType(type: TerminalFrameType): boolean {
+  return LOCAL_ACTION_FRAME_TYPES.has(type);
+}
+
+export function negotiateTerminalLocalActions(
+  offer: unknown,
+  implementedKinds: ReadonlySet<TerminalLocalActionKind>,
+): TerminalLocalActionProtocolAcceptance | undefined {
+  if (offer === undefined) return undefined;
+  validateLocalActionOffer(offer);
+  const acceptedKinds = (offer as TerminalLocalActionProtocolOffer).kinds.filter((kind) => implementedKinds.has(kind));
+  if (acceptedKinds.length === 0) return undefined;
+  return Object.freeze({ name: LOCAL_ACTION_PROTOCOL, acceptedKinds: Object.freeze(acceptedKinds) });
+}
+
+function validateLocalActionOffer(value: unknown): asserts value is TerminalLocalActionProtocolOffer {
+  const offer = objectValue(value);
+  assertKeys(offer, ["name", "maxRequestBytes", "maxResultBytes", "streamWindowBytes", "kinds"]);
+  if (
+    offer.name !== LOCAL_ACTION_PROTOCOL ||
+    !isBoundedPositiveInteger(offer.maxRequestBytes, MAX_LOCAL_ACTION_CONTROL_BYTES) ||
+    !isBoundedPositiveInteger(offer.maxResultBytes, MAX_LOCAL_ACTION_CONTROL_BYTES) ||
+    !isBoundedPositiveInteger(offer.streamWindowBytes, MAX_LOCAL_STREAM_WINDOW_BYTES)
+  ) throwInvalidPayload();
+  validateKinds(offer.kinds, true);
+}
+
+function validateLocalActionAcceptance(value: unknown): asserts value is TerminalLocalActionProtocolAcceptance {
+  const acceptance = objectValue(value);
+  assertKeys(acceptance, ["name", "acceptedKinds"]);
+  if (acceptance.name !== LOCAL_ACTION_PROTOCOL) throwInvalidPayload();
+  validateKinds(acceptance.acceptedKinds, true);
+}
+
+function validateKinds(value: unknown, requireNonempty: boolean): asserts value is readonly TerminalLocalActionKind[] {
+  if (!Array.isArray(value) || (requireNonempty && value.length === 0) || value.length > TERMINAL_LOCAL_ACTION_KINDS.length) throwInvalidPayload();
+  const allowed = new Set<string>(TERMINAL_LOCAL_ACTION_KINDS);
+  if (new Set(value).size !== value.length || value.some((kind) => typeof kind !== "string" || !allowed.has(kind))) throwInvalidPayload();
+}
+
+function validateLocalActionRequestFrame(value: Record<string, unknown>): void {
+  assertKeys(value, ["request"]);
+  const request = objectValue(value.request);
+  assertKeys(request, ["version", "id", "identity", "provider", "kind", "arguments", "argumentsDigest", "requestedScope", "createdAt", "expiresAt", "nonce"]);
+  const identity = objectValue(request.identity);
+  validateLocalActionIdentity(identity);
+  if (
+    request.version !== 1 || !isIdentifier(request.id) ||
+    !new Set(["claude-code", "codex", "opencode"]).has(String(request.provider)) ||
+    !new Set<string>(TERMINAL_LOCAL_ACTION_KINDS).has(String(request.kind)) ||
+    !isJsonObject(request.arguments) || !SHA256_PREFIXED.test(String(request.argumentsDigest)) ||
+    !isIdentifier(request.requestedScope) || !isSafeTimestamp(request.createdAt) ||
+    !isSafeTimestamp(request.expiresAt) || Number(request.expiresAt) <= Number(request.createdAt) ||
+    !isIdentifier(request.nonce)
+  ) throwInvalidPayload();
+}
+
+function validateLocalActionResultFrame(value: Record<string, unknown>): void {
+  if (value.message === "ack") {
+    assertKeys(value, ["message", "requestId", "argumentDigest"]);
+    if (!isIdentifier(value.requestId) || !SHA256_PREFIXED.test(String(value.argumentDigest))) throwInvalidPayload();
+    return;
+  }
+  assertKeys(value, ["message", "requestId", "argumentDigest", "result"]);
+  if (value.message !== "outcome" || !isIdentifier(value.requestId) || !SHA256_PREFIXED.test(String(value.argumentDigest))) throwInvalidPayload();
+  const result = objectValue(value.result);
+  assertKeys(result, ["version", "requestId", "kind", "identity", "status", "completedAt"], ["safeData", "safeReason"]);
+  validateLocalActionIdentity(objectValue(result.identity));
+  if (
+    result.version !== 1 || result.requestId !== value.requestId ||
+    !new Set<string>(TERMINAL_LOCAL_ACTION_KINDS).has(String(result.kind)) ||
+    !new Set(["succeeded", "failed", "denied", "expired", "cancelled"]).has(String(result.status)) ||
+    !isSafeTimestamp(result.completedAt) ||
+    (result.safeData !== undefined && !isJsonObject(result.safeData)) ||
+    (result.safeReason !== undefined && !isIdentifier(result.safeReason))
+  ) throwInvalidPayload();
+}
+
+function validateLocalActionIdentity(identity: Record<string, unknown>): void {
+  assertKeys(identity, ["userId", "deviceId", "machineId", "workspaceBindingId", "workspaceBindingGeneration", "agentSessionId", "processEpoch", "fencingGeneration"]);
+  if (
+    !isIdentifier(identity.userId) || !isIdentifier(identity.deviceId) || !isIdentifier(identity.machineId) ||
+    (identity.workspaceBindingId !== null && !isCanonicalUuid(identity.workspaceBindingId)) ||
+    (identity.workspaceBindingGeneration !== null && !isPositiveUint64Number(identity.workspaceBindingGeneration)) ||
+    (identity.workspaceBindingId === null) !== (identity.workspaceBindingGeneration === null) ||
+    !isIdentifier(identity.agentSessionId) || !isIdentifier(identity.processEpoch) ||
+    !isBoundedPositiveInteger(identity.fencingGeneration, Number.MAX_SAFE_INTEGER)
+  ) throwInvalidPayload();
+}
+
+function validateReadyIdentity(value: Record<string, unknown>): void {
+  const present = ["machineId", "machineGeneration", "workspaceBindingId", "workspaceBindingGeneration"]
+    .filter((key) => key in value).length;
+  if (present === 0) {
+    if (value.localActionProtocol !== undefined) throwInvalidPayload();
+    return;
+  }
+  if (
+    present !== 4 ||
+    !isIdentifier(value.machineId) ||
+    !isIdentifier(value.machineGeneration) ||
+    (value.workspaceBindingId !== null && !isCanonicalUuid(value.workspaceBindingId)) ||
+    (value.workspaceBindingGeneration !== null && !isPositiveUint64Number(value.workspaceBindingGeneration)) ||
+    (value.workspaceBindingId === null) !== (value.workspaceBindingGeneration === null)
+  ) throwInvalidPayload();
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throwInvalidPayload();
+  return value as Record<string, unknown>;
+}
+
+function assertKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): void {
+  const keys = Object.keys(value);
+  const allowed = new Set([...required, ...optional]);
+  if (required.some((key) => !(key in value)) || keys.some((key) => !allowed.has(key))) throwInvalidPayload();
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  try {
+    const encoded = JSON.stringify(value);
+    return encoded !== undefined && encoder.encode(encoded).byteLength <= MAX_LOCAL_ACTION_CONTROL_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+function isSafeTimestamp(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isUint64Number(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isPositiveUint64Number(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 1;
+}
+
+function isUint64String(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9]+$/u.test(value) && BigInt(value) <= 0xffff_ffff_ffff_ffffn;
+}
+
+function isBoundedPositiveInteger(value: unknown, maximum: number): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= maximum;
+}
+
+function isBoundedNonnegativeInteger(value: unknown, maximum: number): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= maximum;
+}
+
+function decodedBase64urlLength(value: string): number {
+  if (value.length === 0) return 0;
+  const remainder = value.length % 4;
+  if (remainder === 1) return -1;
+  return Math.floor(value.length * 3 / 4);
+}
+
+function sha256Base64url(value: string): string {
+  try {
+    return createHash("sha256").update(Buffer.from(value, "base64url")).digest("hex");
+  } catch {
+    return "";
+  }
+}
+
 const SIGNALS: ReadonlySet<string> = new Set(["interrupt", "suspend", "terminate"]);
 const EXIT_REASONS: ReadonlySet<string> = new Set(["exited", "signaled", "terminated", "failed"]);
+const BASE64URL = /^[A-Za-z0-9_-]*$/u;
+const SHA256 = /^[0-9a-f]{64}$/u;
+const SHA256_PREFIXED = /^sha256:[0-9a-f]{64}$/u;
 
 function isIdentifier(value: unknown): value is string {
   return typeof value === "string" && value.length >= 1 && value.length <= 256 && !value.includes("\0");
+}
+
+function isCanonicalUuid(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value);
 }
 
 function isDimension(value: unknown): value is number {

@@ -238,14 +238,14 @@ function containsAsciiControl(value: string): boolean {
   return false;
 }
 
-function validatePageOptions(options: PageOptions): Readonly<Record<string, string>> {
+function validatePageOptions(options: PageOptions, resource = "AgentSession"): Readonly<Record<string, string>> {
   if (
     options.limit !== undefined &&
     (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100)
   ) {
     throw new CunaError({
       code: "cuna.usage.invalid",
-      message: "AgentSession page limit must be an integer from 1 through 100.",
+      message: `${resource} page limit must be an integer from 1 through 100.`,
       exitCode: EXIT_CODES.usage,
     });
   }
@@ -255,7 +255,7 @@ function validatePageOptions(options: PageOptions): Readonly<Record<string, stri
   ) {
     throw new CunaError({
       code: "cuna.usage.invalid",
-      message: "AgentSession cursor is malformed.",
+      message: `${resource} cursor is malformed.`,
       exitCode: EXIT_CODES.usage,
     });
   }
@@ -409,7 +409,11 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
     },
     async listMachines(signal) {
       return fetchDecoded(
-        { method: "GET", path: "/v1/sessions", ...(signal === undefined ? {} : { signal }) },
+        {
+          method: "GET",
+          path: "/v1/sessions",
+          ...(signal === undefined ? {} : { signal }),
+        },
         decodeMachinePage,
       );
     },
@@ -723,7 +727,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const request: HttpRequest = {
         method: "PATCH",
         path: `/v1/agent-sessions/${safeId}`,
-        settleWith: `cuna agent-sessions show ${id}`,
+        settleWith: `cuna agent-sessions get ${id}`,
         body: { name },
       };
       return assertAgentSessionBinding(
@@ -737,7 +741,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const request: HttpRequest = {
         method: "POST",
         path: `/v1/agent-sessions/${safeId}/terminate`,
-        settleWith: `cuna agent-sessions show ${id}`,
+        settleWith: `cuna agent-sessions get ${id}`,
       };
       return assertAgentSessionBinding(
         await fetchDecoded(request, decodeAgentSessionItem),
@@ -830,7 +834,8 @@ export async function requireCapability(input: {
   readonly scope: CapabilityScope;
   readonly resourceId?: string;
   readonly capabilityId: string;
-  readonly now?: number;
+  /** Number for a fixed observation, or a clock sampled after discovery returns. */
+  readonly now?: number | (() => number);
   readonly allowedInteractions?: readonly import("./contracts.js").CapabilityInteraction[];
   readonly signal?: AbortSignal;
 }): Promise<void> {
@@ -873,7 +878,8 @@ export async function requireCapability(input: {
       },
     });
   }
-  const decision = decideCapability(snapshot, input.capabilityId, input.now, input.allowedInteractions);
+  const receivedAt = typeof input.now === "function" ? input.now() : input.now;
+  const decision = decideCapability(snapshot, input.capabilityId, receivedAt, input.allowedInteractions);
   if (decision.status === "supported") return;
   throw new CunaError({
     code:

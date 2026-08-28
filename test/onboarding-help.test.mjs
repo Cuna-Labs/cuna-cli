@@ -80,7 +80,7 @@ test("the short help is materially shorter and reaches a command sooner", () => 
     shortLines.length < fullLines.length / 2,
     `short help is ${shortLines.length} lines against ${fullLines.length}`,
   );
-  const firstCommand = shortLines.findIndex((line) => /^\s{2}doctor\s/u.test(line));
+  const firstCommand = shortLines.findIndex((line) => /^\s{2}cuna\s/u.test(line));
   assert.ok(firstCommand >= 0 && firstCommand < 16, `first command at line ${firstCommand + 1}`);
 });
 
@@ -147,26 +147,22 @@ test("--all on a command topic is refused rather than silently ignored", async (
 
 test("the short help presents the composed journey without obsolete native or preview caveats", () => {
   const available = SHORT_HELP.slice(
-    SHORT_HELP.indexOf("Works with no network:"),
-    SHORT_HELP.indexOf("Not available in this build:"),
+    SHORT_HELP.indexOf("Start here:"),
+    SHORT_HELP.indexOf("First run:"),
   );
   assert.ok(available.length > 0);
   for (const command of ["login", "signup", "logout"]) {
     assert.ok(
-      !new RegExp(`^\\s{2}${command}\\b`, "mu").test(available),
+      !new RegExp(`^\\s{2}cuna ${command}\\b`, "mu").test(available),
       `${command} must not be listed as available`,
     );
   }
-  for (const command of ["claude", "codex", "openclaw", "opencode", "connect"]) {
-    assert.ok(new RegExp(`^\\s{2}${command}\\b`, "mu").test(available), `${command} must be listed as available`);
+  for (const command of ["machines", "claude", "codex", "opencode"]) {
+    assert.ok(new RegExp(`^\\s{2}cuna ${command}\\b`, "mu").test(available), `${command} must be listed as available`);
   }
-  const unavailable = SHORT_HELP.slice(SHORT_HELP.indexOf("Not available in this build:"));
-  assert.ok(!unavailable.includes("native credential vault"), unavailable);
-  assert.ok(!unavailable.includes("cuna login"), unavailable);
-  assert.ok(!unavailable.includes("encrypted browser-link"), unavailable);
-  for (const command of ["claude", "codex", "openclaw", "opencode", "connect"]) {
-    assert.ok(!unavailable.includes(command), `${command} must not be marked unavailable`);
-  }
+  assert.doesNotMatch(SHORT_HELP, /native credential vault|encrypted browser-link/iu);
+  assert.doesNotMatch(available, /connect SESSION_ID|--agent-session/u);
+  assert.doesNotMatch(`${SHORT_HELP}\n${FULL_HELP}`, /\bopenclaw\b/iu);
 });
 
 test("doctor help distinguishes the encrypted local store from the opt-in remote browser-login probe", async () => {
