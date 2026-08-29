@@ -57,6 +57,48 @@ function sanitizeSingleLineHumanOutput(value: string): string {
   return sanitizeHumanTerminalOutput(value).replaceAll("\n", "\\n").replaceAll("\t", "\\t");
 }
 
+function tableRows(data: unknown): readonly Readonly<Record<string, unknown>>[] | undefined {
+  const candidate = Array.isArray(data)
+    ? data
+    : data !== null && typeof data === "object"
+      ? Object.values(data as Record<string, unknown>).find((value) => Array.isArray(value))
+      : undefined;
+  if (!Array.isArray(candidate) || candidate.length === 0) return undefined;
+  if (!candidate.every((value) => value !== null && typeof value === "object" && !Array.isArray(value))) return undefined;
+  return candidate as readonly Readonly<Record<string, unknown>>[];
+}
+
+function cell(value: unknown): string {
+  if (value === null || value === undefined) return "-";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return sanitizeSingleLineHumanOutput(String(value));
+  }
+  if (Array.isArray(value) && value.every((item) => typeof item === "string" || typeof item === "number" || typeof item === "boolean")) {
+    return sanitizeSingleLineHumanOutput(value.join(", "));
+  }
+  return sanitizeSingleLineHumanOutput(JSON.stringify(value));
+}
+
+function heading(key: string): string {
+  return key.replaceAll("_", " ").toUpperCase();
+}
+
+/**
+ * Lists are data records, not prose. Deriving their columns from the result at
+ * the one output boundary gives every parser command the same legible terminal
+ * treatment without a duplicate command registry.
+ */
+export function renderHumanResult(data: unknown, fallback: string): string {
+  const rows = tableRows(data);
+  if (rows === undefined) return sanitizeHumanTerminalOutput(fallback);
+  const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+  if (columns.length === 0) return sanitizeHumanTerminalOutput(fallback);
+  const values = rows.map((row) => columns.map((column) => cell(row[column])));
+  const widths = columns.map((column, index) => Math.max(heading(column).length, ...values.map((row) => (row[index] ?? "").length)));
+  const format = (row: readonly string[]) => row.map((value, index) => value.padEnd(widths[index] ?? value.length)).join("  ").trimEnd();
+  return [format(columns.map(heading)), format(widths.map((width) => "-".repeat(width))), ...values.map(format)].join("\n");
+}
+
 /**
  * Render one `details` entry for a human terminal.
  *
@@ -89,7 +131,7 @@ export function createOutputWriter(input: {
           JSON.stringify({ schema_version: OUTPUT_SCHEMA_VERSION, type: "result", command, data }),
         );
       } else {
-        writeLine(input.streams.stdout, sanitizeHumanTerminalOutput(human));
+        writeLine(input.streams.stderr, renderHumanResult(data, human));
       }
     },
     error(command, error) {
@@ -120,7 +162,7 @@ export function createOutputWriter(input: {
       }
     },
     text(value) {
-      writeLine(input.streams.stdout, sanitizeHumanTerminalOutput(value));
+      writeLine(input.streams.stderr, sanitizeHumanTerminalOutput(value));
     },
   };
   return Object.freeze(writer);

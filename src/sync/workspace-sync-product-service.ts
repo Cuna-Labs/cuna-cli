@@ -18,6 +18,7 @@ import {
   FileWorkspaceSyncCheckpointStore,
   WorkspaceSyncCoordinator,
   createFilesystemChunkSource,
+  type WorkspaceSyncProgress,
 } from "./workspace-sync-coordinator.js";
 import { WORKSPACE_SYNC_PROTOCOL } from "./workspace-sync-protocol.js";
 
@@ -48,6 +49,7 @@ export interface SynchronizeLocalWorkspaceInput {
   readonly maximumConcurrentUploads?: number;
   readonly maximumAttempts?: number;
   readonly signal?: AbortSignal;
+  readonly onProgress?: (progress: WorkspaceSyncProgress) => void;
 }
 
 export interface WorkspaceSyncProductReceipt {
@@ -130,6 +132,7 @@ export async function synchronizeLocalWorkspace(
         ? {}
         : { maximumConcurrentUploads: input.maximumConcurrentUploads }),
       ...(input.maximumAttempts === undefined ? {} : { maximumAttempts: input.maximumAttempts }),
+      ...(input.onProgress === undefined ? {} : { onProgress: input.onProgress }),
     });
     const receipt = await coordinator.synchronize({
       workspaceId,

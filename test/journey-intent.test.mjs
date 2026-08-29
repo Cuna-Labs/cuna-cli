@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isAbsolute } from "node:path";
 import test from "node:test";
 
 import {
@@ -44,6 +45,13 @@ test("agent commands normalize to closed agent kinds without performing journey 
   }
 });
 
+test("a relative local path is resolved at admission", () => {
+  const intent = parseAgentJourneyIntent(["claude", "."]);
+  assert.equal(intent.target, "reconcile");
+  assert.equal(typeof intent.localPath, "string");
+  assert.equal(isAbsolute(intent.localPath), true);
+});
+
 test("the admitted reconcile intent preserves exact path, machine selector, auth mode, and session choice", () => {
   const intent = parseAgentJourneyIntent([
     "claude",
@@ -57,13 +65,15 @@ test("the admitted reconcile intent preserves exact path, machine selector, auth
     "--credential-binding",
     CREDENTIAL_BINDING_ID,
   ]);
-  assert.deepEqual(intent, {
+  const { localPath, ...withoutLocalPath } = intent;
+  assert.equal(typeof localPath, "string");
+  assert.equal(isAbsolute(localPath), true);
+  assert.deepEqual(withoutLocalPath, {
     schemaVersion: "1.0",
     command: "claude",
     agent: "claude-code",
     target: "reconcile",
     machine: { kind: "exact-name", name: "review-machine" },
-    localPath: "services/api",
     syncMode: "disabled",
     newSession: true,
     authMode: "credential_binding",
@@ -235,7 +245,7 @@ test("argv-derived values with unsafe types, controls, empty paths, or oversized
 test("the option terminator preserves an exact path that begins with two hyphens", () => {
   const intent = parseAgentJourneyIntent(["claude", "--", "--machine"]);
   assert.equal(intent.target, "reconcile");
-  assert.equal(intent.localPath, "--machine");
+  assert.equal(isAbsolute(intent.localPath ?? ""), true);
   assert.deepEqual(intent.machine, { kind: "automatic" });
 });
 

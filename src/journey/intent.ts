@@ -1,4 +1,5 @@
 import type { AgentAuthMode, AgentKind } from "../api/contracts.js";
+import { resolve } from "node:path";
 import { parseArgv, type OptionValue, type ParsedInvocation } from "../cli/parser.js";
 import { usageError } from "../core/errors.js";
 import { assertCanonicalUuid, assertSafeDisplayText } from "../core/validation.js";
@@ -139,7 +140,7 @@ function safeLocalPath(value: string): string {
       "The path must not contain control or formatting characters and must be at most 4096 characters.",
     );
   }
-  return value;
+  return resolve(value);
 }
 
 function safeMachineName(value: string): string {

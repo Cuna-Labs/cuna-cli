@@ -155,7 +155,7 @@ try {
       automatic.agent = intent.agent;
       const automaticSessionId = process.env.CUNA_TEST_AGENT_SESSION_ID;
       return {
-        onPhase(phase) { automatic.phases.push(phase); },
+        onPhase(event) { if (event.type === "started") automatic.phases.push(event.phase); },
         async inspectWorkspace() { return { canonicalLocalRoot: process.cwd() }; },
         async observeMachines() { return [{ id: "10000000-0000-4000-8000-000000000001", name: "matrix-machine", agent: "unknown", requestedAgentSupport: "supported", state: "running", ownership: "owned", freshness: "fresh", recency: "recent", resources: {}, costStatus: "known" }]; },
         async createMachine() { return { id: "10000000-0000-4000-8000-000000000001", state: "running" }; },

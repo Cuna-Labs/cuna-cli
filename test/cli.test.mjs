@@ -1762,7 +1762,7 @@ test("valid automatic agent intents execute the effects-fenced journey and exact
       },
       clientFactory: () => fakeClient(),
       automaticJourneyEffectsFactory: () => ({
-        onPhase(phase) { phases.push(phase); },
+        onPhase(event) { if (event.type === "started") phases.push(event.phase); },
         async inspectWorkspace() { return { canonicalLocalRoot: "C:\\work\\project" }; },
         async observeMachines() {
           return [{ id: FOREGROUND_SESSION_A, name: "review", agent: "unknown", requestedAgentSupport: "supported", state: "running", ownership: "owned", freshness: "fresh", recency: "recent", resources: {}, costStatus: "known" }];
@@ -1783,6 +1783,9 @@ test("valid automatic agent intents execute the effects-fenced journey and exact
     assert.deepEqual(attached, { id: FOREGROUND_SESSION_C, agent: argv[0] === "claude" ? "claude-code" : argv[0] });
     assert.equal(phases[0], "inspect-workspace");
     assert.equal(phases.at(-1), "attach");
+    assert.match(streams.stderr(), /inspect workspace - completed/u);
+    assert.match(streams.stderr(), /attach - completed/u);
+    assert.doesNotMatch(streams.stdout(), /Cuna:/u);
   }
 });
 

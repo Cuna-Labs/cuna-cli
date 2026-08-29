@@ -74,6 +74,15 @@ export interface WorkspaceSyncCoordinatorOptions {
   readonly maximumAttempts?: number;
   readonly sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   readonly now?: () => Date;
+  readonly onProgress?: (progress: WorkspaceSyncProgress) => void;
+}
+
+/** Measured local-manifest work, never a time-derived estimate. */
+export interface WorkspaceSyncProgress {
+  readonly completedBytes: number;
+  readonly totalBytes: number;
+  readonly completedFiles: number;
+  readonly totalFiles: number;
 }
 
 export interface SynchronizeWorkspaceInput {
@@ -92,6 +101,7 @@ export class WorkspaceSyncCoordinator {
   readonly #maximumConcurrentUploads: number;
   readonly #maximumAttempts: number;
   readonly #sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+  readonly #onProgress?: (progress: WorkspaceSyncProgress) => void;
   readonly #now: () => Date;
 
   constructor(options: WorkspaceSyncCoordinatorOptions) {
@@ -106,6 +116,7 @@ export class WorkspaceSyncCoordinator {
     );
     this.#maximumAttempts = boundedInteger(options.maximumAttempts ?? 3, 1, 5, "attempt_limit");
     this.#sleep = options.sleep ?? abortableSleep;
+    if (options.onProgress !== undefined) this.#onProgress = options.onProgress;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -124,6 +135,21 @@ export class WorkspaceSyncCoordinator {
     input: SynchronizeWorkspaceInput,
     transaction: WorkspaceSyncCheckpointTransaction,
   ): Promise<WorkspaceSyncCommitReceipt> {
+    const files = input.manifest.entries.filter((entry) => entry.kind === "file");
+    const totals = Object.freeze({
+      totalBytes: files.reduce((sum, entry) => sum + entry.byteLength, 0),
+      totalFiles: files.length,
+    });
+    let completedBytes = 0;
+    let completedFiles = 0;
+    const reportProgress = (): void => {
+      try {
+        this.#onProgress?.(Object.freeze({ completedBytes, completedFiles, ...totals }));
+      } catch {
+        // Progress is presentation-only and must never alter a durable sync.
+      }
+    };
+    reportProgress();
     const identity = Object.freeze({
       workspace_id: input.workspaceId,
       workspace_binding_id: input.workspaceBindingId,
@@ -137,6 +163,9 @@ export class WorkspaceSyncCoordinator {
     checkpoint ??= await this.#persist(transaction, { ...identity, phase: "begin_pending", sync_id: null, selected_protocol: null, committed_generation: null });
     if (checkpoint.phase === "committed") {
       if (checkpoint.sync_id === null || checkpoint.selected_protocol === null || checkpoint.committed_generation === null) throw invalidCheckpoint();
+      completedBytes = totals.totalBytes;
+      completedFiles = totals.totalFiles;
+      reportProgress();
       return Object.freeze({
         selected_protocol: checkpoint.selected_protocol,
         state: "committed",
@@ -203,6 +232,10 @@ export class WorkspaceSyncCoordinator {
           const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
           if (failure !== undefined) throw failure.reason;
         }
+        completedBytes += page.entries.filter((entry) => entry.kind === "file").reduce((sum, entry) => sum + entry.byte_length, 0);
+        completedFiles += page.entries.filter((entry) => entry.kind === "file").length;
+        reportProgress();
+
       }
       checkpoint = await this.#persist(transaction, { ...identity, phase: "commit_pending", sync_id: syncId, selected_protocol: selectedProtocol, committed_generation: null });
       const commitRequest = Object.freeze({
