@@ -15,6 +15,7 @@ import {
   localEncryptedSessionPaths,
   WINDOWS_ACL_COMMAND_PROGRAMS,
 } from "../dist/credentials/index.js";
+import { CredentialBoundaryError } from "../dist/credentials/errors.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -65,6 +66,31 @@ test("Windows ACL commands are static and isolate case-insensitive child environ
   assert.deepEqual(namesFor(reconciliationEnvironment, "CUNA_SESSION_ACL_SID_V1"), []);
   assert.equal(inherited.cuna_session_acl_path_v1, "hostile-lowercase-path", "the parent environment is never mutated");
   assert.equal(inherited.cuna_session_acl_sid_v1, "S-1-5-21-555-666-777-888", "the parent environment is never mutated");
+});
+
+test("Windows probe preserves a nested ACL process timeout instead of reporting unavailable credentials", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cuna-local-session-probe-timeout-"));
+  const paths = localEncryptedSessionPaths(directory, "probe-timeout");
+  const timeout = Object.assign(new Error("simulated killed PowerShell ACL inspection"), {
+    killed: true,
+    signal: "SIGTERM",
+  });
+  const windowsAcl = {
+    inspectOwnerOnly: async () => { throw new Error("ACL adapter failed", { cause: timeout }); },
+    reconcileNewOwnerOnly: async () => { throw new Error("unexpected reconciliation"); },
+  };
+  try {
+    await mkdir(path.dirname(paths.sessionFile), { recursive: true });
+    const backend = new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl });
+    await assert.rejects(
+      backend.probe(),
+      (error) => error instanceof CredentialBoundaryError &&
+        error.code === "credential_process_timeout" &&
+        error.retryable === true &&
+        error.cause === timeout,
+      "the process failure must survive both the adapter and probe boundaries",
+    );
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 function waitForChild(child, phase) {
@@ -183,13 +209,15 @@ test("Windows ACL work uses a fresh SID, verifies first, and never repairs a tam
     calls.reconcile.length = 0;
     calls.inspect.length = 0;
     const secondBackend = new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl });
+    assert.equal((await secondBackend.probe()).status, "verified");
     assert.deepEqual(Buffer.from(await secondBackend.read("ignored")), Buffer.from(`cuna_login_${"p".repeat(43)}`));
     assert.equal(new Set(calls.inspect.map(({ currentSid }) => currentSid)).size, calls.inspect.length, "a second backend repeats fresh owner inspection");
     assert.equal(calls.reconcile.length, 0, "an existing compliant path does not mutate ACLs");
+    assert.equal(calls.inspect.length, 6, "probe and read each inspect the directory, key, and ciphertext");
     assert.equal(
       calls.inspect.filter(({ target, directoryEntry }) => target === sessionDirectory && directoryEntry).length,
-      1,
-      "the existing directory receives its full owner/DACL inspection after physical lock acquisition",
+      2,
+      "probe and read each inspect the existing directory after acquiring the physical lock",
     );
 
     compliant.delete(entry(paths.sessionFile, false));
@@ -357,9 +385,9 @@ test("Windows ACL verification timeout is a retryable backend failure and preser
     const reader = new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl: failingAcl });
     await assert.rejects(
       reader.read("ignored"),
-      (error) => error?.code === "credential_backend_failure" &&
+      (error) => error?.code === "credential_process_timeout" &&
         error.retryable === true &&
-        error.safeDetails?.reason === "windows_acl_inspection_timeout",
+        error.safeDetails?.reason === "credential_process_timeout",
     );
     assert.deepEqual(await readFile(paths.sessionFile), beforeSession, "a failed ACL observation must not erase ciphertext");
     assert.deepEqual(await readFile(paths.keyFile), beforeKey, "a failed ACL observation must not erase the key");
