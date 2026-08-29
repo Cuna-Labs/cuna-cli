@@ -94,7 +94,7 @@ test("the full surface stays reachable and keeps every relocated section", async
   // one. Relocation is only legitimate if the destination actually holds them.
   for (const section of [
     "Available now:",
-    "Capability-gated foreground preview:",
+    "Foreground terminal attach (the server must grant terminal_connections.create):",
     "Automatic local-to-cloud journey:",
     "Reserved and fail-closed in this build:",
     "Global options:",

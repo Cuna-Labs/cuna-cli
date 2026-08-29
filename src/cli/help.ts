@@ -62,16 +62,29 @@ export const FIRST_RUN_TRANSCRIPT: readonly (readonly string[])[] = Object.freez
 ]);
 
 /**
- * Render primary discovery from supported command capabilities. A producer
- * claim cannot advertise a provider whose command route is absent from this
- * build, which keeps OpenCode hidden until both halves actually exist.
+ * Render primary discovery as the intersection of this build's provider routes
+ * and the caller's set.
+ *
+ * WHAT THE DEFAULT MEANS. Help is rendered offline, before any credential or
+ * capability request, so the only authority available to it is this build's
+ * route registry. The default therefore lists every ROUTED provider and makes
+ * no claim at all about what the server currently serves. It is not a
+ * capability filter, and the earlier comment here claimed it was one: it said
+ * this call "keeps OpenCode hidden until both halves actually exist" while
+ * production's only call site is `renderShortHelp()` with no argument, whose
+ * default is derived from the same registry it filters — a tautology that
+ * could never hide anything.
+ *
+ * The parameter is still real, and narrower than the default: a caller holding
+ * a live capability snapshot may pass the subset it proves. Nothing in this
+ * package does that today.
  */
 export function renderShortHelp(
-  supportedProviderCommands: readonly string[] = CURRENT_PROVIDER_COMMANDS,
+  routedProviderCommands: readonly string[] = CURRENT_PROVIDER_COMMANDS,
 ): string {
-  const supported = new Set(supportedProviderCommands);
+  const routed = new Set(routedProviderCommands);
   const providerLines = CURRENT_PROVIDER_COMMANDS
-    .filter((command) => supported.has(command))
+    .filter((command) => routed.has(command))
     .map((command) => `  cuna ${command} [PATH]${" ".repeat(Math.max(1, 18 - command.length))}${PROVIDER_LABELS[command]}`)
     .join("\n");
   return `Cuna CLI
@@ -101,9 +114,22 @@ Advanced and automation:
 
 export const SHORT_HELP = renderShortHelp();
 
+/**
+ * The marker legend, printed immediately above the reference.
+ *
+ * Without it the bracketed word reads as a status, and a status is exactly what
+ * this CLI cannot know before it asks. Naming the authority in the same breath
+ * is the whole repair.
+ */
+export const COMMAND_REFERENCE_LEGEND = `  [routed]   this build dispatches the command
+  [reserved] this build accepts the name and refuses
+  Neither marker is a server answer. Run \`cuna capabilities\` for what the
+  server currently proves for your account, machine, or AgentSession.
+`;
+
 /** One generated line per semantic parser route; tests parse these markers. */
 export const COMPLETE_COMMAND_REFERENCE = CLI_ROUTE_REGISTRY
-  .map((route) => `  [${route.classification}] ${route.key} :: cuna ${route.syntax}\n      ${route.summary}`)
+  .map((route) => `  [${route.dispatch}] ${route.key} :: cuna ${route.syntax}\n      ${route.summary}`)
   .join("\n");
 
 export const FULL_HELP = `Cuna CLI
@@ -117,7 +143,7 @@ Available now:
   signup                               Create a waitlist-only Cuna account in the browser
   login                                Sign in through the browser and paste the durable login code
   whoami                               Show account context; reuse the encrypted session
-  access status                        Show identity, admission, and workspace separately
+  access status                        Print the same line whoami prints, as record access.status
   logout                               Revoke the login-code family server-first;
                                        reuse the encrypted session automatically
   capabilities                         Inspect current server capability truth
@@ -125,6 +151,7 @@ Available now:
   machines list                        List owned Cuna machines
   machines create [options]            Create a machine when server-advertised
   machines start|pause|resume|stop ID  Change lifecycle when server-advertised
+  machines update-supervisor ID        Update a stopped OpenCode terminal supervisor
   machines delete ID                   Delete when server-advertised
   records list                         List redacted account activity records
   account show                         Show the public account identity
@@ -144,18 +171,24 @@ Available now:
   self-test --offline                  Verify the installed CLI without network access
   doctor                               Report platform, runtime, and encrypted local session-store state
 
-Capability-gated foreground preview:
+Foreground terminal attach (the server must grant terminal_connections.create):
   connect SESSION_ID [SESSION_ID...]   Attach 1-4 exact cloud sessions in this terminal
   agent-sessions attach SESSION_ID     Attach one exact cloud session in this terminal
   agent logout --agent-session ID      Sign Claude Code or Codex out of one exact AgentSession
   claude --agent-session SESSION_ID    Attach one exact Claude Code child
   codex --agent-session SESSION_ID     Attach one exact Codex child
   opencode --agent-session SESSION_ID  Attach one exact OpenCode child
-  The server must prove current terminal capability. JSON and redirected output
-  fail closed. Nested SSH/tmux and TERM=dumb use a one-session byte-preserving plain
-  fallback with no appbar; set CUNA_TERMINAL_MODE=plain for accessibility or diagnosis.
+  These routes exist in this build. That is the whole of what the [routed]
+  marker in the complete reference below claims about them.
+  Each invocation still re-reads an AgentSession-scoped capability snapshot and
+  refuses, changing nothing, when the server does not grant
+  terminal_connections.create for that exact session. \`cuna capabilities --scope
+  agent_session --resource-id ID\` shows the same answer before you attach.
+  JSON and redirected output fail closed. Nested SSH/tmux and TERM=dumb use a
+  one-session byte-preserving plain fallback with no appbar; set
+  CUNA_TERMINAL_MODE=plain for accessibility or diagnosis.
   Ctrl+C detaches locally in one press. Use Ctrl+] c to send Ctrl+C to the agent.
-  Background daemon and local companion behavior remain unavailable.
+  Background daemon and local companion behavior are absent from this build.
 
 Automatic local-to-cloud journey:
   claude [PATH] [--machine NAME | --new] [--no-sync] [--new-session]
@@ -173,8 +206,10 @@ Automatic local-to-cloud journey:
   Ambiguous, stale, cancelled, or unknown outcomes fail closed without silently
   choosing a target or retrying with a second identity.
   --credential-binding ID is required exactly when --auth-mode is credential_binding.
-  OpenCode is interactive-only: use /connect inside its terminal. Provider credentials
-  remain in that AgentSession and are never copied from Codex or another provider store.
+  OpenCode is interactive-only: after Cuna attaches its remote terminal, use
+  /connect to choose and sign in to a provider, then /models to choose a model.
+  Cuna does not broker an OpenCode device-sign-in page. Provider credentials remain
+  in that AgentSession and are never copied from Codex or another provider store.
   Use --agent-session SESSION_ID to bypass reconciliation and attach one exact child;
   it cannot be combined with PATH, --machine, --new, --new-session, --no-sync,
   --auth-mode, or --credential-binding.
@@ -183,6 +218,7 @@ Reserved and fail-closed in this build:
   shell, background daemon, local companion
 
 Complete command reference:
+${COMMAND_REFERENCE_LEGEND}
 ${COMPLETE_COMMAND_REFERENCE}
 
 Compatibility aliases (advanced only):

@@ -7,7 +7,28 @@ export interface ParsedInvocation {
   readonly options: Readonly<Record<string, OptionValue>>;
 }
 
-export type CliRouteClassification = "supported" | "compatibility-reserved";
+/**
+ * What THIS BUILD does with a command name. Never what the server allows.
+ *
+ * `routed`   — the preflight switch in `commands/commands.ts` dispatches this
+ *              leaf in this build.
+ * `reserved` — the name is accepted for compatibility and refuses.
+ *
+ * This vocabulary is deliberately DISJOINT from `CapabilityAvailability` in
+ * `src/api/contracts.ts` (`supported | unsupported | temporarily_unavailable |
+ * unknown`). That enum is the server's answer about one capability at one
+ * moment. This field is a compile-time constant computed with no network call,
+ * so it cannot know that answer.
+ *
+ * The two were spelled the same word until 2026-08-29, and `cuna help --all`
+ * consequently stamped `[supported]` on `machines.start`, every
+ * `agent-sessions` action, every terminal path, `usage`, `workspace`,
+ * `authorizations` and `api_keys.list` — while a live `cuna capabilities`
+ * listed none of them. One word, two authorities, and the offline one won on
+ * screen. `test/progressive-command-disclosure.test.mjs` now fails if the two
+ * vocabularies ever intersect again.
+ */
+export type CliRouteDispatch = "routed" | "reserved";
 
 /**
  * One semantic leaf accepted by the CLI preflight/dispatch boundary.
@@ -25,10 +46,10 @@ export interface CliRouteDefinition {
   readonly syntax: string;
   readonly argv: readonly string[];
   readonly summary: string;
-  readonly classification: CliRouteClassification;
+  readonly dispatch: CliRouteDispatch;
 }
 
-const supported = (
+const routed = (
   key: string,
   syntax: string,
   argv: readonly string[],
@@ -42,7 +63,7 @@ const supported = (
   syntax,
   argv: Object.freeze([...argv]),
   summary,
-  classification: "supported",
+  dispatch: "routed",
 });
 
 const reserved = (key: string, summary: string): CliRouteDefinition => Object.freeze({
@@ -53,49 +74,50 @@ const reserved = (key: string, summary: string): CliRouteDefinition => Object.fr
   syntax: key,
   argv: Object.freeze(key.split(" ")),
   summary,
-  classification: "compatibility-reserved",
+  dispatch: "reserved",
 });
 
 /** The closed discovery projection of the command preflight switch. */
 export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
-  supported("signup", "signup", ["signup"], "Create an account through the browser"),
-  supported("login", "login", ["login"], "Sign in through the browser"),
-  supported("logout", "logout", ["logout"], "Revoke the current interactive login"),
-  supported("whoami", "whoami", ["whoami"], "Show the current account context"),
-  supported("access status", "access status", ["access", "status"], "Show identity, admission, and workspace state"),
-  supported("capabilities", "capabilities", ["capabilities"], "Inspect live server capability truth"),
-  supported("machines", "machines", ["machines"], "Browse machines and AgentSessions interactively"),
-  supported("machines list", "machines list", ["machines", "list"], "List exact machine resources"),
-  supported("machines create", "machines create --name NAME --yes", ["machines", "create", "--name", "fixture", "--yes"], "Create a machine"),
-  supported("machines start", "machines start MACHINE_ID --yes", ["machines", "start", "00000000-0000-4000-8000-000000000001", "--yes"], "Start a machine"),
-  supported("machines pause", "machines pause MACHINE_ID --yes", ["machines", "pause", "00000000-0000-4000-8000-000000000001", "--yes"], "Pause a machine"),
-  supported("machines resume", "machines resume MACHINE_ID --yes", ["machines", "resume", "00000000-0000-4000-8000-000000000001", "--yes"], "Resume a machine"),
-  supported("machines stop", "machines stop MACHINE_ID --yes", ["machines", "stop", "00000000-0000-4000-8000-000000000001", "--yes"], "Stop a machine"),
-  supported("machines delete", "machines delete MACHINE_ID --yes", ["machines", "delete", "00000000-0000-4000-8000-000000000001", "--yes"], "Delete a machine"),
-  supported("records list", "records list", ["records", "list"], "List redacted account activity"),
-  supported("authorizations list", "authorizations list --machine MACHINE_ID", ["authorizations", "list", "--machine", "00000000-0000-4000-8000-000000000001"], "List machine credential rules"),
-  supported("account show", "account show", ["account", "show"], "Show the account identity"),
-  supported("workspace show", "workspace show", ["workspace", "show"], "Show workspace assignment"),
-  supported("usage show", "usage show", ["usage", "show"], "Show workspace usage estimates"),
-  supported("api-keys list", "api-keys list", ["api-keys", "list"], "List API-key metadata"),
-  supported("api-keys create", "api-keys create --name NAME --yes", ["api-keys", "create", "--name", "fixture", "--yes"], "Create an API key"),
-  supported("api-keys revoke", "api-keys revoke KEY_ID --yes", ["api-keys", "revoke", "00000000-0000-4000-8000-000000000001", "--yes"], "Revoke an API key"),
-  supported("agent-sessions list", "agent-sessions list --machine MACHINE_ID", ["agent-sessions", "list", "--machine", "00000000-0000-4000-8000-000000000001"], "List a machine's AgentSessions"),
-  supported("agent-sessions get", "agent-sessions get SESSION_ID", ["agent-sessions", "get", "00000000-0000-4000-8000-000000000001"], "Read one AgentSession"),
-  supported("agent-sessions create", "agent-sessions create --machine ID --workspace-binding-id ID --workspace-generation N --agent KIND --yes", ["agent-sessions", "create", "--machine", "00000000-0000-4000-8000-000000000001", "--workspace-binding-id", "00000000-0000-4000-8000-000000000002", "--workspace-generation", "1", "--agent", "claude-code", "--yes"], "Create an exact AgentSession"),
-  supported("agent-sessions rename", "agent-sessions rename SESSION_ID --name NAME --yes", ["agent-sessions", "rename", "00000000-0000-4000-8000-000000000001", "--name", "fixture", "--yes"], "Rename an AgentSession"),
-  supported("agent-sessions terminate", "agent-sessions terminate SESSION_ID --yes", ["agent-sessions", "terminate", "00000000-0000-4000-8000-000000000001", "--yes"], "Terminate an AgentSession"),
-  supported("agent-sessions attach", "agent-sessions attach SESSION_ID", ["agent-sessions", "attach", "00000000-0000-4000-8000-000000000001"], "Attach an exact AgentSession"),
-  supported("agent logout", "agent logout --agent-session SESSION_ID --yes", ["agent", "logout", "--agent-session", "00000000-0000-4000-8000-000000000001", "--yes"], "Sign a provider out of one AgentSession"),
-  supported("connect", "connect SESSION_ID [SESSION_ID...]", ["connect", "00000000-0000-4000-8000-000000000001"], "Attach one through four exact AgentSessions", "free"),
-  supported("config get", "config get", ["config", "get"], "Show redacted configuration"),
-  supported("doctor", "doctor", ["doctor"], "Inspect local runtime health"),
-  supported("self-test", "self-test --offline", ["self-test", "--offline"], "Verify this installation offline"),
-  supported("version", "version", ["version"], "Show build identity"),
-  supported("help", "help [--all]", ["help"], "Show primary or complete help"),
-  supported("claude", "claude [PATH]", ["claude"], "Open Claude Code", "free"),
-  supported("codex", "codex [PATH]", ["codex"], "Open Codex", "free"),
-  supported("opencode", "opencode [PATH]", ["opencode"], "Open OpenCode", "free"),
+  routed("signup", "signup", ["signup"], "Create an account through the browser"),
+  routed("login", "login", ["login"], "Sign in through the browser"),
+  routed("logout", "logout", ["logout"], "Revoke the current interactive login"),
+  routed("whoami", "whoami", ["whoami"], "Show the current account context"),
+  routed("access status", "access status", ["access", "status"], "Show the same account context whoami prints, recorded as access.status"),
+  routed("capabilities", "capabilities", ["capabilities"], "Inspect live server capability truth"),
+  routed("machines", "machines", ["machines"], "Browse machines and AgentSessions interactively"),
+  routed("machines list", "machines list", ["machines", "list"], "List exact machine resources"),
+  routed("machines create", "machines create --name NAME --yes", ["machines", "create", "--name", "fixture", "--yes"], "Create a machine"),
+  routed("machines start", "machines start MACHINE_ID --yes", ["machines", "start", "00000000-0000-4000-8000-000000000001", "--yes"], "Start a machine"),
+  routed("machines pause", "machines pause MACHINE_ID --yes", ["machines", "pause", "00000000-0000-4000-8000-000000000001", "--yes"], "Pause a machine"),
+  routed("machines resume", "machines resume MACHINE_ID --yes", ["machines", "resume", "00000000-0000-4000-8000-000000000001", "--yes"], "Resume a machine"),
+  routed("machines stop", "machines stop MACHINE_ID --yes", ["machines", "stop", "00000000-0000-4000-8000-000000000001", "--yes"], "Stop a machine"),
+  routed("machines update-supervisor", "machines update-supervisor MACHINE_ID --yes", ["machines", "update-supervisor", "00000000-0000-4000-8000-000000000001", "--yes"], "Update a stopped machine's terminal supervisor"),
+  routed("machines delete", "machines delete MACHINE_ID --yes", ["machines", "delete", "00000000-0000-4000-8000-000000000001", "--yes"], "Delete a machine"),
+  routed("records list", "records list", ["records", "list"], "List redacted account activity"),
+  routed("authorizations list", "authorizations list --machine MACHINE_ID", ["authorizations", "list", "--machine", "00000000-0000-4000-8000-000000000001"], "List machine credential rules"),
+  routed("account show", "account show", ["account", "show"], "Show the account identity"),
+  routed("workspace show", "workspace show", ["workspace", "show"], "Show workspace assignment"),
+  routed("usage show", "usage show", ["usage", "show"], "Show workspace usage estimates"),
+  routed("api-keys list", "api-keys list", ["api-keys", "list"], "List API-key metadata"),
+  routed("api-keys create", "api-keys create --name NAME --yes", ["api-keys", "create", "--name", "fixture", "--yes"], "Create an API key"),
+  routed("api-keys revoke", "api-keys revoke KEY_ID --yes", ["api-keys", "revoke", "00000000-0000-4000-8000-000000000001", "--yes"], "Revoke an API key"),
+  routed("agent-sessions list", "agent-sessions list --machine MACHINE_ID", ["agent-sessions", "list", "--machine", "00000000-0000-4000-8000-000000000001"], "List a machine's AgentSessions"),
+  routed("agent-sessions get", "agent-sessions get SESSION_ID", ["agent-sessions", "get", "00000000-0000-4000-8000-000000000001"], "Read one AgentSession"),
+  routed("agent-sessions create", "agent-sessions create --machine ID --workspace-binding-id ID --workspace-generation N --agent KIND --yes", ["agent-sessions", "create", "--machine", "00000000-0000-4000-8000-000000000001", "--workspace-binding-id", "00000000-0000-4000-8000-000000000002", "--workspace-generation", "1", "--agent", "claude-code", "--yes"], "Create an exact AgentSession"),
+  routed("agent-sessions rename", "agent-sessions rename SESSION_ID --name NAME --yes", ["agent-sessions", "rename", "00000000-0000-4000-8000-000000000001", "--name", "fixture", "--yes"], "Rename an AgentSession"),
+  routed("agent-sessions terminate", "agent-sessions terminate SESSION_ID --yes", ["agent-sessions", "terminate", "00000000-0000-4000-8000-000000000001", "--yes"], "Terminate an AgentSession"),
+  routed("agent-sessions attach", "agent-sessions attach SESSION_ID", ["agent-sessions", "attach", "00000000-0000-4000-8000-000000000001"], "Attach an exact AgentSession once the server grants terminal_connections.create"),
+  routed("agent logout", "agent logout --agent-session SESSION_ID --yes", ["agent", "logout", "--agent-session", "00000000-0000-4000-8000-000000000001", "--yes"], "Sign a provider out of one AgentSession"),
+  routed("connect", "connect SESSION_ID [SESSION_ID...]", ["connect", "00000000-0000-4000-8000-000000000001"], "Attach one through four exact AgentSessions once the server grants terminal_connections.create", "free"),
+  routed("config get", "config get", ["config", "get"], "Show redacted configuration"),
+  routed("doctor", "doctor", ["doctor"], "Inspect local runtime health"),
+  routed("self-test", "self-test --offline", ["self-test", "--offline"], "Verify this installation offline"),
+  routed("version", "version", ["version"], "Show build identity"),
+  routed("help", "help [--all]", ["help"], "Show primary or complete help"),
+  routed("claude", "claude [PATH]", ["claude"], "Open Claude Code", "free"),
+  routed("codex", "codex [PATH]", ["codex"], "Open Codex", "free"),
+  routed("opencode", "opencode [PATH]", ["opencode"], "Open OpenCode", "free"),
   reserved("config set", "Reserved; configuration mutation is not implemented"),
   reserved("shell", "Reserved; no shell runtime in this build"),
   reserved("sync", "Reserved; no standalone sync command in this build"),
