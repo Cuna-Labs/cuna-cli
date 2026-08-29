@@ -40,6 +40,16 @@ const requestLedger = [];
 let machineGate;
 let machineRequestObservedAt;
 let agentSessionScenario = "default";
+// OpenCode's attach label is deliberately not "Attaching to <provider>": it
+// must ALSO tell the person that provider sign-in happens with `/connect`
+// inside the remote TUI, because Cuna never holds an OpenCode credential.
+// This asserts the two properties that copy has to keep — it names the
+// provider, and it names `/connect` — instead of one frozen sentence. Honest
+// rewording stays legal; dropping the instruction does not. The previous
+// literal went stale when the label improved, and a stale witness is no
+// witness: this case was failing while the attach itself worked.
+const OPENCODE_ATTACH_LABEL = /OpenCode terminal[^\n]*\/connect/u;
+
 const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 const DIAGNOSTIC_TAIL_CHARACTERS = 1_200;
 
@@ -448,7 +458,7 @@ try {
     testId: "T14.3-WIN-OPENCODE-DIRECT", args: [machinesToForegroundFixture, configFile, "--opencode"], environment: cliEnvironment,
     async drive(context) {
       await context.waitUntil(
-        () => context.transcript().includes("Connecting to OpenCode") || context.transcript().includes("Attaching to OpenCode"),
+        () => OPENCODE_ATTACH_LABEL.test(context.transcript()),
         "cuna opencode did not render immediate provider-specific feedback",
       );
       context.observations.processLaunchToFeedbackMs = Date.now() - context.launchedAt;
@@ -462,9 +472,9 @@ try {
         "cuna opencode did not compose the Cuna appbar with the OpenCode provider viewport",
       );
       const transition = context.transcript();
-      assert.match(transition, /Attaching to OpenCode/u, "OpenCode attach progress did not identify the provider");
+      assert.match(transition, OPENCODE_ATTACH_LABEL, "OpenCode attach progress did not identify the provider");
       assert.ok(
-        transition.indexOf("Attaching to OpenCode") < transition.indexOf("OPENCODE_TUI_ANSI256"),
+        transition.search(OPENCODE_ATTACH_LABEL) < transition.indexOf("OPENCODE_TUI_ANSI256"),
         "OpenCode feedback first appeared only after foreground ownership",
       );
       assert.match(transition, /◐/u, "OpenCode attach did not render the first loading frame");
@@ -483,6 +493,25 @@ try {
       context.child.write("\u001b[A");
       await context.waitUntil(() => context.screen().includes("❯ Continue"), "Up arrow did not move inside the OpenCode provider TUI");
       context.observations.arrowNavigation = "Continue → Connect provider → Continue";
+      // Long paste, one of the negative paths with no witness until now. A
+      // large paste is not a big keystroke: ConPTY delivers it in chunks, and
+      // the way it fails is silent — a boundary swallows bytes, or reorders
+      // them, and the viewport still looks correct. Assert the exact length the
+      // provider received and both edges, so truncation, reordering at the
+      // ends, and appended noise are all caught rather than merely "input
+      // arrived".
+      const pasted = Array.from(
+        { length: 4096 },
+        (_, index) => "abcdefghijklmnopqrstuvwxyz0123456789"[index % 36],
+      ).join("");
+      context.child.write(`${pasted}\r`);
+      await context.waitUntil(
+        () => context.screen().includes(`PASTED ${pasted.length} ${pasted.slice(0, 8)} ${pasted.slice(-8)}`),
+        `a ${pasted.length}-byte paste did not reach the OpenCode provider intact`,
+        10_000,
+      );
+      context.observations.longPasteBytes = pasted.length;
+
       context.resize(64, 16);
       await context.waitUntil(
         () => context.screen().includes("CUNA") && context.screen().includes("OPENCODE_TUI_ANSI256") && context.screen().includes("RESIZED_64x14"),
@@ -512,7 +541,7 @@ try {
     async oracle({ finalState, transcript }) {
       assert.equal(finalState.exitCode, 0, "cuna opencode ConPTY flow exited nonzero");
       assert.equal(finalState.activeScreen, "normal", "cuna opencode did not restore the normal screen");
-      assert.match(transcript(), /Attaching to OpenCode/u, "cuna opencode did not preserve its provider-specific attach label");
+      assert.match(transcript(), OPENCODE_ATTACH_LABEL, "cuna opencode did not preserve its provider-specific attach label");
       assert.match(transcript(), /\u001b\[\?1049h/u, "cuna opencode never entered the alternate screen");
       assert.match(transcript(), /\u001b\[\?1049l/u, "cuna opencode did not leave the alternate screen");
     },
@@ -527,7 +556,36 @@ try {
           () => context.screen().includes("claude-ended-a") && context.screen().includes("claude-live"),
           "bare cuna did not reach its machine-first selector",
         );
-        assert.match(context.transcript(), /Finding a machine or AgentSession/u, "bare cuna did not render discovery progress");
+        // The promise this guards is stated at src/cli/run.ts:870-875: a bare
+        // interactive invocation must acknowledge input BEFORE any credential,
+        // configuration or network read, so the terminal is never blank while
+        // work is happening. The old literal ("Finding a machine or
+        // AgentSession") belonged to a superseded root journey; bare `cuna`
+        // now opens the Machines browser, which names its work more precisely
+        // ("Refreshing live sessions"). Assert the promise and its ordering,
+        // not the retired sentence — a rewording stays legal, and going quiet
+        // does not.
+        const acknowledgedAt = context.transcript().indexOf("Starting Cuna");
+        assert.ok(acknowledgedAt >= 0, "bare cuna did not acknowledge input before its first read");
+        assert.ok(
+          acknowledgedAt < context.transcript().indexOf("claude-ended-a"),
+          "bare cuna rendered its inventory before acknowledging input",
+        );
+        // The explorer states what Enter will do in its own footer: on a
+        // machine row it manages the machine, and only on a session row does
+        // it attach (src/machines/explorer.ts:1087,1096). The old drive pressed
+        // Enter on the machine row, so once the browser replaced the root
+        // journey this case stopped exercising attach at all while still
+        // reading green-ish. Walk down until the footer itself promises an
+        // attach, then take it.
+        for (let step = 0; step < 10 && !/Enter\/→ attach/u.test(context.screen()); step += 1) {
+          context.child.write("[B");
+          await new Promise((resolve) => setTimeout(resolve, 60));
+        }
+        await context.waitUntil(
+          () => /Enter\/→ attach/u.test(context.screen()),
+          "the machines explorer never offered an attach for a live session",
+        );
         const transitionOffset = context.transcript().length;
         context.child.write("\r");
         await context.waitUntil(
@@ -556,7 +614,7 @@ try {
     }));
 
     results.push(await runConptyCase({
-      testId: "T14.3-WIN-MACHINE-SMART-ATTACH", args: [machinesToForegroundFixture, configFile], environment: cliEnvironment,
+      testId: "T14.3-WIN-MACHINE-EXACT-SESSION-ATTACH", args: [machinesToForegroundFixture, configFile], environment: cliEnvironment,
       async drive(context) {
         await context.waitUntil(
           () => context.screen().includes("claude-ended-a") && context.screen().includes("claude-live") && context.screen().includes("claude-ended-b"),
@@ -565,37 +623,94 @@ try {
         assert.match(context.screen(), /❯ ▾ conpty-界-🦊/u, "initial selection did not remain on the machine row");
         assert.match(context.screen(), /Claude · claude-live  attachable/u, "the unique live AgentSession was not classified attachable");
         assert.match(context.screen(), /Claude · claude-ended-[ab]  terminated/u, "terminated sibling AgentSessions were not represented");
+        // SPECIFICATION CHANGED ON PURPOSE, and the assertion is INVERTED
+        // rather than deleted. This case used to demand a shortcut: Enter on a
+        // machine holding exactly one openable child attached straight to it,
+        // skipping the machine view. That shortcut was removed, and removing it
+        // was right — deciding an attach from a machine row decides it from a
+        // snapshot, so it can hand someone a terminal for a session that was
+        // launched but never observed. The code that replaced it makes that
+        // state explicit instead (waitingForSessionObservation,
+        // isUnobservedLaunchedSession, legacySupervisorBlockedNotice), which is
+        // the rule that a terminal is offered only against a current
+        // observation. So the coverage is kept and turned around: Enter on a
+        // machine row must NOT reach a terminal, and the attach must come from
+        // an exact session the person chose.
+        context.child.write("\r");
+        await context.waitUntil(
+          () => /Enter\/→ attach|Enter select/u.test(context.screen()),
+          "Enter on the machine row did not open the machine view",
+        );
+        assert.ok(
+          !context.screen().includes("FLOW_PROVIDER_ANSI256"),
+          "Enter on a machine row reached a provider terminal without an exact session being selected",
+        );
+        context.observations.machineRowEnterAttaches = false;
+        // Never walk blind. The machine view lists ACTIONS, not sessions, and
+        // its last row is "Stop machine" — a Down-until-something-matches loop
+        // ends there and the next Enter stops a machine. Go to the top first,
+        // then step down only until the cursor is on the row we named, and
+        // fail loudly if it never is.
+        const selectRow = async (pattern, failure) => {
+          const marked = () => context.screen().split("\n").find((row) => row.trimStart().startsWith("❯")) ?? "";
+          for (let up = 0; up < 12; up += 1) {
+            context.child.write("[A");
+            await new Promise((resolve) => setTimeout(resolve, 40));
+          }
+          for (let down = 0; down < 12; down += 1) {
+            if (pattern.test(marked())) return;
+            context.child.write("[B");
+            await new Promise((resolve) => setTimeout(resolve, 60));
+          }
+          assert.ok(pattern.test(marked()), `${failure} (cursor rested on: ${marked().trim()})`);
+        };
+        await selectRow(/sessions/u, "the machine view never let the cursor reach its session list");
+        context.child.write("\r");
+        await context.waitUntil(
+          () => context.screen().includes("claude-live"),
+          "opening the provider row did not list the machine's sessions",
+        );
+        await selectRow(/claude-live/u, "the session list never let the cursor reach the one live session");
+        // The row is labelled "attachable", but THIS screen's footer only says
+        // "Enter select" — it never states that Enter attaches. The machines
+        // overview does state it (src/machines/explorer.ts:1096); the
+        // drilled-down session screen falls back to a generic footer. Assert
+        // the classification, which is the promise the product actually makes
+        // here, and record the footer gap as an observation instead of
+        // pretending it is fine.
+        const markedRow = context.screen().split("\n").find((row) => row.trimStart().startsWith(String.fromCharCode(0x276F))) ?? "";
+        assert.match(
+          markedRow,
+          /claude-live\s+attachable/u,
+          "the live session was not classified attachable on its own screen",
+        );
+        context.observations.sessionScreenFooterStatesAttach = /Enter\/→ attach/u.test(context.screen());
         const transitionOffset = context.transcript().length;
-        // Exact user gesture: Enter on the initially-selected machine. No
-        // Down, Right, or other navigation byte is sent before it.
         context.child.write("\r");
         await context.waitUntil(
           () => context.screen().includes("CUNA") && context.screen().includes("FLOW_PROVIDER_ANSI256"),
-          "Enter on a machine with one openable child did not smart-attach foreground",
+          "attaching the exact selected session did not reach the foreground",
         );
         const transition = context.transcript().slice(transitionOffset);
-        assert.doesNotMatch(transition, /◆── conpty-界-🦊/u, "machine smart-attach incorrectly opened the machine context menu");
-        assert.doesNotMatch(transition, /Claude provider and sessions|Claude  provider and sessions|Stop  stop/u, "machine smart-attach rendered the intermediate machine menu");
-        assert.match(transition, /Attaching to Claude Code/u, "machine smart-attach did not identify the provider while loading");
-        assert.match(transition, /◐/u, "machine smart-attach did not render the first loading frame");
-        assert.match(transition, /◓/u, "machine smart-attach loading indicator did not animate");
-        assert.match(transition, /\u001b\[48;2;235;86;37m/u, "machine smart-attach did not render the Cuna foreground appbar");
-        assert.match(transition, /FLOW_PROVIDER_ANSI256/u, "machine smart-attach did not render the provider viewport");
+        assert.match(transition, /Attaching to Claude Code/u, "exact-session attach did not identify the provider while loading");
+        assert.match(transition, /◐/u, "exact-session attach did not render the first loading frame");
+        assert.match(transition, /◓/u, "exact-session attach loading indicator did not animate");
+        assert.match(transition, /\[48;2;235;86;37m/u, "exact-session attach did not render the Cuna foreground appbar");
+        assert.match(transition, /FLOW_PROVIDER_ANSI256/u, "exact-session attach did not render the provider viewport");
         context.observations.initialSelection = `machine:${MACHINE_ID}`;
         context.observations.openableSessions = 1;
         context.observations.terminatedSessions = 2;
-        context.observations.inputBeforeAttach = "Enter only";
-        context.observations.skippedMachineMenu = true;
+        context.observations.inputBeforeAttach = "Enter, down, Enter";
         context.child.write("\u0003");
-        await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("one Ctrl-C did not exit the smart-attach flow within two seconds")), 2_000))]);
+        await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("one Ctrl-C did not exit the exact-session attach flow within two seconds")), 2_000))]);
       },
       async oracle({ finalState, transcript }) {
-        assert.equal(finalState.exitCode, 0, "machine smart-attach flow exited nonzero");
-        assert.equal(finalState.activeScreen, "normal", "machine smart-attach flow did not restore the normal screen");
-        assert.match(transcript(), /Attaching to Claude Code/u, "smart-attach dispatch did not preserve the selected provider");
+        assert.equal(finalState.exitCode, 0, "exact-session attach flow exited nonzero");
+        assert.equal(finalState.activeScreen, "normal", "exact-session attach flow did not restore the normal screen");
+        assert.match(transcript(), /Attaching to Claude Code/u, "exact-session attach did not preserve the selected provider");
         const foregroundStart = transcript().lastIndexOf("\u001b[?1049h");
         const foregroundEnd = transcript().lastIndexOf("\u001b[?1049l");
-        assert.doesNotMatch(transcript().slice(foregroundStart, foregroundEnd), /Attaching to Claude Code/u, "smart-attach spinner painted over the foreground PTY");
+        assert.doesNotMatch(transcript().slice(foregroundStart, foregroundEnd), /Attaching to Claude Code/u, "exact-session attach spinner painted over the foreground PTY");
       },
     }));
   } finally {

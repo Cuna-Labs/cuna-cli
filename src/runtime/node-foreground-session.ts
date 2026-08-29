@@ -34,6 +34,7 @@ import {
 } from "./terminal-transport.js";
 
 const TERMINAL_CAPABILITY_ID = "terminal_connections.create";
+const OPENCODE_AUTH_ADVISORY_TIMEOUT_MS = 250;
 // A first interactive OpenCode session has no credential state yet. Provider
 // auth is an advisory display observation: it may be absent, temporarily
 // unreachable, or unavailable on an older deployment. A fresh supervisor
@@ -51,9 +52,13 @@ export interface ForegroundSessionRunnerInput {
   readonly terminalKind?: string;
   readonly hostPlatform?: NodeJS.Platform;
   readonly presentationMode?: ForegroundPresentationMode;
-  /** OpenCode effects are admitted only after the local producer witness gate. */
-  readonly opencodeEnabled?: boolean;
   readonly browser?: BrowserOpener;
+  /**
+   * Foreground startup performs several deliberate authority fences.  Surface
+   * the current local phase while the caller still owns an inline progress UI;
+   * never emit this after raw/alternate-screen terminal ownership begins.
+   */
+  readonly onProgress?: (label: string) => void;
   /** Clears caller-owned progress UI before raw/alternate-screen terminal ownership. */
   readonly onBeforeTerminalOwnership?: () => void;
 }
@@ -155,13 +160,8 @@ async function runNodeForegroundSessionsOnce(
     const agentSessionId = sessionIds[index];
     if (agentSessionId === undefined) continue;
     throwIfAborted(input.signal);
+    input.onProgress?.("Checking selected AgentSession");
     const session = await input.client.getAgentSession(agentSessionId, input.signal);
-    if (session.agent === "opencode" && input.opencodeEnabled !== true) {
-      throw runtimeFailure(
-        "capability_unsupported",
-        "OpenCode is not enabled by this CLI's producer contract witness.",
-      );
-    }
     if (session.agent !== "claude-code" && session.agent !== "codex" && session.agent !== "opencode") {
       throw runtimeFailure(
         "capability_unsupported",
@@ -175,6 +175,7 @@ async function runNodeForegroundSessionsOnce(
         "The selected AgentSession does not match the requested agent command.",
       );
     }
+    input.onProgress?.("Verifying terminal authority");
     const capabilitySnapshot = await controlPlane.discoverCapabilities(
       "agent_session",
       agentSessionId,
@@ -188,6 +189,7 @@ async function runNodeForegroundSessionsOnce(
       surface: "cli",
       interaction: "native",
     }, clock());
+    input.onProgress?.("Checking live session status");
     const observation = assertRemoteAgentSessionEvidence({
       evidence: await controlPlane.observeAgentSession(agentSessionId, input.signal),
       expectedAgentSessionId: agentSessionId,
@@ -195,6 +197,7 @@ async function runNodeForegroundSessionsOnce(
     });
     throwIfAborted(input.signal);
     admitSessionIdentity(session, observation, agentSessionId);
+    input.onProgress?.("Checking provider sign-in");
     const providerAuthentication = await observeProviderAuthentication({
       client: input.client,
       session,
@@ -234,6 +237,7 @@ async function runNodeForegroundSessionsOnce(
   }
   throwIfAborted(input.signal);
 
+  input.onProgress?.("Preparing your cloud terminal");
   input.onBeforeTerminalOwnership?.();
   const coordinator = presentationMode === "rich"
     ? new ForegroundTerminalCoordinator({
@@ -398,10 +402,38 @@ async function observeProviderAuthentication(input: Readonly<{
   signal?: AbortSignal;
 }>): Promise<ForegroundTabIntent["providerAuthentication"]> {
   let status: AgentSessionAuth;
+  // OpenCode authentication is presentation-only at this point.  The exact
+  // supervisor observation and one-use terminal grant already admitted the
+  // process; holding the person behind a server-side auth probe (which may
+  // wait for an older supervisor) does not add authority. Bound it so a first
+  // `/connect` can reach the real OpenCode TUI promptly.
+  const authProbeSignal = mayEnterOpenCodeLogin(input.session, input.observation, input.now())
+    ? input.signal === undefined
+      ? AbortSignal.timeout(OPENCODE_AUTH_ADVISORY_TIMEOUT_MS)
+      : AbortSignal.any([input.signal, AbortSignal.timeout(OPENCODE_AUTH_ADVISORY_TIMEOUT_MS)])
+    : input.signal;
   try {
-    status = await input.client.getAgentSessionAuth(input.session.id, input.signal);
+    status = await input.client.getAgentSessionAuth(input.session.id, authProbeSignal);
   } catch (error) {
     throwIfAborted(input.signal);
+    // This proceeds for EVERY read failure, including an off-contract payload,
+    // and that is a decided semantic rather than an oversight.
+    //
+    // Two suites demanded opposite things here. Three unit variants in
+    // `test/node-foreground-session.test.mjs` — missing resource, off-contract
+    // observation, transport fault — pin "enter the PTY". The installed E2E
+    // asserted "fail closed" for the off-contract one; that case had never
+    // executed, because an earlier phase aborted the suite before reaching it,
+    // so it had never been reconciled with this behaviour.
+    //
+    // Resolved in favour of entering: the probe is presentation-only, and
+    // admission was already granted by the exact supervisor observation and the
+    // one-use terminal grant. Refusing here would withhold a terminal the
+    // runtime had already admitted, on a signal that never authorized it.
+    //
+    // The obligation that survives is presentational, and it is enforced
+    // below and in the E2E: an observation that cannot be decoded must never
+    // be rendered as a signed-in provider — only as login-pending.
     if (mayEnterOpenCodeLogin(input.session, input.observation, input.now())) {
       return openCodeInteractiveLoginPending(input.observation);
     }

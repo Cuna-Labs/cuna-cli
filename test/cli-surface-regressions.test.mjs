@@ -39,6 +39,7 @@ test("--help resolves the command it was typed after, not the root help", async 
     { argv: ["machines", "--help"], topic: "machines", must: ["cuna machines <list|create"] },
     { argv: ["machines", "create", "--help"], topic: "machines create", must: ["--name NAME", "--yes", "--vcpus N"] },
     { argv: ["machines", "list", "--help"], topic: "machines list", must: ["cuna machines list"] },
+    { argv: ["machines", "update-supervisor", "--help"], topic: "machines update-supervisor", must: ["MACHINE_ID", "--yes", "never stops the machine"] },
     { argv: ["agent-sessions", "create", "--help"], topic: "agent-sessions create", must: ["--workspace-binding-id", "--workspace-generation", "claude-code, codex, or opencode"] },
     { argv: ["agent", "--help"], topic: "agent", must: ["Sign Claude Code or Codex out"] },
     { argv: ["doctor", "--help"], topic: "doctor", must: ["encrypted local\nsession-store state", "--check-browser-login"] },
@@ -137,6 +138,7 @@ test("a malformed machine ID fails at the edge, before any client call", async (
   // failed inside the transport against a rule the command layer never had.
   for (const argv of [
     ["machines", "pause", "m_1", "--yes"],
+    ["machines", "update-supervisor", "m_1", "--yes"],
     ["machines", "delete", "mch_1", "--yes"],
     ["agent-sessions", "list", "--machine", "m_1"],
   ]) {
@@ -250,6 +252,54 @@ test("the cuna namespace is prepended to every credential boundary code", async 
     });
     assert.equal(record.error.code, `cuna.auth.${code}`, code);
   }
+});
+
+// Every authenticated command re-exchanges the stored login code, and the
+// server allows ten exchanges per rolling minute, so the eleventh command in a
+// minute fails. That is a transport verdict about the request, not a verdict
+// about the credential — and the exit-code contract already promises HTTP 429
+// arrives as `cuna.network.rate_limited`. Exiting `auth` here sent a person to
+// `cuna login`, a mutation, to fix something that clears by waiting.
+function refreshFailedWith(reason) {
+  return {
+    env: {},
+    humanAuth: {
+      acquireAccessToken: async () => {
+        throw credentialFailure(
+          "credential_refresh_failed",
+          "Credential refresh failed without changing the stored credential.",
+          { retryable: true, ...(reason === undefined ? {} : { safeDetails: { reason } }) },
+        );
+      },
+    },
+  };
+}
+
+test("a rate-limited refresh is reported as a network failure, not as a bad credential", async () => {
+  const { exit, record } = await runJson(["capabilities", "--json"], refreshFailedWith("cuna.network.rate_limited"));
+  assert.equal(record.error.code, "cuna.network.rate_limited");
+  assert.equal(exit, EXIT_CODES.network);
+  assert.equal(record.error.retryable, true);
+  assert.ok(!record.error.code.startsWith("cuna.auth."));
+});
+
+test("a client-side wait that expired during refresh keeps its own class too", async () => {
+  const { exit, record } = await runJson(["capabilities", "--json"], refreshFailedWith("cuna.client.response_budget_elapsed"));
+  assert.equal(record.error.code, "cuna.client.response_budget_elapsed");
+  assert.equal(exit, EXIT_CODES.network);
+});
+
+test("NEGATIVE CONTROL: a refresh failure with no transport reason stays an auth failure", async () => {
+  const { exit, record } = await runJson(["capabilities", "--json"], refreshFailedWith(undefined));
+  assert.equal(record.error.code, "cuna.auth.credential_refresh_failed");
+  assert.equal(exit, EXIT_CODES.auth);
+});
+
+test("NEGATIVE CONTROL: a local reason is not mistaken for a transport reason", async () => {
+  const { exit, record } = await runJson(["capabilities", "--json"], refreshFailedWith("process_lock_unavailable"));
+  assert.equal(record.error.code, "cuna.auth.credential_refresh_failed");
+  assert.equal(exit, EXIT_CODES.auth);
+  assert.deepEqual(record.error.details, { reason: "process_lock_unavailable" });
 });
 
 test("the top-level catch names cuna.internal.unexpected for a non-Cuna throw", async () => {

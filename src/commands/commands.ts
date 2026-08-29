@@ -15,7 +15,6 @@ import type {
 } from "../api/contracts.js";
 import type { EffectiveConfig } from "../config/config.js";
 import { DEFAULT_BASE_URL, environmentCredentialState, publicConfig } from "../config/config.js";
-import { assertOpenCodeExecutionEnabled } from "../config/opencode-feature-gate.js";
 import { EXIT_CODES, CunaError, unsupportedError, usageError, type SafeErrorDetails } from "../core/errors.js";
 import {
   REMOTE_CONVERGENCE_BUDGET_MS,
@@ -33,6 +32,13 @@ import {
 } from "../core/validation.js";
 import { preflightAgentJourneyInvocation } from "../journey/intent.js";
 import { listAllMachines } from "../machines/pagination.js";
+import {
+  isOpenCodeRuntimeUnverifiedCapabilityRejection,
+  isOpenCodeSupervisorRepairCapabilityRejection,
+  isOpenCodeSupervisorUpgradeCapabilityRejection,
+  openCodeRuntimeUnverified,
+  openCodeSupervisorUpgradeRequired,
+} from "../machines/opencode-supervisor.js";
 import { machineProviderAvailability, machineSupportsProvider, providerDisplayName } from "../machines/provider-availability.js";
 import { classifySessionActionability, displaySessionActionability } from "../machines/session-actionability.js";
 import { isAgentSessionIntendedActive } from "../machines/session-visibility.js";
@@ -144,6 +150,31 @@ function agentSessionTerminationConfirmed(session: AgentSession): boolean {
   return session.desiredState === "terminated" &&
     session.requestState === "terminal" &&
     session.processState === "terminated";
+}
+
+/**
+ * An AgentSession carries three states and this CLI's own invariants are
+ * conjunctions of all three — see `agentSessionTerminationConfirmed` above, and
+ * the termination timeout, which reports all three because one is not enough to
+ * explain anything.
+ *
+ * The human rendering used to print `processState` alone, so a session that was
+ * `terminated / termination_pending / running` displayed as plain `running`:
+ * exactly the disagreement a person needs to see, replaced by the one word that
+ * hides it. Settled sessions still show a single word, because a triple on every
+ * healthy row is noise; anything unsettled shows all three, in the fixed order
+ * desired/request/process.
+ */
+function agentSessionStateLabel(session: AgentSession): string {
+  if (agentSessionTerminationConfirmed(session)) return "terminated";
+  if (
+    session.desiredState === "running" &&
+    session.requestState === "launched" &&
+    session.processState === "running"
+  ) {
+    return "running";
+  }
+  return `${session.desiredState}/${session.requestState}/${session.processState}`;
 }
 
 function requireCredential(context: CommandContext): void {
@@ -386,7 +417,6 @@ interface MachineOverviewRow {
 function renderMachineOverview(
   items: readonly MachineOverviewRow[],
   now: number,
-  opencodePreferred: boolean,
 ): string {
   if (items.length === 0) return "No machines found.";
   return items.flatMap(({ machine, sessions, sessionsError }) => {
@@ -399,7 +429,7 @@ function renderMachineOverview(
     const claude = `Claude ${counts.claude.running}/${counts.claude.total} running`;
     const codex = `Codex ${counts.codex.running}/${counts.codex.total} running`;
     const opencode = `OpenCode ${counts.opencode.running}/${counts.opencode.total} running`;
-    const providerCounts = opencodePreferred ? `${opencode} · ${claude} · ${codex}` : `${claude} · ${codex} · ${opencode}`;
+    const providerCounts = `${opencode} · ${claude} · ${codex}`;
     const header = `▾ ${machine.name}  ${machine.state}  ${provider.displayName} ${provider.usability}  ${providerCounts}`;
     if (sessionsError !== undefined) return [header, "  └─ AgentSessions unavailable"];
     if (sessions.length === 0) return [header, "  └─ No AgentSessions"];
@@ -613,6 +643,13 @@ function preflightMachines(parsed: ParsedInvocation): void {
     agentOption(parsed, false);
     integerOption(parsed, "vcpus", 1, 8);
     integerOption(parsed, "memory-mib", 512, 16_384);
+    return;
+  }
+  if (action === "update-supervisor") {
+    rejectUnknownOptions(parsed, ["yes"]);
+    if (parsed.operands.length !== 2) throw usageError("machines update-supervisor requires exactly one machine ID.");
+    requireConfirmation(parsed, "machines.update-supervisor");
+    assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
     return;
   }
   if (action === "start" || action === "pause" || action === "resume" || action === "stop" || action === "delete") {
@@ -1044,11 +1081,22 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         });
       }
       const observedAuth = await client.getAgentSessionAuth(id);
+      const observationIsAboutThisSession =
+        observedAuth.agentSessionId === id &&
+        observedAuth.agent === session.agent &&
+        observedAuth.processEpoch === session.processEpoch;
+      // Absence of evidence is not a contradiction. Some providers abstain from
+      // reporting a login state at all — the Edge does exactly that for Codex,
+      // because a successful `codex login status` proves credentials exist and
+      // not that the account would be accepted. That abstention arrives as
+      // `state: "unavailable"`, and treating it as a failed postcondition
+      // turned a sign-out the server had CONFIRMED into an error the person
+      // could do nothing about. `postconditionUnverified` is reserved, by its
+      // own contract above, for an observation that CONTRADICTS the write.
+      const providerAbstains = observedAuth.state === "unavailable";
       if (
-        observedAuth.agentSessionId !== id ||
-        observedAuth.agent !== session.agent ||
-        observedAuth.processEpoch !== session.processEpoch ||
-        observedAuth.state !== "login_required"
+        !observationIsAboutThisSession ||
+        (!providerAbstains && observedAuth.state !== "login_required")
       ) {
         postconditionUnverified("AgentSession provider logout", {
           agent_session_id: id,
@@ -1067,8 +1115,13 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
           adapter_version: receipt.adapterVersion,
           observed_at: receipt.observedAt,
           outcome: receipt.outcome,
+          // Say which of the two happened. The sign-out is confirmed either
+          // way; only one of them was independently observed afterwards.
+          post_state: providerAbstains ? "unobserved" : "login_required",
         }),
-        human: `Signed out ${session.agent} in AgentSession ${session.id}.`,
+        human: providerAbstains
+          ? `Signed out ${session.agent} in AgentSession ${session.id}. ${agentDisplayName(session.agent)} does not report a login state, so this was not independently re-checked.`
+          : `Signed out ${session.agent} in AgentSession ${session.id}.`,
       });
     }
     case "signup":
@@ -1255,7 +1308,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
           ...(sessionsError === undefined ? {} : { agent_sessions_error: sessionsError }),
         }))),
       }),
-      human: renderMachineOverview(overview, now, context.config.opencodeFeatureGate.state === "enabled"),
+      human: renderMachineOverview(overview, now),
     });
   }
   if (action === "list") {
@@ -1283,7 +1336,6 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
       throw usageError("Option --name must contain 1 through 80 characters.");
     }
     const agent = agentOption(parsed, false);
-    if (agent === "opencode") assertOpenCodeExecutionEnabled(context.config.opencodeFeatureGate);
     const vcpus = integerOption(parsed, "vcpus", 1, 8);
     const memoryMiB = integerOption(parsed, "memory-mib", 512, 16_384);
     await requireCapability({ client, scope: "account", capabilityId: "machines.create", now: context.capabilityClock ?? now });
@@ -1312,6 +1364,83 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
       command: "machines.create",
       data: machineRecord(observed),
       human: `Created machine ${observed.name} (${observed.id}) in state ${observed.state}.`,
+    });
+  }
+  if (action === "update-supervisor") {
+    rejectUnknownOptions(parsed, ["yes"]);
+    if (parsed.operands.length !== 2) throw usageError("machines update-supervisor requires exactly one machine ID.");
+    requireConfirmation(parsed, "machines.update-supervisor");
+    const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
+
+    // A normal AgentSession create treats this capability refusal as its stop
+    // condition. This is the one explicit remediation action: it is admitted
+    // only when the server itself reported the OpenCode-specific prerequisite.
+    let updateRequired = false;
+    let stoppedRuntimeUnverified: CunaError | undefined;
+    try {
+      await requireCapability({
+        client,
+        scope: "machine",
+        resourceId: id,
+        capabilityId: "agent_sessions.create",
+        now: context.capabilityClock ?? now,
+      });
+    } catch (error) {
+      if (isOpenCodeSupervisorRepairCapabilityRejection(error)) {
+        updateRequired = true;
+      } else if (isOpenCodeRuntimeUnverifiedCapabilityRejection(error)) {
+        // A stopped Machine cannot run the OpenCode binary probe.  That is the
+        // required precondition for this explicit repair, not evidence that
+        // the supervisor update itself is forbidden.  Re-read the exact
+        // Machine below; the endpoint remains the authority for whether a
+        // compatible supervisor already exists.
+        stoppedRuntimeUnverified = error;
+      } else {
+        throw error;
+      }
+    }
+
+    // The replacement route has the same `machines:update` authority as a
+    // start. Do not substitute the deliberately unsupported create capability
+    // for the authorization that permits the remediation.
+    await requireCapability({
+      client,
+      scope: "machine",
+      resourceId: id,
+      capabilityId: "machines.lifecycle",
+      now: context.capabilityClock ?? now,
+    });
+    const current = await client.getMachine(id);
+    if (current.state !== "stopped") {
+      throw new CunaError({
+        code: "cuna.machine.supervisor_update_requires_stopped",
+        message: "The Machine must be stopped before its terminal supervisor can be updated.",
+        exitCode: EXIT_CODES.conflict,
+        hint: `Cuna will not stop ${current.name} or terminate any AgentSessions. End only the sessions you intend to end, then run \`cuna machines stop ${id} --yes\`.`,
+        details: { machine_id: id, observed_state: current.state },
+      });
+    }
+    if (stoppedRuntimeUnverified !== undefined) {
+      if (current.agent !== "opencode") throw stoppedRuntimeUnverified;
+      updateRequired = true;
+    }
+    if (!updateRequired) {
+      throw new CunaError({
+        code: "cuna.machine.supervisor_update_not_required",
+        message: "Cuna does not report that this Machine needs an OpenCode terminal-supervisor update.",
+        exitCode: EXIT_CODES.unsupported,
+        hint: "Create an OpenCode AgentSession normally. This action is available only after Cuna reports the exact supervisor prerequisite.",
+        details: { machine_id: id },
+      });
+    }
+    const updated = await client.replaceMachineSupervisor(id);
+    if (updated.id !== id) {
+      postconditionUnverified("terminal supervisor update", { machine_id: id, observed_id: updated.id });
+    }
+    return Object.freeze({
+      command: "machines.update-supervisor",
+      data: machineRecord(updated),
+      human: `Cuna confirmed a new terminal supervisor for ${updated.name}; the Machine is ${updated.state}.`,
     });
   }
   if (action === "start" || action === "pause" || action === "resume" || action === "stop") {
@@ -1416,7 +1545,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
       data: { items, ...(page.nextCursor === undefined ? {} : { next_cursor: page.nextCursor }) },
       human: items.length === 0
         ? "No AgentSessions found."
-        : page.items.map((item) => `${item.id}\t${item.name}\t${item.agent}\t${item.processState}\t${item.cwd}`).join("\n"),
+        : page.items.map((item) => `${item.id}\t${item.name}\t${item.agent}\t${agentSessionStateLabel(item)}\t${item.cwd}`).join("\n"),
     });
   }
   if (action === "get") {
@@ -1424,7 +1553,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     if (parsed.operands.length !== 2) throw usageError("agent-sessions get requires exactly one AgentSession ID.");
     const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
     const session = await client.getAgentSession(id);
-    return Object.freeze({ command: "agent-sessions.get", data: agentSessionRecord(session), human: `${session.id}\t${session.name}\t${session.agent}\t${session.processState}\t${session.cwd}` });
+    return Object.freeze({ command: "agent-sessions.get", data: agentSessionRecord(session), human: `${session.id}\t${session.name}\t${session.agent}\t${agentSessionStateLabel(session)}\t${session.cwd}` });
   }
   if (action === "create") {
     rejectUnknownOptions(parsed, [
@@ -1449,7 +1578,6 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     }
     const agent = agentOption(parsed, true);
     if (agent === undefined) throw usageError("Option --agent is required.");
-    if (agent === "opencode") assertOpenCodeExecutionEnabled(context.config.opencodeFeatureGate);
     const cwd = assertSafeDisplayText(stringOption(parsed, "cwd") ?? "/workspace", "workspace path");
     if (!cwd.startsWith("/workspace") || cwd.split("/").includes("..") || cwd.length > 1024) {
       throw usageError("Option --cwd must be a safe absolute path inside /workspace.");
@@ -1487,7 +1615,25 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
         },
       });
     }
-    await requireCapability({ client, scope: "machine", resourceId: machineId, capabilityId: "agent_sessions.create", now: context.capabilityClock ?? now });
+    try {
+      await requireCapability({ client, scope: "machine", resourceId: machineId, capabilityId: "agent_sessions.create", now: context.capabilityClock ?? now });
+    } catch (error) {
+      if (agent === "opencode" && isOpenCodeSupervisorUpgradeCapabilityRejection(error)) {
+        throw openCodeSupervisorUpgradeRequired({
+          ...(error.details === undefined ? {} : { details: error.details }),
+          machineId,
+          cause: error,
+        });
+      }
+      if (agent === "opencode" && isOpenCodeRuntimeUnverifiedCapabilityRejection(error)) {
+        throw openCodeRuntimeUnverified({
+          ...(error.details === undefined ? {} : { details: error.details }),
+          machineId,
+          cause: error,
+        });
+      }
+      throw error;
+    }
     const session = await client.createAgentSession(machineId, {
       ...(name === undefined ? {} : { name }),
       agent,

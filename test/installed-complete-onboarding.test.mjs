@@ -582,7 +582,7 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
       installedHelpTopics = (await import(pathToFileURL(path.join(installedRoot, "dist", "cli", "command-help.js")).href)).HELP_TOPICS;
       assert.deepEqual([...installedHelpTopics].sort(), [...INSTALLED_HELP_TOPICS].sort(), "a new installed command lacks matrix classification");
       const leafTopics = installedHelpTopics.filter((topic) => !installedHelpTopics.some((candidate) => candidate.startsWith(`${topic} `)));
-      assert.deepEqual([...leafTopics].sort(), [...SUPPORTED_SUCCESS_TOPICS, ...DELIBERATE_UNSUPPORTED_TOPICS].sort(), "a leaf command lacks success or deliberate-unsupported evidence");
+      assert.deepEqual([...leafTopics].sort(), [...SUPPORTED_SUCCESS_TOPICS, ...CONDITIONALLY_AVAILABLE_TOPICS, ...DELIBERATE_UNSUPPORTED_TOPICS].sort(), "a leaf command lacks success, conditional, or deliberate-unsupported evidence");
     });
 
     await runPhase(receipt, "installed-readonly-command-matrix", installedE2ePhaseTimeout("installed-readonly-command-matrix"), async () => {
@@ -784,11 +784,29 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
         assert.equal(result.receipt.events.includes("wire:close"), true, `OpenCode ${id} leaked its terminal wire`);
         assert.equal(result.receipt.child_closed, true, `OpenCode ${id} left its transport child open`);
       }
+      // DECIDED, after this case and the unit tests were found to demand
+      // opposite things for the same input. This case had never executed — an
+      // earlier phase aborted the suite before reaching it — so it had never
+      // been reconciled with the behaviour three unit variants already pin in
+      // test/node-foreground-session.test.mjs.
+      //
+      // The resolution is that the auth probe is presentation-only: admission
+      // was already decided by the exact supervisor observation and the one-use
+      // terminal grant, so an undecodable auth observation must not withhold a
+      // terminal the runtime already admitted. What it must never do is CLAIM
+      // anything — an impossible observation cannot present the person as
+      // signed in. So the terminal opens, and the claim stays conservative.
       for (const [id, sessionId] of [["semantic-invalid", OPENCODE_AUTH_INVALID_SESSION_ID]]) {
         const result = await invokeInstalledForeground(["opencode", "--agent-session", sessionId], env, sandbox);
-        assert.notEqual(result.code, 0, `OpenCode ${id} auth evidence must fail closed`);
-        assert.equal(result.receipt.events.includes("host:acquire"), false, `OpenCode ${id} reached terminal ownership`);
-        assert.equal(Object.hasOwn(result.receipt, "child_pid"), false, `OpenCode ${id} reached terminal child creation`);
+        assert.equal(result.code, 0, `OpenCode ${id} did not open: ${safeErrorCode(result.stderr)} ${result.stderr.slice(0, 500)}`);
+        assert.equal(result.receipt.events.includes("host:acquire"), true, `OpenCode ${id} never acquired the terminal`);
+        assert.equal(result.receipt.events.includes("child:ready"), true, `OpenCode ${id} never reached PTY readiness`);
+        assert.equal(result.receipt.events.includes("wire:close"), true, `OpenCode ${id} leaked its terminal wire`);
+        assert.equal(result.receipt.child_closed, true, `OpenCode ${id} left its transport child open`);
+        // The part that still has to fail safe: an off-contract observation
+        // must never be rendered as a signed-in provider.
+        const shown = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+        assert.doesNotMatch(shown, /authenticated/iu, `OpenCode ${id} presented impossible evidence as signed in`);
       }
       assert.ok(authority.state.openCodeSessionRequests >= 5, "OpenCode did not bind exact AgentSession authority");
       assert.equal(authority.state.openCodeAgentAuth404Requests, 1, "OpenCode did not inspect missing auth evidence exactly once");
@@ -910,7 +928,7 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
 const INSTALLED_HELP_TOPICS = Object.freeze([
   "signup", "login", "logout", "whoami", "access", "capabilities",
   "machines", "machines list", "machines create", "machines start", "machines pause",
-  "machines resume", "machines stop", "machines delete", "records", "authorizations",
+  "machines resume", "machines stop", "machines update-supervisor", "machines delete", "records", "authorizations",
   "account", "workspace", "usage", "api-keys", "api-keys create", "api-keys list",
   "api-keys revoke", "agent-sessions", "agent-sessions list", "agent-sessions get",
   "agent-sessions create", "agent-sessions rename", "agent-sessions terminate",
@@ -926,6 +944,11 @@ const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
   "agent-sessions list", "agent-sessions get", "agent-sessions create", "agent-sessions rename", "agent-sessions terminate", "agent-sessions attach",
   "agent", "connect", "doctor", "self-test", "version", "claude", "codex", "opencode",
 ]);
+// These commands are implemented and help-visible, but only become actionable
+// when the producer advertises their narrow prerequisite. Do not exercise them
+// against the generic installed matrix: that would manufacture the OpenCode
+// supervisor-upgrade condition or change an existing Machine.
+const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze(["machines update-supervisor"]);
 const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "sync", "companion"]);
 
 const INSTALLED_FAILURE_MATRIX = Object.freeze([
@@ -1160,7 +1183,16 @@ function createContractAuthority() {
         if (request.method === "PATCH" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}`) { state.agentName = body.name; return send(200, { ...agentSession(), row_version: 1 }); }
         if (request.method === "POST" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/terminate`) { state.agentTerminated = true; return send(200, agentSession(true)); }
         if (request.method === "POST" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/agent-auth/logout`) return send(200, { observation_id: "80000000-0000-4000-8000-000000000008", agent_session_id: AGENT_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent: "codex", agent_version: "1.0.0", adapter_version: "runa.agent-auth.v1", observed_at: "2026-08-14T00:00:02.000Z", outcome: "logout_confirmed" });
-        if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/agent-auth`) return send(200, { observation_id: "81000000-0000-4000-8000-000000000008", agent_session_id: AGENT_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "codex", auth_mode: "interactive_login", agent_version: "1.0.0", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_login_status", observed_at: "2026-08-14T00:00:02.000Z", valid_until: "2026-08-14T00:00:32.000Z", state: "login_required" });
+        // Codex abstains, and this fixture used to fabricate a response the real
+        // service cannot produce. `classifyProviderLoginStatus` in the Edge
+        // (edge/src/agent-session-auth.ts) emits `provider_cli_login_status` only
+        // for Claude Code: "Codex only documents that a successful
+        // `codex login status` means credentials are present; credential presence
+        // is not proof that the current account can make an accepted request."
+        // So a Codex session reports insufficient evidence, and the decoder is
+        // right to refuse anything else. An unavailable observation must also
+        // carry `agent_version: "unavailable"` and `valid_until === observed_at`.
+        if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/agent-auth`) return send(200, { observation_id: "81000000-0000-4000-8000-000000000008", agent_session_id: AGENT_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "codex", auth_mode: "interactive_login", agent_version: "unavailable", adapter_version: "runa.agent-auth.v1", evidence_class: "insufficient", observed_at: "2026-08-14T00:00:02.000Z", valid_until: "2026-08-14T00:00:02.000Z", state: "unavailable" });
         if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${OPENCODE_SESSION_ID}/agent-auth`) {
           const observationTime = Date.now();
           const observedAt = new Date(observationTime - 100).toISOString();

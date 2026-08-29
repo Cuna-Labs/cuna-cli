@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { PACKAGE_NAME, REPOSITORY, invariant, parseArgs, readJson, sha256File } from "./lib/release-evidence.mjs";
 import { assertInstalledProductAbsent, invokeInstalledCuna, runNpm } from "./lib/installed-candidate-probe.mjs";
 import { validateCycloneDxSbom, validateSupportPolicy } from "./release-distribution-lib.mjs";
+import { ARTIFACT_CHANNEL } from "../dist/build-identity.js";
 
 const execute = promisify(execFile);
 const args = parseArgs(process.argv.slice(2));
@@ -77,7 +78,16 @@ try {
   invariant(version?.data?.version === packageJson.version, "Local installed version differs from package.json");
   invariant(/^[0-9a-f]{64}$/.test(version?.data?.buildDigest), "Local installed build digest is invalid");
   invariant(version?.data?.platform === process.platform && version?.data?.architecture === process.arch, "Local runtime platform identity differs");
-  invariant(version?.data?.artifactChannel === "npm", "Local artifact channel is not npm");
+  // Bound to the declared constant, not to a literal. This script installs a
+  // LOCAL tarball and then checks that the installed CLI reports the channel
+  // the build actually declares — which is the whole point of the check, and
+  // the reason a hardcoded "npm" went stale the moment the build began
+  // declaring "local". The installation path is a local tarball; npm
+  // publication is a separate, parked lane with its own verifiers.
+  invariant(
+    version?.data?.artifactChannel === ARTIFACT_CHANNEL,
+    `Installed artifact channel ${String(version?.data?.artifactChannel)} does not match the declared ${ARTIFACT_CHANNEL}`,
+  );
 
   const cleanupCache = path.join(temporaryRoot, "cleanup-cache");
   await mkdir(cleanupCache, { recursive: false });

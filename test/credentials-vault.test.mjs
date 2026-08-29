@@ -490,6 +490,53 @@ test("refresh exceptions preserve the old credential and do not retain untrusted
   secret.dispose();
 });
 
+// A refresh that fails one call in three with one fixed sentence leaves a user
+// nothing to act on. The code is the one field that separates "wait" from
+// "sign in again", so it is lifted — under a grammar tight enough that a
+// leaked secret cannot pass as a code. The cause stays dropped either way.
+async function refreshFailure(thrown) {
+  const backend = new MemorySecureBackend();
+  const vault = new CredentialVault({ backend, clock: () => NOW });
+  const secret = SecretMaterial.fromUtf8("stable-refresh-secret");
+  await vault.rotate({ binding: BINDING, material: secret });
+  try {
+    await vault.refresh(BINDING, async () => { throw thrown; });
+    assert.fail("refresh should have thrown");
+  } catch (error) {
+    assert.ok(error instanceof CredentialBoundaryError);
+    assert.equal(error.code, "credential_refresh_failed");
+    assert.equal(error.retryable, true);
+    assert.equal(error.cause, undefined);
+    return error;
+  } finally {
+    secret.dispose();
+  }
+}
+
+test("a refresh failure surfaces the underlying error code so the user can act", async () => {
+  const withCode = Object.assign(new Error("unusable message"), {
+    code: "cuna.network.service_unavailable",
+  });
+  const error = await refreshFailure(withCode);
+  assert.deepEqual(error.safeDetails, { reason: "cuna.network.service_unavailable" });
+  assert.doesNotMatch(String(error), /unusable message/u);
+});
+
+test("NEGATIVE CONTROL: a secret-shaped code is refused by the grammar, not by its field name", async () => {
+  const leaking = Object.assign(new Error("boom"), {
+    code: "cuna_sk_7Fq2XvLm9RtZ0aBcDeGhJkNpQsUwYz13",
+  });
+  const error = await refreshFailure(leaking);
+  assert.equal(error.safeDetails, undefined);
+  assert.doesNotMatch(String(error), /7Fq2XvLm/u);
+});
+
+test("NEGATIVE CONTROL: a cause carrying no code adds no details at all", async () => {
+  const error = await refreshFailure(new Error("provider leaked secret-token-in-cause"));
+  assert.equal(error.safeDetails, undefined);
+  assert.doesNotMatch(String(error), /secret-token-in-cause/u);
+});
+
 test("tampering and cross-binding substitution are reported as corruption before secret release", async () => {
   const backend = new MemorySecureBackend();
   const vault = new CredentialVault({ backend, clock: () => NOW });

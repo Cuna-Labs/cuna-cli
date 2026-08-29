@@ -97,6 +97,23 @@ export async function runLocalRichForeground(input = {}) {
         inputBuffer = inputBuffer.slice(next + 3);
         changed = true;
       }
+      // Long-paste witness. ConPTY hands a large paste to the child in many
+      // chunks, and the failure it hides is silent: bytes dropped, truncated
+      // at a chunk boundary, or delivered out of order, with a viewport that
+      // still looks fine. Reporting the exact length the provider received,
+      // plus both edges, turns "something arrived" into "all of it arrived, in
+      // order, and nothing was appended". A carriage return submits.
+      const submitted = inputBuffer.indexOf("\r");
+      if (submitted >= 0) {
+        const payload = inputBuffer.slice(0, submitted);
+        inputBuffer = inputBuffer.slice(submitted + 1);
+        outputSequence += 1n;
+        await callbacks.onTerminalOutput(outputEvent(
+          outputSequence,
+          providerFrame(`PASTED ${payload.length} ${payload.slice(0, 8)} ${payload.slice(-8)}`),
+        ));
+        return;
+      }
       if (!changed) return;
       outputSequence += 1n;
       await callbacks.onTerminalOutput(outputEvent(outputSequence, providerFrame("↑↓ provider navigation ready")));

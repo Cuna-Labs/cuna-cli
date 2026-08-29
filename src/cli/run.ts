@@ -13,10 +13,6 @@ import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } f
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import { assertApiKeyUsable, resolveConfig, type EffectiveConfig } from "../config/config.js";
 import {
-  assertOpenCodeExecutionEnabled,
-  type OpenCodeFeatureGate,
-} from "../config/opencode-feature-gate.js";
-import {
   executeCommand,
   preflightInvocation,
   type ConvergencePoller,
@@ -59,6 +55,7 @@ import {
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
 import { runNodeMachinesExplorer, type MachinesExplorerRunner } from "../machines/explorer.js";
+import { isOpenCodeSupervisorUpgradeReason } from "../machines/opencode-supervisor.js";
 import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
 import { createOutputWriter, sanitizeHumanTerminalOutput, type CliStreams } from "./output.js";
@@ -92,8 +89,6 @@ export interface RunCliDependencies {
    */
   readonly doctorCredentialBackend?: Pick<SecureCredentialBackend, "backendId" | "probe">;
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
-  /** Test/embedding seam; production uses the gate derived by resolveConfig. */
-  readonly opencodeFeatureGate?: OpenCodeFeatureGate;
   readonly foregroundTerminalRunner?: ForegroundSessionRunner;
   readonly machinesExplorerRunner?: MachinesExplorerRunner;
   readonly rootJourneyRunner?: RootJourneyRunner;
@@ -559,6 +554,51 @@ function runtimeError(error: RuntimeBoundaryError): CunaError {
   });
 }
 
+/**
+ * A credential refresh that failed because the request did — a 429, a 5xx, a
+ * timeout — is not an auth failure. Reporting it as one exits `auth`, which
+ * this CLI documents as "no usable credential", and sends a person to
+ * `cuna login` to fix something that clears on its own. The exit-code contract
+ * already promises that "HTTP 429 and 5xx arrive as `cuna.network.rate_limited`
+ * and `cuna.network.service_unavailable`"; this keeps that promise across the
+ * credential boundary, where the class used to be overwritten.
+ *
+ * Every authenticated command re-exchanges the stored login code, and the
+ * server allows ten exchanges per rolling minute, so the eleventh command in a
+ * minute lands here. Say that, rather than doubting the credential.
+ */
+function credentialError(error: CredentialBoundaryError): CunaError {
+  const reason = error.safeDetails?.["reason"];
+  const transport = typeof reason === "string" &&
+      (reason.startsWith("cuna.network.") || reason.startsWith("cuna.client."))
+    ? reason
+    : undefined;
+  if (transport !== undefined) {
+    return new CunaError({
+      code: transport,
+      message: "Cuna could not renew this session because the request did not complete.",
+      exitCode: EXIT_CODES.network,
+      retryable: true,
+      hint: transport === "cuna.network.rate_limited"
+        ? "This account exchanged its sign-in too many times in the last minute. Wait a minute and run the command again. The stored session is unchanged and `cuna login` is not needed."
+        : "Run the command again. The stored session is unchanged.",
+      details: { reason: transport },
+      cause: error,
+    });
+  }
+  return new CunaError({
+    code: `cuna.auth.${error.code}`,
+    message: error.message,
+    exitCode: EXIT_CODES.auth,
+    retryable: error.retryable,
+    // `RuntimeBoundaryError` already forwards its safe details; this arm
+    // dropped them, so the credential backend's reason died here even
+    // when the vault had populated it.
+    ...(error.safeDetails === undefined ? {} : { details: error.safeDetails }),
+    cause: error,
+  });
+}
+
 interface InlineProgress {
   update(label: string): void;
   stop(): void;
@@ -589,6 +629,23 @@ function isTerminalResumeHandleConflict(error: CunaError): boolean {
     error.details?.reason === "terminal_connection_resume_handle_conflict";
 }
 
+function terminalSupervisorReadiness(error: CunaError): "waiting" | "lease_expired" | "upgrade_required" | "unverified" | undefined {
+  if (
+    error.code !== "cuna.runtime.capability_unknown" &&
+    error.code !== "cuna.runtime.capability_unavailable"
+  ) return undefined;
+  const reason = error.details?.reason_code;
+  if (isOpenCodeSupervisorUpgradeReason(reason)) return "upgrade_required";
+  if (reason === "runtime_lease_expired") return "lease_expired";
+  if (reason === "supervisor_registry_unavailable") return "waiting";
+  // A capability-abstention at this exact boundary is not an actionable CLI
+  // error for a person.  The server has declined to prove that it can mint an
+  // attached terminal; Cuna must leave the AgentSession alone and explain the
+  // transient state without leaking the internal capability vocabulary.
+  if (error.details?.capability_id === "terminal_connections.create") return "unverified";
+  return undefined;
+}
+
 function writeTerminalReconnectConflict(stream: Writable, color: boolean): void {
   const accent = (value: string): string => color ? `\u001b[38;5;202m\u001b[1m${value}\u001b[0m` : value;
   const success = (value: string): string => color ? `\u001b[38;5;42m${value}\u001b[0m` : value;
@@ -598,16 +655,59 @@ function writeTerminalReconnectConflict(stream: Writable, color: boolean): void 
   stream.write("Run `cuna` again to reconnect.\n");
 }
 
+function writeTerminalSupervisorReadiness(
+  stream: Writable,
+  color: boolean,
+  state: "waiting" | "lease_expired" | "upgrade_required" | "unverified",
+): void {
+  const accent = (value: string): string => color ? `\u001b[38;5;202m\u001b[1m${value}\u001b[0m` : value;
+  const success = (value: string): string => color ? `\u001b[38;5;42m${value}\u001b[0m` : value;
+  if (state === "upgrade_required") {
+    stream.write(`${accent("◆ CUNA")}  Machine terminal update needed\n`);
+    stream.write("This machine needs its terminal supervisor updated before it can attach.\n");
+  } else if (state === "lease_expired") {
+    stream.write(`${accent("◆ CUNA")}  AgentSession needs a fresh runtime check\n`);
+    stream.write("The machine has not recently confirmed that this selected AgentSession is still running.\n");
+  } else if (state === "unverified") {
+    stream.write(`${accent("◆ CUNA")}  Terminal connection not ready\n`);
+    stream.write("Cuna could not verify this machine's terminal authority yet.\n");
+  } else {
+    stream.write(`${accent("◆ CUNA")}  Waiting for the machine terminal supervisor\n`);
+    stream.write("The machine is reconnecting its terminal control.\n");
+  }
+  if (state === "unverified") {
+    stream.write(`${success("Cuna did not attach a terminal and did not change the remote AgentSession.")}\n`);
+    stream.write("Open this same AgentSession again in a moment.\n");
+  } else {
+    stream.write(`${success("No terminal connection was created and the remote AgentSession was not changed.")}\n`);
+    stream.write(state === "lease_expired"
+      ? "Wait for a fresh runtime observation, then open this same AgentSession again.\n"
+      : state === "upgrade_required"
+        ? "After the stopped-machine supervisor update, open this same AgentSession again.\n"
+        : "When the machine terminal control reconnects, open this same AgentSession again.\n");
+  }
+}
+
 function startInlineProgress(stream: Writable, color: boolean, initialLabel = "Loading machines"): Readonly<InlineProgress> {
   const frames = ["◐", "◓", "◑", "◒"];
   const bars = ["━╺━━━━", "━━╺━━━", "━━━╺━━", "━━━━╺━", "━━━━━╺", "━━━━╸━", "━━━╸━━", "━━╸━━━"];
+  const startedAt = Date.now();
   let frame = 0;
   let label = initialLabel;
   let stopped = false;
   const paint = (): void => {
-    const text = `${frames[frame % frames.length]} ${label}  ${bars[frame % bars.length]}`;
+    const elapsed = Date.now() - startedAt;
+    // A spinner alone is too easy to mistake for a frozen cursor on slower
+    // Windows terminals. Keep the phase honest, then add a small, actionable
+    // acknowledgement while an authenticated read is still in flight.
+    const slowHint = elapsed >= 12_000
+      ? " · still working — Ctrl-C cancels"
+      : elapsed >= 4_000
+        ? " · still working"
+        : "";
+    const text = `◆ CUNA  ${frames[frame % frames.length]} ${label}${slowHint}  ${bars[frame % bars.length]}`;
     const styled = color
-      ? `\u001b[38;5;202m${frames[frame % frames.length]}\u001b[0m \u001b[38;5;255m\u001b[1m${label}\u001b[0m  \u001b[38;5;208m${bars[frame % bars.length]}\u001b[0m`
+      ? `\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;202m${frames[frame % frames.length]}\u001b[0m \u001b[38;5;255m\u001b[1m${label}\u001b[0m\u001b[38;5;245m${slowHint}\u001b[0m  \u001b[38;5;208m${bars[frame % bars.length]}\u001b[0m`
       : text;
     stream.write(`\r\u001b[2K${styled}`);
     frame += 1;
@@ -650,8 +750,22 @@ function journeyPhaseLabel(phase: AgentJourneyPhase, agent: "claude-code" | "cod
     case "observe-agent-sessions": return `Finding a ${display} session`;
     case "create-agent-session": return `Creating ${display} session`;
     case "ready-agent-session": return `Starting ${display}`;
-    case "attach": return `Opening ${display}`;
+    case "attach": return agent === "opencode"
+      ? "Opening OpenCode terminal — use /connect there"
+      : `Opening ${display}`;
   }
+}
+
+function journeyPreparationLabel(agent: string): string {
+  return agent === "opencode"
+    ? "Preparing OpenCode — use /connect in its terminal"
+    : `Preparing ${agentDisplayName(agent)}`;
+}
+
+function foregroundAttachLabel(agent: string): string {
+  return agent === "opencode"
+    ? "Opening OpenCode terminal — use /connect there"
+    : `Attaching to ${agentDisplayName(agent)}`;
 }
 
 export async function runCli(argv: readonly string[], dependencies: RunCliDependencies = {}): Promise<ExitCode> {
@@ -753,12 +867,29 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       return EXIT_CODES.success;
     }
 
-    // Preflight gates and configuration must read the same invocation
-    // environment. Otherwise an injected test or embedding could report an
-    // OpenCode gate as enabled after preflight had already read a different
-    // process-level value.
+    // A bare interactive invocation must acknowledge input before any local
+    // credential-store, configuration, or network read.  In particular, an
+    // access-token refresh can take several seconds; leaving the terminal
+    // blank during that work makes Cuna look stuck and encourages a duplicate
+    // invocation.  The phase remains deliberately neutral until config and
+    // authentication tell us what is actually happening.
     const effectiveEnvironment: NodeJS.ProcessEnv = { ...(dependencies.env ?? process.env) };
     Object.freeze(effectiveEnvironment);
+    if (interactiveRoot) {
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      interactiveRootColor = color;
+      interactiveCloseUi = true;
+      interactiveCloseColor = color;
+      if (streams.stderrIsTTY === true) {
+        inlineRootProgress = startInlineProgress(streams.stderr, color, "Starting Cuna");
+      } else {
+        streams.stderr.write("Cuna: starting...\n");
+      }
+    }
+
+    // Preflight gates and configuration must read the same invocation
+    // environment. This keeps credential and profile selection deterministic
+    // across embedded invocations.
     if (parsed.command !== undefined) preflightInvocation(parsed);
 
     let journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "opencode"
@@ -801,10 +932,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     if (journeyIntent !== undefined) {
       // This is deliberately before config, credential, and network work: it
       // tells the truth immediately without claiming that attach has begun.
-      const display = agentDisplayName(journeyIntent.agent);
+      const preparation = journeyPreparationLabel(journeyIntent.agent);
       const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
-      if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, `Preparing ${display}`);
-      else streams.stderr.write(`Cuna: preparing ${display}...\n`);
+      if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, preparation);
+      else streams.stderr.write(`Cuna: ${preparation.charAt(0).toLowerCase()}${preparation.slice(1)}...\n`);
     }
     const platform = dependencies.platform ?? createPlatformAdapter({ env: effectiveEnvironment });
     let foregroundPresentation: ForegroundPresentationMode | undefined;
@@ -844,8 +975,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(configFile === undefined ? {} : { configFile }),
       },
     });
-    const opencodeFeatureGate = dependencies.opencodeFeatureGate ?? config.opencodeFeatureGate;
-    if (parsed.command === "opencode") assertOpenCodeExecutionEnabled(opencodeFeatureGate);
+    if (interactiveRoot) {
+      inlineRootProgress?.update(config.apiKey === undefined ? "Checking your Cuna sign-in" : "Checking Cuna access");
+    }
     // Fail closed before any authority is selected, and only for a command that
     // selects one. Empty or malformed still never means absent: an unusable
     // `*_API_KEY` refuses the command rather than silently demoting automation
@@ -930,9 +1062,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           (error.code !== "cuna.auth.required" && error.code !== "cuna.auth.reauthentication_required")) {
           throw error;
         }
+        inlineRootProgress?.stop();
+        inlineRootProgress = undefined;
         streams.stderr.write("Cuna: let's sign you in first...\n");
         await guidedAuth.login(dependencies.signal === undefined ? {} : { signal: dependencies.signal });
         streams.stderr.write("Cuna: signed in. Continuing...\n");
+        if (interactiveRoot && streams.stderrIsTTY === true) {
+          inlineRootProgress = startInlineProgress(streams.stderr, interactiveRootColor, "Finding a machine or AgentSession");
+        }
       }
     }
 
@@ -1045,7 +1182,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       interactiveCloseUi = true;
       interactiveCloseColor = color;
       if (streams.stderrIsTTY === true) {
-        inlineRootProgress = startInlineProgress(streams.stderr, color, "Finding a machine or AgentSession");
+        if (inlineRootProgress === undefined) {
+          inlineRootProgress = startInlineProgress(streams.stderr, color, "Finding a machine or AgentSession");
+        } else {
+          inlineRootProgress.update("Finding a machine or AgentSession");
+        }
       } else {
         writeJourneyDiscovery(streams.stderr, false);
       }
@@ -1055,7 +1196,6 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         selection = await rootRunner({
           client,
           color,
-          opencodeEnabled: opencodeFeatureGate.state === "enabled",
           onBeforeTerminalOwnership: () => {
             inlineRootProgress?.stop();
             inlineRootProgress = undefined;
@@ -1073,9 +1213,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         return EXIT_CODES.success;
       }
       if (selection.kind === "attach") {
-        const display = agentDisplayName(selection.agent);
-        if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, `Attaching to ${display}`);
-        else streams.stderr.write(`Cuna: attaching to ${display}...\n`);
+        const attachLabel = foregroundAttachLabel(selection.agent);
+        if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, attachLabel);
+        else streams.stderr.write(`Cuna: ${attachLabel.charAt(0).toLowerCase()}${attachLabel.slice(1)}...\n`);
         const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
         try {
           await runner({
@@ -1092,7 +1232,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
               sessionCount: 1,
               ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
             }),
-            opencodeEnabled: opencodeFeatureGate.state === "enabled",
+            onProgress: (nextLabel) => inlineRootProgress?.update(nextLabel),
             onBeforeTerminalOwnership: () => {
               inlineRootProgress?.stop();
               inlineRootProgress = undefined;
@@ -1118,6 +1258,18 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ? await runCli(noColor ? ["--no-color"] : [], dependencies)
           : exit;
       }
+      if (selection.kind === "supervisor-update") {
+        const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+        const progress = startInlineProgress(streams.stderr, !noColor, "Updating terminal supervisor");
+        const exit = await runCli([
+          "machines", "update-supervisor", selection.machineId, "--yes",
+          ...(noColor ? ["--no-color"] : []),
+        ], dependencies);
+        progress.stop();
+        return exit === EXIT_CODES.success
+          ? await runCli(noColor ? ["--no-color"] : [], dependencies)
+          : exit;
+      }
       return await runCli(rootJourneyArgv(selection, { noColor: booleanOption(parsed, "no-color") }), {
         ...dependencies,
         ...(selection.machineId === undefined ? {} : { managedWorkspaceMachineId: selection.machineId }),
@@ -1125,7 +1277,6 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       });
     }
     if (journeyIntent?.target === "reconcile") {
-      if (journeyIntent.agent === "opencode") assertOpenCodeExecutionEnabled(opencodeFeatureGate);
       if (journeyIntent.agent === "openclaw") {
         throw unsupportedError("openclaw", "provider_route_unavailable");
       }
@@ -1210,7 +1361,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
               color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
               hostPlatform: nodePlatform(platform.kind),
               presentationMode,
-              opencodeEnabled: opencodeFeatureGate.state === "enabled",
+              onProgress: (nextLabel) => inlineJourneyProgress?.update(nextLabel),
               onBeforeTerminalOwnership: () => {
                 inlineJourneyProgress?.stop();
                 inlineJourneyProgress = undefined;
@@ -1261,7 +1412,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ? foreground.agentSessionIds.length === 1
           ? "Attaching to AgentSession"
           : `Attaching to ${foreground.agentSessionIds.length} AgentSessions`
-        : `Attaching to ${agentDisplayName(expectedAgent)}`;
+        : foregroundAttachLabel(expectedAgent);
       const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
       if (inlineJourneyProgress !== undefined) inlineJourneyProgress.update(attachLabel);
       else if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, attachLabel);
@@ -1279,7 +1430,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           color,
           hostPlatform: nodePlatform(platform.kind),
           ...(foregroundPresentation === undefined ? {} : { presentationMode: foregroundPresentation }),
-          opencodeEnabled: opencodeFeatureGate.state === "enabled",
+          onProgress: (nextLabel) => inlineJourneyProgress?.update(nextLabel),
           onBeforeTerminalOwnership: () => {
             inlineJourneyProgress?.stop();
             inlineJourneyProgress = undefined;
@@ -1339,15 +1490,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       const selection = await runner({
         client,
         color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
-        opencodeEnabled: opencodeFeatureGate.state === "enabled",
         ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
       }, dependencies.now === undefined ? {} : { now: dependencies.now });
       if (selection !== undefined) {
         if (selection.kind === "attach") {
-          const display = agentDisplayName(selection.agent);
+          const attachLabel = foregroundAttachLabel(selection.agent);
           const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
-          if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, `Attaching to ${display}`);
-          else streams.stderr.write(`Cuna: attaching to ${display}...\n`);
+          if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, attachLabel);
+          else streams.stderr.write(`Cuna: ${attachLabel.charAt(0).toLowerCase()}${attachLabel.slice(1)}...\n`);
           const foregroundRunner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
           try {
             await foregroundRunner({
@@ -1364,7 +1514,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
                 sessionCount: 1,
                 ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
               }),
-              opencodeEnabled: opencodeFeatureGate.state === "enabled",
+              onProgress: (nextLabel) => inlineRootProgress?.update(nextLabel),
               onBeforeTerminalOwnership: () => {
                 inlineRootProgress?.stop();
                 inlineRootProgress = undefined;
@@ -1381,6 +1531,17 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
             ...dependencies,
             ...(selection.machineId === undefined ? {} : { managedWorkspaceMachineId: selection.machineId }),
           });
+        } else if (selection.kind === "supervisor-update") {
+          const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+          const progress = startInlineProgress(streams.stderr, !noColor, "Updating terminal supervisor");
+          const exit = await runCli([
+            "machines", "update-supervisor", selection.machineId, "--yes",
+            ...(noColor ? ["--no-color"] : []),
+          ], dependencies);
+          progress.stop();
+          return exit === EXIT_CODES.success
+            ? await runCli(["machines", ...(noColor ? ["--no-color"] : [])], dependencies)
+            : exit;
         } else {
           const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
           const progress = startInlineProgress(streams.stderr, !noColor, selection.action === "start" ? "Starting machine" : "Stopping machine");
@@ -1416,17 +1577,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     inlineJourneyProgress?.stop();
     inlineRootProgress?.stop();
     const error = unknownError instanceof CredentialBoundaryError
-      ? new CunaError({
-          code: `cuna.auth.${unknownError.code}`,
-          message: unknownError.message,
-          exitCode: EXIT_CODES.auth,
-          retryable: unknownError.retryable,
-          // `RuntimeBoundaryError` already forwards its safe details; this arm
-          // dropped them, so the credential backend's reason died here even
-          // when the vault had populated it.
-          ...(unknownError.safeDetails === undefined ? {} : { details: unknownError.safeDetails }),
-          cause: unknownError,
-        })
+      ? credentialError(unknownError)
       : unknownError instanceof RuntimeBoundaryError
         ? runtimeError(unknownError)
       : normalizeError(unknownError);
@@ -1437,6 +1588,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     }
     if (interactiveRootUi && streams.stderrIsTTY === true && isTerminalResumeHandleConflict(error)) {
       writeTerminalReconnectConflict(streams.stderr, interactiveRootColor);
+      return error.exitCode;
+    }
+    const supervisorReadiness = terminalSupervisorReadiness(error);
+    // The initial Cuna journey is interactive whenever stdin/stdout are TTYs.
+    // Some Windows hosts expose stderr as a non-TTY even though it is visible
+    // to the person.  Never leak an internal capability name merely because
+    // that host classification is conservative; render the same plain-language
+    // recovery instead.
+    if (interactiveCloseUi && supervisorReadiness !== undefined) {
+      writeTerminalSupervisorReadiness(
+        streams.stderr,
+        interactiveCloseColor && streams.stderrIsTTY === true,
+        supervisorReadiness,
+      );
       return error.exitCode;
     }
     writer.error(label, error);

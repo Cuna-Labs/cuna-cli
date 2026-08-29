@@ -354,11 +354,17 @@ export class CredentialVault {
       let refreshed: CredentialRefreshResult;
       try {
         refreshed = await refresher(currentSnapshot);
-      } catch {
+      } catch (cause) {
+        // The bare `catch` here is deliberate: the refresher is untrusted and
+        // its message may carry credential material, so the cause is NOT
+        // retained. But dropping everything made a transient outage and a
+        // revoked session print one identical sentence, with no flag able to
+        // tell them apart. Lift the error code alone, and only when its shape
+        // is a code rather than a secret.
         throw credentialFailure(
           "credential_refresh_failed",
           "Credential refresh failed without changing the stored credential.",
-          { retryable: true },
+          { retryable: true, ...refreshFailureDetails(cause) },
         );
       }
       if (refreshed.status === "missing") {
@@ -673,6 +679,26 @@ export function probeCredentialTarget(nonce: Uint8Array = randomBytes(PROBE_NONC
     workspaceId: `${PROBE_BINDING_NAMESPACE}:${hexadecimal(nonce)}`,
     kind: PROBE_BINDING_KIND,
   });
+}
+
+/**
+ * A refresh failure carries the one fact a user needs — wait, or sign in again
+ * — in its error code. The message and the cause stay quarantined because the
+ * refresher is untrusted, so this lifts the code and nothing else, and only
+ * when it LOOKS like a code. The grammar is the control: a lowercase dotted
+ * identifier cannot express a high-entropy secret, so a leaked token fails the
+ * shape test rather than relying on the field's name. Returns an empty object
+ * so the caller can spread it under `exactOptionalPropertyTypes`.
+ */
+const PUBLIC_ERROR_CODE = /^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*$/u;
+
+function refreshFailureDetails(
+  cause: unknown,
+): { readonly safeDetails: Readonly<Record<string, string>> } | Record<string, never> {
+  if (typeof cause !== "object" || cause === null) return {};
+  const code = (cause as { readonly code?: unknown }).code;
+  if (typeof code !== "string" || code.length > 64 || !PUBLIC_ERROR_CODE.test(code)) return {};
+  return { safeDetails: { reason: code } };
 }
 
 function hexadecimal(bytes: Uint8Array): string {

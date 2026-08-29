@@ -63,6 +63,7 @@ function fakeClient(overrides = {}) {
     async revokeApiKey() { throw new Error("unexpected revoke API key"); },
     async createMachine() { throw new Error("unexpected create"); },
     async transitionMachine() { throw new Error("unexpected transition"); },
+    async replaceMachineSupervisor() { throw new Error("unexpected terminal supervisor replacement"); },
     async deleteMachine() { throw new Error("unexpected delete"); },
     async listAgentSessions() { return { items: [] }; },
     async createAgentSession() { throw new Error("unexpected create agent"); },
@@ -332,9 +333,36 @@ test("no-args remains help off-TTY but a real TTY infers and attaches the select
   assert.match(stripAnsi(interactive.stderr()), /Finding a machine or AgentSession/u);
   assert.equal(interactive.stderr().includes(`${ESCAPE}[38;5;202m`), true, "the root journey should use the Cuna flare accent");
   const progressOutput = stripAnsi(interactive.stderr());
-  assert.match(progressOutput, /◐ Finding a machine or AgentSession  ━╺━━━━/u);
+  assert.match(progressOutput, /[◐◓◑◒] Finding a machine or AgentSession/u);
   assert.match(progressOutput, /◐ Attaching to Claude Code  ━╺━━━━/u);
   assert.doesNotMatch(progressOutput, /Cuna: attaching to Claude/u);
+});
+
+test("bare cuna paints a neutral loader before a delayed local sign-in check", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  let resolveToken;
+  const token = new Promise((resolve) => { resolveToken = resolve; });
+  const pending = runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: {},
+    humanAuth: {
+      async acquireAccessToken() { return token; },
+      async login() { throw new Error("login is not expected when a stored session resolves"); },
+    },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => undefined,
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const beforeCredential = stripAnsi(interactive.stderr());
+  assert.match(beforeCredential, /Starting Cuna/u);
+  assert.doesNotMatch(beforeCredential, /Finding a machine or AgentSession/u);
+
+  resolveToken(`cuna_at_${"h".repeat(43)}`);
+  assert.equal(await pending, EXIT_CODES.success);
+  const complete = stripAnsi(interactive.stderr());
+  assert.ok(complete.indexOf("Starting Cuna") < complete.indexOf("Finding a machine or AgentSession"));
 });
 
 test("bare cuna explains a replaced terminal link without exposing resume-handle internals", async () => {
@@ -370,6 +398,173 @@ test("bare cuna explains a replaced terminal link without exposing resume-handle
   assert.match(visible, /Cuna did not stop the remote AgentSession/u);
   assert.match(visible, /Run `cuna` again to reconnect/u);
   assert.doesNotMatch(visible, /terminal_connection_resume_handle_conflict|request_id|Re-read the resource/u);
+});
+
+test("foreground Cuna explains a terminal supervisor that is not ready without creating another terminal", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unknown",
+        message: "The server cannot currently prove this capability.",
+        exitCode: EXIT_CODES.policy,
+        details: {
+          capability_id: "terminal_connections.create",
+          reason_code: "supervisor_registry_unavailable",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  Waiting for the machine terminal supervisor/u);
+  assert.match(visible, /No terminal connection was created and the remote AgentSession was not changed/u);
+  assert.match(visible, /When the machine terminal control reconnects, open this same AgentSession again/u);
+  assert.doesNotMatch(visible, /Error \[/u);
+});
+
+test("foreground Cuna translates a terminal-capability abstention without leaking its internal capability name", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unknown",
+        message: "The server cannot currently prove this capability.",
+        exitCode: EXIT_CODES.policy,
+        details: { capability_id: "terminal_connections.create" },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  Terminal connection not ready/u);
+  assert.match(visible, /could not verify this machine's terminal authority yet/u);
+  assert.match(visible, /did not attach a terminal and did not change the remote AgentSession/u);
+  assert.match(visible, /Open this same AgentSession again in a moment/u);
+  assert.doesNotMatch(visible, /terminal_connections\.create|Error \[/u);
+});
+
+test("bare Cuna keeps the terminal-capability recovery human when Windows exposes visible stderr as non-TTY", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: false });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unknown",
+        message: "The server cannot currently prove this capability.",
+        exitCode: EXIT_CODES.policy,
+        details: { capability_id: "terminal_connections.create" },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = interactive.stderr();
+  assert.match(visible, /CUNA  Terminal connection not ready/u);
+  assert.match(visible, /did not attach a terminal and did not change the remote AgentSession/u);
+  assert.doesNotMatch(visible, /terminal_connections\.create|Error \[/u);
+  // Kept out of the regex above on purpose: a control character inside a
+  // pattern trips no-control-regex, and suppressing the rule would hide the
+  // next one too. A substring check states the same thing more plainly.
+  assert.ok(!visible.includes("\u001b["), "an ANSI escape must not reach non-TTY output");
+  // Kept out of the regex above on purpose: a control character inside a
+  // pattern trips no-control-regex, and suppressing the rule would hide the
+  // next one too. A substring check states the same thing more plainly.
+  assert.ok(!visible.includes("["), "an ANSI escape must not reach non-TTY output");
+});
+
+test("foreground Cuna explains an expired AgentSession runtime lease without pretending the terminal is reconnecting", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unavailable",
+        message: "The terminal runtime lease expired.",
+        exitCode: EXIT_CODES.policy,
+        details: {
+          capability_id: "terminal_connections.create",
+          reason_code: "runtime_lease_expired",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  AgentSession needs a fresh runtime check/u);
+  assert.match(visible, /has not recently confirmed that this selected AgentSession is still running/u);
+  assert.match(visible, /No terminal connection was created and the remote AgentSession was not changed/u);
+  assert.match(visible, /Wait for a fresh runtime observation, then open this same AgentSession again/u);
+  assert.doesNotMatch(visible, /reconnecting its terminal control|Error \[/u);
+});
+
+test("foreground Cuna recognizes the OpenCode supervisor-upgrade reason without claiming a session changed", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unavailable",
+        message: "The terminal supervisor must be upgraded.",
+        exitCode: EXIT_CODES.policy,
+        details: {
+          capability_id: "terminal_connections.create",
+          reason_code: "opencode_supervisor_upgrade_required",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  Machine terminal update needed/u);
+  assert.match(visible, /No terminal connection was created and the remote AgentSession was not changed/u);
+  assert.doesNotMatch(visible, /Error \[/u);
 });
 
 test("Ctrl-C while bare cuna is attaching closes visibly and returns success", async () => {
@@ -1127,7 +1322,13 @@ test("production login uses the encrypted backend and reuses the canonical durab
       fetch,
     });
     assert.equal(laterExit, EXIT_CODES.success, laterStreams.stderr());
-    assert.equal(observedAuthorization, `Bearer cuna_at_${"b".repeat(43)}`);
+    // The first bearer, not a second one. A stored bearer with real life left
+    // is now reused across processes: every authenticated command used to
+    // re-exchange, against a server budget of ten exchanges per rolling
+    // minute, so the eleventh command in a minute failed. Asserting the
+    // exchange count is the stronger half of this — one sign-in, one exchange.
+    assert.equal(observedAuthorization, `Bearer cuna_at_${"a".repeat(43)}`);
+    assert.equal(exchangeCount, 1, "a second command must not buy another exchange");
     assert.equal(retiredContinuationStatusRequests, 0);
 
     const whoamiStreams = memoryStreams();
@@ -1426,6 +1627,240 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
   assert.equal(JSON.parse(streams.stdout()).data.state, "paused");
 });
 
+test("terminal supervisor update is an explicit OpenCode-only remediation and preserves lifecycle ownership", async () => {
+  const discoveries = [];
+  let replacements = 0;
+  let lifecycleTransitions = 0;
+  const streams = memoryStreams();
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      discoveries.push({ scope, resourceId });
+      if (discoveries.length === 1) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_supervisor_upgrade_required",
+        }], scope, resourceId);
+      }
+      return capabilitySnapshot([{
+        id: "machines.lifecycle",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["machines:update"],
+      }], scope, resourceId);
+    },
+    async getMachine(id) {
+      return { id, name: "open-dev", state: "stopped", agent: "opencode" };
+    },
+    async transitionMachine() {
+      lifecycleTransitions += 1;
+      throw new Error("the explicit supervisor action must not transition lifecycle");
+    },
+    async replaceMachineSupervisor(id) {
+      replacements += 1;
+      assert.equal(id, MACHINE_ID);
+      return { id, name: "open-dev", state: "running", agent: "opencode" };
+    },
+  });
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(replacements, 1);
+  assert.equal(lifecycleTransitions, 0);
+  assert.deepEqual(discoveries, [
+    { scope: "machine", resourceId: MACHINE_ID },
+    { scope: "machine", resourceId: MACHINE_ID },
+  ]);
+  const record = JSON.parse(streams.stdout());
+  assert.equal(record.command, "machines.update-supervisor");
+  assert.equal(record.data.state, "running");
+});
+
+test("terminal supervisor update admits a stopped OpenCode runtime-unverified preflight", async () => {
+  let discoveries = 0;
+  let replacements = 0;
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        discoveries += 1;
+        if (discoveries === 1) {
+          return capabilitySnapshot([{
+            id: "agent_sessions.create",
+            availability: "temporarily_unavailable",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_runtime_unverified",
+          }], scope, resourceId);
+        }
+        return capabilitySnapshot([{
+          id: "machines.lifecycle",
+          availability: "supported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["machines:update"],
+        }], scope, resourceId);
+      },
+      async getMachine(id) {
+        return { id, name: "stopped-open-dev", state: "stopped", agent: "opencode" };
+      },
+      async replaceMachineSupervisor(id) {
+        replacements += 1;
+        return { id, name: "stopped-open-dev", state: "running", agent: "opencode" };
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(replacements, 1);
+  assert.equal(JSON.parse(streams.stdout()).data.state, "running");
+});
+
+test("terminal supervisor update admits the exact OpenCode protocol-unavailable repair signal", async () => {
+  let discoveries = 0;
+  let replacements = 0;
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        discoveries += 1;
+        if (discoveries === 1) {
+          return capabilitySnapshot([{
+            id: "agent_sessions.create",
+            availability: "temporarily_unavailable",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_supervisor_protocol_unavailable",
+          }], scope, resourceId);
+        }
+        return capabilitySnapshot([{
+          id: "machines.lifecycle",
+          availability: "supported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["machines:update"],
+        }], scope, resourceId);
+      },
+      async getMachine(id) {
+        return { id, name: "protocol-open-dev", state: "stopped", agent: "opencode" };
+      },
+      async replaceMachineSupervisor(id) {
+        replacements += 1;
+        return { id, name: "protocol-open-dev", state: "running", agent: "opencode" };
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(replacements, 1);
+  assert.equal(JSON.parse(streams.stdout()).data.state, "running");
+});
+
+test("terminal supervisor update never stops a running Machine or terminates sessions", async () => {
+  let replacements = 0;
+  let discoveries = 0;
+  const streams = memoryStreams();
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      // The second discovery authorizes the same lifecycle/update authority as
+      // start. It is deliberately separate from the unsupported create proof.
+      discoveries += 1;
+      if (discoveries === 1) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_supervisor_upgrade_required",
+        }], scope, resourceId);
+      }
+      return capabilitySnapshot([{
+        id: "machines.lifecycle",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["machines:update"],
+      }], scope, resourceId);
+    },
+    async getMachine(id) {
+      return { id, name: "protected-open-dev", state: "running", agent: "opencode" };
+    },
+    async replaceMachineSupervisor() {
+      replacements += 1;
+      throw new Error("must not replace a running Machine");
+    },
+  });
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(exit, EXIT_CODES.conflict);
+  assert.equal(replacements, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.machine.supervisor_update_requires_stopped");
+  assert.match(error.hint, /will not stop protected-open-dev or terminate any AgentSessions/u);
+});
+
+test("terminal supervisor update remains hidden unless the exact OpenCode prerequisite is advertised", async () => {
+  let machineReads = 0;
+  let replacements = 0;
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "supervisor_upgrade_required",
+        }], scope, resourceId);
+      },
+      async getMachine() { machineReads += 1; throw new Error("must not inspect a hidden remediation"); },
+      async replaceMachineSupervisor() { replacements += 1; throw new Error("must not replace"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(machineReads, 0);
+  assert.equal(replacements, 0);
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.capability.unsupported");
+});
+
 test("mutations fail closed when independent readback contradicts the write response", async () => {
   // TWO ANSWERS, DELIBERATELY DIFFERENT, and the difference is the fix.
   //
@@ -1656,6 +2091,58 @@ test("AgentSession termination fails closed only when the terminal observation d
   assert.equal(record.error.details.settle_with, `cuna agent-sessions get ${sessionId}`);
 });
 
+test("agent-sessions get shows all three states when they disagree", async () => {
+  // The timeout above names this exact command as the way to settle a session,
+  // and it reports desired/request/process because one state cannot explain
+  // anything on its own. The human rendering used to print processState alone,
+  // so a session that is terminated/termination_pending/running displayed as a
+  // plain "running" — the disagreement replaced by the word that hides it.
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  const disagreeing = {
+    desiredState: "terminated",
+    requestState: "termination_pending",
+    processState: "running",
+  };
+  const streams = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli(["agent-sessions", "get", sessionId], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getAgentSession(id) {
+        assert.equal(id, sessionId);
+        return agentSession({ id, ...disagreeing });
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  const printed = streams.stdout();
+  assert.match(printed, /terminated\/termination_pending\/running/u, printed);
+  // NEGATIVE CONTROL: a settled session must stay a single word, or every
+  // healthy row becomes noise and the triple stops meaning "look here".
+  const settledStreams = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  const settledExit = await runCli(["agent-sessions", "get", sessionId], {
+    streams: settledStreams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getAgentSession(id) {
+        return agentSession({
+          id,
+          desiredState: "terminated",
+          requestState: "terminal",
+          processState: "terminated",
+        });
+      },
+    }),
+  });
+  assert.equal(settledExit, EXIT_CODES.success, settledStreams.stderr());
+  // Check the state FIELD, not the whole line: the cwd is a path and contains
+  // the separator this control looks for.
+  const settledState = settledStreams.stdout().trimEnd().split("\t")[3];
+  assert.equal(settledState, "terminated", settledStreams.stdout());
+});
+
 test("AgentSession create keeps auth mode explicit and rename is capability-gated", async () => {
   const machineId = "22222222-2222-4222-8222-222222222222";
   const sessionId = "11111111-1111-4111-8111-111111111111";
@@ -1770,7 +2257,120 @@ test("AgentSession create rejects a provider not installed on the machine before
   assert.match(error.hint, /machines create --agent codex/u);
 });
 
-test("OpenCode AgentSession creation defaults to interactive login on a compatible machine", async () => {
+test("OpenCode create names a supervisor prerequisite before any session dispatch", async () => {
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo",
+    "--yes", "--json",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async getMachine(id) { return { id, name: "open-dev", state: "running", agent: "opencode" }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_supervisor_upgrade_required",
+        }], scope, resourceId);
+      },
+      async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(creates, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.agent.opencode_supervisor_upgrade_required");
+  assert.match(error.hint, /No OpenCode AgentSession was created/u);
+  assert.match(error.hint, /Update terminal supervisor/u);
+  assert.match(error.hint, /will not stop the Machine or terminate sessions/u);
+});
+
+test("OpenCode runtime verification is a retryable no-create result", async () => {
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo",
+    "--yes", "--json",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async getMachine(id) { return { id, name: "open-verifying", state: "running", agent: "opencode" }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "temporarily_unavailable",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_runtime_unverified",
+        }], scope, resourceId);
+      },
+      async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.network);
+  assert.equal(creates, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.agent.opencode_runtime_unverified");
+  assert.equal(error.retryable, true);
+  assert.match(error.hint, /No OpenCode AgentSession was created/u);
+  assert.match(error.hint, /will not create another Machine/u);
+});
+
+test("OpenCode protocol-unavailable evidence names a replacement before any session dispatch", async () => {
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo",
+    "--yes", "--json",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async getMachine(id) { return { id, name: "protocol-open-dev", state: "running", agent: "opencode" }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "temporarily_unavailable",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_supervisor_protocol_unavailable",
+        }], scope, resourceId);
+      },
+      async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(creates, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.agent.opencode_supervisor_upgrade_required");
+  assert.equal(error.details.reason, "opencode_supervisor_protocol_unavailable");
+  assert.match(error.hint, /cannot provide the OpenCode protocol/u);
+});
+
+test("OpenCode AgentSession creation uses live machine and capability evidence, not a local flag", async () => {
   let effects = 0;
   const client = fakeClient({
     async getMachine(id) { return { id, name: "open-dev", state: "running", agent: "opencode" }; },
@@ -1814,7 +2414,7 @@ test("OpenCode AgentSession creation defaults to interactive login on a compatib
       ...platform,
       async readSafeConfig() { effects += 1; return { exists: false }; },
     },
-    env: { CUNA_API_KEY: API_KEY, CUNA_OPENCODE_ENABLED: "true" },
+    env: { CUNA_API_KEY: API_KEY, CUNA_OPENCODE_ENABLED: "false" },
     now: () => Date.parse("2026-08-08T00:00:00Z"),
     clientFactory: () => { effects += 1; return client; },
   });
@@ -1854,24 +2454,107 @@ test("OpenCode AgentSession creation rejects credential-binding auth before effe
   assert.equal(effects, 0);
 });
 
-test("OpenCode fails closed before API or terminal effects without a committed producer witness", async () => {
-  const cases = [["opencode", ".", "--new-session"], ["opencode", "--agent-session", FOREGROUND_SESSION_A]];
-  for (const argv of cases) {
-    let effects = 0;
-    const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
-    const exit = await runCli(argv, {
-      streams: streams.streams,
-      platform,
-      env: { CUNA_API_KEY: API_KEY, OPENAI_API_KEY: "must-not-be-read" },
-      opencodeFeatureGate: { state: "disabled", source: "compiled_contract", reason: "immutable_contract_witness_required" },
-      clientFactory: () => { effects += 1; return fakeClient(); },
-      automaticJourneyEffectsFactory: () => { effects += 1; throw new Error("unreachable"); },
-      foregroundTerminalRunner: async () => { effects += 1; },
-    });
-    assert.equal(exit, EXIT_CODES.policy, argv.join(" "));
-    assert.match(streams.stderr(), /cuna\.feature\.opencode_disabled/u);
-    assert.equal(effects, 0, `${argv.join(" ")} must stop before protected effects`);
-  }
+test("OpenCode machine creation is stopped by a live backend capability refusal before mutation", async () => {
+  let capabilityReads = 0;
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "machines", "create", "--name", "open-dev", "--agent", "opencode", "--yes",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY, CUNA_OPENCODE_ENABLED: "true" },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        capabilityReads += 1;
+        return capabilitySnapshot([{
+          id: "machines.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["machines:create"],
+          reason: "provider_not_advertised",
+        }], scope, resourceId);
+      },
+      async createMachine() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(capabilityReads, 1);
+  assert.equal(creates, 0);
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.capability.unsupported");
+});
+
+test("OpenCode AgentSession journey surfaces the server's compatible-Machine remedy", async () => {
+  const requests = [];
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo", "--yes",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    fetch: async (url, init) => {
+      const request = { url: url.toString(), method: init?.method ?? "GET" };
+      requests.push(request);
+      if (request.method === "GET" && request.url.endsWith(`/v1/sessions/${MACHINE_ID}`)) {
+        return new Response(JSON.stringify({ id: MACHINE_ID, name: "open-dev", status: "running", agent: "opencode" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (request.method === "GET" && request.url.startsWith("https://api.getcuna.com/v1/capabilities?")) {
+        return new Response(JSON.stringify({
+          schema_version: "1.0",
+          subject_scope: "machine",
+          subject_id: MACHINE_ID,
+          observed_at: "2026-08-08T00:00:00.000Z",
+          expires_at: future,
+          etag: "agent-session-create",
+          capabilities: [{
+            id: "agent_sessions.create",
+            availability: "supported",
+            interaction: "native",
+            mutation_class: "reversible",
+            surfaces: ["cli"],
+            required_permissions: ["agent_sessions:create"],
+          }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (request.method === "POST" && request.url === `https://api.getcuna.com/v1/sessions/${MACHINE_ID}/agent-sessions`) {
+        return new Response(JSON.stringify({
+          type: "https://api.getcuna.com/problems/agent_session_provider_unavailable",
+          title: "Agent provider unavailable",
+          status: 409,
+          code: "agent_session_provider_unavailable",
+          request_id: "55555555-5555-4555-8555-555555555555",
+          retryable: false,
+          detail: "The requested provider is not installed on this Machine.",
+          action: "none",
+        }), { status: 409, headers: { "content-type": "application/problem+json" } });
+      }
+      assert.fail(`unexpected request ${request.method} ${request.url}`);
+    },
+  });
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(exit, EXIT_CODES.unsupported, JSON.stringify({ requests, error }));
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[0], {
+    url: `https://api.getcuna.com/v1/sessions/${MACHINE_ID}`,
+    method: "GET",
+  });
+  assert.match(requests[1].url, /^https:\/\/api\.getcuna\.com\/v1\/capabilities\?/u);
+  assert.deepEqual(requests[2], {
+    url: `https://api.getcuna.com/v1/sessions/${MACHINE_ID}/agent-sessions`,
+    method: "POST",
+  });
+  assert.equal(error.code, "cuna.agent.provider_not_installed");
+  assert.match(error.hint, /Machine configured for OpenCode/u);
 });
 
 test("OpenCode create rejects a remotely downgraded auth mode after authoritative readback", async () => {
@@ -2138,6 +2821,26 @@ test("agent shorthand shows truthful preparation feedback before configuration o
   assert.match(immediate, /[◐◓◑◒]/u, "feedback should animate before configuration resolves");
   releaseConfig();
   assert.equal(await execution, EXIT_CODES.success);
+});
+
+test("OpenCode shorthand directs provider sign-in to its remote TUI before configuration resolves", async () => {
+  let releaseConfig;
+  const configGate = new Promise((resolve) => { releaseConfig = resolve; });
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const execution = runCli(["opencode", "--agent-session", FOREGROUND_SESSION_A], {
+    streams: streams.streams,
+    platform: { ...platform, async readSafeConfig() { await configGate; return { exists: false }; } },
+    env: { CUNA_API_KEY: API_KEY, TERM: "xterm-256color" },
+    clientFactory: () => fakeClient(),
+    foregroundTerminalRunner: async () => {},
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const immediate = streams.stderr();
+  assert.match(stripAnsi(immediate), /Preparing OpenCode — use \/connect in its terminal/u);
+  assert.match(immediate, /[◐◓◑◒]/u, "feedback should animate before configuration resolves");
+  releaseConfig();
+  assert.equal(await execution, EXIT_CODES.success);
+  assert.match(stripAnsi(streams.stderr()).replaceAll("\r", ""), /Opening OpenCode terminal — use \/connect there/u);
 });
 
 test("invalid automatic agent intents fail before config, auth, API, or terminal effects", async () => {
