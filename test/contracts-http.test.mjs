@@ -5,6 +5,8 @@ import {
   API_ORIGINS,
   API_WEBSOCKET_ORIGINS,
   CREDENTIAL_BRANDS,
+  CREDENTIAL_FAMILY_INFIXES,
+  containsCredentialValue,
   createHttpTransport,
   createCunaApiClient,
   decodeApiKeyCreation,
@@ -1063,6 +1065,199 @@ test("HTTP errors preserve retryability only from a closed canonical Problem", a
     (error) => error instanceof CunaError &&
       error.retryable === true &&
       error.details?.request_id === "untrusted-header",
+  );
+});
+
+// `detail` is the only field that says WHY in words. It was validated here and
+// then dropped, so a catch-all `code` reached the user with its cause deleted --
+// measured 2026-08-26 against production: four `machine_create_authority_unavailable`
+// 502s whose real upstream reason the service had already put on the wire.
+const problemWithDetail = (detail, status = 503) => createHttpTransport({
+  baseUrl: "https://api.getcuna.com",
+  fetch: async () => new Response(JSON.stringify({
+    type: "https://api.getcuna.com/problems/request_failed",
+    title: "Request failed",
+    status,
+    code: "request_failed",
+    request_id: "88888888-8888-4888-8888-888888888888",
+    retryable: false,
+    detail,
+  }), { status, headers: { "content-type": "application/problem+json" } }),
+});
+
+test("a Problem detail reaches the user instead of being validated and discarded", async () => {
+  await assert.rejects(
+    problemWithDetail("provider refused the reservation: no capacity in yyz").request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => error instanceof CunaError &&
+      error.details?.detail === "provider refused the reservation: no capacity in yyz" &&
+      // `reason` says which bucket, `detail` says why. Both, not either.
+      error.details?.reason === "request_failed",
+  );
+});
+
+// Extends "HTTP errors expose only stable safe metadata" to the field this
+// change adds. That test's fixture is not a valid Problem, so its secret sits in
+// `message` and never had a path to `details`; a credential inside a VALID
+// Problem's `detail` does. The service scrubs this before sending, but that
+// guarantee is one `replace` call on the server side and a branch deleting it
+// exists, so the client does not rely on it.
+test("a credential inside a Problem detail is redacted before it reaches details", async () => {
+  const secret = `cuna_sk_${"q".repeat(43)}`;
+  await assert.rejects(
+    problemWithDetail(`upstream rejected token ${secret} for tenant`).request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => {
+      const rendered = JSON.stringify(error.details);
+      assert.ok(!rendered.includes(secret), "details must not echo a credential-shaped value");
+      assert.ok(rendered.includes("[redacted credential]"), rendered);
+      // The surrounding explanation survives -- redaction must not cost the
+      // diagnosis, or the field is worth nothing.
+      assert.ok(error.details.detail.includes("upstream rejected token"), error.details.detail);
+      assert.ok(error.details.detail.includes("for tenant"), error.details.detail);
+      return true;
+    },
+  );
+});
+
+test("a bearer header leaked into a Problem detail is redacted too", async () => {
+  await assert.rejects(
+    problemWithDetail("retry sent Bearer eyJhbGciOiJIUzI1NiJ9.abc-def_ghi upstream").request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => {
+      assert.ok(!JSON.stringify(error.details).includes("eyJhbGciOiJIUzI1NiJ9"), error.details.detail);
+      return true;
+    },
+  );
+});
+
+// FOREIGN credential shapes. The first draft of the client redactor knew only
+// `Bearer` and this product's own key brands -- exactly the set the service-side
+// scrubber already covers, so it defended against that scrubber being deleted and
+// added no coverage. A `detail` originates UPSTREAM of the service, where a
+// foreign credential can appear in an error message our own scrubber has no rule
+// for. Each of these is a shape that previously reached the terminal verbatim.
+for (const [name, secret] of [
+  ["a bare JWT (no Bearer prefix)", "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.QWxsWW91ckJhc2VBcmVCZWxvbmc"],
+  ["a GitHub token", `ghp_${"A1b2C3d4E5f6G7h8I9j0".repeat(1)}`],
+  ["an AWS access key id", "AKIA1234567890ABCDEF"],
+  ["a Supabase secret key", `sb_secret_${"xY9".repeat(8)}`],
+]) {
+  test(`${name} in a Problem detail is redacted`, async () => {
+    await assert.rejects(
+      problemWithDetail(`upstream rejected ${secret} while provisioning`).request({
+        method: "POST", path: "/v1/sessions",
+      }),
+      (error) => {
+        const rendered = JSON.stringify(error.details);
+        assert.ok(!rendered.includes(secret), `${name} must not reach details: ${error.details.detail}`);
+        assert.ok(rendered.includes("[redacted credential]"), error.details.detail);
+        // The diagnosis must survive the redaction.
+        assert.ok(error.details.detail.includes("upstream rejected"), error.details.detail);
+        assert.ok(error.details.detail.includes("while provisioning"), error.details.detail);
+        return true;
+      },
+    );
+  });
+}
+
+// FALSE-POSITIVE CONTROL. Over-broad redaction is its own defect: it destroys the
+// explanation this field exists to carry, and it would do so silently. Ordinary
+// operational prose -- including bare hex, uuids, hostnames and version strings --
+// must pass through untouched.
+// EVERY family the product mints, generated FROM the authority rather than
+// listed here. A hand-written copy of this list is what broke: the redactor
+// covered 4 of 10 families and missed `cr`, a bearer capability. namespace.ts
+// records the same bug happening once before, leaking a live `runa_sc_…` to a
+// terminal and to CI logs under --json. If a family is ever added there, this
+// test fails until the redactor covers it -- which a literal list cannot do.
+test("every minted credential family is redacted out of a Problem detail", async () => {
+  for (const brand of CREDENTIAL_BRANDS) {
+    for (const infix of CREDENTIAL_FAMILY_INFIXES) {
+      const secret = `${brand}_${infix}_${"a1B2c3D4".repeat(4)}`;
+      assert.ok(containsCredentialValue(secret), `fixture must be a real credential shape: ${infix}`);
+      await assert.rejects(
+        problemWithDetail(`upstream rejected ${secret} while provisioning`).request({
+          method: "POST", path: "/v1/sessions",
+        }),
+        (error) => {
+          const rendered = JSON.stringify(error.details);
+          assert.ok(!rendered.includes(secret), `${brand}_${infix}_ leaked: ${error.details.detail}`);
+          // The authority itself is the oracle: after redaction it must not
+          // detect a credential. This is the property, not a string match.
+          assert.equal(containsCredentialValue(error.details.detail), false, error.details.detail);
+          assert.ok(error.details.detail.includes("while provisioning"), error.details.detail);
+          return true;
+        },
+      );
+    }
+  }
+});
+
+// The `--json` / non-TTY sink. EVERY previous detail test stopped at the
+// transport, which is exactly why the leak was invisible: output.ts emits
+// `details` raw when stdout is not a TTY, so a piped or CI invocation is the
+// unguarded path. cli-surface-regressions covers only the interactive arm.
+test("a credential cannot reach the structured error record", async () => {
+  const secret = `cuna_cr_${"z9Y8x7W6".repeat(4)}`;
+  await assert.rejects(
+    problemWithDetail(`resume handle ${secret} was refused`).request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => {
+      // The exact bytes a non-TTY invocation writes.
+      const record = JSON.stringify({ schema_version: "1", type: "error", error: {
+        code: error.code, message: error.message, details: error.details,
+      } });
+      assert.ok(!record.includes(secret), record);
+      assert.equal(containsCredentialValue(record), false, record);
+      return true;
+    },
+  );
+});
+
+test("prose containing the word bearer is not mangled", async () => {
+  // The previous `Bearer\s+[A-Za-z0-9._~+/-]+` turned this into
+  // "The [redacted credential] has expired." -- redacting nothing, deleting the
+  // cause, and asserting a secret was present when none was.
+  for (const prose of [
+    "The bearer token has expired.",
+    'upstream returned WWW-Authenticate: Bearer realm="cuna", error="invalid_token"',
+  ]) {
+    await assert.rejects(
+      problemWithDetail(prose).request({ method: "POST", path: "/v1/sessions" }),
+      (error) => {
+        assert.equal(error.details.detail, prose);
+        return true;
+      },
+    );
+  }
+});
+
+test("a publishable key is NOT redacted -- it is public and names the project", async () => {
+  const publishable = `sb_publishable_${"kL3mN4pQ".repeat(3)}`;
+  await assert.rejects(
+    problemWithDetail(`project ${publishable} rejected the request`).request({
+      method: "POST", path: "/v1/sessions",
+    }),
+    (error) => {
+      assert.ok(error.details.detail.includes(publishable), error.details.detail);
+      return true;
+    },
+  );
+});
+
+test("ordinary detail prose is not redacted", async () => {
+  const prose = "provider refused reservation 7f3a9c in region yyz for image sha256:abcd1234 after 3 attempts";
+  await assert.rejects(
+    problemWithDetail(prose).request({ method: "POST", path: "/v1/sessions" }),
+    (error) => {
+      assert.equal(error.details.detail, prose);
+      return true;
+    },
   );
 });
 

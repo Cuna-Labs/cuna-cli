@@ -6,6 +6,7 @@ import {
   automationCredentialHint,
 } from "../core/product-web.js";
 import {
+  CREDENTIAL_VALUE_SOURCE,
   isProblemType,
   isProblemTypeForCode,
   isTransportCredential,
@@ -39,6 +40,14 @@ interface ProblemMetadata {
   readonly code: string;
   readonly requestId: string;
   readonly retryable: boolean;
+  /**
+   * The one field that says WHY, in words, rather than which bucket the failure
+   * fell into. It was validated here and then dropped on the floor, so every
+   * catch-all `code` reached the user with its cause deleted: measured
+   * 2026-08-26, four `machine_create_authority_unavailable` 502s whose actual
+   * upstream reason the service had already put on the wire.
+   */
+  readonly detail?: string;
   readonly selectedProtocol?: 1 | 2 | null;
   readonly capabilities?: typeof WORKSPACE_SYNC_CAPABILITIES | typeof NO_WORKSPACE_SYNC_CAPABILITIES;
 }
@@ -76,6 +85,81 @@ export interface HttpTransport {
   request(input: HttpRequest): Promise<unknown>;
 }
 
+/**
+ * Credential shapes as they would appear inside a server-supplied `detail`.
+ *
+ * The first draft of this covered only `Bearer` and this product's own
+ * `cuna_/runa_` keys — which is EXACTLY the set the service-side scrubber already
+ * covers. A second layer that knows the same shapes as the first defends only
+ * against the first being deleted; it adds no coverage. The shapes below were
+ * added because a `detail` is written to a terminal AND to `--json`, and the text
+ * originates upstream of this service, where a foreign credential can appear in
+ * an error message that our own scrubber has no rule for.
+ *
+ * Redacting more is the safe direction for a redaction boundary. Each pattern is
+ * anchored tightly enough not to eat ordinary prose — the tests pin that the
+ * surrounding explanation survives, because redaction that costs the diagnosis
+ * defeats the field's purpose.
+ */
+const CREDENTIAL_SHAPE = new RegExp(
+  [
+    /*
+     * THIS PRODUCT'S CREDENTIALS COME FROM THE AUTHORITY, NOT FROM HERE.
+     *
+     * An earlier version of this constant carried a hand-written family list
+     * covering `at|sc|se|sk` -- four of the ten families in
+     * `CREDENTIAL_FAMILY_INFIXES`. It silently missed `rt`, `ct`, `tc`, `cb`,
+     * `cr` and `login`, and `cr` is a bearer capability. `namespace.ts` records
+     * this exact bug happening once already: a decoder's own stale copy let a
+     * live `runa_sc_…` reach a terminal and, under `--json`, CI logs. Its
+     * conclusion is the reason for this line: "A denylist assembled anywhere but
+     * here is the same bug waiting for the next family."
+     */
+    CREDENTIAL_VALUE_SOURCE,
+    /*
+     * Authorization header value. The token is required to be LONG.
+     *
+     * The previous form was `[A-Za-z0-9._~+/-]+`, which with the `i` flag turned
+     * the ordinary sentence "The bearer token has expired." into
+     * "The [redacted credential] has expired." -- redacting nothing while
+     * deleting the diagnosis, and telling the reader a secret was present when
+     * none was. A bearer token is not five characters.
+     */
+    String.raw`\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*`,
+    /*
+     * FOREIGN shapes -- credentials this product does not mint, which can appear
+     * in an upstream error message the service's own scrubber has no rule for.
+     * `sb_publishable_` is deliberately absent: it is public by design, and
+     * redacting it would delete which project the failure came from.
+     */
+    String.raw`\bsb_secret_[A-Za-z0-9_-]{16,}\b`,
+    // A bare JWT -- the shape a service-role key takes.
+    String.raw`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`,
+    // GitHub tokens: personal, OAuth, server, user, refresh.
+    String.raw`\bgh[pousr]_[A-Za-z0-9]{20,}\b`,
+    // AWS access key id.
+    String.raw`\bAKIA[0-9A-Z]{16}\b`,
+  ].join("|"),
+  "giu",
+);
+
+/**
+ * Second line of defence on a string we are about to print to a terminal.
+ *
+ * The service already scrubs `detail` before sending it, so on a correct server
+ * this is a no-op. It exists because that guarantee is not structural: the
+ * scrubber's credential rule lives in one `replace` call on the service side,
+ * and a branch that deleted it (`codex/cuna-rebrand`, removing `LOG_CREDENTIAL`)
+ * exists right now. This client cannot verify what the server scrubbed, and the
+ * cost of being wrong is a live key on a user's screen and in their scrollback.
+ *
+ * Worst case it redacts something already redacted. That is an acceptable trade
+ * against printing a credential.
+ */
+function redactCredentialShapes(text: string): string {
+  return text.replace(CREDENTIAL_SHAPE, "[redacted credential]");
+}
+
 function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata | undefined {
   if (!isObject(body)) return undefined;
   if (Object.hasOwn(body, "selected_protocol") || Object.hasOwn(body, "capabilities")) {
@@ -104,6 +188,7 @@ function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata
     code: body.code,
     requestId: body.request_id,
     retryable: body.retryable,
+    ...(typeof body.detail === "string" ? { detail: redactCredentialShapes(body.detail) } : {}),
   });
 }
 
@@ -144,6 +229,8 @@ function workspaceSyncProblemMetadata(
     code: body.code,
     requestId: body.request_id,
     retryable: body.retryable,
+    // Required, not optional, in this shape -- validated non-empty above.
+    detail: redactCredentialShapes(body.detail as string),
     selectedProtocol: selectedProtocol as 1 | 2 | null,
     capabilities: selectedProtocol === null
       ? NO_WORKSPACE_SYNC_CAPABILITIES
@@ -183,6 +270,10 @@ function apiError(input: {
     http_status: status,
     ...(effectiveRequestId === undefined ? {} : { request_id: effectiveRequestId }),
     ...(reason === undefined ? {} : { reason }),
+    // `reason` says which bucket; `detail` says why. Without this line the
+    // service's own explanation is validated and discarded, which is how a
+    // retryable-looking catch-all can hide a permanent, specific refusal.
+    ...(problem?.detail === undefined ? {} : { detail: problem.detail }),
     ...(problem?.selectedProtocol === undefined
       ? {}
       : { selected_protocol: problem.selectedProtocol }),
