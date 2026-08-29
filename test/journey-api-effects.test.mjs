@@ -125,3 +125,135 @@ test("recovered AgentSession with substituted authority is rejected before attac
       error.code === "cuna.journey.agent_session_create_authority_mismatch",
   );
 });
+
+/* -------------------------------------------------------------------------- */
+/* AgentSession readiness: the error named the wrong subsystem                 */
+/*                                                                            */
+/* `cuna.journey.agent_session_ready_timeout` collapsed at least four causes   */
+/* and exited with EXIT_CODES.network, on a run where the network answered     */
+/* ninety times. It is the error that blocked completion conditions 6 and 7,   */
+/* and it sent the reader to their connection while the fault was on the       */
+/* machine.                                                                    */
+/*                                                                            */
+/* The oracles below are RELATIONS. The one that matters most is not "the code */
+/* equals this string" — it is that the transport is proved to have ANSWERED   */
+/* every poll, in the same test that asserts the exit status is not `network`. */
+/* A relabelling cannot satisfy that pair.                                     */
+/* -------------------------------------------------------------------------- */
+
+function stalledClient(processState, observed) {
+  return {
+    async getAgentSession() {
+      observed.polls += 1;
+      return recoveredSession({ processState });
+    },
+  };
+}
+
+async function readinessFailure(processState) {
+  const observed = { polls: 0 };
+  let caught;
+  await assert.rejects(
+    effects(stalledClient(processState, observed)).ensureAgentSessionReady({
+      agentSessionId: SESSION_ID,
+      signal: new AbortController().signal,
+    }),
+    (error) => {
+      caught = error;
+      return error instanceof CunaError;
+    },
+  );
+  return { error: caught, polls: observed.polls };
+}
+
+test("a readiness stall does not exit with a network status, because the network answered", async () => {
+  for (const processState of ["starting", "unknown", "terminating"]) {
+    const { error, polls } = await readinessFailure(processState);
+
+    // The transport answered every single time. That is the whole reason
+    // `network` was the wrong word, and it is measured here rather than assumed.
+    assert.ok(polls > 1, `${processState}: the poll loop did not run`);
+    assert.equal(
+      error.details?.observations,
+      String(polls),
+      `${processState}: the error reports a different number of observations than were made`,
+    );
+    assert.notEqual(
+      error.exitCode,
+      EXIT_CODES.network,
+      `${processState}: ${polls} answered polls still exit with the network status`,
+    );
+
+    // The state it actually observed travels with the error, so the next read
+    // is decided by the message rather than by guessing.
+    assert.equal(error.details?.observed_state, processState);
+    assert.equal(error.details?.observed_states, processState);
+  }
+});
+
+test("three different stalls are three different faults", async () => {
+  const results = new Map();
+  for (const processState of ["starting", "unknown", "terminating"]) {
+    results.set(processState, (await readinessFailure(processState)).error);
+  }
+  const codes = [...results.values()].map((error) => error.code);
+  assert.equal(
+    new Set(codes).size,
+    codes.length,
+    `three stalls produced overlapping codes: ${codes.join(", ")}`,
+  );
+
+  // A session already shutting down is not the same decision as one that never
+  // started, so it does not share their exit status either.
+  assert.notEqual(
+    results.get("terminating").exitCode,
+    results.get("starting").exitCode,
+    "a terminating session and one that never started exit identically",
+  );
+
+  // Literal oracle, so the inequalities above cannot be satisfied by renaming
+  // everything to three arbitrary words.
+  assert.equal(results.get("starting").code, "cuna.journey.agent_session_start_incomplete");
+  assert.equal(results.get("unknown").code, "cuna.journey.agent_session_unobservable");
+  assert.equal(results.get("terminating").code, "cuna.journey.agent_session_terminating");
+  assert.equal(results.get("terminating").exitCode, EXIT_CODES.conflict);
+});
+
+test("a terminal AgentSession names which terminal state it reached", async () => {
+  const reached = [];
+  for (const processState of ["exited", "failed", "terminated"]) {
+    const observed = { polls: 0 };
+    let caught;
+    await assert.rejects(
+      effects(stalledClient(processState, observed)).ensureAgentSessionReady({
+        agentSessionId: SESSION_ID,
+        signal: new AbortController().signal,
+      }),
+      (error) => {
+        caught = error;
+        return error instanceof CunaError;
+      },
+    );
+    assert.equal(observed.polls, 1, `${processState}: a terminal state must be refused on the first read`);
+    assert.equal(caught.code, "cuna.journey.agent_session_failed");
+    assert.equal(caught.details?.observed_state, processState);
+    assert.notEqual(caught.exitCode, EXIT_CODES.network);
+    reached.push(caught.message);
+  }
+  // One code, three messages: the code is the class, and the state it reached is
+  // carried rather than discarded. Splitting the class further is a separate,
+  // deliberate change to the error surface.
+  assert.equal(new Set(reached).size, 3, "three terminal states rendered one message");
+});
+
+test("readiness returns as soon as the producer says ready or running", async () => {
+  for (const processState of ["ready", "running"]) {
+    const observed = { polls: 0 };
+    const result = await effects(stalledClient(processState, observed)).ensureAgentSessionReady({
+      agentSessionId: SESSION_ID,
+      signal: new AbortController().signal,
+    });
+    assert.equal(observed.polls, 1, `${processState}: readiness was not decided on the first read`);
+    assert.equal(result.id, SESSION_ID);
+  }
+});

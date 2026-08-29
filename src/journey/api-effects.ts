@@ -1,4 +1,4 @@
-import type { AgentSession, Machine } from "../api/contracts.js";
+import type { AgentSession, AgentSessionProcessState, Machine } from "../api/contracts.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import { isObservationBudgetCode } from "../core/observation-budget.js";
@@ -32,6 +32,68 @@ export interface ApiAgentJourneyEffectsInput {
 function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.remote, details?: Record<string, string>): CunaError {
   return new CunaError({ code, message, exitCode, ...(details === undefined ? {} : { details }) });
 }
+
+/**
+ * `agent_session_ready_timeout` collapsed at least four causes and exited with
+ * a NETWORK code — on a run where the network answered ninety times.
+ *
+ * Nothing about the transport failed. The CLI asked the producer ninety times
+ * and got ninety answers, and every one of them said the session was not ready.
+ * `EXIT_CODES.network` sent the reader to their connection; the fault was on the
+ * machine. That is what made conditions 6 and 7 expensive to diagnose.
+ *
+ * The three states a poll can exhaust on are three different faults with three
+ * different next reads, so they get three names, and the exit status follows the
+ * name rather than the shape of the loop that produced it:
+ *
+ *   starting     the producer sees it starting and it never finished
+ *   unknown      the producer never observed a process state at all
+ *   terminating  it was already shutting down before it was ever ready
+ *
+ * The partition below is proved exhaustive at COMPILE time against
+ * `AgentSessionProcessState`. A state added to the contract without a decision
+ * here is a type error, not a silent fall-through into whichever branch happens
+ * to be last.
+ */
+const READY_STATES = ["ready", "running"] as const;
+const TERMINAL_STATES = ["exited", "failed", "terminated"] as const;
+const STALLED_STATES = ["unknown", "starting", "terminating"] as const;
+
+const READY_PROCESS_STATES: ReadonlySet<AgentSessionProcessState> = new Set(READY_STATES);
+const TERMINAL_PROCESS_STATES: ReadonlySet<AgentSessionProcessState> = new Set(TERMINAL_STATES);
+
+type StalledProcessState = (typeof STALLED_STATES)[number];
+type ClassifiedProcessState =
+  | (typeof READY_STATES)[number]
+  | (typeof TERMINAL_STATES)[number]
+  | StalledProcessState;
+
+// Both directions: no process state is unclassified, and no classification
+// names a state the contract does not have.
+type Unclassified = Exclude<AgentSessionProcessState, ClassifiedProcessState>;
+type Invented = Exclude<ClassifiedProcessState, AgentSessionProcessState>;
+type Exhaustive<T extends never> = T;
+export type ProcessStateCoverage = [Exhaustive<Unclassified>, Exhaustive<Invented>];
+
+const READINESS_STALL: Readonly<
+  Record<StalledProcessState, { readonly code: string; readonly message: string; readonly exitCode: ExitCode }>
+> = Object.freeze({
+  starting: Object.freeze({
+    code: "cuna.journey.agent_session_start_incomplete",
+    message: "The AgentSession stayed in starting and never became ready. Inspect the machine, not the connection.",
+    exitCode: EXIT_CODES.remote,
+  }),
+  unknown: Object.freeze({
+    code: "cuna.journey.agent_session_unobservable",
+    message: "The producer never observed a process state for this AgentSession.",
+    exitCode: EXIT_CODES.remote,
+  }),
+  terminating: Object.freeze({
+    code: "cuna.journey.agent_session_terminating",
+    message: "The AgentSession was already shutting down before it was ever ready.",
+    exitCode: EXIT_CODES.conflict,
+  }),
+});
 
 function recency(machine: Machine, now: number): "recent" | "not_recent" | "unknown" {
   const timestamp = machine.updatedAt ?? machine.createdAt;
@@ -265,17 +327,31 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       return Object.freeze({ id: session.id, machineId: session.machineId });
     },
     async ensureAgentSessionReady({ agentSessionId, signal }) {
+      const seen = new Set<AgentSessionProcessState>();
+      let last: AgentSessionProcessState = "unknown";
       for (let attempt = 0; attempt < CHILD_POLL_LIMIT; attempt += 1) {
         const session = await input.client.getAgentSession(agentSessionId, signal);
-        if (session.processState === "ready" || session.processState === "running") {
+        last = session.processState;
+        seen.add(last);
+        if (READY_PROCESS_STATES.has(last)) {
           return Object.freeze({ id: session.id, machineId: session.machineId });
         }
-        if (["exited", "failed", "terminated"].includes(session.processState)) {
-          throw fail("cuna.journey.agent_session_failed", "The AgentSession reached a terminal state before attach.");
+        if (TERMINAL_PROCESS_STATES.has(last)) {
+          throw fail(
+            "cuna.journey.agent_session_failed",
+            `The AgentSession reached ${last} before attach.`,
+            EXIT_CODES.remote,
+            { observed_state: last },
+          );
         }
         await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
       }
-      throw fail("cuna.journey.agent_session_ready_timeout", "AgentSession readiness remained unproven.", EXIT_CODES.network);
+      const stall = READINESS_STALL[last as StalledProcessState];
+      throw fail(stall.code, stall.message, stall.exitCode, {
+        observed_state: last,
+        observed_states: [...seen].sort().join(","),
+        observations: String(CHILD_POLL_LIMIT),
+      });
     },
     attach: input.attach,
     async reconcileCancellation({ ledger, signal }) {
