@@ -338,12 +338,108 @@ test("signup capability is closed and never fabricates providers while disabled"
   }));
 });
 
-test("a second login fails before creating a new continuation or orphaning the old family", async () => {
+/**
+ * A second login is a no-op, not a failure.
+ *
+ * The gate used to throw `cuna.auth.already_signed_in` with the auth exit code,
+ * so the CLI told a user whose session was perfectly healthy that something had
+ * gone wrong and exited 3. Being signed in is the state `login` exists to
+ * reach; arriving there early changes nothing and is worth exactly one line.
+ *
+ * What must NOT change is the rest of it: no continuation, no browser, no
+ * exchange, and nothing rewritten in the store. Those are asserted here rather
+ * than the return value alone, because a "fix" that re-ran the whole sign-in
+ * and reported success would satisfy any assertion about the result.
+ */
+test("a second login reports the existing session without a continuation, a browser, or a rotation", async () => {
   const subject = fixture();
-  await subject.service.login();
+  const first = await subject.service.login();
   const creates = subject.client.calls.filter(([name]) => name === "create").length;
-  await assert.rejects(subject.service.login(), (error) => error.code === "cuna.auth.already_signed_in");
+  const exchanges = subject.client.calls.filter(([name]) => name === "exchange").length;
+  const callsBefore = subject.client.calls.length;
+  const openedBefore = subject.opened.length;
+  const handoffBefore = subject.handoff.length;
+  const storedBefore = [...subject.backend.values.entries()]
+    .map(([target, value]) => [target, Buffer.from(value).toString("base64")]);
+
+  const second = await subject.service.login();
+
+  assert.equal(second.alreadySignedIn, true);
+  // The identity is the point: a line that cannot name the profile is not
+  // actionable, because `cuna logout` acts on exactly that profile.
+  assert.equal(second.profile, first.profile);
+  assert.equal(second.sessionId, first.sessionId);
+  assert.deepEqual(second.context, first.context);
+  assert.equal(second.storageMode, "encrypted-local");
+
   assert.equal(subject.client.calls.filter(([name]) => name === "create").length, creates);
+  assert.equal(subject.client.calls.filter(([name]) => name === "exchange").length, exchanges);
+  assert.equal(subject.opened.length, openedBefore, "an existing session must not open a browser");
+  assert.equal(subject.handoff.length, handoffBefore);
+  // The whole point of not re-authenticating: no remote call of any kind.
+  assert.equal(subject.client.calls.length, callsBefore, "reporting an existing session must not touch the network");
+  // Byte-identical: the durable record was read, never rewritten.
+  assert.deepEqual(
+    [...subject.backend.values.entries()].map(([target, value]) => [target, Buffer.from(value).toString("base64")]),
+    storedBefore,
+  );
+
+  // A first login is still a first login, and still says so.
+  assert.equal(first.alreadySignedIn, undefined);
+});
+
+/**
+ * NEGATIVE CONTROL for the change above: a store that is present but
+ * undecodable must stay an error.
+ *
+ * This is the failure mode the fix could plausibly introduce -- "there is a
+ * record, therefore you are signed in" would report a damaged vault as a
+ * healthy session and send the user away with nothing to fix. The envelope here
+ * is valid (so the vault reports `present`, reaching the same branch as a real
+ * session); only the payload inside it is not a session.
+ */
+test("a present but undecodable session store still errors instead of reporting a session", async () => {
+  const subject = fixture();
+  const material = SecretMaterial.fromUtf8("{ this is not a session");
+  try {
+    await subject.vault.rotate({ binding: HUMAN_SESSION_BINDING, material, expiresAt: NOW + 3_600_000 });
+  } finally { material.dispose(); }
+
+  await assert.rejects(
+    subject.service.login(),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.auth.session_corrupt" &&
+      error.exitCode !== 0,
+  );
+  // It failed on the record, not by wandering into a sign-in.
+  assert.equal(subject.client.calls.some(([name]) => name === "create" || name === "exchange"), false);
+  assert.deepEqual(subject.opened, []);
+});
+
+/**
+ * NEGATIVE CONTROL: a genuinely failed sign-in is still a failure.
+ *
+ * Exit code 0 is now reachable from the already-signed-in branch, so the
+ * property that matters is that it is reachable ONLY from there.
+ */
+test("a login that actually fails still raises an auth error with a non-zero exit code", async () => {
+  const subject = fixture({
+    client: fakeClient({
+      async exchange(input) {
+        this.calls.push(["exchange", input]);
+        throw new CunaError({
+          code: "cuna.auth.login_code_invalid",
+          message: "The pasted Cuna login code is invalid.",
+          exitCode: 3,
+        });
+      },
+    }),
+  });
+  await assert.rejects(
+    subject.service.login(),
+    (error) => error instanceof CunaError && error.exitCode === 3,
+  );
+  assert.equal(subject.backend.values.size, 0, "a failed sign-in must leave no session behind");
 });
 
 test("deferred code cancellation and expiry remain local without exchange or persistence", async () => {

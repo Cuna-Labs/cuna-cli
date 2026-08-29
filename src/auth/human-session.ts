@@ -49,6 +49,13 @@ export interface HumanAuthResult {
   readonly sessionId: string;
   readonly context: CliIdentityContext;
   readonly storageMode?: "encrypted-local";
+  /**
+   * `login` found a valid session and did nothing. Present only on that path,
+   * so a caller that ignores it renders the ordinary success it already
+   * rendered. The domain code stays `cuna.auth.already_signed_in` for
+   * machine-readable output; the severity does not follow it.
+   */
+  readonly alreadySignedIn?: true;
 }
 
 export interface HumanAuthService {
@@ -479,6 +486,33 @@ export function createHumanAuthService(input: {
     });
   }
 
+  /**
+   * Describe the session already in the encrypted store, without contacting
+   * the service and without touching the record.
+   *
+   * `undefined` means the record was gone by the time it was read, which is a
+   * real outcome of two separate reads, not an error. A record that is present
+   * but undecodable is NOT swallowed: `decodeStored` throws
+   * `cuna.auth.session_corrupt` straight through this function, so a damaged
+   * vault can never be presented as a working sign-in.
+   */
+  async function describeStoredSession(): Promise<HumanAuthResult | undefined> {
+    const snapshot = await input.vault.load(credentialBinding);
+    if (snapshot === undefined) return undefined;
+    try {
+      const stored = snapshot.material.withBytes((bytes) => decodeStored(bytes, input.config));
+      return Object.freeze({
+        profile: stored.profile,
+        sessionId: stored.sessionId,
+        context: stored.context,
+        storageMode: "encrypted-local" as const,
+        alreadySignedIn: true as const,
+      });
+    } finally {
+      snapshot.material.dispose();
+    }
+  }
+
   async function login(request: { readonly intentClass?: CliIntentClass; readonly signal?: AbortSignal } = {}): Promise<HumanAuthResult> {
     const intentClass = request.intentClass ?? "login";
     assertNotCancelled(request.signal);
@@ -493,11 +527,21 @@ export function createHumanAuthService(input: {
       );
     }
     if (vaultStatus.state === "present") {
-      throw authError(
-        "cuna.auth.already_signed_in",
-        "This Cuna profile already has an interactive session.",
-        { hint: "Run `cuna logout` before signing in again." },
-      );
+      // Being signed in already is the state `login` exists to reach, so
+      // reaching it is not a failure. Report the session that is there and
+      // stop: no continuation, no browser, no re-authentication, and nothing
+      // rotated in the store.
+      //
+      // The description is read from the encrypted record itself rather than
+      // from the network. That keeps this path free of a remote round trip
+      // and, more importantly, keeps a store this CLI cannot decode out of it
+      // -- `decodeStored` raises `cuna.auth.session_corrupt`, which must stay
+      // an error instead of being reported as a healthy session.
+      const existing = await describeStoredSession();
+      if (existing !== undefined) return existing;
+      // `status` and `load` are two reads. Between them the record can expire
+      // or another shell can sign out. Fall through to a real sign-in rather
+      // than announcing a session that no longer exists.
     }
     if (vaultStatus.state === "corrupt") {
       throw authError(

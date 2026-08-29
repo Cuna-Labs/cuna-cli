@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
+import { CunaError, EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
 import { CREDENTIAL_BACKEND_PROTOCOL } from "../dist/credentials/contracts.js";
 
 const API_KEY = "cuna_sk_abcdefghijklmnop";
@@ -565,6 +565,162 @@ test("login defaults to encrypted local storage and authenticated commands reuse
     EXIT_CODES.success,
   );
   assert.equal(observedAuthorization, `Bearer runa_at_${"a".repeat(43)}`);
+});
+
+const SIGNED_IN_RESULT = Object.freeze({
+  profile: "default",
+  sessionId: "00000000-0000-0000-0000-000000000002",
+  context: Object.freeze({
+    requiredTermsVersion: "2026-08",
+    identity: "active",
+    admission: "admitted",
+    workspace: Object.freeze({ state: "assigned", id: "00000000-0000-0000-0000-000000000003" }),
+  }),
+});
+
+function loginAuthority(login) {
+  return {
+    login,
+    async signup() { throw new Error("unexpected signup"); },
+    async acquireAccessToken() { throw new Error("unexpected acquire"); },
+    async whoami() { throw new Error("unexpected whoami"); },
+    async logout() { throw new Error("unexpected logout"); },
+  };
+}
+
+/**
+ * The success line names the profile and stops there.
+ *
+ * It used to end with "using the encrypted local session store". Which store
+ * holds the session is this CLI's business, not an answer to anything the
+ * person asked by typing `cuna login`, and a success line is the worst place to
+ * volunteer it. The machine-readable `storage_mode` field keeps the fact for
+ * anyone who actually needs it, which is what the JSON assertion below pins.
+ */
+test("the login success line names the profile and not the storage backend", async () => {
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  assert.equal(
+    await runCli(["login"], {
+      streams: streams.streams,
+      platform,
+      env: {},
+      humanAuth: loginAuthority(async () => SIGNED_IN_RESULT),
+    }),
+    EXIT_CODES.success,
+  );
+  assert.equal(streams.stdout(), "Signed in to Cuna profile default.\n");
+  assert.doesNotMatch(streams.stdout(), /storage|store|encrypted/iu);
+  assert.equal(streams.stderr(), "");
+});
+
+/**
+ * Already signed in is a success, and reads like one.
+ *
+ * Measured before this change, with a valid session:
+ *
+ *   Error [cuna.auth.already_signed_in]: This Cuna profile already has an
+ *   interactive session.
+ *   Next: Run `cuna logout` before signing in again.
+ *
+ * with exit code 3. Nothing was wrong, nothing needed doing, and the CLI
+ * announced a failure. A domain code is not a severity: the code survives in
+ * the structured output below, the alarm does not survive anywhere.
+ */
+test("login with a valid session exits zero and reads as success, naming the profile", async () => {
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  let browserOpened = false;
+  assert.equal(
+    await runCli(["login"], {
+      streams: streams.streams,
+      platform,
+      env: {},
+      browser: { async open() { browserOpened = true; } },
+      humanAuth: loginAuthority(async () => ({ ...SIGNED_IN_RESULT, alreadySignedIn: true })),
+    }),
+    EXIT_CODES.success,
+  );
+  const stdout = streams.stdout();
+  assert.match(stdout, /^Already signed in to Cuna profile default\.$/mu);
+  // Actionable, and only the one action: how to get to another account.
+  assert.match(stdout, /To use another account, run `cuna logout` first\./u);
+  // The alarming presentation is gone from both streams: no "Error" heading,
+  // no raw domain code shouted at a person, and nothing on stderr at all.
+  assert.doesNotMatch(stdout, /Error/u);
+  assert.doesNotMatch(stdout, /cuna\.auth\.already_signed_in/u);
+  assert.equal(streams.stderr(), "");
+  assert.equal(browserOpened, false, "an existing session must not start a browser flow");
+});
+
+test("already-signed-in login keeps the machine-readable code in structured output", async () => {
+  // Structured mode, so the code has somewhere to live. The record stays a
+  // `result`, not an `error`: the exit code and the envelope must agree.
+  const streams = memoryStreams();
+  assert.equal(
+    await runCli(["login", "--json"], {
+      streams: streams.streams,
+      platform,
+      env: {},
+      humanAuth: loginAuthority(async () => ({ ...SIGNED_IN_RESULT, alreadySignedIn: true })),
+    }),
+    EXIT_CODES.success,
+  );
+  const record = JSON.parse(streams.stdout());
+  assert.equal(record.type, "result");
+  assert.equal(record.command, "login");
+  assert.equal(record.data.code, "cuna.auth.already_signed_in");
+  assert.equal(record.data.already_signed_in, true);
+  assert.equal(record.data.profile, "default");
+  assert.equal(record.data.storage_mode, "encrypted-local");
+
+  // The discriminator is real: an ordinary login carries neither field, so a
+  // script can tell the two apart instead of guessing from prose.
+  const fresh = memoryStreams();
+  assert.equal(
+    await runCli(["login", "--json"], {
+      streams: fresh.streams,
+      platform,
+      env: {},
+      humanAuth: loginAuthority(async () => SIGNED_IN_RESULT),
+    }),
+    EXIT_CODES.success,
+  );
+  const freshRecord = JSON.parse(fresh.stdout());
+  assert.equal(freshRecord.data.already_signed_in, undefined);
+  assert.equal(freshRecord.data.code, undefined);
+  assert.equal(freshRecord.data.storage_mode, "encrypted-local");
+});
+
+/**
+ * NEGATIVE CONTROL: exit 0 is reachable only from the already-signed-in branch.
+ * A sign-in that genuinely fails is still an error, on stderr, with the auth
+ * exit code and the code intact in structured output.
+ */
+test("a failed login is still an error with a non-zero exit code", async () => {
+  const failing = loginAuthority(async () => {
+    throw new CunaError({
+      code: "cuna.auth.login_code_invalid",
+      message: "The pasted Cuna login code is invalid.",
+      exitCode: EXIT_CODES.auth,
+    });
+  });
+
+  const human = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  assert.equal(
+    await runCli(["login"], { streams: human.streams, platform, env: {}, humanAuth: failing }),
+    EXIT_CODES.auth,
+  );
+  assert.notEqual(EXIT_CODES.auth, EXIT_CODES.success);
+  assert.match(human.stderr(), /Error \[cuna\.auth\.login_code_invalid\]/u);
+  assert.equal(human.stdout(), "");
+
+  const structured = memoryStreams();
+  assert.equal(
+    await runCli(["login", "--json"], { streams: structured.streams, platform, env: {}, humanAuth: failing }),
+    EXIT_CODES.auth,
+  );
+  const record = JSON.parse(structured.stderr());
+  assert.equal(record.type, "error");
+  assert.equal(record.error.code, "cuna.auth.login_code_invalid");
 });
 
 test("preview login never prints a capability-bearing browser URL to JSON or redirected output", async () => {
