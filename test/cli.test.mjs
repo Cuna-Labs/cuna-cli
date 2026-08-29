@@ -203,7 +203,7 @@ test("machines overview keeps OpenCode observations visible and actionable on a 
     now: () => Date.parse("2026-08-08T00:00:00.000Z"),
     clientFactory: () => client,
   }), EXIT_CODES.success);
-  assert.match(human.stdout(), /OpenCode declared-installed/u);
+  assert.match(human.stdout(), /OpenCode ready/u);
   assert.match(human.stdout(), /observed-opencode  attachable/u);
   assert.ok(human.stdout().indexOf("OpenCode 1/1 running") < human.stdout().indexOf("Claude 0/0 running"));
 });
@@ -3185,4 +3185,229 @@ test("package and runtime versions remain identical", async () => {
   const streams = memoryStreams();
   await runCli(["--version"], { streams: streams.streams });
   assert.equal(JSON.parse(streams.stdout()).data.version, packageJson.version);
+});
+
+// PRD-OC-011 R2. Every test below fails on the rendering that shipped before
+// it: the field it asserts existed in `data`, was decoded, and was dropped on
+// the one branch a person at a terminal reads.
+
+test("machines list names the provider verdict, so a machine that cannot host a session stops printing like one", async () => {
+  const usable = { id: MACHINE_ID, name: "dev-box", state: "running", agent: "opencode" };
+  const unusable = { id: "44444444-4444-4444-8444-444444444444", name: "old-box", state: "running", agent: "fooagent" };
+  const client = fakeClient({ async listMachines() { return { items: [usable, unusable] }; } });
+  const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["machines", "list"], {
+    streams: human.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => client,
+  }), EXIT_CODES.success, human.stderr());
+  const lines = human.stdout().trim().split("\n");
+  assert.equal(lines[0], `${usable.id}\tdev-box\trunning\tOpenCode ready`);
+  assert.equal(lines[1], `${unusable.id}\told-box\trunning\tUnknown (fooagent) unusable — provider_not_supported_by_cli`);
+
+  // The JSON is the control, and it is unchanged: it carried both fields all
+  // along, and the human branch was the only consumer that lost them.
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "list", "--json"], {
+    streams: json.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  const items = JSON.parse(json.stdout()).data.items;
+  assert.equal(items[1].provider_availability.usability, "declared-installed");
+  assert.equal(items[1].provider_availability.actionable, false);
+});
+
+test("the machines overview header prints the verdict, not the declaration that contradicts it", async () => {
+  // `usability: declared-installed` and `actionable: false` coexist by
+  // construction. The header used to print the first alone, so this machine
+  // read as installed and usable while every session on it classifies
+  // unsupported and `agent-sessions create` fails closed.
+  const machine = { id: MACHINE_ID, name: "old-box", state: "running", agent: "fooagent" };
+  const client = fakeClient({ async listMachines() { return { items: [machine] }; } });
+  const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["machines"], {
+    streams: human.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success, human.stderr());
+  assert.match(human.stdout(), /Unknown \(fooagent\) unusable — provider_not_supported_by_cli/u, human.stdout());
+  assert.doesNotMatch(human.stdout(), /fooagent\) declared-installed/u, human.stdout());
+});
+
+test("api-keys list derives its status word from expiry as well as revocation", async () => {
+  const now = Date.parse("2026-08-08T00:00:00.000Z");
+  const keys = [
+    {
+      id: "11111111-1111-4111-8111-111111111111",
+      name: "expired-never-revoked",
+      prefix: "cuna_sk_abcd",
+      lastFour: "WXYZ",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: "2026-08-01T00:00:00.000Z",
+      lastUsedAt: null,
+      revokedAt: null,
+    },
+    {
+      id: "22222222-2222-4222-8222-222222222222",
+      name: "still-valid",
+      prefix: "cuna_sk_efgh",
+      lastFour: "1234",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: "2026-12-01T00:00:00.000Z",
+      lastUsedAt: null,
+      revokedAt: null,
+    },
+    {
+      id: "33333333-3333-4333-8333-333333333333",
+      name: "no-expiry",
+      prefix: "cuna_sk_ijkl",
+      lastFour: "5678",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: null,
+      lastUsedAt: null,
+      revokedAt: null,
+    },
+    {
+      id: "44444444-4444-4444-8444-444444444444",
+      name: "revoked-key",
+      prefix: "cuna_sk_mnop",
+      lastFour: "9012",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: "2026-12-01T00:00:00.000Z",
+      lastUsedAt: null,
+      revokedAt: "2026-08-02T00:00:00.000Z",
+    },
+  ];
+  const client = fakeClient({
+    async discoverCapabilities(scope) {
+      return capabilitySnapshot([{
+        id: "api_keys.manage",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "secret_revealing",
+        surfaces: ["cli"],
+        requiredPermissions: ["api_keys:manage", "auth:interactive"],
+      }], scope);
+    },
+    async listApiKeys() { return keys; },
+  });
+  const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["api-keys", "list"], {
+    streams: human.streams,
+    platform,
+    env: {},
+    humanAuth: { async acquireAccessToken() { return `cuna_at_${"b".repeat(43)}`; } },
+    now: () => now,
+    clientFactory: () => client,
+  }), EXIT_CODES.success, human.stderr());
+  const lines = human.stdout().trim().split("\n");
+  // The defect: `revokedAt === null` alone printed this key as `active`.
+  assert.equal(lines[0], `${keys[0].id}\texpired-never-revoked\tcuna_sk_abcd…WXYZ\texpired 2026-08-01T00:00:00.000Z`);
+  assert.equal(lines[1], `${keys[1].id}\tstill-valid\tcuna_sk_efgh…1234\tactive until 2026-12-01T00:00:00.000Z`);
+  assert.equal(lines[2], `${keys[2].id}\tno-expiry\tcuna_sk_ijkl…5678\tactive (no expiry)`);
+  assert.equal(lines[3], `${keys[3].id}\trevoked-key\tcuna_sk_mnop…9012\trevoked 2026-08-02T00:00:00.000Z`);
+});
+
+test("cuna version prints the build digest that separates two installations reporting 0.1.0", async () => {
+  const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["version"], { streams: human.streams, platform, env: {} }), EXIT_CODES.success);
+  const printed = human.stdout().trim();
+  assert.match(printed, /^0\.1\.0\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
+
+  // The digest printed is the exact 12-hex prefix of the one the JSON record
+  // carries, so the two surfaces can never name different builds.
+  const json = memoryStreams();
+  assert.equal(await runCli(["version", "--json"], { streams: json.streams, platform, env: {} }), EXIT_CODES.success);
+  const record = JSON.parse(json.stdout());
+  assert.equal(printed.split("\t")[1], `build ${record.data.buildDigest.slice(0, 12)}…`);
+});
+
+test("doctor and config get answer a terminal in lines, not in a JSON dump", async () => {
+  const doctor = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["doctor"], {
+    streams: doctor.streams,
+    platform,
+    env: {},
+    runtimeFeatures: [
+      { feature: "daemon", implementation: "unsupported", reason: "daemon_runtime_unavailable" },
+      { feature: "terminal_workspace", implementation: "available", reason: "foreground_exact_session_composed_live_producer_required" },
+    ],
+  }), EXIT_CODES.success, doctor.stderr());
+  const doctorLines = doctor.stdout().trim().split("\n");
+  assert.equal(doctorLines[0], `platform\t${process.platform}`);
+  assert.equal(doctorLines[1], `node\t${process.version}`);
+  assert.equal(doctorLines[2], "environment_credential\tabsent");
+  assert.equal(doctorLines[3], "environment_credential_variable\tnull");
+  assert.equal(doctorLines[4], "runtime_features");
+  // The reason code is the field that names the prerequisite, and it is on the
+  // line that reports the feature rather than in a nested JSON object.
+  assert.equal(doctorLines[5], "  daemon\tunsupported\tdaemon_runtime_unavailable");
+  assert.equal(doctorLines[6], "  terminal_workspace\tavailable\tforeground_exact_session_composed_live_producer_required");
+  assert.doesNotMatch(doctor.stdout(), /[{}]/u, doctor.stdout());
+
+  const config = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["config", "get"], { streams: config.streams, platform, env: {} }), EXIT_CODES.success, config.stderr());
+  assert.doesNotMatch(config.stdout(), /[{}]/u, config.stdout());
+  assert.match(config.stdout(), /^profile\tdefault$/mu, config.stdout());
+  assert.match(config.stdout(), /^api_key\tabsent$/mu, config.stdout());
+  assert.match(config.stdout(), /^api_key_variable\tnull$/mu, config.stdout());
+
+  // Both records are unchanged under --json; only the human branch moved.
+  const configJson = memoryStreams();
+  assert.equal(await runCli(["config", "get", "--json"], { streams: configJson.streams, platform, env: {} }), EXIT_CODES.success);
+  assert.equal(JSON.parse(configJson.stdout()).data.profile, "default");
+});
+
+test("a truncated page says so, so a missing record cannot be mistaken for an absent one", async () => {
+  const sessions = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["agent-sessions", "list", "--machine", MACHINE_ID], {
+    streams: sessions.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async listAgentSessions() {
+        return { items: [agentSession({ machineId: MACHINE_ID })], nextCursor: "eyJvIjoxMDB9" };
+      },
+    }),
+  }), EXIT_CODES.success, sessions.stderr());
+  assert.equal(
+    sessions.stdout().trim().split("\n").at(-1),
+    "-- more results; continue with --cursor eyJvIjoxMDB9",
+  );
+
+  // NEGATIVE CONTROL: a complete page must not grow a footer, or the notice
+  // stops meaning anything.
+  const complete = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["agent-sessions", "list", "--machine", MACHINE_ID], {
+    streams: complete.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async listAgentSessions() { return { items: [agentSession({ machineId: MACHINE_ID })] }; },
+    }),
+  }), EXIT_CODES.success, complete.stderr());
+  assert.doesNotMatch(complete.stdout(), /more results/u, complete.stdout());
+
+  // `machines list` takes no `--cursor`, so it must not offer one it cannot accept.
+  const machines = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["machines", "list"], {
+    streams: machines.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "dev-box", state: "running", agent: "opencode" }], nextCursor: "eyJvIjoxMDB9" };
+      },
+    }),
+  }), EXIT_CODES.success, machines.stderr());
+  assert.equal(
+    machines.stdout().trim().split("\n").at(-1),
+    "-- truncated; more machines exist beyond this page",
+  );
+  assert.doesNotMatch(machines.stdout(), /--cursor/u, machines.stdout());
 });

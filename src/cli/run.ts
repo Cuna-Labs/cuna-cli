@@ -799,10 +799,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         artifactChannel: ARTIFACT_CHANNEL,
         protocolRange: PROTOCOL_RANGE,
       });
+      // Both `cuna version --json` and the help text promise version, build
+      // digest, platform and protocol range; the human branch printed the
+      // version alone. The digest is the one field that separates two
+      // installations reporting the same `0.1.0` — measured 2026-08-25, when
+      // the installed CLI was not the repo build and nothing printed said so.
+      // It is shown as a 12-hex prefix with the same `…` this CLI already uses
+      // for a truncated API-key prefix, so it can never read as the whole hash.
+      const humanIdentity = `${identity.version}\tbuild ${identity.buildDigest.slice(0, 12)}…` +
+        `\t${identity.platform}/${identity.architecture}` +
+        `\tprotocol ${identity.protocolRange.minimum}..${identity.protocolRange.maximum}`;
       if (writer.structured) {
-        writer.success("version", identity, CLI_VERSION);
+        writer.success("version", identity, humanIdentity);
       } else {
-        writer.text(CLI_VERSION);
+        writer.text(humanIdentity);
       }
       return EXIT_CODES.success;
     }

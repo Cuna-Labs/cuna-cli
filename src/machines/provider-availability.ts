@@ -55,6 +55,30 @@ export function machineProviderAvailability(machine: Pick<Machine, "id" | "agent
   });
 }
 
+/**
+ * The provider verdict a person acts on, not the declaration they cannot act on.
+ *
+ * `usability` and `actionable` are independent by construction above: a machine
+ * declaring a provider this CLI cannot drive comes back
+ * `usability: "declared-installed"` WITH `actionable: false` and a reason code.
+ * The human renderings printed the first field alone, so
+ * `Unknown (foo) declared-installed` read as installed and usable on exactly
+ * the machines where `agent-sessions create` fails closed with
+ * `cuna.agent.provider_not_installed`. One word decides whether the next
+ * command can run, so that is the word; the reason follows only when the
+ * answer is no.
+ *
+ * It lives here, beside the two fields it reconciles, so that every surface
+ * reaches one verdict instead of deriving its own. `machines` and
+ * `machines list` use it; the TUI explorer at `explorer.ts` still prints raw
+ * `usability` and carries the same defect until it adopts this.
+ */
+export function providerVerdict(provider: MachineProviderAvailability): string {
+  return provider.actionable
+    ? "ready"
+    : `unusable — ${provider.reasonCode ?? "provider_unusable"}`;
+}
+
 export function providerDisplayName(provider: string): string {
   const normalized = normalizeKnownProvider(provider);
   return normalized === undefined ? `Unknown (${provider})` : DISPLAY_NAMES[normalized];

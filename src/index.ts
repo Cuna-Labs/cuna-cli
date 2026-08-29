@@ -232,6 +232,7 @@ export {
   machineSupportsProvider,
   providerAuthLabel,
   providerDisplayName,
+  providerVerdict,
   type ActionableProvider,
   type MachineProviderAvailability,
   type ProviderUsability,

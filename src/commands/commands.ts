@@ -10,6 +10,7 @@ import type {
   AgentAuthMode,
   AgentKind,
   AgentSession,
+  ApiKeyMetadata,
   CapabilitySnapshot,
   Machine,
 } from "../api/contracts.js";
@@ -39,7 +40,12 @@ import {
   openCodeRuntimeUnverified,
   openCodeSupervisorUpgradeRequired,
 } from "../machines/opencode-supervisor.js";
-import { machineProviderAvailability, machineSupportsProvider, providerDisplayName } from "../machines/provider-availability.js";
+import {
+  machineProviderAvailability,
+  machineSupportsProvider,
+  providerDisplayName,
+  providerVerdict,
+} from "../machines/provider-availability.js";
 import { classifySessionActionability, displaySessionActionability } from "../machines/session-actionability.js";
 import { isAgentSessionIntendedActive } from "../machines/session-visibility.js";
 import { INITIAL_RUNTIME_GATES, type RuntimeFeatureGate } from "../runtime/contracts.js";
@@ -290,6 +296,24 @@ function apiKeyCreateInput(parsed: ParsedInvocation, now = Date.now()): { readon
 }
 
 /**
+ * Whether the key on this row still opens the door, from both timestamps.
+ *
+ * `expiresAt` and `revokedAt` are independent nullable instants
+ * (`ApiKeyMetadata`), and `--expires-at` mints keys up to 365 days out. The
+ * human line derived one word from `revokedAt` alone, so a key past its expiry
+ * but never revoked printed `active` while the JSON on the same invocation said
+ * otherwise. Expiry is now a state the word can carry, and the instant it turns
+ * on is printed rather than left to a second command.
+ */
+function apiKeyStatusLabel(key: ApiKeyMetadata, now: number): string {
+  if (key.revokedAt !== null) return `revoked ${key.revokedAt}`;
+  if (key.expiresAt === null) return "active (no expiry)";
+  const expiryMs = Date.parse(key.expiresAt);
+  if (!Number.isFinite(expiryMs)) return `active until ${key.expiresAt}`;
+  return expiryMs <= now ? `expired ${key.expiresAt}` : `active until ${key.expiresAt}`;
+}
+
+/**
  * The reconciliation key for one create operation.
  *
  * Demanding this from the user made every `machines create` fail until they
@@ -408,6 +432,31 @@ async function listAllMachineAgentSessions(
   return Object.freeze(items);
 }
 
+/**
+ * One flat record as one `key\tvalue` line per field.
+ *
+ * `config get` had no human rendering at all: a person at a terminal got the
+ * JSON record pretty-printed, braces and quotes included, for nine scalar
+ * fields. Nothing was hidden, which is why this is a rendering and not a new
+ * projection — every key and every value survives, in declaration order.
+ */
+function renderScalarRecord(record: Readonly<Record<string, unknown>>): string {
+  return Object.entries(record)
+    .map(([key, value]) => `${key}\t${value === null || value === undefined ? "null" : String(value)}`)
+    .join("\n");
+}
+
+/**
+ * A page footer that exists only when the page is not the whole answer.
+ *
+ * Without it "no such session" and "that session is on page 2" print the same
+ * bytes. The continuation is named as the exact next command option, because a
+ * truncation notice that does not say how to continue is only half the fact.
+ */
+function truncationFooter(nextCursor: string | undefined): readonly string[] {
+  return nextCursor === undefined ? [] : [`-- more results; continue with --cursor ${nextCursor}`];
+}
+
 interface MachineOverviewRow {
   readonly machine: Machine;
   readonly sessions: readonly AgentSession[];
@@ -430,7 +479,7 @@ function renderMachineOverview(
     const codex = `Codex ${counts.codex.running}/${counts.codex.total} running`;
     const opencode = `OpenCode ${counts.opencode.running}/${counts.opencode.total} running`;
     const providerCounts = `${opencode} · ${claude} · ${codex}`;
-    const header = `▾ ${machine.name}  ${machine.state}  ${provider.displayName} ${provider.usability}  ${providerCounts}`;
+    const header = `▾ ${machine.name}  ${machine.state}  ${provider.displayName} ${providerVerdict(provider)}  ${providerCounts}`;
     if (sessionsError !== undefined) return [header, "  └─ AgentSessions unavailable"];
     if (sessions.length === 0) return [header, "  └─ No AgentSessions"];
     return [
@@ -750,7 +799,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         throw unsupportedError("configuration mutation", "config_writes_not_implemented");
       }
       const data = publicConfig(config);
-      return Object.freeze({ command: "config.get", data, human: JSON.stringify(data, null, 2) });
+      return Object.freeze({ command: "config.get", data, human: renderScalarRecord(data) });
     }
     case "capabilities": {
       rejectUnknownOptions(parsed, ["scope", "resource-id"]);
@@ -912,7 +961,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
           data,
           human: keys.length === 0
             ? "No API keys found."
-            : keys.map((key) => `${key.id}\t${key.name}\t${key.prefix}…${key.lastFour}\t${key.revokedAt === null ? "active" : "revoked"}`).join("\n"),
+            : keys.map((key) => `${key.id}\t${key.name}\t${key.prefix}…${key.lastFour}\t${apiKeyStatusLabel(key, context.now)}`).join("\n"),
         });
       }
       if (action === "revoke") {
@@ -1152,14 +1201,30 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       // that is the whole reason the refusal moved out of `resolveConfig`. It
       // reports the state instead, because a diagnostic that survives a broken
       // environment and then says nothing about it is no better than dying.
+      const features = context.runtimeFeatures ?? INITIAL_RUNTIME_GATES;
       const data = Object.freeze({
         platform: process.platform,
         node: process.version,
         environment_credential: environmentCredentialState(config),
         environment_credential_variable: config.apiKeyVariable ?? null,
-        runtime_features: context.runtimeFeatures ?? INITIAL_RUNTIME_GATES,
+        runtime_features: features,
       });
-      return Object.freeze({ command: "doctor", data, human: JSON.stringify(data, null, 2) });
+      // `doctor` is the command the help text sends a stuck user to first, and
+      // it answered with a JSON dump on a TTY. Every field the record carries is
+      // still here; each feature now states its implementation AND the reason
+      // code that names the prerequisite, on the line that reports it.
+      return Object.freeze({
+        command: "doctor",
+        data,
+        human: [
+          `platform\t${data.platform}`,
+          `node\t${data.node}`,
+          `environment_credential\t${data.environment_credential}`,
+          `environment_credential_variable\t${data.environment_credential_variable ?? "null"}`,
+          "runtime_features",
+          ...features.map((gate) => `  ${gate.feature}\t${gate.implementation}\t${gate.reason}`),
+        ].join("\n"),
+      });
     }
     case "self-test": {
       rejectUnknownOptions(parsed, ["offline"]);
@@ -1319,9 +1384,22 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     return Object.freeze({
       command: "machines.list",
       data: Object.freeze({ items, ...(page.nextCursor === undefined ? {} : { next_cursor: page.nextCursor }) }),
-      human: items.length === 0
-        ? "No machines found."
-        : page.items.map((machine) => `${machine.id}\t${machine.name}\t${machine.state}`).join("\n"),
+      // The provider verdict is what decides whether the ID on this row can host
+      // a session at all. Without it a machine declaring `opencode` and a machine
+      // declaring nothing printed byte-identically, and the person picked an ID
+      // the very next command refuses. `machines list` takes no `--cursor`, so a
+      // truncated page says so without promising an option that does not exist.
+      human: [
+        ...(items.length === 0
+          ? ["No machines found."]
+          : page.items.map((machine) => {
+              const provider = machineProviderAvailability(machine);
+              return `${machine.id}\t${machine.name}\t${machine.state}\t${provider.displayName} ${providerVerdict(provider)}`;
+            })),
+        ...(page.nextCursor === undefined
+          ? []
+          : ["-- truncated; more machines exist beyond this page"]),
+      ].join("\n"),
     });
   }
   if (action === "create") {
@@ -1543,9 +1621,12 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     return Object.freeze({
       command: "agent-sessions.list",
       data: { items, ...(page.nextCursor === undefined ? {} : { next_cursor: page.nextCursor }) },
-      human: items.length === 0
-        ? "No AgentSessions found."
-        : page.items.map((item) => `${item.id}\t${item.name}\t${item.agent}\t${agentSessionStateLabel(item)}\t${item.cwd}`).join("\n"),
+      human: [
+        ...(items.length === 0
+          ? ["No AgentSessions found."]
+          : page.items.map((item) => `${item.id}\t${item.name}\t${item.agent}\t${agentSessionStateLabel(item)}\t${item.cwd}`)),
+        ...truncationFooter(page.nextCursor),
+      ].join("\n"),
     });
   }
   if (action === "get") {
