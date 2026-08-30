@@ -107,8 +107,48 @@ function runCli(args) {
   });
 }
 
+/**
+ * Any running AgentSession on the machine — deliberately weak, and never on its
+ * own a witness that THIS run did anything.
+ *
+ * Measured 2026-08-30: a run reported seven green witnesses in 26–31ms against
+ * a machine that already held a running session from an earlier run. It created
+ * a second session and opened no terminal at all; every predicate below was
+ * already true before it started. The durable record settled it — two
+ * `terminal_connections` rows existed, both bound to the OLD session and both
+ * issued minutes earlier.
+ *
+ * So this is a precondition, not a witness. `sessionCreatedThisRun` is what the
+ * assertions below actually use; this is kept only to make the distinction
+ * legible to the next reader.
+ */
 function durableRunningSession() {
   return durableSessions.find((s) => s.process_state === "running");
+}
+
+/**
+ * A running AgentSession that THIS run created.
+ *
+ * Bounding by `startedAt` is the whole point: without it a session left by an
+ * earlier run certifies a run that created nothing.
+ *
+ * THIS IS STILL NOT A WITNESS THAT A PTY ATTACHED. The only durable proof of an
+ * attach is a `terminal_connections` row with `redeemed_at` set and bound to the
+ * exact `agent_session_id` — a grant can be issued and never consumed. The CLI
+ * exposes no command that lists terminal connections, so this harness cannot
+ * check it, and inventing a weaker screen-based substitute is what produced two
+ * separate rounds of false green today. Verify it out of band:
+ *
+ *   select agent_session_id, state, issued_at, redeemed_at
+ *     from public.terminal_connections
+ *    where machine_id = '<id>' order by issued_at;
+ */
+const runStartedAt = Date.now();
+function sessionCreatedThisRun() {
+  return durableSessions.find((s) =>
+    s.process_state === "running" &&
+    typeof s.created_at === "string" &&
+    Date.parse(s.created_at) >= runStartedAt - 5_000);
 }
 
 async function refreshDurableSessions() {
@@ -183,16 +223,36 @@ try {
   // Durable state is the witness: an AgentSession must exist on this exact
   // machine, in `running`, before an attach can mean anything.
   await witness(
-    "create_or_open_exact_session — a durable AgentSession is running on this machine",
-    () => durableRunningSession() !== undefined,
+    "create_or_open_exact_session — THIS run created a durable AgentSession, now running",
+    () => sessionCreatedThisRun() !== undefined,
     240_000,
   );
-  await witness(
-    "attach_pty — an OpenCode viewport rendered over a live durable session",
-    () => durableRunningSession() !== undefined &&
-      /OpenCode/u.test(screen()) && !/ATTACHING/u.test(screen()),
-    180_000,
-  );
+  // attach_pty IS NOT WITNESSED HERE, and this runner will not pretend it is.
+  //
+  // Three attempts to witness it from inside this process have now produced a
+  // green against a run that opened no terminal at all:
+  //   1. `/OpenCode/.test(screen())` — satisfied by the CLI's own chrome.
+  //   2. the same, plus any running session — satisfied by a session an earlier
+  //      run left behind.
+  //   3. the same, plus a session THIS run created — satisfied the moment the
+  //      session exists, which is strictly before any attach.
+  // Measured 2026-08-30T17:03-17:11Z: all seven witnesses green, and
+  // `select … from terminal_connections where issued_at > <run start>` returned
+  // zero rows. Nothing was attached.
+  //
+  // A grant can be issued and never consumed, so the only durable proof is a
+  // `terminal_connections` row with `redeemed_at` set, bound to the exact
+  // `agent_session_id`. The CLI exposes no command that reads that table, so
+  // this harness cannot check it — and every screen-shaped substitute is
+  // satisfiable without an attach. Emitting an unverifiable green is the exact
+  // failure this runner exists to prevent, so it prints the query instead.
+  const created = sessionCreatedThisRun();
+  witnesses.push({
+    name: `attach_pty — NOT WITNESSED by this harness; verify out of band for session ${created?.id ?? "<none created>"}`,
+    observed: false,
+    ms: 0,
+    unwitnessable: true,
+  });
   // A remote frame styled by the provider, not by Cuna's own chrome. Cuna uses
   // truecolor; this is the ANSI-256 signature of the provider's own TUI, so a
   // pass here cannot be the appbar mistaken for the child.
@@ -244,10 +304,34 @@ try {
 }
 
 for (const entry of witnesses) {
-  console.log(`${entry.observed ? "OK  " : "FAIL"} ${entry.name}${entry.ms > 0 ? ` (${entry.ms}ms)` : ""}`);
+  const mark = entry.unwitnessable === true ? "----" : entry.observed ? "OK  " : "FAIL";
+  console.log(`${mark} ${entry.name}${entry.ms > 0 ? ` (${entry.ms}ms)` : ""}`);
+}
+if (witnesses.some((w) => w.unwitnessable === true)) {
+  console.log([
+    "",
+    "attach_pty must be verified against the durable record:",
+    "  select agent_session_id, state, issued_at, redeemed_at",
+    "    from public.terminal_connections",
+    `   where machine_id = <this machine> and issued_at > '${new Date(runStartedAt).toISOString()}'`,
+    "",
+    "A row with redeemed_at set is an attach. No rows means nothing attached,",
+    "however green everything above reads.",
+  ].join("\n"));
 }
 console.log(`exit=${JSON.stringify(exitResult ?? null)}`);
 if (failure !== undefined) {
   console.error(String(failure.message ?? failure));
   process.exitCode = 1;
+} else if (witnesses.some((w) => w.unwitnessable === true)) {
+  // Zero must mean "every conjunct was witnessed", not "nothing threw". A run
+  // that cannot check attach_pty has not proven the journey, and exiting zero
+  // is how a reader — or a CI job — comes to believe otherwise. Measured
+  // 2026-08-30: a run exited zero with seven greens while
+  // `terminal_connections` held no row for it at all.
+  console.error(
+    "INCOMPLETE: attach_pty was not witnessed. Exit 0 is reserved for a run in " +
+    "which every conjunct above was checked.",
+  );
+  process.exitCode = 2;
 }
