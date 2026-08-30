@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import test from "node:test";
 
+import { CunaError, EXIT_CODES } from "../dist/index.js";
 import { orchestrateAgentJourney } from "../dist/journey/orchestrator.js";
 
 const MACHINE = "10000000-0000-4000-8000-000000000001";
@@ -157,6 +158,70 @@ test("exhausted AgentSession create recovery fails closed before attach", async 
   );
   assert.equal(creates, 1);
   assert.equal(attaches, 0);
+});
+
+test("authoritative OpenCode supervisor rejection never becomes an unproven create", async () => {
+  let attaches = 0;
+  let readinessChecks = 0;
+  const fx = effects({
+    async observeMachines() {
+      fx.calls.push("observe-machines");
+      return [machine({ agent: "opencode" })];
+    },
+    async createAgentSession(input) {
+      fx.calls.push(["create-session", input]);
+      throw new CunaError({
+        code: "cuna.agent.opencode_supervisor_upgrade_required",
+        message: "OpenCode cannot start until this Machine's terminal supervisor is updated.",
+        exitCode: EXIT_CODES.unsupported,
+        retryable: false,
+        hint: "No OpenCode AgentSession was created. In this Machine's controls, stop it after ending any sessions you need, then choose Update terminal supervisor. Cuna will not stop the Machine or terminate sessions for you. When the update completes, retry OpenCode.",
+      });
+    },
+    async ensureAgentSessionReady() { readinessChecks += 1; },
+    async attach() { attaches += 1; },
+  });
+  await assert.rejects(
+    orchestrateAgentJourney({
+      intent: intent({ command: "opencode", agent: "opencode" }),
+      effects: fx,
+      scope: SCOPE,
+    }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.agent.opencode_supervisor_upgrade_required" &&
+      /No OpenCode AgentSession was created/u.test(error.hint ?? ""),
+  );
+  assert.equal(readinessChecks, 0);
+  assert.equal(attaches, 0);
+  assert.deepEqual(
+    fx.calls.map((call) => Array.isArray(call) ? call[0] : call),
+    ["inspect-workspace", "observe-machines", "ready-machine", "sync", "observe-sessions", "create-session"],
+  );
+});
+
+test("a known OpenCode supervisor repair never creates a sibling machine automatically", async () => {
+  const fx = effects({
+    async observeMachines() {
+      fx.calls.push("observe-machines");
+      return [machine({
+        agent: "opencode",
+        requestedAgentSupport: "unsupported",
+        requestedAgentBlocker: "opencode-supervisor-update-required",
+      })];
+    },
+  });
+  await assert.rejects(
+    orchestrateAgentJourney({
+      intent: intent({ command: "opencode", agent: "opencode" }),
+      effects: fx,
+      scope: SCOPE,
+    }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.journey.authority_unavailable" &&
+      error.details?.reason === "opencode-supervisor-update-required" &&
+      /did not create another machine/u.test(error.hint ?? ""),
+  );
+  assert.deepEqual(fx.calls, ["inspect-workspace", "observe-machines"]);
 });
 
 test("cancellation at every effect boundary stops downstream work and reconciles one ledger", async () => {

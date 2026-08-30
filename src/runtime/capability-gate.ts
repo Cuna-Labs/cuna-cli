@@ -51,13 +51,19 @@ export function admitCapability(
   const capability = matches[0];
   if (capability === undefined || capability.availability === "unknown") {
     throw runtimeFailure("capability_unknown", "The server cannot currently prove this capability.", {
-      safeDetails: { capability_id: requirement.id },
+      safeDetails: {
+        capability_id: requirement.id,
+        ...(capability?.reasonCode === undefined ? {} : { reason_code: capability.reasonCode }),
+      },
     });
   }
   if (capability.availability === "temporarily_unavailable") {
     throw runtimeFailure("capability_unavailable", "The required capability is temporarily unavailable.", {
       retryable: true,
-      safeDetails: { capability_id: requirement.id },
+      safeDetails: {
+        capability_id: requirement.id,
+        ...(capability.reasonCode === undefined ? {} : { reason_code: capability.reasonCode }),
+      },
     });
   }
   if (capability.availability !== "supported") {

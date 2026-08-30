@@ -50,6 +50,22 @@ test("T8.5 machine action resolver is machine-first and provider truthful", () =
   ]);
 });
 
+test("OpenCode supervisor repair is explicit and never makes Stop the default action", () => {
+  assert.deepEqual(resolveMachineContextActions(machine({ agent: "opencode" }), {
+    opencodeSupervisorRepairRequired: true,
+  }), [
+    { kind: "supervisor-blocked", label: "OpenCode needs a terminal update", machineId: MACHINE_ID },
+    { kind: "provider", label: "OpenCode", machineId: MACHINE_ID, provider: "opencode" },
+    { kind: "stop", label: "Stop", machineId: MACHINE_ID },
+  ]);
+  assert.deepEqual(resolveMachineContextActions(machine({ agent: "opencode", state: "stopped" }), {
+    opencodeSupervisorRepairRequired: true,
+  }), [
+    { kind: "update-supervisor", label: "Update terminal supervisor", machineId: MACHINE_ID },
+    { kind: "start", label: "Start", machineId: MACHINE_ID },
+  ]);
+});
+
 test("T8.2 provider context contains existing sessions only; creation belongs to the machine menu", () => {
   const base = { machine: machine(), provider: "claude-code", sessions: [session()], now: NOW };
   assert.deepEqual(resolveProviderContextActions({ ...base, canCreateSession: false }).map((item) => item.kind), ["session"]);
@@ -67,10 +83,10 @@ test("T8.6 reducer moves through machine -> provider and Back returns exactly on
   assert.equal(reduceMachineFirstNavigation(INITIAL_MACHINE_FIRST_STATE, { type: "quit" }).quit, true);
 });
 
-test("T8.3 auto-continuation cannot occur before a cancellable three-second screen", () => {
+test("T8.3 machine-first never auto-continues, even after a cancellable screen", () => {
   const base = { safeContinuationCount: 1, screenShownAt: 1_000, cancelled: false };
   assert.equal(canAutoContinueMachineFirst({ ...base, now: 3_999 }), false);
-  assert.equal(canAutoContinueMachineFirst({ ...base, now: 4_000 }), true);
+  assert.equal(canAutoContinueMachineFirst({ ...base, now: 4_000 }), false);
   assert.equal(canAutoContinueMachineFirst({ ...base, now: 4_000, cancelled: true }), false);
   assert.equal(canAutoContinueMachineFirst({ ...base, now: 4_000, safeContinuationCount: 2 }), false);
 });

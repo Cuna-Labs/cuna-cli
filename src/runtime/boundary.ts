@@ -137,7 +137,12 @@ export interface RuntimeBoundaryOptions {
     readonly signal: AbortSignal;
   }) => void | Promise<void>;
   readonly onTerminalState?: (snapshot: RuntimeTerminalSnapshot) => void;
-  readonly localActionKinds?: readonly TerminalLocalActionKind[];
+  /**
+   * The negotiated action surface is attachment-scoped.  A single foreground
+   * may host several providers, so advertising a process-wide superset would
+   * let a provider see kinds it can never use.
+   */
+  readonly localActionKinds?: readonly TerminalLocalActionKind[] | ((agentSessionId: string) => readonly TerminalLocalActionKind[]);
   readonly onLocalActionFrame?: (event: {
     readonly tabId: string;
     readonly frame: TerminalFrame;
@@ -395,7 +400,10 @@ export class CunaRuntimeBoundary {
       entry.heartbeatSequence = 0n;
       entry.fencingGeneration = ready.payload.fencingGeneration;
       entry.resizeCapability = ready.payload.resizeCapability;
-      entry.localActionAcceptance = this.#localActionAcceptance(ready.payload.localActionProtocol);
+      entry.localActionAcceptance = this.#localActionAcceptance(
+        ready.payload.localActionProtocol,
+        entry.observation.agentSessionId,
+      );
       entry.viewId = viewId(input.tabId, ready.payload.fencingGeneration);
       this.#views.open({
         viewId: entry.viewId,
@@ -763,7 +771,10 @@ export class CunaRuntimeBoundary {
       };
       const ready = await this.#awaitReady(candidate, iterator, reconnectAbort.signal);
       candidate.lastHeartbeatAt = this.#clock();
-      candidate.localActionAcceptance = this.#localActionAcceptance(ready.payload.localActionProtocol);
+      candidate.localActionAcceptance = this.#localActionAcceptance(
+        ready.payload.localActionProtocol,
+        candidate.observation.agentSessionId,
+      );
       if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
         throw runtimeFailure("terminal_disconnected", "Terminal reconnection was superseded by detach or shutdown.");
       }
@@ -1378,9 +1389,14 @@ export class CunaRuntimeBoundary {
     this.#options.onTerminalState?.(snapshot(entry, this.#heartbeatTimeoutMs()));
   }
 
-  #localActionAcceptance(offer: unknown): TerminalLocalActionProtocolAcceptance | undefined {
+  #localActionAcceptance(
+    offer: unknown,
+    agentSessionId: string,
+  ): TerminalLocalActionProtocolAcceptance | undefined {
     if (this.#options.onLocalActionFrame === undefined) return undefined;
-    const configured = this.#options.localActionKinds ?? [];
+    const configured = typeof this.#options.localActionKinds === "function"
+      ? this.#options.localActionKinds(agentSessionId)
+      : this.#options.localActionKinds ?? [];
     const valid = configured.filter((kind): kind is TerminalLocalActionKind =>
       (TERMINAL_LOCAL_ACTION_KINDS as readonly string[]).includes(kind));
     return negotiateTerminalLocalActions(offer, new Set(valid));

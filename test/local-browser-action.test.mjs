@@ -6,6 +6,8 @@ import {
   ProviderOAuthPasteGuard,
   admitProviderAuthUrl,
 } from "../dist/local-actions/browser-action.js";
+import { providerAllowsLocalAction } from "../dist/local-actions/providers.js";
+import { validateLocalActionArguments } from "../dist/local-actions/schemas.js";
 
 const encoder = new TextEncoder();
 const binding = {
@@ -73,6 +75,33 @@ test("Codex admits only its remote-safe device page", () => {
   assert.equal(admitProviderAuthUrl("codex", "https://auth.openai.com/codex/device")?.href, "https://auth.openai.com/codex/device");
   assert.equal(admitProviderAuthUrl("codex", "https://auth.openai.com/oauth/authorize?state=x"), undefined);
   assert.equal(admitProviderAuthUrl("codex", "http://auth.openai.com/codex/device"), undefined);
+});
+
+test("OpenCode TUI sign-in has no Cuna local browser or device admission", () => {
+  assert.throws(
+    () => new ProviderBrowserActionDetector({ provider: "opencode", ...binding }),
+    /supports only Claude Code and Codex/u,
+  );
+  assert.equal(providerAllowsLocalAction("opencode", "browser.open"), false);
+  assert.equal(providerAllowsLocalAction("opencode", "auth.device.present"), false);
+  const request = {
+    version: 1,
+    id: "opencode-sidecar-1",
+    identity: {
+      userId: "user-1",
+      deviceId: "device-1",
+      machineId: "machine-1",
+      workspaceBindingId: null,
+      workspaceBindingGeneration: null,
+      agentSessionId: binding.agentSessionId,
+      processEpoch: binding.processEpoch,
+      fencingGeneration: binding.fencingGeneration,
+    },
+    provider: "opencode",
+    kind: "auth.device.present",
+    arguments: {},
+  };
+  assert.throws(() => validateLocalActionArguments(request), /closed schema/u);
 });
 
 test("provider allowlists reject userinfo, ports, lookalikes, and unrelated links", () => {

@@ -4,7 +4,6 @@ import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { isSecretApiKey, readBrandedEnvironment } from "../core/namespace.js";
 import { isObject } from "../core/validation.js";
 import type { PlatformAdapter } from "../platform/adapter.js";
-import { resolveOpenCodeFeatureGate, type OpenCodeFeatureGate } from "./opencode-feature-gate.js";
 
 export const DEFAULT_BASE_URL = "https://api.getcuna.com" as const;
 const MAX_CONFIG_BYTES = 65_536;
@@ -42,11 +41,6 @@ export interface EffectiveConfig {
    * handed to the transport, and never falls back to interactive sign-in.
    */
   readonly apiKeyProblem: CunaError | undefined;
-  /**
-   * Local consumer admission only. It neither activates the producer nor
-   * carries a credential into OpenCode or any child process.
-   */
-  readonly opencodeFeatureGate: OpenCodeFeatureGate;
 }
 
 /** How `config get` and `doctor` report the environment credential. */
@@ -258,7 +252,6 @@ export async function resolveConfig(input: {
   const apiKeyProblem = apiKeyEnvironment !== undefined && !apiKeyUsable
     ? configError("invalid_api_key", "environment", apiKeyEnvironment.name)
     : undefined;
-  const opencodeFeatureGate = resolveOpenCodeFeatureGate(env);
   return Object.freeze({
     platformKind: input.platform.kind,
     profile,
@@ -271,7 +264,6 @@ export async function resolveConfig(input: {
     apiKeySource: apiKeyEnvironment === undefined ? "absent" : "environment",
     apiKeyVariable: apiKeyEnvironment?.name,
     apiKeyProblem,
-    opencodeFeatureGate,
   });
 }
 
@@ -288,9 +280,6 @@ export function publicConfig(config: EffectiveConfig): Readonly<Record<string, u
     // user can now actually have. Reporting the name is not a disclosure: the
     // name is chosen by the caller and the value is never printed.
     api_key_variable: config.apiKeyVariable ?? null,
-    opencode_feature: config.opencodeFeatureGate.state,
-    opencode_feature_source: config.opencodeFeatureGate.source,
-    opencode_feature_reason: config.opencodeFeatureGate.reason,
     config_file: config.configFile,
   });
 }

@@ -235,13 +235,45 @@ test("rich Ctrl+C cancels a pending initial attach and restores immediately", as
   const { coordinator, calls, host, intents } = harness({ attachGate });
   const starting = coordinator.start(intents.slice(0, 1));
   await waitUntil(() => calls.attach.length === 1 && host.input !== undefined, "rich terminal should own input while attach is pending");
+  const baselineWrites = host.writes.length;
   host.emitInput(Uint8Array.of(0x03));
+  await waitUntil(
+    () => host.writes.slice(baselineWrites).some((bytes) => decoder.decode(bytes).includes("✦ Closing Cuna...")),
+    "a startup interrupt should visibly acknowledge closing before restoration",
+  );
+  assert.equal(host.restored, 0);
+  assert.deepEqual(calls.input, [], "startup Ctrl-C must remain local and never reach the remote PTY");
   await starting;
   await coordinator.waitForStop();
   assert.equal(coordinator.state, "stopped");
   assert.equal(host.restored, 1);
   assert.deepEqual(calls.detach, []);
   assert.deepEqual(calls.input, []);
+  const closing = host.writes.slice(baselineWrites).map((bytes) => decoder.decode(bytes));
+  assert.equal(closing.some((frame) => frame.includes("CUNA  CLOSING")), true);
+  assert.equal(closing.some((frame) => frame.includes("✦ Closing Cuna...")), true);
+  assert.equal(closing.some((frame) => frame.includes("✓ Closed.")), true);
+  assert.equal(host.writesAtRestore, host.writes.length, "startup close feedback must finish before prompt restoration");
+  releaseAttach();
+});
+
+test("rich attach keeps a visible animated authority check until the remote terminal is ready", async () => {
+  let releaseAttach;
+  const attachGate = new Promise((resolve) => { releaseAttach = resolve; });
+  const { coordinator, calls, host, intents } = harness({ attachGate });
+  const starting = coordinator.start(intents.slice(0, 1));
+  await waitUntil(
+    () => calls.attach.length === 1 && host.writes.length >= 2,
+    "a pending cloud attach should repaint its loader rather than look frozen",
+  );
+  const frames = host.writes.map((bytes) => decoder.decode(bytes));
+  assert.ok(frames.some((frame) => frame.includes("Checking terminal authority")));
+  assert.ok(frames.some((frame) => frame.includes("Ctrl-C cancels")));
+  assert.notEqual(frames[0], frames.at(-1), "the loading frame should visibly advance while authority is checked");
+
+  host.emitInput(Uint8Array.of(0x03));
+  await starting;
+  await coordinator.waitForStop();
   releaseAttach();
 });
 
@@ -295,7 +327,7 @@ test("negotiated remote browser request stays awaiting until provider observatio
     },
   });
   await coordinator.start(intents.slice(0, 1));
-  assert.deepEqual(callbacks.localActionKinds, ["browser.open"]);
+  assert.deepEqual(callbacks.localActionKinds(SESSION_A), ["browser.open"]);
   const url = "https://platform.claude.com/oauth/authorize?code=true&state=remote";
   const args = Object.freeze({ url });
   const request = Object.freeze({
@@ -315,7 +347,7 @@ test("negotiated remote browser request stays awaiting until provider observatio
     kind: "browser.open",
     arguments: args,
     argumentsDigest: digestLocalActionArguments(args),
-    requestedScope: "provider-auth",
+    requestedScope: "mcp:browser.open",
     createdAt: 1_000,
     expiresAt: 61_000,
     nonce: "remote-nonce-1",
@@ -337,6 +369,84 @@ test("negotiated remote browser request stays awaiting until provider observatio
   assert.equal(calls.localActionControls[0].type, "local_action_result");
   assert.equal(calls.localActionControls[0].tabId, "tab-a");
   assert.equal(calls.localActionControls[0].payload.result.status, "cancelled");
+});
+
+test("OpenCode remote TUI output is relayed and never opens a local browser", async () => {
+  const opened = [];
+  const { coordinator, callbacks, host, intents } = harness({
+    coordinatorOptions: {
+      browser: { async open(url) { opened.push(url); } },
+      clock: () => 1_000,
+    },
+  });
+  intents[0].agent = "opencode";
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  assert.deepEqual(callbacks.localActionKinds(SESSION_A), []);
+  await callbacks.onTerminalOutput(outputEvent(
+    intents[0], 1n, encoder.encode("OpenCode: use /connect to choose a provider, then /models.\r\n"),
+  ));
+  assert.match(decoder.decode(host.writes.at(-1)), /\/connect/u);
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  assert.deepEqual(opened, []);
+  await coordinator.stop();
+});
+
+test("RTP local-action negotiation is scoped to the attached provider", async () => {
+  const { coordinator, callbacks, intents } = harness();
+  intents[0].agent = "opencode";
+  await coordinator.start(intents);
+  assert.deepEqual(callbacks.localActionKinds(SESSION_A), []);
+  assert.deepEqual(callbacks.localActionKinds(SESSION_B), ["browser.open", "auth.device.present"]);
+  await coordinator.stop();
+});
+
+test("OpenCode remote local-action frames are rejected before the broker", async () => {
+  const opened = [];
+  const { coordinator, callbacks, calls, host, intents } = harness({
+    coordinatorOptions: {
+      browser: { async open(url) { opened.push(url); } },
+      deviceId: "device-1",
+      clock: () => 1_000,
+    },
+  });
+  intents[0].agent = "opencode";
+  await coordinator.start(intents.slice(0, 1));
+  const args = Object.freeze({ url: "https://example.test/local-action" });
+  const request = Object.freeze({
+    version: 1,
+    id: "remote-opencode-local-action-1",
+    identity: Object.freeze({
+      userId: "user-1",
+      deviceId: "device-1",
+      machineId: "machine-1",
+      workspaceBindingId: null,
+      workspaceBindingGeneration: null,
+      agentSessionId: SESSION_A,
+      processEpoch: `epoch-${SESSION_A}`,
+      fencingGeneration: 1,
+    }),
+    provider: "opencode",
+    kind: "browser.open",
+    arguments: args,
+    argumentsDigest: digestLocalActionArguments(args),
+    requestedScope: "mcp:browser.open",
+    createdAt: 1_000,
+    expiresAt: 61_000,
+    nonce: "remote-opencode-local-action-nonce-1",
+  });
+  await assert.rejects(
+    callbacks.onLocalActionFrame({
+      tabId: "tab-a",
+      frame: { type: "local_action_request" },
+      payload: { request },
+    }),
+    /not negotiated by the foreground/u,
+  );
+  assert.deepEqual(opened, []);
+  assert.equal(calls.localActionControls.length, 0);
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  await coordinator.stop();
 });
 
 test("denied and cross-provider browser URLs never execute locally", async () => {

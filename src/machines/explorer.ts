@@ -7,7 +7,12 @@ import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import type { ForegroundTerminalHost } from "../terminal/foreground.js";
 import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
 import { listAllMachines } from "./pagination.js";
-import { machineProviderAvailability, providerDisplayName, type ActionableProvider } from "./provider-availability.js";
+import {
+  isOpenCodeRuntimeUnverifiedReason,
+  isOpenCodeSupervisorProtocolUnavailableReason,
+  isOpenCodeSupervisorUpgradeRequiredReason,
+} from "./opencode-supervisor.js";
+import { machineProviderAvailability, providerDisplayName, providerVerdict, type ActionableProvider } from "./provider-availability.js";
 import { classifySessionActionability, displaySessionActionability } from "./session-actionability.js";
 import { isAgentSessionIntendedActive } from "./session-visibility.js";
 import {
@@ -47,8 +52,27 @@ interface MachineRow {
   readonly machine: Machine;
   readonly sessions: readonly AgentSession[];
   readonly sessionsLoading?: boolean;
-  readonly sessionsError?: string;
+  readonly sessionsError?: string | undefined;
   readonly canCreateSession?: boolean;
+  /**
+   * A missing, stale, or failed capability read is not evidence that creating
+   * another session or another machine is appropriate.  Keep that distinction
+   * separate from a current, verified "unsupported" answer.
+   */
+  readonly sessionCreateCapabilityState: "checking" | "verified" | "unverified";
+  readonly sessionCreateCapabilityReason?: string | undefined;
+  /** Expiry of the last accepted capability snapshot; never inferred locally. */
+  readonly sessionCreateCapabilityExpiresAt?: number | undefined;
+  /** Present only for the exact, current OpenCode repair refusal. */
+  readonly opencodeSupervisorRepairReason: string | undefined;
+  /**
+   * The supervisor has not announced its OpenCode protocol yet. This is a
+   * retryable observation wait, not permission to tell a person to update or
+   * restart the Machine.
+   */
+  readonly opencodeSupervisorProtocolUnavailable: boolean;
+  /** Current capability evidence says OpenCode is still being verified. */
+  readonly opencodeRuntimeUnverified: boolean;
 }
 
 type SelectionKey =
@@ -57,6 +81,7 @@ type SelectionKey =
   | `machine-provider:${ActionableProvider}`
   | `machine-create:${ActionableProvider}`
   | `machine-lifecycle:${"start" | "stop"}`
+  | `machine-supervisor:${"blocked" | "update"}`
   | `provider-session:${string}`
   | `create:${ActionableProvider}`;
 type LoadingPhase = "machines" | "sessions" | undefined;
@@ -65,7 +90,6 @@ export interface MachinesExplorerInput {
   readonly client: CunaApiClient;
   readonly signal?: AbortSignal;
   readonly color?: boolean;
-  readonly opencodeEnabled?: boolean;
   readonly onBeforeTerminalOwnership?: () => void;
 }
 
@@ -89,6 +113,14 @@ export type MachinesExplorerResult = MachinesExplorerSelection | Readonly<{
 }> | Readonly<{
   readonly kind: "lifecycle";
   readonly action: "start" | "stop";
+  readonly machineId: string;
+}> | Readonly<{
+  /**
+   * Reached only after the person selected the stopped-Machine repair and
+   * confirmed it in this foreground UI. The caller still performs the normal
+   * capability/state fences before any replacement request.
+   */
+  readonly kind: "supervisor-update";
   readonly machineId: string;
 }>;
 
@@ -122,6 +154,7 @@ export async function runNodeMachinesExplorer(
   let refreshInFlight = false;
   let refreshError: string | undefined;
   let interactionNotice: string | undefined;
+  let pendingSupervisorUpdateMachineId: string | undefined;
   let closingNotice: string | undefined;
   let failure: unknown;
   const lifetimeAbort = new AbortController();
@@ -143,6 +176,13 @@ export async function runNodeMachinesExplorer(
   let initialized = false;
   let selection: MachinesExplorerResult | undefined;
   let navigation: MachineFirstNavigationState = INITIAL_MACHINE_FIRST_STATE;
+
+  // A local exit fences every in-flight read with this controller before the
+  // close animation has rendered its first frame.  Treat that fence itself as
+  // closing state: otherwise an aborted capability read can win the tiny
+  // interval before `closingNotice` is assigned and leak a misleading
+  // `cuna.network.cancelled` error after a normal q/Ctrl-C exit.
+  const isClosing = (): boolean => stopped || closingNotice !== undefined || lifetimeAbort.signal.aborted;
 
   const stop = (): void => {
     if (stopped) return;
@@ -170,7 +210,6 @@ export async function runNodeMachinesExplorer(
             columns,
             now: snapshotObservedAt,
             navigation,
-            opencodeEnabled: input.opencodeEnabled === true,
             refreshError,
             interactionNotice,
             closingNotice,
@@ -243,13 +282,22 @@ export async function runNodeMachinesExplorer(
       if (stopped || closingNotice !== undefined) return;
       refreshError = undefined;
       interactionNotice = undefined;
+      const capabilityNow = dependencies.now?.() ?? Date.now();
       const loaded = machines.map((machine): MachineRow => {
         const previous = previousRows.get(machine.id);
+        const retainCapability = previous?.sessionCreateCapabilityState === "verified" &&
+          (previous.sessionCreateCapabilityExpiresAt ?? 0) > capabilityNow;
         return Object.freeze({
           machine,
           sessions: previous?.sessions ?? Object.freeze([]),
           sessionsLoading: true,
-          canCreateSession: previous?.canCreateSession ?? false,
+          canCreateSession: retainCapability && previous!.canCreateSession === true,
+          sessionCreateCapabilityState: retainCapability ? "verified" : "checking",
+          sessionCreateCapabilityReason: retainCapability ? previous!.sessionCreateCapabilityReason : undefined,
+          sessionCreateCapabilityExpiresAt: retainCapability ? previous!.sessionCreateCapabilityExpiresAt : undefined,
+          opencodeSupervisorRepairReason: previous?.opencodeSupervisorRepairReason,
+          opencodeSupervisorProtocolUnavailable: previous?.opencodeSupervisorProtocolUnavailable ?? false,
+          opencodeRuntimeUnverified: previous?.opencodeRuntimeUnverified ?? false,
         });
       });
       loaded.sort((left, right) => left.machine.name.localeCompare(right.machine.name) || left.machine.id.localeCompare(right.machine.id));
@@ -260,7 +308,7 @@ export async function runNodeMachinesExplorer(
         if (!initialized || !previousIds.has(row.machine.id)) expanded.add(row.machine.id);
       }
       initialized = true;
-      const visibleKeys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, input.opencodeEnabled === true);
+      const visibleKeys = selectableKeys(rows, expanded, snapshotObservedAt, navigation);
       // Input remains live while the network refresh is pending. Reconcile the
       // selection that is current when the response is applied, rather than a
       // stale value captured before awaiting the API. Otherwise an arrow press
@@ -273,34 +321,68 @@ export async function runNodeMachinesExplorer(
       render();
 
       await Promise.all(rows.map(async ({ machine }) => {
-        try {
-          const [observedSessions, capability] = await Promise.all([
-            listAllAgentSessions(input.client, machine.id, requestSignal),
-            observeSessionCreateCapability(input.client, machine.id, dependencies.now?.() ?? Date.now(), requestSignal),
-          ]);
-          if (stopped || closingNotice !== undefined) return;
-          const previous = rows.find((row) => row.machine.id === machine.id)?.sessions ?? Object.freeze([]);
-          const sessions = mergeAgentSessionObservations(previous, observedSessions)
-            .filter(isAgentSessionIntendedActive)
-            .sort((left, right) => left.agent.localeCompare(right.agent) || left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
-          updateMachineRow(machine.id, { sessions: Object.freeze(sessions), sessionsLoading: false, canCreateSession: capability });
-        } catch {
-          if (stopped || closingNotice !== undefined) return;
-          const confirmed = rows.find((row) => row.machine.id === machine.id)?.sessions ?? Object.freeze([]);
-          updateMachineRow(machine.id, {
-            // A failed child read is not an authoritative empty membership
-            // observation. Retain the last confirmed list and make the partial
-            // failure explicit until a successful refresh replaces it.
-            sessions: confirmed,
-            sessionsLoading: false,
-            sessionsError: "sessions unavailable",
+        // Session inventory is the useful, non-mutating first answer.  Do not
+        // hide it behind a slower capability read: that used to make bare
+        // `cuna` look frozen and made an existing session appear absent for
+        // the entire capability timeout.
+        const sessionsTask = listAllAgentSessions(input.client, machine.id, requestSignal)
+          .then((observedSessions) => {
+            if (stopped || closingNotice !== undefined) return;
+            const previous = rows.find((row) => row.machine.id === machine.id)?.sessions ?? Object.freeze([]);
+            const sessions = mergeAgentSessionObservations(previous, observedSessions)
+              .filter(isAgentSessionIntendedActive)
+              .sort((left, right) => left.agent.localeCompare(right.agent) || left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+            updateMachineRow(machine.id, {
+              sessions: Object.freeze(sessions),
+              sessionsLoading: false,
+              sessionsError: undefined,
+            });
+            reconcileSelection();
+          })
+          .catch(() => {
+            if (stopped || closingNotice !== undefined) return;
+            const confirmed = rows.find((row) => row.machine.id === machine.id)?.sessions ?? Object.freeze([]);
+            updateMachineRow(machine.id, {
+              // A failed child read is not an authoritative empty membership
+              // observation. Retain the last confirmed list and make the
+              // partial failure explicit until a successful refresh replaces it.
+              sessions: confirmed,
+              sessionsLoading: false,
+              sessionsError: "sessions unavailable",
+            });
+            reconcileSelection();
           });
-        }
-        const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, input.opencodeEnabled === true);
-        if (selectedKey === undefined || !keys.includes(selectedKey)) selectedKey = keys[0];
-        render();
+        const capabilityTask = observeSessionCreateCapability(
+          input.client,
+          machine.id,
+          dependencies.now?.() ?? Date.now(),
+          requestSignal,
+        ).then((capability) => {
+          if (stopped || closingNotice !== undefined) return;
+          const provider = machineProviderAvailability(machine);
+          const repairReason = provider.agent === "opencode" &&
+            isOpenCodeSupervisorUpgradeRequiredReason(capability.reason)
+            ? capability.reason
+            : undefined;
+          const supervisorProtocolUnavailable = provider.agent === "opencode" &&
+            isOpenCodeSupervisorProtocolUnavailableReason(capability.reason);
+          const runtimeUnverified = provider.agent === "opencode" &&
+            isOpenCodeRuntimeUnverifiedReason(capability.reason);
+          updateMachineRow(machine.id, {
+            canCreateSession: capability.canCreateSession,
+            sessionCreateCapabilityState: capability.state,
+            sessionCreateCapabilityReason: capability.reason,
+            sessionCreateCapabilityExpiresAt: capability.expiresAt,
+            opencodeSupervisorRepairReason: repairReason,
+            opencodeSupervisorProtocolUnavailable: supervisorProtocolUnavailable,
+            opencodeRuntimeUnverified: runtimeUnverified,
+          });
+          reconcileSelection();
+        });
+        await Promise.all([sessionsTask, capabilityTask]);
       }));
     } catch (error) {
+      if (isClosing()) return;
       if (!initialized || rows.length === 0 || !isRetryableExplorerRefreshError(error)) throw error;
       // A transient bearer re-exchange or read failure is not evidence that
       // the last confirmed inventory disappeared. Keep navigation alive; the
@@ -317,7 +399,8 @@ export async function runNodeMachinesExplorer(
 
   const moveSelection = (delta: -1 | 1): void => {
     interactionNotice = undefined;
-    const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, input.opencodeEnabled === true);
+    pendingSupervisorUpdateMachineId = undefined;
+    const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation);
     if (keys.length === 0) return;
     const currentIndex = selectedKey === undefined ? -1 : keys.indexOf(selectedKey);
     const origin = currentIndex < 0 ? (delta > 0 ? -1 : keys.length) : currentIndex;
@@ -326,13 +409,20 @@ export async function runNodeMachinesExplorer(
     render();
   };
 
+  const reconcileSelection = (): void => {
+    const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation);
+    if (selectedKey === undefined || !keys.includes(selectedKey)) selectedKey = keys[0];
+    render();
+  };
+
   const goBack = (): void => {
     interactionNotice = undefined;
+    pendingSupervisorUpdateMachineId = undefined;
     const previous = navigation;
     const previousScreen = previous.screen;
     navigation = reduceMachineFirstNavigation(navigation, { type: "back" });
     if (navigation !== previous) {
-      const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, input.opencodeEnabled === true);
+      const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation);
       if (previousScreen.kind === "machine" && navigation.screen.kind === "machines") {
         const parentKey: SelectionKey = `machine:${previousScreen.machineId}`;
         selectedKey = keys.includes(parentKey) ? parentKey : keys[0];
@@ -340,7 +430,7 @@ export async function runNodeMachinesExplorer(
         const row = rows.find((candidate) => candidate.machine.id === previousScreen.machineId);
         const providerAction = row === undefined
           ? undefined
-          : machineContextActions(row, snapshotObservedAt, input.opencodeEnabled === true).find(
+          : machineContextActions(row, snapshotObservedAt).find(
               (action) => action.kind === "provider" && action.provider === previousScreen.provider,
             );
         const parentKey = providerAction === undefined ? undefined : machineActionSelectionKey(providerAction);
@@ -355,7 +445,7 @@ export async function runNodeMachinesExplorer(
   const activateOverviewSession = (sessionId: string): boolean => {
     const row = rows.find((candidate) => candidate.sessions.some((session) => session.id === sessionId));
     const session = row?.sessions.find((candidate) => candidate.id === sessionId);
-    if (row === undefined || session === undefined || !isActionableProvider(session.agent, input.opencodeEnabled === true)) return false;
+    if (row === undefined || session === undefined || !isActionableProvider(session.agent)) return false;
     const actionability = classifySessionActionability({ session, machine: row.machine, now: snapshotObservedAt });
     if (actionability.canAttach) {
       selection = Object.freeze({ kind: "attach", agentSessionId: session.id, agent: session.agent });
@@ -366,16 +456,25 @@ export async function runNodeMachinesExplorer(
       void refresh().catch((error) => { failure ??= error; stop(); });
       return false;
     }
+    if (actionability.recoveryAction === "wait") {
+      interactionNotice = hasLegacySupervisorBlockedOpenCodeSession(row) &&
+        session.agent === "opencode" && isUnobservedLaunchedSession(session)
+        ? legacySupervisorBlockedNotice()
+        : waitingForSessionObservation(session);
+      render();
+      return false;
+    }
     interactionNotice = `Session ended. Open ${safeLine(row.machine.name)} to start a new ${providerDisplayName(session.agent)} session.`;
     render();
     return false;
   };
 
   const goForward = (): void => {
+    pendingSupervisorUpdateMachineId = undefined;
     if (selectedKey?.startsWith("machine:") === true && navigation.screen.kind === "machines") {
       const machineId = selectedKey.slice("machine:".length);
       navigation = reduceMachineFirstNavigation(navigation, { type: "open-machine", machineId });
-      selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, input.opencodeEnabled === true)[0];
+      selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation)[0];
       render();
       return;
     }
@@ -390,14 +489,14 @@ export async function runNodeMachinesExplorer(
       const row = rows.find((candidate) => candidate.machine.id === screen.machineId);
       const action = row === undefined
         ? undefined
-        : machineContextActions(row, snapshotObservedAt, input.opencodeEnabled === true).find((candidate) => machineActionSelectionKey(candidate) === selectedKey);
+        : machineContextActions(row, snapshotObservedAt).find((candidate) => machineActionSelectionKey(candidate) === selectedKey);
       if (action?.kind === "provider") {
         navigation = reduceMachineFirstNavigation(navigation, {
           type: "open-provider",
           machineId: action.machineId,
           provider: action.provider,
         });
-        selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, input.opencodeEnabled === true)[0];
+        selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation)[0];
         render();
       }
     }
@@ -449,40 +548,51 @@ export async function runNodeMachinesExplorer(
     else if (byte === 0x0d || byte === 0x0a || byte === 0x20) {
       if (selectedKey?.startsWith("machine:") === true) {
         const id = selectedKey.slice("machine:".length);
-        const row = rows.find((candidate) => candidate.machine.id === id);
-        const directSession = row === undefined ? undefined : uniqueOpenableSession(row, snapshotObservedAt, input.opencodeEnabled === true);
-        if (directSession !== undefined) {
-          selection = Object.freeze({
-            kind: "attach",
-            agentSessionId: directSession.id,
-            agent: directSession.agent as ActionableProvider,
-          });
-          stop();
-          return true;
-        }
+        // A Machine is a container, not a synonym for whichever session
+        // happens to be unique right now.  Attaching is an explicit action on
+        // a concrete AgentSession only; this keeps one-key navigation read-only
+        // and prevents a stale/unique child from being opened by surprise.
         navigation = reduceMachineFirstNavigation(navigation, { type: "open-machine", machineId: id });
-        selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, input.opencodeEnabled === true)[0];
+        selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation)[0];
         render();
       } else if (selectedKey?.startsWith("session:") === true && navigation.screen.kind === "machines") {
         return activateOverviewSession(selectedKey.slice("session:".length));
       } else if ((selectedKey?.startsWith("machine-provider:") === true || selectedKey?.startsWith("machine-create:") === true
-        || selectedKey?.startsWith("machine-lifecycle:") === true)
+        || selectedKey?.startsWith("machine-lifecycle:") === true || selectedKey?.startsWith("machine-supervisor:") === true)
         && navigation.screen.kind === "machine") {
         const screen = navigation.screen;
         const row = rows.find((candidate) => candidate.machine.id === screen.machineId);
         const action = row === undefined
           ? undefined
-          : machineContextActions(row, snapshotObservedAt, input.opencodeEnabled === true).find((candidate) => machineActionSelectionKey(candidate) === selectedKey);
+          : machineContextActions(row, snapshotObservedAt).find((candidate) => machineActionSelectionKey(candidate) === selectedKey);
         if (action?.kind === "provider") {
           navigation = reduceMachineFirstNavigation(navigation, {
             type: "open-provider",
             machineId: action.machineId,
             provider: action.provider,
           });
-          selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, input.opencodeEnabled === true)[0];
+          selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation)[0];
           render();
         } else if (action?.kind === "start" || action?.kind === "stop") {
           selection = Object.freeze({ kind: "lifecycle", action: action.kind, machineId: action.machineId });
+          stop();
+          return true;
+        } else if (action?.kind === "supervisor-blocked") {
+          pendingSupervisorUpdateMachineId = undefined;
+          interactionNotice = row !== undefined && hasLegacySupervisorBlockedOpenCodeSession(row)
+            ? legacySupervisorBlockedNotice()
+            : row?.machine.state === "stopped"
+            ? "OpenCode is ready for a terminal update. Select Update terminal supervisor, then press Enter again to confirm."
+            : `Protected: Cuna will not stop ${safeLine(row?.machine.name ?? "this Machine")} or terminate AgentSessions. Stop it yourself when you are ready; the update will then be available here.`;
+          render();
+        } else if (action?.kind === "update-supervisor") {
+          if (pendingSupervisorUpdateMachineId !== action.machineId) {
+            pendingSupervisorUpdateMachineId = action.machineId;
+            interactionNotice = "Press Enter again to update the terminal supervisor. Cuna will not stop the Machine or terminate AgentSessions.";
+            render();
+            return false;
+          }
+          selection = Object.freeze({ kind: "supervisor-update", machineId: action.machineId });
           stop();
           return true;
         } else if (action?.kind === "new-session") {
@@ -513,8 +623,17 @@ export async function runNodeMachinesExplorer(
             stop();
             return true;
           }
-          if (actionability.recoveryAction === "refresh") void refresh().catch((error) => { failure ??= error; stop(); });
-          else render();
+          if (actionability.recoveryAction === "refresh") {
+            void refresh().catch((error) => { failure ??= error; stop(); });
+          } else if (actionability.recoveryAction === "wait") {
+            interactionNotice = row !== undefined && hasLegacySupervisorBlockedOpenCodeSession(row) &&
+              action.session.agent === "opencode" && isUnobservedLaunchedSession(action.session)
+              ? legacySupervisorBlockedNotice()
+              : waitingForSessionObservation(action.session);
+            render();
+          } else {
+            render();
+          }
         }
       } else if (selectedKey?.startsWith("create:") === true) {
         const agent = selectedKey.slice("create:".length) as ActionableProvider;
@@ -531,17 +650,23 @@ export async function runNodeMachinesExplorer(
           now: snapshotObservedAt,
           refreshStatus: row.sessionsLoading === true ? "pending" : "idle",
         });
-        if (session !== undefined && isActionableProvider(session.agent, input.opencodeEnabled === true) && actionability?.canAttach === true) {
+        if (session !== undefined && isActionableProvider(session.agent) && actionability?.canAttach === true) {
           selection = Object.freeze({ kind: "attach", agentSessionId: session.id, agent: session.agent });
           stop();
           return true;
         }
         if (actionability?.recoveryAction === "refresh") {
           void refresh().catch((error) => { failure ??= error; stop(); });
+        } else if (actionability?.recoveryAction === "wait") {
+          interactionNotice = row !== undefined && hasLegacySupervisorBlockedOpenCodeSession(row) &&
+            session?.agent === "opencode" && isUnobservedLaunchedSession(session)
+            ? legacySupervisorBlockedNotice()
+            : waitingForSessionObservation(session!);
+          render();
         } else if (actionability?.recoveryAction === "authenticate") {
           // Authentication owns the same provider PTY, but remains distinct
           // from an already-attachable base state in the policy.
-          if (session !== undefined && isActionableProvider(session.agent, input.opencodeEnabled === true)) {
+          if (session !== undefined && isActionableProvider(session.agent)) {
             selection = Object.freeze({ kind: "attach", agentSessionId: session.id, agent: session.agent });
             stop();
             return true;
@@ -550,7 +675,7 @@ export async function runNodeMachinesExplorer(
           // A visible but non-attachable supported session is still a useful
           // navigation target. Open its provider context instead of making
           // Enter appear broken; no attach or mutation is attempted.
-          if (session !== undefined && isActionableProvider(session.agent, input.opencodeEnabled === true)) goForward();
+          if (session !== undefined && isActionableProvider(session.agent)) goForward();
           else render();
         }
       }
@@ -608,13 +733,35 @@ async function observeSessionCreateCapability(
   machineId: string,
   now: number,
   signal?: AbortSignal,
-): Promise<boolean> {
-  if (typeof client.discoverCapabilities !== "function") return false;
+): Promise<Readonly<{
+  readonly canCreateSession: boolean;
+  readonly state: "verified" | "unverified";
+  readonly reason?: string;
+  readonly expiresAt?: number;
+}>> {
+  if (typeof client.discoverCapabilities !== "function") {
+    return Object.freeze({
+      canCreateSession: false,
+      state: "unverified",
+      reason: "capability_discovery_unavailable",
+    });
+  }
   try {
     const snapshot = await client.discoverCapabilities("machine", machineId, signal);
-    return decideCapability(snapshot, "agent_sessions.create", now).status === "supported";
+    const decision = decideCapability(snapshot, "agent_sessions.create", now);
+    const expiresAt = Date.parse(snapshot.expiresAt);
+    return Object.freeze({
+      canCreateSession: decision.status === "supported",
+      state: decision.status === "unknown" ? "unverified" : "verified",
+      ...(decision.status === "supported" ? {} : { reason: decision.reason }),
+      ...(decision.status === "unknown" ? {} : { expiresAt }),
+    });
   } catch {
-    return false;
+    return Object.freeze({
+      canCreateSession: false,
+      state: "unverified",
+      reason: "capability_discovery_unavailable",
+    });
   }
 }
 
@@ -669,7 +816,6 @@ function renderMachinesExplorer(input: {
   readonly columns: number;
   readonly now: number;
   readonly navigation: MachineFirstNavigationState;
-  readonly opencodeEnabled: boolean;
   readonly refreshError?: string | undefined;
   readonly interactionNotice?: string | undefined;
   readonly closingNotice?: string | undefined;
@@ -682,12 +828,12 @@ function renderMachinesExplorer(input: {
   if (input.navigation.screen.kind !== "machines") return renderContextScreen(input);
   const lines = [machineHeader("Machines"), " Your machines and the agents running inside them.", ""];
   let selectedLine: number | undefined;
-  const offerGlobalCreation = shouldOfferGlobalCreation(input.rows, input.now, input.opencodeEnabled);
+  const offerGlobalCreation = shouldOfferGlobalCreation(input.rows, input.now);
   if (input.loadingPhase === "machines" && input.rows.length === 0) {
     lines.push(loaderLine("Discovering machines", input.animationFrame));
   } else if (input.rows.length === 0) {
     lines.push("No machines yet. Choose a supported configuration:");
-    for (const agent of providerCreationOrder(input.opencodeEnabled)) {
+    for (const agent of providerCreationOrder()) {
       const key: SelectionKey = `create:${agent}`;
       const selected = input.selectedKey === key;
       if (selected) selectedLine = lines.length;
@@ -701,15 +847,16 @@ function renderMachinesExplorer(input: {
     if (machineSelected) selectedLine = lines.length;
     const provider = machineProviderAvailability(row.machine);
     const counts = row.sessionsLoading === true && row.sessions.length === 0
-      ? input.opencodeEnabled
-        ? "OpenCode … · Claude … · Codex …"
-        : "Claude … · Codex … · OpenCode …"
+      ? "OpenCode … · Claude … · Codex …"
       : row.sessionsError === undefined
-        ? providerSummaryOrder(input.opencodeEnabled).map((agent) => agentSummary(row, agent, input.now)).join(" · ")
-        : input.opencodeEnabled
-          ? "OpenCode ? · Claude ? · Codex ?"
-          : "Claude ? · Codex ? · OpenCode ?";
-    lines.push(`${machineSelected ? "❯" : " "} ${open ? "▾" : "▸"} ${safeLine(row.machine.name)}  ${safeLine(row.machine.state)}  ${provider.displayName} ${provider.usability}  ${counts}`);
+        ? providerSummaryOrder().map((agent) => agentSummary(row, agent, input.now)).join(" · ")
+        : "OpenCode ? · Claude ? · Codex ?";
+    // `usability` is the declaration, not the verdict. Printing it raw said
+    // `declared-installed` — a word the reader cannot act on, and worse, one
+    // that reads as usable on exactly the machines where the next command
+    // fails closed. `providerVerdict` is the reconciliation the other surfaces
+    // already use, which is what makes this row agree with `machines list`.
+    lines.push(`${machineSelected ? "❯" : " "} ${open ? "▾" : "▸"} ${safeLine(row.machine.name)}  ${safeLine(row.machine.state)}  ${provider.displayName} ${providerVerdict(provider)}  ${counts}`);
     if (!open) continue;
     if (row.sessionsLoading === true && row.sessions.length === 0) {
       lines.push(`    ${loaderLine("Loading AgentSessions", input.animationFrame)}`);
@@ -717,7 +864,21 @@ function renderMachinesExplorer(input: {
     }
     if (row.sessionsError !== undefined) lines.push(`    ├─ ${row.sessionsError}; showing last confirmed sessions`);
     if (row.sessions.length === 0) {
-      if (row.sessionsError === undefined) lines.push("    └─ No AgentSessions");
+      if (row.sessionsError === undefined && row.opencodeSupervisorRepairReason === undefined &&
+          !row.opencodeSupervisorProtocolUnavailable && !row.opencodeRuntimeUnverified) {
+        lines.push("    └─ No AgentSessions");
+      } else if (row.sessionsError === undefined) {
+        lines.push("    ├─ No AgentSessions");
+      }
+      if (row.opencodeSupervisorRepairReason !== undefined) {
+        lines.push(`    ${row.opencodeSupervisorProtocolUnavailable || row.opencodeRuntimeUnverified ? "├─" : "└─"} ${openCodeRepairSummary(row)}`);
+      }
+      if (row.opencodeSupervisorProtocolUnavailable) {
+        lines.push(`    ${row.opencodeRuntimeUnverified ? "├─" : "└─"} ${openCodeSupervisorProtocolWaitSummary()}`);
+      }
+      if (row.opencodeRuntimeUnverified) {
+        lines.push("    └─ Checking OpenCode runtime; no new OpenCode session was requested");
+      }
       continue;
     }
     for (const [sessionIndex, session] of row.sessions.entries()) {
@@ -734,10 +895,22 @@ function renderMachinesExplorer(input: {
       lines.push(`${sessionSelected ? "❯" : " "}   ${branch} ${providerDisplayName(session.agent)} · ${safeLine(session.name)}  ${displaySessionActionability(actionability)}`);
       lines.push(`       ${session.id} · ${safeLine(session.cwd)}`);
     }
+    if (row.opencodeSupervisorRepairReason !== undefined) {
+      lines.push(`     ${openCodeRepairSummary(row)}`);
+      if (hasLegacySupervisorBlockedOpenCodeSession(row)) lines.push(`     ${legacySupervisorRecoveryRoute()}`);
+    }
+    if (row.opencodeSupervisorProtocolUnavailable) {
+      lines.push(`     ${openCodeSupervisorProtocolWaitSummary()}`);
+    }
+    if (row.opencodeRuntimeUnverified) {
+      lines.push("     Checking OpenCode runtime; no new OpenCode session was requested");
+    }
   }
+  const capacityNotice = overviewSessionCreateCapacityNotice(input.rows);
+  if (capacityNotice !== undefined) lines.push("", capacityNotice);
   if (input.rows.length > 0 && offerGlobalCreation) {
     lines.push("", "No available machine can open an AgentSession. Create a supported machine:");
-    for (const agent of providerCreationOrder(input.opencodeEnabled)) {
+    for (const agent of providerCreationOrder()) {
       const key: SelectionKey = `create:${agent}`;
       const selected = input.selectedKey === key;
       if (selected) selectedLine = lines.length;
@@ -749,7 +922,7 @@ function renderMachinesExplorer(input: {
   }
   if (input.refreshError !== undefined) lines.push("", input.refreshError);
   if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
-  lines.push("", overviewFooter(input.rows, input.selectedKey, input.now, input.opencodeEnabled));
+  lines.push("", overviewFooter(input.rows, input.selectedKey, input.now));
   return Object.freeze({
     lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))),
     ...(selectedLine === undefined ? {} : { selectedLine }),
@@ -764,7 +937,6 @@ function renderContextScreen(input: {
   readonly columns: number;
   readonly now: number;
   readonly navigation: MachineFirstNavigationState;
-  readonly opencodeEnabled: boolean;
   readonly refreshError?: string | undefined;
   readonly interactionNotice?: string | undefined;
 }): MachinesExplorerFrame {
@@ -782,7 +954,7 @@ function renderContextScreen(input: {
   lines[1] = ` ${safeLine(row.machine.state)} · observation ${safeLine(row.machine.updatedAt ?? "unversioned")}`;
   lines.push("");
   const actions = screen.kind === "machine"
-    ? machineContextActions(row, input.now, input.opencodeEnabled)
+    ? machineContextActions(row, input.now)
     : resolveProviderContextActions({
         machine: row.machine,
         provider: screen.provider,
@@ -802,6 +974,32 @@ function renderContextScreen(input: {
       : action.kind === "provider" ? "sessions" : "";
     const label = action.kind === "start" || action.kind === "stop" ? `${action.label} machine` : action.label;
     lines.push(`${selected ? "❯" : " "} ${label}${detail === "" ? "" : `  ${detail}`}`);
+  }
+  if (row.opencodeSupervisorRepairReason !== undefined) {
+    lines.push("");
+    lines.push(` ${openCodeRepairSummary(row)}`);
+    if (row.machine.state === "stopped") {
+      lines.push(" Select Update terminal supervisor, then press Enter again to confirm.");
+    } else if (hasLegacySupervisorBlockedOpenCodeSession(row)) {
+      lines.push(` ${legacySupervisorRecoveryRoute()}`);
+    } else {
+      lines.push(" Protected: stop this Machine yourself after ending only the sessions you no longer need.");
+    }
+  }
+  if (row.opencodeSupervisorProtocolUnavailable) {
+    lines.push("");
+    lines.push(` ${openCodeSupervisorProtocolWaitSummary()}`);
+    lines.push(" Keep this Machine running; Cuna refreshes status automatically. Press r to check now.");
+  }
+  if (row.opencodeRuntimeUnverified) {
+    lines.push("");
+    lines.push(" Checking OpenCode runtime. No new OpenCode session was requested.");
+    lines.push(" Keep this Machine running; Cuna refreshes status automatically. Press r to check now.");
+  }
+  const capacityNotice = sessionCreateCapacityNotice(row);
+  if (capacityNotice !== undefined) {
+    lines.push("");
+    lines.push(` ${capacityNotice}`);
   }
   if (input.loadingPhase !== undefined) lines.push("", loaderLine("Refreshing machine", input.animationFrame));
   if (input.refreshError !== undefined) lines.push("", input.refreshError);
@@ -830,7 +1028,7 @@ function selectVisibleLines(frame: MachinesExplorerFrame, terminalRows: number):
   ]);
 }
 
-function machineContextActions(row: MachineRow, now: number, opencodeEnabled: boolean): readonly MachineContextAction[] {
+function machineContextActions(row: MachineRow, now: number): readonly MachineContextAction[] {
   const provider = machineProviderAvailability(row.machine);
   const hasSessions = provider.actionable && provider.agent !== undefined
     ? resolveProviderContextActions({
@@ -843,30 +1041,45 @@ function machineContextActions(row: MachineRow, now: number, opencodeEnabled: bo
   return resolveMachineContextActions(row.machine, {
     hasSessions,
     canCreateSession: row.canCreateSession === true,
-  }).filter((action) => action.kind === "start" || action.kind === "stop" ||
-    action.provider !== "opencode" || opencodeEnabled);
+    opencodeSupervisorRepairRequired: row.opencodeSupervisorRepairReason !== undefined,
+  });
 }
 
-function uniqueOpenableSession(row: MachineRow, now: number, opencodeEnabled: boolean): AgentSession | undefined {
-  const openable = row.sessions.filter((session) => {
-    if (!isActionableProvider(session.agent, opencodeEnabled)) return false;
+function hasOpenableSession(row: MachineRow, now: number): boolean {
+  return row.sessions.some((session) => {
+    if (!isActionableProvider(session.agent)) return false;
     const actionability = classifySessionActionability({ session, machine: row.machine, now });
     return actionability.canAttach || actionability.recoveryAction === "authenticate";
   });
-  return openable.length === 1 ? openable[0] : undefined;
+}
+
+function waitingForSessionObservation(session: AgentSession): string {
+  return `${providerDisplayName(session.agent)} is starting. Waiting for its first process observation; refreshing automatically — r to refresh now.`;
 }
 
 function shouldOfferGlobalCreation(
   rows: readonly MachineRow[],
   now: number,
-  opencodeEnabled: boolean,
 ): boolean {
   if (rows.length === 0) return true;
   return rows.every((row) => {
+    // `temporarily_unavailable` is not evidence that another Machine is
+    // needed. Do not turn a runtime verification wait into a misleading
+    // create affordance (and a possible extra billable resource).
+    if (row.opencodeRuntimeUnverified) return false;
+    // A current supervisor-repair prerequisite names the existing Machine
+    // that needs attention. Offering a global OpenCode create beside it turns
+    // a safe repair into an accidental extra Machine.
+    if (row.opencodeSupervisorRepairReason !== undefined) return false;
+    // An unannounced supervisor is a transient observation wait. It is not
+    // proof that another Machine is needed or that this one should be changed.
+    if (row.opencodeSupervisorProtocolUnavailable) return false;
     if (row.sessionsLoading === true) return false;
-    return !machineContextActions(row, now, opencodeEnabled).some(
+    if (row.sessionsError !== undefined) return false;
+    if (row.sessionCreateCapabilityState !== "verified") return false;
+    return !machineContextActions(row, now).some(
       (action) => action.kind === "start" || action.kind === "provider" || action.kind === "new-session",
-    ) && uniqueOpenableSession(row, now, opencodeEnabled) === undefined;
+    ) && !hasOpenableSession(row, now);
   });
 }
 
@@ -874,26 +1087,27 @@ function overviewFooter(
   rows: readonly MachineRow[],
   selectedKey: SelectionKey | undefined,
   now: number,
-  opencodeEnabled: boolean,
 ): string {
   if (selectedKey?.startsWith("machine:") === true) {
-    const row = rows.find((candidate) => candidate.machine.id === selectedKey.slice("machine:".length));
-    const directSession = row === undefined ? undefined : uniqueOpenableSession(row, now, opencodeEnabled);
-    return directSession === undefined
-      ? " ↑↓ move  ·  Enter/→ manage machine  ·  r refresh  ·  q quit"
-      : ` ↑↓ move  ·  Enter attach ${providerDisplayName(directSession.agent)}  ·  → manage machine  ·  r refresh  ·  q quit`;
+    return " ↑↓ move  ·  Enter/→ manage machine  ·  r refresh  ·  q quit";
   }
   if (selectedKey?.startsWith("session:") === true) {
     const sessionId = selectedKey.slice("session:".length);
     const row = rows.find((candidate) => candidate.sessions.some((session) => session.id === sessionId));
     const session = row?.sessions.find((candidate) => candidate.id === sessionId);
-    if (row !== undefined && session !== undefined && isActionableProvider(session.agent, opencodeEnabled)) {
+    if (row !== undefined && session !== undefined && isActionableProvider(session.agent)) {
       const actionability = classifySessionActionability({ session, machine: row.machine, now });
       if (actionability.canAttach || actionability.recoveryAction === "authenticate") {
         return ` ↑↓ move  ·  Enter/→ attach ${providerDisplayName(session.agent)}  ·  r refresh  ·  q quit`;
       }
       if (actionability.recoveryAction === "refresh") {
         return " ↑↓ move  ·  Enter refresh session  ·  ← back  ·  r refresh  ·  q quit";
+      }
+      if (actionability.recoveryAction === "wait") {
+        return hasLegacySupervisorBlockedOpenCodeSession(row) && session.agent === "opencode" &&
+          isUnobservedLaunchedSession(session)
+          ? " ↑↓ move  ·  Legacy supervisor blocked  ·  ← back  ·  r refresh  ·  q quit"
+          : " ↑↓ move  ·  Waiting for process observation  ·  ← back  ·  r refresh  ·  q quit";
       }
       return " ↑↓ move  ·  Enter session details  ·  ← back  ·  r refresh  ·  q quit";
     }
@@ -909,14 +1123,13 @@ function selectableKeys(
   expanded: ReadonlySet<string>,
   now: number,
   navigation: MachineFirstNavigationState,
-  opencodeEnabled: boolean,
 ): readonly SelectionKey[] {
   if (navigation.screen.kind === "machine") {
     const screen = navigation.screen;
     const row = rows.find((candidate) => candidate.machine.id === screen.machineId);
     return row === undefined
       ? Object.freeze([])
-      : Object.freeze(machineContextActions(row, now, opencodeEnabled).map(machineActionSelectionKey));
+      : Object.freeze(machineContextActions(row, now).map(machineActionSelectionKey));
   }
   if (navigation.screen.kind === "provider") {
     const screen = navigation.screen;
@@ -934,12 +1147,12 @@ function selectableKeys(
     `machine:${row.machine.id}`,
     ...(expanded.has(row.machine.id)
       ? row.sessions
-          .filter((session) => isActionableProvider(session.agent, opencodeEnabled))
+          .filter((session) => isActionableProvider(session.agent))
           .map((session): SelectionKey => `session:${session.id}`)
       : []),
   ]);
-  const creationKeys = shouldOfferGlobalCreation(rows, now, opencodeEnabled)
-    ? providerCreationOrder(opencodeEnabled).map((agent): SelectionKey => `create:${agent}`)
+  const creationKeys = shouldOfferGlobalCreation(rows, now)
+    ? providerCreationOrder().map((agent): SelectionKey => `create:${agent}`)
     : [];
   return Object.freeze([...machineKeys, ...creationKeys]);
 }
@@ -949,6 +1162,10 @@ function machineActionSelectionKey(action: MachineContextAction): SelectionKey {
     ? `machine-provider:${action.provider}`
     : action.kind === "new-session"
       ? `machine-create:${action.provider}`
+      : action.kind === "supervisor-blocked"
+        ? "machine-supervisor:blocked"
+        : action.kind === "update-supervisor"
+          ? "machine-supervisor:update"
       : `machine-lifecycle:${action.kind}`;
 }
 
@@ -956,20 +1173,36 @@ function providerActionSelectionKey(action: ProviderContextAction): SelectionKey
   return `provider-session:${action.session.id}`;
 }
 
-function isActionableProvider(provider: AgentSession["agent"], opencodeEnabled: boolean): provider is ActionableProvider {
-  return provider === "claude-code" || provider === "codex" || (provider === "opencode" && opencodeEnabled);
+function isActionableProvider(provider: AgentSession["agent"]): provider is ActionableProvider {
+  return provider === "claude-code" || provider === "codex" || provider === "opencode";
 }
 
-function providerCreationOrder(opencodeEnabled: boolean): readonly ActionableProvider[] {
-  return opencodeEnabled
-    ? Object.freeze(["opencode", "claude-code", "codex"])
-    : Object.freeze(["claude-code", "codex"]);
+function providerCreationOrder(): readonly ActionableProvider[] {
+  return Object.freeze(["opencode", "claude-code", "codex"]);
 }
 
-function providerSummaryOrder(opencodeEnabled: boolean): readonly ActionableProvider[] {
-  return opencodeEnabled
-    ? providerCreationOrder(true)
-    : Object.freeze(["claude-code", "codex", "opencode"]);
+function providerSummaryOrder(): readonly ActionableProvider[] {
+  return providerCreationOrder();
+}
+
+function sessionCreateCapacityNotice(row: MachineRow): string | undefined {
+  if (row.sessionCreateCapabilityState === "checking") {
+    return "Checking whether this Machine can start a new session; existing sessions stay available.";
+  }
+  if (row.sessionCreateCapabilityState === "unverified") {
+    return "New-session capacity cannot be verified; Cuna will not offer a create action.";
+  }
+  return undefined;
+}
+
+function overviewSessionCreateCapacityNotice(rows: readonly MachineRow[]): string | undefined {
+  if (rows.some((row) => row.sessionCreateCapabilityState === "unverified")) {
+    return "New-session capacity cannot be verified; Cuna will not offer a create action.";
+  }
+  if (rows.some((row) => row.sessionCreateCapabilityState === "checking")) {
+    return "Checking whether these Machines can start a new session; existing sessions stay available.";
+  }
+  return undefined;
 }
 
 function isRetryableExplorerRefreshError(error: unknown): boolean {
@@ -996,6 +1229,12 @@ function paintMachinesExplorer(lines: readonly string[], columns: number, color:
     if (line.startsWith("❯")) return `${ANSI.orange}${ANSI.bold}${paintStatus(line)}${ANSI.reset}`;
     if (line.startsWith("  ▾") || line.startsWith("  ▸") || line.startsWith(" ▾") || line.startsWith(" ▸")) {
       return `${ANSI.bold}${ANSI.orange}${paintStatus(line)}${ANSI.reset}`;
+    }
+    if (line.includes("Blocked by legacy supervisor")) {
+      return `${ANSI.red}${ANSI.bold}${paintStatus(line)}${ANSI.reset}`;
+    }
+    if (line.includes("Route: end stale") || line.includes("Protected:") || line.includes("needs a terminal update")) {
+      return `${ANSI.orange}${ANSI.bold}${paintStatus(line)}${ANSI.reset}`;
     }
     if (line.includes("Claude") || line.includes("Codex") || line.includes("OpenCode")) return `${ANSI.cyan}${paintStatus(line)}${ANSI.reset}`;
     if (line.includes("Discovering") || line.includes("Loading") || line.includes("Refreshing")) {
@@ -1030,6 +1269,41 @@ function agentSummary(row: MachineRow, agent: ActionableProvider, now: number): 
       refreshStatus: row.sessionsLoading === true ? "pending" : "idle",
     }).canAttach).length;
   return `${providerDisplayName(agent)} ${running}/${matching.length} live`;
+}
+
+function openCodeRepairSummary(row: MachineRow): string {
+  // This capability is evaluated only for a new AgentSession. An existing
+  // child can be unobserved for a different reason, so keep the two messages
+  // distinct. A launched-but-unknown child plus a legacy capability is the
+  // one proved deadlock: further refreshing cannot create its observation.
+  return hasLegacySupervisorBlockedOpenCodeSession(row)
+    ? "Blocked by legacy supervisor — waiting will not fix this"
+    : "New OpenCode sessions are blocked until the terminal supervisor is updated";
+}
+
+function openCodeSupervisorProtocolWaitSummary(): string {
+  return "Waiting for this Machine's OpenCode terminal supervisor; no new OpenCode session was requested";
+}
+
+function isUnobservedLaunchedSession(session: AgentSession): boolean {
+  return session.agent === "opencode" && session.requestState === "launched" && session.processState === "unknown";
+}
+
+function hasLegacySupervisorBlockedOpenCodeSession(row: MachineRow): boolean {
+  return row.opencodeSupervisorRepairReason !== undefined &&
+    row.sessions.some(isUnobservedLaunchedSession);
+}
+
+function legacySupervisorRecoveryRoute(): string {
+  return "Route: end stale OpenCode session → stop Machine → Update terminal supervisor.";
+}
+
+function legacySupervisorBlockedNotice(): string {
+  return `${openCodeRepairSummaryForLegacy()}\n${legacySupervisorRecoveryRoute()}`;
+}
+
+function openCodeRepairSummaryForLegacy(): string {
+  return "Blocked by legacy supervisor — waiting will not fix this.";
 }
 
 function safeLine(value: string): string {

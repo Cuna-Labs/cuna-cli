@@ -13,10 +13,8 @@ export type BrowserActionState =
   | "expired"
   | "failed";
 
-export interface LocalBrowserActionRequest {
+interface LocalBrowserActionRequestBase {
   readonly id: string;
-  readonly type: "browser.open";
-  readonly provider: BrowserActionProvider;
   readonly agentSessionId: string;
   readonly processEpoch: string;
   readonly fencingGeneration: number;
@@ -28,7 +26,24 @@ export interface LocalBrowserActionRequest {
   readonly state: "pending_permission";
 }
 
+export interface LocalBrowserOpenActionRequest extends LocalBrowserActionRequestBase {
+  readonly type: "browser.open";
+  readonly provider: BrowserActionProvider;
+}
+
+/** Codex's established device-code transport keeps its two-field contract. */
+export interface LocalCodexDeviceActionRequest extends LocalBrowserActionRequestBase {
+  readonly type: "auth.device.present";
+  readonly provider: "codex";
+  readonly userCode: string;
+}
+
+export type LocalBrowserActionRequest =
+  | LocalBrowserOpenActionRequest
+  | LocalCodexDeviceActionRequest;
+
 export interface BrowserActionDetectorOptions {
+  /** Only providers whose supported fallback is a PTY browser URL belong here. */
   readonly provider: BrowserActionProvider;
   readonly agentSessionId: string;
   readonly processEpoch: string;
@@ -72,7 +87,7 @@ export class ProviderOAuthPasteGuard {
   #disabled = false;
   #captureCodes = false;
 
-  constructor(request: LocalBrowserActionRequest) {
+  constructor(request: LocalBrowserOpenActionRequest) {
     const admitted = admitProviderAuthUrl(request.provider, request.url);
     if (
       request.type !== "browser.open" ||
@@ -224,7 +239,9 @@ function pasteGuardResult(
 }
 
 /**
- * Turns the provider's unavoidable PTY fallback into a typed local request.
+ * Turns Claude/Codex's established PTY browser fallback into a typed local
+ * request. OpenCode is deliberately excluded: its TUI text is output only;
+ * a future private sidecar must use the RTP1 `auth.device.present` envelope.
  * Detection cannot execute anything and the full URL is never logged.
  */
 export class ProviderBrowserActionDetector {
@@ -235,6 +252,9 @@ export class ProviderBrowserActionDetector {
   #buffer = "";
 
   constructor(options: BrowserActionDetectorOptions) {
+    if (!browserActionProvider(options.provider)) {
+      throw new TypeError("PTY browser detection supports only Claude Code and Codex.");
+    }
     if (!identifier(options.agentSessionId) || !identifier(options.processEpoch)) {
       throw new TypeError("Browser action detection requires an exact AgentSession process binding.");
     }
@@ -278,6 +298,10 @@ export class ProviderBrowserActionDetector {
     if (this.#buffer.length > MAX_URL_CHARACTERS) this.#buffer = this.#buffer.slice(-MAX_URL_CHARACTERS);
     return Object.freeze(requests);
   }
+}
+
+function browserActionProvider(value: string): value is BrowserActionProvider {
+  return value === "claude-code" || value === "codex";
 }
 
 export function admitProviderAuthUrl(provider: BrowserActionProvider, raw: string): URL | undefined {

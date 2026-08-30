@@ -39,15 +39,12 @@ export const LOCAL_ACTION_PROVIDERS: Readonly<Record<LocalActionProvider, LocalA
   opencode: Object.freeze({
     provider: "opencode",
     enabled: true,
+    // OpenCode v1.18.23 owns provider selection and authentication inside its
+    // TUI (`/connect`, then `/models`). It has no Cuna console-device handoff,
+    // so the foreground must not advertise or execute a local auth action for
+    // it. Keeping the provider enabled here preserves direct terminal attach.
     authTopologies: Object.freeze(["provider_defined"] satisfies ProviderAuthTopology[]),
-    // OpenCode can front many model providers, so arbitrary browser URLs are
-    // never inferred from PTY text. Typed callback relay and observed auth are
-    // admitted; the remaining common actions retain their ordinary policy.
-    allowedActions: Object.freeze([
-      ...COMMON_ACTIONS.filter((kind) => kind !== "browser.open"),
-      "auth.callback.relay",
-      "auth.result.observe",
-    ] satisfies LocalActionKind[]),
+    allowedActions: Object.freeze([] satisfies LocalActionKind[]),
     remoteAdapter: "mcp_stdio",
   }),
 });

@@ -324,6 +324,23 @@ test("runtime capability admission fails closed for expired, ambiguous, and non-
     }, NOW),
     (error) => error instanceof RuntimeBoundaryError && error.code === "capability_unsupported",
   );
+  const supervisorPending = capabilitySnapshot("agent-1");
+  supervisorPending.capabilities[0] = {
+    ...supervisorPending.capabilities[0],
+    availability: "unknown",
+    reasonCode: "supervisor_registry_unavailable",
+  };
+  assert.throws(
+    () => admitCapability(supervisorPending, {
+      id: CAPABILITY_ID,
+      scope: "agent_session",
+      subjectId: "agent-1",
+      interaction: "native",
+    }, NOW),
+    (error) => error instanceof RuntimeBoundaryError &&
+      error.code === "capability_unknown" &&
+      error.safeDetails?.reason_code === "supervisor_registry_unavailable",
+  );
 });
 
 test("terminal grants reject non-Runa origins, query secrets, and incomplete capability evidence", () => {

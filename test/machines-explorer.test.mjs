@@ -95,7 +95,7 @@ test("machines explorer renders nested counts, opens machine actions, resizes, a
   await waitUntil(() => host.writes.some((write) => write.includes("Claude 1/1 live")), "nested machine inventory should render");
   const expanded = host.writes.at(-1);
   assert.match(stripAnsi(expanded), /Claude · goal0-claude  attachable/u);
-  assert.match(stripAnsi(expanded), /Enter attach Claude.*→ manage machine/u);
+  assert.match(stripAnsi(expanded), /Enter\/→ manage machine/u);
   assert.equal(expanded.includes("\u001b[48;5;202m"), true, "brand cell should use Cuna flare");
   assert.equal(expanded.includes("\u001b[38;5;232m"), true, "brand text should use theme-independent Cuna ground");
   assert.equal(expanded.includes("\u001b[30m"), false, "brand text should not inherit a terminal's remapped basic black");
@@ -143,7 +143,7 @@ test("machines explorer renders nested counts, opens machine actions, resizes, a
 });
 
 for (const [label, key] of [["Enter", 0x0d], ["Space", 0x20]]) {
-  test(`${label} on a machine with one openable child attaches that exact AgentSession directly`, async () => {
+  test(`${label} on a machine with one openable child opens its context before any attach`, async () => {
     const host = new FakeHost();
     const operation = runNodeMachinesExplorer({
       client: {
@@ -159,14 +159,43 @@ for (const [label, key] of [["Enter", 0x0d], ["Space", 0x20]]) {
       },
     }, { host });
     await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("Claude 1/4 live")), "one live child among history should render");
-    assert.match(stripAnsi(host.writes.at(-1)), /Enter attach Claude.*→ manage machine/u);
+    assert.match(stripAnsi(host.writes.at(-1)), /Enter\/→ manage machine/u);
 
     host.emitInput([key]);
+    await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("CUNA  ◆── goal0"), "machine selection should open the machine menu");
+    assert.equal(host.input !== undefined, true, "opening a machine is navigation, not an attach");
+    host.emitInput([0x0d]);
+    await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("Claude  sessions"), "the provider must be selected explicitly");
+    host.emitInput([0x0d]);
     assert.deepEqual(await operation, { kind: "attach", agentSessionId: SESSION_ID, agent: "claude-code" });
-    assert.equal(host.writes.some((frame) => stripAnsi(frame).includes("CUNA  ◆── goal0\r\n")), false, "direct attach must not visit the machine submenu");
+    assert.equal(host.writes.some((frame) => stripAnsi(frame).includes("CUNA  ◆── goal0\r\n")), true, "the machine submenu must be shown before attaching");
     assert.equal(host.restored, 1);
   });
 }
+
+test("capacity that cannot be verified never manufactures a create action while existing reads stay visible", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "goal0", state: "running", agent: "claude-code" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities() { throw new Error("capability observation unavailable"); },
+    },
+  }, { host });
+  await waitUntil(
+    () => host.writes.at(-1) !== undefined && stripAnsi(host.writes.at(-1)).includes("New-session capacity cannot be verified"),
+    "the capacity abstention should be visible",
+  );
+  const overview = stripAnsi(host.writes.at(-1));
+  assert.match(overview, /No AgentSessions/u);
+  assert.doesNotMatch(overview, /Create Claude machine|Create OpenCode machine|Create Codex machine/u);
+
+  host.emitInput([0x0d]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("CUNA  ◆── goal0"), "machine context should still open");
+  assert.doesNotMatch(stripAnsi(host.writes.at(-1)), /New Claude session/u);
+  host.emitInput([0x03]);
+  assert.equal(await operation, undefined);
+});
 
 test("Enter on a machine with multiple openable children opens management without choosing arbitrarily", async () => {
   const host = new FakeHost();
@@ -349,14 +378,13 @@ test("Enter on a Claude or Codex child returns the exact attach selection", asyn
   assert.equal(host.restored, 1);
 });
 
-test("OpenCode counts and a live OpenCode child are visible and attachable when enabled", async () => {
+test("OpenCode counts and a live OpenCode child are visible and attachable", async () => {
   const host = new FakeHost();
   const operation = runNodeMachinesExplorer({
     client: {
       async listMachines() { return { items: [{ id: MACHINE_ID, name: "open-dev", state: "running", agent: "opencode" }] }; },
       async listAgentSessions() { return { items: [agentSession({ agent: "opencode", name: "open-main" })] }; },
     },
-    opencodeEnabled: true,
   }, { host });
   await waitUntil(() => host.writes.some((write) => write.includes("OpenCode 1/1 live")), "OpenCode count should render");
   const overview = stripAnsi(host.writes.at(-1));
@@ -366,6 +394,261 @@ test("OpenCode counts and a live OpenCode child are visible and attachable when 
   host.emitInput([0x0d]);
   assert.deepEqual(await operation, { kind: "attach", agentSessionId: SESSION_ID, agent: "opencode" });
   assert.equal(host.restored, 1);
+});
+
+test("a stopped OpenCode Machine offers only an explicit, double-confirmed supervisor repair", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "open-repair", state: "stopped", agent: "opencode" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities() {
+        const now = Date.now();
+        return {
+          schemaVersion: "1.0",
+          subjectScope: "machine",
+          subjectId: MACHINE_ID,
+          observedAt: new Date(now - 1_000).toISOString(),
+          expiresAt: new Date(now + 30_000).toISOString(),
+          etag: "open-repair",
+          capabilities: [{
+            id: "agent_sessions.create",
+            availability: "unsupported",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_supervisor_upgrade_required",
+          }],
+        };
+      },
+    },
+  }, { host });
+  await waitUntil(() => host.writes.some((write) => stripAnsi(write).includes("New OpenCode sessions are blocked until the terminal supervisor is updated")), "repair prerequisite should render in inventory");
+  assert.doesNotMatch(stripAnsi(host.writes.at(-1)), /Create OpenCode machine/u);
+  host.emitInput([0x1b, 0x5b, 0x43]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("❯ Update terminal supervisor"), "repair must be the selected stopped-Machine action");
+  host.emitInput([0x0d]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("Press Enter again to update the terminal supervisor"), "first Enter must only request confirmation");
+  host.emitInput([0x0d]);
+  assert.deepEqual(await operation, { kind: "supervisor-update", machineId: MACHINE_ID });
+  assert.equal(host.restored, 1);
+});
+
+test("a running OpenCode repair stays protected and never selects Stop on Enter", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "open-protected", state: "running", agent: "opencode" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities() {
+        const now = Date.now();
+        return {
+          schemaVersion: "1.0",
+          subjectScope: "machine",
+          subjectId: MACHINE_ID,
+          observedAt: new Date(now - 1_000).toISOString(),
+          expiresAt: new Date(now + 30_000).toISOString(),
+          etag: "open-protected",
+          capabilities: [{
+            id: "agent_sessions.create",
+            availability: "unsupported",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_supervisor_upgrade_required",
+          }],
+        };
+      },
+    },
+  }, { host });
+  await waitUntil(() => host.writes.some((write) => stripAnsi(write).includes("New OpenCode sessions are blocked until the terminal supervisor is updated")), "repair prerequisite should render in inventory");
+  host.emitInput([0x1b, 0x5b, 0x43]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("❯ OpenCode needs a terminal update"), "protected explanation must be selected before Stop");
+  host.emitInput([0x0d]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("Protected: Cuna will not stop open-protected"), "Enter must explain protection instead of stopping");
+  host.emitInput([0x03]);
+  await operation;
+  assert.equal(host.restored, 1);
+});
+
+test("a first OpenCode process observation remains distinct from the next-session supervisor upgrade", async () => {
+  const host = new FakeHost();
+  const pending = agentSession({
+    name: "opencode",
+    agent: "opencode",
+    requestState: "launch_pending",
+    processState: "unknown",
+    processEpoch: undefined,
+    runtimeObservedAt: undefined,
+    runtimeExpiresAt: undefined,
+  });
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "open-existing", state: "running", agent: "opencode" }] };
+      },
+      async listAgentSessions() { return { items: [pending] }; },
+      async discoverCapabilities() {
+        const now = Date.now();
+        return {
+          schemaVersion: "1.0",
+          subjectScope: "machine",
+          subjectId: MACHINE_ID,
+          observedAt: new Date(now - 1_000).toISOString(),
+          expiresAt: new Date(now + 30_000).toISOString(),
+          etag: "open-existing-upgrade",
+          capabilities: [{
+            id: "agent_sessions.create",
+            availability: "unsupported",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_supervisor_upgrade_required",
+          }],
+        };
+      },
+    },
+  }, { host });
+
+  await waitUntil(
+    () => {
+      const write = host.writes.at(-1);
+      if (write === undefined) return false;
+      const frame = stripAnsi(write);
+      return frame.includes("OpenCode · opencode  starting") &&
+        frame.includes("New OpenCode sessions are blocked until the terminal supervisor is updated");
+    },
+    "the create fence should not be presented as this existing session failing to start",
+  );
+  assert.doesNotMatch(stripAnsi(host.writes.at(-1)), /needs a terminal update before it can start/u);
+
+  host.emitInput([0x1b, 0x5b, 0x42]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("❯   └─ OpenCode"), "pending session should remain selectable");
+  host.emitInput([0x0d]);
+  await waitUntil(
+    () => stripAnsi(host.writes.at(-1)).includes("OpenCode is starting. Waiting for its first process observation"),
+    "the selected existing session should explain its own observation wait",
+  );
+  host.emitInput([0x03]);
+  await operation;
+});
+
+test("a launched unknown OpenCode session names the legacy-supervisor recovery route", async () => {
+  const host = new FakeHost();
+  const stale = agentSession({
+    name: "opencode",
+    agent: "opencode",
+    requestState: "launched",
+    processState: "unknown",
+    processEpoch: undefined,
+    runtimeObservedAt: undefined,
+    runtimeExpiresAt: undefined,
+  });
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "open-legacy", state: "running", agent: "opencode" }] };
+      },
+      async listAgentSessions() { return { items: [stale] }; },
+      async discoverCapabilities() {
+        const now = Date.now();
+        return {
+          schemaVersion: "1.0",
+          subjectScope: "machine",
+          subjectId: MACHINE_ID,
+          observedAt: new Date(now - 1_000).toISOString(),
+          expiresAt: new Date(now + 30_000).toISOString(),
+          etag: "open-legacy",
+          capabilities: [{
+            id: "agent_sessions.create",
+            availability: "unsupported",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_supervisor_upgrade_required",
+          }],
+        };
+      },
+    },
+  }, { host });
+
+  await waitUntil(
+    () => {
+      const write = host.writes.at(-1);
+      if (write === undefined) return false;
+      const frame = stripAnsi(write);
+      return frame.includes("Blocked by legacy supervisor — waiting will not fix this") &&
+        frame.includes("Route: end stale OpenCode session → stop Machine → Update terminal supervisor.");
+    },
+    "a proven legacy supervisor must not look like a transient observation wait",
+  );
+  assert.match(stripAnsi(host.writes.at(-1)), /OpenCode · opencode  starting/u);
+
+  host.emitInput([0x1b, 0x5b, 0x42]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("❯   └─ OpenCode"), "stale child should remain selectable");
+  host.emitInput([0x0d]);
+  await waitUntil(
+    () => stripAnsi(host.writes.at(-1)).includes("Blocked by legacy supervisor — waiting will not fix this."),
+    "Enter must preserve the deterministic recovery route instead of asking the person to wait",
+  );
+  assert.match(stripAnsi(host.writes.at(-1)), /Route: end stale OpenCode session → stop Machine → Update terminal supervisor./u);
+  host.emitInput([0x03]);
+  await operation;
+});
+
+test("an unannounced OpenCode supervisor is a retryable wait, not a terminal update", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "open-heartbeat", state: "running", agent: "opencode" }] };
+      },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities() {
+        const now = Date.now();
+        return {
+          schemaVersion: "1.0",
+          subjectScope: "machine",
+          subjectId: MACHINE_ID,
+          observedAt: new Date(now - 1_000).toISOString(),
+          expiresAt: new Date(now + 30_000).toISOString(),
+          etag: "open-heartbeat",
+          capabilities: [{
+            id: "agent_sessions.create",
+            availability: "temporarily_unavailable",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_supervisor_protocol_unavailable",
+          }],
+        };
+      },
+    },
+  }, { host });
+
+  await waitUntil(
+    () => {
+      const write = host.writes.at(-1);
+      return write !== undefined && stripAnsi(write).includes("Waiting for this Machine's OpenCode terminal supervisor");
+    },
+    "protocol heartbeat absence should render as a wait",
+  );
+  const overview = stripAnsi(host.writes.at(-1));
+  assert.doesNotMatch(overview, /terminal supervisor is updated|Update terminal supervisor|needs a terminal update/u);
+  assert.doesNotMatch(overview, /Create OpenCode machine|No available machine can open an AgentSession/u);
+
+  host.emitInput([0x1b, 0x5b, 0x43]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("CUNA  ◆── open-heartbeat"), "machine context should remain available");
+  const context = stripAnsi(host.writes.at(-1));
+  assert.match(context, /Waiting for this Machine's OpenCode terminal supervisor/u);
+  assert.doesNotMatch(context, /Update terminal supervisor/u);
+  host.emitInput([0x03]);
+  await operation;
 });
 
 test("bare explorer offers machine creation when every observed machine is unusable", async () => {
@@ -391,12 +674,11 @@ test("bare explorer offers machine creation when every observed machine is unusa
             mutationClass: "reversible",
             surfaces: ["cli"],
             requiredPermissions: ["agent_sessions:create"],
-            reason: "opencode_runtime_unverified",
+            reasonCode: "machine_runtime_failed",
           }],
         };
       },
     },
-    opencodeEnabled: true,
   }, { host });
 
   await waitUntil(
@@ -411,6 +693,47 @@ test("bare explorer offers machine creation when every observed machine is unusa
   await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("❯ Create OpenCode machine"), "Down should select OpenCode creation");
   host.emitInput([0x0d]);
   assert.deepEqual(await operation, { kind: "launch", agent: "opencode" });
+  assert.equal(host.restored, 1);
+});
+
+test("OpenCode runtime verification waits rather than offering another machine", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "open-verifying", state: "running", agent: "opencode" }] };
+      },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities() {
+        return {
+          schemaVersion: "1.0",
+          subjectScope: "machine",
+          subjectId: MACHINE_ID,
+          observedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30_000).toISOString(),
+          etag: "runtime-verifying",
+          capabilities: [{
+            id: "agent_sessions.create",
+            availability: "temporarily_unavailable",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_runtime_unverified",
+          }],
+        };
+      },
+    },
+  }, { host });
+
+  await waitUntil(
+    () => host.writes.some((write) => stripAnsi(write).includes("Checking OpenCode runtime; no new OpenCode session was requested")),
+    "runtime verification should remain a transient no-create state",
+  );
+  const frame = stripAnsi(host.writes.at(-1));
+  assert.doesNotMatch(frame, /Create OpenCode machine|No available machine can open an AgentSession/u);
+  host.emitInput(Buffer.from("q"));
+  await operation;
   assert.equal(host.restored, 1);
 });
 
@@ -531,7 +854,18 @@ test("machines explorer renders an unknown declared provider truthfully beside i
       async listAgentSessions() { return { items: [] }; },
     },
   }, { host });
-  await waitUntil(() => host.writes.some((write) => write.includes("Unknown (future-agent) declared-installed")), "unknown provider should be explicit");
+  // Was `Unknown (future-agent) declared-installed`. That string is the defect
+  // `provider-availability.ts:58-74` documents in its own words: `usability` is
+  // the declaration, `actionable` is the verdict, they are independent by
+  // construction, and printing the first alone reads as *usable* on exactly the
+  // machines where `agent-sessions create` fails closed. The explorer was the
+  // last surface still printing the raw field; `machines list` had already
+  // adopted `providerVerdict`.
+  await waitUntil(
+    () => host.writes.some((write) =>
+      write.includes("Unknown (future-agent) unusable — provider_not_supported_by_cli")),
+    "an unknown provider must name why the next command cannot run",
+  );
   assert.match(host.writes.at(-1), /OpenCode 0\/0 live/u);
   host.emitInput([0x03]);
   await operation;
@@ -598,6 +932,48 @@ test("machines explorer does not turn a cached live session stale while refresh 
   await waitUntil(() => host.writes.some((write) => write.includes("goal0-claude  attachable") && !write.includes("Refreshing live sessions")), "renewed snapshot should commit");
   host.emitInput([0x03]);
   await operation;
+});
+
+test("a launch-pending OpenCode session waits for a newer observation instead of ending or creating another session", async () => {
+  const host = new FakeHost();
+  let reads = 0;
+  const pending = agentSession({
+    name: "opencode",
+    agent: "opencode",
+    requestState: "launch_pending",
+    processState: "unknown",
+    processEpoch: undefined,
+    runtimeObservedAt: undefined,
+    runtimeExpiresAt: undefined,
+  });
+  const observed = agentSession({
+    name: "opencode",
+    agent: "opencode",
+    rowVersion: 2,
+  });
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "opencode-machine", state: "running", agent: "opencode" }] };
+      },
+      async listAgentSessions() {
+        reads += 1;
+        return { items: [reads === 1 ? pending : observed] };
+      },
+    },
+  }, { host });
+  await waitUntil(() => host.writes.some((write) => stripAnsi(write).includes("OpenCode · opencode  starting")), "pending OpenCode should render as starting");
+
+  host.emitInput([0x1b, 0x5b, 0x42]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("❯   └─ OpenCode"), "Down should select the pending OpenCode session");
+  host.emitInput([0x0d]);
+  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("OpenCode is starting. Waiting for its first process observation"), "Enter should explain the pending state");
+  assert.doesNotMatch(stripAnsi(host.writes.at(-1)), /Session ended|New OpenCode session/u);
+
+  host.emitInput([0x72]);
+  await waitUntil(() => reads >= 2 && stripAnsi(host.writes.at(-1)).includes("OpenCode · opencode  attachable"), "only a newer observed row should make OpenCode attachable");
+  host.emitInput([0x0d]);
+  assert.deepEqual(await operation, { kind: "attach", agentSessionId: SESSION_ID, agent: "opencode" });
 });
 
 test("failed refresh retains the last confirmed session membership", async () => {
@@ -917,6 +1293,38 @@ test("an abort during machine discovery restores the host without starting child
   release();
   await operation;
   assert.equal(childReads, 0);
+  assert.equal(host.writes.some((write) => stripAnsi(write).includes("✦ Closing Cuna...")), true);
+  assert.equal(host.writes.some((write) => stripAnsi(write).includes("✓ Closed.")), true);
+  assert.equal(host.restored, 1);
+});
+
+test("q treats an aborted in-flight capability read as a normal explorer close", async () => {
+  const host = new FakeHost();
+  let capabilityStarted = false;
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "closing-capability", state: "running", agent: "opencode" }] };
+      },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(_scope, _machineId, signal) {
+        capabilityStarted = true;
+        return await new Promise((_resolve, reject) => {
+          const rejectCancelled = () => reject(new CunaError({
+            code: "cuna.network.cancelled",
+            message: "The Cuna request was cancelled.",
+            exitCode: 1,
+          }));
+          if (signal?.aborted) rejectCancelled();
+          else signal?.addEventListener("abort", rejectCancelled, { once: true });
+        });
+      },
+    },
+  }, { host });
+
+  await waitUntil(() => capabilityStarted, "capability observation should be in flight");
+  host.emitInput([0x71]);
+  assert.equal(await operation, undefined);
   assert.equal(host.writes.some((write) => stripAnsi(write).includes("✦ Closing Cuna...")), true);
   assert.equal(host.writes.some((write) => stripAnsi(write).includes("✓ Closed.")), true);
   assert.equal(host.restored, 1);

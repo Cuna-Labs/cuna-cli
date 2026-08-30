@@ -114,6 +114,12 @@ export interface CunaApiClient {
   getMachineCreateRequest(id: string, signal?: AbortSignal): Promise<MachineCreateRequest>;
   reconcileMachineCreateRequest(id: string, signal?: AbortSignal): Promise<MachineCreateRequest>;
   transitionMachine(id: string, action: "start" | "pause" | "resume" | "stop", signal?: AbortSignal): Promise<Machine>;
+  /**
+   * Explicitly replace a stopped Machine's terminal supervisor. The server
+   * owns all child-session and durable-fence checks; callers must never infer
+   * that replacing it is safe from a cached Machine row.
+   */
+  replaceMachineSupervisor(id: string, signal?: AbortSignal): Promise<Machine>;
   deleteMachine(id: string): Promise<unknown>;
   createWorkspaceBinding(
     input: WorkspaceBindingCreateInput,
@@ -522,6 +528,20 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const request: HttpRequest = {
         method: "POST",
         path: `/v1/sessions/${safeId}/${action}`,
+        settleWith: "cuna machines list",
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const machine = await fetchDecoded(request, decodeMachineItem);
+      if (machine.id !== id) {
+        throw malformed(contractViolation("matches_requested_resource", "id"), operationLabel(request));
+      }
+      return machine;
+    },
+    async replaceMachineSupervisor(id, signal) {
+      const safeId = encodeMachineId(id);
+      const request: HttpRequest = {
+        method: "POST",
+        path: `/v1/sessions/${safeId}/supervisor/replace`,
         settleWith: "cuna machines list",
         ...(signal === undefined ? {} : { signal }),
       };

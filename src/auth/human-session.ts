@@ -21,8 +21,34 @@ import {
 } from "./human-contracts.js";
 import { createPkceAuthorization } from "./pkce.js";
 
+/**
+ * The short-lived bearer, kept beside the durable login code INSIDE the same
+ * AES-GCM envelope. Its capability is a strict subset of what that envelope
+ * already holds: the login code mints bearers for thirty days, while this one
+ * is terminal, capped at ten minutes by the server, and re-checked against
+ * `revoked_at is null` on every use. Co-locating it means logout's existing
+ * revision-fenced delete already destroys it, so there is no second
+ * invalidation path to keep correct.
+ *
+ * It exists because every authenticated command used to re-exchange the login
+ * code, and the server allows ten exchanges per rolling minute — so the
+ * eleventh command in a minute failed. Measured: 35 failures in 88 attempts.
+ */
+interface StoredAccess {
+  readonly token: string;
+  readonly expiresAt: string;
+  readonly observedAt: string;
+}
+
 interface StoredHumanSession {
   readonly version: 3;
+  /**
+   * Absent on every record written before this field existed, and absent again
+   * whenever the bearer is unusable. Optional rather than a null triple so a
+   * session with no cached bearer keeps exactly the old key set, which is what
+   * lets an already-stored session keep working instead of reading as corrupt.
+   */
+  readonly access?: StoredAccess;
   readonly baseUrl: string;
   readonly profile: string;
   readonly clientInstanceId: string;
@@ -147,7 +173,36 @@ function encodeStored(session: StoredHumanSession): SecretMaterial {
     redirect_uri: session.redirectUri,
     context: contextWire(session.context),
     intent_class: session.intentClass,
+    ...(session.access === undefined ? {} : {
+      access_token: session.access.token,
+      access_expires_at: session.access.expiresAt,
+      access_observed_at: session.access.observedAt,
+    }),
   }));
+}
+
+/**
+ * How much life a stored bearer must have left before it is reused instead of
+ * re-exchanged. 90 s is the longest single request this bearer authorizes
+ * (`MACHINE_CREATE_REQUEST_BUDGET_MS`), plus 30 s of headroom, so a request
+ * admitted on a reused token cannot outlive it. At this margin a continuously
+ * used CLI exchanges at most ~7.5 times an hour against a 600/hour ceiling.
+ */
+const ACCESS_REUSE_MARGIN_MS = 120_000;
+
+function usableStoredAccess(
+  session: StoredHumanSession,
+  nowMs: number,
+  rejectedToken?: string,
+): StoredAccess | undefined {
+  const access = session.access;
+  if (access === undefined) return undefined;
+  // A bearer the server just refused must never be handed back from disk, or a
+  // 401 becomes an infinite loop against a dead token.
+  if (rejectedToken !== undefined && access.token === rejectedToken) return undefined;
+  const expiresAt = Date.parse(access.expiresAt);
+  if (!Number.isSafeInteger(expiresAt) || expiresAt - nowMs <= ACCESS_REUSE_MARGIN_MS) return undefined;
+  return access;
 }
 
 function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSession {
@@ -163,9 +218,32 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
     "base_url", "client_instance_id", "code_verifier", "context", "continuation_id", "intent_class", "login_code",
     "login_code_expires_at", "profile", "redirect_uri", "session_id", "state", "version",
   ];
+  // Two shapes are legal, and only two: the original key set, and that set
+  // plus the cached-bearer triple. Accepting the original one is what keeps an
+  // already-stored session readable instead of forcing a fresh `cuna login`;
+  // demanding all three of the triple together is what stops a half-written
+  // record from being read as "no bearer" and silently losing the guard.
+  const accessKeys = ["access_expires_at", "access_observed_at", "access_token"];
+  const withAccess = [...expected, ...accessKeys].sort();
   const keys = Object.keys(record).sort();
-  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+  const matches = (shape: readonly string[]): boolean =>
+    keys.length === shape.length && keys.every((key, index) => key === shape[index]);
+  const carriesAccess = matches(withAccess);
+  if (!carriesAccess && !matches(expected)) {
     throw authError("cuna.auth.session_corrupt", "The protected Cuna sign-in session has an invalid shape.");
+  }
+  if (
+    carriesAccess && (
+      typeof record.access_token !== "string" || !isAccessToken(record.access_token) ||
+      typeof record.access_expires_at !== "string" ||
+      Number.isNaN(Date.parse(record.access_expires_at)) ||
+      new Date(record.access_expires_at).toISOString() !== record.access_expires_at ||
+      typeof record.access_observed_at !== "string" ||
+      Number.isNaN(Date.parse(record.access_observed_at)) ||
+      new Date(record.access_observed_at).toISOString() !== record.access_observed_at
+    )
+  ) {
+    throw authError("cuna.auth.session_corrupt", "The protected Cuna sign-in session failed validation.");
   }
   if (
     record.version !== 3 ||
@@ -185,6 +263,13 @@ function decodeStored(bytes: Uint8Array, config: EffectiveConfig): StoredHumanSe
   }
   return Object.freeze({
     version: 3,
+    ...(carriesAccess ? {
+      access: Object.freeze({
+        token: record.access_token as string,
+        expiresAt: record.access_expires_at as string,
+        observedAt: record.access_observed_at as string,
+      }),
+    } : {}),
     baseUrl: config.baseUrl,
     profile: assertProfile(config.profile),
     clientInstanceId: assertUuid(record.client_instance_id, "client instance ID"),
@@ -210,6 +295,14 @@ function storedFromExchange(
 ): StoredHumanSession {
   return Object.freeze({
     version: 3,
+    // The login exchange already produced a bearer. Keeping it means the first
+    // command after `cuna login` reuses it rather than immediately spending a
+    // second exchange out of the ten-per-minute budget.
+    access: Object.freeze({
+      token: exchange.accessToken,
+      expiresAt: exchange.accessExpiresAt,
+      observedAt: new Date().toISOString(),
+    }),
     baseUrl: config.baseUrl,
     profile: config.profile,
     clientInstanceId,
@@ -654,7 +747,7 @@ export function createHumanAuthService(input: {
     }
   }
 
-  async function reexchangeAccess(signal?: AbortSignal): Promise<void> {
+  async function reexchangeAccess(signal?: AbortSignal, rejectedToken?: string): Promise<void> {
     assertNotCancelled(signal);
     // `vault.refresh` already reads, validates, and locks the exact encrypted
     // record before invoking this callback. An initial `vault.load` duplicated
@@ -674,6 +767,21 @@ export function createHumanAuthService(input: {
         const stored = current.material.withBytes((bytes) => decodeStored(bytes, input.config));
         if (Date.parse(stored.loginCodeExpiresAt) <= now()) {
           return { status: "rejected", reason: "local_expired" } as const;
+        }
+        // The whole point: a bearer with real life left is reused instead of
+        // buying a new one. Every authenticated command used to exchange, and
+        // the server allows ten exchanges per rolling minute, so the eleventh
+        // command in a minute failed. No HTTP happens on this path.
+        const reusable = usableStoredAccess(stored, now(), rejectedToken);
+        if (reusable !== undefined) {
+          captured?.material.dispose();
+          captured = {
+            material: SecretMaterial.fromUtf8(reusable.token),
+            expiresAt: Date.parse(reusable.expiresAt),
+            profile: stored.profile,
+            sessionId: stored.sessionId,
+          };
+          return { status: "retained" } as const;
         }
         try {
           const exchange = await input.client.exchange({
@@ -717,10 +825,27 @@ export function createHumanAuthService(input: {
             profile: stored.profile,
             sessionId: stored.sessionId,
           };
-          // Re-exchange has no durable-token rotation.  The exact encrypted
-          // browser code stays revision-fenced in place until logout or a
-          // terminal server rejection proves it must be removed.
-          return { status: "retained" } as const;
+          // The exact encrypted browser code still stays in place: this
+          // rewrites the SAME record, adding only the bearer just obtained so
+          // the next process can reuse it instead of buying another one.
+          //
+          // `expiresAt` is the LOGIN CODE's expiry, never the bearer's. The
+          // vault compare-deletes an envelope once its header expiry passes,
+          // so passing the ten-minute access expiry here would delete the
+          // thirty-day login code every ten minutes. It is also not optional:
+          // an omitted `expiresAt` writes a header with no expiry at all.
+          return {
+            status: "rotated",
+            material: encodeStored({
+              ...stored,
+              access: {
+                token: exchange.accessToken,
+                expiresAt: exchange.accessExpiresAt,
+                observedAt: new Date(exchangedAt).toISOString(),
+              },
+            }),
+            expiresAt: Date.parse(stored.loginCodeExpiresAt),
+          } as const;
         } catch (error) {
           if (isAuthoritativeReexchangeRejection(error)) {
             return { status: "rejected", reason: "authoritative_remote" } as const;
@@ -793,7 +918,22 @@ export function createHumanAuthService(input: {
     }
     access?.material.dispose();
     access = undefined;
-    return acquireAccessToken(signal);
+    // Name the refused bearer so the stored copy of that same string cannot be
+    // handed straight back, which would answer a 401 with the dead token that
+    // caused it.
+    //
+    // An in-flight exchange started BEFORE this rejection does not know the
+    // token is dead, so joining it can return that same string and spin the
+    // 401 forever. Always start a fresh one that carries the rejection.
+    assertNotCancelled(signal);
+    const created = reexchangeAccess(signal, rejectedAccessToken);
+    reexchangeFlight = created;
+    void created.then(
+      () => { if (reexchangeFlight === created) reexchangeFlight = undefined; },
+      () => { if (reexchangeFlight === created) reexchangeFlight = undefined; },
+    );
+    await waitForReexchange(created, signal);
+    return cachedAccessToken();
   }
 
   async function whoami(signal?: AbortSignal): Promise<HumanAuthResult> {
@@ -814,6 +954,32 @@ export function createHumanAuthService(input: {
   function discardCachedAccess(): void {
     access?.material.dispose();
     access = undefined;
+  }
+
+  /**
+   * Drop the bearer from the encrypted record while keeping the durable login
+   * code exactly where it is.
+   *
+   * Clearing only the in-process copy stopped being enough once the bearer
+   * began outliving the process: after an ambiguous logout the server may have
+   * revoked it, and the next command would otherwise read that same possibly
+   * dead bearer straight back off disk. The login code is untouched, so a
+   * fresh acquisition still works without a new browser sign-in.
+   */
+  async function forgetStoredAccess(): Promise<void> {
+    await input.vault.refresh(credentialBinding, async (current) => {
+      if (current === undefined) return { status: "retained" } as const;
+      const stored = current.material.withBytes((bytes) => decodeStored(bytes, input.config));
+      if (stored.access === undefined) return { status: "retained" } as const;
+      const { access: _discarded, ...withoutAccess } = stored;
+      return {
+        status: "rotated",
+        material: encodeStored(withoutAccess),
+        // The envelope keeps the LOGIN CODE's expiry, never the bearer's; the
+        // vault deletes a record once its header expiry passes.
+        expiresAt: Date.parse(stored.loginCodeExpiresAt),
+      } as const;
+    });
   }
 
   /**
@@ -872,9 +1038,13 @@ export function createHumanAuthService(input: {
     } catch (error) {
       if (!isDefinitiveLogoutTermination(error)) {
         // An ambiguous remote write must not leave a possibly-revoked bearer
-        // usable in this process. The encrypted durable code remains for the
-        // next, fresh acquisition and is never destroyed on this path.
+        // usable — in this process or the next one. The encrypted durable code
+        // remains for a fresh acquisition and is never destroyed on this path.
         discardCachedAccess();
+        // If this clear fails the bearer stays readable, which is bad; masking
+        // the logout failure that brought us here would be worse, so the
+        // original error is still the one raised.
+        try { await forgetStoredAccess(); } catch { /* the logout error below is the one that matters */ }
         throw error;
       }
       if (

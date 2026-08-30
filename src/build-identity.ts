@@ -89,5 +89,8 @@ export function packageBuildDigest(): Promise<string> {
   return cachedDigest;
 }
 
-export const ARTIFACT_CHANNEL = "npm" as const;
+// GOAL_0 is deliberately installed from a tarball built on this machine.  npm
+// may be the package *tool* used to unpack that tarball, but it is not the
+// artifact source and must never be reported as one to the owner.
+export const ARTIFACT_CHANNEL = "local" as const;
 export const PROTOCOL_RANGE = Object.freeze({ minimum: "1", maximum: "1" });

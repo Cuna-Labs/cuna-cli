@@ -459,17 +459,28 @@ test("AgentSession authentication evidence is closed, fresh, and process-scoped"
     evidence_class: "credential_binding_authority",
   })));
   const opencodeConfigured = decodeAgentSessionAuth(agentSessionAuth({
+    agent: "opencode",
+    agent_version: "1.18.23",
     state: "configured",
     auth_mode: "interactive_login",
     evidence_class: "provider_cli_credential_presence",
   }));
   assert.equal(opencodeConfigured.state, "configured");
   const opencodeLoginRequired = decodeAgentSessionAuth(agentSessionAuth({
+    agent: "opencode",
+    agent_version: "1.18.23",
     state: "login_required",
     auth_mode: "interactive_login",
     evidence_class: "provider_cli_credential_presence",
   }));
   assert.equal(opencodeLoginRequired.state, "login_required");
+  assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({
+    agent: "codex",
+    agent_version: "0.147.0",
+    state: "authenticated",
+    auth_mode: "interactive_login",
+    evidence_class: "provider_cli_login_status",
+  })));
   assert.throws(() => decodeAgentSessionAuth(agentSessionAuth({
     state: "authenticated",
     auth_mode: "interactive_login",
@@ -900,6 +911,27 @@ test("machine transition rejects a producer response bound to a sibling machine"
   );
 });
 
+test("terminal supervisor replacement has one explicit POST with no body or idempotency key", async () => {
+  const requested = "22222222-2222-4222-8222-222222222222";
+  const requests = [];
+  const client = createCunaApiClient({
+    async request(request) {
+      requests.push(request);
+      return { id: requested, name: "open-dev", status: "running" };
+    },
+  });
+  const machine = await client.replaceMachineSupervisor(requested);
+  assert.equal(machine.id, requested);
+  assert.deepEqual(requests, [{
+    method: "POST",
+    path: `/v1/sessions/${requested}/supervisor/replace`,
+    settleWith: "cuna machines list",
+  }]);
+
+  await assert.rejects(client.replaceMachineSupervisor("not-a-machine-id"), CunaError);
+  assert.equal(requests.length, 1, "invalid input must not reach the replacement route");
+});
+
 test("legacy array shape remains safe while canonical machine identity is enforced", () => {
   const id = "22222222-2222-4222-8222-222222222222";
   const page = decodeMachinePage([{ id, name: "dev", status: "running", memory_mib: 512, vcpus: 1, url: "https://internal.invalid" }]);
@@ -1020,6 +1052,137 @@ test("HTTP errors expose only stable safe metadata", async () => {
   await assert.rejects(
     transport.request({ method: "POST", path: "/v1/sessions/m_1/stop" }),
     (error) => error instanceof CunaError && error.code === "cuna.policy.denied" && JSON.stringify(error.details).includes("cuna_sk_bad") === false,
+  );
+});
+
+test("OpenCode provider admission names the Machine remedy from the durable server refusal", async () => {
+  const requestId = "55555555-5555-4555-8555-555555555555";
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: "cuna_sk_abcdefghijklmnop",
+    fetch: async () => new Response(JSON.stringify({
+      type: "https://api.getcuna.com/problems/agent_session_provider_unavailable",
+      title: "Agent provider unavailable",
+      status: 409,
+      code: "agent_session_provider_unavailable",
+      request_id: requestId,
+      retryable: false,
+      detail: "The requested provider is not installed on this Machine.",
+      action: "none",
+    }), { status: 409, headers: { "content-type": "application/problem+json" } }),
+  });
+  await assert.rejects(
+    transport.request({ method: "POST", path: "/v1/agent-sessions" }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.agent.provider_not_installed" &&
+      error.exitCode === 8 &&
+      error.details?.reason === "agent_session_provider_unavailable" &&
+      error.details?.request_id === requestId &&
+      /Machine configured for OpenCode/u.test(error.hint ?? ""),
+  );
+});
+
+test("OpenCode supervisor upgrade refusal proves no AgentSession was created", async () => {
+  const requestId = "56565656-5656-4656-8656-565656565656";
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: "cuna_sk_abcdefghijklmnop",
+    fetch: async () => new Response(JSON.stringify({
+      type: "https://api.getcuna.com/problems/opencode_supervisor_upgrade_required",
+      title: "OpenCode terminal supervisor upgrade required",
+      status: 409,
+      code: "opencode_supervisor_upgrade_required",
+      request_id: requestId,
+      retryable: false,
+      detail: "This Machine needs terminal supervisor v2 before OpenCode can start.",
+      action: "none",
+    }), { status: 409, headers: { "content-type": "application/problem+json" } }),
+  });
+  await assert.rejects(
+    transport.request({
+      method: "POST",
+      path: "/v1/sessions/33333333-3333-4333-8333-333333333333/agent-sessions",
+      body: { agent: "opencode" },
+    }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.agent.opencode_supervisor_upgrade_required" &&
+      error.exitCode === 8 &&
+      error.details?.reason === "opencode_supervisor_upgrade_required" &&
+      error.details?.request_id === requestId &&
+      /No OpenCode AgentSession was created/u.test(error.hint ?? ""),
+  );
+});
+
+test("OpenCode protocol-unavailable refusal receives distinct explicit repair copy", async () => {
+  const requestId = "57575757-5757-4757-8757-575757575757";
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: "cuna_sk_abcdefghijklmnop",
+    fetch: async () => new Response(JSON.stringify({
+      type: "https://api.getcuna.com/problems/opencode_supervisor_protocol_unavailable",
+      title: "OpenCode terminal supervisor protocol unavailable",
+      status: 409,
+      code: "opencode_supervisor_protocol_unavailable",
+      request_id: requestId,
+      retryable: true,
+      detail: "This Machine's terminal supervisor cannot provide the OpenCode protocol.",
+      action: "none",
+    }), { status: 409, headers: { "content-type": "application/problem+json" } }),
+  });
+  await assert.rejects(
+    transport.request({
+      method: "POST",
+      path: "/v1/sessions/33333333-3333-4333-8333-333333333333/agent-sessions",
+      body: { agent: "opencode" },
+    }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.agent.opencode_supervisor_upgrade_required" &&
+      error.details?.reason === "opencode_supervisor_protocol_unavailable" &&
+      error.details?.request_id === requestId &&
+      /cannot provide the OpenCode protocol/u.test(error.hint ?? ""),
+  );
+});
+
+test("provider-neutral supervisor upgrade codes normalize only an OpenCode create", async () => {
+  const reply = () => new Response(JSON.stringify({
+    type: "https://api.getcuna.com/problems/supervisor_upgrade_required",
+    title: "Terminal supervisor upgrade required",
+    status: 409,
+    code: "supervisor_upgrade_required",
+    request_id: "57575757-5757-4757-8757-575757575757",
+    retryable: false,
+    detail: "This Machine needs terminal supervisor v2.",
+    action: "none",
+  }), { status: 409, headers: { "content-type": "application/problem+json" } });
+  const openCodeTransport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: "cuna_sk_abcdefghijklmnop",
+    fetch: async () => reply(),
+  });
+  await assert.rejects(
+    openCodeTransport.request({
+      method: "POST",
+      path: "/v1/sessions/33333333-3333-4333-8333-333333333333/agent-sessions",
+      body: { agent: "opencode" },
+    }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.agent.opencode_supervisor_upgrade_required",
+  );
+
+  const claudeTransport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: "cuna_sk_abcdefghijklmnop",
+    fetch: async () => reply(),
+  });
+  await assert.rejects(
+    claudeTransport.request({
+      method: "POST",
+      path: "/v1/sessions/33333333-3333-4333-8333-333333333333/agent-sessions",
+      body: { agent: "claude-code" },
+    }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.remote.conflict" &&
+      /No OpenCode AgentSession was created/u.test(error.hint ?? "") === false,
   );
 });
 
@@ -1303,4 +1466,53 @@ test("a deployment without capability discovery is named as such before any muta
       error.exitCode === 8,
   );
   assert.equal(discoveries, 1);
+});
+
+// `sessions.start` is declared `"errorModel": "legacy"` in the contract, so it
+// answers `{"error": "<sentence>"}` with no Problem document. Measured against
+// production 2026-08-29: the web console printed the server's sentence while
+// the CLI printed only `http_status: 409` and a fixed sentence of its own, so
+// the one actionable fact never reached the person who had to act on it.
+test("a legacy 409 envelope reaches the user as the server's own sentence", async () => {
+  const legacy = (error) => createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: "cuna_sk_abcdefghijklmnop",
+    fetch: async () => new Response(JSON.stringify({ error }), {
+      status: 409,
+      headers: { "content-type": "application/json" },
+    }),
+  });
+  const start = (transport) => transport.request({
+    method: "POST",
+    path: "/v1/sessions/33333333-3333-4333-8333-333333333333/start",
+  });
+
+  await assert.rejects(
+    start(legacy("machine stop is still settling; refresh and try start again")),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.remote.conflict" &&
+      error.message === "machine stop is still settling; refresh and try start again",
+    "the server's sentence must be the message, not a fixed one",
+  );
+
+  // Negative control one: prose that fails the terminal-safety guard must fall
+  // back rather than propagate. Without this the guard could be deleted and
+  // every assertion above would still pass.
+  await assert.rejects(
+    start(legacy("stop is settling\u001b[31m; refresh")),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.remote.conflict" &&
+      error.message ===
+        "Cuna could not apply the operation because current state conflicts with it.",
+    "a control character must disqualify the sentence, not reach the terminal",
+  );
+
+  // Negative control two: a body carrying no sentence at all still answers.
+  await assert.rejects(
+    start(legacy("")),
+    (error) => error instanceof CunaError &&
+      error.message ===
+        "Cuna could not apply the operation because current state conflicts with it.",
+    "an empty error string is not a sentence",
+  );
 });

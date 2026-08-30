@@ -646,14 +646,17 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
   const state = enumField(value, "state", AGENT_AUTH_STATES);
   const unavailable = state === "unavailable";
   const providerCredentialPresence =
+    value.agent === "opencode" &&
     authMode === "interactive_login" &&
     evidenceClass === "provider_cli_credential_presence" &&
     (state === "login_required" || state === "configured");
   const providerLoginStatus =
+    value.agent === "claude-code" &&
     authMode === "interactive_login" &&
     evidenceClass === "provider_cli_login_status" &&
     (state === "login_required" || state === "authenticated");
   const credentialBindingAuthority =
+    (value.agent === "claude-code" || value.agent === "codex" || value.agent === "openclaw") &&
     authMode === "credential_binding" &&
     evidenceClass === "credential_binding_authority" &&
     state === "configured";

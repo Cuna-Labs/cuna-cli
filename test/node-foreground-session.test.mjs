@@ -430,6 +430,21 @@ test("TC-055-01/02 all explicit sessions preflight before host ownership and one
   assert.equal(events.includes(`capability:${SESSION_B}`), true);
 });
 
+test("an unknown terminal capability stops before session observation, grant, socket, or terminal ownership", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events, () => "unknown");
+  await assert.rejects(runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW }),
+  (error) => error?.code === "capability_unknown");
+
+  assert.deepEqual(events, [`get:${SESSION_A}`, `capability:${SESSION_A}`]);
+  assert.equal(host.acquired, 0);
+});
+
 test("TC-055-01 session authority drift fails before host ownership", async () => {
   const events = [];
   const host = new FakeHost(events);
@@ -703,7 +718,7 @@ test("TC-055-06 auth evidence expiring exactly now cannot reach the appbar", asy
   await operation;
 });
 
-test("OpenCode direct attach is unavailable before auth, capability, grant, host, or terminal effects", async () => {
+test("an unsupported provider direct attach is unavailable before auth, capability, grant, host, or terminal effects", async () => {
   const events = [];
   const host = new FakeHost(events);
   const system = terminalSystem(events);
@@ -712,11 +727,11 @@ test("OpenCode direct attach is unavailable before auth, capability, grant, host
     runSupportedForegroundSessions({
       client: fakeClient(events, {
         async getAgentSession(id) {
-          return session(id, { agent: "opencode" });
+          return session(id, { agent: "openclaw" });
         },
         async getAgentSessionAuth() {
           authReads += 1;
-          throw new Error("must not read provider auth for unavailable OpenCode");
+          throw new Error("must not read provider auth for an unavailable provider");
         },
       }),
       baseUrl: "https://api.getcuna.com",
@@ -734,7 +749,7 @@ test("OpenCode direct attach is unavailable before auth, capability, grant, host
   assert.equal(events.some((event) => event.startsWith("capability:") || event.startsWith("grant:") || event.startsWith("wire:")), false);
 });
 
-test("OpenCode direct attach reaches the PTY only with the compiled gate and exact provider auth evidence", async () => {
+test("OpenCode direct attach reaches the PTY with live terminal and exact provider auth evidence", async () => {
   const events = [];
   const host = new FakeHost(events);
   host.columns = 160;
@@ -765,7 +780,6 @@ test("OpenCode direct attach reaches the PTY only with the compiled gate and exa
     baseUrl: "https://api.getcuna.com",
     agentSessionIds: [SESSION_A],
     expectedAgentKinds: ["opencode"],
-    opencodeEnabled: true,
   }, {
     host,
     controlPlane: system.controlPlane,
@@ -804,7 +818,6 @@ test(`OpenCode ${missingAuthCode} enters a current ready PTY for interactive log
     baseUrl: "https://api.getcuna.com",
     agentSessionIds: [SESSION_A],
     expectedAgentKinds: ["opencode"],
-    opencodeEnabled: true,
   }, {
     host,
     controlPlane: system.controlPlane,
@@ -851,7 +864,6 @@ test("OpenCode auth endpoint errors enter a current ready PTY for interactive lo
       baseUrl: "https://api.getcuna.com",
       agentSessionIds: [SESSION_A],
       expectedAgentKinds: ["opencode"],
-      opencodeEnabled: true,
     }, {
       host,
       controlPlane: system.controlPlane,
@@ -863,6 +875,47 @@ test("OpenCode auth endpoint errors enter a current ready PTY for interactive lo
     host.emitInput(Uint8Array.of(0x1d, 0x64));
     await operation;
   }
+});
+
+test("a slow OpenCode auth observation is advisory and cannot delay a ready PTY", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) {
+        events.push(`get:${id}`);
+        return session(id, { agent: "opencode" });
+      },
+      async getAgentSessionAuth(id, signal) {
+        events.push(`auth:${id}`);
+        await new Promise((_resolve, reject) => {
+          const rejectOnAbort = () => {
+            events.push(`auth-aborted:${id}`);
+            reject(signal?.reason ?? new Error("auth probe aborted"));
+          };
+          if (signal?.aborted) rejectOnAbort();
+          else signal?.addEventListener("abort", rejectOnAbort, { once: true });
+        });
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    expectedAgentKinds: ["opencode"],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+
+  await waitUntil(() => events.includes(`auth-aborted:${SESSION_A}`), "the advisory auth read should be bounded");
+  await waitUntil(() => events.includes("wire:connected"), "a fresh OpenCode process should reach its PTY after the bounded auth read");
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
 });
 
 test("OpenCode missing auth observation still rejects stale or unavailable process readiness", async () => {
@@ -898,7 +951,6 @@ test("OpenCode missing auth observation still rejects stale or unavailable proce
         baseUrl: "https://api.getcuna.com",
         agentSessionIds: [SESSION_A],
         expectedAgentKinds: ["opencode"],
-        opencodeEnabled: true,
       }, {
         host,
         controlPlane: system.controlPlane,
@@ -952,7 +1004,6 @@ test("OpenCode login admission rejects credential binding and an unavailable aut
         baseUrl: "https://api.getcuna.com",
         agentSessionIds: [SESSION_A],
         expectedAgentKinds: ["opencode"],
-        opencodeEnabled: true,
       }, {
         host,
         controlPlane: system.controlPlane,
@@ -996,7 +1047,6 @@ test("OpenCode matching unavailable auth abstention enters the current PTY as lo
     baseUrl: "https://api.getcuna.com",
     agentSessionIds: [SESSION_A],
     expectedAgentKinds: ["opencode"],
-    opencodeEnabled: true,
   }, {
     host,
     controlPlane: system.controlPlane,
@@ -1040,7 +1090,6 @@ test("OpenCode login admission rejects a provider auth observation for another a
       baseUrl: "https://api.getcuna.com",
       agentSessionIds: [SESSION_A],
       expectedAgentKinds: ["opencode"],
-      opencodeEnabled: true,
     }, {
       host,
       controlPlane: system.controlPlane,

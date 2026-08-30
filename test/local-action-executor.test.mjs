@@ -93,7 +93,7 @@ test("one approved request dispatches once, revalidates authority, cleans up, an
   assert.equal(subject.completeCalls(), 1);
 });
 
-test("unregistered kinds fail closed while enabled OpenCode dispatches only its registered adapter", async () => {
+test("unregistered kinds and every OpenCode local action fail closed", async () => {
   const clipboard = makeRequest("clipboard.write", { text: "hello" });
   const unregistered = harness(clipboard, []);
   const unsupported = await unregistered.executor.execute(unregistered.executing);
@@ -133,8 +133,10 @@ test("unregistered kinds fail closed while enabled OpenCode dispatches only its 
     isIdentityLive: () => true,
     adapters: [{ kind: "auth.result.observe", async execute() { effects += 1; return { status: "succeeded", safeData: { authenticated: true } }; } }],
   });
-  assert.equal((await executor.execute(snapshot)).status, "succeeded");
-  assert.equal(effects, 1);
+  const result = await executor.execute(snapshot);
+  assert.equal(result.status, "failed");
+  assert.equal(result.safeReason, "unsupported");
+  assert.equal(effects, 0);
 });
 
 test("a pending or forged snapshot never reaches an adapter", async () => {

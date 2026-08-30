@@ -5,6 +5,7 @@ import type {
 import type { TerminalFrame, TerminalLocalActionKind } from "./codec.js";
 import type { BrowserOpener } from "../auth/browser.js";
 import {
+  admitProviderAuthUrl,
   ProviderBrowserActionDetector,
   ProviderOAuthPasteGuard,
   type LocalBrowserActionRequest,
@@ -48,6 +49,10 @@ const DISCONNECTING_FRAMES = Object.freeze([
   "✧ Disconnecting...",
   "✦ Disconnecting...",
 ]);
+const STARTUP_CLOSE_FRAMES = Object.freeze(["✦ Closing Cuna...", "✧ Closing Cuna...", "✓ Closed."]);
+const ATTACHING_FRAMES = Object.freeze(["◐", "◓", "◑", "◒"]);
+const ATTACHING_PROGRESS = Object.freeze(["━╺━━━━", "━━╺━━━", "━━━╺━━", "━━━━╺━", "━━━━━╺", "━━━━╸━", "━━━╸━━", "━━╸━━━"]);
+const ATTACHING_FRAME_MS = 90;
 // Three progress frames plus one confirmation frame: 120ms by default and
 // never more than one second under an injected/test cadence.
 const MAX_DISCONNECT_FRAME_MS = 250;
@@ -56,6 +61,9 @@ const FLOW_CONTROL_NOTICE = "Terminal output kept active · Ctrl+] s sends Ctrl+
 const RECONNECT_FAILED_NOTICE = "Reconnect failed · Ctrl+] r retries · Ctrl+C disconnects.";
 const BRACKETED_PASTE_START = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e);
 const BRACKETED_PASTE_END = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e);
+const CLAUDE_LOCAL_ACTION_KINDS = Object.freeze(["browser.open"] as const);
+const CODEX_LOCAL_ACTION_KINDS = Object.freeze(["browser.open", "auth.device.present"] as const);
+const NO_LOCAL_ACTION_KINDS = Object.freeze([] as const);
 export const MAX_FOREGROUND_PENDING_INPUT_BYTES = 1_048_576;
 
 export type ForegroundTerminalState = "idle" | "starting" | "active" | "stopping" | "stopped" | "failed";
@@ -113,6 +121,17 @@ interface ForegroundInputTarget {
   readonly binding: RuntimeTerminalResponse["binding"];
 }
 
+/**
+ * A completed local effect is retained until the remote MCP bridge confirms
+ * the exact request digest.  Keeping the immutable broker snapshot—not just a
+ * request id—means a reconnect can retransmit only a result fenced to the
+ * same AgentSession process generation.
+ */
+interface PendingRemoteLocalActionResult {
+  readonly tabId: string;
+  readonly snapshot: LocalActionSnapshot;
+}
+
 export interface ForegroundTerminalCoordinatorOptions {
   readonly host: ForegroundTerminalHost;
   readonly browser?: BrowserOpener;
@@ -165,7 +184,8 @@ export class ForegroundTerminalCoordinator {
   readonly #handledBrowserUrls = new Set<string>();
   readonly #browserRequests = new Map<string, LocalBrowserActionRequest>();
   readonly #remoteLocalActionTabs = new Map<string, string>();
-  readonly #remoteLocalActionResultsSent = new Set<string>();
+  readonly #pendingRemoteLocalActionResults = new Map<string, PendingRemoteLocalActionResult>();
+  readonly #remoteLocalActionResultSends = new Map<string, Promise<void>>();
   readonly #remoteLocalActionResultTasks = new Set<Promise<void>>();
   readonly #localActionBroker: LocalActionBroker;
   #removeAbort: (() => void) | undefined;
@@ -181,6 +201,8 @@ export class ForegroundTerminalCoordinator {
   #startupDetached = false;
   #closingTabId: string | undefined;
   #disconnectNotice: string | undefined;
+  #attachingAnimationTimer: NodeJS.Timeout | undefined;
+  #attachingFrame = 0;
 
   constructor(options: ForegroundTerminalCoordinatorOptions) {
     const resizeCoalesceMs = options.resizeCoalesceMs ?? RESIZE_COALESCE_MS;
@@ -244,7 +266,7 @@ export class ForegroundTerminalCoordinator {
       readonly signal: AbortSignal;
     }) => Promise<void>;
     readonly onTerminalState: (snapshot: RuntimeTerminalSnapshot) => void;
-    readonly localActionKinds: readonly TerminalLocalActionKind[];
+    readonly localActionKinds: (agentSessionId: string) => readonly TerminalLocalActionKind[];
     readonly onLocalActionFrame: (event: {
       readonly tabId: string;
       readonly frame: TerminalFrame;
@@ -255,7 +277,7 @@ export class ForegroundTerminalCoordinator {
       onTerminalReady: async (snapshot) => await this.#terminalReady(snapshot),
       onTerminalOutput: async (event) => await this.#queueTerminalOutput(event),
       onTerminalState: (snapshot) => this.#terminalState(snapshot),
-      localActionKinds: Object.freeze(["browser.open"] as const),
+      localActionKinds: (agentSessionId) => this.#localActionKindsForSession(agentSessionId),
       onLocalActionFrame: async (event) => await this.#localActionFrame(event),
     });
   }
@@ -287,11 +309,13 @@ export class ForegroundTerminalCoordinator {
       this.#removeResize = this.#options.host.onResize(() => this.#queueResize());
       const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
       await this.#renderAttaching(intents.length, dimensions);
+      this.#startAttachingAnimation(intents.length);
       const attachSignal = signal === undefined
         ? this.#lifetimeAbort.signal
         : AbortSignal.any([signal, this.#lifetimeAbort.signal]);
       for (const intent of intents) {
         if (attachSignal.aborted) throw runtimeFailure("terminal_disconnected", "Foreground terminal startup was cancelled.");
+        this.#startAttachingAnimation(intents.length);
         const attachDimensions = admitForegroundDimensions(this.#options.host.dimensions());
         const snapshot = await runtime.attach({
           tabId: intent.tabId,
@@ -316,6 +340,7 @@ export class ForegroundTerminalCoordinator {
         await this.#reconcileGeometry(snapshot, true);
         await this.#render();
       }
+      this.#stopAttachingAnimation();
       this.#state = "active";
       await this.#render();
     } catch (error) {
@@ -357,6 +382,7 @@ export class ForegroundTerminalCoordinator {
   async #stopNow(): Promise<void> {
     if (this.#state === "stopped") return;
     this.#state = "stopping";
+    this.#stopAttachingAnimation();
     this.#lifetimeAbort.abort();
     this.#removeAbort?.();
     this.#removeAbort = undefined;
@@ -386,7 +412,8 @@ export class ForegroundTerminalCoordinator {
     this.#oauthPasteGuards.clear();
     this.#browserRequests.clear();
     this.#remoteLocalActionTabs.clear();
-    this.#remoteLocalActionResultsSent.clear();
+    this.#pendingRemoteLocalActionResults.clear();
+    this.#remoteLocalActionResultSends.clear();
     this.#remoteLocalActionResultTasks.clear();
     this.#pendingBrowserAction = undefined;
     this.#pendingBrowserActionTabId = undefined;
@@ -408,6 +435,11 @@ export class ForegroundTerminalCoordinator {
   }
 
   async #terminalReady(snapshot: RuntimeTerminalSnapshot): Promise<void> {
+    // `onTerminalReady` is the precise boundary at which remote bytes may be
+    // rendered. Stop the local timer first, then drain its last queued paint;
+    // this guarantees the loading chrome never races or interleaves with PTY
+    // output.
+    this.#stopAttachingAnimation();
     const runtime = this.#requireRuntime();
     const intent = this.#findIntent(snapshot.tabId, snapshot.agentSessionId);
     const previous = this.#tabs.get(snapshot.tabId);
@@ -423,6 +455,9 @@ export class ForegroundTerminalCoordinator {
     const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
     if (
       intent.localBrowserActions === true &&
+      // OpenCode owns `/connect` inside its remote TUI. PTY text is display
+      // only, never authority to open a local browser; only the currently
+      // supported Claude/Codex flows may request that foreground action.
       (intent.agent === "claude-code" || intent.agent === "codex")
     ) {
       this.#browserDetectors.set(snapshot.tabId, new ProviderBrowserActionDetector({
@@ -436,6 +471,10 @@ export class ForegroundTerminalCoordinator {
       this.#browserDetectors.delete(snapshot.tabId);
     }
     this.#localActionBroker.cancelStaleForIdentity(this.#localActionIdentity(intent, snapshot));
+    // A replacement process or fencing generation is a hard authority
+    // boundary. Results from the previous binding must never be replayed into
+    // the new terminal, even if their old socket later becomes writable.
+    this.#fenceRemoteLocalActionResults(snapshot.tabId, this.#localActionIdentity(intent, snapshot));
     if (
       this.#pendingBrowserActionTabId === snapshot.tabId &&
       this.#pendingBrowserAction?.fencingGeneration !== snapshot.fencingGeneration
@@ -466,6 +505,10 @@ export class ForegroundTerminalCoordinator {
       clock: this.#clock,
     });
     this.#tabs.set(snapshot.tabId, { intent, snapshot, viewport });
+    // A reconnect for the same binding may have dropped the outcome after the
+    // local side effect completed. The server ACK is the only condition that
+    // clears the cache, so resubmit it once this exact attachment is ready.
+    this.#resendPendingRemoteLocalActionResults(snapshot.tabId, this.#localActionIdentity(intent, snapshot));
   }
 
   async #queueTerminalOutput(event: {
@@ -591,7 +634,15 @@ export class ForegroundTerminalCoordinator {
   #queueInput(bytes: Uint8Array): void {
     if (bytes.byteLength < 1) return;
     if (this.#state === "starting" && bytes.includes(INTERRUPT)) {
+      if (this.#startupDetached) return;
       this.#startupDetached = true;
+      this.#stopAttachingAnimation();
+      // There is no foreground viewport until the first attach completes, so
+      // the normal workbench close renderer has nothing to paint here. Queue a
+      // short, host-owned close acknowledgement before restoration instead.
+      // This keeps Ctrl-C single-press and visible even while authority is
+      // still being checked.
+      this.#queueStartupCloseFeedback();
       void this.stop().catch(() => { this.#state = "failed"; });
       return;
     }
@@ -809,7 +860,9 @@ export class ForegroundTerminalCoordinator {
       this.#pendingBrowserAction = undefined;
       this.#pendingBrowserActionTabId = undefined;
       this.#handledBrowserUrls.add(this.#browserRequestKey(request));
-      this.#browserNotice = "Browser authentication denied. The provider URL remains in the terminal.";
+      this.#browserNotice = request.type === "auth.device.present"
+        ? "Device sign-in denied. The provider page remains in the cloud terminal."
+        : "Browser authentication denied. The provider URL remains in the terminal.";
       await this.#render();
       this.#promoteBrowserAction();
       return true;
@@ -819,7 +872,10 @@ export class ForegroundTerminalCoordinator {
     }
     if (this.#browserOpening) return true;
     this.#browserOpening = true;
-    this.#localActionBroker.decide(request.id, true, "provider-auth");
+    // Remote MCP requests retain their exact mcp:<kind> scope. Passing the
+    // local detector scope here would widen it and makes the broker reject a
+    // valid, fenced request before the browser can open.
+    this.#localActionBroker.decide(request.id, true);
     this.#browserNotice = `Opening ${new URL(request.url).hostname} in your local browser...`;
     await this.#render();
     void this.#openBrowser(request).catch(() => undefined);
@@ -833,18 +889,30 @@ export class ForegroundTerminalCoordinator {
       await browser.open(request.url);
       const tracked = this.#localActionBroker.get(request.id);
       if (tracked?.state !== "executing") return;
-      this.#localActionBroker.awaitingRemoteCompletion(request.id);
       this.#pendingBrowserAction = undefined;
       this.#pendingBrowserActionTabId = undefined;
       this.#handledBrowserUrls.add(this.#browserRequestKey(request));
-      for (const [tabId, tab] of this.#tabs) {
-        if (tab.snapshot.agentSessionId === request.agentSessionId &&
-          tab.snapshot.processEpoch === request.processEpoch &&
-          tab.snapshot.fencingGeneration === request.fencingGeneration) {
-          this.#oauthPasteGuards.get(tabId)?.beginCodeCapture();
+      if (request.type === "auth.device.present") {
+        // This confirms only local presentation. The remote provider owns its
+        // device-code polling and Cuna must not claim that it is signed in.
+        this.#localActionBroker.complete(
+          request.id,
+          tracked.request.identity,
+          "succeeded",
+          Object.freeze({ awaitingProvider: true }),
+        );
+        this.#browserNotice = `${providerName(request.provider)} sign-in opened · complete it there · waiting for confirmation…`;
+      } else {
+        this.#localActionBroker.awaitingRemoteCompletion(request.id);
+        for (const [tabId, tab] of this.#tabs) {
+          if (tab.snapshot.agentSessionId === request.agentSessionId &&
+            tab.snapshot.processEpoch === request.processEpoch &&
+            tab.snapshot.fencingGeneration === request.fencingGeneration) {
+            this.#oauthPasteGuards.get(tabId)?.beginCodeCapture();
+          }
         }
+        this.#browserNotice = "Browser opened locally. Complete authentication there, then return here.";
       }
-      this.#browserNotice = "Browser opened locally. Complete authentication there, then return here.";
     } catch {
       const tracked = this.#localActionBroker.get(request.id);
       if (tracked !== undefined) {
@@ -863,27 +931,42 @@ export class ForegroundTerminalCoordinator {
 
   #enqueueBrowserAction(tabId: string, tab: ForegroundTab, request: LocalBrowserActionRequest): void {
     if (request.fencingGeneration !== tab.snapshot.fencingGeneration || this.#handledBrowserUrls.has(this.#browserRequestKey(request))) return;
-    const actionArguments = Object.freeze({ url: request.url });
-    const action: LocalActionRequest<"browser.open"> = Object.freeze({
-      version: LOCAL_ACTION_PROTOCOL_VERSION,
-      id: request.id,
-      identity: this.#localActionIdentity(tab.intent, tab.snapshot),
-      provider: request.provider,
-      kind: "browser.open",
-      arguments: actionArguments,
-      argumentsDigest: digestLocalActionArguments(actionArguments),
-      requestedScope: "provider-auth",
-      createdAt: request.detectedAt,
-      expiresAt: request.expiresAt,
-      nonce: request.nonce,
-    });
+    const action: LocalActionRequest = request.type === "browser.open"
+      ? Object.freeze({
+        version: LOCAL_ACTION_PROTOCOL_VERSION,
+        id: request.id,
+        identity: this.#localActionIdentity(tab.intent, tab.snapshot),
+        provider: request.provider,
+        kind: "browser.open",
+        arguments: Object.freeze({ url: request.url }),
+        argumentsDigest: digestLocalActionArguments({ url: request.url }),
+        requestedScope: "provider-auth",
+        createdAt: request.detectedAt,
+        expiresAt: request.expiresAt,
+        nonce: request.nonce,
+      })
+      : Object.freeze({
+        version: LOCAL_ACTION_PROTOCOL_VERSION,
+        id: request.id,
+        identity: this.#localActionIdentity(tab.intent, tab.snapshot),
+        provider: "codex",
+        kind: "auth.device.present",
+        arguments: Object.freeze({ verificationUri: request.url, userCode: request.userCode }),
+        argumentsDigest: digestLocalActionArguments({ verificationUri: request.url, userCode: request.userCode }),
+        requestedScope: "provider-auth",
+        createdAt: request.detectedAt,
+        expiresAt: request.expiresAt,
+        nonce: request.nonce,
+      });
     try {
       this.#localActionBroker.submit(action);
     } catch {
       return;
     }
     this.#browserRequests.set(request.id, request);
-    this.#oauthPasteGuards.set(tabId, new ProviderOAuthPasteGuard(request));
+    if (request.type === "browser.open") {
+      this.#oauthPasteGuards.set(tabId, new ProviderOAuthPasteGuard(request));
+    }
   }
 
   async #localActionFrame(event: {
@@ -891,36 +974,73 @@ export class ForegroundTerminalCoordinator {
     readonly frame: TerminalFrame;
     readonly payload: Readonly<Record<string, unknown>>;
   }): Promise<void> {
-    // Result acknowledgements are terminal bookkeeping owned by RTP1. The
-    // foreground consumes only server-originated requests for kinds it
-    // explicitly advertised during RESUME.
+    if (event.frame.type === "local_action_result") {
+      this.#acknowledgeRemoteLocalActionResult(event.tabId, event.payload);
+      return;
+    }
     if (event.frame.type !== "local_action_request") return;
     const raw = event.payload.request;
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
       throw runtimeFailure("terminal_protocol_error", "The local action request payload is malformed.");
     }
     const request = raw as LocalActionRequest;
-    if (request.kind !== "browser.open" || request.provider === "opencode") {
-      throw runtimeFailure("capability_unsupported", "This local action kind was not negotiated by the foreground.");
-    }
     const tab = this.#tabs.get(event.tabId);
     if (tab === undefined) throw runtimeFailure("terminal_disconnected", "The local action targets an unavailable tab.");
-    const url = request.arguments.url;
-    if (typeof url !== "string") throw runtimeFailure("terminal_protocol_error", "The browser action URL is malformed.");
-    const browserRequest: LocalBrowserActionRequest = Object.freeze({
-      id: request.id,
-      type: "browser.open",
-      provider: request.provider,
-      agentSessionId: request.identity.agentSessionId,
-      processEpoch: request.identity.processEpoch,
-      fencingGeneration: request.identity.fencingGeneration,
-      url,
-      origin: new URL(url).origin,
-      nonce: request.nonce,
-      detectedAt: request.createdAt,
-      expiresAt: request.expiresAt,
-      state: "pending_permission",
-    });
+    let browserRequest: LocalBrowserActionRequest;
+    if (request.kind === "browser.open") {
+      const url = request.arguments.url;
+      if (
+        (request.provider !== "claude-code" && request.provider !== "codex") ||
+        typeof url !== "string"
+      ) {
+        throw runtimeFailure("capability_unsupported", "This browser action was not negotiated by the foreground.");
+      }
+      const admitted = admitProviderAuthUrl(request.provider, url);
+      if (admitted === undefined) {
+        throw runtimeFailure("terminal_protocol_error", "The browser action URL is outside Cuna's provider descriptor.");
+      }
+      browserRequest = Object.freeze({
+        id: request.id,
+        type: "browser.open",
+        provider: request.provider,
+        agentSessionId: request.identity.agentSessionId,
+        processEpoch: request.identity.processEpoch,
+        fencingGeneration: request.identity.fencingGeneration,
+        url: admitted.href,
+        origin: admitted.origin,
+        nonce: request.nonce,
+        detectedAt: request.createdAt,
+        expiresAt: request.expiresAt,
+        state: "pending_permission",
+      });
+    } else if (request.kind === "auth.device.present" && request.provider === "codex") {
+      const verificationUri = request.arguments.verificationUri;
+      const userCode = request.arguments.userCode;
+      if (typeof verificationUri !== "string" || typeof userCode !== "string") {
+        throw runtimeFailure("terminal_protocol_error", "The Codex device request is malformed.");
+      }
+      const admitted = admitProviderAuthUrl("codex", verificationUri);
+      if (admitted === undefined) {
+        throw runtimeFailure("terminal_protocol_error", "The Codex device URI is outside Cuna's provider descriptor.");
+      }
+      browserRequest = Object.freeze({
+        id: request.id,
+        type: "auth.device.present",
+        provider: "codex",
+        agentSessionId: request.identity.agentSessionId,
+        processEpoch: request.identity.processEpoch,
+        fencingGeneration: request.identity.fencingGeneration,
+        url: admitted.href,
+        origin: admitted.origin,
+        userCode,
+        nonce: request.nonce,
+        detectedAt: request.createdAt,
+        expiresAt: request.expiresAt,
+        state: "pending_permission",
+      });
+    } else {
+      throw runtimeFailure("capability_unsupported", "This local action kind was not negotiated by the foreground.");
+    }
     this.#remoteLocalActionTabs.set(request.id, event.tabId);
     this.#browserRequests.set(request.id, browserRequest);
     let admitted: LocalActionSnapshot;
@@ -931,33 +1051,121 @@ export class ForegroundTerminalCoordinator {
       this.#browserRequests.delete(request.id);
       throw error;
     }
-    if (["succeeded", "failed", "denied", "expired", "cancelled"].includes(admitted.state)) return;
-    this.#oauthPasteGuards.set(event.tabId, new ProviderOAuthPasteGuard(browserRequest));
+    if (["succeeded", "failed", "denied", "expired", "cancelled"].includes(admitted.state)) {
+      // The bridge may replay a completed request after a transport break.
+      // Reuse its immutable result and wait for the exact ACK rather than
+      // executing the local side effect a second time.
+      this.#queueRemoteLocalActionResult(admitted);
+      return;
+    }
+    if (browserRequest.type === "browser.open") {
+      this.#oauthPasteGuards.set(event.tabId, new ProviderOAuthPasteGuard(browserRequest));
+    }
     this.#promoteBrowserAction();
     await this.#render();
   }
 
+  #acknowledgeRemoteLocalActionResult(tabId: string, payload: Readonly<Record<string, unknown>>): void {
+    if (
+      payload.message !== "ack" ||
+      typeof payload.requestId !== "string" ||
+      typeof payload.argumentDigest !== "string"
+    ) {
+      throw runtimeFailure("terminal_protocol_error", "The local action acknowledgement is malformed.");
+    }
+    const pending = this.#pendingRemoteLocalActionResults.get(payload.requestId);
+    // ACKs are idempotent. An old result, a result from another foreground
+    // process, or a request with a different canonical argument digest cannot
+    // discharge this foreground's cached outcome.
+    if (
+      pending === undefined ||
+      pending.tabId !== tabId ||
+      pending.snapshot.request.argumentsDigest !== payload.argumentDigest
+    ) return;
+    const tab = this.#tabs.get(tabId);
+    if (
+      tab === undefined ||
+      !sameLocalActionIdentity(
+        pending.snapshot.request.identity,
+        this.#localActionIdentity(tab.intent, tab.snapshot),
+      )
+    ) return;
+    this.#pendingRemoteLocalActionResults.delete(payload.requestId);
+    if (this.#remoteLocalActionTabs.get(payload.requestId) === tabId) {
+      this.#remoteLocalActionTabs.delete(payload.requestId);
+    }
+  }
+
   async #sendRemoteLocalActionResult(snapshot: LocalActionSnapshot): Promise<void> {
     const tabId = this.#remoteLocalActionTabs.get(snapshot.request.id);
-    if (tabId === undefined || snapshot.result === undefined || this.#remoteLocalActionResultsSent.has(snapshot.request.id)) return;
+    if (tabId === undefined || snapshot.result === undefined) return;
+    const existing = this.#pendingRemoteLocalActionResults.get(snapshot.request.id);
+    if (existing === undefined) {
+      this.#pendingRemoteLocalActionResults.set(snapshot.request.id, Object.freeze({ tabId, snapshot }));
+    } else if (
+      existing.tabId !== tabId ||
+      existing.snapshot.request.argumentsDigest !== snapshot.request.argumentsDigest ||
+      !sameLocalActionIdentity(existing.snapshot.request.identity, snapshot.request.identity)
+    ) {
+      // Request ids are single-use within the broker. A different binding or
+      // digest is a replay collision and must never replace the result already
+      // waiting for its matching acknowledgement.
+      return;
+    }
+    await this.#sendPendingRemoteLocalActionResult(snapshot.request.id);
+  }
+
+  async #sendPendingRemoteLocalActionResult(requestId: string): Promise<void> {
+    const pending = this.#pendingRemoteLocalActionResults.get(requestId);
+    if (pending === undefined || pending.snapshot.result === undefined) return;
+    const tab = this.#tabs.get(pending.tabId);
+    if (
+      tab === undefined ||
+      !sameLocalActionIdentity(
+        pending.snapshot.request.identity,
+        this.#localActionIdentity(tab.intent, tab.snapshot),
+      )
+    ) return;
     const runtime = this.#runtime;
     if (runtime === undefined) return;
     await runtime.sendLocalActionControl("local_action_result", Object.freeze({
       message: "outcome",
-      requestId: snapshot.request.id,
-      argumentDigest: snapshot.request.argumentsDigest,
-      result: snapshot.result,
-    }), tabId);
-    this.#remoteLocalActionResultsSent.add(snapshot.request.id);
-    this.#remoteLocalActionTabs.delete(snapshot.request.id);
+      requestId,
+      argumentDigest: pending.snapshot.request.argumentsDigest,
+      result: pending.snapshot.result,
+    }), pending.tabId);
   }
 
   #queueRemoteLocalActionResult(snapshot: LocalActionSnapshot): void {
+    const requestId = snapshot.request.id;
+    if (this.#remoteLocalActionResultSends.has(requestId)) return;
     const task = this.#sendRemoteLocalActionResult(snapshot);
+    this.#remoteLocalActionResultSends.set(requestId, task);
     this.#remoteLocalActionResultTasks.add(task);
     void task.catch((error: unknown) => {
       if (this.#state !== "stopping" && this.#state !== "stopped") this.#recordFailure(error);
-    }).finally(() => this.#remoteLocalActionResultTasks.delete(task));
+    }).finally(() => {
+      this.#remoteLocalActionResultTasks.delete(task);
+      if (this.#remoteLocalActionResultSends.get(requestId) === task) {
+        this.#remoteLocalActionResultSends.delete(requestId);
+      }
+    });
+  }
+
+  #resendPendingRemoteLocalActionResults(tabId: string, identity: LocalActionSessionIdentity): void {
+    for (const pending of this.#pendingRemoteLocalActionResults.values()) {
+      if (pending.tabId !== tabId || !sameLocalActionIdentity(pending.snapshot.request.identity, identity)) continue;
+      this.#queueRemoteLocalActionResult(pending.snapshot);
+    }
+  }
+
+  #fenceRemoteLocalActionResults(tabId: string, identity: LocalActionSessionIdentity): void {
+    for (const [requestId, pending] of this.#pendingRemoteLocalActionResults) {
+      if (pending.tabId === tabId && !sameLocalActionIdentity(pending.snapshot.request.identity, identity)) {
+        this.#pendingRemoteLocalActionResults.delete(requestId);
+        if (this.#remoteLocalActionTabs.get(requestId) === tabId) this.#remoteLocalActionTabs.delete(requestId);
+      }
+    }
   }
 
   #promoteBrowserAction(): void {
@@ -998,7 +1206,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   #browserRequestKey(request: LocalBrowserActionRequest): string {
-    return `${request.agentSessionId}:${request.processEpoch}:${request.fencingGeneration}:${request.url}`;
+    return `${request.agentSessionId}:${request.processEpoch}:${request.fencingGeneration}:${request.type}:${request.url}`;
   }
 
   #guardProviderOAuthPaste(
@@ -1284,7 +1492,11 @@ export class ForegroundTerminalCoordinator {
           : this.#browserNotice !== undefined
             ? { notice: this.#browserNotice }
             : this.#pendingBrowserAction !== undefined && this.#pendingBrowserActionTabId === activeTabId
-              ? { notice: `${providerName(this.#pendingBrowserAction.provider)} requests browser authentication · Enter/o open · d/Esc deny` }
+              ? {
+                notice: this.#pendingBrowserAction.type === "auth.device.present"
+                  ? `${providerName(this.#pendingBrowserAction.provider)} requests device sign-in · code ${this.#pendingBrowserAction.userCode} · Enter/o open · d/Esc deny`
+                  : `${providerName(this.#pendingBrowserAction.provider)} requests browser authentication · Enter/o open · d/Esc deny`,
+              }
               : this.#helpVisible
                 ? { notice: "Keys: Ctrl+C detach | Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry | d detach" }
                 : {}),
@@ -1305,6 +1517,21 @@ export class ForegroundTerminalCoordinator {
     return intent;
   }
 
+  /**
+   * RTP negotiation happens before `onTerminalReady`, so fall back to the
+   * immutable startup intents.  An unknown attachment gets no local actions.
+   */
+  #localActionKindsForSession(agentSessionId: string): readonly TerminalLocalActionKind[] {
+    const existing = [...this.#tabs.values()].find((tab) => tab.intent.agentSessionId === agentSessionId)?.intent;
+    const intent = existing ?? this.#pendingIntents.find((candidate) => candidate.agentSessionId === agentSessionId);
+    if (intent?.agent === "claude-code") return CLAUDE_LOCAL_ACTION_KINDS;
+    if (intent?.agent === "codex") return CODEX_LOCAL_ACTION_KINDS;
+    // OpenCode owns `/connect` and `/models` in its remote TUI.  It must not
+    // advertise a local-action protocol that could be mistaken for a browser
+    // or device-auth handoff.
+    return NO_LOCAL_ACTION_KINDS;
+  }
+
   #pendingIntents: readonly ForegroundTabIntent[] = Object.freeze([]);
 
   #requireRuntime(): ForegroundTerminalRuntime {
@@ -1318,7 +1545,81 @@ export class ForegroundTerminalCoordinator {
   ): Promise<void> {
     const color = this.#options.color ?? true;
     const top = padTrustedLine(` CUNA  ATTACHING ${count} EXACT AGENTSESSION${count === 1 ? "" : "S"}`, dimensions.columns);
-    const detail = padTrustedLine(" Authorizing the requested cloud terminals. No action is required.", dimensions.columns);
+    const indicator = `${ATTACHING_FRAMES[this.#attachingFrame % ATTACHING_FRAMES.length]} Checking terminal authority  ${ATTACHING_PROGRESS[this.#attachingFrame % ATTACHING_PROGRESS.length]}`;
+    const detail = padTrustedLine(` ${indicator}  ·  Ctrl-C cancels`, dimensions.columns);
+    const text = [
+      "\u001b[?25l\u001b[H\u001b[2J",
+      color ? "\u001b[48;2;235;86;37m\u001b[38;2;255;255;255m" : "",
+      top,
+      color ? "\u001b[0m" : "",
+      dimensions.rows > 1 ? "\r\n" : "",
+      dimensions.rows > 1 && color ? "\u001b[48;2;121;48;25m\u001b[38;2;224;210;203m" : "",
+      dimensions.rows > 1 ? detail : "",
+      color ? "\u001b[0m" : "",
+    ].join("");
+    await this.#options.host.write(new TextEncoder().encode(text));
+  }
+
+  #startAttachingAnimation(count: number): void {
+    if (this.#state !== "starting" || this.#startupDetached) return;
+    if (this.#attachingAnimationTimer !== undefined) return;
+    this.#attachingAnimationTimer = setInterval(() => {
+      if (this.#state !== "starting" || this.#startupDetached) {
+        this.#stopAttachingAnimation();
+        return;
+      }
+      this.#attachingFrame = (this.#attachingFrame + 1) % ATTACHING_PROGRESS.length;
+      this.#queueAttachingRender(count);
+    }, ATTACHING_FRAME_MS);
+    this.#attachingAnimationTimer.unref();
+  }
+
+  #stopAttachingAnimation(): void {
+    if (this.#attachingAnimationTimer === undefined) return;
+    clearInterval(this.#attachingAnimationTimer);
+    this.#attachingAnimationTimer = undefined;
+  }
+
+  #queueAttachingRender(count: number): void {
+    const operation = this.#renderTail.then(async () => {
+      if (this.#state !== "starting" || this.#startupDetached) return;
+      await this.#renderAttaching(count, admitForegroundDimensions(this.#options.host.dimensions()));
+    });
+    this.#renderTail = operation.then(() => undefined, () => undefined);
+    void operation.catch((error) => {
+      this.#recordFailure(error);
+      if (this.#state === "starting") void this.stop().catch(() => { this.#state = "failed"; });
+    });
+  }
+
+  #queueStartupCloseFeedback(): void {
+    const operation = this.#renderTail.then(async () => {
+      const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
+      for (let index = 0; index < STARTUP_CLOSE_FRAMES.length; index += 1) {
+        const notice = STARTUP_CLOSE_FRAMES[index];
+        if (notice === undefined) continue;
+        try {
+          await this.#renderStartupClose(notice, dimensions);
+        } catch {
+          // Decorative shutdown feedback must never prevent the host lease
+          // from being restored after a local interrupt.
+          return;
+        }
+        if (index + 1 < STARTUP_CLOSE_FRAMES.length) {
+          await new Promise<void>((resolve) => setTimeout(resolve, this.#options.disconnectFrameMs ?? DISCONNECT_FRAME_MS));
+        }
+      }
+    });
+    this.#renderTail = operation.then(() => undefined, () => undefined);
+  }
+
+  async #renderStartupClose(
+    notice: string,
+    dimensions: { readonly columns: number; readonly rows: number },
+  ): Promise<void> {
+    const color = this.#options.color ?? true;
+    const top = padTrustedLine(" CUNA  CLOSING", dimensions.columns);
+    const detail = padTrustedLine(` ${notice}`, dimensions.columns);
     const text = [
       "\u001b[?25l\u001b[H\u001b[2J",
       color ? "\u001b[48;2;235;86;37m\u001b[38;2;255;255;255m" : "",
@@ -1469,7 +1770,8 @@ function padTrustedLine(value: string, columns: number): string {
 }
 
 function providerName(provider: LocalBrowserActionRequest["provider"]): string {
-  return provider === "claude-code" ? "Claude Code" : "Codex";
+  if (provider === "claude-code") return "Claude Code";
+  return "Codex";
 }
 
 async function raceAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {

@@ -14,6 +14,8 @@ export type MachineSelectionState =
   | "unknown";
 export type MachineCostStatus = "known" | "unknown" | "unavailable";
 export type AttachmentStatus = "detached" | "attached" | "unknown";
+/** A producer-proven condition that blocks automatic machine creation. */
+export type RequestedAgentBlocker = "opencode-supervisor-update-required";
 
 export interface MachineSelectionObservation {
   readonly id: string;
@@ -22,6 +24,12 @@ export interface MachineSelectionObservation {
   readonly agent: AgentKind | "unknown";
   /** Fresh machine-scoped producer evidence for creating the requested child agent. */
   readonly requestedAgentSupport: "supported" | "unsupported" | "unknown";
+  /**
+   * A narrow, human-actionable blocker preserved from fresh capability
+   * evidence. It is not provider inventory and it must never be guessed from
+   * `machine.agent` or terminal text.
+   */
+  readonly requestedAgentBlocker?: RequestedAgentBlocker;
   readonly state: MachineSelectionState;
   readonly ownership: OwnershipStatus;
   readonly freshness: AuthorityFreshness;
@@ -150,6 +158,7 @@ export interface UnavailablePlan {
     | "duplicate-id"
     | "not-found"
     | "ownership-unverified"
+    | "opencode-supervisor-update-required"
     | "state-not-reusable"
     | "state-unknown";
 }
@@ -311,6 +320,8 @@ function validMachine(machine: MachineSelectionObservation): boolean {
     (machine.requestedAgentSupport === "supported" ||
       machine.requestedAgentSupport === "unsupported" ||
       machine.requestedAgentSupport === "unknown") &&
+    (machine.requestedAgentBlocker === undefined ||
+      machine.requestedAgentBlocker === "opencode-supervisor-update-required") &&
     MACHINE_STATES.has(machine.state) &&
     (machine.ownership === "owned" || machine.ownership === "foreign" || machine.ownership === "unknown") &&
     (machine.freshness === "fresh" || machine.freshness === "stale" || machine.freshness === "unknown") &&
@@ -353,6 +364,9 @@ function validateSelectedMachine(
   if (machine.ownership === "unknown") return unavailable("machine", "ownership-unverified", machine.id);
   if (machine.freshness !== "fresh") {
     return unavailable("machine", "authority-observation-stale", machine.id);
+  }
+  if (machine.requestedAgentBlocker === "opencode-supervisor-update-required") {
+    return unavailable("machine", "opencode-supervisor-update-required", machine.id);
   }
   if (machine.requestedAgentSupport === "unknown") {
     return unavailable("machine", "state-unknown", machine.id);
@@ -534,6 +548,19 @@ export function planMachineSelection(input: MachineSelectionInput): MachineSelec
       reason: "multiple-compatible-candidates",
       candidates: sortMachines(eligible),
     });
+  }
+  // A current OpenCode-specific repair condition is a reason to stop and
+  // explain—not a license to allocate another paid machine. `--new` returned
+  // above intentionally remains an explicit user choice.
+  const repairBlocked = input.machines.find(
+    (machine) =>
+      machine.ownership === "owned" &&
+      machine.freshness === "fresh" &&
+      machine.requestedAgentBlocker === "opencode-supervisor-update-required" &&
+      REUSABLE_MACHINE_STATES.has(machine.state),
+  );
+  if (repairBlocked !== undefined) {
+    return unavailable("machine", "opencode-supervisor-update-required", repairBlocked.id);
   }
   return freezePlan({
     kind: "create-required",

@@ -54,23 +54,22 @@ function sessionCreateCapability() {
   };
 }
 
-test("bare root zero-machine journey offers only supported creation choices without identifiers", async () => {
+test("bare root zero-machine journey offers all normal provider choices without identifiers", async () => {
   const host = new Host();
   const operation = runNodeRootJourney({
     client: { async listMachines() { return { items: [] }; } },
   }, { host, now: () => NOW });
-  await waitUntil(() => host.writes.some((frame) => frame.includes("Create Claude machine") && frame.includes("Create Codex machine")));
+  await waitUntil(() => host.writes.some((frame) => frame.includes("Create OpenCode machine") && frame.includes("Create Claude machine") && frame.includes("Create Codex machine")));
   const transcript = host.writes.at(-1);
   assert.doesNotMatch(transcript, /UUID|binding|generation|idempotency/iu);
-  host.send([0x1b, 0x5b, 0x42, 0x0d]);
+  host.send([0x1b, 0x5b, 0x42, 0x1b, 0x5b, 0x42, 0x0d]);
   assert.deepEqual(await operation, { kind: "launch", agent: "codex" });
 });
 
-test("bare root offers and returns OpenCode when the compiled feature gate is enabled", async () => {
+test("bare root offers and returns OpenCode through the normal provider route", async () => {
   const host = new Host();
   const operation = runNodeRootJourney({
     client: { async listMachines() { return { items: [] }; } },
-    opencodeEnabled: true,
   }, { host, now: () => NOW });
   await waitUntil(() => host.writes.some((frame) => frame.includes("Create OpenCode machine")));
   const frame = host.writes.at(-1);
@@ -98,7 +97,11 @@ test("bare root traverses machine -> provider -> existing session using the shar
   await waitUntil(() => host.writes.at(-1).includes("Claude  sessions"));
   host.send([0x1b]);
   await waitUntil(() => host.writes.at(-1).includes("CUNA  ◆── Machines"));
-  await waitUntil(() => host.writes.at(-1).includes("Enter attach Claude"));
+  await waitUntil(() => host.writes.at(-1).includes("Enter/→ manage machine"));
+  host.send([0x0d]);
+  await waitUntil(() => host.writes.at(-1).includes("CUNA  ◆── dev"));
+  host.send([0x0d]);
+  await waitUntil(() => host.writes.at(-1).includes("Claude  sessions"));
   host.send([0x0d]);
   assert.deepEqual(await operation, { kind: "attach", agentSessionId: SESSION, agent: "claude-code" });
 });

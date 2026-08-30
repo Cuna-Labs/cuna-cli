@@ -7,12 +7,17 @@ import {
   automationCredentialHint,
 } from "../core/product-web.js";
 import {
+  containsCredentialValue,
   isAccessToken,
   isProblemType,
   isProblemTypeForCode,
   isTransportCredential,
 } from "../core/namespace.js";
 import { isIdempotencyKey, isObject, safeReasonCode } from "../core/validation.js";
+import {
+  isOpenCodeSupervisorUpgradeReason,
+  openCodeSupervisorUpgradeRequired,
+} from "../machines/opencode-supervisor.js";
 import {
   DEFAULT_REQUEST_BUDGET_MS,
   observationBudgetElapsed,
@@ -27,6 +32,17 @@ const OVERSIZED_RESPONSE_HINT =
 const PROBLEM_CODE = /^[a-z][a-z0-9_]{2,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PROBLEM_ACTIONS = new Set(["retry", "sign_in", "open_web", "contact_support", "none"]);
+// Server prose reaches a terminal, so it may not carry control or format
+// characters, and it may never echo a credential back at the user. Same guard
+// `safePublicString` applies in `api/contracts.ts`; it rejects here instead of
+// throwing, because an unusable sentence must degrade to the generic message
+// rather than turn a server refusal into a client crash.
+const FORBIDDEN_PUBLIC_CHARACTER = /[\p{Cc}\p{Cf}]/u;
+function publicProse(value: string): string | undefined {
+  if (FORBIDDEN_PUBLIC_CHARACTER.test(value) || containsCredentialValue(value)) return undefined;
+  return value;
+}
+const AGENT_SESSION_CREATE_PATH = /^\/v1\/sessions\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/agent-sessions$/u;
 const WORKSPACE_SYNC_CAPABILITIES = Object.freeze([
   "atomic_generation_commit",
   "bounded_manifest_pages",
@@ -37,10 +53,37 @@ const WORKSPACE_SYNC_CAPABILITIES = Object.freeze([
 ] as const);
 const NO_WORKSPACE_SYNC_CAPABILITIES = Object.freeze([] as const);
 
+function isOpenCodeAgentSessionCreate(input: Readonly<{
+  readonly method: HttpRequest["method"];
+  readonly path: string;
+  readonly requestBody: unknown;
+}>): boolean {
+  return input.method === "POST" &&
+    AGENT_SESSION_CREATE_PATH.test(input.path) &&
+    isObject(input.requestBody) &&
+    input.requestBody.agent === "opencode";
+}
+
+function machineIdFromAgentSessionCreatePath(path: string): string | undefined {
+  return AGENT_SESSION_CREATE_PATH.exec(path)?.[1];
+}
+
 interface ProblemMetadata {
   readonly code: string;
   readonly requestId: string;
   readonly retryable: boolean;
+  /**
+   * The server's own sentence about this refusal.
+   *
+   * Both fields were already validated here and then dropped, so every refusal
+   * the CLI could not name specifically reached the user as one fixed sentence
+   * with the actionable half discarded. They are optional because the
+   * workspace-sync problem shape does not carry them and because prose that
+   * fails the terminal-safety guard degrades to the generic message rather
+   * than propagating.
+   */
+  readonly title?: string;
+  readonly detail?: string;
   readonly selectedProtocol?: 1 | 2 | null;
   readonly capabilities?: typeof WORKSPACE_SYNC_CAPABILITIES | typeof NO_WORKSPACE_SYNC_CAPABILITIES;
 }
@@ -107,10 +150,14 @@ function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata
   ) {
     return undefined;
   }
+  const title = publicProse(body.title);
+  const detail = typeof body.detail === "string" ? publicProse(body.detail) : undefined;
   return Object.freeze({
     code: body.code,
     requestId: body.request_id,
     retryable: body.retryable,
+    ...(title === undefined ? {} : { title }),
+    ...(detail === undefined ? {} : { detail }),
   });
 }
 
@@ -179,12 +226,25 @@ function apiError(input: {
   readonly credentialKind: "api_key" | "interactive" | "anonymous";
   readonly method: HttpRequest["method"];
   readonly path: string;
+  /** The caller's original structured intent, never the decoded response. */
+  readonly requestBody: unknown;
   readonly origin: string;
 }): CunaError {
   const { status, requestId, body, credentialKind } = input;
   const problem = problemMetadata(body, status);
   const reason = problem?.code ??
     (isObject(body) ? safeReasonCode(body.code) ?? safeReasonCode(body.error) : undefined);
+  // Not every route on this API answers with a Problem document. `sessions.start`
+  // is declared `"errorModel": "legacy"` in the contract and answers
+  // `{"error": "<sentence>"}` with no code, title or detail — so `problem` is
+  // undefined and the sentence is not a reason code either, because it has
+  // spaces. Measured: the web console renders exactly this string while the CLI
+  // showed only `http_status: 409`. The sentence is the whole actionable
+  // content, so read it as prose under the same terminal-safety guard.
+  const legacyReason = isObject(body) && typeof body.error === "string" &&
+      body.error.length >= 1 && body.error.length <= 500
+    ? publicProse(body.error)
+    : undefined;
   const effectiveRequestId = problem?.requestId ?? requestId;
   const details = {
     http_status: status,
@@ -224,12 +284,52 @@ function apiError(input: {
       details,
     });
   }
+  // This is not a retryable state conflict: the durable create authority
+  // rejected an AgentSession because its provider is not installed on the
+  // selected Machine. Keep the server's reason in safe details, but turn it
+  // into the same actionable provider-selection result the CLI emits when its
+  // immediately preceding machine observation detects the mismatch.
+  if (status === 409 && reason === "agent_session_provider_unavailable") {
+    return new CunaError({
+      code: "cuna.agent.provider_not_installed",
+      message: "OpenCode is not installed on the selected Machine.",
+      exitCode: EXIT_CODES.unsupported,
+      hint: "Choose a running Machine configured for OpenCode, or create one with `cuna machines create --agent opencode --name NAME --yes`.",
+      ...(problem === undefined ? {} : { retryable: problem.retryable }),
+      details,
+    });
+  }
+  // This is an authoritative refusal from the durable AgentSession create
+  // authority, not an attach failure and not an ambiguous network outcome.
+  // Keep the route fence here: `supervisor_upgrade_required` also occurs on
+  // terminal connections, where saying that no AgentSession was created would
+  // be false.
+  if (
+    status === 409 &&
+    problem !== undefined &&
+    isOpenCodeAgentSessionCreate(input) &&
+    isOpenCodeSupervisorUpgradeReason(problem.code)
+  ) {
+    const machineId = machineIdFromAgentSessionCreatePath(input.path);
+    return openCodeSupervisorUpgradeRequired({
+      details,
+      ...(machineId === undefined ? {} : { machineId }),
+      retryable: problem.retryable,
+    });
+  }
   if (status === 409) {
+    // The server names which state conflicts; this used to answer every 409
+    // with one fixed sentence and throw that away, so the user was told a
+    // conflict exists but never which one. Prefer the server's own words and
+    // keep the generic sentence only as the fallback for a refusal that
+    // carried none.
     return new CunaError({
       code: "cuna.remote.conflict",
-      message: "Cuna could not apply the operation because current state conflicts with it.",
+      message: problem?.title ?? legacyReason ??
+        "Cuna could not apply the operation because current state conflicts with it.",
       exitCode: EXIT_CODES.conflict,
-      hint: "Re-read the resource and decide again from its current state. Repeating this request unchanged repeats this answer.",
+      hint: problem?.detail ??
+        "Re-read the resource and decide again from its current state. Repeating this request unchanged repeats this answer.",
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
@@ -570,6 +670,7 @@ export function createHttpTransport(input: {
               credentialKind,
               method: request.method,
               path: request.path,
+              requestBody: request.body,
               origin: input.baseUrl,
             });
           }

@@ -37,13 +37,17 @@ export function validateLocalActionArguments(request: LocalActionRequest): void 
       if (typeof args.url !== "string" || admitProviderAuthUrl(request.provider, args.url) === undefined) invalid();
       return;
     case "auth.device.present":
-      exactKeys(args, ["verificationUri", "userCode"]);
-      if (request.provider !== "codex" || typeof args.verificationUri !== "string" ||
-        admitProviderAuthUrl("codex", args.verificationUri) === undefined || !boundedString(args.userCode, 256)) invalid();
+      if (request.provider === "codex") {
+        exactKeys(args, ["verificationUri", "userCode"]);
+        if (typeof args.verificationUri !== "string" ||
+          admitProviderAuthUrl("codex", args.verificationUri) === undefined || !boundedString(args.userCode, 256)) invalid();
+        return;
+      }
+      invalid();
       return;
     case "auth.callback.relay":
       exactKeys(args, ["provider", "localPath", "expectedStateDigest", "expectedNonceDigest", "exactLocalPort", "remoteLoopbackPort", "deadlineMs"]);
-      if ((args.provider !== "codex" && args.provider !== "opencode") || args.provider !== request.provider ||
+      if (args.provider !== "codex" || args.provider !== request.provider ||
         !exactPath(args.localPath) || !digest(args.expectedStateDigest) || !digest(args.expectedNonceDigest) ||
         !port(args.exactLocalPort, false) || !port(args.remoteLoopbackPort, false) || !deadline(args.deadlineMs, request)) invalid();
       return;

@@ -23,6 +23,14 @@ export type MachineFirstNavigationEvent =
 export type MachineContextAction =
   | Readonly<{ readonly kind: "start"; readonly label: "Start"; readonly machineId: string }>
   | Readonly<{ readonly kind: "stop"; readonly label: "Stop"; readonly machineId: string }>
+  /**
+   * An informational, non-mutating first action. It exists so a running
+   * OpenCode Machine with a supervisor prerequisite does not make `Stop` the
+   * default Enter target in the machine menu.
+   */
+  | Readonly<{ readonly kind: "supervisor-blocked"; readonly label: "OpenCode needs a terminal update"; readonly machineId: string }>
+  /** Available only after the current Machine observation is stopped. */
+  | Readonly<{ readonly kind: "update-supervisor"; readonly label: "Update terminal supervisor"; readonly machineId: string }>
   | Readonly<{ readonly kind: "provider"; readonly label: string; readonly machineId: string; readonly provider: ActionableProvider }>
   | Readonly<{ readonly kind: "new-session"; readonly label: string; readonly machineId: string; readonly provider: ActionableProvider }>;
 
@@ -65,14 +73,35 @@ export function reduceMachineFirstNavigation(
 
 export function resolveMachineContextActions(
   machine: Machine,
-  options: Readonly<{ readonly hasSessions?: boolean; readonly canCreateSession?: boolean }> = {},
+  options: Readonly<{
+    readonly hasSessions?: boolean;
+    readonly canCreateSession?: boolean;
+    /** Exact, current server evidence—not a local provider guess. */
+    readonly opencodeSupervisorRepairRequired?: boolean;
+  }> = {},
 ): readonly MachineContextAction[] {
   const provider = machineProviderAvailability(machine);
-  if (machine.state === "stopped" || machine.state === "paused") {
-    return Object.freeze([Object.freeze({ kind: "start", label: "Start", machineId: machine.id })]);
+  if (machine.state === "stopped") {
+    return Object.freeze([
+      ...(options.opencodeSupervisorRepairRequired === true
+        ? [Object.freeze({ kind: "update-supervisor" as const, label: "Update terminal supervisor" as const, machineId: machine.id })]
+        : []),
+      Object.freeze({ kind: "start", label: "Start", machineId: machine.id }),
+    ]);
+  }
+  if (machine.state === "paused") {
+    return Object.freeze([
+      ...(options.opencodeSupervisorRepairRequired === true
+        ? [Object.freeze({ kind: "supervisor-blocked" as const, label: "OpenCode needs a terminal update" as const, machineId: machine.id })]
+        : []),
+      Object.freeze({ kind: "start", label: "Start", machineId: machine.id }),
+    ]);
   }
   if (machine.state !== "running") return Object.freeze([]);
   return Object.freeze([
+    ...(options.opencodeSupervisorRepairRequired === true
+      ? [Object.freeze({ kind: "supervisor-blocked" as const, label: "OpenCode needs a terminal update" as const, machineId: machine.id })]
+      : []),
     ...(provider.actionable && provider.agent !== undefined && options.hasSessions !== false
       ? [Object.freeze({
           kind: "provider" as const,
@@ -118,5 +147,11 @@ export function canAutoContinueMachineFirst(input: Readonly<{
   readonly now: number;
   readonly cancelled: boolean;
 }>): boolean {
-  return input.safeContinuationCount === 1 && !input.cancelled && input.now - input.screenShownAt >= 3_000;
+  // Deliberately retain the public helper as a fail-closed compatibility seam,
+  // but never use uniqueness or elapsed time as consent to attach a remote
+  // AgentSession.  A person must select the exact session in its provider
+  // context.  Keeping this false also prevents a future caller from reviving
+  // the former three-second auto-continue behaviour by accident.
+  void input;
+  return false;
 }

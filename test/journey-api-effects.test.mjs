@@ -46,10 +46,10 @@ function capability() {
   };
 }
 
-function effects(client) {
+function effects(client, requestedAgent = "claude-code") {
   return createApiAgentJourneyEffects({
     client,
-    requestedAgent: "claude-code",
+    requestedAgent,
     async inspectWorkspace() { return { canonicalLocalRoot: "C:\\work\\project" }; },
     async synchronizeWorkspace() { throw new Error("unused"); },
     async attach() { throw new Error("unused"); },
@@ -78,6 +78,43 @@ test("machine observation rejects a provider mismatch before capability discover
   assert.equal(capabilityReads, 0);
   assert.equal(observed[0].requestedAgentSupport, "unsupported");
   assert.equal(observed[0].agent, "claude-code");
+});
+
+test("OpenCode machine observation preserves a supervisor-repair blocker without inventing a provider", async () => {
+  const unavailable = capability();
+  unavailable.capabilities = [{
+    ...unavailable.capabilities[0],
+    availability: "unsupported",
+    reasonCode: "opencode_supervisor_upgrade_required",
+  }];
+  const observed = await createApiAgentJourneyEffects({
+    client: {
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "open-repair", state: "running", agent: "opencode" }] };
+      },
+      async discoverCapabilities() { return unavailable; },
+    },
+    requestedAgent: "opencode",
+    async inspectWorkspace() { throw new Error("unused"); },
+    async synchronizeWorkspace() { throw new Error("unused"); },
+    async attach() { throw new Error("unused"); },
+    async authorizeMachineCreate() { return false; },
+    now: () => NOW,
+  }).observeMachines({ signal: new AbortController().signal });
+
+  assert.deepEqual(observed[0], {
+    id: MACHINE_ID,
+    name: "open-repair",
+    agent: "opencode",
+    requestedAgentSupport: "unsupported",
+    requestedAgentBlocker: "opencode-supervisor-update-required",
+    state: "running",
+    ownership: "owned",
+    freshness: "fresh",
+    recency: "unknown",
+    resources: {},
+    costStatus: "unknown",
+  });
 });
 
 test("uncertain AgentSession create recovers by the exact original idempotency key", async () => {
@@ -112,6 +149,75 @@ test("uncertain AgentSession create recovers by the exact original idempotency k
   });
   assert.deepEqual(result, { id: SESSION_ID, machineId: MACHINE_ID });
   assert.deepEqual(calls, ["create", ["inspect", "stable-agent-create-key"]]);
+});
+
+test("OpenCode supervisor capability rejection happens before any create dispatch", async () => {
+  let creates = 0;
+  const unavailable = capability();
+  unavailable.capabilities = [{
+    ...unavailable.capabilities[0],
+    availability: "unsupported",
+    reasonCode: "opencode_supervisor_upgrade_required",
+  }];
+  const client = {
+    async discoverCapabilities() { return unavailable; },
+    async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+  };
+  await assert.rejects(
+    effects(client, "opencode").createAgentSession({
+      machineId: MACHINE_ID,
+      agent: "opencode",
+      authMode: "interactive_login",
+      workspace: {
+        bindingId: BINDING_ID,
+        workspaceIdentity: BINDING_ID,
+        generation: 7,
+        remoteCwd: "/workspace/projects/project",
+      },
+      idempotencyKey: "opencode-supervisor-upgrade",
+      signal: new AbortController().signal,
+    }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.agent.opencode_supervisor_upgrade_required" &&
+      error.details?.reason === "opencode_supervisor_upgrade_required" &&
+      /No OpenCode AgentSession was created/u.test(error.hint ?? ""),
+  );
+  assert.equal(creates, 0);
+});
+
+test("OpenCode runtime verification remains a transient no-create result", async () => {
+  let creates = 0;
+  const unavailable = capability();
+  unavailable.capabilities = [{
+    ...unavailable.capabilities[0],
+    availability: "temporarily_unavailable",
+    reasonCode: "opencode_runtime_unverified",
+  }];
+  const client = {
+    async discoverCapabilities() { return unavailable; },
+    async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+  };
+  await assert.rejects(
+    effects(client, "opencode").createAgentSession({
+      machineId: MACHINE_ID,
+      agent: "opencode",
+      authMode: "interactive_login",
+      workspace: {
+        bindingId: BINDING_ID,
+        workspaceIdentity: BINDING_ID,
+        generation: 7,
+        remoteCwd: "/workspace/projects/project",
+      },
+      idempotencyKey: "opencode-runtime-unverified",
+      signal: new AbortController().signal,
+    }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.agent.opencode_runtime_unverified" &&
+      error.retryable === true &&
+      /No OpenCode AgentSession was created/u.test(error.hint ?? "") &&
+      /will not create another Machine/u.test(error.hint ?? ""),
+  );
+  assert.equal(creates, 0);
 });
 
 test("recovered AgentSession with substituted authority is rejected before attach", async () => {

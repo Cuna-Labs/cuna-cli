@@ -85,3 +85,95 @@ test("--no-sync without a committed local binding performs no producer mutation"
   );
   assert.equal(creates, 0);
 });
+
+// A generation is a witness to workspace content. Committing one for content
+// the server already has is not a wasted round trip, it is an identity change:
+// `workspaceGeneration` is compared in `isExactSessionKey`, so the previous
+// AgentSession stops being exact and the journey creates a sibling with a new
+// process epoch. Measured in production 2026-08-30 on binding dab40ec9:
+// generations 1, 2 and 3 all carried manifest root d4313d11..., entry_count 1,
+// content_bytes 28, with no file touched between runs — and two runs against
+// one Machine left two live OpenCode processes where the owner expected to
+// reconnect to one.
+test("an unchanged workspace reuses its committed generation instead of committing another", async (t) => {
+  const { project, state } = await roots(t);
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(join(project, "main.js"), "console.log(1);\n");
+
+  const { computeWorkspaceManifestRoot } = await import(
+    "../dist/sync/workspace-sync-product-service.js"
+  );
+  const manifestRoot = await computeWorkspaceManifestRoot({
+    localRoot: project,
+    filesystemCapabilities: conservativeFilesystemCapabilities("windows"),
+  });
+
+  const binding = {
+    bindingId: "40000000-0000-4000-8000-000000000001",
+    projectId: "50000000-0000-4000-8000-000000000001",
+    localInstanceId: "60000000-0000-4000-8000-000000000001",
+    remoteRoot: "/workspace/projects/p",
+    exclusionPolicyDigest: undefined,
+    activeGeneration: 7,
+    activeManifestRoot: manifestRoot,
+  };
+  const client = {
+    async createWorkspaceBinding(input) {
+      binding.exclusionPolicyDigest = input.exclusionPolicyDigest;
+      return { ...binding, exclusionPolicyDigest: input.exclusionPolicyDigest };
+    },
+    async getWorkspaceBinding() {
+      return { ...binding };
+    },
+  };
+
+  // The transport throws on any request, so reaching the network at all fails
+  // this test rather than silently passing on a slower path.
+  const result = await effects(client, state).synchronizeWorkspace({
+    machineId: MACHINE,
+    localPath: project,
+    syncMode: "enabled",
+    signal: new AbortController().signal,
+  });
+
+  assert.equal(result.generation, 7, "the committed generation must be reused, not advanced");
+  assert.equal(result.bindingId, binding.bindingId);
+});
+
+// Negative control: the skip must be keyed on the manifest, not on nothing at
+// all. With a different remote manifest root the journey must go to the network
+// — here that surfaces as the transport's own refusal, which is proof it tried.
+test("a changed workspace still synchronizes rather than reusing a stale generation", async (t) => {
+  const { project, state } = await roots(t);
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(join(project, "main.js"), "console.log(1);\n");
+
+  const binding = {
+    bindingId: "40000000-0000-4000-8000-000000000002",
+    projectId: "50000000-0000-4000-8000-000000000002",
+    localInstanceId: "60000000-0000-4000-8000-000000000002",
+    remoteRoot: "/workspace/projects/p",
+    exclusionPolicyDigest: undefined,
+    activeGeneration: 7,
+    activeManifestRoot: "0".repeat(64),
+  };
+  const client = {
+    async createWorkspaceBinding(input) {
+      binding.exclusionPolicyDigest = input.exclusionPolicyDigest;
+      return { ...binding, exclusionPolicyDigest: input.exclusionPolicyDigest };
+    },
+    async getWorkspaceBinding() {
+      return { ...binding };
+    },
+  };
+
+  await assert.rejects(
+    effects(client, state).synchronizeWorkspace({
+      machineId: MACHINE,
+      localPath: project,
+      syncMode: "enabled",
+      signal: new AbortController().signal,
+    }),
+    "a differing manifest must reach the transport, not silently reuse generation 7",
+  );
+});

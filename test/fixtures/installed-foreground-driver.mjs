@@ -173,7 +173,6 @@ try {
             agentSessionIds: [input.agentSessionId],
             expectedAgentKinds: [input.expectedAgent],
             presentationMode: "plain",
-            opencodeEnabled: intent.agent === "opencode",
           });
         },
         async reconcileCancellation() {},

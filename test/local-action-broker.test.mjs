@@ -77,13 +77,56 @@ test("exact duplicate delivery is idempotent while conflicting reuse is rejected
   );
 });
 
-test("disabled OpenCode is rejected before it can enter the queue", () => {
+test("OpenCode rejects arbitrary browser requests before they enter the queue", () => {
   const subject = broker();
   assert.throws(
     () => subject.submit(request({ provider: "opencode" })),
     (error) => error instanceof LocalActionBrokerError && error.code === "provider_action_unavailable",
   );
   assert.equal(subject.current(), undefined);
+});
+
+test("OpenCode rejects every local action while Codex keeps its device flow", () => {
+  const subject = broker();
+  assert.throws(
+    () => subject.submit(request({
+      id: "opencode-local-action-1",
+      nonce: "opencode-local-action-nonce-1",
+      provider: "opencode",
+      kind: "auth.device.present",
+      arguments: {},
+      argumentsDigest: digestLocalActionArguments({}),
+    })),
+    (error) => error instanceof LocalActionBrokerError && error.code === "provider_action_unavailable",
+  );
+  assert.equal(subject.current(), undefined);
+
+  const codexArgs = {
+    verificationUri: "https://auth.openai.com/codex/device",
+    userCode: "ABCD-EFGH",
+  };
+  const codex = subject.submit(request({
+    id: "codex-device-1",
+    nonce: "codex-device-nonce-1",
+    provider: "codex",
+    kind: "auth.device.present",
+    arguments: codexArgs,
+    argumentsDigest: digestLocalActionArguments(codexArgs),
+  }));
+  assert.equal(codex.state, "pending_user");
+
+  const invalidArgs = { ...codexArgs, unexpected: "not-allowed" };
+  assert.throws(
+    () => subject.submit(request({
+      id: "codex-device-invalid",
+      nonce: "codex-device-invalid-nonce",
+      provider: "codex",
+      kind: "auth.device.present",
+      arguments: invalidArgs,
+      argumentsDigest: digestLocalActionArguments(invalidArgs),
+    })),
+    (error) => error instanceof LocalActionBrokerError && error.code === "invalid_request",
+  );
 });
 
 test("closed schemas reject unknown properties and unsafe local targets", () => {

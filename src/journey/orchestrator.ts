@@ -202,9 +202,11 @@ function selectionFailure(
       : `Cuna could not prove a safe ${target} selection.`,
     exitCode: plan.kind === "ambiguous" ? EXIT_CODES.conflict : EXIT_CODES.policy,
     hint: target === "machine"
-      ? plan.reason === "agent-mismatch"
-        ? "Choose or create a machine configured for this provider (`cuna machines create --agent claude-code|codex|opencode ...`)."
-        : "Select an exact machine with --machine NAME."
+      ? plan.reason === "opencode-supervisor-update-required"
+        ? "An existing OpenCode machine needs its terminal supervisor updated before a session can start. Cuna did not create another machine. Open `cuna machines`, stop only the machine and sessions you choose, then select Update terminal supervisor."
+        : plan.reason === "agent-mismatch"
+          ? "Choose or create a machine configured for this provider (`cuna machines create --agent claude-code|codex|opencode ...`)."
+          : "Select an exact machine with --machine NAME."
       : "Select an exact child with --agent-session ID or request --new-session.",
     details: {
       target: target === "machine" ? "machine" : "agent_session",
@@ -241,6 +243,16 @@ function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
     details: { recovery: "exhausted" },
     cause,
   });
+}
+
+/**
+ * A typed 409 from the create authority settles this create attempt: it did
+ * not commit.  It must not be converted into the generic "cannot prove"
+ * result, which is reserved for a missing authoritative response.
+ */
+function isProvenAgentSessionCreateRejection(cause: unknown): cause is CunaError {
+  return cause instanceof CunaError &&
+    cause.code === "cuna.agent.opencode_supervisor_upgrade_required";
 }
 
 function defaultAuthMode(intent: ReconciledAgentJourneyIntent): AgentAuthMode {
@@ -429,7 +441,9 @@ export async function orchestrateAgentJourney(input: {
           }),
         });
       } catch (createError) {
-        if (signal.aborted) throw createError;
+        if (signal.aborted || isProvenAgentSessionCreateRejection(createError)) {
+          throw createError;
+        }
         throw unreconcilableAgentSessionCreate(createError);
       }
       ledger.createdAgentSessionId = agentSession.id;

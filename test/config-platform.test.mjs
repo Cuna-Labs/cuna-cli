@@ -117,27 +117,19 @@ test("only the published API-key alias survives the configuration rename", async
   assert.equal(file.configFile, "/explicit/config.json");
 });
 
-test("OpenCode local consumer admission is compiled from the immutable producer witness", async () => {
-  const defaultGate = await resolveConfig({ platform: fakePlatform(), env: {} });
-  assert.deepEqual(defaultGate.opencodeFeatureGate, {
-    state: "enabled",
-    source: "compiled_contract",
-    reason: "enabled",
-  });
+test("configuration does not contain a local OpenCode release gate", async () => {
+  const defaultConfig = await resolveConfig({ platform: fakePlatform(), env: {} });
+  assert.equal(Object.hasOwn(defaultConfig, "opencodeFeatureGate"), false);
 
   for (const value of ["", "TRUE", "1", " true ", "false", "true"]) {
-    const gate = await resolveConfig({
+    const config = await resolveConfig({
       platform: fakePlatform(),
       env: { CUNA_OPENCODE_ENABLED: value },
     });
-    assert.deepEqual(gate.opencodeFeatureGate, {
-      state: "enabled",
-      source: "compiled_contract",
-      reason: "enabled",
-    }, JSON.stringify(value));
+    assert.equal(Object.hasOwn(config, "opencodeFeatureGate"), false, JSON.stringify(value));
   }
 
-  assert.deepEqual(publicConfig(defaultGate), {
+  assert.deepEqual(publicConfig(defaultConfig), {
     profile: "default",
     profile_source: "default",
     base_url: DEFAULT_BASE_URL,
@@ -146,9 +138,6 @@ test("OpenCode local consumer admission is compiled from the immutable producer 
     api_key: "absent",
     api_key_source: "absent",
     api_key_variable: null,
-    opencode_feature: "enabled",
-    opencode_feature_source: "compiled_contract",
-    opencode_feature_reason: "enabled",
     config_file: "/home/test/.config/cuna/config.json",
   });
 });

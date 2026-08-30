@@ -70,6 +70,37 @@ export interface WorkspaceSyncPolicyInspection {
   readonly exclusionPolicyDigest: string;
 }
 
+/**
+ * The manifest root the next synchronization would commit, computed without
+ * transferring anything.
+ *
+ * It lives here rather than in the journey layer so that one module owns what a
+ * manifest root is; two answers to that question is how a caller ends up
+ * committing a generation for content the server already has.
+ */
+export async function computeWorkspaceManifestRoot(input: {
+  readonly localRoot: string;
+  readonly filesystemCapabilities: FilesystemCapabilities;
+  readonly manifestLimits?: SynchronizeLocalWorkspaceInput["manifestLimits"];
+  readonly allowSafeRelativeSymlinks?: boolean;
+}): Promise<string> {
+  const root = await canonicalWorkspaceRoot(input.localRoot);
+  const policy = compileExclusionPolicy(
+    await readProjectExclusionPolicy(root),
+    input.filesystemCapabilities,
+  );
+  const manifest = await createWorkspaceManifest({
+    root,
+    policy,
+    capabilities: input.filesystemCapabilities,
+    ...(input.manifestLimits === undefined ? {} : { limits: input.manifestLimits }),
+    ...(input.allowSafeRelativeSymlinks === undefined
+      ? {}
+      : { allowSafeRelativeSymlinks: input.allowSafeRelativeSymlinks }),
+  });
+  return manifest.manifestRoot;
+}
+
 /** Safe policy-only preflight used to bind the exact policy before transfer. */
 export async function inspectWorkspaceSyncPolicy(input: {
   readonly localRoot: string;

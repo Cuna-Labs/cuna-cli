@@ -216,6 +216,27 @@ test("terminal machines with unavailable provider evidence do not block automati
   assert.equal(creating.reason, "authority-observation-stale");
 });
 
+test("an OpenCode supervisor repair blocks automatic allocation but not explicit --new", () => {
+  const repairing = machine({
+    agent: "opencode",
+    requestedAgentSupport: "unsupported",
+    requestedAgentBlocker: "opencode-supervisor-update-required",
+  });
+  assert.deepEqual(
+    planMachineSelection(machineInput([repairing], { requestedAgent: "opencode" })),
+    {
+      kind: "unavailable",
+      target: "machine",
+      targetId: MACHINE_A,
+      reason: "opencode-supervisor-update-required",
+    },
+  );
+  assert.deepEqual(
+    planMachineSelection(machineInput([repairing], { requestedAgent: "opencode", forceNew: true })),
+    { kind: "create-required", target: "machine", reason: "forced" },
+  );
+});
+
 test("PRD-033 legacy machine agent never blocks a different supported child agent", () => {
   const plan = planMachineSelection(machineInput([
     machine({ agent: "claude-code", requestedAgentSupport: "supported" }),

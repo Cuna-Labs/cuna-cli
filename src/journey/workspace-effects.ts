@@ -8,6 +8,7 @@ import type { ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.
 import {
   inspectWorkspaceSyncPolicy,
   startContinuousWorkspaceSync,
+  computeWorkspaceManifestRoot,
   synchronizeLocalWorkspace,
   type AuthenticatedWorkspaceSyncTransport,
 } from "../sync/workspace-sync-product-service.js";
@@ -157,6 +158,38 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           throw fail("cuna.journey.workspace_generation_unavailable", "--no-sync cannot attach until the binding has a committed workspace generation.", EXIT_CODES.policy);
         }
         return Object.freeze({ bindingId: authority.bindingId, workspaceIdentity: authority.bindingId, generation: authority.activeGeneration, remoteCwd: authority.remoteRoot });
+      }
+
+      // A generation is a witness to workspace content. If the content has not
+      // changed there is nothing to witness, so do not commit one.
+      //
+      // This is not an optimisation. `workspaceGeneration` is part of the
+      // AgentSession identity key (`journey/selection.ts:596-604`), so a
+      // generation committed for identical content makes the previous session
+      // stop being "exact" and forces a sibling with a new process epoch.
+      // Measured in production 2026-08-30 on binding dab40ec9: generations 1,
+      // 2 and 3 all carry manifest root d4313d11…, entry_count 1,
+      // content_bytes 28 — three generations, one manifest, no file touched.
+      // Two runs against one Machine left two live OpenCode processes where the
+      // owner expected to reconnect to one.
+      //
+      // The manifest is recomputed inside `synchronizeLocalWorkspace` when the
+      // content HAS changed, which is the only case that pays for it. Skipping
+      // returns exactly the shape the proven `--no-sync` branch above returns.
+      const currentManifestRoot = await computeWorkspaceManifestRoot({
+        localRoot: inspected.policy.canonicalRoot,
+        filesystemCapabilities: input.filesystemCapabilities,
+      });
+      if (
+        authority.activeGeneration >= 1 &&
+        authority.activeManifestRoot === currentManifestRoot
+      ) {
+        return Object.freeze({
+          bindingId: authority.bindingId,
+          workspaceIdentity: authority.bindingId,
+          generation: authority.activeGeneration,
+          remoteCwd: authority.remoteRoot,
+        });
       }
 
       const checkpointRoot = join(input.stateDirectory, "workspace-sync");

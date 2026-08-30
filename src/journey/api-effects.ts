@@ -2,6 +2,13 @@ import type { AgentSession, Machine } from "../api/contracts.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import { isObservationBudgetCode } from "../core/observation-budget.js";
+import {
+  isOpenCodeRuntimeUnverifiedCapabilityRejection,
+  isOpenCodeSupervisorUpgradeReason,
+  isOpenCodeSupervisorUpgradeCapabilityRejection,
+  openCodeRuntimeUnverified,
+  openCodeSupervisorUpgradeRequired,
+} from "../machines/opencode-supervisor.js";
 import { machineProviderAvailability } from "../machines/provider-availability.js";
 import type { MachineSelectionState } from "./selection.js";
 import type {
@@ -92,6 +99,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       }
       return Promise.all(page.items.map(async (machine) => {
         let support: "supported" | "unsupported" | "unknown" = "unknown";
+        let supportReason: string | undefined;
         const provider = machineProviderAvailability(machine);
         if (!provider.actionable || provider.agent !== input.requestedAgent) {
           return Object.freeze({
@@ -132,14 +140,21 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
             : decision.status === "unsupported"
               ? "unsupported"
               : "unknown";
+          supportReason = decision.status === "supported" ? undefined : decision.reason;
         } catch {
           support = "unknown";
         }
+        const requestedAgentBlocker = input.requestedAgent === "opencode" &&
+          support === "unsupported" &&
+          isOpenCodeSupervisorUpgradeReason(supportReason)
+          ? "opencode-supervisor-update-required" as const
+          : undefined;
         return Object.freeze({
           id: machine.id,
           name: machine.name,
           agent: provider.agent ?? "unknown" as const,
           requestedAgentSupport: support,
+          ...(requestedAgentBlocker === undefined ? {} : { requestedAgentBlocker }),
           state: machineState(machine.state),
           ownership: "owned" as const,
           freshness: "fresh" as const,
@@ -214,14 +229,32 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       return Object.freeze(page.items.map(sessionObservation));
     },
     async createAgentSession({ machineId, agent, authMode, credentialBindingId, workspace, idempotencyKey, signal }) {
-      await requireCapability({
-        client: input.client,
-        scope: "machine",
-        resourceId: machineId,
-        capabilityId: "agent_sessions.create",
-        now,
-        signal,
-      });
+      try {
+        await requireCapability({
+          client: input.client,
+          scope: "machine",
+          resourceId: machineId,
+          capabilityId: "agent_sessions.create",
+          now,
+          signal,
+        });
+      } catch (error) {
+        if (agent === "opencode" && isOpenCodeSupervisorUpgradeCapabilityRejection(error)) {
+          throw openCodeSupervisorUpgradeRequired({
+            ...(error.details === undefined ? {} : { details: error.details }),
+            machineId,
+            cause: error,
+          });
+        }
+        if (agent === "opencode" && isOpenCodeRuntimeUnverifiedCapabilityRejection(error)) {
+          throw openCodeRuntimeUnverified({
+            ...(error.details === undefined ? {} : { details: error.details }),
+            machineId,
+            cause: error,
+          });
+        }
+        throw error;
+      }
       const createInput = {
         agent,
         cwd: workspace.remoteCwd,
