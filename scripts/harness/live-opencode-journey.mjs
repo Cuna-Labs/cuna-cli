@@ -24,6 +24,8 @@
  * "failed" costs a second run to learn anything.
  */
 import { spawnSync } from "node:child_process";
+import { writeFileSync, rmSync } from "node:fs";
+import os from "node:os";
 import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
@@ -83,6 +85,8 @@ const exited = new Promise((resolve) => child.onExit((event) => {
  * this is a fence, not a progress bar.
  */
 let durableSessions = [];
+let attachProbe;
+let lastAttachProbe = 0;
 let lastDurableRefresh = 0;
 let durableError;
 const machineIdPromise = (async () => {
@@ -151,6 +155,54 @@ function sessionCreatedThisRun() {
     Date.parse(s.created_at) >= runStartedAt - 5_000);
 }
 
+/**
+ * Did a terminal connection get REDEEMED during this run?
+ *
+ * This reads the database directly, which a product surface must never do — but
+ * this is a harness, and the alternative is what happened three times today:
+ * a screen-shaped proxy that goes green without an attach. A grant can be
+ * issued and never consumed, so `redeemed_at` is the fact, and no field the CLI
+ * exposes carries it.
+ *
+ * Fails CLOSED. If the query cannot run — no Supabase CLI, no session, wrong
+ * project — this returns `undefined`, which the caller reports as unwitnessed.
+ * It never returns `true` on an unanswered question.
+ *
+ * Requires `supabase projects list` to already work; set CUNA_HARNESS_PROJECT_REF
+ * to override the project.
+ */
+function terminalRedeemedThisRun(machineId) {
+  const projectRef = process.env.CUNA_HARNESS_PROJECT_REF ?? "gnxoicpqjjrktktuzqws";
+  const since = new Date(runStartedAt - 5_000).toISOString();
+  const sql = `select count(*)::int as redeemed from public.terminal_connections `
+    + `where machine_id = '${machineId}' and redeemed_at is not null `
+    + `and issued_at > '${since}';`;
+  const file = path.join(os.tmpdir(), `cuna-journey-${process.pid}.sql`);
+  try {
+    writeFileSync(file, `${sql}\n`, "utf8");
+    const out = spawnSync(
+      "supabase",
+      ["db", "query", "--linked", "--project-ref", projectRef, "--file", file],
+      // Run OUTSIDE the workspace under test. The Supabase CLI writes a
+      // `supabase/.temp/` directory into its working directory, and this
+      // harness runs with the workspace as its cwd -- so the witness that
+      // proves the attach was also adding two files to the workspace it
+      // measures. That advanced the workspace generation, and generation is
+      // part of the exact-session key, so the next run could no longer match
+      // the session this one created and forked a sibling instead. The
+      // instrument was manufacturing the defect it would then have reported.
+      { encoding: "utf8", timeout: 120_000, shell: true, cwd: os.tmpdir() },
+    );
+    const match = /"redeemed":\s*(\d+)/u.exec(out.stdout ?? "");
+    if (match === null) return undefined;
+    return Number(match[1]) > 0;
+  } catch {
+    return undefined;
+  } finally {
+    try { rmSync(file, { force: true }); } catch { /* best effort */ }
+  }
+}
+
 async function refreshDurableSessions() {
   try {
     const machineId = await machineIdPromise;
@@ -188,6 +240,13 @@ async function witness(name, predicate, timeoutMs) {
     if (Date.now() - lastDurableRefresh > 5_000) {
       lastDurableRefresh = Date.now();
       void refreshDurableSessions();
+    }
+    // The durable attach probe is expensive (it shells out), so it runs on its
+    // own slower cadence and only once a session exists to attach to.
+    if (Date.now() - lastAttachProbe > 15_000 && sessionCreatedThisRun() !== undefined) {
+      lastAttachProbe = Date.now();
+      const id = await machineIdPromise.catch(() => undefined);
+      if (id !== undefined) attachProbe = terminalRedeemedThisRun(id);
     }
   }
 }
@@ -246,13 +305,17 @@ try {
   // this harness cannot check it — and every screen-shaped substitute is
   // satisfiable without an attach. Emitting an unverifiable green is the exact
   // failure this runner exists to prevent, so it prints the query instead.
-  const created = sessionCreatedThisRun();
-  witnesses.push({
-    name: `attach_pty — NOT WITNESSED by this harness; verify out of band for session ${created?.id ?? "<none created>"}`,
-    observed: false,
-    ms: 0,
-    unwitnessable: true,
-  });
+  // So it asks the durable record instead. `redeemed_at` is the fact: a grant
+  // issued and never consumed is not an attach, and no field the CLI exposes
+  // carries it.
+  await witness(
+    "attach_pty — a terminal grant was REDEEMED during this run",
+    () => {
+      if (attachProbe === undefined) return false;
+      return attachProbe === true;
+    },
+    180_000,
+  );
   // A remote frame styled by the provider, not by Cuna's own chrome. Cuna uses
   // truecolor; this is the ANSI-256 signature of the provider's own TUI, so a
   // pass here cannot be the appbar mistaken for the child.

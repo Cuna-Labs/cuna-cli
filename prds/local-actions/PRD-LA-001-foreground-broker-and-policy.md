@@ -51,7 +51,7 @@ interface LocalActionResult<K extends LocalActionKind = LocalActionKind> {
 
 `LocalActionKind` es una unión cerrada definida por los PRDs 002–007. Payloads SHALL rechazar propiedades desconocidas en fronteras de red. `argumentsDigest` SHALL ser SHA-256 de la serialización canónica del tipo validado. Los timestamps numéricos son epoch milliseconds.
 
-La única fuente normativa del mapa cerrado `kind → args keys → success keys` es `src/local-actions/schemas.ts`; este PRD no mantiene una copia divergente. En síntesis: `browser.open:url`; `auth.device.present:verificationUri,userCode`; `auth.callback.relay:provider,localPath,expectedStateDigest,expectedNonceDigest,exactLocalPort,remoteLoopbackPort,deadlineMs`; `auth.result.observe:{}`; `clipboard.write:text`; `port.forward:remoteHost,remotePort,requestedLocalPort,purpose,deadlineMs`; `file.select:purpose,accept,multiple,maximumFiles,maximumTotalBytes`; `attachment.import:opaqueId,expectedSha256`; `artifact.save:remoteArtifactId,expectedSha256,suggestedName,maximumBytes`; `preview.open:source,mediaType`; `diff.open:leftArtifactId,rightArtifactId,expectedDigests`; `editor.open:editor,connectionDescriptorId,workspaceBindingId,workspaceBindingGeneration`; `notification.show:category,title,body,focusRequestId`; `git.sign:objectType,canonicalPayloadBase64url,decodedLength,payloadSha256,keySelectorId`; `local_service.request:registrationId,operationId,bodyEncoding,body,decodedLength,bodySha256`; `device.select:deviceClass,purpose,requestedMetadata`. Los success payloads también se validan exclusivamente en ese archivo.
+La única fuente normativa del mapa cerrado `kind → args keys → success keys` es `src/local-actions/schemas.ts`; este PRD no mantiene una copia divergente. En síntesis: `browser.open:url`; `auth.device.present:verificationUri,userCode` sólo para Codex; `auth.callback.relay:provider,localPath,expectedStateDigest,expectedNonceDigest,exactLocalPort,remoteLoopbackPort,deadlineMs`; `auth.result.observe:{}`; `clipboard.write:text`; `port.forward:remoteHost,remotePort,requestedLocalPort,purpose,deadlineMs`; `file.select:purpose,accept,multiple,maximumFiles,maximumTotalBytes`; `attachment.import:opaqueId,expectedSha256`; `artifact.save:remoteArtifactId,expectedSha256,suggestedName,maximumBytes`; `preview.open:source,mediaType`; `diff.open:leftArtifactId,rightArtifactId,expectedDigests`; `editor.open:editor,connectionDescriptorId,workspaceBindingId,workspaceBindingGeneration`; `notification.show:category,title,body,focusRequestId`; `git.sign:objectType,canonicalPayloadBase64url,decodedLength,payloadSha256,keySelectorId`; `local_service.request:registrationId,operationId,bodyEncoding,body,decodedLength,bodySha256`; `device.select:deviceClass,purpose,requestedMetadata`. `opencode` permanece en el tipo de proveedor sólo para mantener el binding de sesión y el attach; su registry contiene cero kinds. Su estado de auth, si el supervisor puede observarlo, es remoto, privado y nunca concede un efecto de dispositivo ni transmite credenciales al broker.
 
 Los `safeReason` emitibles por el cliente son una unión cerrada: `unsupported|denied_by_policy|denied_by_user|stale_identity|cancelled_by_foreground|foreground_stopped|terminal_detached|terminal_binding_changed|user_interrupt|execution_timeout|request_expired|adapter_failed|browser_open_failed|rate_limited|local_client_unavailable|outcome_unknown_nonretryable`. Un valor fuera de esta unión MUST fallar validación antes del wire.
 
@@ -80,6 +80,8 @@ EffectivePermission(r) = ProjectRequestCeiling(r.kind)
 | R1.6 | WHEN el usuario pulsa Ctrl-C, el broker SHALL iniciar cleanup, renderizar `Closing…`, restaurar el terminal y terminar. | MUST | G1.3 |
 | R1.7 | IF la cola está llena o el payload excede su cota, THEN el broker SHALL rechazarlo sin retener sus argumentos. | MUST | G1.3 |
 | R1.8 | El broker SHALL redactar URL query, códigos, paths completos, clipboard, cuerpos y credenciales de todo mensaje seguro. | MUST | G1.2 |
+| R1.9 | WHEN un efecto se compromete y produce un resultado, el broker SHALL conservarlo en un cache foreground acotado bajo `(requestId,argumentsDigest,identity)`, retransmitirlo sin reejecutar sólo tras una identidad nuevamente válida, y eliminarlo sólo con ACK exacto, expiry o fencing de esa identidad. | MUST | G1.2,G1.3 |
+| R1.10 | WHERE el proveedor sea OpenCode, el broker SHALL rechazar todo `LocalActionRequest` antes de cola, consentimiento y adaptador; la CLI SHALL mantener sólo el attach de TUI remoto y no mostrará una tarjeta de consentimiento local. | MUST | G1.2 |
 
 ## State machine y CFG
 
@@ -109,7 +111,7 @@ stateDiagram-v2
   awaiting_remote_completion --> failed: interrupt/identity tras commit [outcome_unknown_nonretryable]
 ```
 
-Transiciones no listadas son ilegales. Los estados terminales no tienen salidas. `effectCommit∈{not_started,committed}` es monotónico: después de `committed`, cancel/expiry nunca se reportan como si el efecto no hubiese ocurrido. El CFG es `decode → validate → dedupe → fence → enqueue → recompute-policy → consent → acquire → execute → mark-commit → observe/cache → send/ACK → cleanup` con ramas fail-closed en cada guard.
+Transiciones no listadas son ilegales. Los estados terminales no tienen salidas. `effectCommit∈{not_started,committed}` es monotónico: después de `committed`, cancel/expiry nunca se reportan como si el efecto no hubiese ocurrido. El CFG es `decode → validate → dedupe → fence → enqueue → recompute-policy → consent → acquire → execute → mark-commit → observe/cache → send/retransmit → exact-ACK|expiry|fence → cleanup` con ramas fail-closed en cada guard.
 
 ## Petri net, CSP y temporal logic
 
@@ -125,7 +127,7 @@ Effect(r) => live(r.identity) ∧ approved(r) ∧ policyAllows(r)
 terminal(r) => ownedResources(r)=0
 ```
 
-LTL: `G(Executing(r) -> ApprovedLatched(r))`, `G(identityChanged(i) -> F terminalRequestsBoundTo(i))`, `G(cancelled(r) -> G !effectCommitted(r))`, `G(interrupt(f) -> F terminalRestored(f))`, `G(queued(r) -> F terminalState(r))` bajo fairness. CTL: `AG(Recoverable(r) -> AF Idle(r))` bajo fairness explícita.
+LTL: `G(Executing(r) -> ApprovedLatched(r))`, `G(identityChanged(i) -> F terminalRequestsBoundTo(i))`, `G(cancelled(r) -> G !effectCommitted(r))`, `G(interrupt(f) -> F terminalRestored(f))`, `G(queued(r) -> F terminalState(r))` bajo fairness, `G(ResultCached(r) ∧ ¬ExactAck(r) -> (ResultCached(r) U (ExactAck(r) ∨ Expired(r) ∨ Fenced(r))))`, y `G(Retransmit(r) -> SameRequestDigestIdentity(r) ∧ ¬Reexecute(r))`. CTL: `AG(Recoverable(r) -> AF Idle(r))` bajo fairness explícita.
 
 P-invariantes: `consent_free + prompting = 1`; `adapter_free[k] + adapter_owned[k] = capacity(k)`; para cada request, la suma de sus estados lifecycle es 1. `result_count(request) <= 1` es una propiedad de seguridad, no un P-invariante.
 
@@ -137,15 +139,17 @@ Exploración acotada ejecutada por `npm run model-check:local-actions`: 3 reques
 - **Given** tres requests simultáneos, **When** se renderizan, **Then** sólo uno solicita consentimiento y el orden es FIFO.
 - **Given** un request aprobado, **When** cambia el process epoch antes del efecto, **Then** queda `cancelled`.
 - **Given** el mismo ID y digest duplicado, **When** el primero ejecuta, **Then** el segundo no ejecuta.
+- **Given** un resultado post-commit sin ACK, **When** la misma identidad se reatacha, **Then** se retransmite el mismo resultado sin repetir el efecto; un ACK distinto, expiry o fencing no puede consumir el resultado de otra identidad.
 - **Given** Ctrl-C durante consentimiento o efecto, **When** cleanup termina, **Then** el prompt vuelve tras un único interrupt.
+- **Given** un request `auth.device.present` o `browser.open` atribuido a OpenCode, **When** llega al broker, **Then** no se encola, no se abre browser/device UI y no se muestra consentimiento.
 
 ## Trazabilidad
 
 | Goal | Req | Diseño | Tarea | Test |
 |---|---|---|---|---|
 | G1.1 | R1.1–R1.2 | tipos + broker | T1-types, T1-broker | TC1-schema, TC1-queue |
-| G1.2 | R1.3–R1.4, R1.8 | policy/fence/redactor | T1-policy | TC1-deny, TC1-fence, TC1-redact |
-| G1.3 | R1.5–R1.7 | dedupe/cleanup/cotas | T1-lifecycle | TC1-race, TC1-ctrlc, TC1-bounds |
+| G1.2 | R1.3–R1.4, R1.8, R1.10 | policy/fence/redactor + registry sin kinds OpenCode | T1-policy | TC1-deny, TC1-fence, TC1-redact, `test/local-action-broker.test.mjs` |
+| G1.3 | R1.5–R1.7,R1.9 | dedupe/cache-ACK/cleanup/cotas | T1-lifecycle | TC1-race, TC1-result-cache, TC1-ctrlc, TC1-bounds |
 
 ## Riesgos y calidad
 

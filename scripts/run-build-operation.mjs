@@ -71,10 +71,9 @@ async function productTestFiles() {
 
 const lock = await acquireExclusiveBuildLock(repositoryRoot);
 try {
-  // The feature gate consumes the compiled witness from the npm artifact.
-  // Regenerate it inside the build lock so a changed vendored identity cannot
-  // leave an earlier committed/mutable verdict in dist.  The emitter is
-  // content-stable and performs no network or producer lookup.
+  // Keep the vendored API identity current for contract diagnostics. Provider
+  // admission is deliberately not derived from this local artifact: live
+  // capability and runtime observations decide each OpenCode operation.
   await emitVendoredInfraContractWitness(repositoryRoot);
   await cleanBuildOutput(repositoryRoot);
   await runNode([resolve(repositoryRoot, "node_modules/typescript/bin/tsc"), "-p", "tsconfig.json"]);

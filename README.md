@@ -163,7 +163,7 @@ cannot change meaning without a named test failing.
 | `3` | `auth` | No usable credential, a rejected credential, or an auth-mode conflict. | `cuna whoami` while `CUNA_API_KEY` is set mints `cuna.auth.mode_conflict`. A credential the server refuses arrives as `cuna.auth.rejected` from HTTP 401. |
 | `4` | `policy` | Understood and refused by policy, including a required confirmation. | `cuna machines delete ID` without `--yes` mints `cuna.confirmation.required`. A server refusal arrives as `cuna.policy.denied` from HTTP 403. |
 | `5` | `network` | No authoritative answer arrived, including when the CLI stopped waiting for one. | a request exceeding its observation budget mints `cuna.client.response_budget_elapsed`, and a bounded read-back that has not converged mints `cuna.client.convergence_budget_elapsed`; both are retryable and name the read to run. HTTP 429 and 5xx arrive as `cuna.network.rate_limited` and `cuna.network.service_unavailable`. |
-| `6` | `conflict` | Current state contradicts the change; repeating it unchanged repeats this. | HTTP 409 mints `cuna.remote.conflict`. A foreground attach to a session already held mints `cuna.runtime.session_conflict`. |
+| `6` | `conflict` | Current state contradicts the change; repeating it unchanged repeats this. | Most HTTP 409 responses mint `cuna.remote.conflict`. A foreground attach to a session already held mints `cuna.runtime.session_conflict`; provider-installation admission is instead an unsupported action with a concrete Machine-selection remedy. |
 | `7` | `remote` | The server answered, but not in a way the published contract allows. | `cuna account show` against a deployment whose body fails contract decoding mints `cuna.remote.malformed_response`. A 404 that does carry a JSON body is an absent resource and lands here as `cuna.remote.not_found`. |
 | `8` | `unsupported` | This deployment does not serve or does not advertise the capability. | `cuna records list` against a deployment with no route for it mints `cuna.remote.operation_not_served`: HTTP 404 whose body is not JSON, which only a layer in front of the API writes. |
 | `70` | `internal` | The CLI itself failed; no server outcome is implied. | any throw that is not a `CunaError` reaching the top of `runCli` is normalized to `cuna.internal.unexpected`. |
@@ -198,14 +198,14 @@ both names are present, `CUNA_API_KEY` always wins. An empty or malformed
 canonical value fails instead of falling through to the legacy credential.
 Other earlier-brand environment-variable names and local paths are not accepted.
 
-OpenCode creation and attachment are admitted only when this CLI was built from
-the committed Infra contract that declares interactive-only OpenCode support.
-No environment variable can invent or suppress that producer truth. Each live
-operation still requires current server capability evidence, a compatible
-machine, and exact AgentSession authority. OpenCode uses `interactive_login`
-only: choose `/connect` inside its remote terminal. Cuna never copies Codex,
-OpenAI, local-keychain, or other provider credentials into OpenCode. `cuna
-config get --json` reports the non-secret compiled gate state and reason.
+OpenCode creation and attachment are admitted from live server capability
+evidence, the observed compatible machine, and exact AgentSession authority.
+The CLI has no local OpenCode feature switch or release-witness gate, so a
+current server response—not package provenance or an environment
+variable—decides whether an operation may proceed. OpenCode uses
+`interactive_login` only: choose `/connect` inside its remote terminal. Cuna
+never copies Codex, OpenAI, local-keychain, or other provider credentials into
+OpenCode.
 
 `CUNA_API_KEY` and its deprecated `RUNA_API_KEY` alias are explicit automation
 credentials and are never persisted automatically. An automation

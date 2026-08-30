@@ -7,7 +7,7 @@
 
 ## 1. Problema
 
-El terminal remoto puede mostrar una necesidad local —abrir una URL, presentar un código, seleccionar un archivo o abrir un preview— pero el texto del PTY no constituye autoridad para ejecutar acciones en el equipo del usuario. La implementación actual sólo detecta URLs de autenticación de Claude/Codex en `src/local-actions/browser-action.ts`; no existe un envelope general, resultado tipado ni canal de capacidades locales.
+El terminal remoto puede mostrar una necesidad local —abrir una URL, presentar un código, seleccionar un archivo o abrir un preview— pero el texto del PTY no constituye autoridad para ejecutar acciones en el equipo del usuario. La implementación actual admite detectores de autenticación acotados para Claude/Codex. OpenCode es distinto: su runtime real elige proveedor y autentica dentro de su TUI remoto mediante `/connect`, seguido de `/models`; no existe un handoff CUNA device/browser para OpenCode. No existe autoridad implícita para una URL, un prompt o un servidor MCP arbitrario.
 
 Sin una frontera explícita, ampliar esa detección produciría dos fallos posibles: una CLI incapaz de completar journeys comunes, o un agente remoto con autoridad local excesiva. El problema central es permitir handoffs concretos sin convertir texto, MCP o la VM en autoridad del dispositivo.
 
@@ -18,7 +18,7 @@ Sin una frontera explícita, ampliar esa detección produciría dos fallos posib
 - **G0.1:** El usuario completa acciones locales comunes desde una sesión foreground con consentimiento visible y contexto verificable.
 - **G0.2:** Ningún origen remoto obtiene más autoridad que la intersección de política, decisión humana e identidad viva.
 - **G0.3:** Las capacidades funcionan mediante contratos uniformes en Windows, macOS y Linux, con evidencia runtime sólo donde exista host real.
-- **G0.4:** Claude y Codex son funcionales; OpenCode sólo queda preparado y oculto mientras su gate actual permanezca cerrado.
+- **G0.4:** Claude y Codex son funcionales mediante sus topologías locales acotadas. OpenCode queda habilitado como attach de TUI remoto: el usuario usa `/connect` para elegir/autenticar proveedor y `/models` para elegir modelo. El broker local expone cero acciones OpenCode y nunca abre browser, device UI, callback, paste, archivos, puertos ni otra acción local por OpenCode.
 
 ### No-objetivos / DoNotBuild
 
@@ -42,7 +42,7 @@ Un orden topológico de ejecución es `000, 001, [002-device|003], 004, 002-loop
 
 Dependency graph de repositorios/servicios: `cuna-cli(local broker, UI, adapters) → edge terminal-gateway → agent-session supervisor → per-session MCP`; `Supabase schema/RPC → edge`; `provider CLI → per-session MCP`; `PlatformAdapter → OS allowlists`. No existe arista `provider/VM → OS local`.
 
-Execution DAG: `validate envelope → prove live identity → enqueue → interactive decision → acquire exact resource → execute adapter → mark effect commit → observe/cache outcome → send → ACK → release`. `detach` puede cancelar sólo antes de effect commit; después de commit conserva el outcome cache o termina `outcome_unknown_nonretryable`.
+Execution DAG: `validate envelope → prove live identity → enqueue → interactive decision → acquire exact resource → execute adapter → mark effect commit → observe/cache outcome → send → ACK → release`. Un outcome post-commit permanece en el cache foreground bajo `(requestId,argumentsDigest,identity)` y se retransmite sin reejecutar hasta el ACK exacto, expiry o fencing de la identidad. `detach` puede cancelar sólo antes de effect commit; después de commit conserva ese outcome o termina `outcome_unknown_nonretryable`.
 
 ## 4. Requisitos EARS globales
 
@@ -52,9 +52,14 @@ Execution DAG: `validate envelope → prove live identity → enqueue → intera
 | R0.2 | WHEN una acción local sea solicitada, el broker SHALL verificar tipo, identidad viva, policy ceiling, política local y decisión humana antes del efecto. | MUST | G0.1, G0.2 |
 | R0.3 | IF cambia epoch, attachment generation o sesión, THEN el broker SHALL cancelar solicitudes y grants ligados a la identidad anterior. | MUST | G0.2 |
 | R0.4 | WHERE una capacidad no esté implementada por el adaptador del SO, la CLI SHALL declararla `unsupported` antes de cualquier efecto. | MUST | G0.3 |
-| R0.5 | WHILE OpenCode no supere su gate existente, la CLI SHALL NOT exponer acciones ejecutables de OpenCode. | MUST | G0.4 |
+| R0.5 | WHERE el proveedor sea OpenCode, la CLI SHALL adjuntar el terminal remoto y mostrar la guía `/connect` seguido de `/models`; SHALL exponer cero `LocalActionKind` para OpenCode y SHALL rechazar todo request/frame OpenCode antes de cola, consentimiento, adaptador, browser o cualquier otro efecto local. Un estado de auth OpenCode SHALL provenir sólo de una observación remota privada de la sesión exacta, nunca de texto PTY ni de una acción local. | MUST | G0.4 |
 | R0.6 | El trabajo SHALL preservar el protocolo RTP1 desplegado para peers que no negocien la extensión. | MUST | G0.1 |
 | R0.7 | La suite SHALL NOT introducir ninguno de los elementos DoNotBuild. | MUST | G0.2 |
+| R0.8 | WHEN `cuna` se ejecute sin comando en un TTY autenticado, THEN SHALL pintar `Finding a machine or AgentSession` antes de la primera lectura de inventario y SHALL NOT afirmar que adjunta antes de una selección explícita. | MUST | G0.1 |
+| R0.9 | WHEN la capacidad de crear AgentSession no sea fresca y verificable, THEN SHALL mostrar que la capacidad no puede verificarse y SHALL NOT ofrecer `New session` ni `Create machine` por inferencia; una sesión existente confirmada seguirá siendo seleccionable explícitamente. | MUST | G0.1, G0.2 |
+| R0.10 | WHEN una persona seleccione una Machine, THEN Enter/Right SHALL abrir sólo el contexto de esa Machine; SHALL NOT adjuntar una AgentSession por ser única. El attach SHALL requerir elegir una sesión concreta. | MUST | G0.1, G0.2 |
+| R0.11 | WHEN Ctrl-C ocurra durante discovery, capability, selector o attach, THEN SHALL abortar trabajo pendiente, mostrar `Closing…`, restaurar el terminal y devolver el prompt con una sola pulsación. | MUST | G0.1 |
+| R0.12 | WHILE el selector root no haya recibido una acción humana confirmada, THEN SHALL ejecutar sólo lecturas y SHALL NOT crear/iniciar/detener una Machine, crear una AgentSession ni crear una conexión de terminal. | MUST | G0.2 |
 
 ## 5. Arquitectura verificable
 
@@ -88,7 +93,7 @@ flowchart LR
   O --> Z[redacted LocalActionResult]
 ```
 
-Eventos: `request.detected → request.validated → request.queued → consent.decided → effect.started → effect.committed? → completion.observed → result.cached → result.sent → result.acked`. Antes de `effect.committed`, `identity.changed`, `expired`, `interrupt` o `detach` causa `request.cancelled`. Después de commit, nunca se finge cancelación: se conserva/retransmite el outcome o se produce `outcome_unknown_nonretryable`, y después ocurre cleanup.
+Eventos: `request.detected → request.validated → request.queued → consent.decided → effect.started → effect.committed? → completion.observed → result.cached → result.sent → result.acked`. Antes de `effect.committed`, `identity.changed`, `expired`, `interrupt` o `detach` causa `request.cancelled`. Después de commit, nunca se finge cancelación: se conserva/retransmite el outcome con el mismo `(requestId,argumentsDigest,identity)` hasta ACK exacto, expiry o fencing; si no se conserva un outcome verificable se produce `outcome_unknown_nonretryable`, y después ocurre cleanup.
 
 ### 5.3 CFG global
 
@@ -145,7 +150,7 @@ Selector(
 DeliverLocalActions
   -> EstablishAuthority(LA-001)
   -> Parallel[
-       ProviderAuthDeviceAndPaste(LA-002-device),
+       ClaudePasteAndCodexDevice(LA-002-device),
        Sequence(StructuredTransport(LA-003),
                  CallbackAndPorts(LA-004),
                  ProviderAuthLoopback(LA-002-loopback),
@@ -181,7 +186,12 @@ Propiedades LTL/CTL:
 - `G(IdentityChanged(i) -> G !EffectBoundTo(i))`.
 - `G(Interrupt -> F(RestoredTerminal ∧ NoOwnedResources))`.
 - `AG(Recoverable -> AF Idle)` bajo fairness explícita del consumidor y del cleanup.
-- `G(OpenCodeGateClosed -> !OpenCodeEffect)`.
+- `G(OpenCodeLocalActionFrame(r) -> F(RejectedBeforeQueue(r) ∧ ¬Effect(r)))`.
+- `G(OpenCodePtyOutput -> ¬LocalBrowserOrDeviceEffect)`.
+- `G(RootUnselected -> ¬RemoteMutation ∧ ¬TerminalAttach)`.
+- `G(CapacityUnverified -> ¬OfferCreate ∧ ¬OfferNewSession)`.
+- `G(MachineEnter -> X(MachineContext) ∧ ¬Attach)`.
+- `G(SIGINT -> F(TerminalRestored ∧ ¬PostAbortMutation))`.
 
 ### Bounded model checking
 
@@ -193,7 +203,8 @@ El explorador ejecutable `scripts/model-check-local-actions.mjs` cubre 3 request
 - **Given** dos requests simultáneos, **When** ambos requieren consentimiento, **Then** sólo uno se muestra y ambos terminan o expiran.
 - **Given** un peer RTP1 sin opt-in, **When** se conecta, **Then** conserva el comportamiento de terminal existente.
 - **Given** Ctrl-C en cualquier estado foreground, **When** se procesa, **Then** se muestra `Closing…`, se limpian recursos y vuelve el prompt.
-- **Given** el gate OpenCode cerrado, **When** cualquier origen pide una acción OpenCode, **Then** falla antes de red, host o proceso hijo.
+- **Given** un terminal OpenCode adjunto, **When** el usuario necesita elegir proveedor, **Then** la CLI muestra `/connect`, seguido de `/models`, dentro del TUI remoto y no abre un browser o UI de dispositivo local.
+- **Given** cualquier request/frame local atribuido a OpenCode, **When** llega al foreground, **Then** se rechaza antes de cola, consentimiento, broker o adaptador y nunca declara autenticación.
 
 ## 9. Trazabilidad
 
@@ -202,9 +213,10 @@ El explorador ejecutable `scripts/model-check-local-actions.mjs` cubre 3 request
 | G0.1 | R0.2, R0.6 | Broker + RTP opt-in | LA-001/003 | TC-000-01/02 |
 | G0.2 | R0.1, R0.3, R0.7 | Policy/fencing/DoNotBuild | LA-001/007 | TC-000-03/04 |
 | G0.3 | R0.4 | PlatformAdapter | LA-005/006/007 | TC-000-05 |
-| G0.4 | R0.5 | Existing OpenCode gate | LA-002/003 | TC-000-06 |
+| G0.4 | R0.5 | registry sin actions OpenCode + guía de attach TUI | LA-002/003 | `test/local-action-broker.test.mjs`, `test/terminal-foreground.test.mjs`, `test/progressive-command-disclosure.test.mjs` |
+| G0.1, G0.2 | R0.8–R0.12 | selector root read-only, capacidad explícita y attach por sesión | CLI explorer / foreground | `test/machines-explorer.test.mjs`, `test/root-journey.test.mjs`, `test/cli.test.mjs` |
 
-Oracles ejecutables: `TC-000-01/03 = npm run model-check:local-actions` sólo para las invariantes acotadas declaradas; `TC-000-02 = test/terminal-local-action-protocol.test.mjs`; `TC-000-05 = test/local-file-transfers.test.mjs + scripts/test-windows-conpty.mjs`; `TC-000-06 = test/provider-mcp-config.test.mjs`. `TC-000-04` (fairness/liveness fuerte) y cada ID no listado aquí permanecen `PLANNED`, no evidencia.
+Oracles ejecutables: `TC-000-01/03 = npm run model-check:local-actions` sólo para las invariantes acotadas declaradas; `TC-000-02 = test/terminal-local-action-protocol.test.mjs`; `TC-000-05 = test/local-file-transfers.test.mjs + scripts/test-windows-conpty.mjs`; la evidencia de R0.5 es `test/local-action-broker.test.mjs`, `test/local-browser-action.test.mjs`, `test/terminal-foreground.test.mjs` y `test/progressive-command-disclosure.test.mjs`. `TC-000-04` (fairness/liveness fuerte) y cada ID no listado aquí permanecen `PLANNED`, no evidencia.
 
 ## 10. Riesgos, supuestos y calidad
 
