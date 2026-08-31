@@ -337,15 +337,22 @@ test("duplicate AgentSession IDs and stale or unknown child state cannot select 
     ).reason,
     "duplicate-id",
   );
-  for (const observation of [
-    agentSession({ freshness: "stale" }),
-    agentSession({ processState: "unknown" }),
-    agentSession({ processState: "starting" }),
-    agentSession({ attachment: "unknown" }),
+  // Each cause keeps its own name. These four used to answer one reason, and
+  // only three of them were about an observation being old: `attachment` is a
+  // hardcoded `"unknown"` because no per-AgentSession attachment authority is
+  // published, so every exact match was refused as "stale" while its
+  // observation was seconds old. Stale invites a retry; unobservable is a
+  // missing prerequisite that no retry supplies, and a user told the wrong one
+  // waits for something that cannot arrive.
+  for (const [observation, expected] of [
+    [agentSession({ freshness: "stale" }), "authority-observation-stale"],
+    [agentSession({ processState: "unknown" }), "authority-observation-stale"],
+    [agentSession({ processState: "starting" }), "authority-observation-stale"],
+    [agentSession({ attachment: "unknown" }), "attachment-unobservable"],
   ]) {
     const plan = planAgentSessionSelection(agentSessionInput([observation]));
     assert.equal(plan.kind, "unavailable");
-    assert.equal(plan.reason, "authority-observation-stale");
+    assert.equal(plan.reason, expected);
   }
 });
 

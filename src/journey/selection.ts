@@ -152,6 +152,7 @@ export interface UnavailablePlan {
   readonly targetId?: string;
   readonly reason:
     | "already-attached"
+    | "attachment-unobservable"
     | "authority-data-invalid"
     | "authority-observation-stale"
     | "contradictory-selection"
@@ -726,14 +727,33 @@ export function planAgentSessionSelection(
   }
 
   const exact = input.agentSessions.filter((session) => isExactSessionKey(session, input));
+  /*
+   * Separate "the observation is old" from "this fact is not published at all".
+   *
+   * Both used to answer `authority-observation-stale`, and only one of them was
+   * ever true. `attachment` is a hardcoded `"unknown"` (`api-effects.ts:76`)
+   * because no per-AgentSession attachment authority exists yet, so EVERY exact
+   * match reaches this branch and is refused as stale. Measured in production
+   * 2026-08-30: three runs against machine 20ea0900 refused with
+   * `authority-observation-stale` while the matched session's observation was
+   * five seconds old with a valid runtime lease and a running process. Nothing
+   * was stale; the CLI simply cannot see who is attached, and said the wrong
+   * thing about it.
+   *
+   * The distinction is not cosmetic. Stale is transient and a retry is the
+   * right advice; unobservable is a missing prerequisite, and telling someone
+   * to retry it is telling them to wait for something that cannot arrive.
+   */
+  if (exact.some((session) => session.attachment === "unknown")) {
+    return unavailable("agent-session", "attachment-unobservable");
+  }
   if (
     exact.some(
       (session) =>
         session.freshness !== "fresh" ||
         session.processState === "unknown" ||
         session.processState === "starting" ||
-        session.processState === "terminating" ||
-        session.attachment === "unknown",
+        session.processState === "terminating",
     )
   ) {
     return unavailable("agent-session", "authority-observation-stale");

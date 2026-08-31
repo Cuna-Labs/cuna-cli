@@ -207,10 +207,27 @@ function selectionFailure(
         : plan.reason === "agent-mismatch"
           ? "Choose or create a machine configured for this provider (`cuna machines create --agent claude-code|codex|opencode ...`)."
           : "Select an exact machine with --machine NAME."
-      : "Select an exact child with --agent-session ID or request --new-session.",
+      : plan.reason === "attachment-unobservable"
+        // Naming the prerequisite instead of implying a retry. Cuna does not
+        // publish per-AgentSession attachment state, so reuse cannot prove the
+        // session is free and abstains rather than racing a terminal that may
+        // already have a writer. Waiting changes nothing, which is exactly why
+        // this must not read as a transient staleness.
+        ? "Cuna cannot yet observe whether an existing session is attached, so it will not reuse one automatically. Attach a known session with --agent-session ID, or start a fresh one with --new-session."
+        : "Select an exact child with --agent-session ID or request --new-session.",
     details: {
       target: target === "machine" ? "machine" : "agent_session",
       reason: plan.reason,
+      // Which one. Every `unavailable` plan may carry the id it rejected, and
+      // dropping it made two different branches indistinguishable from the
+      // outside: on 2026-08-30 a refusal reading
+      // `authority-observation-stale` could have come either from one
+      // session's own freshness or from the whole collection's, and the
+      // printed error could not say which -- while both inputs were hardcoded
+      // fresh, so neither branch should have been reachable at all.
+      ...("targetId" in plan && plan.targetId !== undefined
+        ? { target_id: plan.targetId }
+        : {}),
       ...(candidates === undefined ? {} : { candidates }),
     },
   });
