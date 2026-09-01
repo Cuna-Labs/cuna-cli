@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { TestResourceLedger } from "./support/test-resource-ledger.mjs";
 
-import { decodeTerminalControl, decodeTerminalFrame, encodeTerminalControl, encodeTerminalFrame, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
+import { decodeTerminalControl, decodeTerminalFrame, encodeTerminalControl, encodeTerminalFrame, TERMINAL_PROTOCOL, TerminalProtocolError } from "../dist/terminal/codec.js";
 import { requireVerifiedPtyAdapter } from "../dist/pty/evidence-gate.js";
 import { createNodeProcessAdapter } from "../dist/pty/node-process.js";
 import { createApiTerminalControlPlane } from "../dist/runtime/api-terminal-control-plane.js";
@@ -129,6 +129,9 @@ class FakeTerminalSystem {
     this.epochs = new Map();
     this.generation = 0;
     this.outputOnReady = new Map();
+    // The seat READY announces per AgentSession; a writer at epoch 1 unless a
+    // test says the terminal is already held.
+    this.seatOnReady = new Map();
     this.outputSequenceOnReady = new Map();
     this.retainedOutputOnResume = new Map();
     this.connectionsWithoutReady = new Set();
@@ -143,6 +146,8 @@ class FakeTerminalSystem {
           processEpoch: grant.processEpoch,
           fencingGeneration: grant.attachmentGeneration,
           resizeCapability: "live",
+          accessMode: this.seatOnReady.get(grant.agentSessionId)?.accessMode ?? "writer",
+          writerEpoch: this.seatOnReady.get(grant.agentSessionId)?.writerEpoch ?? 1,
         });
         const output = this.outputOnReady.get(grant.agentSessionId);
         let initial = this.connectionsWithoutReady.has(this.connections.length + 1) ? undefined : ready;
@@ -992,6 +997,8 @@ test("heartbeat lease begins only after delayed readiness is proven", async () =
     processEpoch: grant.processEpoch,
     fencingGeneration: grant.attachmentGeneration,
     resizeCapability: "live",
+    accessMode: "writer",
+    writerEpoch: 1,
   }));
   const attached = await attaching;
   assert.equal(attached.heartbeatObservedAt, now);
@@ -1205,6 +1212,8 @@ test("detach during reconnect permanently wins over a late ready frame", async (
     processEpoch: replacementGrant.processEpoch,
     fencingGeneration: replacementGrant.attachmentGeneration,
     resizeCapability: "live",
+    accessMode: "writer",
+    writerEpoch: 1,
   }));
 
   await assert.rejects(
@@ -1552,4 +1561,180 @@ test("runtime startup evidence expiry revokes readiness before later mutations",
   assert.equal(runtime.daemon.state, "recovery_required");
   assert.equal(system.createCalls.length, 0);
   await runtime.shutdown();
+});
+
+// ---------------------------------------------------------------------------
+// The writer seat. One attachment types; every other one observes. The seat
+// moves only on the server's own writer_epoch notice, never on a local guess.
+// ---------------------------------------------------------------------------
+
+function writerHeldRefusal() {
+  const error = new Error("Terminal writer held");
+  Object.assign(error, {
+    code: "cuna.remote.conflict",
+    details: { http_status: 409, reason: "terminal_writer_held" },
+  });
+  return error;
+}
+
+test("a held writer seat attaches as an observer, and an observer's keys never reach the wire", async () => {
+  const system = new FakeTerminalSystem();
+  const refused = [];
+  const issue = system.controlPlane.createTerminalConnection;
+  system.controlPlane.createTerminalConnection = async (input) => {
+    if (input.accessMode !== "observer") {
+      refused.push(input);
+      throw writerHeldRefusal();
+    }
+    return issue(input);
+  };
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 4 });
+  const { runtime, states } = createRuntime(system);
+  const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  assert.equal(attached.accessMode, "observer");
+  assert.equal(attached.writerEpoch, 4);
+  assert.equal(attached.writerClientInstanceId, null, "READY does not name the holder; the notice does");
+  assert.equal(refused.length, 1, "the writer seat is asked for exactly once before observing");
+  assert.equal(system.createCalls.at(-1).accessMode, "observer");
+  assert.notEqual(
+    system.createCalls.at(-1).idempotencyKey,
+    refused[0].idempotencyKey,
+    "the observer request is a new request, not a replay of the refused one",
+  );
+  assert.equal(system.createCalls.at(-1).expectedWriterEpoch, undefined, "an observer expects no epoch");
+
+  const connection = system.connections.at(-1);
+  const sentBefore = connection.sent.length;
+  await assert.rejects(
+    runtime.sendInput(new TextEncoder().encode("x"), "tab-a"),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_observer",
+  );
+  assert.equal(connection.sent.length, sentBefore, "a refused keystroke sends nothing");
+  assert.equal(states.at(-1).state, "active", "refusing a keystroke does not disturb the attachment");
+
+  connection.incoming.push(encodeTerminalControl("writer_epoch", 7n, {
+    writerEpoch: 5,
+    writerClientInstanceId: "client-1",
+    accessMode: "writer",
+  }));
+  await waitUntil(
+    () => states.at(-1)?.accessMode === "writer" && states.at(-1)?.writerEpoch === 5,
+    "the server's notice seats the attachment as the writer",
+  );
+  await runtime.sendInput(new TextEncoder().encode("y"), "tab-a");
+  assert.equal(decodeTerminalFrame(connection.sent.at(-1)).type, "input");
+  await runtime.shutdown();
+});
+
+test("a writer demoted by a transfer keeps observing; taking the seat back is confirmed by the API and seated by the notice", async () => {
+  const system = new FakeTerminalSystem();
+  const transfers = [];
+  system.controlPlane.transferTerminalWriter = async (input) => {
+    transfers.push(input);
+    return {
+      agentSessionId: input.agentSessionId,
+      processEpoch: `epoch-${input.agentSessionId}`,
+      writerEpoch: input.expectedWriterEpoch + 1,
+      writerClientInstanceId: input.clientInstanceId,
+      transferPending: false,
+    };
+  };
+  const { runtime, states } = createRuntime(system);
+  const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  assert.equal(attached.accessMode, "writer");
+  assert.equal(attached.writerClientInstanceId, "client-1");
+  const connection = system.connections.at(-1);
+
+  connection.incoming.push(encodeTerminalControl("writer_epoch", 3n, {
+    writerEpoch: 2,
+    writerClientInstanceId: "client-9",
+    accessMode: "observer",
+  }));
+  await waitUntil(() => states.at(-1)?.accessMode === "observer", "the notice demotes the former writer");
+  assert.equal(states.at(-1).reason, "writer_transferred");
+  assert.equal(states.at(-1).writerClientInstanceId, "client-9");
+  assert.equal(states.at(-1).state, "active", "a demoted writer stays attached");
+  await assert.rejects(
+    runtime.sendInput(new TextEncoder().encode("x"), "tab-a"),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_observer",
+  );
+
+  const asked = await runtime.takeWriter({ tabId: "tab-a" });
+  assert.deepEqual(transfers, [{ agentSessionId: "agent-a", clientInstanceId: "client-1", expectedWriterEpoch: 2 }]);
+  assert.equal(asked.accessMode, "observer", "the API's confirmation does not seat the client; the server's notice does");
+  assert.equal(asked.writerEpoch, 3);
+  assert.equal(asked.writerClientInstanceId, "client-1");
+  await assert.rejects(
+    runtime.sendInput(new TextEncoder().encode("early"), "tab-a"),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_observer",
+  );
+
+  connection.incoming.push(encodeTerminalControl("writer_epoch", 4n, {
+    writerEpoch: 3,
+    writerClientInstanceId: "client-1",
+    accessMode: "writer",
+  }));
+  await waitUntil(() => states.at(-1)?.accessMode === "writer", "the notice seats the new writer");
+  assert.equal(states.at(-1).reason, undefined);
+  await runtime.sendInput(new TextEncoder().encode("y"), "tab-a");
+  assert.equal(decodeTerminalFrame(connection.sent.at(-1)).type, "input");
+
+  const again = await runtime.takeWriter({ tabId: "tab-a" });
+  assert.equal(transfers.length, 1, "a writer asking for its own seat sends nothing");
+  assert.equal(again.accessMode, "writer");
+  await runtime.shutdown();
+});
+
+test("a transfer answered for another terminal or client is refused as a scope mismatch", async () => {
+  const system = new FakeTerminalSystem();
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  system.controlPlane.transferTerminalWriter = async (input) => ({
+    agentSessionId: input.agentSessionId,
+    processEpoch: `epoch-${input.agentSessionId}`,
+    writerEpoch: 2,
+    writerClientInstanceId: "somebody-else",
+    transferPending: false,
+  });
+  const { runtime, states } = createRuntime(system);
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await assert.rejects(
+    runtime.takeWriter({ tabId: "tab-a" }),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "grant_scope_mismatch",
+  );
+  assert.equal(states.at(-1).accessMode, "observer");
+  assert.equal(states.at(-1).writerEpoch, 1, "a mismatched answer moves nothing locally");
+  await runtime.shutdown();
+});
+
+test("the writer seat is spelled on the wire exactly, or refused", () => {
+  const ready = {
+    protocol: TERMINAL_PROTOCOL,
+    agentSessionId: "agent-a",
+    processEpoch: "epoch-agent-a",
+    fencingGeneration: 1,
+    resizeCapability: "live",
+  };
+  // The encoder spells whatever it is given; the receiving side is the oracle.
+  const received = (type, payload) => decodeTerminalControl(decodeTerminalFrame(encodeTerminalControl(type, 1n, payload)));
+  const malformed = (error) => error instanceof TerminalProtocolError && error.code === "invalid_payload";
+  assert.throws(() => received("ready", ready), malformed, "READY without a seat is not READY");
+  assert.throws(() => received("ready", { ...ready, accessMode: "root", writerEpoch: 1 }), malformed);
+  assert.throws(() => received("ready", { ...ready, accessMode: "writer", writerEpoch: 0 }), malformed);
+  assert.equal(received("ready", { ...ready, accessMode: "observer", writerEpoch: 1 }).accessMode, "observer");
+  assert.throws(
+    () => received("writer_epoch", { writerEpoch: 1, accessMode: "writer" }),
+    malformed,
+    "the notice must name the holder, even as null",
+  );
+  assert.throws(
+    () => received("writer_epoch", { writerEpoch: 1, writerClientInstanceId: null, accessMode: "root" }),
+    malformed,
+  );
+  assert.throws(
+    () => received("writer_epoch", { writerEpoch: 1, writerClientInstanceId: null, accessMode: "writer", extra: true }),
+    malformed,
+    "an unknown key is refused, not ignored",
+  );
+  const notice = received("writer_epoch", { writerEpoch: 2, writerClientInstanceId: null, accessMode: "observer" });
+  assert.deepEqual(notice, { writerEpoch: 2, writerClientInstanceId: null, accessMode: "observer" });
 });

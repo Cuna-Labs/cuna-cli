@@ -2,6 +2,7 @@ import type { CapabilitySnapshot } from "../api/contracts.js";
 import type {
   TerminalCapabilityName,
   TerminalConnectionGrant,
+  TerminalWriterState,
 } from "../api/contracts.js";
 import { instantOrNull } from "../core/instant.js";
 import { isTerminalConnectToken } from "../core/namespace.js";
@@ -51,8 +52,16 @@ export interface TerminalControlPlane {
     readonly idempotencyKey: string;
     readonly capabilityEvidence: CapabilityAdmission;
     readonly resumeHandle?: string;
+    readonly accessMode?: "writer" | "observer";
+    readonly expectedWriterEpoch?: number;
     readonly signal?: AbortSignal;
   }): Promise<TerminalConnectionGrant>;
+  transferTerminalWriter(input: {
+    readonly agentSessionId: string;
+    readonly clientInstanceId: string;
+    readonly expectedWriterEpoch?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<TerminalWriterState>;
 }
 
 export interface TerminalWireConnection {
@@ -82,6 +91,7 @@ export function createUnavailableTerminalControlPlane(): TerminalControlPlane {
     discoverCapabilities: unavailable,
     observeAgentSession: unavailable,
     createTerminalConnection: unavailable,
+    transferTerminalWriter: unavailable,
   });
 }
 

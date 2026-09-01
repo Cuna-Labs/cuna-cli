@@ -15,6 +15,7 @@ import {
   TerminalProtocolError,
   assertTerminalFrameLegal,
   decodeTerminalControl,
+  type TerminalWriterEpochPayload,
   decodeTerminalFrame,
   encodeTerminalControl,
   encodeTerminalFrame,
@@ -91,6 +92,9 @@ export interface RuntimeTerminalSnapshot {
   readonly outputSequence: bigint;
   readonly outputContinuity: "complete" | "unknown" | "incomplete";
   readonly resizeCapability: "live" | "initial_resize_only";
+  readonly accessMode: "writer" | "observer";
+  readonly writerEpoch: number;
+  readonly writerClientInstanceId: string | null;
   readonly heartbeatObservedAt: number;
   readonly heartbeatExpiresAt: number;
   readonly reason?: string;
@@ -160,6 +164,9 @@ interface TerminalEntry {
   fencingGeneration: number;
   capabilities: readonly TerminalConnectionCapability[];
   resizeCapability: "live" | "initial_resize_only";
+  accessMode: "writer" | "observer";
+  writerEpoch: number;
+  writerClientInstanceId: string | null;
   wireSequence: bigint;
   inputSequence: bigint;
   acknowledgedInputSequence: bigint;
@@ -387,6 +394,9 @@ export class CunaRuntimeBoundary {
         resumeHandle: grant.resumeHandle,
         localActionsNegotiated: false,
         localActionAcceptance: undefined,
+        accessMode: "observer",
+        writerEpoch: 0,
+        writerClientInstanceId: null,
         sendTail: Promise.resolve(),
         connectionRevision: 1,
         heartbeatSequence: 0n,
@@ -400,6 +410,9 @@ export class CunaRuntimeBoundary {
       entry.heartbeatSequence = 0n;
       entry.fencingGeneration = ready.payload.fencingGeneration;
       entry.resizeCapability = ready.payload.resizeCapability;
+      entry.accessMode = ready.payload.accessMode;
+      entry.writerEpoch = ready.payload.writerEpoch;
+      entry.writerClientInstanceId = ready.payload.accessMode === "writer" ? this.#options.clientInstanceId : null;
       entry.localActionAcceptance = this.#localActionAcceptance(
         ready.payload.localActionProtocol,
         entry.observation.agentSessionId,
@@ -507,6 +520,15 @@ export class CunaRuntimeBoundary {
   ): Promise<void> {
     this.#assertReady();
     const entry = this.#requireActiveTerminal(tabId);
+    if (entry.accessMode !== "writer") {
+      // An observer's keystrokes never reach the wire: the gateway would
+      // close the attachment on the first one. Refuse here, by name, and
+      // leave the attachment observing.
+      throw runtimeFailure(
+        "terminal_observer",
+        "This attachment observes the terminal; press Ctrl+] w to take control.",
+      );
+    }
     if (expectedBinding !== undefined && !sameEntryBinding(entry, expectedBinding)) {
       throw runtimeFailure("grant_scope_mismatch", "Terminal input targets a replaced attachment generation.");
     }
@@ -656,6 +678,36 @@ export class CunaRuntimeBoundary {
     await queued;
   }
 
+  /**
+   * Ask for the terminal's writing seat. The durable transfer is confirmed by
+   * the API; the seat this attachment holds changes only when the server's
+   * writer_epoch notice arrives, because the gateway fences input on that
+   * notice and a locally-assumed promotion would be closed on its first byte.
+   */
+  async takeWriter(input: { readonly tabId: string; readonly signal?: AbortSignal }): Promise<RuntimeTerminalSnapshot> {
+    this.#assertReady();
+    const entry = this.#requireActiveTerminal(input.tabId);
+    if (entry.accessMode === "writer") return snapshot(entry, this.#heartbeatTimeoutMs());
+    const state = await this.#options.controlPlane.transferTerminalWriter({
+      agentSessionId: entry.observation.agentSessionId,
+      clientInstanceId: this.#options.clientInstanceId,
+      expectedWriterEpoch: entry.writerEpoch,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+    });
+    if (
+      state.agentSessionId !== entry.observation.agentSessionId ||
+      state.processEpoch !== entry.observation.processEpoch ||
+      state.writerClientInstanceId !== this.#options.clientInstanceId
+    ) {
+      throw runtimeFailure("grant_scope_mismatch", "The writer transfer answered for another terminal or client.");
+    }
+    entry.writerEpoch = state.writerEpoch;
+    entry.writerClientInstanceId = state.writerClientInstanceId;
+    if (state.transferPending) entry.reason = "writer_transfer_pending";
+    this.#publish(entry);
+    return snapshot(entry, this.#heartbeatTimeoutMs());
+  }
+
   async reconnect(input: { readonly tabId: string; readonly signal?: AbortSignal }): Promise<RuntimeTerminalSnapshot> {
     this.#assertReady();
     const entry = this.#requireTerminal(input.tabId);
@@ -719,6 +771,12 @@ export class CunaRuntimeBoundary {
         undefined,
         entry.reconnectIdempotencyKey,
         reconnectAbort.signal,
+        // Reclaim the seat this attachment held, at the epoch it last saw. If
+        // the seat moved meanwhile the server says so and the reconnect lands
+        // as an observer, which is the truth of it.
+        entry.accessMode === "writer"
+          ? { accessMode: "writer", expectedWriterEpoch: entry.writerEpoch }
+          : { accessMode: "observer" },
       );
       // A ConnectionGrant is one-use. Once the control plane has returned a
       // replacement grant, retrying that mutation key after the WebSocket has
@@ -768,6 +826,9 @@ export class CunaRuntimeBoundary {
         outputAbort: new AbortController(),
         localActionsNegotiated: false,
         localActionAcceptance: undefined,
+        accessMode: "observer",
+        writerEpoch: 0,
+        writerClientInstanceId: null,
       };
       const ready = await this.#awaitReady(candidate, iterator, reconnectAbort.signal);
       candidate.lastHeartbeatAt = this.#clock();
@@ -822,6 +883,9 @@ export class CunaRuntimeBoundary {
       entry.fencingGeneration = ready.payload.fencingGeneration;
       entry.capabilities = grant.capabilities;
       entry.resizeCapability = ready.payload.resizeCapability;
+      entry.accessMode = ready.payload.accessMode;
+      entry.writerEpoch = ready.payload.writerEpoch;
+      entry.writerClientInstanceId = ready.payload.accessMode === "writer" ? this.#options.clientInstanceId : null;
       entry.viewId = nextViewId;
       entry.resumeHandle = grant.resumeHandle;
       entry.localActionAcceptance = candidate.localActionAcceptance;
@@ -1154,16 +1218,33 @@ export class CunaRuntimeBoundary {
     resumeHandle: string | undefined,
     idempotencyKey = this.#idempotencyKey(),
     signal?: AbortSignal,
+    seat: { readonly accessMode: "writer" | "observer"; readonly expectedWriterEpoch?: number } = { accessMode: "writer" },
   ): Promise<TerminalConnectionGrant> {
-    const grant = await this.#options.controlPlane.createTerminalConnection({
-      agentSessionId: observation.agentSessionId,
-      protocol: TERMINAL_PROTOCOL,
-      clientInstanceId: this.#options.clientInstanceId,
-      idempotencyKey,
-      capabilityEvidence: capability,
-      ...(resumeHandle === undefined ? {} : { resumeHandle }),
-      ...(signal === undefined ? {} : { signal }),
-    });
+    const request = (accessMode: "writer" | "observer", key: string): Promise<TerminalConnectionGrant> =>
+      this.#options.controlPlane.createTerminalConnection({
+        agentSessionId: observation.agentSessionId,
+        protocol: TERMINAL_PROTOCOL,
+        clientInstanceId: this.#options.clientInstanceId,
+        idempotencyKey: key,
+        capabilityEvidence: capability,
+        accessMode,
+        ...(resumeHandle === undefined ? {} : { resumeHandle }),
+        ...(accessMode === "writer" && seat.expectedWriterEpoch !== undefined
+          ? { expectedWriterEpoch: seat.expectedWriterEpoch }
+          : {}),
+        ...(signal === undefined ? {} : { signal }),
+      });
+    let grant: TerminalConnectionGrant;
+    try {
+      grant = await request(seat.accessMode, idempotencyKey);
+    } catch (error) {
+      // The writing seat belongs to another client of this principal, or it
+      // moved while this one was away. Attach as an observer instead of
+      // failing: the terminal is still visible, and Ctrl+] w asks for the
+      // seat later through the transfer the server arbitrates.
+      if (seat.accessMode !== "writer" || !writerSeatUnavailable(error)) throw error;
+      grant = await request("observer", this.#idempotencyKey());
+    }
     return validateTerminalGrant({
       grant,
       allowedCunaOrigins: this.#options.allowedCunaOrigins,
@@ -1328,6 +1409,19 @@ export class CunaRuntimeBoundary {
       ) {
         throw runtimeFailure("grant_scope_mismatch", "Terminal readiness evidence targets another AgentSession generation.");
       }
+      return;
+    }
+    if (frame.type === "writer_epoch") {
+      // The writer seat moved. The server names the new epoch, its holder and
+      // this attachment's own mode; the local view follows and says so.
+      const payload = decodeTerminalControl(frame) as unknown as TerminalWriterEpochPayload;
+      const wasWriter = entry.accessMode === "writer";
+      entry.accessMode = payload.accessMode;
+      entry.writerEpoch = payload.writerEpoch;
+      entry.writerClientInstanceId = payload.writerClientInstanceId;
+      if (wasWriter && payload.accessMode !== "writer") entry.reason = "writer_transferred";
+      else if (!wasWriter && payload.accessMode === "writer") delete entry.reason;
+      this.#publish(entry);
       return;
     }
     if (frame.type === "acknowledgement") {
@@ -1545,6 +1639,18 @@ async function withOutputDeadline<T>(operation: Promise<T>, timeoutMs: number): 
   }
 }
 
+/**
+ * The server's own name for "the writing seat is not yours to take right now":
+ * held by another client (`terminal_writer_held`) or moved past the epoch this
+ * client expected (`terminal_writer_stale`). The reason travels in the safe
+ * error details the API transport keeps for every refusal.
+ */
+function writerSeatUnavailable(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const reason = (error as { readonly details?: { readonly reason?: unknown } }).details?.reason;
+  return reason === "terminal_writer_held" || reason === "terminal_writer_stale";
+}
+
 function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000): RuntimeTerminalSnapshot {
   return Object.freeze({
     tabId: entry.tabId,
@@ -1563,6 +1669,9 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000): RuntimeTer
     outputSequence: entry.outputSequence,
     outputContinuity: entry.outputContinuity,
     resizeCapability: entry.resizeCapability,
+    accessMode: entry.accessMode,
+    writerEpoch: entry.writerEpoch,
+    writerClientInstanceId: entry.writerClientInstanceId,
     heartbeatObservedAt: entry.lastHeartbeatAt,
     heartbeatExpiresAt: entry.lastHeartbeatAt + heartbeatTimeoutMs,
     ...(entry.reason === undefined ? {} : { reason: entry.reason }),

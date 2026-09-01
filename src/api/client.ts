@@ -26,7 +26,9 @@ import {
   decodeOk,
   decodeCunaIdentity,
   decodeTerminalConnectionGrant,
+  decodeTerminalWriterState,
   decodeWorkspaceBindingAuthority,
+  type TerminalWriterState,
   type AgentKind,
   type AgentAuthMode,
   type AgentSession,
@@ -89,6 +91,14 @@ export interface TerminalConnectionCreateInput {
   readonly protocol: typeof TERMINAL_PROTOCOL;
   readonly clientInstanceId: string;
   readonly resumeHandle?: string;
+  /** Omitted means "writer": the seat that may type. "observer" only reads. */
+  readonly accessMode?: "writer" | "observer";
+  readonly expectedWriterEpoch?: number;
+}
+
+export interface TerminalWriterTransferInput {
+  readonly clientInstanceId: string;
+  readonly expectedWriterEpoch?: number;
 }
 
 export interface CunaApiClient {
@@ -157,6 +167,11 @@ export interface CunaApiClient {
     idempotencyKey: string,
     signal?: AbortSignal,
   ): Promise<TerminalConnectionGrant>;
+  transferTerminalWriter(
+    agentSessionId: string,
+    input: TerminalWriterTransferInput,
+    signal?: AbortSignal,
+  ): Promise<TerminalWriterState>;
 }
 
 /**
@@ -799,11 +814,45 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
             protocol: input.protocol,
             client_instance_id: input.clientInstanceId,
             ...(input.resumeHandle === undefined ? {} : { resume_handle: input.resumeHandle }),
+            ...(input.accessMode === undefined ? {} : { access_mode: input.accessMode }),
+            ...(input.expectedWriterEpoch === undefined ? {} : { expected_writer_epoch: input.expectedWriterEpoch }),
           },
           idempotencyKey,
           ...(signal === undefined ? {} : { signal }),
         },
         decodeTerminalConnectionGrant,
+      );
+    },
+    async transferTerminalWriter(agentSessionId, input, signal) {
+      const safeId = encodeCanonicalUuid(agentSessionId, "AgentSession ID");
+      if (!/^[A-Za-z0-9._:-]{1,256}$/u.test(input.clientInstanceId)) {
+        throw new CunaError({
+          code: "cuna.usage.invalid",
+          message: "Terminal client instance ID is malformed.",
+          exitCode: EXIT_CODES.usage,
+        });
+      }
+      if (
+        input.expectedWriterEpoch !== undefined &&
+        (!Number.isSafeInteger(input.expectedWriterEpoch) || input.expectedWriterEpoch < 0)
+      ) {
+        throw new CunaError({
+          code: "cuna.usage.invalid",
+          message: "The expected terminal writer epoch must be a non-negative integer.",
+          exitCode: EXIT_CODES.usage,
+        });
+      }
+      return fetchDecoded(
+        {
+          method: "POST",
+          path: `/v1/agent-sessions/${safeId}/terminal-writer`,
+          body: {
+            client_instance_id: input.clientInstanceId,
+            ...(input.expectedWriterEpoch === undefined ? {} : { expected_writer_epoch: input.expectedWriterEpoch }),
+          },
+          ...(signal === undefined ? {} : { signal }),
+        },
+        decodeTerminalWriterState,
       );
     },
   };

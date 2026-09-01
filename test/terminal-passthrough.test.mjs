@@ -53,6 +53,8 @@ function snapshot(state = "active", overrides = {}) {
     outputSequence: 0n,
     outputContinuity: "complete",
     resizeCapability: "live",
+    accessMode: "writer",
+    writerEpoch: 1,
     heartbeatObservedAt: 100,
     heartbeatExpiresAt: 200,
     ...overrides,
@@ -96,7 +98,7 @@ function harness({ deferredAttach = false, deferredInput = false, resizeCapabili
     async attach(input) {
       calls.attach.push(input);
       await waitForGateOrAbort(attachGate, input.signal);
-      const ready = snapshot("active", { resizeCapability });
+      const ready = snapshot("active", { resizeCapability, accessMode: "writer", writerEpoch: 1 });
       await callbacks.onTerminalReady(ready);
       return ready;
     },

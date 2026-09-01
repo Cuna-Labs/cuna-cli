@@ -25,8 +25,9 @@ const identity = Object.freeze({
   fencingGeneration: 7,
 });
 
-test("RTP1 reserves 11-16 and negotiates only the implemented intersection", () => {
-  assert.deepEqual(Object.values(TERMINAL_FRAME_TYPES).slice(-6), [11, 12, 13, 14, 15, 16]);
+test("RTP1 reserves 11-16 for local actions and 17 for the writer seat, and negotiates only the implemented intersection", () => {
+  assert.deepEqual(Object.values(TERMINAL_FRAME_TYPES).slice(-7), [11, 12, 13, 14, 15, 16, 17]);
+  assert.equal(TERMINAL_FRAME_TYPES.writer_epoch, 17);
   const acceptance = negotiateTerminalLocalActions({
     name: LOCAL_ACTION_PROTOCOL,
     maxRequestBytes: 65_536,
@@ -45,6 +46,8 @@ test("a local-action READY requires a complete canonical WorkspaceBinding identi
     processEpoch: "epoch-1",
     fencingGeneration: 7,
     resizeCapability: "live",
+    accessMode: "writer",
+    writerEpoch: 1,
     localActionProtocol: {
       name: LOCAL_ACTION_PROTOCOL,
       maxRequestBytes: 65_536,

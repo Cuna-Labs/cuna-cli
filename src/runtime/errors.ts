@@ -13,6 +13,8 @@ export type RuntimeErrorCode =
   | "terminal_not_ready"
   | "terminal_disconnected"
   | "terminal_timeout"
+  | "terminal_observer"
+  | "terminal_writer_unavailable"
   | "session_conflict"
   | "session_unknown"
   | "session_discontinuous"

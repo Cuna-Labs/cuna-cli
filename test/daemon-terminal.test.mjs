@@ -240,6 +240,8 @@ test("ready and acknowledgement control frames preserve PTY truth and non-execut
     processEpoch: "epoch-1",
     fencingGeneration: 3,
     resizeCapability: "initial_resize_only",
+    accessMode: "writer",
+    writerEpoch: 1,
   });
   const ready = decodeTerminalFrame(readyWire);
   assert.equal(decodeTerminalControl(ready).processEpoch, "epoch-1");
@@ -249,6 +251,8 @@ test("ready and acknowledgement control frames preserve PTY truth and non-execut
     processEpoch: "epoch-1",
     fencingGeneration: 0,
     resizeCapability: "live",
+    accessMode: "writer",
+    writerEpoch: 1,
   });
   assert.throws(
     () => decodeTerminalControl(decodeTerminalFrame(unfencedReady)),

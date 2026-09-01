@@ -42,6 +42,7 @@ const NEXT_TAB = 0x6e;
 const DETACH = 0x64;
 const HELP = 0x3f;
 const RETRY = 0x72;
+const TAKE_WRITER = 0x77; // Ctrl+] w: take the terminal's one writing seat
 const RESIZE_COALESCE_MS = 50;
 const DISCONNECT_FRAME_MS = 30;
 const DISCONNECTING_FRAMES = Object.freeze([
@@ -80,6 +81,7 @@ export interface ForegroundTerminalRuntime {
   }): Promise<RuntimeTerminalSnapshot>;
   detach(tabId: string): Promise<void>;
   reconnect(input: { readonly tabId: string; readonly signal?: AbortSignal }): Promise<RuntimeTerminalSnapshot>;
+  takeWriter(input: { readonly tabId: string; readonly signal?: AbortSignal }): Promise<RuntimeTerminalSnapshot>;
   sendInput(bytes: Uint8Array, tabId?: string, expectedBinding?: RuntimeTerminalResponse["binding"]): Promise<void>;
   resize(columns: number, rows: number, tabId?: string): Promise<void>;
   switchActive(tabId: string): RuntimeTerminalSnapshot;
@@ -172,6 +174,7 @@ export class ForegroundTerminalCoordinator {
   #pasteStartMatch = 0;
   #pasteEndMatch = 0;
   #stopPromise: Promise<void> | undefined;
+  #seatNotice: string | undefined;
   readonly #stopStarted: Promise<void>;
   readonly #resolveStopStarted: () => void;
   readonly #lifetimeAbort = new AbortController();
@@ -693,6 +696,13 @@ export class ForegroundTerminalCoordinator {
       try { await this.#routeInput(payload, receiptTarget); } finally { this.#pendingInputBytes -= payload.byteLength; }
     });
     this.#inputTail = operation.catch((error) => {
+      if (error instanceof RuntimeBoundaryError && error.code === "terminal_observer") {
+        // Typing into an observed terminal is refused, not fatal: the seat is
+        // someone else's. Say so on the notice line and keep observing.
+        this.#seatNotice = error.message;
+        void this.#render().catch(() => undefined);
+        return;
+      }
       if (error instanceof RuntimeBoundaryError && (error.code === "terminal_disconnected" || error.code === "session_unknown")) {
         if (this.#pendingBrowserActionTabId === this.#activeTabId) {
           this.#pendingBrowserAction = undefined;
@@ -811,6 +821,9 @@ export class ForegroundTerminalCoordinator {
       } else if (byte === RETRY) {
         await flush();
         this.#retryActiveTab();
+      } else if (byte === TAKE_WRITER) {
+        await flush();
+        this.#takeWriterActiveTab();
       } else {
         this.#helpVisible = false;
         target = chordTarget ?? target;
@@ -1498,8 +1511,10 @@ export class ForegroundTerminalCoordinator {
                   : `${providerName(this.#pendingBrowserAction.provider)} requests browser authentication · Enter/o open · d/Esc deny`,
               }
               : this.#helpVisible
-                ? { notice: "Keys: Ctrl+C detach | Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry | d detach" }
-                : {}),
+                ? { notice: "Keys: Ctrl+C detach | Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry | w take control | d detach" }
+                : this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) !== undefined
+                  ? { notice: this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) as string }
+                  : {}),
       });
       await this.#options.host.write(frame.bytes);
     });
@@ -1674,6 +1689,40 @@ export class ForegroundTerminalCoordinator {
     const tabId = this.#activeTabId;
     if (tabId === undefined || this.#tabs.get(tabId)?.snapshot.state !== "interrupted") return;
     this.#startRecovery(tabId);
+  }
+
+  /**
+   * Ctrl+] w: ask for the terminal's one writing seat. The seat itself moves
+   * only when the server's writer_epoch notice arrives; until then the tab
+   * keeps observing, and the notice line says which of the two is true.
+   */
+  #takeWriterActiveTab(): void {
+    const tabId = this.#activeTabId;
+    const runtime = this.#runtime;
+    if (tabId === undefined || runtime === undefined) return;
+    const tab = this.#tabs.get(tabId);
+    if (tab === undefined || tab.snapshot.state !== "active") return;
+    if (tab.snapshot.accessMode === "writer") {
+      this.#seatNotice = "You already hold this terminal's writer seat.";
+      void this.#render().catch(() => undefined);
+      return;
+    }
+    this.#seatNotice = "Taking control…";
+    void this.#render().catch(() => undefined);
+    void runtime.takeWriter({ tabId, signal: this.#lifetimeAbort.signal }).then(
+      () => { this.#seatNotice = undefined; },
+      (error: unknown) => {
+        this.#seatNotice = `Could not take control: ${error instanceof Error ? error.message : String(error)}`;
+      },
+    ).finally(() => { void this.#render().catch(() => undefined); });
+  }
+
+  #seatNoticeFor(snapshot: RuntimeTerminalSnapshot | undefined): string | undefined {
+    if (this.#seatNotice !== undefined) return this.#seatNotice;
+    if (snapshot === undefined || snapshot.state !== "active" || snapshot.accessMode !== "observer") return undefined;
+    return snapshot.reason === "writer_transferred"
+      ? "Control moved to another client · Ctrl+] w to take it back"
+      : "Observing (read-only) · Ctrl+] w to take control";
   }
 }
 

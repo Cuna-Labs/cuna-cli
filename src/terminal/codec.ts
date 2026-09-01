@@ -53,6 +53,9 @@ export const TERMINAL_FRAME_TYPES = Object.freeze({
   local_stream_data: 14,
   local_stream_close: 15,
   local_stream_window_update: 16,
+  // Server -> client: the terminal's writer seat moved (a transfer). Carries
+  // the new writer epoch, who holds it, and this attachment's own access mode.
+  writer_epoch: 17,
 } as const);
 
 export type TerminalFrameType = keyof typeof TERMINAL_FRAME_TYPES;
@@ -76,7 +79,17 @@ export interface TerminalReadyPayload {
   readonly processEpoch: string;
   readonly fencingGeneration: number;
   readonly resizeCapability: "live" | "initial_resize_only";
+  // The seat this attachment was bound to, and the terminal's writer epoch at
+  // that moment. "observer" reads; only the "writer" may send input.
+  readonly accessMode: "writer" | "observer";
+  readonly writerEpoch: number;
   readonly localActionProtocol?: TerminalLocalActionProtocolOffer;
+}
+
+export interface TerminalWriterEpochPayload {
+  readonly writerEpoch: number;
+  readonly writerClientInstanceId: string | null;
+  readonly accessMode: "writer" | "observer";
 }
 
 export interface TerminalLocalActionProtocolOffer {
@@ -313,12 +326,12 @@ const LEGAL_FRAMES: Readonly<
   Record<TerminalConnectionState, Readonly<Record<TerminalFrameDirection, ReadonlySet<TerminalFrameType>>>>
 > = Object.freeze({
   negotiating: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["heartbeat"]), server_to_client: new Set<TerminalFrameType>(["ready", "error"])}),
-  ready: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["resume", "heartbeat"]), server_to_client: new Set<TerminalFrameType>(["ready", "error", "heartbeat"])}),
+  ready: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["resume", "heartbeat"]), server_to_client: new Set<TerminalFrameType>(["ready", "error", "heartbeat", "writer_epoch"])}),
   attached: Object.freeze({
     client_to_server: new Set<TerminalFrameType>(["input", "resize", "signal", "heartbeat", "resume"]),
-    server_to_client: new Set<TerminalFrameType>(["output", "acknowledgement", "heartbeat", "exit", "error", "ready"]),
+    server_to_client: new Set<TerminalFrameType>(["output", "acknowledgement", "heartbeat", "exit", "error", "ready", "writer_epoch"]),
   }),
-  draining: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["heartbeat"]), server_to_client: new Set<TerminalFrameType>(["output", "exit", "error", "heartbeat"])}),
+  draining: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["heartbeat"]), server_to_client: new Set<TerminalFrameType>(["output", "exit", "error", "heartbeat", "writer_epoch"])}),
   interrupted: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["resume"]), server_to_client: new Set<TerminalFrameType>(["ready", "error"])}),
   closed: Object.freeze({ client_to_server: new Set<TerminalFrameType>(), server_to_client: new Set<TerminalFrameType>() }),
 });
@@ -375,15 +388,25 @@ function validateControlPayload(type: TerminalFrameType, value: Record<string, u
         !isIdentifier(value.processEpoch) ||
         !Number.isSafeInteger(value.fencingGeneration) ||
         Number(value.fencingGeneration) < 1 ||
-        (value.resizeCapability !== "live" && value.resizeCapability !== "initial_resize_only")
+        (value.resizeCapability !== "live" && value.resizeCapability !== "initial_resize_only") ||
+        (value.accessMode !== "writer" && value.accessMode !== "observer") ||
+        !isBoundedPositiveInteger(value.writerEpoch, Number.MAX_SAFE_INTEGER)
       ) throwInvalidPayload();
       assertKeys(
         value,
-        ["protocol", "agentSessionId", "processEpoch", "fencingGeneration", "resizeCapability"],
+        ["protocol", "agentSessionId", "processEpoch", "fencingGeneration", "resizeCapability", "accessMode", "writerEpoch"],
         ["machineId", "machineGeneration", "workspaceBindingId", "workspaceBindingGeneration", "localActionProtocol"],
       );
       validateReadyIdentity(value);
       if (value.localActionProtocol !== undefined) validateLocalActionOffer(value.localActionProtocol);
+      return;
+    case "writer_epoch":
+      if (
+        !isBoundedPositiveInteger(value.writerEpoch, Number.MAX_SAFE_INTEGER) ||
+        (value.writerClientInstanceId !== null && typeof value.writerClientInstanceId !== "string") ||
+        (value.accessMode !== "writer" && value.accessMode !== "observer")
+      ) throwInvalidPayload();
+      assertKeys(value, ["writerEpoch", "writerClientInstanceId", "accessMode"]);
       return;
     case "resize":
       if (!isDimension(value.columns) || !isDimension(value.rows)) throwInvalidPayload();

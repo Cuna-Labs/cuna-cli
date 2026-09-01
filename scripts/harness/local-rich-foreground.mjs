@@ -37,6 +37,8 @@ export async function runLocalRichForeground(input = {}) {
       outputSequence: 0n,
       outputContinuity: "complete",
       resizeCapability: "live",
+      accessMode: "writer",
+      writerEpoch: 1,
       heartbeatObservedAt: now - 100,
       heartbeatExpiresAt: now + 30_000,
     });

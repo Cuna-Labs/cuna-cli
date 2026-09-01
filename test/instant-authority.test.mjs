@@ -170,6 +170,8 @@ test("local-action READY must match the exact AgentSession WorkspaceBinding", ()
     processEpoch: admitted.processEpoch,
     fencingGeneration: 7,
     resizeCapability: "live",
+    accessMode: "writer",
+    writerEpoch: 1,
     localActionProtocol: {
       name: "cuna.local-actions.v1",
       maxRequestBytes: 65_536,

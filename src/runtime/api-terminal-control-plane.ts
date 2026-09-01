@@ -67,8 +67,26 @@ export function createApiTerminalControlPlane(input: {
           ...(request.resumeHandle === undefined
             ? {}
             : { resumeHandle: request.resumeHandle }),
+          ...(request.accessMode === undefined ? {} : { accessMode: request.accessMode }),
+          ...(request.expectedWriterEpoch === undefined
+            ? {}
+            : { expectedWriterEpoch: request.expectedWriterEpoch }),
         },
         request.idempotencyKey,
+        request.signal,
+      );
+    },
+    async transferTerminalWriter(
+      request: Parameters<TerminalControlPlane["transferTerminalWriter"]>[0],
+    ) {
+      return input.client.transferTerminalWriter(
+        request.agentSessionId,
+        {
+          clientInstanceId: request.clientInstanceId,
+          ...(request.expectedWriterEpoch === undefined
+            ? {}
+            : { expectedWriterEpoch: request.expectedWriterEpoch }),
+        },
         request.signal,
       );
     },

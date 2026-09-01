@@ -302,6 +302,8 @@ function terminalSystem(events, availability = () => "supported") {
         processEpoch: grant.processEpoch,
         fencingGeneration: grant.attachmentGeneration,
         resizeCapability: "live",
+        accessMode: "writer",
+        writerEpoch: 1,
       }));
       events.push("wire:connected");
       return {

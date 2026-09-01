@@ -88,6 +88,8 @@ function snapshot(intent, generation = 1) {
     outputSequence: 0n,
     outputContinuity: "complete",
     resizeCapability: "live",
+    accessMode: "writer",
+    writerEpoch: 1,
     heartbeatObservedAt: 100,
     heartbeatExpiresAt: 200,
   };
@@ -119,7 +121,7 @@ function harness(options = {}) {
     ...options.coordinatorOptions,
   });
   const callbacks = coordinator.runtimeCallbacks();
-  const calls = { attach: [], detach: [], reconnect: [], input: [], inputAuthorities: [], repaint: [], resize: [], switch: [], responses: [], localActionControls: [] };
+  const calls = { attach: [], detach: [], reconnect: [], takeWriter: [], input: [], inputAuthorities: [], repaint: [], resize: [], switch: [], responses: [], localActionControls: [] };
   const intents = [
     { tabId: "tab-a", agentSessionId: SESSION_A, label: "primary", agent: "claude-code" },
     { tabId: "tab-b", agentSessionId: SESSION_B, label: "review", agent: "codex" },
@@ -144,6 +146,11 @@ function harness(options = {}) {
         callbacks.onTerminalState({ ...snapshot(intent), state });
         await new Promise((resolve) => setImmediate(resolve));
       }
+    },
+    async takeWriter(input) {
+      calls.takeWriter.push(input.tabId);
+      if (options.takeWriterError !== undefined) throw options.takeWriterError;
+      return snapshot(intents.find((item) => item.tabId === input.tabId));
     },
     async reconnect(input) {
       calls.reconnect.push(input.tabId);
@@ -1410,4 +1417,42 @@ test("plain Node host restoration neutralizes hostile alternate-screen, focus, c
   assert.equal(restored.includes("\u001b>"), true);
   assert.equal(stdin.raw, false);
   assert.equal(stdin.readableFlowing, false);
+});
+
+test("an observed tab says so on the notice line, and Ctrl+] w asks the runtime for the writer seat", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness();
+  await coordinator.start(intents.slice(0, 1));
+  assert.equal(decoder.decode(host.writes.at(-1)).includes("Observing"), false, "a writer is not told it is observing");
+
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2, writerClientInstanceId: "other-client" });
+  await waitUntil(
+    () => decoder.decode(host.writes.at(-1)).includes("Observing (read-only)"),
+    "an observed tab renders its seat on the notice line",
+  );
+
+  host.emitInput(Uint8Array.of(0x1d, 0x77));
+  await waitUntil(() => calls.takeWriter.length === 1, "the chord asks for the seat");
+  assert.deepEqual(calls.takeWriter, ["tab-a"]);
+
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2, reason: "writer_transferred" });
+  await waitUntil(
+    () => decoder.decode(host.writes.at(-1)).includes("Control moved to another client"),
+    "a demoted writer is told the seat moved",
+  );
+  await coordinator.stop();
+});
+
+test("a refused seat request is reported on the notice line and does not stop the foreground", async () => {
+  const failure = new Error("Terminal writer changed");
+  const { coordinator, callbacks, calls, host, intents } = harness({ takeWriterError: failure });
+  await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+  host.emitInput(Uint8Array.of(0x1d, 0x77));
+  await waitUntil(() => calls.takeWriter.length === 1, "the chord asks for the seat");
+  await waitUntil(
+    () => decoder.decode(host.writes.at(-1)).includes("Could not take control: Terminal writer changed"),
+    "the refusal is shown with the server's own words",
+  );
+  assert.equal(coordinator.state, "active");
+  await coordinator.stop();
 });

@@ -1045,6 +1045,38 @@ export function decodeApiKeyCreation(value: unknown): ApiKeyCreation {
     : Object.freeze({ ...metadata, idempotencyReplayed: false, key: key as string });
 }
 
+/**
+ * The terminal's writer seat after a transfer request: which epoch it is at,
+ * who holds it, and whether the supervisor has confirmed the promotion yet.
+ */
+export interface TerminalWriterState {
+  readonly agentSessionId: string;
+  readonly processEpoch: string;
+  readonly writerEpoch: number;
+  readonly writerClientInstanceId: string;
+  readonly transferPending: boolean;
+}
+
+export function decodeTerminalWriterState(value: unknown): TerminalWriterState {
+  if (!isObject(value)) throw contractViolation("object");
+  exactKeys(value, ["agent_session_id", "process_epoch", "writer_epoch", "writer_client_instance_id", "transfer_pending"]);
+  const agentSessionId = canonicalUuid(value, "agent_session_id");
+  const processEpoch = canonicalUuid(value, "process_epoch");
+  if (
+    !Number.isSafeInteger(value.writer_epoch) || Number(value.writer_epoch) < 1 ||
+    typeof value.writer_client_instance_id !== "string" ||
+    !/^[A-Za-z0-9._:-]{1,256}$/u.test(value.writer_client_instance_id) ||
+    typeof value.transfer_pending !== "boolean"
+  ) throw contractViolation("terminal_writer_state_shape");
+  return Object.freeze({
+    agentSessionId,
+    processEpoch,
+    writerEpoch: Number(value.writer_epoch),
+    writerClientInstanceId: value.writer_client_instance_id,
+    transferPending: value.transfer_pending,
+  });
+}
+
 export function decodeOk(value: unknown): true {
   if (!isObject(value)) throw contractViolation("object");
   exactKeys(value, ["ok"]);
