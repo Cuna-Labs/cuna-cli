@@ -444,11 +444,16 @@ export class CunaRuntimeBoundary {
       if (entry.resizeCapability !== "live") {
         throw runtimeFailure("capability_unsupported", "This terminal cannot establish its initial dimensions.");
       }
-      entry.wireSequence += 1n;
-      await connection.send(encodeTerminalControl("resize", entry.wireSequence, {
-        columns: input.columns,
-        rows: input.rows,
-      }));
+      // Only the writing seat sets the PTY's geometry. An observer renders
+      // whatever size the writer chose; a RESIZE from it would close the
+      // attachment at the gateway (observer_control_rejected).
+      if (entry.accessMode === "writer") {
+        entry.wireSequence += 1n;
+        await connection.send(encodeTerminalControl("resize", entry.wireSequence, {
+          columns: input.columns,
+          rows: input.rows,
+        }));
+      }
       // The supervisor starts and drains the provider PTY before a terminal
       // client necessarily attaches. READY proves the live binding but does
       // not include retained output, so request replay only after the ordered
@@ -583,6 +588,7 @@ export class CunaRuntimeBoundary {
 
   async resize(columns: number, rows: number, tabId = this.#activeTabId): Promise<void> {
     const entry = this.#requireActiveTerminal(tabId);
+    this.#requireWriterSeat(entry);
     this.#requireGrantCapability(entry, "live_resize");
     if (entry.resizeCapability !== "live") {
       throw runtimeFailure("capability_unsupported", "This terminal supports only its initial dimensions.");
@@ -596,6 +602,7 @@ export class CunaRuntimeBoundary {
 
   async signal(signal: "interrupt" | "suspend" | "terminate", tabId = this.#activeTabId): Promise<void> {
     const entry = this.#requireActiveTerminal(tabId);
+    this.#requireWriterSeat(entry);
     this.#requireGrantCapability(entry, "signals");
     await this.#enqueueTerminalSend(entry, async (authority) => {
       this.#views.routeInput(authority.viewId, authority.fencingGeneration);
@@ -848,11 +855,14 @@ export class CunaRuntimeBoundary {
         throw runtimeFailure("capability_unsupported", "The reconnected terminal cannot restore its dimensions.");
       }
       const previous = this.#views.require(previousViewId);
-      const resizeSequence = entry.wireSequence + 1n;
-      await connection.send(encodeTerminalControl("resize", resizeSequence, {
-        columns: previous.columns,
-        rows: previous.rows,
-      }));
+      // As on attach: an observer never resizes the PTY.
+      const resizeSequence = entry.accessMode === "writer" ? entry.wireSequence + 1n : entry.wireSequence;
+      if (entry.accessMode === "writer") {
+        await connection.send(encodeTerminalControl("resize", resizeSequence, {
+          columns: previous.columns,
+          rows: previous.rows,
+        }));
+      }
       const resumeSequence = resizeSequence + 1n;
       await connection.send(encodeTerminalControl("resume", resumeSequence, {
         resumeHandle: grant.resumeHandle,
@@ -1500,6 +1510,21 @@ export class CunaRuntimeBoundary {
     const entry = this.#terminals.get(tabId);
     if (entry === undefined) throw runtimeFailure("session_unknown", "The local terminal tab does not exist.");
     return entry;
+  }
+
+  /**
+   * Only the writing seat may reach the PTY: input, resize and signals. The
+   * gateway closes an observer's attachment on the first such frame
+   * (`observer_control_rejected`), so the refusal must happen here, by name,
+   * before anything is sent. An observer tab keeps observing.
+   */
+  #requireWriterSeat(entry: TerminalEntry): void {
+    if (entry.accessMode !== "writer") {
+      throw runtimeFailure(
+        "terminal_observer",
+        "This attachment observes the terminal; press Ctrl+] w to take control.",
+      );
+    }
   }
 
   #requireActiveTerminal(tabId: string | undefined): TerminalEntry {

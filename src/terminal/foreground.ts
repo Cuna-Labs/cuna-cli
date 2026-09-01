@@ -1393,7 +1393,13 @@ export class ForegroundTerminalCoordinator {
     const rows = remoteRows(dimensions.rows);
     for (const [tabId, tab] of this.#tabs) {
       await tab.viewport.resize(dimensions.columns, rows);
-      if (tab.snapshot.resizeCapability === "live" && tab.snapshot.state === "active") {
+      // An observer renders at the writer's dimensions; it never resizes the
+      // PTY. The gateway would close its attachment on the first RESIZE.
+      if (
+        tab.snapshot.resizeCapability === "live" &&
+        tab.snapshot.state === "active" &&
+        tab.snapshot.accessMode !== "observer"
+      ) {
         await this.#requireRuntime().resize(dimensions.columns, rows, tabId);
       }
     }
@@ -1409,6 +1415,10 @@ export class ForegroundTerminalCoordinator {
       tab === undefined ||
       snapshot.state !== "active" ||
       snapshot.resizeCapability !== "live" ||
+      // An observer neither resizes the PTY nor asks it to repaint: both are
+      // writer actions the gateway closes an observer's attachment for.
+      snapshot.accessMode === "observer" ||
+      tab.snapshot.accessMode === "observer" ||
       tab.snapshot.state !== "active" ||
       tab.snapshot.resizeCapability !== "live" ||
       !sameSnapshotBinding(tab.snapshot, snapshot)

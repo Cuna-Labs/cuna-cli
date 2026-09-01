@@ -1611,6 +1611,17 @@ test("a held writer seat attaches as an observer, and an observer's keys never r
   );
   assert.equal(connection.sent.length, sentBefore, "a refused keystroke sends nothing");
   assert.equal(states.at(-1).state, "active", "refusing a keystroke does not disturb the attachment");
+  await assert.rejects(
+    runtime.resize(100, 40, "tab-a"),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_observer",
+    "an observer does not resize the PTY",
+  );
+  await assert.rejects(
+    runtime.signal("interrupt", "tab-a"),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "terminal_observer",
+    "an observer does not signal the process",
+  );
+  assert.equal(connection.sent.length, sentBefore, "a refused resize or signal sends nothing either");
 
   connection.incoming.push(encodeTerminalControl("writer_epoch", 7n, {
     writerEpoch: 5,

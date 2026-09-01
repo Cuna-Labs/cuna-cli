@@ -1429,6 +1429,11 @@ test("an observed tab says so on the notice line, and Ctrl+] w asks the runtime 
     () => decoder.decode(host.writes.at(-1)).includes("Observing (read-only)"),
     "an observed tab renders its seat on the notice line",
   );
+  const resizesBefore = calls.resize.length;
+  host.columns = 132;
+  host.emitResize();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(calls.resize.length, resizesBefore, "an observed tab never resizes the PTY");
 
   host.emitInput(Uint8Array.of(0x1d, 0x77));
   await waitUntil(() => calls.takeWriter.length === 1, "the chord asks for the seat");
