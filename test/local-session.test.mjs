@@ -262,9 +262,16 @@ test("a batched inspection failure is raised at the enforcement site without a s
     failBatch = true;
     const before = { single: counters.single, batch: counters.batch };
     // The first enforcement site in any operation is the directory check that
-    // follows lock acquisition; its error surfaces unchanged, as it did for a
-    // single-path directory inspection before batching.
-    await assert.rejects(backend.read("ignored"), (error) => error?.code === "ETIMEDOUT" && /simulated batched ACL timeout/u.test(error.message));
+    // follows lock acquisition. A bounded timeout there is the same named,
+    // retryable condition as at the key and ciphertext sites; before this
+    // it escaped raw and rendered as an internal defect (exit 70).
+    await assert.rejects(
+      backend.read("ignored"),
+      (error) => error?.code === "credential_backend_failure" &&
+        error.retryable === true &&
+        error.safeDetails?.reason === "windows_acl_inspection_timeout" &&
+        /directory/u.test(error.message),
+    );
     assert.equal(counters.batch - before.batch, 1);
     assert.equal(counters.single - before.single, 0, "a failed batch is not retried path by path");
     assert.equal((await backend.probe()).status, "unavailable");

@@ -493,7 +493,16 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
         // boundary to derive its authority; immediately after acquisition the
         // full owner/DACL inspection below is mandatory before any operation.
         if (input.verifyExistingWindowsAcl ?? true) {
-          await this.#assertWindowsOwnerOnlyAcl(directory, true);
+          // The directory check is the first enforcement site of every
+          // operation. A bounded helper timeout here used to escape as a raw
+          // child-process error and render as an internal defect (exit 70);
+          // it is the same retryable, fail-closed condition as at the key
+          // and ciphertext sites.
+          try {
+            await this.#assertWindowsOwnerOnlyAcl(directory, true);
+          } catch (error) {
+            throw localSessionReadFailure("directory", error);
+          }
         }
       } else {
         await this.#ensureNewWindowsOwnerOnlyAcl(
@@ -605,7 +614,7 @@ function validateExpectedDigest(value: string | null): void {
  * retryable/fail-closed and leave the durable pair untouched; only a parsed
  * invalid key or ciphertext is reported as credential corruption.
  */
-function localSessionReadFailure(subject: "ciphertext" | "key", error: unknown): CredentialBoundaryError {
+function localSessionReadFailure(subject: "ciphertext" | "key" | "directory", error: unknown): CredentialBoundaryError {
   if (error instanceof CredentialBoundaryError) return error;
   if (isBoundedWindowsAclTimeout(error)) {
     return credentialFailure(
@@ -821,7 +830,10 @@ async function inspectWindowsAcl(path: string, directory: boolean): Promise<Wind
     ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_ACL_COMMAND_PROGRAMS.inspect],
     {
       windowsHide: true,
-      timeout: 5_000,
+      // PowerShell 5.1 start-up alone is 1–3 s on a loaded host and single
+      // spawns of 4.9–5.2 s were measured under a CPU hog; the bound must
+      // outlast that without becoming an effective hang.
+      timeout: 15_000,
       maxBuffer: 16 * 1024,
       encoding: "utf8",
       env: isolateWindowsAclChildEnvironment(process.env, path),
@@ -843,7 +855,10 @@ export async function inspectWindowsAclMany(
     ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany],
     {
       windowsHide: true,
-      timeout: 5_000,
+      // PowerShell 5.1 start-up alone is 1–3 s on a loaded host and single
+      // spawns of 4.9–5.2 s were measured under a CPU hog; the bound must
+      // outlast that without becoming an effective hang.
+      timeout: 15_000,
       maxBuffer: 64 * 1024,
       encoding: "utf8",
       env: isolateWindowsAclBatchChildEnvironment(process.env, requests.map((request) => request.path)),
@@ -886,7 +901,10 @@ async function reconcileNewWindowsAcl(path: string, directory: boolean): Promise
     ["-NoProfile", "-NonInteractive", "-Command", program],
     {
       windowsHide: true,
-      timeout: 5_000,
+      // PowerShell 5.1 start-up alone is 1–3 s on a loaded host and single
+      // spawns of 4.9–5.2 s were measured under a CPU hog; the bound must
+      // outlast that without becoming an effective hang.
+      timeout: 15_000,
       maxBuffer: 32 * 1024,
       encoding: "utf8",
       env: isolateWindowsAclChildEnvironment(process.env, path),
