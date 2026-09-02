@@ -126,10 +126,14 @@ test("exclusion policy runs before content reads and never opens immutable secre
   await mkdir(join(root, ".cuna"));
   await writeFile(join(root, ".cuna", "workspace.json"), "private metadata");
   await writeFile(join(root, ".env"), "SECRET=should-not-be-read");
-  await mkdir(join(root, "dist"));
-  await writeFile(join(root, "dist", "generated.js"), "generated");
+  // Not `dist`: that directory now carries its own immutable exclusion
+  // (PRD-PM-002 S9), independent of the `cunaignore` rule this test exists
+  // to exercise. `build-output` keeps the user-rule scenario isolated from
+  // the immutable-defaults behavior exercised elsewhere.
+  await mkdir(join(root, "build-output"));
+  await writeFile(join(root, "build-output", "generated.js"), "generated");
   await writeFile(join(root, "source.ts"), "export const safe = true;\n");
-  const policy = compileExclusionPolicy([{ source: "cunaignore", text: "dist/**\n" }], linuxCapabilities);
+  const policy = compileExclusionPolicy([{ source: "cunaignore", text: "build-output/**\n" }], linuxCapabilities);
   const opened = [];
   const manifest = await createWorkspaceManifest({
     root,
@@ -138,7 +142,7 @@ test("exclusion policy runs before content reads and never opens immutable secre
     beforeContentRead: (path) => opened.push(path),
   });
   assert.deepEqual(opened, ["source.ts"]);
-  assert.deepEqual(manifest.entries.map((entry) => entry.path), ["dist", "source.ts"]);
+  assert.deepEqual(manifest.entries.map((entry) => entry.path), ["build-output", "source.ts"]);
   assert.equal(manifest.excludedCounts.immutable_credentials, 1);
   assert.equal(manifest.excludedCounts.immutable_metadata, 1);
   assert.equal(manifest.excludedCounts.user_rule, 1);
