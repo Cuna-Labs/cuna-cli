@@ -198,6 +198,53 @@ test("duplicate machine IDs, stale bindings, unknown authority and incompatible 
   });
 });
 
+test("a stopped machine whose runtime cannot be verified is started, not refused", () => {
+  // Measured 2026-09-02: `cuna opencode --machine NAME` on a stopped OpenCode
+  // Machine refused with `state-unknown`, because `agent_sessions.create`
+  // reads `temporarily_unavailable / opencode_runtime_unverified` while the
+  // Machine is off — a fact about the Machine being off, not about OpenCode.
+  const stopped = planMachineSelection(machineInput([
+    machine({ state: "stopped", requestedAgentSupport: "unknown", agent: "opencode" }),
+  ], { requestedAgent: "opencode", selector: { kind: "id", value: MACHINE_A } }));
+  assert.equal(stopped.kind, "select", JSON.stringify(stopped));
+  assert.equal(stopped.machineId, MACHINE_A);
+
+  // Negative control: while it runs, the same unverifiable capability is
+  // evidence Cuna does not have, and the refusal stands.
+  const running = planMachineSelection(machineInput([
+    machine({ state: "running", requestedAgentSupport: "unknown", agent: "opencode" }),
+  ], { requestedAgent: "opencode", selector: { kind: "id", value: MACHINE_A } }));
+  assert.equal(running.kind, "unavailable");
+  assert.equal(running.reason, "state-unknown");
+
+  // The provider declaration is checked before the capability and does not
+  // depend on the Machine running: a stopped Claude Machine still refuses an
+  // OpenCode request.
+  const wrongProvider = planMachineSelection(machineInput([
+    machine({ state: "stopped", requestedAgentSupport: "unsupported", agent: "claude-code" }),
+  ], { requestedAgent: "opencode", selector: { kind: "id", value: MACHINE_A } }));
+  assert.equal(wrongProvider.kind, "incompatible");
+  assert.equal(wrongProvider.reason, "agent-mismatch");
+
+  // Same rule without a selector: one stopped OpenCode Machine is the one to
+  // start, not a reason to call the whole collection unobserved (which is
+  // what sent the automatic path to `authority-observation-stale`) and not a
+  // reason to allocate a second paid Machine.
+  const automatic = planMachineSelection(machineInput([
+    machine({ state: "stopped", requestedAgentSupport: "unknown", agent: "opencode" }),
+  ], { requestedAgent: "opencode" }));
+  assert.equal(automatic.kind, "select", JSON.stringify(automatic));
+  assert.equal(automatic.source, "unique-compatible");
+
+  // Negative control for the automatic path: a running Machine whose
+  // capability could not be read is an unobserved authority, and Cuna stops.
+  const automaticRunning = planMachineSelection(machineInput([
+    machine({ state: "running", requestedAgentSupport: "unknown", agent: "opencode" }),
+  ], { requestedAgent: "opencode" }));
+  assert.equal(automaticRunning.kind, "unavailable");
+  assert.equal(automaticRunning.reason, "authority-observation-stale");
+});
+
 test("terminal machines with unavailable provider evidence do not block automatic creation", () => {
   for (const state of ["error", "deleted"]) {
     assert.deepEqual(

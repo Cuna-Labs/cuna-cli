@@ -342,8 +342,27 @@ function validMachine(machine: MachineSelectionObservation): boolean {
   );
 }
 
+/**
+ * A per-provider capability is an observation of a running Machine. While one
+ * is stopped, paused or still creating, `agent_sessions.create` is reported
+ * `temporarily_unavailable` because the runtime cannot be probed — a fact
+ * about the Machine being off, not about the provider. The provider
+ * declaration is checked separately and does not depend on the state, so an
+ * unverifiable capability on a Machine that is not running is treated as
+ * "not yet observed" rather than as incompatibility; the create step re-reads
+ * the capability once the Machine runs and fails closed there.
+ */
+function capabilityIsObservable(machine: MachineSelectionObservation): boolean {
+  return machine.state === "running" || machine.state === "unknown";
+}
+
+function machineMayBeSelected(machine: MachineSelectionObservation): boolean {
+  return machine.requestedAgentSupport === "supported" ||
+    (machine.requestedAgentSupport === "unknown" && !capabilityIsObservable(machine));
+}
+
 function safeMachine(machine: MachineSelectionObservation): SafeMachineCandidate {
-  if (machine.requestedAgentSupport !== "supported" || machine.state === "unknown") {
+  if (!machineMayBeSelected(machine) || machine.state === "unknown") {
     throw new TypeError("A machine with unknown compatibility cannot become a selection candidate.");
   }
   const resources = Object.freeze({
@@ -379,7 +398,16 @@ function validateSelectedMachine(
   if (machine.requestedAgentBlocker === "opencode-supervisor-update-required") {
     return unavailable("machine", "opencode-supervisor-update-required", machine.id);
   }
-  if (machine.requestedAgentSupport === "unknown") {
+  // A provider's runtime can only be verified while the Machine runs: on a
+  // stopped one `agent_sessions.create` reads `temporarily_unavailable /
+  // opencode_runtime_unverified`, which says nothing about the provider.
+  // Measured 2026-09-02: that abstention refused a Machine the journey was
+  // about to start, and told the user to pass the `--machine` they had just
+  // passed. The provider declaration is checked before this point and is not
+  // state-dependent, and the create step re-reads the capability and fails
+  // closed, so an unverifiable capability on a startable Machine is not a
+  // refusal — on a running one it still is.
+  if (machine.requestedAgentSupport === "unknown" && machine.state === "running") {
     return unavailable("machine", "state-unknown", machine.id);
   }
   if (machine.requestedAgentSupport === "unsupported") {
@@ -522,13 +550,14 @@ export function planMachineSelection(input: MachineSelectionInput): MachineSelec
   }
 
   const plausiblyCompatible = input.machines.filter(
-    (machine) => machine.ownership !== "foreign" && machine.requestedAgentSupport === "supported",
+    (machine) => machine.ownership !== "foreign" && machineMayBeSelected(machine),
   );
   if (
     input.machines.some(
       (machine) =>
         machine.ownership !== "foreign" &&
         machine.requestedAgentSupport === "unknown" &&
+        capabilityIsObservable(machine) &&
         (machine.state === "unknown" || REUSABLE_MACHINE_STATES.has(machine.state)),
     ) ||
     plausiblyCompatible.some(

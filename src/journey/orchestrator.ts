@@ -210,7 +210,12 @@ function selectionFailure(
             ? "No machine by that name exists in this account. See your machines with `cuna machines list`, create one with `cuna machines create --name NAME --agent claude-code|codex|opencode --yes`, or omit --machine to let Cuna use or create one."
             : plan.reason === "state-not-reusable"
               ? "That machine is not running. Start it with `cuna machines start MACHINE_ID --yes`, or omit --machine to let Cuna use or create a running one."
-              : "Select an exact machine with --machine NAME."
+              // `state-unknown` names a running machine whose provider runtime
+              // Cuna could not verify. Repeating `--machine NAME` was the old
+              // hint and it named the option the caller had already given.
+              : plan.reason === "state-unknown"
+                ? "That machine is running, but Cuna could not verify its agent runtime. Read it with `cuna capabilities --scope machine --resource-id MACHINE_ID`; if the terminal supervisor is the blocker, update it from `cuna machines`."
+                : "Read the machine with `cuna machines list` and select one that is running."
       : plan.reason === "attachment-unobservable"
         // Naming the prerequisite instead of implying a retry. The writer seat
         // is read from the API; when it reports no attestable PTY (`none`,
