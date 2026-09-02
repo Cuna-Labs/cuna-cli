@@ -601,6 +601,8 @@ function credentialError(error: CredentialBoundaryError): CunaError {
 
 interface InlineProgress {
   update(label: string): void;
+  /** Print one durable line above the spinner, then keep spinning. */
+  note(line: string): void;
   stop(): void;
 }
 
@@ -719,6 +721,15 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
     update(nextLabel: string) {
       if (stopped || nextLabel === label) return;
       label = nextLabel;
+      paint();
+    },
+    note(line: string) {
+      if (stopped) {
+        stream.write(`${line}\n`);
+        return;
+      }
+      // Clear the spinner row, leave the line behind, resume spinning below it.
+      stream.write(`\r${String.fromCharCode(0x1b)}[2K${line}\n`);
       paint();
     },
     stop() {
@@ -1372,6 +1383,13 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           workspaceId,
           stateDirectory: platform.paths.stateDirectory,
           filesystemCapabilities: conservativeFilesystemCapabilities(platform.kind),
+          // The journey never runs under structured output (fenced above), so
+          // this line is always a human-facing note on stderr: above the
+          // spinner while it runs, a plain line otherwise.
+          onNotice: (line) => {
+            if (inlineJourneyProgress !== undefined) inlineJourneyProgress.note(line);
+            else streams.stderr.write(`${line}\n`);
+          },
         });
         stopJourneyWorkspace = () => workspace.stopContinuousSync();
         const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;

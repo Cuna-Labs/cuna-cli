@@ -178,6 +178,15 @@ export async function persistWorkspaceBinding(input: {
   readonly root: string;
   readonly binding: WorkspaceBindingRecordDraft;
   readonly expected: WorkspaceBindingCompareAndSwap | null;
+  /**
+   * The folder is the project; a Machine is disposable. A rebind moves the
+   * folder's project onto another Machine under a new WorkspaceBinding, so the
+   * binding and machine identities change while the project identity, the
+   * owner and the remote root must not. Only a caller that has proven the
+   * previous Machine is gone may ask for this; it still requires the exact
+   * compare-and-swap of the record it is replacing.
+   */
+  readonly rebind?: boolean;
   readonly now?: Date;
 }): Promise<WorkspaceBindingRecord> {
   const root = await captureCanonicalWorkspaceRoot(input.root);
@@ -193,7 +202,12 @@ export async function persistWorkspaceBinding(input: {
     const current = await readOptionalBindingRecord(marker);
     assertCompareAndSwap(current, input.expected);
     validateDraft(input.binding);
-    if (current !== undefined) assertStableBindingIdentity(current, input.binding);
+    if (input.rebind === true) {
+      if (current === undefined) throw staleBinding("rebind_without_record");
+      assertRebindIdentity(current, input.binding);
+    } else if (current !== undefined) {
+      assertStableBindingIdentity(current, input.binding);
+    }
     const now = input.now ?? new Date();
     if (!Number.isFinite(now.getTime())) throw corruptRecord("invalid_timestamp");
     if (current !== undefined && now.getTime() < Date.parse(current.recordUpdatedAt)) {
@@ -447,6 +461,29 @@ function assertStableBindingIdentity(
     !sameInstant(current.bindingCreatedAt, next.bindingCreatedAt) ||
     Date.parse(next.bindingUpdatedAt) < Date.parse(current.bindingUpdatedAt) ||
     next.generation < current.generation
+  ) {
+    throw ownerMismatch();
+  }
+}
+
+/**
+ * A rebind keeps everything that names the project and changes only what
+ * names the Machine and its binding. A "rebind" that lands on the same Machine
+ * or the same binding is not a rebind and is refused as an identity error.
+ */
+function assertRebindIdentity(
+  current: WorkspaceBindingRecord,
+  next: WorkspaceBindingRecordDraft,
+): void {
+  if (
+    current.profileId !== profile(next.profileId) ||
+    current.userId !== next.userId ||
+    current.workspaceId !== next.workspaceId ||
+    current.projectId !== next.projectId ||
+    current.localInstanceId !== next.localInstanceId ||
+    current.remoteRoot !== next.remoteRoot ||
+    current.machineId === next.machineId ||
+    current.bindingId === next.bindingId
   ) {
     throw ownerMismatch();
   }

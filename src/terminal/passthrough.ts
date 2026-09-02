@@ -4,6 +4,7 @@ import type {
 } from "../runtime/boundary.js";
 import { runtimeFailure } from "../runtime/errors.js";
 import type {
+  DetachedForegroundSession,
   ForegroundTabIntent,
   ForegroundTerminalHost,
   ForegroundTerminalRuntime,
@@ -56,6 +57,7 @@ export class PassthroughTerminalCoordinator {
   #remotePasteDisableMatch = 0;
   #detachChordTrusted = true;
   #localDetachTabId: string | undefined;
+  readonly #detachedSessions: DetachedForegroundSession[] = [];
   #failure: unknown;
   #stopPromise: Promise<void> | undefined;
   readonly #stopStarted: Promise<void>;
@@ -85,6 +87,11 @@ export class PassthroughTerminalCoordinator {
 
   get failure(): unknown {
     return this.#failure;
+  }
+
+  /** The AgentSession the person detached from with Ctrl+] d, once the runtime confirmed it. */
+  get detachedSessions(): readonly DetachedForegroundSession[] {
+    return Object.freeze([...this.#detachedSessions]);
   }
 
   bindRuntime(runtime: ForegroundTerminalRuntime): void {
@@ -445,6 +452,10 @@ export class PassthroughTerminalCoordinator {
       this.#snapshot = Object.freeze({ ...snapshot, state: "detached" });
     }
     this.#localDetachTabId = undefined;
+    const intent = this.#intent;
+    if (intent !== undefined && intent.tabId === snapshot.tabId) {
+      this.#detachedSessions.push(Object.freeze({ agentSessionId: intent.agentSessionId, label: intent.label }));
+    }
     void this.stop().catch(() => { this.#state = "failed"; });
   }
 

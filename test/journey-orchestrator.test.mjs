@@ -101,6 +101,31 @@ test("explicit relative workspace paths are resolved before workspace inspection
   assert.equal(observedLocalPath, resolve("project"));
 });
 
+// PRD-PM-008 E14-D1, automatic form. The folder remembers a Machine that is no
+// longer in the account's collection. The folder is the project and the Machine
+// is disposable, so the journey proceeds to select (or create) a Machine and
+// leaves the rebind decision to the synchronize step, which reads the bound
+// Machine directly. Before this, the run died on `machine-missing`.
+test("E14-D1: a project binding whose Machine is gone from the collection no longer stops the automatic journey", async () => {
+  const fx = effects({
+    async inspectWorkspace() { fx.calls.push("inspect-workspace"); return { canonicalLocalRoot: "C:\\work", projectMachineId: MACHINE_2 }; },
+  });
+  const result = await orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE, idempotencyKey: "cuna-journey-rebind-0001" });
+  assert.equal(result.machineId, MACHINE, "the only compatible Machine is selected");
+  assert.equal(fx.calls.find((call) => Array.isArray(call) && call[0] === "sync")[1].machineId, MACHINE);
+});
+
+// Negative control: a bound Machine that IS in the collection is still the one
+// the automatic journey selects, even when another compatible Machine exists.
+test("E14-D1 control: a project binding whose Machine is present still selects that Machine", async () => {
+  const fx = effects({
+    async inspectWorkspace() { fx.calls.push("inspect-workspace"); return { canonicalLocalRoot: "C:\\work", projectMachineId: MACHINE_2 }; },
+    async observeMachines() { fx.calls.push("observe-machines"); return [machine(), machine({ id: MACHINE_2, name: "bound" })]; },
+  });
+  const result = await orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE, idempotencyKey: "cuna-journey-rebind-0002" });
+  assert.equal(result.machineId, MACHINE_2);
+});
+
 test("ambiguous machine authority performs no mutation", async () => {
   const fx = effects({
     async observeMachines() { fx.calls.push("observe-machines"); return [machine(), machine({ id: MACHINE_2, name: "other" })]; },

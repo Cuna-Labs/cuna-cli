@@ -333,18 +333,27 @@ export async function orchestrateAgentJourney(input: {
       phase: "observe-machines", signal, effects: input.effects, ledger,
       action: () => input.effects.observeMachines({ requestedAgent: input.intent.agent, signal }),
     });
-    const machinePlan = planMachineSelection({
+    const planMachines = (projectMachineId: string | undefined) => planMachineSelection({
       requestedAgent: input.intent.agent,
       forceNew: input.intent.machine.kind === "new",
       ...(input.intent.machine.kind === "exact-name"
         ? { selector: { kind: "name" as const, value: input.intent.machine.name } }
         : {}),
-      ...(workspaceInspection.projectMachineId === undefined || input.intent.machine.kind !== "automatic"
+      ...(projectMachineId === undefined || input.intent.machine.kind !== "automatic"
         ? {}
-        : { projectBinding: { machineId: workspaceInspection.projectMachineId, freshness: "fresh" as const } }),
+        : { projectBinding: { machineId: projectMachineId, freshness: "fresh" as const } }),
       collectionFreshness: "fresh",
       machines,
     });
+    let machinePlan = planMachines(workspaceInspection.projectMachineId);
+    if (machinePlan.kind === "stale-binding" && machinePlan.reason === "machine-missing") {
+      // The folder is the project; a Machine is disposable (PRD-PM-008 §H,
+      // E14-D1). A binding whose Machine is no longer in the collection does
+      // not stop the journey: select or create as an unbound folder would,
+      // and let the synchronize step read the bound Machine itself before it
+      // rebinds — a listing is not proof of absence, the Machine read is.
+      machinePlan = planMachines(undefined);
+    }
 
     let machine: JourneyMachine;
     if (machinePlan.kind === "select" && machinePlan.target === "machine") {

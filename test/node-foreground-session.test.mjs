@@ -103,7 +103,10 @@ class FakeHost {
     this.events.push("host:acquire");
     return { restore: async () => { this.restored += 1; this.events.push("host:restore"); } };
   }
-  async write(bytes) { this.writes.push(bytes.slice()); }
+  async write(bytes) {
+    this.writes.push(bytes.slice());
+    if (new TextDecoder().decode(bytes).startsWith("Detached ·")) this.events.push("detach-line");
+  }
   onInput(listener) { this.input = listener; return () => { this.input = undefined; }; }
   onResize() { return () => undefined; }
   emitInput(bytes) { this.input?.(bytes); }
@@ -149,6 +152,59 @@ test("attach progress hands off before terminal ownership", async () => {
   await operation;
   assert.ok(events.indexOf(`get:${SESSION_A}`) < events.indexOf("progress:stop"));
   assert.ok(events.indexOf("progress:stop") < events.indexOf("host:acquire"));
+});
+
+// PRD-PM-008 E14-D6. Detaching with Ctrl+] d used to print nothing, so the
+// person could not tell whether the session survived or how to come back. One
+// line, after the terminal is restored, says both.
+test("E14-D6: detaching with Ctrl+] d prints one line after the terminal is restored", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => host.input !== undefined, "foreground ownership should start after preflight");
+  const writesBeforeDetach = host.writes.length;
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+  const afterRestore = host.writes.slice(writesBeforeDetach).map((bytes) => new TextDecoder().decode(bytes));
+  const line = afterRestore.at(-1);
+  assert.equal(line, `Detached · session 1111 keeps running · cuna connect ${SESSION_A}\n`);
+  assert.ok(events.indexOf("host:restore") < events.indexOf("detach-line"), "the line follows the restore, never precedes it");
+});
+
+// Control: a foreground that ends without a local detach prints no such line.
+test("E14-D6 control: a cancelled foreground prints no detach line", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const abort = new AbortController();
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    signal: abort.signal,
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => host.input !== undefined, "foreground ownership should start after preflight");
+  abort.abort();
+  await operation.catch(() => undefined);
+  assert.equal(host.restored, 1);
+  const text = host.writes.map((bytes) => new TextDecoder().decode(bytes)).join("");
+  assert.doesNotMatch(text, /Detached ·/u);
 });
 
 test("one pre-negotiation ticket race is recovered without repeating user input", async () => {
