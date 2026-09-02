@@ -18,6 +18,7 @@ import {
   decodeCredentialRules,
   decodeMachinePage,
   decodeCunaIdentity,
+  MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
   decodeTerminalConnectionGrant,
   decideCapability,
   requireCapability,
@@ -1044,6 +1045,10 @@ test("terminal supervisor replacement has one explicit POST with no body or idem
     method: "POST",
     path: `/v1/sessions/${requested}/supervisor/replace`,
     settleWith: "cuna machines list",
+    // A supervisor replacement boots the Machine and waits for the new fence
+    // to accept control, so it carries the lifecycle budget, not the list
+    // default. The shape stays exact: still no body, still no idempotency key.
+    budgetMs: MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
   }]);
 
   await assert.rejects(client.replaceMachineSupervisor("not-a-machine-id"), CunaError);
