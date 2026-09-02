@@ -5,6 +5,7 @@ import { CunaError } from "../core/errors.js";
 import { OBSERVATION_BUDGET_CODES } from "../core/observation-budget.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
+import { reconnectDelay, type ReconnectPolicy } from "../runtime/backoff.js";
 import type { ForegroundTerminalHost } from "../terminal/foreground.js";
 import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
 import { listAllMachines } from "./pagination.js";
@@ -42,6 +43,20 @@ const CLOSE_FRAMES = Object.freeze(["✦ Closing Cuna...", "✧ Closing Cuna..."
 const LIFECYCLE_CONVERGENCE_BUDGET_MS = 180_000;
 const LIFECYCLE_POLL_INTERVAL_MS = 2_500;
 const MACHINE_NAME_MAX_LENGTH = 80;
+/**
+ * PRD-PM-008 E13-R7. A retryable machine-list failure (a 5xx while the edge
+ * redeploys, a transport failure) keeps the screen alive and is retried with
+ * the runtime's backoff until this window lapses; only then is the notice
+ * final and `r` the only retry. 1 s, 2 s, 4 s, 8 s, 8 s fits inside 30 s.
+ */
+const LIST_RETRY_WINDOW_MS = 30_000;
+const LIST_RETRY_POLICY: ReconnectPolicy = Object.freeze({
+  maximumAttempts: 5,
+  maximumElapsedMs: LIST_RETRY_WINDOW_MS,
+  initialDelayMs: 1_000,
+  maximumDelayMs: 8_000,
+  jitterRatio: 0.2,
+});
 
 const ANSI = Object.freeze({
   reset: "\u001b[0m",
@@ -122,6 +137,12 @@ export interface MachinesExplorerDependencies {
     readonly pollIntervalMs?: number;
     readonly budgetMs?: number;
   }>;
+  /** Test seam for E13-R7; production keeps the 30 s window and 1 s… backoff. */
+  readonly listRetry?: Readonly<{
+    readonly policy?: ReconnectPolicy;
+    readonly windowMs?: number;
+    readonly random?: () => number;
+  }>;
 }
 
 export interface MachinesExplorerSelection {
@@ -192,7 +213,17 @@ export async function runNodeMachinesExplorer(
   let animationFrame = 0;
   let stopped = false;
   let refreshInFlight = false;
+  /**
+   * E13-R7. The one-line notice for a failed machine list. It carries the
+   * typed reason and says whether Cuna is still retrying by itself.
+   */
   let refreshError: string | undefined;
+  /** The current outage: when it began and how many list attempts failed in it. */
+  let listFailure: Readonly<{ readonly since: number; readonly attempt: number }> | undefined;
+  let listRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  const listRetryPolicy = dependencies.listRetry?.policy ?? LIST_RETRY_POLICY;
+  const listRetryWindowMs = dependencies.listRetry?.windowMs ?? LIST_RETRY_WINDOW_MS;
+  const listRetryRandom = dependencies.listRetry?.random ?? Math.random;
   let interactionNotice: string | undefined;
   /**
    * Outcome of an in-place lifecycle action. Kept apart from
@@ -261,6 +292,7 @@ export async function runNodeMachinesExplorer(
             columns,
             now: snapshotObservedAt,
             navigation,
+            machinesListed: initialized,
             refreshError,
             interactionNotice,
             lifecycleNotice,
@@ -447,6 +479,34 @@ export async function runNodeMachinesExplorer(
     render();
   };
 
+  const clearListRetry = (): void => {
+    if (listRetryTimer === undefined) return;
+    clearTimeout(listRetryTimer);
+    listRetryTimer = undefined;
+  };
+
+  /**
+   * E13-R7. The delay before the next automatic list attempt, or `undefined`
+   * once the outage has used up the policy's attempts or the bounded window.
+   * The elapsed time is measured from the first failure of this outage, so a
+   * slow server cannot stretch the window by answering late.
+   */
+  const nextListRetryDelay = (attempt: number, elapsedMs: number): number | undefined => {
+    if (attempt > listRetryPolicy.maximumAttempts) return undefined;
+    const delay = reconnectDelay(attempt, listRetryPolicy, listRetryRandom);
+    return elapsedMs + delay > listRetryWindowMs ? undefined : delay;
+  };
+
+  const scheduleListRetry = (delayMs: number): void => {
+    clearListRetry();
+    listRetryTimer = setTimeout(() => {
+      listRetryTimer = undefined;
+      if (isClosing()) return;
+      void refresh().catch((error) => { failure ??= error; stop(); });
+    }, delayMs);
+    listRetryTimer.unref();
+  };
+
   const refresh = async (): Promise<void> => {
     if (refreshInFlight || stopped) return;
     refreshInFlight = true;
@@ -458,6 +518,8 @@ export async function runNodeMachinesExplorer(
       const machines = await listAllMachines(input.client, requestSignal);
       if (stopped || closingNotice !== undefined) return;
       refreshError = undefined;
+      listFailure = undefined;
+      clearListRetry();
       interactionNotice = undefined;
       // The delete prompt lives in `interactionNotice`; once a refresh has
       // taken it off the screen, the next Enter must ask again, not delete.
@@ -489,7 +551,7 @@ export async function runNodeMachinesExplorer(
         if (!initialized || !previousIds.has(row.machine.id)) expanded.add(row.machine.id);
       }
       initialized = true;
-      const visibleKeys = selectableKeys(rows, expanded, snapshotObservedAt, navigation);
+      const visibleKeys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized);
       // Input remains live while the network refresh is pending. Reconcile the
       // selection that is current when the response is applied, rather than a
       // stale value captured before awaiting the API. Otherwise an arrow press
@@ -564,11 +626,18 @@ export async function runNodeMachinesExplorer(
       }));
     } catch (error) {
       if (isClosing()) return;
-      if (!initialized || rows.length === 0 || !isRetryableExplorerRefreshError(error)) throw error;
-      // A transient bearer re-exchange or read failure is not evidence that
-      // the last confirmed inventory disappeared. Keep navigation alive; the
-      // next manual/automatic refresh gets a fresh acquisition attempt.
-      refreshError = "refresh unavailable; showing last confirmed machines";
+      // E13-R7. Only a non-retryable failure (auth, policy, usage) leaves the
+      // screen, and it leaves with the typed error. A retryable one is not
+      // evidence that the inventory disappeared, and before any inventory it
+      // is not an empty list either: keep what is known, say why the list is
+      // unavailable, and retry within the bounded window.
+      if (!isRetryableExplorerRefreshError(error)) throw error;
+      const failedAt = Date.now();
+      const attempt = (listFailure?.attempt ?? 0) + 1;
+      listFailure = Object.freeze({ since: listFailure?.since ?? failedAt, attempt });
+      const retryDelayMs = nextListRetryDelay(attempt, failedAt - listFailure.since);
+      refreshError = listFailureNotice(error, rows.length > 0, retryDelayMs);
+      if (retryDelayMs !== undefined) scheduleListRetry(retryDelayMs);
       render();
     } finally {
       snapshotObservedAt = dependencies.now?.() ?? Date.now();
@@ -583,7 +652,7 @@ export async function runNodeMachinesExplorer(
     lifecycleNotice = undefined;
     pendingSupervisorUpdateMachineId = undefined;
     pendingDeleteMachineId = undefined;
-    const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation);
+    const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized);
     if (keys.length === 0) return;
     const currentIndex = selectedKey === undefined ? -1 : keys.indexOf(selectedKey);
     const origin = currentIndex < 0 ? (delta > 0 ? -1 : keys.length) : currentIndex;
@@ -593,7 +662,7 @@ export async function runNodeMachinesExplorer(
   };
 
   const reconcileSelection = (): void => {
-    const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation);
+    const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized);
     if (selectedKey === undefined || !keys.includes(selectedKey)) selectedKey = keys[0];
     render();
   };
@@ -607,7 +676,7 @@ export async function runNodeMachinesExplorer(
     const previousScreen = previous.screen;
     navigation = reduceMachineFirstNavigation(navigation, { type: "back" });
     if (navigation !== previous) {
-      const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation);
+      const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized);
       if (previousScreen.kind === "machine" && navigation.screen.kind === "machines") {
         const parentKey: SelectionKey = `machine:${previousScreen.machineId}`;
         selectedKey = keys.includes(parentKey) ? parentKey : keys[0];
@@ -664,7 +733,7 @@ export async function runNodeMachinesExplorer(
     if (selectedKey?.startsWith("machine:") === true && navigation.screen.kind === "machines") {
       const machineId = selectedKey.slice("machine:".length);
       navigation = reduceMachineFirstNavigation(navigation, { type: "open-machine", machineId });
-      selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation)[0];
+      selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized)[0];
       render();
       return;
     }
@@ -686,7 +755,7 @@ export async function runNodeMachinesExplorer(
           machineId: action.machineId,
           provider: action.provider,
         });
-        selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation)[0];
+        selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized)[0];
         render();
       }
     }
@@ -776,7 +845,7 @@ export async function runNodeMachinesExplorer(
         // a concrete AgentSession only; this keeps one-key navigation read-only
         // and prevents a stale/unique child from being opened by surprise.
         navigation = reduceMachineFirstNavigation(navigation, { type: "open-machine", machineId: id });
-        selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation)[0];
+        selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized)[0];
         render();
       } else if (selectedKey?.startsWith("session:") === true && navigation.screen.kind === "machines") {
         return activateOverviewSession(selectedKey.slice("session:".length));
@@ -794,7 +863,7 @@ export async function runNodeMachinesExplorer(
             machineId: action.machineId,
             provider: action.provider,
           });
-          selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation)[0];
+          selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized)[0];
           render();
         } else if (action?.kind === "start" || action?.kind === "stop") {
           pendingDeleteMachineId = undefined;
@@ -916,6 +985,10 @@ export async function runNodeMachinesExplorer(
         }
       }
     } else if (byte === 0x72) {
+      // E13-R7: a person's retry opens a fresh bounded window; it is not one
+      // more attempt charged against the automatic one.
+      listFailure = undefined;
+      clearListRetry();
       void refresh().catch((error) => { failure ??= error; stop(); });
     }
     return false;
@@ -954,6 +1027,7 @@ export async function runNodeMachinesExplorer(
   } finally {
     clearInterval(animationTimer);
     clearInterval(liveRefreshTimer);
+    clearListRetry();
     if (escapeTimer !== undefined) clearTimeout(escapeTimer);
     stopped = true;
     removeInput();
@@ -1052,6 +1126,8 @@ function renderMachinesExplorer(input: {
   readonly columns: number;
   readonly now: number;
   readonly navigation: MachineFirstNavigationState;
+  /** E13-R7: at least one machine list has succeeded. Until then an empty `rows` is not an empty inventory. */
+  readonly machinesListed: boolean;
   readonly refreshError?: string | undefined;
   readonly interactionNotice?: string | undefined;
   readonly lifecycleNotice?: string | undefined;
@@ -1070,9 +1146,13 @@ function renderMachinesExplorer(input: {
   if (input.navigation.screen.kind !== "machines") return renderContextScreen(input);
   const lines = [machineHeader("Machines"), " Your machines and the agents running inside them.", ""];
   let selectedLine: number | undefined;
-  const offerGlobalCreation = shouldOfferGlobalCreation(input.rows, input.now);
+  const offerGlobalCreation = shouldOfferGlobalCreation(input.rows, input.now, input.machinesListed);
   if (input.loadingPhase === "machines" && input.rows.length === 0) {
     lines.push(loaderLine("Discovering machines", input.animationFrame));
+  } else if (!input.machinesListed) {
+    // E13-R7: no list has succeeded yet. This is an error state, not an
+    // empty inventory; the notice below carries the typed reason.
+    lines.push("Machines could not be listed.");
   } else if (input.rows.length === 0) {
     lines.push("No machines yet. Choose a supported configuration:");
     for (const agent of providerCreationOrder()) {
@@ -1331,7 +1411,10 @@ function waitingForSessionObservation(session: AgentSession): string {
 function shouldOfferGlobalCreation(
   rows: readonly MachineRow[],
   now: number,
+  machinesListed: boolean,
 ): boolean {
+  // E13-R7: an empty list is a create affordance only once a list succeeded.
+  if (!machinesListed) return false;
   if (rows.length === 0) return true;
   return rows.every((row) => {
     // `temporarily_unavailable` is not evidence that another Machine is
@@ -1501,6 +1584,7 @@ function selectableKeys(
   expanded: ReadonlySet<string>,
   now: number,
   navigation: MachineFirstNavigationState,
+  machinesListed: boolean,
 ): readonly SelectionKey[] {
   if (navigation.screen.kind === "new-machine") {
     return Object.freeze(providerCreationOrder().map((agent): SelectionKey => `new-machine:${agent}`));
@@ -1533,7 +1617,7 @@ function selectableKeys(
           .map((session): SelectionKey => `session:${session.id}`)
       : []),
   ]);
-  const creationKeys = shouldOfferGlobalCreation(rows, now)
+  const creationKeys = shouldOfferGlobalCreation(rows, now, machinesListed)
     ? providerCreationOrder().map((agent): SelectionKey => `create:${agent}`)
     : [];
   return Object.freeze([...machineKeys, ...creationKeys]);
@@ -1585,6 +1669,25 @@ function overviewSessionCreateCapacityNotice(rows: readonly MachineRow[]): strin
 
 function isRetryableExplorerRefreshError(error: unknown): boolean {
   return (error instanceof CredentialBoundaryError || error instanceof CunaError) && error.retryable;
+}
+
+/**
+ * E13-R7. One line: what is unavailable, the typed reason the client already
+ * carries, and whether Cuna is still retrying by itself. The server's own
+ * sentence is not repeated here; `cuna machines list` prints it in full.
+ */
+function listFailureNotice(error: unknown, hasRows: boolean, retryDelayMs: number | undefined): string {
+  const code = error instanceof CunaError || error instanceof CredentialBoundaryError ? error.code : "unknown_failure";
+  const status = error instanceof CunaError ? error.details?.http_status : undefined;
+  const reason = typeof status === "number" ? `${code} (http ${status})` : code;
+  // Kept short: the whole line must survive a 120-column truncation.
+  const subject = hasRows
+    ? "refresh failed; showing last confirmed machines"
+    : "machines could not be listed";
+  const retry = retryDelayMs === undefined
+    ? "Press r to retry."
+    : `Retrying in ${Math.max(1, Math.round(retryDelayMs / 1000))} s; r retries now.`;
+  return ` ${reason}: ${subject}. ${retry}`;
 }
 
 function loaderLine(label: string, frame: number): string {
