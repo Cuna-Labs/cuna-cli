@@ -32,22 +32,38 @@ const session = (overrides = {}) => ({
   ...overrides,
 });
 
+const DELETE = { kind: "delete", label: "Delete", machineId: MACHINE_ID };
+
 test("T8.5 machine action resolver is machine-first and provider truthful", () => {
   assert.deepEqual(resolveMachineContextActions(machine({ state: "stopped" })), [
     { kind: "start", label: "Start", machineId: MACHINE_ID },
+    DELETE,
   ]);
   assert.deepEqual(resolveMachineContextActions(machine()), [
     { kind: "provider", label: "Claude", machineId: MACHINE_ID, provider: "claude-code" },
     { kind: "stop", label: "Stop", machineId: MACHINE_ID },
+    DELETE,
   ]);
   assert.deepEqual(resolveMachineContextActions(machine(), { hasSessions: false, canCreateSession: true }), [
     { kind: "new-session", label: "New Claude session", machineId: MACHINE_ID, provider: "claude-code" },
     { kind: "stop", label: "Stop", machineId: MACHINE_ID },
+    DELETE,
   ]);
   assert.deepEqual(resolveMachineContextActions(machine({ agent: "opencode" })), [
     { kind: "provider", label: "OpenCode", machineId: MACHINE_ID, provider: "opencode" },
     { kind: "stop", label: "Stop", machineId: MACHINE_ID },
+    DELETE,
   ]);
+});
+
+test("E13-R2 Delete is offered in every state, and is the only action on an error Machine", () => {
+  assert.deepEqual(resolveMachineContextActions(machine({ state: "error" })), [DELETE]);
+  assert.deepEqual(resolveMachineContextActions(machine({ state: "creating" })), [DELETE]);
+  assert.deepEqual(resolveMachineContextActions(machine({ state: "paused" })), [
+    { kind: "start", label: "Start", machineId: MACHINE_ID },
+    DELETE,
+  ]);
+  assert.equal(resolveMachineContextActions(machine()).at(-1).kind, "delete", "Delete is never the default Enter target");
 });
 
 test("OpenCode supervisor repair is explicit and never makes Stop the default action", () => {
@@ -57,13 +73,24 @@ test("OpenCode supervisor repair is explicit and never makes Stop the default ac
     { kind: "supervisor-blocked", label: "OpenCode needs a terminal update", machineId: MACHINE_ID },
     { kind: "provider", label: "OpenCode", machineId: MACHINE_ID, provider: "opencode" },
     { kind: "stop", label: "Stop", machineId: MACHINE_ID },
+    DELETE,
   ]);
   assert.deepEqual(resolveMachineContextActions(machine({ agent: "opencode", state: "stopped" }), {
     opencodeSupervisorRepairRequired: true,
   }), [
     { kind: "update-supervisor", label: "Update terminal supervisor", machineId: MACHINE_ID },
     { kind: "start", label: "Start", machineId: MACHINE_ID },
+    DELETE,
   ]);
+});
+
+test("E13-R1 new-machine screens sit beside the machine screens and back out one level at a time", () => {
+  const providerStep = reduceMachineFirstNavigation(INITIAL_MACHINE_FIRST_STATE, { type: "open-new-machine" });
+  assert.equal(providerStep.screen.kind, "new-machine");
+  const nameStep = reduceMachineFirstNavigation(providerStep, { type: "choose-new-machine-provider", provider: "codex" });
+  assert.deepEqual(nameStep.screen, { kind: "new-machine-name", provider: "codex" });
+  assert.equal(reduceMachineFirstNavigation(nameStep, { type: "back" }).screen.kind, "new-machine");
+  assert.equal(reduceMachineFirstNavigation(providerStep, { type: "back" }).screen.kind, "machines");
 });
 
 test("T8.2 provider context contains existing sessions only; creation belongs to the machine menu", () => {

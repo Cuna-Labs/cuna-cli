@@ -1294,6 +1294,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ? await runCli(noColor ? ["--no-color"] : [], dependencies)
           : exit;
       }
+      if (selection.kind === "create") {
+        // E13-R1/R6: the screen chose provider and name; the batch command
+        // owns the `machines.create` gate, the idempotency key and the read.
+        const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+        const progress = startInlineProgress(streams.stderr, !noColor, "Creating machine");
+        const exit = await runCli([
+          "machines", "create", "--name", selection.name, "--agent", selection.agent, "--yes",
+          ...(noColor ? ["--no-color"] : []),
+        ], dependencies);
+        progress.stop();
+        return exit === EXIT_CODES.success
+          ? await runCli(noColor ? ["--no-color"] : [], dependencies)
+          : exit;
+      }
       return await runCli(rootJourneyArgv(selection, { noColor: booleanOption(parsed, "no-color") }), {
         ...dependencies,
         ...(selection.machineId === undefined ? {} : { managedWorkspaceMachineId: selection.machineId }),
@@ -1560,6 +1574,17 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           const progress = startInlineProgress(streams.stderr, !noColor, "Updating terminal supervisor");
           const exit = await runCli([
             "machines", "update-supervisor", selection.machineId, "--yes",
+            ...(noColor ? ["--no-color"] : []),
+          ], dependencies);
+          progress.stop();
+          return exit === EXIT_CODES.success
+            ? await runCli(["machines", ...(noColor ? ["--no-color"] : [])], dependencies)
+            : exit;
+        } else if (selection.kind === "create") {
+          const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+          const progress = startInlineProgress(streams.stderr, !noColor, "Creating machine");
+          const exit = await runCli([
+            "machines", "create", "--name", selection.name, "--agent", selection.agent, "--yes",
             ...(noColor ? ["--no-color"] : []),
           ], dependencies);
           progress.stop();

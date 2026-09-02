@@ -106,21 +106,87 @@ test("bare root traverses machine -> provider -> existing session using the shar
   assert.deepEqual(await operation, { kind: "attach", agentSessionId: SESSION, agent: "claude-code" });
 });
 
-test("stopped machine exposes Start and returns a lifecycle action without an identifier prompt", async () => {
+test("stopped machine exposes Start, runs it in place without an identifier prompt, and keeps the screen", async () => {
   const host = new Host();
+  let state = "stopped";
+  const transitions = [];
   const operation = runNodeRootJourney({
     client: {
-      async listMachines() { return { items: [{ id: MACHINE, name: "paused-dev", state: "stopped", agent: "claude-code", updatedAt: "v2" }] }; },
+      async listMachines() { return { items: [{ id: MACHINE, name: "paused-dev", state, agent: "claude-code", updatedAt: "v2" }] }; },
       async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, resourceId) {
+        return {
+          ...sessionCreateCapability(),
+          subjectScope: scope,
+          subjectId: resourceId,
+          capabilities: [{
+            id: "machines.lifecycle",
+            availability: "supported",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["machines:write"],
+          }],
+        };
+      },
+      async transitionMachine(id, action) {
+        transitions.push([id, action]);
+        return { id, name: "paused-dev", state: "starting", agent: "claude-code" };
+      },
+      async getMachine(id) {
+        state = "running";
+        return { id, name: "paused-dev", state, agent: "claude-code" };
+      },
     },
-  }, { host, now: () => NOW });
+  }, { host, now: () => NOW, convergence: { pollIntervalMs: 1, budgetMs: 1_000 } });
   await waitUntil(() => host.writes.some((frame) => frame.includes("paused-dev")));
   host.send([0x0d]);
   await waitUntil(() => host.writes.at(-1).includes("Start machine"));
   assert.doesNotMatch(host.writes.at(-1), /UUID|binding|generation|idempotency/iu);
   assert.doesNotMatch(host.writes.at(-1), /Claude  provider|OpenCode|ensure/iu);
+  assert.match(host.writes.at(-1), /Delete machine/u);
   host.send([0x0d]);
-  assert.deepEqual(await operation, { kind: "lifecycle", action: "start", machineId: MACHINE });
+  await waitUntil(() => host.writes.at(-1).includes("Stop machine"));
+  assert.deepEqual(transitions, [[MACHINE, "start"]]);
+  assert.equal(host.input !== undefined, true, "a lifecycle action must not leave the screen");
+  host.send([0x03]);
+  assert.equal(await operation, undefined);
+});
+
+test("bare root offers New machine from any overview and returns the create selection", async () => {
+  const host = new Host();
+  const operation = runNodeRootJourney({
+    client: {
+      async listMachines() { return { items: [{ id: MACHINE, name: "dev", state: "running", agent: "claude-code", updatedAt: "v1" }] }; },
+      async listAgentSessions() { return { items: [liveSession()] }; },
+      async discoverCapabilities(scope) {
+        return scope === "account"
+          ? {
+              ...sessionCreateCapability(),
+              subjectScope: "account",
+              subjectId: undefined,
+              capabilities: [{
+                id: "machines.create",
+                availability: "supported",
+                interaction: "native",
+                mutationClass: "financial",
+                surfaces: ["cli"],
+                requiredPermissions: ["machines:create"],
+              }],
+            }
+          : sessionCreateCapability();
+      },
+    },
+  }, { host, now: () => NOW });
+  await waitUntil(() => host.writes.some((frame) => frame.includes("dev") && frame.includes("1 session")));
+  assert.match(host.writes.at(-1), /n new machine/u);
+  host.send([0x6e]);
+  await waitUntil(() => host.writes.at(-1).includes("❯ OpenCode"));
+  host.send([0x1b, 0x5b, 0x42, 0x1b, 0x5b, 0x42, 0x0d]);
+  await waitUntil(() => host.writes.at(-1).includes("cuna-codex-1"));
+  assert.doesNotMatch(host.writes.at(-1), /UUID|binding|generation|idempotency/iu);
+  host.send([0x0d]);
+  assert.deepEqual(await operation, { kind: "create", agent: "codex", name: "cuna-codex-1" });
 });
 
 test("running provider exposes New session only when current capability advertises it", async () => {

@@ -69,7 +69,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "",
       "Interactive view:",
       "  machines                    Browse machines and their AgentSessions",
-      "                              (↑/↓ move, Enter open, r refresh, q quit)",
+      "                              (↑/↓ move, Enter open, n new machine, r refresh, q quit)",
       "",
       "Actions:",
       "  list                        List owned machines",

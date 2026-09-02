@@ -5,7 +5,11 @@ import { classifySessionActionability } from "./session-actionability.js";
 export type MachineFirstScreen =
   | Readonly<{ readonly kind: "machines" }>
   | Readonly<{ readonly kind: "machine"; readonly machineId: string }>
-  | Readonly<{ readonly kind: "provider"; readonly machineId: string; readonly provider: ActionableProvider }>;
+  | Readonly<{ readonly kind: "provider"; readonly machineId: string; readonly provider: ActionableProvider }>
+  /** PRD-PM-008 E13-R1: provider step of `n  New machine`, reachable from any overview. */
+  | Readonly<{ readonly kind: "new-machine" }>
+  /** Name step; the default is computed by the caller from the current inventory. */
+  | Readonly<{ readonly kind: "new-machine-name"; readonly provider: ActionableProvider }>;
 
 export interface MachineFirstNavigationState {
   readonly screen: MachineFirstScreen;
@@ -17,12 +21,20 @@ export type MachineFirstNavigationEvent =
   | Readonly<{ readonly type: "move"; readonly delta: -1 | 1; readonly itemCount: number }>
   | Readonly<{ readonly type: "open-machine"; readonly machineId: string }>
   | Readonly<{ readonly type: "open-provider"; readonly machineId: string; readonly provider: ActionableProvider }>
+  | Readonly<{ readonly type: "open-new-machine" }>
+  | Readonly<{ readonly type: "choose-new-machine-provider"; readonly provider: ActionableProvider }>
   | Readonly<{ readonly type: "back" }>
   | Readonly<{ readonly type: "quit" }>;
 
 export type MachineContextAction =
   | Readonly<{ readonly kind: "start"; readonly label: "Start"; readonly machineId: string }>
   | Readonly<{ readonly kind: "stop"; readonly label: "Stop"; readonly machineId: string }>
+  /**
+   * PRD-PM-008 E13-R2: offered in every state, including `error`, because a
+   * Machine the console can delete must be deletable here. The screen owns
+   * the double confirmation; this list only says the action exists.
+   */
+  | Readonly<{ readonly kind: "delete"; readonly label: "Delete"; readonly machineId: string }>
   /**
    * An informational, non-mutating first action. It exists so a running
    * OpenCode Machine with a supervisor prerequisite does not make `Stop` the
@@ -61,11 +73,22 @@ export function reduceMachineFirstNavigation(
         selectedIndex: 0,
         quit: false,
       });
+    case "open-new-machine":
+      return Object.freeze({ screen: Object.freeze({ kind: "new-machine" }), selectedIndex: 0, quit: false });
+    case "choose-new-machine-provider":
+      return Object.freeze({
+        screen: Object.freeze({ kind: "new-machine-name", provider: event.provider }),
+        selectedIndex: 0,
+        quit: false,
+      });
     case "back":
       if (state.screen.kind === "provider") {
         return Object.freeze({ screen: Object.freeze({ kind: "machine", machineId: state.screen.machineId }), selectedIndex: 0, quit: false });
       }
-      if (state.screen.kind === "machine") return INITIAL_MACHINE_FIRST_STATE;
+      if (state.screen.kind === "new-machine-name") {
+        return Object.freeze({ screen: Object.freeze({ kind: "new-machine" }), selectedIndex: 0, quit: false });
+      }
+      if (state.screen.kind === "machine" || state.screen.kind === "new-machine") return INITIAL_MACHINE_FIRST_STATE;
       return state;
     case "quit": return Object.freeze({ ...state, quit: true });
   }
@@ -81,12 +104,14 @@ export function resolveMachineContextActions(
   }> = {},
 ): readonly MachineContextAction[] {
   const provider = machineProviderAvailability(machine);
+  const remove = Object.freeze({ kind: "delete" as const, label: "Delete" as const, machineId: machine.id });
   if (machine.state === "stopped") {
     return Object.freeze([
       ...(options.opencodeSupervisorRepairRequired === true
         ? [Object.freeze({ kind: "update-supervisor" as const, label: "Update terminal supervisor" as const, machineId: machine.id })]
         : []),
       Object.freeze({ kind: "start", label: "Start", machineId: machine.id }),
+      remove,
     ]);
   }
   if (machine.state === "paused") {
@@ -95,9 +120,12 @@ export function resolveMachineContextActions(
         ? [Object.freeze({ kind: "supervisor-blocked" as const, label: "OpenCode needs a terminal update" as const, machineId: machine.id })]
         : []),
       Object.freeze({ kind: "start", label: "Start", machineId: machine.id }),
+      remove,
     ]);
   }
-  if (machine.state !== "running") return Object.freeze([]);
+  // `error`, `creating`, `deleted`, or any state this client does not know:
+  // no transition is offered, but the console's Delete still is.
+  if (machine.state !== "running") return Object.freeze([remove]);
   return Object.freeze([
     ...(options.opencodeSupervisorRepairRequired === true
       ? [Object.freeze({ kind: "supervisor-blocked" as const, label: "OpenCode needs a terminal update" as const, machineId: machine.id })]
@@ -119,6 +147,7 @@ export function resolveMachineContextActions(
         })]
       : []),
     Object.freeze({ kind: "stop" as const, label: "Stop" as const, machineId: machine.id }),
+    remove,
   ]);
 }
 

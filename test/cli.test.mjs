@@ -308,6 +308,48 @@ test("machine lifecycle recursion preserves --no-color for explorer and progress
   assert.equal(interactive.stderr().includes("\u001b[48;"), false);
 });
 
+test("explorer create selection runs machines create with the chosen provider and name, then reopens the explorer", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  let explorerCalls = 0;
+  const creates = [];
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      return capabilitySnapshot([{
+        id: "machines.create",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "financial",
+        surfaces: ["cli"],
+        requiredPermissions: ["machines:create"],
+      }], scope, resourceId);
+    },
+    async createMachine(body) {
+      creates.push(body);
+      return { id: MACHINE_ID, name: body.name, state: "creating", agent: body.agent };
+    },
+    async getMachine(id) { return { id, name: "cuna-codex-1", state: "creating", agent: "codex" }; },
+  });
+  assert.equal(await runCli(["machines", "--no-color"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+    machinesExplorerRunner: async () => {
+      explorerCalls += 1;
+      return explorerCalls === 1
+        ? { kind: "create", agent: "codex", name: "cuna-codex-1" }
+        : undefined;
+    },
+  }), EXIT_CODES.success);
+  assert.equal(creates.length, 1, "the screen's create selection issues exactly one machines create");
+  assert.equal(creates[0].name, "cuna-codex-1");
+  assert.equal(creates[0].agent, "codex");
+  assert.equal(explorerCalls, 2, "a successful create reopens the explorer");
+  assert.match(interactive.stderr(), /Creating machine/u);
+  assert.equal(interactive.stderr().includes("[38;"), false);
+});
+
 test("no-args remains help off-TTY but a real TTY infers and attaches the selected AgentSession", async () => {
   const redirected = memoryStreams();
   assert.equal(await runCli([], { streams: redirected.streams }), EXIT_CODES.success);
