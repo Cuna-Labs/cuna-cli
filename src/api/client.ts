@@ -1,5 +1,8 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
-import { MACHINE_CREATE_REQUEST_BUDGET_MS } from "../core/observation-budget.js";
+import {
+  MACHINE_CREATE_REQUEST_BUDGET_MS,
+  MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
+} from "../core/observation-budget.js";
 import { OFF_CONTRACT_RESPONSE_HINT } from "../core/product-web.js";
 import {
   ContractViolation,
@@ -553,6 +556,10 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         method: "POST",
         path: `/v1/sessions/${safeId}/${action}`,
         settleWith: "cuna machines list",
+        // A start boots a VM and waits for its supervisor; the list budget
+        // aborted the journey's own step at 15 s and told the caller the
+        // operation "may have completed".
+        budgetMs: MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
         ...(signal === undefined ? {} : { signal }),
       };
       const machine = await fetchDecoded(request, decodeMachineItem);
@@ -567,6 +574,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         method: "POST",
         path: `/v1/sessions/${safeId}/supervisor/replace`,
         settleWith: "cuna machines list",
+        budgetMs: MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
         ...(signal === undefined ? {} : { signal }),
       };
       const machine = await fetchDecoded(request, decodeMachineItem);

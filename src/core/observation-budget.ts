@@ -88,6 +88,22 @@ export const DEFAULT_REQUEST_BUDGET_MS = 15_000;
 export const MACHINE_CREATE_REQUEST_BUDGET_MS = 90_000;
 
 /**
+ * `POST /v1/sessions/{id}/{start|resume}` boots a VM and waits for its
+ * supervisor to accept control before it answers, so it is not bounded by the
+ * same budget as a list either.
+ *
+ * DERIVATION. Measured 2026-09-02 against edge v148 on Machine fceaf633: the
+ * answer came at 24 s from `cuna machines start` (which the caller had widened
+ * by hand with `--timeout-ms`), while the same transition inside `cuna
+ * opencode` aborted at the 15 s default and told the user the operation "may
+ * have completed" — for the step the journey itself had just decided to take.
+ * 60 000 ms is that duration with a 150% margin; it stays well inside the
+ * `--timeout-ms` ceiling of 120 000, and it is deliberately lower than the
+ * create budget because starting an existing VM does not provision one.
+ */
+export const MACHINE_LIFECYCLE_REQUEST_BUDGET_MS = 60_000;
+
+/**
  * How long the CLI reads back before it stops judging a postcondition.
  *
  * DERIVATION. Measured 2026-08-19: a deleted machine was still `present` on an
