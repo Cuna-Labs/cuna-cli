@@ -846,17 +846,23 @@ function renderMachinesExplorer(input: {
     const machineSelected = input.selectedKey === machineKey;
     if (machineSelected) selectedLine = lines.length;
     const provider = machineProviderAvailability(row.machine);
-    const counts = row.sessionsLoading === true && row.sessions.length === 0
-      ? "OpenCode … · Claude … · Codex …"
-      : row.sessionsError === undefined
-        ? providerSummaryOrder().map((agent) => agentSummary(row, agent, input.now)).join(" · ")
-        : "OpenCode ? · Claude ? · Codex ?";
+    // One fact the reader acts on: how many agents run here. The former
+    // three-provider tally (`OpenCode 0/0 live · Claude 0/0 live · Codex 0/0
+    // live`) repeated on every machine, including stopped and errored ones,
+    // was the loudest line on the screen and answered nothing.
+    const sessions = row.sessionsLoading === true && row.sessions.length === 0
+      ? "…"
+      : row.sessionsError !== undefined
+        ? "sessions ?"
+        : row.sessions.length === 0
+          ? "no sessions"
+          : `${row.sessions.length} session${row.sessions.length === 1 ? "" : "s"}`;
     // `usability` is the declaration, not the verdict. Printing it raw said
     // `declared-installed` — a word the reader cannot act on, and worse, one
     // that reads as usable on exactly the machines where the next command
     // fails closed. `providerVerdict` is the reconciliation the other surfaces
     // already use, which is what makes this row agree with `machines list`.
-    lines.push(`${machineSelected ? "❯" : " "} ${open ? "▾" : "▸"} ${safeLine(row.machine.name)}  ${safeLine(row.machine.state)}  ${provider.displayName} ${providerVerdict(provider)}  ${counts}`);
+    lines.push(`${machineSelected ? "❯" : " "} ${open ? "▾" : "▸"} ${safeLine(row.machine.name)}  ${safeLine(row.machine.state)}  ${provider.displayName} ${providerVerdict(provider)}  ${sessions}`);
     if (!open) continue;
     if (row.sessionsLoading === true && row.sessions.length === 0) {
       lines.push(`    ${loaderLine("Loading AgentSessions", input.animationFrame)}`);
@@ -876,8 +882,10 @@ function renderMachinesExplorer(input: {
       if (row.opencodeSupervisorProtocolUnavailable) {
         lines.push(`    ${row.opencodeRuntimeUnverified ? "├─" : "└─"} ${openCodeSupervisorProtocolWaitSummary()}`);
       }
-      if (row.opencodeRuntimeUnverified) {
-        lines.push("    └─ Checking OpenCode runtime; no new OpenCode session was requested");
+      // Only a running machine can be verified; on a stopped or errored one
+      // the line is noise the reader cannot act on.
+      if (row.opencodeRuntimeUnverified && row.machine.state === "running") {
+        lines.push("    └─ OpenCode runtime not verified yet");
       }
       continue;
     }
@@ -902,8 +910,8 @@ function renderMachinesExplorer(input: {
     if (row.opencodeSupervisorProtocolUnavailable) {
       lines.push(`     ${openCodeSupervisorProtocolWaitSummary()}`);
     }
-    if (row.opencodeRuntimeUnverified) {
-      lines.push("     Checking OpenCode runtime; no new OpenCode session was requested");
+    if (row.opencodeRuntimeUnverified && row.machine.state === "running") {
+      lines.push("     OpenCode runtime not verified yet");
     }
   }
   const capacityNotice = overviewSessionCreateCapacityNotice(input.rows);
@@ -1181,10 +1189,6 @@ function providerCreationOrder(): readonly ActionableProvider[] {
   return Object.freeze(["opencode", "claude-code", "codex"]);
 }
 
-function providerSummaryOrder(): readonly ActionableProvider[] {
-  return providerCreationOrder();
-}
-
 function sessionCreateCapacityNotice(row: MachineRow): string | undefined {
   if (row.sessionCreateCapabilityState === "checking") {
     return "Checking whether this Machine can start a new session; existing sessions stay available.";
@@ -1258,17 +1262,6 @@ function paintStatus(line: string): string {
     .replaceAll("stale", `${ANSI.orange}stale${ANSI.reset}`)
     .replaceAll("failed", `${ANSI.red}failed${ANSI.reset}`)
     .replaceAll("unsupported", `${ANSI.gray}unsupported${ANSI.reset}`);
-}
-
-function agentSummary(row: MachineRow, agent: ActionableProvider, now: number): string {
-  const matching = row.sessions.filter((session) => session.agent === agent);
-  const running = matching.filter((session) => session.processState === "running" && classifySessionActionability({
-      session,
-      machine: row.machine,
-      now,
-      refreshStatus: row.sessionsLoading === true ? "pending" : "idle",
-    }).canAttach).length;
-  return `${providerDisplayName(agent)} ${running}/${matching.length} live`;
 }
 
 function openCodeRepairSummary(row: MachineRow): string {

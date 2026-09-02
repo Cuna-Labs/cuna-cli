@@ -900,7 +900,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // Preflight gates and configuration must read the same invocation
     // environment. This keeps credential and profile selection deterministic
     // across embedded invocations.
-    if (parsed.command !== undefined) preflightInvocation(parsed);
+    if (parsed.command !== undefined) preflightInvocation(parsed, (dependencies.now ?? Date.now)());
 
     let journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "opencode"
       ? preflightAgentJourneyInvocation(parsed)
@@ -1136,17 +1136,31 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
             : `Cuna completed signup for profile ${result.profile}.`,
         );
       } else if (parsed.command === "login") {
-        const result = await (await getHumanAuth()).login(
-          dependencies.signal === undefined ? {} : { signal: dependencies.signal },
-        );
+        const auth = await getHumanAuth();
+        let result;
+        let alreadySignedIn = false;
+        try {
+          result = await auth.login(
+            dependencies.signal === undefined ? {} : { signal: dependencies.signal },
+          );
+        } catch (error) {
+          // Being signed in already is the outcome the user asked for, not a
+          // failure: report who they are and how to switch, exit 0.
+          if (!(error instanceof CunaError) || error.code !== "cuna.auth.already_signed_in") throw error;
+          result = await auth.whoami(dependencies.signal);
+          alreadySignedIn = true;
+        }
         const data = Object.freeze({
           ...humanResult(result),
           storage_mode: "encrypted-local" as const,
+          already_signed_in: alreadySignedIn,
         });
         writer.success(
           "login",
           data,
-          "Signed in to Cuna.",
+          alreadySignedIn
+            ? `Already signed in as ${result.context.identity}. Run \`cuna logout\` to switch accounts.`
+            : "Signed in to Cuna.",
         );
       } else if (parsed.command === "whoami" || parsed.command === "access") {
         const result = await (await getHumanAuth()).whoami(dependencies.signal);

@@ -206,7 +206,11 @@ function selectionFailure(
         ? "An existing OpenCode machine needs its terminal supervisor updated before a session can start. Cuna did not create another machine. Open `cuna machines`, stop only the machine and sessions you choose, then select Update terminal supervisor."
         : plan.reason === "agent-mismatch"
           ? "Choose or create a machine configured for this provider (`cuna machines create --agent claude-code|codex|opencode ...`)."
-          : "Select an exact machine with --machine NAME."
+          : plan.reason === "not-found"
+            ? "No machine by that name exists in this account. See your machines with `cuna machines list`, create one with `cuna machines create --name NAME --agent claude-code|codex|opencode --yes`, or omit --machine to let Cuna use or create one."
+            : plan.reason === "state-not-reusable"
+              ? "That machine is not running. Start it with `cuna machines start MACHINE_ID --yes`, or omit --machine to let Cuna use or create a running one."
+              : "Select an exact machine with --machine NAME."
       : plan.reason === "attachment-unobservable"
         // Naming the prerequisite instead of implying a retry. Cuna does not
         // publish per-AgentSession attachment state, so reuse cannot prove the

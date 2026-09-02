@@ -78,7 +78,7 @@ async function waitUntil(predicate, message) {
   assert.fail(message);
 }
 
-test("machines explorer renders nested counts, opens machine actions, resizes, and exits on one Ctrl+C", async () => {
+test("machines explorer renders one session summary per machine, opens machine actions, resizes, and exits on one Ctrl+C", async () => {
   const host = new FakeHost();
   const calls = [];
   const client = {
@@ -92,9 +92,10 @@ test("machines explorer renders nested counts, opens machine actions, resizes, a
     },
   };
   const operation = runNodeMachinesExplorer({ client, color: true }, { host });
-  await waitUntil(() => host.writes.some((write) => write.includes("Claude 1/1 live")), "nested machine inventory should render");
+  await waitUntil(() => host.writes.some((write) => stripAnsi(write).includes("goal0  running  Claude") && stripAnsi(write).includes("  1 session")), "nested machine inventory should render");
   const expanded = host.writes.at(-1);
   assert.match(stripAnsi(expanded), /Claude · goal0-claude  attachable/u);
+  assert.doesNotMatch(stripAnsi(expanded), /\d+\/\d+ live/u, "the per-provider tally must not be rendered on the machine line");
   assert.match(stripAnsi(expanded), /Enter\/→ manage machine/u);
   assert.equal(expanded.includes("\u001b[48;5;202m"), true, "brand cell should use Cuna flare");
   assert.equal(expanded.includes("\u001b[38;5;232m"), true, "brand text should use theme-independent Cuna ground");
@@ -158,7 +159,7 @@ for (const [label, key] of [["Enter", 0x0d], ["Space", 0x20]]) {
         },
       },
     }, { host });
-    await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("Claude 1/4 live")), "one live child among history should render");
+    await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("  4 sessions")), "one live child among history should render");
     assert.match(stripAnsi(host.writes.at(-1)), /Enter\/→ manage machine/u);
 
     host.emitInput([key]);
@@ -210,7 +211,7 @@ test("Enter on a machine with multiple openable children opens management withou
       },
     },
   }, { host });
-  await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("Claude 2/2 live")), "both openable children should render");
+  await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("  2 sessions")), "both openable children should render");
   assert.match(stripAnsi(host.writes.at(-1)), /Enter\/→ manage machine/u);
   host.emitInput([0x0d]);
   await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("CUNA  ◆── goal0"), "ambiguous Enter should open machine management");
@@ -386,9 +387,10 @@ test("OpenCode counts and a live OpenCode child are visible and attachable", asy
       async listAgentSessions() { return { items: [agentSession({ agent: "opencode", name: "open-main" })] }; },
     },
   }, { host });
-  await waitUntil(() => host.writes.some((write) => write.includes("OpenCode 1/1 live")), "OpenCode count should render");
+  await waitUntil(() => host.writes.some((write) => stripAnsi(write).includes("open-dev  running  OpenCode")), "OpenCode machine should render");
   const overview = stripAnsi(host.writes.at(-1));
-  assert.ok(overview.indexOf("OpenCode 1/1 live") < overview.indexOf("Claude 0/0 live"), "OpenCode should be the first recommended provider summary when enabled");
+  assert.match(overview, /open-dev  running  OpenCode [^\r\n]*  1 session\b/u, "the machine line names its provider once and counts sessions");
+  assert.doesNotMatch(overview, /Claude 0\/0 live|Codex 0\/0 live/u, "providers absent from this machine are not tallied");
   host.emitInput([0x1b, 0x5b, 0x42]);
   await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("❯   └─ OpenCode"), "OpenCode child should be selected");
   host.emitInput([0x0d]);
@@ -727,11 +729,12 @@ test("OpenCode runtime verification waits rather than offering another machine",
   }, { host });
 
   await waitUntil(
-    () => host.writes.some((write) => stripAnsi(write).includes("Checking OpenCode runtime; no new OpenCode session was requested")),
+    () => host.writes.some((write) => stripAnsi(write).includes("OpenCode runtime not verified yet")),
     "runtime verification should remain a transient no-create state",
   );
   const frame = stripAnsi(host.writes.at(-1));
   assert.doesNotMatch(frame, /Create OpenCode machine|No available machine can open an AgentSession/u);
+  assert.doesNotMatch(frame, /Checking OpenCode runtime/u, "the transient line is one short fact, not a sentence per machine");
   host.emitInput(Buffer.from("q"));
   await operation;
   assert.equal(host.restored, 1);
@@ -767,7 +770,7 @@ test("machines explorer treats a producer-renewed future runtime expiry as live"
       async listAgentSessions() { return { items: [session] }; },
     },
   }, { host, now: () => now });
-  await waitUntil(() => host.writes.some((write) => write.includes("Claude 1/1 live")), "renewed lease should render live");
+  await waitUntil(() => host.writes.some((write) => write.includes("goal0-claude  attachable")), "renewed lease should render live");
   host.emitInput(Buffer.from("q"));
   await operation;
 });
@@ -794,7 +797,7 @@ test("machines explorer excludes sessions whose termination is intended or pendi
       },
     },
   }, { host });
-  await waitUntil(() => host.writes.some((write) => write.includes("Claude 1/1 live")), "only the intended-active session should count");
+  await waitUntil(() => host.writes.some((write) => stripAnsi(write).includes("  1 session")), "only the intended-active session should count");
   const frame = host.writes.at(-1);
   assert.match(frame, /goal0-claude/u);
   assert.doesNotMatch(frame, /already-terminating|pending-termination/u);
@@ -834,7 +837,7 @@ test("machines explorer keeps stale sessions visible without counting them as ru
       },
     },
   }, { host, now: () => Date.parse("2026-08-27T01:00:00.000Z") });
-  await waitUntil(() => host.writes.some((write) => write.includes("Claude 0/1 live")), "expired runtime evidence must not count as running");
+  await waitUntil(() => host.writes.some((write) => write.includes("goal0-claude  stale")), "expired runtime evidence must not count as running");
   assert.match(host.writes.at(-1), /Claude · goal0-claude  stale/u);
   host.emitInput([0x1b, 0x5b, 0x42]);
   await waitUntil(() => host.writes.at(-1).includes("❯   └─ Claude"), "a stale session with refresh recovery should be selectable");
@@ -866,7 +869,7 @@ test("machines explorer renders an unknown declared provider truthfully beside i
       write.includes("Unknown (future-agent) unusable — provider_not_supported_by_cli")),
     "an unknown provider must name why the next command cannot run",
   );
-  assert.match(host.writes.at(-1), /OpenCode 0\/0 live/u);
+  assert.doesNotMatch(host.writes.at(-1), /\d+\/\d+ live/u, "no provider tally is rendered beside the verdict");
   host.emitInput([0x03]);
   await operation;
 });
@@ -920,12 +923,12 @@ test("machines explorer does not turn a cached live session stale while refresh 
       },
     },
   }, { host, now: () => now });
-  await waitUntil(() => host.writes.some((write) => write.includes("Claude 1/1 live")), "initial live snapshot should render");
+  await waitUntil(() => host.writes.some((write) => write.includes("goal0-claude  attachable")), "initial live snapshot should render");
 
   now = start + 10_000;
   host.emitInput([0x72]);
   await waitUntil(() => reads === 2 && host.writes.at(-1).includes("Refreshing live sessions"), "refresh should be visibly pending");
-  assert.match(host.writes.at(-1), /Claude 1\/1 live/u);
+  assert.match(host.writes.at(-1), /goal0-claude  attachable/u);
   assert.doesNotMatch(host.writes.at(-1), /goal0-claude  stale/u);
 
   releaseRefresh();
@@ -1071,7 +1074,7 @@ test("unknown-provider sessions remain visible but are never selectable or alias
   }, { host });
   await waitUntil(() => host.writes.some((write) => write.includes("future-child  unsupported")), "unsupported session should stay observable");
   assert.match(host.writes.at(-1), /Unknown \(future-agent\)/u);
-  assert.match(host.writes.at(-1), /OpenCode 0\/0 live/u);
+  assert.doesNotMatch(host.writes.at(-1), /\d+\/\d+ live/u, "no provider tally is rendered beside the verdict");
   assert.doesNotMatch(host.writes.at(-1), /OpenCode · future-child/u);
   host.emitInput([0x1b, 0x5b, 0x42]);
   await new Promise((resolve) => setTimeout(resolve, 10));

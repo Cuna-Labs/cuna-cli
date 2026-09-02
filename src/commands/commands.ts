@@ -515,6 +515,7 @@ function capabilityRecord(snapshot: CapabilitySnapshot): Readonly<Record<string,
 
 export function preflightInvocation(
   parsed: ParsedInvocation,
+  now: number = Date.now(),
 ): void {
   assertRegisteredCliRoute(parsed);
   switch (parsed.command) {
@@ -587,7 +588,10 @@ export function preflightInvocation(
         rejectUnknownOptions(parsed, ["name", "expires-at", "yes"]);
         if (parsed.operands.length !== 1) throw usageError("api-keys create accepts no operands.");
         requireConfirmation(parsed, "api-keys.create");
-        apiKeyCreateInput(parsed);
+        // Preflight and execution must read one clock; validating here with
+        // the wall clock while execution used the injected one let a fixed
+        // test date turn red the day the calendar caught up with it.
+        apiKeyCreateInput(parsed, now);
         return;
       }
       throw usageError(`Unknown api-keys action ${action}.`);
