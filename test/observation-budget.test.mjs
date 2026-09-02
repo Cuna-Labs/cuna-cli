@@ -443,7 +443,7 @@ test("D2: a delete that never converges reports the CLI's budget, retryable, nam
   assert.equal(record_.details.settle_with, "cuna machines list");
   assert.equal(record_.details.observed_state, "running");
   assert.equal(record_.details.remote_outcome, "unobserved");
-  assert.equal(clock.elapsed(), 30_000);
+  assert.equal(clock.elapsed(), 120_000);
   assert.ok(record.reads > 1);
 });
 
