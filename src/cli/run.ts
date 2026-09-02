@@ -1695,7 +1695,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         interactiveCloseColor && streams.stderrIsTTY === true,
         supervisorReadiness,
       );
-      return error.exitCode;
+      // A process that is gone is a final refusal, not a network condition:
+      // retrying cannot change it, so the exit code must not say "retry".
+      return supervisorReadiness === "ended" ? EXIT_CODES.policy : error.exitCode;
     }
     writer.error(label, error);
     return error.exitCode;
