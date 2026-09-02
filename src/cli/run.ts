@@ -631,12 +631,18 @@ function isTerminalResumeHandleConflict(error: CunaError): boolean {
     error.details?.reason === "terminal_connection_resume_handle_conflict";
 }
 
-function terminalSupervisorReadiness(error: CunaError): "waiting" | "lease_expired" | "upgrade_required" | "unverified" | undefined {
+type TerminalSupervisorReadiness = "waiting" | "lease_expired" | "upgrade_required" | "unverified" | "ended";
+
+function terminalSupervisorReadiness(error: CunaError): TerminalSupervisorReadiness | undefined {
   if (
     error.code !== "cuna.runtime.capability_unknown" &&
     error.code !== "cuna.runtime.capability_unavailable"
   ) return undefined;
   const reason = error.details?.reason_code;
+  // The process this AgentSession named is gone for good (the Machine
+  // restarted, or the owner could not be recovered). Nothing can still
+  // arrive, so this is BLOCKED with a route, never a "try again in a moment".
+  if (reason === "terminal_owner_unrecoverable") return "ended";
   if (isOpenCodeSupervisorUpgradeReason(reason)) return "upgrade_required";
   if (reason === "runtime_lease_expired") return "lease_expired";
   if (reason === "supervisor_registry_unavailable") return "waiting";
@@ -660,10 +666,17 @@ function writeTerminalReconnectConflict(stream: Writable, color: boolean): void 
 function writeTerminalSupervisorReadiness(
   stream: Writable,
   color: boolean,
-  state: "waiting" | "lease_expired" | "upgrade_required" | "unverified",
+  state: TerminalSupervisorReadiness,
 ): void {
   const accent = (value: string): string => color ? `\u001b[38;5;202m\u001b[1m${value}\u001b[0m` : value;
   const success = (value: string): string => color ? `\u001b[38;5;42m${value}\u001b[0m` : value;
+  if (state === "ended") {
+    stream.write(`${accent("◆ CUNA")}  This AgentSession's process has ended\n`);
+    stream.write("The Machine restarted, so the exact process and terminal cannot be recovered.\n");
+    stream.write(`${success("Cuna did not attach a terminal and did not change the remote AgentSession.")}\n`);
+    stream.write("Start a fresh one with `cuna <claude|codex|opencode> --new-session`.\n");
+    return;
+  }
   if (state === "upgrade_required") {
     stream.write(`${accent("◆ CUNA")}  Machine terminal update needed\n`);
     stream.write("This machine needs its terminal supervisor updated before it can attach.\n");

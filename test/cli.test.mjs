@@ -577,6 +577,43 @@ test("foreground Cuna explains an expired AgentSession runtime lease without pre
   assert.doesNotMatch(visible, /reconnecting its terminal control|Error \[/u);
 });
 
+test("foreground Cuna renders an unrecoverable AgentSession as ended with a route, never as a wait", async () => {
+  // Measured 2026-09-02 after edge v147 settled a session across a Machine
+  // restart: the edge answered `terminal_owner_unrecoverable` and the CLI said
+  // "Terminal connection not ready … Open this same AgentSession again in a
+  // moment", a promise that nothing could keep.
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unavailable",
+        message: "The terminal owner cannot be recovered.",
+        exitCode: EXIT_CODES.policy,
+        details: {
+          capability_id: "terminal_connections.create",
+          reason_code: "terminal_owner_unrecoverable",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  This AgentSession's process has ended/u);
+  assert.match(visible, /cannot be recovered/u);
+  assert.match(visible, /--new-session/u);
+  assert.doesNotMatch(visible, /again in a moment|Wait for a fresh runtime observation|reconnecting its terminal control|Error \[/u);
+});
+
 test("foreground Cuna recognizes the OpenCode supervisor-upgrade reason without claiming a session changed", async () => {
   const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
   const exit = await runCli([], {
