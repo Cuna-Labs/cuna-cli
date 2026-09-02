@@ -455,6 +455,7 @@ export class ForegroundTerminalCoordinator {
       throw runtimeFailure("terminal_disconnected", "Terminal readiness arrived after foreground ownership ended.");
     }
     previous?.viewport.dispose();
+    if (previous !== undefined) this.#forgetSeatNoticeOnSeatChange(previous.snapshot, snapshot);
     const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
     if (
       intent.localBrowserActions === true &&
@@ -557,6 +558,7 @@ export class ForegroundTerminalCoordinator {
   #terminalState(snapshot: RuntimeTerminalSnapshot): void {
     const tab = this.#tabs.get(snapshot.tabId);
     if (tab !== undefined) {
+      this.#forgetSeatNoticeOnSeatChange(tab.snapshot, snapshot);
       tab.snapshot = snapshot;
       if (
         snapshot.state === "active" &&
@@ -1725,6 +1727,18 @@ export class ForegroundTerminalCoordinator {
         this.#seatNotice = `Could not take control: ${error instanceof Error ? error.message : String(error)}`;
       },
     ).finally(() => { void this.#render().catch(() => undefined); });
+  }
+
+  /**
+   * A seat notice describes one moment: a refused keystroke, a pending or
+   * refused take-control. It must not outlive the seat it described. Forget
+   * it when the published seat (mode or reason) changes; keep it across a
+   * publish that changes nothing about the seat, such as a heartbeat, so a
+   * "Could not take control" line is still readable.
+   */
+  #forgetSeatNoticeOnSeatChange(before: RuntimeTerminalSnapshot, after: RuntimeTerminalSnapshot): void {
+    if (this.#seatNotice === undefined) return;
+    if (before.accessMode !== after.accessMode || before.reason !== after.reason) this.#seatNotice = undefined;
   }
 
   #seatNoticeFor(snapshot: RuntimeTerminalSnapshot | undefined): string | undefined {

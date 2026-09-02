@@ -556,6 +556,12 @@ export class CunaRuntimeBoundary {
     ) {
       throw runtimeFailure("grant_scope_mismatch", "The terminal response targets another attachment authority.");
     }
+    // The writer's headless xterm is the one that answers the PTY's queries
+    // (DA1, DSR, ...). An observer mirrors the same bytes and would answer
+    // them too, onto a PTY it does not hold; the gateway closes an observer's
+    // attachment for that. The answer is the terminal's, not the user's, so
+    // there is nothing to report: drop it.
+    if (entry.accessMode !== "writer") return;
     await this.#sendTerminalBytes(entry, response.bytes);
   }
 
@@ -863,9 +869,14 @@ export class CunaRuntimeBoundary {
         throw runtimeFailure("capability_unsupported", "The reconnected terminal cannot restore its dimensions.");
       }
       const previous = this.#views.require(previousViewId);
-      // As on attach: an observer never resizes the PTY.
-      const resizeSequence = entry.accessMode === "writer" ? entry.wireSequence + 1n : entry.wireSequence;
-      if (entry.accessMode === "writer") {
+      // As on attach: an observer never resizes the PTY. The seat that
+      // decides is the one this READY names, not the one held before the
+      // interruption: a writer may land back as an observer (the gateway
+      // would close the attachment on the RESIZE) and an observer may land
+      // as the writer (the PTY geometry must then be restored).
+      const landsAsWriter = ready.payload.accessMode === "writer";
+      const resizeSequence = landsAsWriter ? entry.wireSequence + 1n : entry.wireSequence;
+      if (landsAsWriter) {
         await connection.send(encodeTerminalControl("resize", resizeSequence, {
           columns: previous.columns,
           rows: previous.rows,

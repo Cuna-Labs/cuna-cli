@@ -161,6 +161,8 @@ function harness(options = {}) {
       return ready;
     },
     async sendInput(bytes, tabId, authority) {
+      const refusal = options.sendInputError?.();
+      if (refusal !== undefined) throw refusal;
       if (bytes.length === 1 && bytes[0] === 0x0c) {
         calls.repaint.push({ tabId, authority });
         return;
@@ -1459,5 +1461,72 @@ test("a refused seat request is reported on the notice line and does not stop th
     "the refusal is shown with the server's own words",
   );
   assert.equal(coordinator.state, "active");
+  await coordinator.stop();
+});
+
+const OBSERVER_REFUSAL = "This attachment observes the terminal; press Ctrl+] w to take control.";
+
+test("a refused keystroke's notice yields to every later seat change", async () => {
+  let observing = false;
+  const { coordinator, callbacks, host, intents } = harness({
+    sendInputError: () => (observing ? runtimeFailure("terminal_observer", OBSERVER_REFUSAL) : undefined),
+  });
+  await coordinator.start(intents.slice(0, 1));
+  const observer = (extra = {}) => ({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2, ...extra });
+  const writer = (extra = {}) => ({ ...snapshot(intents[0]), accessMode: "writer", writerEpoch: 3, ...extra });
+  const lastFrame = () => decoder.decode(host.writes.at(-1));
+
+  observing = true;
+  callbacks.onTerminalState(observer());
+  await waitUntil(() => lastFrame().includes("Observing (read-only)"), "the observer seat is rendered");
+  host.emitInput(encoder.encode("x"));
+  await waitUntil(() => lastFrame().includes(OBSERVER_REFUSAL), "the refused keystroke is explained");
+
+  observing = false;
+  const writesBeforePromotion = host.writes.length;
+  callbacks.onTerminalState(writer());
+  await waitUntil(() => host.writes.length > writesBeforePromotion, "promotion repaints");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(lastFrame().includes("observes the terminal"), false, "a promoted writer is not told it observes");
+  assert.equal(lastFrame().includes("Observing"), false, "a promoted writer is not told it is observing");
+
+  observing = true;
+  callbacks.onTerminalState(observer({ reason: "writer_transferred" }));
+  await waitUntil(() => lastFrame().includes("Control moved to another client"), "a demoted writer is told the seat moved");
+  assert.equal(lastFrame().includes("observes the terminal"), false, "the old refusal does not mask the transfer");
+
+  host.emitInput(encoder.encode("y"));
+  await waitUntil(() => lastFrame().includes(OBSERVER_REFUSAL), "a second refusal is explained again");
+
+  observing = false;
+  const writesBeforeSecond = host.writes.length;
+  callbacks.onTerminalState(writer({ writerEpoch: 4 }));
+  await waitUntil(() => host.writes.length > writesBeforeSecond, "the second promotion repaints");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(lastFrame().includes("observes the terminal"), false, "the second promotion clears the second refusal");
+  assert.equal(lastFrame().includes("Control moved"), false, "the transfer line does not outlive the promotion");
+  await coordinator.stop();
+});
+
+test("a take-control refusal survives an unchanged seat heartbeat publish", async () => {
+  const failure = new Error("Terminal writer changed");
+  const { coordinator, callbacks, calls, host, intents } = harness({ takeWriterError: failure });
+  await coordinator.start(intents.slice(0, 1));
+  const observer = () => ({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+  callbacks.onTerminalState(observer());
+  host.emitInput(Uint8Array.of(0x1d, 0x77));
+  await waitUntil(() => calls.takeWriter.length === 1, "the chord asks for the seat");
+  await waitUntil(
+    () => decoder.decode(host.writes.at(-1)).includes("Could not take control: Terminal writer changed"),
+    "the refusal is shown",
+  );
+  const writesBefore = host.writes.length;
+  callbacks.onTerminalState({ ...observer(), heartbeatObservedAt: 150, heartbeatExpiresAt: 250 });
+  await waitUntil(() => host.writes.length > writesBefore, "an unchanged-seat publish still repaints");
+  assert.equal(
+    decoder.decode(host.writes.at(-1)).includes("Could not take control: Terminal writer changed"),
+    true,
+    "a heartbeat publish with the same seat keeps the refusal on the line",
+  );
   await coordinator.stop();
 });

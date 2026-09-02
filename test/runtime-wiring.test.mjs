@@ -1749,3 +1749,145 @@ test("the writer seat is spelled on the wire exactly, or refused", () => {
   const notice = received("writer_epoch", { writerEpoch: 2, writerClientInstanceId: null, accessMode: "observer" });
   assert.deepEqual(notice, { writerEpoch: 2, writerClientInstanceId: null, accessMode: "observer" });
 });
+
+function terminalResponseFor(attached, bytes) {
+  return {
+    tabId: attached.tabId,
+    binding: {
+      userId: attached.userId,
+      machineId: attached.machineId,
+      agentSessionId: attached.agentSessionId,
+      processEpoch: attached.processEpoch,
+      fencingGeneration: attached.fencingGeneration,
+    },
+    bytes: new TextEncoder().encode(bytes),
+  };
+}
+
+function inputFrames(connection) {
+  return connection.sent.map(decodeTerminalFrame).filter((frame) => frame?.type === "input");
+}
+
+test("an observer's terminal-generated responses are dropped silently; a writer's reach the wire once", async () => {
+  const system = new FakeTerminalSystem();
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 4 });
+  const { runtime, states } = createRuntime(system);
+  const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  assert.equal(attached.accessMode, "observer");
+  const connection = system.connections.at(-1);
+  const sentBefore = connection.sent.length;
+
+  await runtime.sendTerminalResponse(terminalResponseFor(attached, "[?1;2c"));
+  assert.equal(connection.sent.length, sentBefore, "an observer's DA1 answer never reaches the PTY");
+  assert.equal(inputFrames(connection).length, 0);
+  assert.equal(states.at(-1).state, "active", "dropping the answer does not disturb the attachment");
+
+  connection.incoming.push(encodeTerminalControl("writer_epoch", 7n, {
+    writerEpoch: 5,
+    writerClientInstanceId: "client-1",
+    accessMode: "writer",
+  }));
+  await waitUntil(() => states.at(-1)?.accessMode === "writer", "the notice seats the attachment as the writer");
+  await runtime.sendTerminalResponse(terminalResponseFor(attached, "[1;1R"));
+  assert.equal(inputFrames(connection).length, 1, "a writer's answer reaches the PTY exactly once");
+  await runtime.shutdown();
+});
+
+async function interrupt(system, runtime, tabId) {
+  system.connections.at(-1).incoming.close();
+  await waitUntil(
+    () => runtime.listTerminals().find((terminal) => terminal.tabId === tabId)?.state === "interrupted",
+    "terminal did not become interrupted",
+  );
+}
+
+function handshake(connection) {
+  return connection.sent.map(decodeTerminalFrame).map((frame) => frame?.type);
+}
+
+test("the initial RESIZE on reconnect follows the seat READY names, not the seat held before the interruption", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  assert.equal(attached.accessMode, "writer");
+  await interrupt(system, runtime, "tab-a");
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 2 });
+  const demoted = await runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(demoted.accessMode, "observer");
+  assert.deepEqual(
+    handshake(system.connections.at(-1)),
+    ["resume"],
+    "a reconnect that lands as an observer sends no RESIZE (the gateway closes an observer's attachment for one)",
+  );
+  await runtime.shutdown();
+
+  const mirror = new FakeTerminalSystem();
+  mirror.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  const second = createRuntime(mirror);
+  const observed = await second.runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  assert.equal(observed.accessMode, "observer");
+  assert.deepEqual(handshake(mirror.connections.at(-1)), ["resume"], "an observer attach sends no RESIZE");
+  await interrupt(mirror, second.runtime, "tab-a");
+  mirror.seatOnReady.set("agent-a", { accessMode: "writer", writerEpoch: 2 });
+  const promoted = await second.runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(promoted.accessMode, "writer");
+  assert.deepEqual(
+    handshake(mirror.connections.at(-1)),
+    ["resize", "resume"],
+    "a reconnect that lands as the writer restores the PTY geometry before resuming",
+  );
+  assert.deepEqual(decodeTerminalControl(decodeTerminalFrame(mirror.connections.at(-1).sent[0])), { columns: 80, rows: 24 });
+  await second.runtime.shutdown();
+});
+
+test("a seat held at any point is remembered across reconnects: landing as an observer afterwards is a transfer", async () => {
+  // Arm 1: the seat was taken on a reconnect READY (never on attach), so the
+  // memory can only come from the reconnect path.
+  const system = new FakeTerminalSystem();
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  const { runtime, states } = createRuntime(system);
+  const observed = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  assert.equal(observed.accessMode, "observer");
+  await interrupt(system, runtime, "tab-a");
+  system.seatOnReady.set("agent-a", { accessMode: "writer", writerEpoch: 2 });
+  const seated = await runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(seated.accessMode, "writer");
+  assert.equal(seated.writerEpoch, 2);
+  await interrupt(system, runtime, "tab-a");
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 3 });
+  const createCallsBefore = system.createCalls.length;
+  const demoted = await runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(demoted.accessMode, "observer");
+  const asked = system.createCalls[createCallsBefore];
+  assert.equal(asked.accessMode, "writer", "a former writer reclaims its seat by name");
+  assert.equal(asked.expectedWriterEpoch, 2, "at the epoch it last held");
+  assert.equal(states.at(-1).accessMode, "observer");
+  assert.equal(states.at(-1).reason, "writer_transferred", "landing as an observer after holding the seat is a transfer");
+  await runtime.shutdown();
+
+  // Arm 2: the seat was held from attach.
+  const held = new FakeTerminalSystem();
+  const second = createRuntime(held);
+  await second.runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await interrupt(held, second.runtime, "tab-a");
+  held.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 2 });
+  await second.runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(held.createCalls[1].accessMode, "writer");
+  assert.equal(held.createCalls[1].expectedWriterEpoch, 1);
+  assert.equal(second.states.at(-1).reason, "writer_transferred");
+  await second.runtime.shutdown();
+
+  // Negative control: a seat never held is not "transferred" when a reconnect
+  // observes, and no epoch is asked for.
+  const never = new FakeTerminalSystem();
+  never.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  const third = createRuntime(never);
+  await third.runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  await interrupt(never, third.runtime, "tab-a");
+  const reconnected = await third.runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(reconnected.accessMode, "observer");
+  assert.equal(never.createCalls[1].accessMode, "observer");
+  assert.equal(never.createCalls[1].expectedWriterEpoch, undefined, "an observer that never held the seat expects no epoch");
+  assert.equal(third.states.at(-1).reason, undefined, "an observer that never held the seat was not demoted");
+  await third.runtime.shutdown();
+});
