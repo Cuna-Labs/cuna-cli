@@ -296,12 +296,22 @@
       "delete": {
         "operationId": "sessions.delete",
         "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "resource_not_found",
+          "workspace_not_assigned",
+          "machine_state_conflict",
+          "machine_state_commit_failed",
+          "machine_lifecycle_authority_unavailable",
+          "provider_unavailable",
+          "provider_request_rejected"
+        ],
         "responses": {
           "200": {
             "$ref": "#/components/responses/Ok"
           },
           "default": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Problem"
           }
         },
         "x-runa-auth-classes": [
@@ -1284,12 +1294,25 @@
       "post": {
         "operationId": "sessions.pause",
         "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "resource_not_found",
+          "workspace_not_assigned",
+          "machine_state_conflict",
+          "machine_state_commit_failed",
+          "machine_lifecycle_authority_unavailable",
+          "provider_unavailable",
+          "provider_request_rejected",
+          "machine_runtime_unavailable",
+          "machine_transition_invalid",
+          "machine_already_in_target_state"
+        ],
         "responses": {
           "200": {
             "$ref": "#/components/responses/Session"
           },
           "default": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Problem"
           }
         },
         "x-runa-auth-classes": [
@@ -1322,12 +1345,28 @@
       "post": {
         "operationId": "sessions.resume",
         "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "resource_not_found",
+          "workspace_not_assigned",
+          "machine_state_conflict",
+          "machine_state_commit_failed",
+          "machine_lifecycle_authority_unavailable",
+          "provider_unavailable",
+          "provider_request_rejected",
+          "machine_runtime_unavailable",
+          "machine_transition_invalid",
+          "machine_control_not_ready",
+          "control_credential_expired",
+          "machine_wake_in_progress",
+          "machine_wake_pending"
+        ],
         "responses": {
           "200": {
             "$ref": "#/components/responses/Session"
           },
           "default": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Problem"
           }
         },
         "x-runa-auth-classes": [
@@ -1360,12 +1399,26 @@
       "post": {
         "operationId": "sessions.stop",
         "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "resource_not_found",
+          "workspace_not_assigned",
+          "machine_state_conflict",
+          "machine_state_commit_failed",
+          "machine_lifecycle_authority_unavailable",
+          "provider_unavailable",
+          "provider_request_rejected",
+          "machine_runtime_unavailable",
+          "machine_transition_invalid",
+          "machine_already_in_target_state",
+          "machine_stop_settling"
+        ],
         "responses": {
           "200": {
             "$ref": "#/components/responses/Session"
           },
           "default": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Problem"
           }
         },
         "x-runa-auth-classes": [
@@ -1398,12 +1451,39 @@
       "post": {
         "operationId": "sessions.start",
         "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "resource_not_found",
+          "workspace_not_assigned",
+          "machine_state_conflict",
+          "machine_state_commit_failed",
+          "machine_lifecycle_authority_unavailable",
+          "provider_unavailable",
+          "provider_request_rejected",
+          "machine_runtime_unavailable",
+          "machine_transition_invalid",
+          "machine_stop_settling",
+          "machine_restart_settlement_failed",
+          "machine_control_not_ready",
+          "machine_wake_in_progress",
+          "machine_wake_pending",
+          "supervisor_upgrade_required",
+          "supervisor_upgrade_machine_not_stopped",
+          "supervisor_upgrade_runtime_unavailable",
+          "supervisor_upgrade_provider_not_stopped",
+          "supervisor_upgrade_not_required",
+          "supervisor_upgrade_agent_sessions_active",
+          "supervisor_upgrade_in_progress",
+          "supervisor_upgrade_authority_unavailable",
+          "supervisor_upgrade_v2_not_observed",
+          "supervisor_upgrade_publish_pending"
+        ],
         "responses": {
           "200": {
             "$ref": "#/components/responses/Session"
           },
           "default": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Problem"
           }
         },
         "x-runa-auth-classes": [
@@ -6505,6 +6585,9 @@
           "unavailable_reason",
           "writer_epoch",
           "writer_client_instance_id",
+          "writer_attached",
+          "writer_attached_at",
+          "writer_detached_at",
           "observed_at"
         ],
         "properties": {
@@ -6548,10 +6631,30 @@
             ],
             "description": "The client instance currently holding the writer seat; null when nobody holds it or state is `none`."
           },
+          "writer_attached": {
+            "type": "boolean",
+            "description": "Whether the client named by `writer_client_instance_id` is attached right now, decided only by durable rows: true iff that client's newest redeemed terminal connection on this process epoch is still `redeemed` (the gateway writes `closed` on transport close, heartbeat timeout after 45 s of silence, every protocol refusal, and machine delete; a transport orphaned by an edge restart is closed at the next boot). false when nobody holds the seat or state is `none`."
+          },
+          "writer_attached_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the attached writer's current connection was redeemed; null unless `writer_attached` is true."
+          },
+          "writer_detached_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the named writer's newest connection was closed; null while attached, when the seat is unheld, or when that client never redeemed a connection on this process epoch."
+          },
           "observed_at": {
             "type": "string",
             "format": "date-time",
-            "description": "When the edge read the durable row. Not a liveness claim: no attachment count is reported because live attachments are process-local to the edge and vanish on deploy."
+            "description": "When the edge read the durable rows. Liveness is `writer_attached`, read from `terminal_connections`; no attachment count is reported because live attachments are process-local to the edge and vanish on deploy."
           }
         }
       }

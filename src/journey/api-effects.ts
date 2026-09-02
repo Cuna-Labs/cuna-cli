@@ -90,6 +90,10 @@ export function attachmentFromSeat(
 ): SeatAttachment {
   if (seat.state !== "available") return { attachment: "unknown" };
   if (seat.writerClientInstanceId === null) return { attachment: "detached" };
+  // The row names the last writer forever; only its connection says whether
+  // that client is there now. A writer that has detached leaves the terminal
+  // reusable, which is the whole point of a durable session.
+  if (!seat.writerAttached) return { attachment: "detached" };
   if (ownClientInstanceId !== undefined && seat.writerClientInstanceId === ownClientInstanceId) {
     return { attachment: "detached" };
   }

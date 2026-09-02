@@ -542,6 +542,9 @@ function terminalSeat(overrides = {}) {
     unavailable_reason: null,
     writer_epoch: 2,
     writer_client_instance_id: "cli:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    writer_attached: true,
+    writer_attached_at: "2026-09-02T00:00:00.500Z",
+    writer_detached_at: null,
     observed_at: "2026-09-02T00:00:01.000Z",
     ...overrides,
   };
@@ -556,13 +559,26 @@ test("terminal seat decoder accepts every producer state and is closed", () => {
     unavailableReason: null,
     writerEpoch: 2,
     writerClientInstanceId: "cli:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    writerAttached: true,
+    writerAttachedAt: "2026-09-02T00:00:00.500Z",
+    writerDetachedAt: null,
     observedAt: "2026-09-02T00:00:01.000Z",
   });
   assert.equal(Object.isFrozen(held), true);
-  const free = decodeAgentSessionTerminalSeat(terminalSeat({ writer_client_instance_id: null }));
+  const free = decodeAgentSessionTerminalSeat(terminalSeat({
+    writer_client_instance_id: null, writer_attached: false, writer_attached_at: null,
+  }));
   assert.equal(free.writerClientInstanceId, null);
+  assert.equal(free.writerAttached, false);
+  // The writer this seat still names has gone: the terminal is reusable.
+  const detached = decodeAgentSessionTerminalSeat(terminalSeat({
+    writer_attached: false, writer_detached_at: "2026-09-02T00:00:00.900Z",
+  }));
+  assert.equal(detached.writerAttached, false);
+  assert.equal(detached.writerDetachedAt, "2026-09-02T00:00:00.900Z");
   const none = decodeAgentSessionTerminalSeat(terminalSeat({
     process_epoch: null, state: "none", writer_epoch: 0, writer_client_instance_id: null,
+    writer_attached: false, writer_attached_at: null,
   }));
   assert.equal(none.state, "none");
   assert.equal(none.processEpoch, null);
@@ -587,6 +603,12 @@ test("terminal seat decoder accepts every producer state and is closed", () => {
     ["unsafe holder", terminalSeat({ writer_client_instance_id: "cli one\n" }), "client_instance_id_or_null"],
     ["undefined holder", terminalSeat({ writer_client_instance_id: undefined }), "client_instance_id_or_null"],
     ["unparseable timestamp", terminalSeat({ observed_at: "yesterday" }), "timestamp"],
+    ["non-boolean liveness", terminalSeat({ writer_attached: "yes" }), "boolean"],
+    ["missing liveness", terminalSeat({ writer_attached: undefined }), "boolean"],
+    ["attached with nobody holding the seat", terminalSeat({ writer_client_instance_id: null }),
+      "writer_attached_without_writer"],
+    ["unparseable attach time", terminalSeat({ writer_attached_at: "recently" }), "timestamp_or_null"],
+    ["unparseable detach time", terminalSeat({ writer_detached_at: 7 }), "timestamp_or_null"],
   ]) {
     assert.throws(
       () => decodeAgentSessionTerminalSeat(shape),

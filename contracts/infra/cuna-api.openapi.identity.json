@@ -2,27 +2,27 @@
   "schemaVersion": 2,
   "artifact_file": "contracts/infra/cuna-api.openapi.json",
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
-  "infra_openapi_raw_sha256": "93b42b7dcd4862d43a080ae7ab26de7cf3185568680ba1f84f71d9f793e17797",
-  "infra_openapi_canonical_sha256": "795d558825afe4c79d1843045b6e0ab0bdf5b8f873c5bc099f456df5d7916612",
+  "infra_openapi_raw_sha256": "3a2eb85158efc8b9b0cfd949bb42bd4f2c83876a32d6419fc05a14116e7edf54",
+  "infra_openapi_canonical_sha256": "a1d990b8538172dc0fa56162a0beaf9a344c666e72575f0e0593d29808d6ccdb",
   "producer_repository": "Cuna-Labs/infra",
   "producer_content_state": "committed",
-  "producer_revision": "73b92986ea9dcc4e835b0054d23f7c87978bee81",
+  "producer_revision": "43a16c056425a1ad73b9731f569cbc402b765c56",
   "producer_full_tree": {
     "object_format": "sha1",
-    "commit": "73b92986ea9dcc4e835b0054d23f7c87978bee81",
-    "tree": "52edf2cc5229ea1d5307476f3cbb2132e1665a4f",
-    "contract_blob": "b23623120c84fb0102af7dc9e42ee7c3fe07d815"
+    "commit": "43a16c056425a1ad73b9731f569cbc402b765c56",
+    "tree": "93f742a1a75454fd8f7bc5a843c6533dfe72d9b9",
+    "contract_blob": "059cb569a948de5456f0f799ad625339a3b7c5fb"
   },
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
   "producer_projection_sha256": "a6324587044c440f69d830cd68cca7f09c53bc7f76ab16bc159a36c13fe45f6e",
-  "producer_runtime_manifest_sha256": "6cd5ea39bb3243a1ca7a60d80f3e25c2a74da72a20dd364adf0fcfd675744f40",
+  "producer_runtime_manifest_sha256": "944c6587610b4dfe562b4435cd2569a84aebeed7ac41cf291522952c8260bb3c",
   "feature_contracts": {
     "opencode_interactive_only": {
-      "openapi_raw_sha256": "93b42b7dcd4862d43a080ae7ab26de7cf3185568680ba1f84f71d9f793e17797",
-      "openapi_canonical_sha256": "795d558825afe4c79d1843045b6e0ab0bdf5b8f873c5bc099f456df5d7916612",
-      "producer_commit": "73b92986ea9dcc4e835b0054d23f7c87978bee81",
-      "producer_tree": "52edf2cc5229ea1d5307476f3cbb2132e1665a4f",
-      "producer_contract_blob": "b23623120c84fb0102af7dc9e42ee7c3fe07d815"
+      "openapi_raw_sha256": "3a2eb85158efc8b9b0cfd949bb42bd4f2c83876a32d6419fc05a14116e7edf54",
+      "openapi_canonical_sha256": "a1d990b8538172dc0fa56162a0beaf9a344c666e72575f0e0593d29808d6ccdb",
+      "producer_commit": "43a16c056425a1ad73b9731f569cbc402b765c56",
+      "producer_tree": "93f742a1a75454fd8f7bc5a843c6533dfe72d9b9",
+      "producer_contract_blob": "059cb569a948de5456f0f799ad625339a3b7c5fb"
     }
   }
 }

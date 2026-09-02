@@ -265,6 +265,9 @@ function seat(overrides = {}) {
     unavailableReason: null,
     writerEpoch: 1,
     writerClientInstanceId: null,
+    writerAttached: false,
+    writerAttachedAt: null,
+    writerDetachedAt: null,
     observedAt: "2026-09-02T00:00:00.000Z",
     ...overrides,
   };
@@ -298,10 +301,14 @@ test("session observation maps the durable writer seat onto attachment", async (
   const signal = new AbortController().signal;
   for (const [label, seatResult, ownId, expected] of [
     ["available, nobody holds it", seat(), OWN_CLIENT, { attachment: "detached" }],
-    ["available, another client holds it", seat({ writerClientInstanceId: OTHER_CLIENT }), OWN_CLIENT,
+    ["available, another client is attached", seat({ writerClientInstanceId: OTHER_CLIENT, writerAttached: true }), OWN_CLIENT,
       { attachment: "attached", attachmentHolder: OTHER_CLIENT }],
-    ["available, this client holds it", seat({ writerClientInstanceId: OWN_CLIENT }), OWN_CLIENT, { attachment: "detached" }],
-    ["available, held, and we have no own id", seat({ writerClientInstanceId: OWN_CLIENT }), null,
+    // Measured 2026-09-02: a clean detach leaves the row naming the client
+    // that left, and reuse was refused as if it were still there.
+    ["available, the named writer has detached", seat({ writerClientInstanceId: OTHER_CLIENT, writerAttached: false }), OWN_CLIENT,
+      { attachment: "detached" }],
+    ["available, this client is attached", seat({ writerClientInstanceId: OWN_CLIENT, writerAttached: true }), OWN_CLIENT, { attachment: "detached" }],
+    ["available, attached, and we have no own id", seat({ writerClientInstanceId: OWN_CLIENT, writerAttached: true }), null,
       { attachment: "attached", attachmentHolder: OWN_CLIENT }],
     ["owner_unrecoverable", seat({ state: "owner_unrecoverable", unavailableReason: "master_not_attested" }), OWN_CLIENT,
       { attachment: "unknown" }],

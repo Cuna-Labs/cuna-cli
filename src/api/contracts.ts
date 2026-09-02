@@ -1093,6 +1093,18 @@ export interface AgentSessionTerminalSeat {
   readonly unavailableReason: string | null;
   readonly writerEpoch: number;
   readonly writerClientInstanceId: string | null;
+  /**
+   * Whether the named writer is connected right now.
+   *
+   * The seat row remembers the last writer so a reconnecting client can
+   * reclaim its epoch; on 2026-09-02 that made a clean detach read as
+   * "another client holds the terminal" five seconds later. Liveness is a
+   * separate durable fact (the terminal connection row's state) and is the
+   * one this CLI acts on.
+   */
+  readonly writerAttached: boolean;
+  readonly writerAttachedAt: string | null;
+  readonly writerDetachedAt: string | null;
   readonly observedAt: string;
 }
 
@@ -1112,6 +1124,9 @@ export function decodeAgentSessionTerminalSeat(value: unknown): AgentSessionTerm
     "unavailable_reason",
     "writer_epoch",
     "writer_client_instance_id",
+    "writer_attached",
+    "writer_attached_at",
+    "writer_detached_at",
     "observed_at",
   ]);
   const agentSessionId = canonicalUuid(value, "agent_session_id");
@@ -1134,6 +1149,21 @@ export function decodeAgentSessionTerminalSeat(value: unknown): AgentSessionTerm
   ) {
     throw contractViolation("client_instance_id_or_null", "writer_client_instance_id");
   }
+  if (typeof value.writer_attached !== "boolean") {
+    throw contractViolation("boolean", "writer_attached");
+  }
+  // An unheld seat cannot have an attached writer, and a seat nobody holds
+  // must not carry attachment timestamps: the two facts come from different
+  // rows, so their disagreement is a producer defect, not a state.
+  if (value.writer_client_instance_id === null && value.writer_attached === true) {
+    throw contractViolation("writer_attached_without_writer", "writer_attached");
+  }
+  for (const key of ["writer_attached_at", "writer_detached_at"] as const) {
+    const at = value[key];
+    if (at !== null && (typeof at !== "string" || !Number.isFinite(Date.parse(at)))) {
+      throw contractViolation("timestamp_or_null", key);
+    }
+  }
   const observedAt = requiredString(value, "observed_at");
   if (!Number.isFinite(Date.parse(observedAt))) throw contractViolation("timestamp", "observed_at");
   return Object.freeze({
@@ -1143,6 +1173,9 @@ export function decodeAgentSessionTerminalSeat(value: unknown): AgentSessionTerm
     unavailableReason: value.unavailable_reason as string | null,
     writerEpoch: Number(value.writer_epoch),
     writerClientInstanceId: value.writer_client_instance_id as string | null,
+    writerAttached: value.writer_attached,
+    writerAttachedAt: value.writer_attached_at as string | null,
+    writerDetachedAt: value.writer_detached_at as string | null,
     observedAt,
   });
 }
