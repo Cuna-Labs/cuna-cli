@@ -1321,6 +1321,20 @@ test("workspace sync Problems preserve only the negotiated protocol and canonica
       error.details?.request_id === requestId,
   );
 
+  // A legacy-model route (`sessions.start`) answers 503 with its own sentence;
+  // the CLI must show that sentence, not a fixed "temporarily unavailable".
+  // Measured 2026-09-02: nine identical generic answers hid "The machine
+  // started, but its control connection could not be restored."
+  const legacySentence = "The machine started, but its control connection could not be restored. Try the action again.";
+  await assert.rejects(
+    makeTransport(503, { error: legacySentence }).request({ method: "POST", path: "/v1/sessions/s_1/start" }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.network.service_unavailable" &&
+      error.retryable === true &&
+      error.message === legacySentence &&
+      error.details?.server_error === legacySentence,
+  );
+
   for (const malformed of [
     { selected_protocol: null, capabilities },
     { selected_protocol: 2, capabilities: capabilities.slice(0, -1) },

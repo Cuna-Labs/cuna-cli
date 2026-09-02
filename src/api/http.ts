@@ -335,15 +335,26 @@ function apiError(input: {
     });
   }
   if (status === 429 || status >= 500) {
+    // A 5xx that carries the server's own sentence (a Problem title, or the
+    // legacy `{"error": "<sentence>"}` that `sessions.start` answers) must
+    // show it: nine identical "temporarily unavailable" answers in a row on
+    // 2026-09-02 hid a reason the server had named every time.
+    const serverSentence = status === 429 ? undefined : problem?.title ?? legacyReason;
     return new CunaError({
       code: status === 429 ? "cuna.network.rate_limited" : "cuna.network.service_unavailable",
-      message: status === 429 ? "Cuna is rate limiting this request." : "The Cuna service is temporarily unavailable.",
+      message: status === 429
+        ? "Cuna is rate limiting this request."
+        : serverSentence ?? "The Cuna service is temporarily unavailable.",
       exitCode: EXIT_CODES.network,
       hint: status === 429
         ? "Wait before retrying. No change was applied by this request."
-        : "No authoritative answer was received. Retry a read; do not assume a write was applied.",
+        : problem?.detail ??
+          "No authoritative answer was received. Retry a read; do not assume a write was applied.",
       retryable: problem?.retryable ?? true,
-      details,
+      details: {
+        ...details,
+        ...(legacyReason === undefined || problem !== undefined ? {} : { server_error: legacyReason }),
+      },
     });
   }
   if (status === 404 && !input.apiEncodedBody) {
