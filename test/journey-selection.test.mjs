@@ -356,17 +356,80 @@ test("duplicate AgentSession IDs and stale or unknown child state cannot select 
   }
 });
 
-test("nonmatching, attached, and terminal children never substitute for an exact detached child", () => {
+test("nonmatching and terminal children never substitute for an exact detached child", () => {
   const nonmatching = agentSession({ id: SESSION_A, cwd: "services/web" });
-  const attached = agentSession({ id: SESSION_B, attachment: "attached" });
   const terminated = agentSession({ id: SESSION_C, processState: "terminated" });
-  const plan = planAgentSessionSelection(agentSessionInput([nonmatching, attached, terminated]));
+  const plan = planAgentSessionSelection(agentSessionInput([nonmatching, terminated]));
   assert.deepEqual(plan, {
     kind: "create-required",
     target: "agent-session",
     machineId: MACHINE_A,
     reason: "no-compatible-candidate",
   });
+});
+
+test("a live exact session whose writer seat another client holds is refused by name, never shadowed by a sibling create", () => {
+  const holder = "cli:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const held = agentSession({ id: SESSION_B, attachment: "attached", attachmentHolder: holder });
+  const plan = planAgentSessionSelection(agentSessionInput([held]));
+  assert.deepEqual(plan, {
+    kind: "unavailable",
+    target: "agent-session",
+    targetId: SESSION_B,
+    holder,
+    reason: "already-attached",
+  });
+
+  // The holder is display data, not a precondition: a held seat with no
+  // recorded holder is still held.
+  const anonymous = planAgentSessionSelection(agentSessionInput([agentSession({ id: SESSION_B, attachment: "attached" })]));
+  assert.equal(anonymous.reason, "already-attached");
+  assert.equal(Object.hasOwn(anonymous, "holder"), false);
+
+  // A free exact session still wins over a held one; the held one is not an
+  // ambiguity because it was never a candidate.
+  const free = agentSession({ id: SESSION_A, attachment: "detached" });
+  const reused = planAgentSessionSelection(agentSessionInput([held, free]));
+  assert.equal(reused.kind, "select");
+  assert.equal(reused.agentSessionId, SESSION_A);
+
+  // Explicit selection of the held session says the same thing.
+  const explicit = planAgentSessionSelection(agentSessionInput([held], { agentSessionId: SESSION_B }));
+  assert.equal(explicit.reason, "already-attached");
+  assert.equal(explicit.holder, holder);
+
+  // Terminal state is judged before the seat: a terminated session with a
+  // stale holder is not "already attached", it is not reusable.
+  const dead = agentSession({ id: SESSION_C, processState: "terminated", attachment: "attached", attachmentHolder: holder });
+  assert.equal(planAgentSessionSelection(agentSessionInput([dead])).reason, "no-compatible-candidate");
+  assert.equal(planAgentSessionSelection(agentSessionInput([dead], { agentSessionId: SESSION_C })).reason, "state-not-reusable");
+});
+
+test("an unobservable seat is named as such on both the automatic and the explicit path", () => {
+  const unobservable = agentSession({ id: SESSION_B, attachment: "unknown" });
+  const automatic = planAgentSessionSelection(agentSessionInput([unobservable]));
+  assert.deepEqual(automatic, {
+    kind: "unavailable",
+    target: "agent-session",
+    targetId: SESSION_B,
+    reason: "attachment-unobservable",
+  });
+  const explicit = planAgentSessionSelection(agentSessionInput([unobservable], { agentSessionId: SESSION_B }));
+  assert.equal(explicit.reason, "attachment-unobservable");
+  assert.equal(explicit.targetId, SESSION_B);
+});
+
+test("a holder reported beside a seat that is not held is invalid authority data", () => {
+  for (const attachment of ["detached", "unknown"]) {
+    const plan = planAgentSessionSelection(
+      agentSessionInput([agentSession({ attachment, attachmentHolder: "cli:x" })]),
+    );
+    assert.equal(plan.reason, "authority-data-invalid", attachment);
+  }
+  const unsafe = planAgentSessionSelection(
+    agentSessionInput([agentSession({ attachment: "attached", attachmentHolder: "cli\u0007bell" })]),
+  );
+  assert.equal(unsafe.reason, "authority-data-invalid");
 });
 
 test("the central journey planner never evaluates AgentSessions until one machine is selected", () => {

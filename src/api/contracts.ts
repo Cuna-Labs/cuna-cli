@@ -1077,6 +1077,76 @@ export function decodeTerminalWriterState(value: unknown): TerminalWriterState {
   });
 }
 
+export type TerminalSeatState = "available" | "owner_unrecoverable" | "none";
+
+/**
+ * The durable writer seat of an AgentSession terminal, read from the
+ * database for the session's *current* process epoch (`GET
+ * /v1/agent-sessions/{id}/terminal`). It carries no attachment count: live
+ * attachments are process-local to the edge and vanish on deploy, so a count
+ * would report an empty terminal while a supervisor still holds a PTY.
+ */
+export interface AgentSessionTerminalSeat {
+  readonly agentSessionId: string;
+  readonly processEpoch: string | null;
+  readonly state: TerminalSeatState;
+  readonly unavailableReason: string | null;
+  readonly writerEpoch: number;
+  readonly writerClientInstanceId: string | null;
+  readonly observedAt: string;
+}
+
+const TERMINAL_SEAT_STATES: ReadonlySet<TerminalSeatState> = new Set<TerminalSeatState>([
+  "available",
+  "owner_unrecoverable",
+  "none",
+]);
+const CLIENT_INSTANCE_ID = /^[A-Za-z0-9._:-]{1,256}$/u;
+
+export function decodeAgentSessionTerminalSeat(value: unknown): AgentSessionTerminalSeat {
+  if (!isObject(value)) throw contractViolation("object");
+  exactKeys(value, [
+    "agent_session_id",
+    "process_epoch",
+    "state",
+    "unavailable_reason",
+    "writer_epoch",
+    "writer_client_instance_id",
+    "observed_at",
+  ]);
+  const agentSessionId = canonicalUuid(value, "agent_session_id");
+  if (value.process_epoch !== null && (typeof value.process_epoch !== "string" || !UUID.test(value.process_epoch))) {
+    throw contractViolation("canonical_uuid_or_null", "process_epoch");
+  }
+  const state = enumField(value, "state", TERMINAL_SEAT_STATES);
+  if (
+    value.unavailable_reason !== null &&
+    (typeof value.unavailable_reason !== "string" || value.unavailable_reason.length > 4096)
+  ) {
+    throw contractViolation("string_or_null", "unavailable_reason");
+  }
+  if (!Number.isSafeInteger(value.writer_epoch) || Number(value.writer_epoch) < 0) {
+    throw contractViolation("non_negative_integer", "writer_epoch");
+  }
+  if (
+    value.writer_client_instance_id !== null &&
+    (typeof value.writer_client_instance_id !== "string" || !CLIENT_INSTANCE_ID.test(value.writer_client_instance_id))
+  ) {
+    throw contractViolation("client_instance_id_or_null", "writer_client_instance_id");
+  }
+  const observedAt = requiredString(value, "observed_at");
+  if (!Number.isFinite(Date.parse(observedAt))) throw contractViolation("timestamp", "observed_at");
+  return Object.freeze({
+    agentSessionId,
+    processEpoch: value.process_epoch as string | null,
+    state,
+    unavailableReason: value.unavailable_reason as string | null,
+    writerEpoch: Number(value.writer_epoch),
+    writerClientInstanceId: value.writer_client_instance_id as string | null,
+    observedAt,
+  });
+}
+
 export function decodeOk(value: unknown): true {
   if (!isObject(value)) throw contractViolation("object");
   exactKeys(value, ["ok"]);
