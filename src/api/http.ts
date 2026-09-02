@@ -476,17 +476,131 @@ function parseJson(bytes: Uint8Array, request: Pick<HttpRequest, "method" | "pat
   });
 }
 
-function isRetryableAfterUnknownDispatch(request: HttpRequest): boolean {
-  // A transport FAILURE — connection refused, TLS error, DNS — cannot prove
-  // whether a mutating request reached the authority. An idempotency key alone
-  // is not reconciliation evidence, so mutations stay fail-closed until a
-  // producer contract exposes authoritative operation-status reconciliation.
+/**
+ * Which phase of the exchange a transport failure belongs to.
+ *
+ * `connect`: the TCP connection, name resolution or TLS handshake never
+ * completed, so no request bytes were written and the server observed nothing.
+ * `response`: the request may have been written; the connection failed before
+ * an authoritative answer arrived, so the server may have applied it.
+ *
+ * The distinction is what makes a retry safe. Measured 2026-09-02 (PRD-PM-008
+ * §E14-D8): `machines create` and `machines list` each failed once with
+ * `cuna.network.failed` after 17–18 s, with the TCP connect started and never
+ * completed (undici `UND_ERR_CONNECT_TIMEOUT`); the next call succeeded. A
+ * request that was never sent can be re-sent for every method, including POST.
+ */
+type TransportFailurePhase = "connect" | "response";
+
+const CONNECT_PHASE_CODES: ReadonlySet<string> = new Set([
+  // undici gave up waiting for the socket to connect.
+  "UND_ERR_CONNECT_TIMEOUT",
+  // The kernel refused or could not route the connect.
+  "ECONNREFUSED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EADDRNOTAVAIL",
+  // Name resolution failed, permanently or transiently.
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EAI_FAIL",
+  "EAI_NONAME",
+  // The TLS handshake was refused. Node reports certificate faults with the
+  // OpenSSL verify-result names, and handshake protocol faults as `EPROTO`
+  // (only trusted here when the syscall confirms it happened during connect)
+  // or `ERR_TLS_*`.
+  "CERT_HAS_EXPIRED",
+  "CERT_NOT_YET_VALID",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+  "ERR_TLS_HANDSHAKE_TIMEOUT",
+  "ERR_SSL_WRONG_VERSION_NUMBER",
+]);
+// A syscall name is stronger evidence than a code: `ETIMEDOUT` on `connect`
+// never wrote a byte, while `ETIMEDOUT` on `write` may have.
+const CONNECT_PHASE_SYSCALLS: ReadonlySet<string> = new Set(["connect", "getaddrinfo"]);
+
+/**
+ * Walk the error, its `cause` chain and any `AggregateError.errors` (Node's
+ * Happy Eyeballs connect reports one `ECONNREFUSED` per address family that
+ * way) looking for a `connect`-phase witness. Anything else — headers or body
+ * timeouts, a reset after the request was written, a bare `fetch failed` with
+ * no cause — is `response`: the fail-closed answer, because the CLI cannot
+ * prove the request was not sent.
+ */
+function transportFailurePhase(error: unknown): TransportFailurePhase {
+  const seen = new Set<object>();
+  const pending: unknown[] = [error];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current !== "object" || current === null || seen.has(current)) continue;
+    seen.add(current);
+    if (seen.size > 16) break;
+    const record = current as { code?: unknown; syscall?: unknown; cause?: unknown; errors?: unknown };
+    if (typeof record.syscall === "string" && CONNECT_PHASE_SYSCALLS.has(record.syscall)) return "connect";
+    if (typeof record.code === "string" && CONNECT_PHASE_CODES.has(record.code)) return "connect";
+    if (Array.isArray(record.errors)) pending.push(...record.errors);
+    pending.push(record.cause);
+  }
+  return "response";
+}
+
+function transportFailure(input: {
+  readonly request: HttpRequest;
+  readonly phase: TransportFailurePhase;
+  readonly attempts: number;
+  readonly cause: unknown;
+}): CunaError {
+  const { request, phase, attempts } = input;
+  if (phase === "connect") {
+    // Never sent, so nothing was applied, so every method may retry. The
+    // sentence says so: the old one ("failed before an authoritative result
+    // was received") left the user unable to tell a lost answer from a lost
+    // connection, and those call for different next steps.
+    return new CunaError({
+      code: "cuna.network.failed",
+      message: `Cuna could not be reached: the connection was not established after ${attempts} attempts, so the request was never sent.`,
+      exitCode: EXIT_CODES.network,
+      hint: "No change was applied by this request. Check connectivity to the API origin shown by `cuna config get`, then retry.",
+      retryable: true,
+      details: {
+        method: request.method,
+        path: request.path,
+        phase,
+        remote_outcome: "not_sent",
+        attempts,
+      },
+      cause: input.cause,
+    });
+  }
+  // A failure after the request may have been written cannot prove whether a
+  // mutating request reached the authority. An idempotency key alone is not
+  // reconciliation evidence, so mutations stay fail-closed until a producer
+  // contract exposes authoritative operation-status reconciliation.
   //
-  // This no longer governs the timeout arm, and that separation is the fix.
+  // This does not govern the timeout arm, and that separation is deliberate.
   // A budget elapsing is not a transport failure: nothing failed, the CLI
   // stopped waiting. `core/observation-budget.ts` owns that answer and makes it
   // retryable at a single site.
-  return request.method === "GET";
+  return new CunaError({
+    code: "cuna.network.failed",
+    message: "The Cuna request was sent, but the connection failed before an authoritative result was received.",
+    exitCode: EXIT_CODES.network,
+    hint: "Check connectivity to the API origin shown by `cuna config get`. A mutating request may still have been applied; re-read the resource before re-issuing it.",
+    retryable: request.method === "GET",
+    details: {
+      method: request.method,
+      path: request.path,
+      phase,
+      remote_outcome: "unobserved",
+      attempts,
+    },
+    cause: input.cause,
+  });
 }
 
 export function createHttpTransport(input: {
@@ -628,6 +742,9 @@ export function createHttpTransport(input: {
       }
       const controller = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
+      // Dispatches actually started, reported in `details.attempts` so a
+      // transport failure says how many connections were tried.
+      let attempts = 0;
       const onAbort = () => controller.abort(request.signal?.reason);
       request.signal?.addEventListener("abort", onAbort, { once: true });
       try {
@@ -687,8 +804,26 @@ export function createHttpTransport(input: {
           }
           return parseJson(bytes, request);
         };
+        // One immediate retry when the connection was never established. The
+        // request was not sent, so this is safe for every method, and the
+        // budget is respected without splitting it: both attempts share
+        // `controller`, so the one `setTimeout` above bounds their sum, and an
+        // attempt that fails after the budget fired is reported as the budget,
+        // never retried. Counted so the final error can say how many times.
+        const dispatchWithConnectRetry = async (bearer: string | undefined): Promise<unknown> => {
+          attempts += 1;
+          try {
+            return await dispatch(bearer);
+          } catch (error) {
+            if (error instanceof CunaError || error instanceof CredentialBoundaryError) throw error;
+            if (controller.signal.aborted) throw error;
+            if (transportFailurePhase(error) !== "connect") throw error;
+            attempts += 1;
+            return await dispatch(bearer);
+          }
+        };
         try {
-          return await dispatch(requestCredential);
+          return await dispatchWithConnectRetry(requestCredential);
         } catch (error) {
           const canRetryUnauthorized = error instanceof CunaError &&
             error.code === "cuna.auth.rejected" &&
@@ -711,7 +846,9 @@ export function createHttpTransport(input: {
           }
           // Deliberately outside a retry loop: a second 401 is authoritative.
           // The same serialized body and Idempotency-Key are reused verbatim.
-          return await dispatch(refreshedCredential);
+          // The connect retry still applies: the first exchange proved the
+          // origin reachable, and a fresh connection can still stall.
+          return await dispatchWithConnectRetry(refreshedCredential);
         }
       } catch (error) {
         if (error instanceof CunaError) throw error;
@@ -753,12 +890,10 @@ export function createHttpTransport(input: {
             cause: error,
           });
         }
-        throw new CunaError({
-          code: "cuna.network.failed",
-          message: "The Cuna request failed before an authoritative result was received.",
-          exitCode: EXIT_CODES.network,
-          hint: "Check connectivity to the API origin shown by `cuna config get`. A mutating request may still have been applied.",
-          retryable: isRetryableAfterUnknownDispatch(request),
+        throw transportFailure({
+          request,
+          phase: transportFailurePhase(error),
+          attempts,
           cause: error,
         });
       } finally {

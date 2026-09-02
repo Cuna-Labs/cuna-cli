@@ -1530,3 +1530,203 @@ test("a legacy 409 envelope reaches the user as the server's own sentence", asyn
     "an empty error string is not a sentence",
   );
 });
+
+/* -------------------------------------------------------------------------- */
+/* PRD-PM-008 §E14-D8: connect-phase failures are retried once               */
+/* -------------------------------------------------------------------------- */
+
+// Measured 2026-09-02: `machines create` and `machines list` each failed once
+// with `cuna.network.failed` after 17–18 s, TCP connect started and never
+// completed (undici `UND_ERR_CONNECT_TIMEOUT`); the next call succeeded. These
+// fakes reproduce the exact shape Node's fetch throws — `TypeError("fetch
+// failed")` with the transport error as `cause` — as dumped from a live
+// process on the same day.
+const connectTimeout = () => new TypeError("fetch failed", {
+  cause: Object.assign(new Error("Connect Timeout Error"), { code: "UND_ERR_CONNECT_TIMEOUT" }),
+});
+const connectRefused = () => new TypeError("fetch failed", {
+  cause: Object.assign(new AggregateError([
+    Object.assign(new Error("connect ECONNREFUSED ::1:443"), { code: "ECONNREFUSED", syscall: "connect" }),
+    Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:443"), { code: "ECONNREFUSED", syscall: "connect" }),
+  ], ""), { code: "ECONNREFUSED" }),
+});
+const dnsFailure = () => new TypeError("fetch failed", {
+  cause: Object.assign(new Error("getaddrinfo EAI_AGAIN api.getcuna.com"), { code: "EAI_AGAIN", syscall: "getaddrinfo" }),
+});
+const tlsFailure = () => new TypeError("fetch failed", {
+  cause: Object.assign(new Error("certificate has expired"), { code: "CERT_HAS_EXPIRED" }),
+});
+const headersTimeout = () => new TypeError("fetch failed", {
+  cause: Object.assign(new Error("Headers Timeout Error"), { code: "UND_ERR_HEADERS_TIMEOUT" }),
+});
+const resetAfterWrite = () => new TypeError("fetch failed", {
+  cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" }),
+});
+const ok = () => new Response(JSON.stringify({ ok: true }), {
+  status: 200,
+  headers: { "content-type": "application/json" },
+});
+
+test("E14-D8 a connect-phase failure is retried once and the result is returned, for every method", async () => {
+  for (const failure of [connectTimeout, connectRefused, dnsFailure, tlsFailure]) {
+    for (const request of [
+      { method: "GET", path: "/v1/sessions" },
+      { method: "POST", path: "/v1/sessions", body: { name: "dev" }, idempotencyKey: "operation-1" },
+      { method: "POST", path: "/v1/sessions/33333333-3333-4333-8333-333333333333/start" },
+      { method: "DELETE", path: "/v1/sessions/33333333-3333-4333-8333-333333333333" },
+    ]) {
+      const bodies = [];
+      let calls = 0;
+      const transport = createHttpTransport({
+        baseUrl: "https://api.getcuna.com",
+        apiKey: "cuna_sk_abcdefghijklmnop",
+        fetch: async (_url, init) => {
+          calls += 1;
+          bodies.push(init.body);
+          if (calls === 1) throw failure();
+          return ok();
+        },
+      });
+      const label = `${failure.name} ${request.method} ${request.path}`;
+      assert.deepEqual(await transport.request(request), { ok: true }, label);
+      assert.equal(calls, 2, label);
+      // The retry re-sends the identical serialized intent.
+      assert.equal(bodies[0], bodies[1], label);
+    }
+  }
+});
+
+test("E14-D8 two connect-phase failures are reported as never sent and retryable", async () => {
+  let calls = 0;
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: "cuna_sk_abcdefghijklmnop",
+    fetch: async () => { calls += 1; throw connectTimeout(); },
+  });
+  await assert.rejects(
+    transport.request({ method: "POST", path: "/v1/sessions", body: { name: "dev" }, idempotencyKey: "operation-1" }),
+    (error) => {
+      assert.ok(error instanceof CunaError);
+      assert.equal(error.code, "cuna.network.failed");
+      assert.equal(error.details?.phase, "connect");
+      assert.equal(error.details?.remote_outcome, "not_sent");
+      assert.equal(error.details?.attempts, 2);
+      // Never sent, so a POST may be retried.
+      assert.equal(error.retryable, true);
+      assert.match(error.message, /never sent/u);
+      assert.doesNotMatch(error.message, /was sent/u);
+      return true;
+    },
+  );
+  // Exactly one retry: not zero, not a loop.
+  assert.equal(calls, 2);
+});
+
+test("E14-D8 a response-phase failure of a mutation is never retried and stays unobserved", async () => {
+  for (const failure of [headersTimeout, resetAfterWrite]) {
+    let calls = 0;
+    const transport = createHttpTransport({
+      baseUrl: "https://api.getcuna.com",
+      apiKey: "cuna_sk_abcdefghijklmnop",
+      fetch: async () => { calls += 1; throw failure(); },
+    });
+    await assert.rejects(
+      transport.request({ method: "POST", path: "/v1/sessions", body: { name: "dev" }, idempotencyKey: "operation-1" }),
+      (error) => {
+        assert.ok(error instanceof CunaError);
+        assert.equal(error.code, "cuna.network.failed", failure.name);
+        assert.equal(error.details?.phase, "response", failure.name);
+        assert.equal(error.details?.remote_outcome, "unobserved", failure.name);
+        assert.equal(error.details?.attempts, 1, failure.name);
+        assert.equal(error.retryable, false, failure.name);
+        assert.match(error.message, /was sent/u);
+        assert.doesNotMatch(error.message, /never sent/u);
+        return true;
+      },
+    );
+    assert.equal(calls, 1, failure.name);
+  }
+  // Negative control: a failure with no witness at all is not promoted to
+  // `connect`. The fail-closed answer is the one the old code gave.
+  let bareCalls = 0;
+  const bare = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    fetch: async () => { bareCalls += 1; throw new TypeError("fetch failed"); },
+  });
+  await assert.rejects(
+    bare.request({ method: "POST", path: "/v1/sessions", body: { name: "dev" }, idempotencyKey: "operation-1" }),
+    (error) => error instanceof CunaError &&
+      error.details?.phase === "response" &&
+      error.details?.remote_outcome === "unobserved" &&
+      error.retryable === false,
+  );
+  assert.equal(bareCalls, 1);
+});
+
+test("E14-D8 the connect retry never exceeds the caller's budget", async () => {
+  // Arm one: the first connect fails at once, the retry never answers. The
+  // one budget bounds both attempts together, so the outcome is the budget's
+  // own refusal, and the retry was not given a budget of its own.
+  let calls = 0;
+  const started = Date.now();
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    timeoutMs: 20,
+    fetch: async (_url, init) => {
+      calls += 1;
+      if (calls === 1) throw connectTimeout();
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      });
+    },
+  });
+  await assert.rejects(
+    transport.request({ method: "GET", path: "/v1/sessions" }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.client.response_budget_elapsed" &&
+      error.details?.budget_ms === 20,
+  );
+  assert.equal(calls, 2);
+  assert.ok(Date.now() - started < 2_000, "the retry must not extend the budget");
+
+  // Arm two: the connect failure arrives after the budget has already fired.
+  // There is no budget left, so there is no retry: one call, reported as the
+  // budget rather than as a connect failure.
+  let lateCalls = 0;
+  const late = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    timeoutMs: 5,
+    fetch: async (_url, init) => {
+      lateCalls += 1;
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(connectTimeout()), { once: true });
+      });
+    },
+  });
+  await assert.rejects(
+    late.request({ method: "POST", path: "/v1/sessions", body: { name: "dev" }, idempotencyKey: "operation-1" }),
+    (error) => error instanceof CunaError && error.code === "cuna.client.response_budget_elapsed",
+  );
+  assert.equal(lateCalls, 1);
+});
+
+test("E14-D8 caller cancellation during a connect stall is cancellation, not a retry", async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    timeoutMs: 60_000,
+    fetch: async (_url, init) => {
+      calls += 1;
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(connectTimeout()), { once: true });
+        setTimeout(() => controller.abort(new Error("user pressed ctrl-c")), 1);
+      });
+    },
+  });
+  await assert.rejects(
+    transport.request({ method: "GET", path: "/v1/sessions", signal: controller.signal }),
+    (error) => error instanceof CunaError && error.code === "cuna.network.cancelled",
+  );
+  assert.equal(calls, 1);
+});
