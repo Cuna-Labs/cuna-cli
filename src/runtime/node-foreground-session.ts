@@ -283,6 +283,22 @@ async function runNodeForegroundSessionsOnce(
   } catch (error) {
     cleanupFailures.push(error);
   }
+  // PRD-PM-008 E14-D6. Only after the host terminal is restored, and only for
+  // detaches the person asked for and the runtime confirmed: one line that
+  // says the session survived and how to come back. A failed run says nothing
+  // here; its error is the message.
+  if (failure === undefined && cleanupFailures.length === 0) {
+    for (const detached of coordinator.detachedSessions) {
+      try {
+        await host.write(new TextEncoder().encode(
+          `Detached · ${detached.label} keeps running · cuna connect ${detached.agentSessionId}\n`,
+        ));
+      } catch {
+        // The line is a courtesy after a completed detach. A host that cannot
+        // take one more write must not turn a confirmed detach into a failure.
+      }
+    }
+  }
   try {
     await runtime.shutdown();
   } catch (error) {

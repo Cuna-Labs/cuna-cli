@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { CunaApiClient } from "../api/client.js";
+import type { Machine } from "../api/contracts.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import type { ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.js";
 import {
@@ -25,10 +26,53 @@ export interface WorkspaceJourneyEffectsInput {
   readonly workspaceId: string;
   readonly stateDirectory: string;
   readonly filesystemCapabilities: FilesystemCapabilities;
+  /**
+   * One human-readable line about a decision the journey took on the person's
+   * behalf (today: the folder was rebound to another Machine). Absent in
+   * structured or non-interactive runs; the decision is taken either way.
+   */
+  readonly onNotice?: (line: string) => void;
 }
 
 function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.conflict): CunaError {
   return new CunaError({ code, message, exitCode });
+}
+
+/**
+ * Whether the Machine a folder is bound to still exists, read from the Machine
+ * authority itself rather than inferred from a listing.
+ *
+ * Two answers mean "gone": a 404 (`cuna.remote.not_found`, the row is absent)
+ * and a row the server still returns in state `deleted` (the list endpoint
+ * hides those, the read does not). Everything else is not evidence of absence:
+ * a transient failure stays the retryable error it already is, and a 404
+ * without an API body (`operation_not_served`) says this deployment lacks the
+ * route, not that the Machine is gone.
+ */
+async function observeBoundMachine(
+  client: CunaApiClient,
+  machineId: string,
+  signal: AbortSignal,
+): Promise<{ readonly kind: "present"; readonly machine: Machine } | { readonly kind: "absent" }> {
+  let machine: Machine;
+  try {
+    machine = await client.getMachine(machineId, signal);
+  } catch (error) {
+    if (error instanceof CunaError && error.code === "cuna.remote.not_found") return Object.freeze({ kind: "absent" as const });
+    throw error;
+  }
+  if (machine.state === "deleted") return Object.freeze({ kind: "absent" as const });
+  return Object.freeze({ kind: "present" as const, machine });
+}
+
+/** The Machine's name when it can be read, its id otherwise. Never throws: this only decorates a message. */
+async function machineDisplayName(client: CunaApiClient, machineId: string, signal: AbortSignal): Promise<string> {
+  try {
+    const machine = await client.getMachine(machineId, signal);
+    return machine.name.trim().length > 0 ? machine.name : machineId;
+  } catch {
+    return machineId;
+  }
 }
 
 function bindingKey(workspaceId: string, userId: string, canonicalRoot: string): string {
@@ -115,19 +159,83 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
     },
     async synchronizeWorkspace({ machineId, localPath, syncMode, signal }) {
       const inspected = await inspect(localPath);
+      // The local record this run will compare-and-swap against. A rebind
+      // replaces it below, so every later persist must swap against the
+      // rebound record, not the one that named the vanished Machine.
+      let localRecord = inspected.local?.record;
       let authority;
       if (inspected.local !== undefined) {
         const record = inspected.local.record;
-        if (record.machineId !== machineId || record.policyDigest !== inspected.policy.exclusionPolicyDigest) {
-          throw fail("cuna.journey.workspace_binding_conflict", "The local project binding does not authorize the selected machine and exclusion policy.");
+        if (record.policyDigest !== inspected.policy.exclusionPolicyDigest) {
+          throw fail("cuna.journey.workspace_binding_conflict", "The local project binding does not authorize the selected exclusion policy.");
         }
-        authority = await input.client.getWorkspaceBinding(record.bindingId, {
-          workspaceId: input.workspaceId,
-          projectId: record.projectId,
-          localInstanceId: record.localInstanceId,
-          machineId,
-          exclusionPolicyDigest: inspected.policy.exclusionPolicyDigest,
-        }, signal);
+        if (record.machineId !== machineId) {
+          // The folder is the project; a Machine is disposable (PRD-PM-008
+          // §H, E14-D1). Decide from the Machine authority, not the listing:
+          // gone means rebind, present means the typed refusal, anything else
+          // is not evidence and keeps its own error.
+          const bound = await observeBoundMachine(input.client, record.machineId, signal);
+          if (bound.kind === "present") {
+            const boundName = bound.machine.name.trim().length > 0 ? bound.machine.name : record.machineId;
+            const selectedName = await machineDisplayName(input.client, machineId, signal);
+            throw new CunaError({
+              code: "cuna.journey.workspace_binding_conflict",
+              message: `This folder is bound to Machine ${boundName}, not ${selectedName}.`,
+              exitCode: EXIT_CODES.conflict,
+              hint: `Run the same command with \`--machine ${boundName}\` to use the Machine this folder is bound to, or delete \`.cuna/workspace.json\` in this folder to bind it to ${selectedName} on the next run. Neither touches the Workspace on either Machine.`,
+              details: {
+                bound_machine_id: record.machineId,
+                bound_machine_name: boundName,
+                selected_machine_id: machineId,
+                selected_machine_name: selectedName,
+              },
+            });
+          }
+          const createRequest = Object.freeze({
+            workspaceId: input.workspaceId,
+            projectId: record.projectId,
+            localInstanceId: record.localInstanceId,
+            machineId,
+            exclusionPolicyDigest: inspected.policy.exclusionPolicyDigest,
+            excludedPrefixes: Object.freeze([] as string[]),
+          });
+          authority = await input.client.createWorkspaceBinding(
+            createRequest,
+            workspaceBindingCreateKey(createRequest),
+            signal,
+          );
+          // Commit the rebind before any synchronization so the receipt is
+          // truthful even if this run stops here: the next run finds the new
+          // Machine, not a second vanished one.
+          localRecord = await persistWorkspaceBinding({
+            root: inspected.policy.canonicalRoot,
+            binding: {
+              profileId: input.profileId,
+              userId: input.userId,
+              workspaceId: input.workspaceId,
+              bindingId: authority.bindingId,
+              projectId: authority.projectId,
+              localInstanceId: authority.localInstanceId,
+              machineId,
+              remoteRoot: authority.remoteRoot,
+              policyDigest: authority.exclusionPolicyDigest,
+              generation: authority.activeGeneration,
+              bindingCreatedAt: authority.createdAt,
+              bindingUpdatedAt: authority.updatedAt,
+            },
+            expected: workspaceBindingCompareAndSwap(record),
+            rebind: true,
+          });
+          input.onNotice?.(`Rebound this folder to ${await machineDisplayName(input.client, machineId, signal)} · the previous Machine no longer exists`);
+        } else {
+          authority = await input.client.getWorkspaceBinding(record.bindingId, {
+            workspaceId: input.workspaceId,
+            projectId: record.projectId,
+            localInstanceId: record.localInstanceId,
+            machineId,
+            exclusionPolicyDigest: inspected.policy.exclusionPolicyDigest,
+          }, signal);
+        }
       } else {
         if (syncMode === "disabled") {
           throw fail("cuna.journey.workspace_binding_required", "--no-sync requires an existing remotely committed workspace binding.", EXIT_CODES.policy);
@@ -238,7 +346,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           bindingCreatedAt: committedAuthority.createdAt,
           bindingUpdatedAt: committedAuthority.updatedAt,
         },
-        expected: inspected.local === undefined ? null : workspaceBindingCompareAndSwap(inspected.local.record),
+        expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
       });
       supervisor = await startContinuousWorkspaceSync({
         localRoot: inspected.policy.canonicalRoot,

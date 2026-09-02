@@ -123,6 +123,12 @@ interface ForegroundInputTarget {
   readonly binding: RuntimeTerminalResponse["binding"];
 }
 
+/** One AgentSession the person detached from; it keeps running remotely. */
+export interface DetachedForegroundSession {
+  readonly agentSessionId: string;
+  readonly label: string;
+}
+
 /**
  * A completed local effect is retained until the remote MCP bridge confirms
  * the exact request digest.  Keeping the immutable broker snapshot—not just a
@@ -182,6 +188,7 @@ export class ForegroundTerminalCoordinator {
   readonly #recoverableReconnectFailures = new Map<string, unknown>();
   readonly #outputTails = new Map<string, Promise<void>>();
   readonly #localDetachTabIds = new Set<string>();
+  readonly #detachedSessions: DetachedForegroundSession[] = [];
   readonly #browserDetectors = new Map<string, ProviderBrowserActionDetector>();
   readonly #oauthPasteGuards = new Map<string, ProviderOAuthPasteGuard>();
   readonly #handledBrowserUrls = new Set<string>();
@@ -250,6 +257,16 @@ export class ForegroundTerminalCoordinator {
 
   get failure(): unknown {
     return this.#terminalFailure ?? this.#recoverableReconnectFailures.values().next().value;
+  }
+
+  /**
+   * AgentSessions the person detached from on purpose (Ctrl+] d or Ctrl+C),
+   * each confirmed by the runtime. A detach never terminates the remote
+   * process, so the runner tells the person how to come back once the host
+   * terminal is theirs again. Tabs detached by cleanup are not listed.
+   */
+  get detachedSessions(): readonly DetachedForegroundSession[] {
+    return Object.freeze([...this.#detachedSessions]);
   }
 
   bindRuntime(runtime: ForegroundTerminalRuntime): void {
@@ -1299,6 +1316,14 @@ export class ForegroundTerminalCoordinator {
       // observable to the foreground runner after cleanup.
       void this.stop().catch(() => { this.#state = "failed"; });
       throw outcome.error;
+    }
+    // Recorded only once the runtime confirmed the detach: a failed detach
+    // above must never be announced as a session that keeps running.
+    if (departing !== undefined) {
+      this.#detachedSessions.push(Object.freeze({
+        agentSessionId: departing.intent.agentSessionId,
+        label: departing.intent.label,
+      }));
     }
     try {
       if (animate && this.#tabs.size === 1) {
