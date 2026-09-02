@@ -2,6 +2,7 @@ import { decideCapability, type CunaApiClient } from "../api/client.js";
 import type { AgentSession, Machine } from "../api/contracts.js";
 import { sanitizeHumanTerminalOutput } from "../cli/output.js";
 import { CunaError } from "../core/errors.js";
+import { OBSERVATION_BUDGET_CODES } from "../core/observation-budget.js";
 import { CredentialBoundaryError } from "../credentials/errors.js";
 import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import type { ForegroundTerminalHost } from "../terminal/foreground.js";
@@ -22,6 +23,7 @@ import {
   resolveProviderContextActions,
   type MachineContextAction,
   type MachineFirstNavigationState,
+  type MachineFirstScreen,
   type ProviderContextAction,
 } from "./machine-first.js";
 
@@ -32,6 +34,14 @@ const LIVE_REFRESH_MS = 10_000;
 const ESCAPE_SEQUENCE_TIMEOUT_MS = 150;
 const CLOSE_FRAME_MS = 90;
 const CLOSE_FRAMES = Object.freeze(["✦ Closing Cuna...", "✧ Closing Cuna...", "✓ Closed."]);
+/**
+ * PRD-PM-008 E13-R3. A lifecycle request that outlives the per-request
+ * response budget is not an error inside the screen: the Machine usually
+ * did start. Read it back until the state converges or this budget lapses.
+ */
+const LIFECYCLE_CONVERGENCE_BUDGET_MS = 180_000;
+const LIFECYCLE_POLL_INTERVAL_MS = 2_500;
+const MACHINE_NAME_MAX_LENGTH = 80;
 
 const ANSI = Object.freeze({
   reset: "\u001b[0m",
@@ -73,6 +83,8 @@ interface MachineRow {
   readonly opencodeSupervisorProtocolUnavailable: boolean;
   /** Current capability evidence says OpenCode is still being verified. */
   readonly opencodeRuntimeUnverified: boolean;
+  /** E13-R3: a Start/Stop/Delete issued from this screen that has not converged. */
+  readonly pendingLifecycle?: LifecycleAction | undefined;
 }
 
 type SelectionKey =
@@ -80,11 +92,20 @@ type SelectionKey =
   | `session:${string}`
   | `machine-provider:${ActionableProvider}`
   | `machine-create:${ActionableProvider}`
-  | `machine-lifecycle:${"start" | "stop"}`
+  | `machine-lifecycle:${LifecycleAction}`
   | `machine-supervisor:${"blocked" | "update"}`
   | `provider-session:${string}`
-  | `create:${ActionableProvider}`;
+  | `create:${ActionableProvider}`
+  | `new-machine:${ActionableProvider}`
+  | "new-machine-name";
 type LoadingPhase = "machines" | "sessions" | undefined;
+type LifecycleAction = "start" | "stop" | "delete";
+
+/** What the screen knows about `n  New machine` right now. */
+type NewMachineState =
+  | Readonly<{ readonly capability: "checking" }>
+  | Readonly<{ readonly capability: "available" }>
+  | Readonly<{ readonly capability: "unavailable"; readonly reason: string }>;
 
 export interface MachinesExplorerInput {
   readonly client: CunaApiClient;
@@ -96,6 +117,11 @@ export interface MachinesExplorerInput {
 export interface MachinesExplorerDependencies {
   readonly host?: ForegroundTerminalHost;
   readonly now?: () => number;
+  /** Test seam for E13-R3; production keeps the 2.5 s / 180 s defaults. */
+  readonly convergence?: Readonly<{
+    readonly pollIntervalMs?: number;
+    readonly budgetMs?: number;
+  }>;
 }
 
 export interface MachinesExplorerSelection {
@@ -111,9 +137,23 @@ export type MachinesExplorerResult = MachinesExplorerSelection | Readonly<{
   readonly machineName?: string;
   readonly newSession?: boolean;
 }> | Readonly<{
+  /**
+   * Retained for callers that run lifecycle actions as batch commands. The
+   * interactive screen no longer emits it: PRD-PM-008 E13-R3 requires Start,
+   * Stop and Delete to run in place and survive the response budget.
+   */
   readonly kind: "lifecycle";
   readonly action: "start" | "stop";
   readonly machineId: string;
+}> | Readonly<{
+  /**
+   * PRD-PM-008 E13-R1: the person chose a provider and a name. The caller
+   * runs the existing `machines create` path, which owns the capability
+   * gate, the idempotency key and the post-create read.
+   */
+  readonly kind: "create";
+  readonly agent: ActionableProvider;
+  readonly name: string;
 }> | Readonly<{
   /**
    * Reached only after the person selected the stopped-Machine repair and
@@ -154,8 +194,19 @@ export async function runNodeMachinesExplorer(
   let refreshInFlight = false;
   let refreshError: string | undefined;
   let interactionNotice: string | undefined;
+  /**
+   * Outcome of an in-place lifecycle action. Kept apart from
+   * `interactionNotice` because a refresh clears that one, and the typed
+   * budget notice must outlive the automatic refresh that follows it.
+   */
+  let lifecycleNotice: string | undefined;
   let pendingSupervisorUpdateMachineId: string | undefined;
+  let pendingDeleteMachineId: string | undefined;
+  let newMachine: NewMachineState = Object.freeze({ capability: "checking" });
+  let newMachineName = "";
   let closingNotice: string | undefined;
+  const pollIntervalMs = dependencies.convergence?.pollIntervalMs ?? LIFECYCLE_POLL_INTERVAL_MS;
+  const convergenceBudgetMs = dependencies.convergence?.budgetMs ?? LIFECYCLE_CONVERGENCE_BUDGET_MS;
   let failure: unknown;
   const lifetimeAbort = new AbortController();
   const requestSignal = input.signal === undefined
@@ -212,7 +263,10 @@ export async function runNodeMachinesExplorer(
             navigation,
             refreshError,
             interactionNotice,
+            lifecycleNotice,
             closingNotice,
+            newMachine,
+            newMachineName,
           });
           const visible = selectVisibleLines(frame, terminalRows);
           const painted = paintMachinesExplorer(visible, columns, input.color ?? false);
@@ -270,6 +324,129 @@ export async function runNodeMachinesExplorer(
       : row));
   };
 
+  const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, Math.max(0, ms));
+    timer.unref();
+  });
+
+  /**
+   * E13-R2/R3. Run Start, Stop or Delete in place: capability gate, one
+   * request, then a bounded read-back. A lapsed response budget is treated
+   * as "the answer did not arrive", never as "the action failed" — the
+   * owner's Machine was `running` a moment after the screen used to die.
+   */
+  const runLifecycle = async (machineId: string, action: LifecycleAction): Promise<void> => {
+    const row = rows.find((candidate) => candidate.machine.id === machineId);
+    if (row === undefined || row.pendingLifecycle !== undefined) return;
+    const name = safeLine(row.machine.name);
+    const settle = (): void => updateMachineRow(machineId, { pendingLifecycle: undefined });
+    updateMachineRow(machineId, { pendingLifecycle: action });
+    lifecycleNotice = undefined;
+    selectedKey = undefined;
+    render();
+    const capabilityId = action === "delete" ? "machines.delete" : "machines.lifecycle";
+    const decision = await decideExplorerCapability(input.client, "machine", machineId, capabilityId, dependencies.now?.() ?? Date.now(), requestSignal);
+    if (isClosing()) return;
+    if (decision.status !== "supported") {
+      settle();
+      lifecycleNotice = `${capabilityId} is not available for ${name}: ${decision.reason ?? decision.status}. Nothing was requested.`;
+      reconcileSelection();
+      return;
+    }
+    try {
+      if (action === "delete") await input.client.deleteMachine(machineId);
+      else await input.client.transitionMachine(machineId, action, requestSignal);
+    } catch (error) {
+      if (isClosing()) return;
+      if (!(error instanceof CunaError && error.code === OBSERVATION_BUDGET_CODES.response)) {
+        settle();
+        lifecycleNotice = typedLifecycleFailure(error, name, action);
+        reconcileSelection();
+        return;
+      }
+      // The request outlived the response budget. The Machine may well have
+      // moved; only the read-back below can say.
+    }
+    const expectedState = action === "start" ? "running" : action === "stop" ? "stopped" : "deleted";
+    const deadline = Date.now() + convergenceBudgetMs;
+    for (;;) {
+      if (isClosing()) return;
+      let converged = false;
+      try {
+        const observed = await input.client.getMachine(machineId, requestSignal);
+        if (isClosing()) return;
+        if (observed.id === machineId) {
+          updateMachineRow(machineId, { machine: observed });
+          converged = observed.state === expectedState;
+        }
+      } catch (error) {
+        if (isClosing()) return;
+        if (action === "delete" && error instanceof CunaError && error.code === "cuna.remote.not_found") {
+          converged = true;
+        } else {
+          settle();
+          lifecycleNotice = typedLifecycleFailure(error, name, action);
+          reconcileSelection();
+          return;
+        }
+      }
+      if (converged) {
+        settle();
+        if (action === "delete") {
+          rows = Object.freeze(rows.filter((candidate) => candidate.machine.id !== machineId));
+          expanded.delete(machineId);
+          if (navigation.screen.kind !== "machines" && navigation.screen.kind !== "new-machine"
+            && navigation.screen.kind !== "new-machine-name" && navigation.screen.machineId === machineId) {
+            navigation = INITIAL_MACHINE_FIRST_STATE;
+          }
+          lifecycleNotice = `Deleted ${name}.`;
+        } else {
+          lifecycleNotice = `${name} is ${expectedState}.`;
+        }
+        reconcileSelection();
+        void refresh().catch((error) => { failure ??= error; stop(); });
+        return;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        settle();
+        lifecycleNotice = `${OBSERVATION_BUDGET_CODES.convergence}: ${name} had not reached ${expectedState} after ${Math.round(convergenceBudgetMs / 1000)} s. Run \`cuna machines list\` to see its current state.`;
+        reconcileSelection();
+        return;
+      }
+      await sleep(Math.min(pollIntervalMs, remaining));
+    }
+  };
+
+  /** E13-R1. `n` from any overview: read the account capability, then offer providers. */
+  const openNewMachine = (): void => {
+    interactionNotice = undefined;
+    lifecycleNotice = undefined;
+    pendingSupervisorUpdateMachineId = undefined;
+    pendingDeleteMachineId = undefined;
+    navigation = reduceMachineFirstNavigation(navigation, { type: "open-new-machine" });
+    newMachine = Object.freeze({ capability: "checking" });
+    selectedKey = undefined;
+    render();
+    void decideExplorerCapability(input.client, "account", undefined, "machines.create", dependencies.now?.() ?? Date.now(), requestSignal)
+      .then((decision) => {
+        if (isClosing()) return;
+        newMachine = decision.status === "supported"
+          ? Object.freeze({ capability: "available" })
+          : Object.freeze({ capability: "unavailable", reason: decision.reason ?? decision.status });
+        if (navigation.screen.kind === "new-machine") reconcileSelection();
+      });
+  };
+
+  const chooseNewMachineProvider = (provider: ActionableProvider): void => {
+    // The capability answer, not the key press, admits the name step.
+    if (newMachine.capability !== "available") return;
+    navigation = reduceMachineFirstNavigation(navigation, { type: "choose-new-machine-provider", provider });
+    newMachineName = defaultMachineName(provider, rows.map((row) => row.machine.name));
+    selectedKey = "new-machine-name";
+    render();
+  };
+
   const refresh = async (): Promise<void> => {
     if (refreshInFlight || stopped) return;
     refreshInFlight = true;
@@ -282,6 +459,9 @@ export async function runNodeMachinesExplorer(
       if (stopped || closingNotice !== undefined) return;
       refreshError = undefined;
       interactionNotice = undefined;
+      // The delete prompt lives in `interactionNotice`; once a refresh has
+      // taken it off the screen, the next Enter must ask again, not delete.
+      pendingDeleteMachineId = undefined;
       const capabilityNow = dependencies.now?.() ?? Date.now();
       const loaded = machines.map((machine): MachineRow => {
         const previous = previousRows.get(machine.id);
@@ -298,6 +478,7 @@ export async function runNodeMachinesExplorer(
           opencodeSupervisorRepairReason: previous?.opencodeSupervisorRepairReason,
           opencodeSupervisorProtocolUnavailable: previous?.opencodeSupervisorProtocolUnavailable ?? false,
           opencodeRuntimeUnverified: previous?.opencodeRuntimeUnverified ?? false,
+          pendingLifecycle: previous?.pendingLifecycle,
         });
       });
       loaded.sort((left, right) => left.machine.name.localeCompare(right.machine.name) || left.machine.id.localeCompare(right.machine.id));
@@ -399,7 +580,9 @@ export async function runNodeMachinesExplorer(
 
   const moveSelection = (delta: -1 | 1): void => {
     interactionNotice = undefined;
+    lifecycleNotice = undefined;
     pendingSupervisorUpdateMachineId = undefined;
+    pendingDeleteMachineId = undefined;
     const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation);
     if (keys.length === 0) return;
     const currentIndex = selectedKey === undefined ? -1 : keys.indexOf(selectedKey);
@@ -417,7 +600,9 @@ export async function runNodeMachinesExplorer(
 
   const goBack = (): void => {
     interactionNotice = undefined;
+    lifecycleNotice = undefined;
     pendingSupervisorUpdateMachineId = undefined;
+    pendingDeleteMachineId = undefined;
     const previous = navigation;
     const previousScreen = previous.screen;
     navigation = reduceMachineFirstNavigation(navigation, { type: "back" });
@@ -471,6 +656,11 @@ export async function runNodeMachinesExplorer(
 
   const goForward = (): void => {
     pendingSupervisorUpdateMachineId = undefined;
+    pendingDeleteMachineId = undefined;
+    if (selectedKey?.startsWith("new-machine:") === true && navigation.screen.kind === "new-machine") {
+      chooseNewMachineProvider(selectedKey.slice("new-machine:".length) as ActionableProvider);
+      return;
+    }
     if (selectedKey?.startsWith("machine:") === true && navigation.screen.kind === "machines") {
       const machineId = selectedKey.slice("machine:".length);
       navigation = reduceMachineFirstNavigation(navigation, { type: "open-machine", machineId });
@@ -511,7 +701,8 @@ export async function runNodeMachinesExplorer(
 
   const applyKey = (byte: number): boolean => {
     if (closingNotice !== undefined) return true;
-    if (byte === 0x03 || byte === 0x71) {
+    // `q` is a letter inside the name field; Ctrl-C quits from anywhere.
+    if (byte === 0x03 || (byte === 0x71 && navigation.screen.kind !== "new-machine-name")) {
       void exitWithFeedback().catch((error) => { failure ??= error; stop(); });
       return true;
     }
@@ -542,10 +733,42 @@ export async function runNodeMachinesExplorer(
       escapeTimer.unref();
       return false;
     }
+    if (navigation.screen.kind === "new-machine-name") {
+      // A text field: every printable byte is a character, including the
+      // letters that are hotkeys everywhere else. Only Ctrl-C, Esc and the
+      // cursor sequences above keep their meaning.
+      const provider = navigation.screen.provider;
+      if (byte === 0x0d || byte === 0x0a) {
+        const name = newMachineName.trim();
+        if (name.length === 0) {
+          interactionNotice = "Give the Machine a name, then press Enter.";
+          render();
+          return false;
+        }
+        selection = Object.freeze({ kind: "create", agent: provider, name });
+        stop();
+        return true;
+      }
+      if (byte === 0x08 || byte === 0x7f) {
+        newMachineName = newMachineName.slice(0, -1);
+      } else if (byte >= 0x20 && byte <= 0x7e && newMachineName.length < MACHINE_NAME_MAX_LENGTH) {
+        newMachineName += String.fromCharCode(byte);
+      }
+      interactionNotice = undefined;
+      render();
+      return false;
+    }
     if (byte === 0x6b) moveSelection(-1);
     else if (byte === 0x6a) moveSelection(1);
     else if (byte === 0x08 || byte === 0x7f || byte === 0x62) goBack();
+    else if (byte === 0x6e && navigation.screen.kind === "machines") openNewMachine();
     else if (byte === 0x0d || byte === 0x0a || byte === 0x20) {
+      if (navigation.screen.kind === "new-machine") {
+        if (selectedKey?.startsWith("new-machine:") === true) {
+          chooseNewMachineProvider(selectedKey.slice("new-machine:".length) as ActionableProvider);
+        }
+        return false;
+      }
       if (selectedKey?.startsWith("machine:") === true) {
         const id = selectedKey.slice("machine:".length);
         // A Machine is a container, not a synonym for whichever session
@@ -574,9 +797,22 @@ export async function runNodeMachinesExplorer(
           selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation)[0];
           render();
         } else if (action?.kind === "start" || action?.kind === "stop") {
-          selection = Object.freeze({ kind: "lifecycle", action: action.kind, machineId: action.machineId });
-          stop();
-          return true;
+          pendingDeleteMachineId = undefined;
+          void runLifecycle(action.machineId, action.kind).catch((error) => { failure ??= error; stop(); });
+        } else if (action?.kind === "delete") {
+          // E13-R2: double confirmation, like the supervisor repair, naming
+          // the Machine and what disappears with it. No request before the
+          // second Enter; any move or back re-arms it.
+          if (pendingDeleteMachineId !== action.machineId) {
+            pendingDeleteMachineId = action.machineId;
+            const sessionCount = row?.sessions.length ?? 0;
+            interactionNotice = `Press Enter again to delete ${safeLine(row?.machine.name ?? "this Machine")} and its ${sessionCount} AgentSession${sessionCount === 1 ? "" : "s"}. This cannot be undone.`;
+            render();
+            return false;
+          }
+          pendingDeleteMachineId = undefined;
+          interactionNotice = undefined;
+          void runLifecycle(action.machineId, "delete").catch((error) => { failure ??= error; stop(); });
         } else if (action?.kind === "supervisor-blocked") {
           pendingSupervisorUpdateMachineId = undefined;
           interactionNotice = row !== undefined && hasLegacySupervisorBlockedOpenCodeSession(row)
@@ -818,12 +1054,18 @@ function renderMachinesExplorer(input: {
   readonly navigation: MachineFirstNavigationState;
   readonly refreshError?: string | undefined;
   readonly interactionNotice?: string | undefined;
+  readonly lifecycleNotice?: string | undefined;
   readonly closingNotice?: string | undefined;
+  readonly newMachine: NewMachineState;
+  readonly newMachineName: string;
 }): MachinesExplorerFrame {
   if (input.closingNotice !== undefined) {
     return {
       lines: [machineHeader("Machines"), "", ` ${input.closingNotice}`, " Returning to your terminal."],
     };
+  }
+  if (input.navigation.screen.kind === "new-machine" || input.navigation.screen.kind === "new-machine-name") {
+    return renderNewMachineScreen(input, input.navigation.screen);
   }
   if (input.navigation.screen.kind !== "machines") return renderContextScreen(input);
   const lines = [machineHeader("Machines"), " Your machines and the agents running inside them.", ""];
@@ -862,33 +1104,42 @@ function renderMachinesExplorer(input: {
     // that reads as usable on exactly the machines where the next command
     // fails closed. `providerVerdict` is the reconciliation the other surfaces
     // already use, which is what makes this row agree with `machines list`.
-    lines.push(`${machineSelected ? "❯" : " "} ${open ? "▾" : "▸"} ${safeLine(row.machine.name)}  ${safeLine(row.machine.state)}  ${provider.displayName} ${providerVerdict(provider)}  ${sessions}`);
+    //
+    // E13-R4: the verdict is about a runtime, so it exists only while the
+    // Machine is `running`. `OpenCode ready` on a stopped or errored Machine
+    // was the declaration again, wearing the verdict's clothes. E13-R3: a
+    // Machine mid-transition shows the transition, not the stale state.
+    const pending = row.pendingLifecycle;
+    const state = pending !== undefined
+      ? lifecycleLabel(pending)
+      : row.machine.state === "running"
+        ? `${safeLine(row.machine.state)}  ${provider.displayName} ${providerVerdict(provider)}`
+        : safeLine(row.machine.state);
+    lines.push(`${machineSelected ? "❯" : " "} ${open ? "▾" : "▸"} ${safeLine(row.machine.name)}  ${state}  ${sessions}`);
     if (!open) continue;
     if (row.sessionsLoading === true && row.sessions.length === 0) {
       lines.push(`    ${loaderLine("Loading AgentSessions", input.animationFrame)}`);
       continue;
     }
-    if (row.sessionsError !== undefined) lines.push(`    ├─ ${row.sessionsError}; showing last confirmed sessions`);
     if (row.sessions.length === 0) {
-      if (row.sessionsError === undefined && row.opencodeSupervisorRepairReason === undefined &&
-          !row.opencodeSupervisorProtocolUnavailable && !row.opencodeRuntimeUnverified) {
-        lines.push("    └─ No AgentSessions");
-      } else if (row.sessionsError === undefined) {
-        lines.push("    ├─ No AgentSessions");
-      }
-      if (row.opencodeSupervisorRepairReason !== undefined) {
-        lines.push(`    ${row.opencodeSupervisorProtocolUnavailable || row.opencodeRuntimeUnverified ? "├─" : "└─"} ${openCodeRepairSummary(row)}`);
-      }
-      if (row.opencodeSupervisorProtocolUnavailable) {
-        lines.push(`    ${row.opencodeRuntimeUnverified ? "├─" : "└─"} ${openCodeSupervisorProtocolWaitSummary()}`);
-      }
+      // E13-R5: decide the whole child list first, then assign glyphs, so
+      // `├─` can only ever precede a sibling. The old per-line guesses
+      // printed `├─ No AgentSessions` when the runtime line that would have
+      // followed was itself suppressed on a non-running Machine.
+      const children: string[] = [];
+      if (row.sessionsError !== undefined) children.push(`${row.sessionsError}; showing last confirmed sessions`);
+      else children.push("No AgentSessions");
+      if (row.opencodeSupervisorRepairReason !== undefined) children.push(openCodeRepairSummary(row));
+      if (row.opencodeSupervisorProtocolUnavailable) children.push(openCodeSupervisorProtocolWaitSummary());
       // Only a running machine can be verified; on a stopped or errored one
       // the line is noise the reader cannot act on.
-      if (row.opencodeRuntimeUnverified && row.machine.state === "running") {
-        lines.push("    └─ OpenCode runtime not verified yet");
+      if (row.opencodeRuntimeUnverified && row.machine.state === "running") children.push("OpenCode runtime not verified yet");
+      for (const [childIndex, child] of children.entries()) {
+        lines.push(`    ${childIndex === children.length - 1 ? "└─" : "├─"} ${child}`);
       }
       continue;
     }
+    if (row.sessionsError !== undefined) lines.push(`    ├─ ${row.sessionsError}; showing last confirmed sessions`);
     for (const [sessionIndex, session] of row.sessions.entries()) {
       const branch = sessionIndex === row.sessions.length - 1 ? "└─" : "├─";
       const sessionKey: SelectionKey = `session:${session.id}`;
@@ -930,6 +1181,7 @@ function renderMachinesExplorer(input: {
   }
   if (input.refreshError !== undefined) lines.push("", input.refreshError);
   if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
+  if (input.lifecycleNotice !== undefined) lines.push("", ` ${input.lifecycleNotice}`);
   lines.push("", overviewFooter(input.rows, input.selectedKey, input.now));
   return Object.freeze({
     lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))),
@@ -947,30 +1199,38 @@ function renderContextScreen(input: {
   readonly navigation: MachineFirstNavigationState;
   readonly refreshError?: string | undefined;
   readonly interactionNotice?: string | undefined;
+  readonly lifecycleNotice?: string | undefined;
 }): MachinesExplorerFrame {
   const screen = input.navigation.screen;
-  if (screen.kind === "machines") return Object.freeze({ lines: Object.freeze([]) });
+  if (screen.kind !== "machine" && screen.kind !== "provider") return Object.freeze({ lines: Object.freeze([]) });
   const row = input.rows.find((candidate) => candidate.machine.id === screen.machineId);
   const lines = [machineHeader("Machine"), ""];
   if (row === undefined) {
     lines.push("Machine observation is no longer available.", "", " ←/Esc/Backspace back  ·  q quit");
     return Object.freeze({ lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))) });
   }
+  const pending = row.pendingLifecycle;
   lines[0] = machineHeader(screen.kind === "provider"
     ? `${safeLine(row.machine.name)} / ${providerDisplayName(screen.provider)} sessions`
     : safeLine(row.machine.name));
-  lines[1] = ` ${safeLine(row.machine.state)} · observation ${safeLine(row.machine.updatedAt ?? "unversioned")}`;
+  lines[1] = ` ${pending === undefined ? safeLine(row.machine.state) : lifecycleLabel(pending)} · observation ${safeLine(row.machine.updatedAt ?? "unversioned")}`;
   lines.push("");
-  const actions = screen.kind === "machine"
-    ? machineContextActions(row, input.now)
-    : resolveProviderContextActions({
-        machine: row.machine,
-        provider: screen.provider,
-        sessions: row.sessions,
-        now: input.now,
-      });
+  const actions = pending !== undefined
+    ? []
+    : screen.kind === "machine"
+      ? machineContextActions(row, input.now)
+      : resolveProviderContextActions({
+          machine: row.machine,
+          provider: screen.provider,
+          sessions: row.sessions,
+          now: input.now,
+        });
   let selectedLine: number | undefined;
-  if (actions.length === 0) lines.push(" No available actions for this observation.");
+  if (pending !== undefined) {
+    lines.push(` ${lifecycleLabel(pending)} Cuna is reading the Machine back until it settles; this screen stays open.`);
+  } else if (actions.length === 0) {
+    lines.push(" No available actions for this observation.");
+  }
   for (const action of actions) {
     const key = screen.kind === "machine"
       ? machineActionSelectionKey(action as MachineContextAction)
@@ -980,7 +1240,7 @@ function renderContextScreen(input: {
     const detail = action.kind === "session"
       ? displaySessionActionability(classifySessionActionability({ session: action.session, machine: row.machine, now: input.now }))
       : action.kind === "provider" ? "sessions" : "";
-    const label = action.kind === "start" || action.kind === "stop" ? `${action.label} machine` : action.label;
+    const label = action.kind === "start" || action.kind === "stop" || action.kind === "delete" ? `${action.label} machine` : action.label;
     lines.push(`${selected ? "❯" : " "} ${label}${detail === "" ? "" : `  ${detail}`}`);
   }
   if (row.opencodeSupervisorRepairReason !== undefined) {
@@ -1012,6 +1272,7 @@ function renderContextScreen(input: {
   if (input.loadingPhase !== undefined) lines.push("", loaderLine("Refreshing machine", input.animationFrame));
   if (input.refreshError !== undefined) lines.push("", input.refreshError);
   if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
+  if (input.lifecycleNotice !== undefined) lines.push("", ` ${input.lifecycleNotice}`);
   lines.push("", " ↑↓ move  ·  ←→ navigate  ·  Enter select  ·  Esc/Backspace back  ·  q quit");
   return Object.freeze({
     lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))),
@@ -1037,6 +1298,8 @@ function selectVisibleLines(frame: MachinesExplorerFrame, terminalRows: number):
 }
 
 function machineContextActions(row: MachineRow, now: number): readonly MachineContextAction[] {
+  // A Machine mid-transition accepts no second action until it settles.
+  if (row.pendingLifecycle !== undefined) return Object.freeze([]);
   const provider = machineProviderAvailability(row.machine);
   const hasSessions = provider.actionable && provider.agent !== undefined
     ? resolveProviderContextActions({
@@ -1096,8 +1359,10 @@ function overviewFooter(
   selectedKey: SelectionKey | undefined,
   now: number,
 ): string {
+  // E13-R1: `n new machine` is on every overview footer, whatever is selected.
+  const tail = "n new machine  ·  r refresh  ·  q quit";
   if (selectedKey?.startsWith("machine:") === true) {
-    return " ↑↓ move  ·  Enter/→ manage machine  ·  r refresh  ·  q quit";
+    return ` ↑↓ move  ·  Enter/→ manage machine  ·  ${tail}`;
   }
   if (selectedKey?.startsWith("session:") === true) {
     const sessionId = selectedKey.slice("session:".length);
@@ -1106,24 +1371,129 @@ function overviewFooter(
     if (row !== undefined && session !== undefined && isActionableProvider(session.agent)) {
       const actionability = classifySessionActionability({ session, machine: row.machine, now });
       if (actionability.canAttach || actionability.recoveryAction === "authenticate") {
-        return ` ↑↓ move  ·  Enter/→ attach ${providerDisplayName(session.agent)}  ·  r refresh  ·  q quit`;
+        return ` ↑↓ move  ·  Enter/→ attach ${providerDisplayName(session.agent)}  ·  ${tail}`;
       }
       if (actionability.recoveryAction === "refresh") {
-        return " ↑↓ move  ·  Enter refresh session  ·  ← back  ·  r refresh  ·  q quit";
+        return ` ↑↓ move  ·  Enter refresh session  ·  ← back  ·  ${tail}`;
       }
       if (actionability.recoveryAction === "wait") {
         return hasLegacySupervisorBlockedOpenCodeSession(row) && session.agent === "opencode" &&
           isUnobservedLaunchedSession(session)
-          ? " ↑↓ move  ·  Legacy supervisor blocked  ·  ← back  ·  r refresh  ·  q quit"
-          : " ↑↓ move  ·  Waiting for process observation  ·  ← back  ·  r refresh  ·  q quit";
+          ? ` ↑↓ move  ·  Legacy supervisor blocked  ·  ← back  ·  ${tail}`
+          : ` ↑↓ move  ·  Waiting for process observation  ·  ← back  ·  ${tail}`;
       }
-      return " ↑↓ move  ·  Enter session details  ·  ← back  ·  r refresh  ·  q quit";
+      return ` ↑↓ move  ·  Enter session details  ·  ← back  ·  ${tail}`;
     }
   }
   if (selectedKey?.startsWith("create:") === true) {
-    return " ↑↓ move  ·  Enter create machine  ·  r refresh  ·  q quit";
+    return ` ↑↓ move  ·  Enter create machine  ·  ${tail}`;
   }
-  return " ↑↓ move  ·  ←→ navigate  ·  Enter open  ·  r refresh  ·  q quit";
+  return ` ↑↓ move  ·  ←→ navigate  ·  Enter open  ·  ${tail}`;
+}
+
+function renderNewMachineScreen(
+  input: {
+    readonly rows: readonly MachineRow[];
+    readonly selectedKey?: SelectionKey | undefined;
+    readonly animationFrame: number;
+    readonly columns: number;
+    readonly interactionNotice?: string | undefined;
+    readonly newMachine: NewMachineState;
+    readonly newMachineName: string;
+  },
+  screen: Extract<MachineFirstScreen, { readonly kind: "new-machine" | "new-machine-name" }>,
+): MachinesExplorerFrame {
+  const lines: string[] = [];
+  let selectedLine: number | undefined;
+  if (screen.kind === "new-machine") {
+    lines.push(machineHeader("New machine"), " Choose the agent this Machine runs.", "");
+    if (input.newMachine.capability === "checking") {
+      lines.push(` ${loaderLine("Checking whether this account can create a Machine", input.animationFrame)}`);
+    } else if (input.newMachine.capability === "unavailable") {
+      // E13-R1 negative control: the reason is shown, never hidden, and
+      // nothing below is selectable, so nothing can be created.
+      lines.push(` New machine is not available for this account: ${safeLine(input.newMachine.reason)}`);
+      lines.push(" Nothing was created.");
+    } else {
+      for (const agent of providerCreationOrder()) {
+        const key: SelectionKey = `new-machine:${agent}`;
+        const selected = input.selectedKey === key;
+        if (selected) selectedLine = lines.length;
+        lines.push(`${selected ? "❯" : " "} ${providerDisplayName(agent)}`);
+      }
+    }
+    if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
+    lines.push("", " ↑↓ move  ·  Enter choose  ·  Esc/Backspace back  ·  q quit");
+  } else {
+    lines.push(machineHeader(`New machine / ${providerDisplayName(screen.provider)}`), " Name this Machine.", "");
+    selectedLine = lines.length;
+    lines.push(`❯ ${input.newMachineName}▏`);
+    if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
+    lines.push("", " type to edit  ·  Backspace delete  ·  Enter create  ·  Esc back");
+  }
+  return Object.freeze({
+    lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))),
+    ...(selectedLine === undefined ? {} : { selectedLine }),
+  });
+}
+
+function lifecycleLabel(action: LifecycleAction): string {
+  return action === "start" ? "Starting…" : action === "stop" ? "Stopping…" : "Deleting…";
+}
+
+/**
+ * The default name the console would suggest: `cuna-<provider>-<n>`, where
+ * `n` is one more than the Machines already carrying that prefix.
+ */
+function defaultMachineName(provider: ActionableProvider, existingNames: readonly string[]): string {
+  const slug = provider === "claude-code" ? "claude" : provider;
+  const prefix = `cuna-${slug}-`;
+  const count = existingNames.filter((name) => name.startsWith(prefix)).length;
+  return `${prefix}${count + 1}`;
+}
+
+/**
+ * One typed line for a lifecycle request the screen could not complete. The
+ * code is the server's or the CLI's own; the message never invents a cause.
+ */
+function typedLifecycleFailure(error: unknown, name: string, action: LifecycleAction): string {
+  const verb = action === "start" ? "start" : action === "stop" ? "stop" : "delete";
+  if (error instanceof CunaError) {
+    return `${error.code}: could not ${verb} ${name}. ${safeLine(error.message)}${error.hint === undefined ? "" : ` ${safeLine(error.hint)}`}`;
+  }
+  return `Could not ${verb} ${name}: unexpected error. Run \`cuna machines list\` to see its current state.`;
+}
+
+/**
+ * Same question the batch commands ask (`requireCapability`), answered as a
+ * value so the screen can render the refusal instead of throwing out of it.
+ */
+async function decideExplorerCapability(
+  client: CunaApiClient,
+  scope: "account" | "machine",
+  resourceId: string | undefined,
+  capabilityId: string,
+  now: number,
+  signal?: AbortSignal,
+): Promise<Readonly<{ readonly status: "supported" | "unsupported" | "temporarily_unavailable" | "unknown"; readonly reason?: string }>> {
+  if (typeof client.discoverCapabilities !== "function") {
+    return Object.freeze({ status: "unknown", reason: "capability_discovery_unavailable" });
+  }
+  try {
+    const snapshot = await client.discoverCapabilities(scope, resourceId, signal);
+    if (snapshot.subjectScope !== scope || (scope !== "account" && snapshot.subjectId !== resourceId)) {
+      return Object.freeze({ status: "unknown", reason: "subject_scope_mismatch" });
+    }
+    const decision = decideCapability(snapshot, capabilityId, now);
+    return decision.status === "supported"
+      ? Object.freeze({ status: "supported" })
+      : Object.freeze({ status: decision.status, ...(decision.reason === undefined ? {} : { reason: decision.reason }) });
+  } catch (error) {
+    return Object.freeze({
+      status: "unknown",
+      reason: error instanceof CunaError ? error.code : "capability_discovery_unavailable",
+    });
+  }
 }
 
 function selectableKeys(
@@ -1132,6 +1502,10 @@ function selectableKeys(
   now: number,
   navigation: MachineFirstNavigationState,
 ): readonly SelectionKey[] {
+  if (navigation.screen.kind === "new-machine") {
+    return Object.freeze(providerCreationOrder().map((agent): SelectionKey => `new-machine:${agent}`));
+  }
+  if (navigation.screen.kind === "new-machine-name") return Object.freeze(["new-machine-name"]);
   if (navigation.screen.kind === "machine") {
     const screen = navigation.screen;
     const row = rows.find((candidate) => candidate.machine.id === screen.machineId);

@@ -7,6 +7,8 @@ export type RootJourneySelection =
   | Readonly<{ readonly kind: "attach"; readonly agentSessionId: string; readonly agent: ActionableProvider }>
   | Readonly<{ readonly kind: "launch"; readonly agent: ActionableProvider; readonly machineId?: string; readonly machineName?: string; readonly newSession?: boolean }>
   | Readonly<{ readonly kind: "lifecycle"; readonly action: "start" | "stop"; readonly machineId: string }>
+  /** PRD-PM-008 E13-R1: provider and name chosen on the screen; `machines create` does the rest. */
+  | Readonly<{ readonly kind: "create"; readonly agent: ActionableProvider; readonly name: string }>
   | Readonly<{ readonly kind: "supervisor-update"; readonly machineId: string }>;
 
 export interface RootJourneyInput {

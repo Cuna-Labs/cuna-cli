@@ -1332,3 +1332,289 @@ test("q treats an aborted in-flight capability read as a normal explorer close",
   assert.equal(host.writes.some((write) => stripAnsi(write).includes("✓ Closed.")), true);
   assert.equal(host.restored, 1);
 });
+
+/* ------------------------------------------------------------------------ */
+/* PRD-PM-008 §E13 — machines screen parity with the console                */
+/* ------------------------------------------------------------------------ */
+
+const OTHER_MACHINE_ID = "55555555-5555-4555-8555-555555555555";
+
+function capabilitySnapshot(scope, subjectId, capabilities) {
+  const now = Date.now();
+  return {
+    schemaVersion: "1.0",
+    subjectScope: scope,
+    ...(subjectId === undefined ? {} : { subjectId }),
+    observedAt: new Date(now - 1_000).toISOString(),
+    expiresAt: new Date(now + 30_000).toISOString(),
+    etag: `${scope}-${subjectId ?? "account"}`,
+    capabilities,
+  };
+}
+
+function supported(id, mutationClass = "reversible") {
+  return { id, availability: "supported", interaction: "native", mutationClass, surfaces: ["cli"], requiredPermissions: ["machines:write"] };
+}
+
+function lastFrame(host) {
+  return stripAnsi(host.writes.at(-1) ?? "");
+}
+
+test("E13-R1: n always offers New machine, walks provider then default name, and returns a create selection", async () => {
+  const host = new FakeHost();
+  const scopes = [];
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: [
+          { id: MACHINE_ID, name: "cuna-claude-1", state: "running", agent: "claude-code" },
+          { id: OTHER_MACHINE_ID, name: "cuna-claude-2", state: "stopped", agent: "claude-code" },
+        ] };
+      },
+      async listAgentSessions() { return { items: [agentSession()] }; },
+      async discoverCapabilities(scope, resourceId) {
+        scopes.push(scope);
+        return scope === "account"
+          ? capabilitySnapshot("account", undefined, [supported("machines.create", "financial")])
+          : capabilitySnapshot("machine", resourceId, [supported("agent_sessions.create")]);
+      },
+      async createMachine() { throw new Error("the screen must not create the Machine itself"); },
+    },
+  }, { host });
+  await waitUntil(() => lastFrame(host).includes("cuna-claude-1  running  Claude"), "inventory should render");
+  assert.match(lastFrame(host), /n new machine/u, "the footer must always offer New machine");
+  assert.doesNotMatch(lastFrame(host), /Create Claude machine|No available machine/u, "an openable Machine must not suppress the affordance");
+
+  host.emitInput([0x6e]);
+  await waitUntil(() => lastFrame(host).includes("❯ OpenCode") && lastFrame(host).includes("CUNA  ◆── New machine"), "n should open the provider step");
+  assert.ok(scopes.includes("account"), "the create capability is read at account scope");
+  host.emitInput([0x1b, 0x5b, 0x42]);
+  await waitUntil(() => lastFrame(host).includes("❯ Claude"), "Down should select Claude");
+  host.emitInput([0x0d]);
+  await waitUntil(() => lastFrame(host).includes("cuna-claude-3"), "the default name counts existing machines with the same prefix");
+  host.emitInput([0x0d]);
+  assert.deepEqual(await operation, { kind: "create", agent: "claude-code", name: "cuna-claude-3" });
+  assert.equal(host.restored, 1);
+});
+
+test("E13-R1: the name step is editable; q, r, n and j are literal characters there", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() { return { items: [] }; },
+      async discoverCapabilities(scope) {
+        return scope === "account"
+          ? capabilitySnapshot("account", undefined, [supported("machines.create", "financial")])
+          : capabilitySnapshot("machine", MACHINE_ID, []);
+      },
+    },
+  }, { host });
+  await waitUntil(() => lastFrame(host).includes("Create OpenCode machine"), "zero-machine overview should render");
+  assert.match(lastFrame(host), /n new machine/u);
+  host.emitInput([0x6e]);
+  await waitUntil(() => lastFrame(host).includes("❯ OpenCode"), "provider step");
+  host.emitInput([0x0d]);
+  await waitUntil(() => lastFrame(host).includes("cuna-opencode-1"), "default name");
+  // Backspace the whole default, then type a name containing the hotkeys.
+  host.emitInput(Array.from({ length: "cuna-opencode-1".length }, () => 0x7f));
+  host.emitInput([..."qrnj-box"].map((character) => character.charCodeAt(0)));
+  await waitUntil(() => lastFrame(host).includes("qrnj-box"), "typed characters should appear");
+  assert.equal(host.input !== undefined, true, "q inside the name must not close the screen");
+  host.emitInput([0x0d]);
+  assert.deepEqual(await operation, { kind: "create", agent: "opencode", name: "qrnj-box" });
+});
+
+test("E13-R1 negative: an unavailable machines.create capability renders the reason and creates nothing", async () => {
+  const host = new FakeHost();
+  let creates = 0;
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "goal0", state: "running", agent: "claude-code" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, resourceId) {
+        return scope === "account"
+          ? capabilitySnapshot("account", undefined, [{ ...supported("machines.create", "financial"), availability: "unsupported", reasonCode: "machine_quota_exhausted" }])
+          : capabilitySnapshot("machine", resourceId, [supported("agent_sessions.create")]);
+      },
+      async createMachine() { creates += 1; throw new Error("unreachable"); },
+    },
+  }, { host });
+  await waitUntil(() => lastFrame(host).includes("goal0  running"), "inventory should render");
+  host.emitInput([0x6e]);
+  await waitUntil(() => lastFrame(host).includes("not available for this account: machine_quota_exhausted"), "the server reason must be shown, never hidden");
+  assert.doesNotMatch(lastFrame(host), /❯ OpenCode|❯ Claude|❯ Codex/u, "no provider may be selectable");
+  host.emitInput([0x0d]);
+  host.emitInput([0x1b]);
+  await waitUntil(() => lastFrame(host).includes("CUNA  ◆── Machines"), "Esc returns to the overview");
+  host.emitInput([0x03]);
+  assert.equal(await operation, undefined);
+  assert.equal(creates, 0);
+});
+
+test("E13-R2: Delete is offered in any state, names the Machine and its sessions, and issues nothing before the second Enter", async () => {
+  const host = new FakeHost();
+  const deletes = [];
+  let reads = 0;
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: deletes.length === 0 ? [{ id: MACHINE_ID, name: "tem", state: "error", agent: "opencode" }] : [] };
+      },
+      async listAgentSessions() {
+        return { items: [agentSession({ agent: "opencode", name: "one" }), agentSession({ id: OTHER_MACHINE_ID, agent: "opencode", name: "two" })] };
+      },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot(scope, resourceId, [supported("machines.delete", "destructive"), supported("machines.lifecycle")]);
+      },
+      async deleteMachine(id) { deletes.push(id); return {}; },
+      async getMachine() {
+        reads += 1;
+        throw new CunaError({ code: "cuna.remote.not_found", message: "gone", exitCode: 7 });
+      },
+    },
+  }, { host, convergence: { pollIntervalMs: 1, budgetMs: 1_000 } });
+  await waitUntil(() => lastFrame(host).includes("tem  error") && lastFrame(host).includes("2 sessions"), "errored inventory should render");
+  host.emitInput([0x0d]);
+  await waitUntil(() => lastFrame(host).includes("Delete machine"), "an error Machine must offer Delete");
+  assert.doesNotMatch(lastFrame(host), /Start machine|Stop machine/u, "no lifecycle transition exists for an error Machine");
+  host.emitInput([0x0d]);
+  await waitUntil(() => lastFrame(host).includes("Press Enter again to delete tem and its 2 AgentSessions"), "first Enter asks for confirmation naming the Machine and its sessions");
+  assert.deepEqual(deletes, [], "no request may be issued before the second confirmation");
+  host.emitInput([0x1b, 0x5b, 0x41]);
+  await waitUntil(() => !lastFrame(host).includes("Press Enter again"), "moving away clears the pending confirmation");
+  host.emitInput([0x0d]);
+  await waitUntil(() => lastFrame(host).includes("Press Enter again to delete tem"), "confirmation must be re-armed after a move");
+  host.emitInput([0x0d]);
+  await waitUntil(() => deletes.length === 1, "the second Enter issues exactly one delete");
+  await waitUntil(() => reads >= 1 && !lastFrame(host).includes("tem  ") && lastFrame(host).includes("CUNA  ◆── Machines"), "an absent Machine converges and the screen returns to the overview");
+  assert.equal(host.input !== undefined, true, "the screen stays alive after delete");
+  host.emitInput([0x03]);
+  assert.equal(await operation, undefined);
+  assert.deepEqual(deletes, [MACHINE_ID]);
+});
+
+test("E13-R3: Start survives the response budget, shows Starting…, and converges in place", async () => {
+  const host = new FakeHost();
+  let state = "stopped";
+  let reads = 0;
+  const transitions = [];
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "paused-dev", state, agent: "claude-code" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot(scope, resourceId, [supported("machines.lifecycle"), supported("agent_sessions.create")]);
+      },
+      async transitionMachine(id, action) {
+        transitions.push(action);
+        throw new CunaError({
+          code: "cuna.client.response_budget_elapsed",
+          message: `The CLI stopped waiting for Cuna to answer POST /v1/sessions/${id}/start after 15000 ms.`,
+          exitCode: 5,
+          retryable: true,
+        });
+      },
+      async getMachine(id) {
+        reads += 1;
+        if (reads >= 3) state = "running";
+        return { id, name: "paused-dev", state, agent: "claude-code" };
+      },
+    },
+  }, { host, convergence: { pollIntervalMs: 1, budgetMs: 1_000 } });
+  await waitUntil(() => lastFrame(host).includes("paused-dev  stopped"), "stopped inventory should render");
+  host.emitInput([0x0d]);
+  await waitUntil(() => lastFrame(host).includes("❯ Start machine"), "Start should be offered");
+  host.emitInput([0x0d]);
+  await waitUntil(() => transitions.length === 1, "Start should issue the transition");
+  await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("Starting…")), "the row must show the transient state");
+  await waitUntil(() => lastFrame(host).includes("Stop machine") && lastFrame(host).includes("running"), "the converged state must render in place");
+  assert.equal(host.input !== undefined, true, "the budget must not exit the screen");
+  assert.doesNotMatch(lastFrame(host), /response_budget_elapsed/u, "a lapsed response budget is not an error once the state converged");
+  host.emitInput([0x1b]);
+  await waitUntil(() => lastFrame(host).includes("paused-dev  running  Claude ready"), "the overview row must agree");
+  host.emitInput([0x03]);
+  assert.equal(await operation, undefined);
+  assert.deepEqual(transitions, ["start"]);
+});
+
+test("E13-R3 negative: a transition that never converges leaves the screen alive with a typed notice naming the read", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "sticky", state: "running", agent: "codex" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot(scope, resourceId, [supported("machines.lifecycle"), supported("agent_sessions.create")]);
+      },
+      async transitionMachine(id) { return { id, name: "sticky", state: "stopping", agent: "codex" }; },
+      async getMachine(id) { return { id, name: "sticky", state: "running", agent: "codex" }; },
+    },
+  }, { host, convergence: { pollIntervalMs: 1, budgetMs: 40 } });
+  await waitUntil(() => lastFrame(host).includes("sticky  running"), "inventory should render");
+  host.emitInput([0x0d]);
+  await waitUntil(() => lastFrame(host).includes("Stop machine"), "Stop should be offered");
+  host.emitInput([0x1b, 0x5b, 0x42]);
+  await waitUntil(() => lastFrame(host).includes("❯ Stop machine"), "Down should select Stop");
+  host.emitInput([0x0d]);
+  await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("Stopping…")), "the row must show the transient state");
+  await waitUntil(() => lastFrame(host).includes("cuna.client.convergence_budget_elapsed") && lastFrame(host).includes("cuna machines list"), "a lapsed convergence budget renders one typed notice with the read to run");
+  assert.equal(host.input !== undefined, true, "the screen must stay alive");
+  assert.doesNotMatch(lastFrame(host), /Stopping…/u, "the transient state must not outlive the budget");
+  host.emitInput([0x03]);
+  assert.equal(await operation, undefined);
+});
+
+test("E13-R4: the provider verdict appears only on a running Machine", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        return { items: [
+          { id: MACHINE_ID, name: "a-live", state: "running", agent: "opencode" },
+          { id: OTHER_MACHINE_ID, name: "b-stopped", state: "stopped", agent: "opencode" },
+          { id: "66666666-6666-4666-8666-666666666666", name: "c-error", state: "error", agent: "opencode" },
+        ] };
+      },
+      async listAgentSessions() { return { items: [] }; },
+    },
+  }, { host });
+  await waitUntil(() => lastFrame(host).includes("c-error") && lastFrame(host).includes("b-stopped") && !lastFrame(host).includes("…"), "three rows should settle");
+  const frame = lastFrame(host);
+  assert.match(frame, /a-live {2}running {2}OpenCode ready/u);
+  assert.match(frame, /b-stopped {2}stopped {2}no sessions/u);
+  assert.match(frame, /c-error {2}error {2}no sessions/u);
+  assert.equal(frame.match(/OpenCode ready/gu)?.length, 1, "a Machine that is not running shows no verdict");
+  host.emitInput([0x03]);
+  assert.equal(await operation, undefined);
+});
+
+test("E13-R5: ├─ appears only when a sibling line follows", async () => {
+  const host = new FakeHost();
+  const operation = runNodeMachinesExplorer({
+    client: {
+      // A stopped OpenCode Machine whose runtime is unverified: the runtime
+      // line is suppressed off a running Machine, so nothing follows the
+      // empty-session line and it must close the tree with └─.
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "stopped-open", state: "stopped", agent: "opencode" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot(scope, resourceId, [{
+          ...supported("agent_sessions.create"),
+          availability: "temporarily_unavailable",
+          reasonCode: "opencode_runtime_unverified",
+        }]);
+      },
+    },
+  }, { host });
+  await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Checking whether"), "the empty tree should settle");
+  const lines = lastFrame(host).split("\r\n");
+  const index = lines.findIndex((line) => line.includes("No AgentSessions"));
+  assert.ok(index >= 0);
+  assert.match(lines[index], /└─ No AgentSessions/u);
+  for (const [lineIndex, line] of lines.entries()) {
+    if (!line.includes("├─")) continue;
+    assert.match(lines[lineIndex + 1] ?? "", /[├└]─/u, `line ${lineIndex} uses ├─ without a sibling below: ${JSON.stringify(line)}`);
+  }
+  host.emitInput([0x03]);
+  assert.equal(await operation, undefined);
+});
