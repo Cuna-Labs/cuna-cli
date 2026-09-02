@@ -1618,3 +1618,112 @@ test("E13-R5: ├─ appears only when a sibling line follows", async () => {
   host.emitInput([0x03]);
   assert.equal(await operation, undefined);
 });
+
+// PRD-PM-008 E13-R7. Measured 2026-09-02 during an edge deploy: the bare
+// `cuna` screen printed "No machines yet" with three Create rows, then died
+// with `cuna.network.service_unavailable`. An error is not an empty list.
+const FAST_LIST_RETRY = Object.freeze({
+  policy: Object.freeze({ maximumAttempts: 2, maximumElapsedMs: 1_000, initialDelayMs: 1, maximumDelayMs: 1, jitterRatio: 0 }),
+  windowMs: 1_000,
+});
+
+function serviceUnavailable() {
+  return new CunaError({
+    code: "cuna.network.service_unavailable",
+    message: "The Cuna service is temporarily unavailable.",
+    exitCode: 5,
+    retryable: true,
+    details: { http_status: 502 },
+  });
+}
+
+test("E13-R7: a retryable initial list failure is never an empty list; it auto-retries, then r retries and succeeds", async () => {
+  const host = new FakeHost();
+  let reads = 0;
+  let available = false;
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        reads += 1;
+        if (!available) throw serviceUnavailable();
+        return { items: [{ id: MACHINE_ID, name: "listed-after-retry", state: "running", agent: "claude-code" }] };
+      },
+      async listAgentSessions() { return { items: [agentSession()] }; },
+    },
+  }, { host, listRetry: FAST_LIST_RETRY });
+
+  await waitUntil(() => lastFrame(host).includes("Press r to retry"), "the bounded auto-retry should end in a final notice");
+  assert.ok(reads >= 3, `the initial failure should be retried automatically within the window (reads=${reads})`);
+  const final = lastFrame(host);
+  assert.match(final, /Machines could not be listed/u);
+  assert.match(final, /cuna\.network\.service_unavailable/u);
+  assert.match(final, /502/u);
+  assert.doesNotMatch(final, /Discovering machines/u);
+  for (const frame of host.writes) {
+    assert.doesNotMatch(stripAnsi(frame), /No machines yet/u, "a failed list must never render as an empty list");
+    assert.doesNotMatch(stripAnsi(frame), /Create (Claude|Codex|OpenCode) machine/u, "create rows appear only after a successful empty list");
+  }
+  assert.equal(host.restored, 0, "a retryable failure must not exit the screen");
+
+  available = true;
+  host.emitInput([0x72]);
+  await waitUntil(() => lastFrame(host).includes("listed-after-retry") && lastFrame(host).includes("goal0-claude"), "r should retry and render the rows");
+  assert.doesNotMatch(lastFrame(host), /could not be listed|Press r to retry/u);
+  host.emitInput([0x71]);
+  assert.equal(await operation, undefined);
+  assert.equal(host.restored, 1);
+});
+
+test("E13-R7 negative: a non-retryable initial list failure exits with the typed error and never renders an empty list", async () => {
+  const host = new FakeHost();
+  let reads = 0;
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        reads += 1;
+        throw new CunaError({
+          code: "cuna.auth.unauthorized",
+          message: "The credential was refused.",
+          exitCode: 3,
+          retryable: false,
+          details: { http_status: 401 },
+        });
+      },
+      async listAgentSessions() { return { items: [] }; },
+    },
+  }, { host, listRetry: FAST_LIST_RETRY });
+  await assert.rejects(operation, (error) => error instanceof CunaError && error.code === "cuna.auth.unauthorized");
+  assert.equal(reads, 1, "a non-retryable failure is not retried");
+  for (const frame of host.writes) {
+    assert.doesNotMatch(stripAnsi(frame), /No machines yet|Create (Claude|Codex|OpenCode) machine/u);
+  }
+  assert.equal(host.restored, 1);
+});
+
+test("E13-R7: a refresh failure after a successful list keeps the rows and names the typed reason", async () => {
+  const host = new FakeHost();
+  let reads = 0;
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() {
+        reads += 1;
+        if (reads >= 2) throw serviceUnavailable();
+        return { items: [{ id: MACHINE_ID, name: "kept-on-failure", state: "running", agent: "claude-code" }] };
+      },
+      async listAgentSessions() { return { items: [agentSession()] }; },
+    },
+  }, { host, listRetry: FAST_LIST_RETRY });
+  // `r` is a no-op while a refresh is in flight; wait for the first one to settle.
+  await waitUntil(() => lastFrame(host).includes("goal0-claude  attachable") && !lastFrame(host).includes("Refreshing live sessions"), "the first inventory should settle");
+  host.emitInput([0x72]);
+  await waitUntil(() => lastFrame(host).includes("Press r to retry"), "the auto-retry window should end in a final notice");
+  const frame = lastFrame(host);
+  assert.match(frame, /kept-on-failure/u);
+  assert.match(frame, /goal0-claude  attachable/u);
+  assert.match(frame, /showing last confirmed machines/u);
+  assert.match(frame, /cuna\.network\.service_unavailable/u);
+  assert.ok(reads >= 4, `the failed refresh should be retried automatically (reads=${reads})`);
+  assert.equal(host.restored, 0);
+  host.emitInput([0x71]);
+  assert.equal(await operation, undefined);
+});
