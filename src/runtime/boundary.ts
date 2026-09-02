@@ -778,10 +778,13 @@ export class CunaRuntimeBoundary {
         undefined,
         entry.reconnectIdempotencyKey,
         reconnectAbort.signal,
-        // Reclaim the seat this attachment held, at the epoch it last saw. If
+        // Reclaim the seat the durable row names for this client, at the epoch
+        // it last saw: a confirmed transfer (takeWriter) names this client
+        // before the promotion notice arrives, and a reconnect in that window
+        // must ask as the writer, not as the observer it still renders as. If
         // the seat moved meanwhile the server says so and the reconnect lands
         // as an observer, which is the truth of it.
-        entry.accessMode === "writer"
+        entry.accessMode === "writer" || entry.writerClientInstanceId === this.#options.clientInstanceId
           ? { accessMode: "writer", expectedWriterEpoch: entry.writerEpoch }
           : { accessMode: "observer" },
       );
