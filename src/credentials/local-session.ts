@@ -18,12 +18,18 @@ const MAX_SESSION_BYTES = 96 * 1024;
 const execFileAsync = promisify(execFile);
 const WINDOWS_SYSTEM32 = "C:\\Windows\\System32";
 const WINDOWS_ACL_PATH_ENVIRONMENT = "CUNA_SESSION_ACL_PATH_V1";
+const WINDOWS_ACL_PATHS_ENVIRONMENT = "CUNA_SESSION_ACL_PATHS_V1";
 const WINDOWS_ACL_CHILD_ENVIRONMENT_NAMES = new Set([
   WINDOWS_ACL_PATH_ENVIRONMENT,
+  WINDOWS_ACL_PATHS_ENVIRONMENT,
   // This name is intentionally stripped even though no current command uses
   // it: a stale inherited value must not travel into the constrained child.
   "CUNA_SESSION_ACL_SID_V1",
 ]);
+// The batched inspection reads a newline-separated path list. Win32 paths
+// cannot legally contain control characters; refuse rather than misparse.
+const WINDOWS_ACL_BATCH_PATH_SEPARATOR = "\n";
+const WINDOWS_ACL_BATCH_MAX_PATHS = 8;
 // Windows ACL verification may invoke several bounded OS helpers while an
 // operation owns the physical lock. Keep a finite deadline, but make it longer
 // than that legitimate critical section so a second Cuna process can observe a
@@ -47,6 +53,27 @@ export const WINDOWS_ACL_COMMAND_PROGRAMS = Object.freeze({
     "$sddl = (Get-Acl -LiteralPath $path).Sddl",
     "[Console]::WriteLine('CUNA_CURRENT_SID=' + $current)",
     "[Console]::WriteLine('CUNA_SDDL=' + $sddl)",
+  ].join("; "),
+  // One spawn inspects several paths. A path that cannot be inspected (most
+  // often: it does not exist yet) emits no line; the caller treats a missing
+  // index as "not inspected", never as "safe", and falls back to `inspect`.
+  inspectMany: [
+    "$ErrorActionPreference = 'Stop'",
+    "Import-Module 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1' -ErrorAction Stop",
+    "$list = $env:CUNA_SESSION_ACL_PATHS_V1",
+    "if ([string]::IsNullOrWhiteSpace($list)) { throw 'Cuna session ACL paths are unavailable.' }",
+    "$paths = $list.Split([char]10)",
+    "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "[Console]::WriteLine('CUNA_CURRENT_SID=' + $current)",
+    "for ($i = 0; $i -lt $paths.Length; $i++) {",
+    "  $path = $paths[$i]",
+    "  if ([string]::IsNullOrWhiteSpace($path)) { continue }",
+    "  try { $sddl = (Get-Acl -LiteralPath $path).Sddl } catch { continue }",
+    "  [Console]::WriteLine('CUNA_SDDL:' + $i + '=' + $sddl)",
+    "}",
+    // A caught per-path error leaves `$?` false, which `-Command` would report
+    // as exit code 1 and the parent would read as a failed batch.
+    "exit 0",
   ].join("; "),
   reconcileFile: [
     "$ErrorActionPreference = 'Stop'",
@@ -145,9 +172,39 @@ interface WindowsAclReconciliation {
   readonly repaired: boolean;
 }
 
+interface WindowsAclInspectionRequest {
+  readonly path: string;
+  readonly directory: boolean;
+}
+
 interface WindowsAclAuthority {
   inspectOwnerOnly(path: string, directory: boolean): Promise<WindowsAclInspection>;
+  /**
+   * Optional: inspect several paths in one OS invocation. The result is
+   * index-aligned with the request; `undefined` means "not inspected" (for
+   * example, the path does not exist yet) and the caller must fall back to
+   * `inspectOwnerOnly` before trusting anything about that path.
+   */
+  inspectManyOwnerOnly?(requests: readonly WindowsAclInspectionRequest[]): Promise<readonly (WindowsAclInspection | undefined)[]>;
   reconcileNewOwnerOnly(path: string, directory: boolean): Promise<WindowsAclReconciliation>;
+}
+
+/**
+ * ACL observations cached for exactly one locked store operation. The scope is
+ * created after the physical lock is acquired and discarded when the operation
+ * ends, so a permission change between two operations is always re-read. A
+ * process-lifetime memo was tried first and rejected: it hid a permission
+ * change made between a write and the next probe, which is the property the
+ * ACL check exists to enforce.
+ */
+interface WindowsAclOperationScope {
+  batched: boolean;
+  failure: unknown;
+  readonly entries: Map<string, WindowsAclInspection>;
+}
+
+function windowsAclScopeKey(path: string, directory: boolean): string {
+  return `${directory ? "d" : "f"}:${path}`;
 }
 
 /**
@@ -164,6 +221,7 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
   readonly #clock: () => number;
   readonly #lockTimeoutMs: number;
   readonly #windowsAcl: WindowsAclAuthority;
+  #aclScope: WindowsAclOperationScope | undefined;
 
   constructor(input: {
     readonly sessionFile: string;
@@ -346,6 +404,10 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
         await delay(LOCK_RETRY_MS);
       }
     }
+    // Nested locks (refresh around storage) each get their own scope; the
+    // innermost operation is the unit of ACL freshness.
+    const previousScope = this.#aclScope;
+    this.#aclScope = { batched: false, failure: undefined, entries: new Map() };
     try {
       // The initial check is required before resolving the physical lock
       // authority. Re-check once after acquiring it: this keeps the prior
@@ -362,8 +424,61 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
       }
       return await operation();
     } finally {
+      this.#aclScope = previousScope;
       await closeServer(server);
     }
+  }
+
+  /**
+   * One ACL observation per path per store operation. The first request in an
+   * operation inspects the directory, the key and the ciphertext in a single
+   * OS invocation when the authority supports it; every later request in the
+   * same operation is served from that observation. A path the batch could
+   * not inspect is inspected on its own, and a batch failure is raised at the
+   * first enforcement site rather than silently retried.
+   */
+  async #inspectWindowsAcl(path: string, directory: boolean): Promise<WindowsAclInspection> {
+    const scope = this.#aclScope;
+    if (scope === undefined) return await this.#windowsAcl.inspectOwnerOnly(path, directory);
+    const key = windowsAclScopeKey(path, directory);
+    const cached = scope.entries.get(key);
+    if (cached !== undefined) return cached;
+    const inspectMany = this.#windowsAcl.inspectManyOwnerOnly;
+    if (!scope.batched && inspectMany !== undefined) {
+      scope.batched = true;
+      const requests: readonly WindowsAclInspectionRequest[] = [
+        { path: dirname(this.#sessionFile), directory: true },
+        { path: this.#keyFile, directory: false },
+        { path: this.#sessionFile, directory: false },
+      ];
+      try {
+        const results = await inspectMany.call(this.#windowsAcl, requests);
+        if (results.length !== requests.length) throw new Error("Windows ACL batch inspection is misaligned");
+        requests.forEach((request, index) => {
+          const result = results[index];
+          if (result !== undefined) scope.entries.set(windowsAclScopeKey(request.path, request.directory), result);
+        });
+      } catch (error) {
+        scope.failure = error;
+      }
+      const batched = scope.entries.get(key);
+      if (batched !== undefined) return batched;
+    }
+    if (scope.failure !== undefined) throw scope.failure;
+    const inspection = await this.#windowsAcl.inspectOwnerOnly(path, directory);
+    scope.entries.set(key, inspection);
+    return inspection;
+  }
+
+  async #assertWindowsOwnerOnlyAcl(path: string, directory: boolean): Promise<void> {
+    assertWindowsOwnerOnlyInspection(await this.#inspectWindowsAcl(path, directory));
+  }
+
+  async #ensureNewWindowsOwnerOnlyAcl(path: string, directory: boolean, assertSafeMetadata: () => Promise<void>): Promise<void> {
+    // A reconciliation rewrites the ACL; any observation of this path taken
+    // earlier in the same operation is stale from here on.
+    this.#aclScope?.entries.delete(windowsAclScopeKey(path, directory));
+    await ensureNewWindowsOwnerOnlyAcl(this.#windowsAcl, path, directory, assertSafeMetadata);
   }
 
   async #ensureDirectory(input: { readonly verifyExistingWindowsAcl?: boolean } = {}): Promise<void> {
@@ -378,11 +493,10 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
         // boundary to derive its authority; immediately after acquisition the
         // full owner/DACL inspection below is mandatory before any operation.
         if (input.verifyExistingWindowsAcl ?? true) {
-          await assertWindowsOwnerOnlyAcl(this.#windowsAcl, directory, true);
+          await this.#assertWindowsOwnerOnlyAcl(directory, true);
         }
       } else {
-        await ensureNewWindowsOwnerOnlyAcl(
-          this.#windowsAcl,
+        await this.#ensureNewWindowsOwnerOnlyAcl(
           directory,
           true,
           async () => await this.#assertSafeDirectoryMetadata(directory),
@@ -418,8 +532,7 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
     if (created) {
       await this.#assertSafeFileMetadata(this.#keyFile, KEY_BYTES);
       if (this.platform === "win32") {
-        await ensureNewWindowsOwnerOnlyAcl(
-          this.#windowsAcl,
+        await this.#ensureNewWindowsOwnerOnlyAcl(
           this.#keyFile,
           false,
           async () => await this.#assertSafeFileMetadata(this.#keyFile, KEY_BYTES),
@@ -435,7 +548,7 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
 
   async #assertSafeIfPresent(file: string, maximum: number): Promise<void> {
     await this.#assertSafeFileMetadata(file, maximum);
-    if (this.platform === "win32") await assertWindowsOwnerOnlyAcl(this.#windowsAcl, file, false);
+    if (this.platform === "win32") await this.#assertWindowsOwnerOnlyAcl(file, false);
   }
 
   async #assertSafeFileMetadata(file: string, maximum: number): Promise<void> {
@@ -465,8 +578,7 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
       await chmod(file, 0o600);
       if (this.platform === "win32") {
         await this.#assertSafeFileMetadata(file, MAX_SESSION_BYTES);
-        await ensureNewWindowsOwnerOnlyAcl(
-          this.#windowsAcl,
+        await this.#ensureNewWindowsOwnerOnlyAcl(
           file,
           false,
           async () => await this.#assertSafeFileMetadata(file, MAX_SESSION_BYTES),
@@ -627,23 +739,43 @@ export function isolateWindowsAclChildEnvironment(
   inherited: NodeJS.ProcessEnv,
   path: string,
 ): NodeJS.ProcessEnv {
+  const environment = stripWindowsAclChildEnvironment(inherited);
+  environment[WINDOWS_ACL_PATH_ENVIRONMENT] = path;
+  return environment;
+}
+
+/**
+ * The batched variant carries a newline-separated list under its own name.
+ * Both isolated environments strip every ACL input name, so a single-path
+ * child never sees a list and a batched child never sees a single path.
+ */
+export function isolateWindowsAclBatchChildEnvironment(
+  inherited: NodeJS.ProcessEnv,
+  paths: readonly string[],
+): NodeJS.ProcessEnv {
+  if (paths.length < 1 || paths.length > WINDOWS_ACL_BATCH_MAX_PATHS) throw new Error("Windows ACL batch size is invalid");
+  for (const path of paths) {
+    if (path.length < 1 || [...path].some((character) => character.codePointAt(0)! < 0x20)) throw new Error("Windows ACL batch path is invalid");
+  }
+  const environment = stripWindowsAclChildEnvironment(inherited);
+  environment[WINDOWS_ACL_PATHS_ENVIRONMENT] = paths.join(WINDOWS_ACL_BATCH_PATH_SEPARATOR);
+  return environment;
+}
+
+function stripWindowsAclChildEnvironment(inherited: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const environment = Object.create(null) as NodeJS.ProcessEnv;
   for (const [name, value] of Object.entries(inherited)) {
     if (WINDOWS_ACL_CHILD_ENVIRONMENT_NAMES.has(name.toLocaleUpperCase("en-US"))) continue;
     if (value !== undefined) environment[name] = value;
   }
-  environment[WINDOWS_ACL_PATH_ENVIRONMENT] = path;
   return environment;
 }
 
 const WINDOWS_ACL_AUTHORITY: WindowsAclAuthority = Object.freeze({
   inspectOwnerOnly: async (path: string, directory: boolean) => await inspectWindowsAcl(path, directory),
+  inspectManyOwnerOnly: async (requests: readonly WindowsAclInspectionRequest[]) => await inspectWindowsAclMany(requests),
   reconcileNewOwnerOnly: async (path: string, directory: boolean) => await reconcileNewWindowsAcl(path, directory),
 });
-
-async function assertWindowsOwnerOnlyAcl(authority: WindowsAclAuthority, path: string, directory: boolean): Promise<void> {
-  assertWindowsOwnerOnlyInspection(await authority.inspectOwnerOnly(path, directory));
-}
 
 function assertWindowsOwnerOnlyInspection(inspection: WindowsAclInspection): void {
   assertWindowsCurrentUserOwner(inspection);
@@ -698,6 +830,53 @@ async function inspectWindowsAcl(path: string, directory: boolean): Promise<Wind
   return parseWindowsAclInspection(stdout, "CUNA_CURRENT_SID", "CUNA_SDDL", directory);
 }
 
+/**
+ * Batched form of `inspectWindowsAcl`: one `powershell.exe` spawn for every
+ * requested path. Exported so the real program and its parser can be
+ * exercised against real files on Windows.
+ */
+export async function inspectWindowsAclMany(
+  requests: readonly WindowsAclInspectionRequest[],
+): Promise<readonly (WindowsAclInspection | undefined)[]> {
+  const { stdout } = await execFileAsync(
+    resolve(WINDOWS_SYSTEM32, "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany],
+    {
+      windowsHide: true,
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+      encoding: "utf8",
+      env: isolateWindowsAclBatchChildEnvironment(process.env, requests.map((request) => request.path)),
+    },
+  );
+  return parseWindowsAclBatchInspection(stdout, requests.map((request) => request.directory));
+}
+
+/**
+ * Parses `inspectMany` output. Exactly one `CUNA_CURRENT_SID=` line is
+ * required; each `CUNA_SDDL:<index>=` line yields an inspection at that index
+ * and an index without a line stays `undefined`. A duplicated or out-of-range
+ * index is a malformed observation and rejects the whole batch.
+ */
+export function parseWindowsAclBatchInspection(
+  stdout: string,
+  directories: readonly boolean[],
+): readonly (WindowsAclInspection | undefined)[] {
+  const sidLines = stdout.match(/^CUNA_CURRENT_SID=.*$/gmu) ?? [];
+  const currentSid = sidLines.length === 1 ? /^CUNA_CURRENT_SID=(S-1-[0-9-]+)$/u.exec(sidLines[0]!)?.[1] : undefined;
+  if (currentSid === undefined) throw new Error("Windows ACL inspection is unavailable");
+  const results: (WindowsAclInspection | undefined)[] = directories.map(() => undefined);
+  for (const line of stdout.match(/^CUNA_SDDL:.*$/gmu) ?? []) {
+    const match = /^CUNA_SDDL:(0|[1-9][0-9]*)=(.+)$/u.exec(line);
+    const index = match === null ? Number.NaN : Number(match[1]);
+    if (match === null || !(index < directories.length) || results[index] !== undefined) {
+      throw new Error("Windows ACL batch inspection is malformed");
+    }
+    results[index] = windowsAclInspectionFromSddl(currentSid, match[2]!, directories[index]!);
+  }
+  return results;
+}
+
 async function reconcileNewWindowsAcl(path: string, directory: boolean): Promise<WindowsAclReconciliation> {
   const program = directory
     ? WINDOWS_ACL_COMMAND_PROGRAMS.reconcileDirectory
@@ -730,8 +909,15 @@ function parseWindowsAclInspection(
 ): WindowsAclInspection {
   const currentSid = new RegExp(`^${currentSidLabel}=(S-1-[0-9-]+)$`, "mu").exec(stdout)?.[1];
   const sddl = new RegExp(`^${sddlLabel}=(.+)$`, "mu").exec(stdout)?.[1];
-  const ownerSid = sddl === undefined ? undefined : /^O:(S-1-[0-9-]+)(?:G:|D:|S:)/u.exec(sddl)?.[1];
-  if (currentSid === undefined || ownerSid === undefined || sddl === undefined) {
+  if (currentSid === undefined || sddl === undefined) {
+    throw new Error("Windows ACL inspection is unavailable");
+  }
+  return windowsAclInspectionFromSddl(currentSid, sddl, directory);
+}
+
+function windowsAclInspectionFromSddl(currentSid: string, sddl: string, directory: boolean): WindowsAclInspection {
+  const ownerSid = /^O:(S-1-[0-9-]+)(?:G:|D:|S:)/u.exec(sddl)?.[1];
+  if (ownerSid === undefined) {
     throw new Error("Windows ACL inspection is unavailable");
   }
   const daclStart = sddl.indexOf("D:");

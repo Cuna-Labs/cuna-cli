@@ -11,9 +11,12 @@ import { promisify } from "node:util";
 
 import {
   CredentialVault,
+  inspectWindowsAclMany,
+  isolateWindowsAclBatchChildEnvironment,
   isolateWindowsAclChildEnvironment,
   LocalEncryptedSessionBackend,
   localEncryptedSessionPaths,
+  parseWindowsAclBatchInspection,
   SecretMaterial,
   WINDOWS_ACL_COMMAND_PROGRAMS,
 } from "../dist/credentials/index.js";
@@ -23,14 +26,23 @@ const execFileAsync = promisify(execFile);
 test("Windows ACL commands are static and isolate case-insensitive child environment inputs", () => {
   assert.equal(Object.isFrozen(WINDOWS_ACL_COMMAND_PROGRAMS), true);
   const programs = Object.values(WINDOWS_ACL_COMMAND_PROGRAMS);
-  assert.equal(programs.length, 3);
-  for (const program of programs) {
-    assert.match(program, /\$env:CUNA_SESSION_ACL_PATH_V1/u);
+  assert.equal(programs.length, 4);
+  for (const [name, program] of Object.entries(WINDOWS_ACL_COMMAND_PROGRAMS)) {
+    if (name === "inspectMany") {
+      assert.match(program, /\$env:CUNA_SESSION_ACL_PATHS_V1/u);
+      assert.doesNotMatch(program, /\$env:CUNA_SESSION_ACL_PATH_V1\b/u);
+    } else {
+      assert.match(program, /\$env:CUNA_SESSION_ACL_PATH_V1/u);
+      assert.doesNotMatch(program, /CUNA_SESSION_ACL_PATHS_V1/u);
+    }
     assert.match(program, /Import-Module 'C:\\Windows\\System32\\WindowsPowerShell\\v1\.0\\Modules\\Microsoft\.PowerShell\.Security\\Microsoft\.PowerShell\.Security\.psd1'/u);
     assert.doesNotMatch(program, /(?:FromBase64String|EncodedCommand|Invoke-Expression|\bIEX\b|ExecutionPolicy)/iu);
     assert.doesNotMatch(program, /(?:^|\s)-File(?:\s|$)/u);
   }
   assert.doesNotMatch(WINDOWS_ACL_COMMAND_PROGRAMS.inspect, /CUNA_SESSION_ACL_SID_V1/u);
+  assert.doesNotMatch(WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany, /CUNA_SESSION_ACL_SID_V1/u);
+  assert.match(WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany, /CUNA_SDDL:' \+ \$i \+ '='/u, "batched output is indexed per path");
+  assert.doesNotMatch(WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany, /Set-Acl/u, "inspection never mutates");
   for (const program of [WINDOWS_ACL_COMMAND_PROGRAMS.reconcileFile, WINDOWS_ACL_COMMAND_PROGRAMS.reconcileDirectory]) {
     assert.doesNotMatch(program, /CUNA_SESSION_ACL_SID_V1/u);
     assert.match(program, /WindowsIdentity\]::GetCurrent\(\)\.User\.Value/u);
@@ -47,6 +59,8 @@ test("Windows ACL commands are static and isolate case-insensitive child environ
     KEEP_ME: "preserved",
     CUNA_SESSION_ACL_PATH_V1: "hostile-uppercase-path",
     cuna_session_acl_path_v1: "hostile-lowercase-path",
+    CUNA_SESSION_ACL_PATHS_V1: "hostile-uppercase-list",
+    cuna_session_acl_paths_v1: "hostile-lowercase-list",
     CUNA_SESSION_ACL_SID_V1: "S-1-5-21-111-222-333-444",
     cuna_session_acl_sid_v1: "S-1-5-21-555-666-777-888",
   });
@@ -62,11 +76,224 @@ test("Windows ACL commands are static and isolate case-insensitive child environ
   assert.equal(Object.getPrototypeOf(inspectionEnvironment), null);
   assert.deepEqual(namesFor(inspectionEnvironment, "CUNA_SESSION_ACL_PATH_V1"), [["CUNA_SESSION_ACL_PATH_V1", "C:\\safe\\session.json"]]);
   assert.deepEqual(namesFor(inspectionEnvironment, "CUNA_SESSION_ACL_SID_V1"), []);
+  assert.deepEqual(namesFor(inspectionEnvironment, "CUNA_SESSION_ACL_PATHS_V1"), [], "a single-path child never sees a list");
   assert.equal(inspectionEnvironment.KEEP_ME, "preserved");
   assert.deepEqual(namesFor(reconciliationEnvironment, "CUNA_SESSION_ACL_PATH_V1"), [["CUNA_SESSION_ACL_PATH_V1", "C:\\safe\\session.key"]]);
   assert.deepEqual(namesFor(reconciliationEnvironment, "CUNA_SESSION_ACL_SID_V1"), []);
   assert.equal(inherited.cuna_session_acl_path_v1, "hostile-lowercase-path", "the parent environment is never mutated");
   assert.equal(inherited.cuna_session_acl_sid_v1, "S-1-5-21-555-666-777-888", "the parent environment is never mutated");
+
+  const batchEnvironment = isolateWindowsAclBatchChildEnvironment(inherited, ["C:\\safe\\sessions-v1", "C:\\safe\\session.key", "C:\\safe\\session.json"]);
+  assert.equal(Object.getPrototypeOf(batchEnvironment), null);
+  assert.deepEqual(namesFor(batchEnvironment, "CUNA_SESSION_ACL_PATHS_V1"), [["CUNA_SESSION_ACL_PATHS_V1", "C:\\safe\\sessions-v1\nC:\\safe\\session.key\nC:\\safe\\session.json"]]);
+  assert.deepEqual(namesFor(batchEnvironment, "CUNA_SESSION_ACL_PATH_V1"), [], "a batched child never sees a single path");
+  assert.deepEqual(namesFor(batchEnvironment, "CUNA_SESSION_ACL_SID_V1"), []);
+  assert.equal(batchEnvironment.KEEP_ME, "preserved");
+  assert.throws(() => isolateWindowsAclBatchChildEnvironment(inherited, ["C:\\safe\\a.json\nC:\\evil\\b.json"]), /batch path is invalid/u, "a separator inside a path cannot forge a second entry");
+  assert.throws(() => isolateWindowsAclBatchChildEnvironment(inherited, []), /batch size is invalid/u);
+  assert.throws(() => isolateWindowsAclBatchChildEnvironment(inherited, ["C:\\safe\\a.json", ""]), /batch path is invalid/u);
+});
+
+test("batched Windows ACL output parses per index and rejects malformed observations", () => {
+  const sid = "S-1-5-21-123-456-789-1001";
+  const ownerOnlyFile = `O:${sid}G:${sid}D:PAI(A;;FA;;;${sid})`;
+  const ownerOnlyDirectory = `O:${sid}G:${sid}D:PAI(A;OICI;FA;;;${sid})`;
+  const everyoneRead = `O:${sid}G:${sid}D:PAI(A;;FA;;;${sid})(A;;FR;;;WD)`;
+  const foreignOwner = `O:S-1-5-21-999-888-777-2002G:${sid}D:PAI(A;;FA;;;${sid})`;
+  const parsed = parseWindowsAclBatchInspection(
+    [`CUNA_CURRENT_SID=${sid}`, `CUNA_SDDL:0=${ownerOnlyDirectory}`, `CUNA_SDDL:2=${everyoneRead}`, `CUNA_SDDL:3=${foreignOwner}`, ""].join("\r\n"),
+    [true, false, false, false],
+  );
+  assert.deepEqual(parsed, [
+    { currentSid: sid, ownerSid: sid, daclOwnerOnly: true },
+    undefined,
+    { currentSid: sid, ownerSid: sid, daclOwnerOnly: false },
+    { currentSid: sid, ownerSid: "S-1-5-21-999-888-777-2002", daclOwnerOnly: true },
+  ]);
+  assert.deepEqual(
+    parseWindowsAclBatchInspection(`CUNA_CURRENT_SID=${sid}\n`, [true, false]),
+    [undefined, undefined],
+    "a batch that inspected nothing reports nothing as inspected",
+  );
+  assert.equal(parseWindowsAclBatchInspection(`CUNA_CURRENT_SID=${sid}\nCUNA_SDDL:0=${ownerOnlyDirectory}\n`, [false])[0].daclOwnerOnly, false, "a directory ACE is not owner-only for a file");
+  assert.equal(parseWindowsAclBatchInspection(`CUNA_CURRENT_SID=${sid}\nCUNA_SDDL:0=${ownerOnlyFile}\n`, [false])[0].daclOwnerOnly, true);
+  assert.throws(() => parseWindowsAclBatchInspection(`CUNA_SDDL:0=${ownerOnlyFile}\n`, [false]), /unavailable/u, "the current SID is mandatory");
+  assert.throws(() => parseWindowsAclBatchInspection(`CUNA_CURRENT_SID=${sid}\nCUNA_CURRENT_SID=S-1-5-21-1-2-3-4\nCUNA_SDDL:0=${ownerOnlyFile}\n`, [false]), /unavailable/u, "two SIDs are one too many");
+  assert.throws(() => parseWindowsAclBatchInspection(`CUNA_CURRENT_SID=${sid}\nCUNA_SDDL:1=${ownerOnlyFile}\n`, [false]), /malformed/u, "an out-of-range index is rejected");
+  assert.throws(() => parseWindowsAclBatchInspection(`CUNA_CURRENT_SID=${sid}\nCUNA_SDDL:0=${ownerOnlyFile}\nCUNA_SDDL:0=${everyoneRead}\n`, [false]), /malformed/u, "a duplicated index is rejected");
+  assert.throws(() => parseWindowsAclBatchInspection(`CUNA_CURRENT_SID=${sid}\nCUNA_SDDL:0=garbage\n`, [false]), /unavailable/u, "an SDDL without an owner is rejected");
+});
+
+test("the real batched inspection observes several paths in one spawn and skips absent ones", { skip: process.platform !== "win32" }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cuna-local-session-batch-real-"));
+  try {
+    const present = path.join(root, "present.key");
+    await writeFile(present, Buffer.alloc(32));
+    const absent = path.join(root, "absent.json");
+    const results = await inspectWindowsAclMany([
+      { path: root, directory: true },
+      { path: present, directory: false },
+      { path: absent, directory: false },
+    ]);
+    assert.equal(results.length, 3);
+    assert.match(results[0].currentSid, /^S-1-/u);
+    assert.equal(results[0].ownerSid, results[0].currentSid, "a fresh temp directory is owned by the current user");
+    assert.equal(results[1].currentSid, results[0].currentSid);
+    assert.equal(results[1].daclOwnerOnly, false, "an inherited default ACL is not owner-only");
+    assert.equal(results[2], undefined, "an absent path is reported as not inspected, never as safe");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+function countingAcl(compliant, counters) {
+  const entry = (target, directoryEntry) => `${directoryEntry ? "directory" : "file"}:${target}`;
+  const observe = (target, directoryEntry) => {
+    counters.sid += 1;
+    const currentSid = `S-1-5-21-123-456-789-${counters.sid}`;
+    return { currentSid, ownerSid: currentSid, daclOwnerOnly: compliant.has(entry(target, directoryEntry)) };
+  };
+  return {
+    inspectOwnerOnly: async (target, directoryEntry) => {
+      counters.single += 1;
+      return observe(target, directoryEntry);
+    },
+    inspectManyOwnerOnly: async (requests) => {
+      counters.batch += 1;
+      counters.batchSizes.push(requests.length);
+      // Emulate the OS program: an absent path is not inspected; one SID per spawn.
+      counters.sid += 1;
+      const currentSid = `S-1-5-21-123-456-789-${counters.sid}`;
+      return Promise.all(requests.map(async ({ path: target, directory: directoryEntry }) => {
+        try { await stat(target); } catch { return undefined; }
+        return { currentSid, ownerSid: currentSid, daclOwnerOnly: compliant.has(entry(target, directoryEntry)) };
+      }));
+    },
+    reconcileNewOwnerOnly: async (target, directoryEntry) => {
+      counters.reconcile += 1;
+      const before = observe(target, directoryEntry);
+      compliant.add(entry(target, directoryEntry));
+      return { before, after: { ...before, daclOwnerOnly: true }, repaired: !before.daclOwnerOnly };
+    },
+  };
+}
+
+test("Windows ACL inspection is at most one spawn per store operation and never outlives it", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cuna-local-session-batch-scope-"));
+  const paths = localEncryptedSessionPaths(directory, "batch-scope");
+  const sessionDirectory = path.dirname(paths.sessionFile);
+  const compliant = new Set();
+  const counters = { single: 0, batch: 0, reconcile: 0, sid: 0, batchSizes: [] };
+  const snapshot = () => ({ single: counters.single, batch: counters.batch, reconcile: counters.reconcile });
+  const delta = (before) => ({ single: counters.single - before.single, batch: counters.batch - before.batch, reconcile: counters.reconcile - before.reconcile });
+  try {
+    const backend = new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl: countingAcl(compliant, counters) });
+    const secret = Buffer.from(`cuna_login_${"b".repeat(43)}`);
+
+    let before = snapshot();
+    await backend.replace("ignored", secret);
+    assert.deepEqual(delta(before), { single: 0, batch: 1, reconcile: 3 }, "a first write reconciles all three artifacts and re-inspects the new directory once after locking");
+
+    before = snapshot();
+    assert.equal((await backend.probe()).status, "verified");
+    assert.deepEqual(delta(before), { single: 0, batch: 1, reconcile: 0 }, "probe: directory, key and ciphertext in one spawn");
+
+    before = snapshot();
+    assert.deepEqual(Buffer.from(await backend.read("ignored")), secret);
+    assert.deepEqual(delta(before), { single: 0, batch: 1, reconcile: 0 }, "read: one spawn");
+
+    before = snapshot();
+    const expected = createHash("sha256").update(secret).digest("hex");
+    assert.equal(await backend.compareAndSwap("ignored", expected, Buffer.from(`cuna_login_${"c".repeat(43)}`)), "replaced");
+    assert.deepEqual(delta(before), { single: 0, batch: 1, reconcile: 1 }, "CAS: one inspection spawn plus the ciphertext reconciliation");
+
+    before = snapshot();
+    await backend.replace("ignored", secret);
+    assert.deepEqual(delta(before), { single: 0, batch: 1, reconcile: 1 }, "replace over an existing key: one inspection spawn plus the ciphertext reconciliation");
+
+    before = snapshot();
+    await backend.withRefreshLock("ignored", async () => {
+      assert.deepEqual(Buffer.from(await backend.read("ignored")), secret);
+    });
+    assert.deepEqual(delta(before), { single: 0, batch: 2, reconcile: 0 }, "a nested storage operation owns its own scope; the refresh lock does not lend it a stale one");
+
+    assert.equal(counters.batchSizes.every((size) => size === 3), true, "every batch covers the directory, the key and the ciphertext");
+    assert.equal(new Set(counters.batchSizes).size, 1);
+
+    // Negative control: a permission change between two operations is read.
+    const entry = `file:${paths.keyFile}`;
+    assert.equal(compliant.delete(entry), true);
+    before = snapshot();
+    assert.equal((await backend.probe()).status, "unavailable", "the next operation observes the changed key ACL");
+    assert.deepEqual(delta(before), { single: 0, batch: 1, reconcile: 0 }, "the change was seen by a fresh spawn, not repaired");
+    await assert.rejects(
+      backend.read("ignored"),
+      (error) => error?.code === "credential_backend_unverified" && error?.retryable === false,
+      "read fails closed on the same change",
+    );
+    compliant.add(entry);
+    before = snapshot();
+    assert.equal((await backend.probe()).status, "verified");
+    assert.deepEqual(delta(before), { single: 0, batch: 1, reconcile: 0 });
+
+    // Negative control: a restored directory ACL is re-read too.
+    assert.equal(compliant.delete(`directory:${sessionDirectory}`), true);
+    assert.equal((await backend.probe()).status, "unavailable", "the next operation observes the changed directory ACL");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a batched inspection failure is raised at the enforcement site without a silent retry", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cuna-local-session-batch-failure-"));
+  const paths = localEncryptedSessionPaths(directory, "batch-failure");
+  const compliant = new Set();
+  const counters = { single: 0, batch: 0, reconcile: 0, sid: 0, batchSizes: [] };
+  const healthy = countingAcl(compliant, counters);
+  let failBatch = false;
+  const windowsAcl = {
+    ...healthy,
+    inspectManyOwnerOnly: async (requests) => {
+      if (!failBatch) return healthy.inspectManyOwnerOnly(requests);
+      counters.batch += 1;
+      throw Object.assign(new Error("simulated batched ACL timeout"), { code: "ETIMEDOUT" });
+    },
+  };
+  try {
+    const backend = new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl });
+    const secret = Buffer.from(`cuna_login_${"f".repeat(43)}`);
+    await backend.replace("ignored", secret);
+    failBatch = true;
+    const before = { single: counters.single, batch: counters.batch };
+    // The first enforcement site in any operation is the directory check that
+    // follows lock acquisition; its error surfaces unchanged, as it did for a
+    // single-path directory inspection before batching.
+    await assert.rejects(backend.read("ignored"), (error) => error?.code === "ETIMEDOUT" && /simulated batched ACL timeout/u.test(error.message));
+    assert.equal(counters.batch - before.batch, 1);
+    assert.equal(counters.single - before.single, 0, "a failed batch is not retried path by path");
+    assert.equal((await backend.probe()).status, "unavailable");
+    failBatch = false;
+    assert.deepEqual(Buffer.from(await backend.read("ignored")), secret, "the failure did not outlive its operation");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("an authority without batching is inspected path by path within one operation and afresh across operations", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cuna-local-session-single-fallback-"));
+  const paths = localEncryptedSessionPaths(directory, "single-fallback");
+  const compliant = new Set();
+  const counters = { single: 0, batch: 0, reconcile: 0, sid: 0, batchSizes: [] };
+  const windowsAcl = countingAcl(compliant, counters);
+  delete windowsAcl.inspectManyOwnerOnly;
+  try {
+    const backend = new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl });
+    const secret = Buffer.from(`cuna_login_${"s".repeat(43)}`);
+    await backend.replace("ignored", secret);
+    let before = counters.single;
+    assert.deepEqual(Buffer.from(await backend.read("ignored")), secret);
+    assert.equal(counters.single - before, 3, "directory, ciphertext and key once each");
+    before = counters.single;
+    const expected = createHash("sha256").update(secret).digest("hex");
+    assert.equal(await backend.compareAndSwap("ignored", expected, secret), "replaced");
+    assert.equal(counters.single - before, 3, "the key is read for the digest and again for the write from one observation");
+    assert.equal(compliant.delete(`file:${paths.sessionFile}`), true);
+    await assert.rejects(backend.read("ignored"), (error) => error?.code === "credential_backend_unverified");
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 function waitForChild(child, phase) {
