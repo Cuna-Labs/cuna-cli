@@ -88,7 +88,7 @@ test("bare root traverses machine -> provider -> existing session using the shar
       async discoverCapabilities() { throw new Error("new session not advertised"); },
     },
   }, { host, now: () => NOW });
-  await waitUntil(() => host.writes.some((frame) => frame.includes("dev") && frame.includes("Claude 1/1 live")));
+  await waitUntil(() => host.writes.some((frame) => frame.includes("dev") && frame.includes("1 session")));
   host.send([0x1b, 0x5b, 0x43]);
   await waitUntil(() => host.writes.at(-1).includes("Claude  sessions"));
   host.send([0x0d]);
