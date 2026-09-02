@@ -896,9 +896,16 @@ export class CunaRuntimeBoundary {
       entry.fencingGeneration = ready.payload.fencingGeneration;
       entry.capabilities = grant.capabilities;
       entry.resizeCapability = ready.payload.resizeCapability;
+      // A writer that reconnects and lands as an observer was demoted by a
+      // transfer while it was away: the notice frame that would have said so
+      // was queued to the attachment that closed. Say it from the durable
+      // fact instead, so the former writer is never left observing in
+      // silence.
+      const heldTheSeat = entry.accessMode === "writer";
       entry.accessMode = ready.payload.accessMode;
       entry.writerEpoch = ready.payload.writerEpoch;
       entry.writerClientInstanceId = ready.payload.accessMode === "writer" ? this.#options.clientInstanceId : null;
+      if (heldTheSeat && ready.payload.accessMode !== "writer") entry.reason = "writer_transferred";
       entry.viewId = nextViewId;
       entry.resumeHandle = grant.resumeHandle;
       entry.localActionAcceptance = candidate.localActionAcceptance;
