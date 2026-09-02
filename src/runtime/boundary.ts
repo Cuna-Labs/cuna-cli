@@ -167,6 +167,8 @@ interface TerminalEntry {
   accessMode: "writer" | "observer";
   writerEpoch: number;
   writerClientInstanceId: string | null;
+  /** True once this attachment has held the writing seat by any path. */
+  heldSeat: boolean;
   wireSequence: bigint;
   inputSequence: bigint;
   acknowledgedInputSequence: bigint;
@@ -397,6 +399,7 @@ export class CunaRuntimeBoundary {
         accessMode: "observer",
         writerEpoch: 0,
         writerClientInstanceId: null,
+        heldSeat: false,
         sendTail: Promise.resolve(),
         connectionRevision: 1,
         heartbeatSequence: 0n,
@@ -413,6 +416,7 @@ export class CunaRuntimeBoundary {
       entry.accessMode = ready.payload.accessMode;
       entry.writerEpoch = ready.payload.writerEpoch;
       entry.writerClientInstanceId = ready.payload.accessMode === "writer" ? this.#options.clientInstanceId : null;
+      entry.heldSeat = ready.payload.accessMode === "writer";
       entry.localActionAcceptance = this.#localActionAcceptance(
         ready.payload.localActionProtocol,
         entry.observation.agentSessionId,
@@ -839,6 +843,7 @@ export class CunaRuntimeBoundary {
         accessMode: "observer",
         writerEpoch: 0,
         writerClientInstanceId: null,
+        heldSeat: false,
       };
       const ready = await this.#awaitReady(candidate, iterator, reconnectAbort.signal);
       candidate.lastHeartbeatAt = this.#clock();
@@ -901,11 +906,12 @@ export class CunaRuntimeBoundary {
       // was queued to the attachment that closed. Say it from the durable
       // fact instead, so the former writer is never left observing in
       // silence.
-      const heldTheSeat = entry.accessMode === "writer";
       entry.accessMode = ready.payload.accessMode;
       entry.writerEpoch = ready.payload.writerEpoch;
       entry.writerClientInstanceId = ready.payload.accessMode === "writer" ? this.#options.clientInstanceId : null;
-      if (heldTheSeat && ready.payload.accessMode !== "writer") entry.reason = "writer_transferred";
+      if (ready.payload.accessMode === "writer") entry.heldSeat = true;
+      else if (entry.heldSeat) entry.reason = "writer_transferred";
+      else delete entry.reason;
       entry.viewId = nextViewId;
       entry.resumeHandle = grant.resumeHandle;
       entry.localActionAcceptance = candidate.localActionAcceptance;
@@ -1439,6 +1445,7 @@ export class CunaRuntimeBoundary {
       entry.accessMode = payload.accessMode;
       entry.writerEpoch = payload.writerEpoch;
       entry.writerClientInstanceId = payload.writerClientInstanceId;
+      if (payload.accessMode === "writer") entry.heldSeat = true;
       if (wasWriter && payload.accessMode !== "writer") entry.reason = "writer_transferred";
       else if (!wasWriter && payload.accessMode === "writer") delete entry.reason;
       this.#publish(entry);
