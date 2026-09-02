@@ -561,17 +561,17 @@
         "x-sdk-exposed": true,
         "x-runa-error-model": "problem",
         "responses": {
-      "200": {
-        "description": "Low-information authentication state for the exact owned AgentSession process generation.",
-        "headers": {
-          "Cache-Control": {
-            "description": "Authentication evidence is never reusable through an HTTP cache.",
-            "schema": {
-              "const": "no-store"
-            }
-          }
-        },
-        "content": {
+          "200": {
+            "description": "Low-information authentication state for the exact owned AgentSession process generation.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Authentication evidence is never reusable through an HTTP cache.",
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AgentSessionAuth"
@@ -829,6 +829,13 @@
           "resource_not_found",
           "machine_not_running",
           "agent_session_not_ready",
+          "terminal_owner_unrecoverable",
+          "terminal_writer_held",
+          "terminal_writer_stale",
+          "terminal_writer_transfer_unavailable",
+          "terminal_observer_output_unavailable",
+          "terminal_connection_legacy_ingress_rejected",
+          "terminal_connection_cancelled",
           "terminal_connection_idempotency_conflict",
           "terminal_connection_resume_handle_conflict",
           "invalid_terminal_connection_request",
@@ -856,6 +863,75 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TerminalConnectionGrant"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "terminal_connections:create"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/agent-sessions/{id}/terminal-connections/cancel": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AgentSessionId"
+        }
+      ],
+      "post": {
+        "operationId": "agentSessions.cancelTerminalConnection",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "resource_not_found",
+          "terminal_connection_idempotency_conflict",
+          "terminal_connection_already_redeemed",
+          "terminal_connection_legacy_ingress_rejected",
+          "invalid_terminal_connection_request",
+          "terminal_connection_authority_unavailable"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminalConnectionCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotently fences the exact terminal-connection request so an unredeemed grant cannot later be redeemed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TerminalConnectionCancellation"
                 }
               }
             }
@@ -1047,8 +1123,18 @@
           "200": {
             "description": "Browser identity approved; the login code is returned exactly once and must not be cached.",
             "headers": {
-              "Cache-Control": { "schema": { "type": "string", "const": "no-store" } },
-              "Pragma": { "schema": { "type": "string", "const": "no-cache" } }
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-cache"
+                }
+              }
             },
             "content": {
               "application/json": {
@@ -1318,6 +1404,46 @@
           },
           "default": {
             "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "machines:update"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{id}/supervisor/replace": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "post": {
+        "operationId": "sessions.replaceSupervisor",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "description": "Explicitly replace a legacy Machine supervisor only at a verified stopped boundary. This does not run as part of normal start and returns only after the exact fresh control generation and lease have acknowledged the compatible renewal protocol.",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Session"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
           }
         },
         "x-runa-auth-classes": [
@@ -1612,37 +1738,125 @@
                 "schema": {
                   "oneOf": [
                     {
-                          "type": "object",
-                          "additionalProperties": false,
-                          "required": ["id", "name", "prefix", "last_four", "created_at", "expires_at", "last_used_at", "revoked_at", "key"],
-                          "properties": {
-                            "id": { "type": "string", "format": "uuid" },
-                            "name": { "type": "string" },
-                            "prefix": { "type": "string" },
-                            "last_four": { "type": "string" },
-                            "created_at": { "type": "string", "format": "date-time" },
-                            "expires_at": { "type": ["string", "null"], "format": "date-time" },
-                            "last_used_at": { "type": ["string", "null"], "format": "date-time" },
-                            "revoked_at": { "type": ["string", "null"], "format": "date-time" },
-                            "key": { "type": "string", "writeOnly": true },
-                            "idempotency_replayed": { "type": "boolean", "const": false }
-                          }
-                    }
-                    ,
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "id",
+                        "name",
+                        "prefix",
+                        "last_four",
+                        "created_at",
+                        "expires_at",
+                        "last_used_at",
+                        "revoked_at",
+                        "key"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "prefix": {
+                          "type": "string"
+                        },
+                        "last_four": {
+                          "type": "string"
+                        },
+                        "created_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "expires_at": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "format": "date-time"
+                        },
+                        "last_used_at": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "format": "date-time"
+                        },
+                        "revoked_at": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "format": "date-time"
+                        },
+                        "key": {
+                          "type": "string",
+                          "writeOnly": true
+                        },
+                        "idempotency_replayed": {
+                          "type": "boolean",
+                          "const": false
+                        }
+                      }
+                    },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["id", "name", "prefix", "last_four", "created_at", "expires_at", "last_used_at", "revoked_at", "idempotency_replayed"],
+                      "required": [
+                        "id",
+                        "name",
+                        "prefix",
+                        "last_four",
+                        "created_at",
+                        "expires_at",
+                        "last_used_at",
+                        "revoked_at",
+                        "idempotency_replayed"
+                      ],
                       "properties": {
-                        "id": { "type": "string", "format": "uuid" },
-                        "name": { "type": "string" },
-                        "prefix": { "type": "string" },
-                        "last_four": { "type": "string" },
-                        "created_at": { "type": "string", "format": "date-time" },
-                        "expires_at": { "type": ["string", "null"], "format": "date-time" },
-                        "last_used_at": { "type": ["string", "null"], "format": "date-time" },
-                        "revoked_at": { "type": ["string", "null"], "format": "date-time" },
-                        "idempotency_replayed": { "type": "boolean", "const": true }
+                        "id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "prefix": {
+                          "type": "string"
+                        },
+                        "last_four": {
+                          "type": "string"
+                        },
+                        "created_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "expires_at": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "format": "date-time"
+                        },
+                        "last_used_at": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "format": "date-time"
+                        },
+                        "revoked_at": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "format": "date-time"
+                        },
+                        "idempotency_replayed": {
+                          "type": "boolean",
+                          "const": true
+                        }
                       }
                     }
                   ]
@@ -2780,6 +2994,127 @@
           }
         ]
       }
+    },
+    "/v1/agent-sessions/{id}/terminal": {
+      "get": {
+        "operationId": "agentSessions.getTerminalSeat",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "resource_not_found",
+          "invalid_agent_session_request",
+          "agent_session_authority_unavailable",
+          "database_unavailable"
+        ],
+        "responses": {
+          "200": {
+            "description": "The terminal's durable writer seat for the AgentSession's current process epoch.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentSessionTerminalSeat"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "agent_sessions:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "summary": "Read the terminal's durable writer seat",
+        "description": "Reports the writer seat of an AgentSession terminal as the database records it for the session's current process epoch: whether the PTY master is attested (`available`), cannot be attested (`owner_unrecoverable`, with the recorded reason), or has no record yet (`none`), together with the writer epoch and the client instance holding the seat. It reads no live attachment registry and never counts connections, so a client can decide to attach, observe, or transfer without a stale in-process answer. Writes nothing."
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AgentSessionId"
+        }
+      ]
+    },
+    "/v1/agent-sessions/{id}/terminal-writer": {
+      "post": {
+        "operationId": "agentSessions.transferTerminalWriter",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "resource_not_found",
+          "terminal_owner_unrecoverable",
+          "terminal_writer_unheld",
+          "terminal_writer_already_held",
+          "terminal_writer_stale",
+          "invalid_terminal_writer_request",
+          "terminal_writer_authority_unavailable"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminalWriterTransfer"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The terminal's durable writer state after the transfer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TerminalWriterState"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "terminal_connections:create"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "summary": "Transfer the terminal's writer to another client instance",
+        "description": "Moves the single writing seat of an AgentSession terminal to the named client instance of the same principal: the supervisor fences the current writer epoch (PREPARE), the database moves (writer, epoch) to (client, epoch+1) in one compare-and-swap, and the supervisor activates the new writer (ACTIVATE). The former writer stays attached as an observer. Returns the terminal's durable writer state."
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AgentSessionId"
+        }
+      ]
     }
   },
   "components": {
@@ -3467,28 +3802,82 @@
       "CliContinuationCompleted": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "phase", "required_terms_version", "login_code", "login_code_expires_at", "request_context", "context"],
+        "required": [
+          "id",
+          "phase",
+          "required_terms_version",
+          "login_code",
+          "login_code_expires_at",
+          "request_context",
+          "context"
+        ],
         "properties": {
-          "id": { "$ref": "#/components/schemas/Uuid" },
-          "phase": { "const": "completed" },
-          "required_terms_version": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "phase": {
+            "const": "completed"
+          },
+          "required_terms_version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
           "login_code": {
             "type": "string",
             "pattern": "^cuna_login_[A-Za-z0-9_-]{43}$",
             "description": "Shown exactly once after approval. Never place in URL, history, storage, logs, analytics, cache, manifest, or product Authorization headers."
           },
-          "login_code_expires_at": { "type": "string", "format": "date-time" },
+          "login_code_expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
           "request_context": {
-            "type": "object", "additionalProperties": false,
-            "required": ["client_instance_id", "client_name", "intent", "scopes"],
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "client_instance_id",
+              "client_name",
+              "intent",
+              "scopes"
+            ],
             "properties": {
-              "client_instance_id": { "$ref": "#/components/schemas/Uuid" },
-              "client_name": { "const": "Cuna CLI" },
-              "intent": { "enum": ["signup", "login", "account.read", "machines.read", "machines.create", "agent_sessions.read", "agent_sessions.create"] },
-              "scopes": { "const": ["cli:session"] }
+              "client_instance_id": {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              "client_name": {
+                "const": "Cuna CLI"
+              },
+              "intent": {
+                "enum": [
+                  "signup",
+                  "login",
+                  "account.read",
+                  "machines.read",
+                  "machines.create",
+                  "agent_sessions.read",
+                  "agent_sessions.create"
+                ]
+              },
+              "scopes": {
+                "const": [
+                  "cli:session"
+                ]
+              }
             }
           },
-          "context": { "type": "object", "additionalProperties": false, "required": ["identity"], "properties": { "identity": { "const": "authenticated" } } }
+          "context": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "identity"
+            ],
+            "properties": {
+              "identity": {
+                "const": "authenticated"
+              }
+            }
+          }
         }
       },
       "CliContinuationExchange": {
@@ -3507,8 +3896,14 @@
             "type": "string",
             "pattern": "^cuna_login_[A-Za-z0-9_-]{43}$"
           },
-          "client_instance_id": { "$ref": "#/components/schemas/Uuid" },
-          "profile": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "client_instance_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "profile": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
           "state": {
             "type": "string",
             "minLength": 32,
@@ -3530,19 +3925,41 @@
       "CliLoginCodeExchangeResult": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["access_token", "token_type", "expires_in", "access_expires_at", "login_code_expires_at", "session_id", "context"],
+        "required": [
+          "access_token",
+          "token_type",
+          "expires_in",
+          "access_expires_at",
+          "login_code_expires_at",
+          "session_id",
+          "context"
+        ],
         "properties": {
-          "access_token": { "type": "string", "pattern": "^cuna_at_[A-Za-z0-9_-]{43}$" },
-          "token_type": { "const": "Bearer" },
-          "expires_in": { "const": 600 },
-          "access_expires_at": { "type": "string", "format": "date-time" },
+          "access_token": {
+            "type": "string",
+            "pattern": "^cuna_at_[A-Za-z0-9_-]{43}$"
+          },
+          "token_type": {
+            "const": "Bearer"
+          },
+          "expires_in": {
+            "const": 600
+          },
+          "access_expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
           "login_code_expires_at": {
             "type": "string",
             "format": "date-time",
             "description": "Authoritative expiry of the reusable login code. Repeated exchanges return the same expiry and never the code itself."
           },
-          "session_id": { "$ref": "#/components/schemas/Uuid" },
-          "context": { "$ref": "#/components/schemas/CliIdentityContext" }
+          "session_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "context": {
+            "$ref": "#/components/schemas/CliIdentityContext"
+          }
         }
       },
       "AgentAuth": {
@@ -4192,6 +4609,32 @@
           "resume_handle": {
             "$ref": "#/components/schemas/Uuid",
             "description": "Previously issued Cuna resume handle. Omit for a new attachment generation."
+          },
+          "access_mode": {
+            "enum": [
+              "writer",
+              "observer"
+            ],
+            "description": "Optional N-1 writer request. Observer issuance currently returns terminal_observer_output_unavailable because output fanout is not implemented."
+          },
+          "expected_writer_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Optional current-writer fence for same-client reissue. Cross-client writer transfer is intentionally unavailable until the supervisor acknowledges an execution-time fence."
+          }
+        }
+      },
+      "TerminalConnectionCancellation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "cancelled"
+        ],
+        "properties": {
+          "cancelled": {
+            "const": true,
+            "description": "The exact idempotent terminal-connection intent is no longer redeemable if it was unredeemed."
           }
         }
       },
@@ -5994,6 +6437,121 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "TerminalWriterTransfer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "client_instance_id"
+        ],
+        "properties": {
+          "client_instance_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "description": "The client instance that should become the writer. Its terminal connection, if already attached as an observer, is promoted in place."
+          },
+          "expected_writer_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optional. When present, the transfer is refused with terminal_writer_stale unless the terminal's current writer epoch equals it."
+          }
+        }
+      },
+      "TerminalWriterState": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "agent_session_id",
+          "process_epoch",
+          "writer_epoch",
+          "writer_client_instance_id",
+          "transfer_pending"
+        ],
+        "properties": {
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "process_epoch": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "writer_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The durable writer epoch after the operation."
+          },
+          "writer_client_instance_id": {
+            "type": "string",
+            "description": "The client instance holding the writer after the operation."
+          },
+          "transfer_pending": {
+            "type": "boolean",
+            "description": "True only when the database moved the epoch but the supervisor did not confirm activation; it converges from the database on its next observation."
+          }
+        }
+      },
+      "AgentSessionTerminalSeat": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "agent_session_id",
+          "process_epoch",
+          "state",
+          "unavailable_reason",
+          "writer_epoch",
+          "writer_client_instance_id",
+          "observed_at"
+        ],
+        "properties": {
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "process_epoch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The AgentSession's current process epoch the seat is read for; null when no process has been observed yet (state is then `none`)."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "available",
+              "owner_unrecoverable",
+              "none"
+            ],
+            "description": "`available`: the supervisor attested the PTY master for this process epoch. `owner_unrecoverable`: the master cannot be attested; see `unavailable_reason`. `none`: no durable attachment record exists for the current process epoch."
+          },
+          "unavailable_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The database's recorded reason when state is `owner_unrecoverable`; null otherwise."
+          },
+          "writer_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The durable writer epoch; 0 when state is `none`."
+          },
+          "writer_client_instance_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client instance currently holding the writer seat; null when nobody holds it or state is `none`."
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the edge read the durable row. Not a liveness claim: no attachment count is reported because live attachments are process-local to the edge and vanish on deploy."
           }
         }
       }

@@ -1,4 +1,4 @@
-import type { AgentSession, Machine } from "../api/contracts.js";
+import type { AgentSession, AgentSessionTerminalSeat, Machine } from "../api/contracts.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import { isObservationBudgetCode } from "../core/observation-budget.js";
@@ -24,6 +24,12 @@ export interface ApiAgentJourneyEffectsInput {
   readonly client: CunaApiClient;
   /** The only provider executable this journey may select a machine for. */
   readonly requestedAgent: "claude-code" | "codex" | "opencode";
+  /**
+   * This process's terminal client instance id, when the caller has one. A
+   * writer seat held by it is reported `detached` so the reconnect path can
+   * reissue with the resume handle. Absent, every held seat is a stranger's.
+   */
+  readonly clientInstanceId?: string;
   readonly inspectWorkspace: AgentJourneyEffects["inspectWorkspace"];
   readonly synchronizeWorkspace: AgentJourneyEffects["synchronizeWorkspace"];
   readonly attach: AgentJourneyEffects["attach"];
@@ -60,7 +66,48 @@ function relativeCwd(cwd: string): string {
   return cwd.replace(/^\/workspace\/?/u, "") || ".";
 }
 
-function sessionObservation(session: AgentSession) {
+type SeatAttachment =
+  | { readonly attachment: "detached" | "unknown" }
+  | { readonly attachment: "attached"; readonly attachmentHolder: string };
+
+/**
+ * Map the durable writer seat onto the selection's attachment fact.
+ *
+ *   available ∧ writer = null          → detached   (nobody types; reuse)
+ *   available ∧ writer = this client   → detached   (our own seat; the
+ *                                         reconnect path reissues with the
+ *                                         resume handle)
+ *   available ∧ writer = other client  → attached   (name the holder)
+ *   owner_unrecoverable | none         → unknown    (no attestable PTY)
+ *
+ * Without our own client instance id every held seat is another client's:
+ * claiming a seat as ours on no evidence would race a terminal that has a
+ * writer.
+ */
+export function attachmentFromSeat(
+  seat: AgentSessionTerminalSeat,
+  ownClientInstanceId: string | undefined,
+): SeatAttachment {
+  if (seat.state !== "available") return { attachment: "unknown" };
+  if (seat.writerClientInstanceId === null) return { attachment: "detached" };
+  if (ownClientInstanceId !== undefined && seat.writerClientInstanceId === ownClientInstanceId) {
+    return { attachment: "detached" };
+  }
+  return { attachment: "attached", attachmentHolder: seat.writerClientInstanceId };
+}
+
+/**
+ * An edge that does not serve the seat route answers 404. Both spellings the
+ * transport gives a 404 map to "the fact is not published here": a plain
+ * 404 is `operation_not_served`, a Problem-shaped `resource_not_found` is
+ * `not_found`. Every other error is a real failure and propagates.
+ */
+function isSeatUnserved(error: unknown): boolean {
+  return error instanceof CunaError &&
+    (error.code === "cuna.remote.operation_not_served" || error.code === "cuna.remote.not_found");
+}
+
+function sessionObservation(session: AgentSession, seat: SeatAttachment) {
   return Object.freeze({
     id: session.id,
     machineId: session.machineId,
@@ -71,9 +118,7 @@ function sessionObservation(session: AgentSession) {
     cwd: relativeCwd(session.cwd),
     authMode: session.authMode,
     processState: session.processState,
-    // AgentSession does not own attachment state. Until a child-scoped
-    // connection authority is exposed, automatic child reuse must abstain.
-    attachment: "unknown" as const,
+    ...seat,
     freshness: "fresh" as const,
     createdAt: session.createdAt,
   });
@@ -226,7 +271,22 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       if (page.nextCursor !== undefined) {
         throw fail("cuna.journey.agent_session_page_incomplete", "AgentSession selection requires a complete bounded collection.", EXIT_CODES.policy);
       }
-      return Object.freeze(page.items.map(sessionObservation));
+      return Object.freeze(await Promise.all(page.items.map(async (session) => {
+        // Only a session that could be reused is asked for its seat. A
+        // terminal or starting one is refused on its process state before the
+        // seat would matter, and reading it would only spend a request.
+        if (session.processState !== "ready" && session.processState !== "running") {
+          return sessionObservation(session, { attachment: "unknown" });
+        }
+        let seat: AgentSessionTerminalSeat;
+        try {
+          seat = await input.client.getAgentSessionTerminalSeat(session.id, signal);
+        } catch (error) {
+          if (isSeatUnserved(error)) return sessionObservation(session, { attachment: "unknown" });
+          throw error;
+        }
+        return sessionObservation(session, attachmentFromSeat(seat, input.clientInstanceId));
+      })));
     },
     async createAgentSession({ machineId, agent, authMode, credentialBindingId, workspace, idempotencyKey, signal }) {
       try {

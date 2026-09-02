@@ -253,3 +253,103 @@ test("recovered AgentSession with substituted authority is rejected before attac
       error.code === "cuna.journey.agent_session_create_authority_mismatch",
   );
 });
+
+const OWN_CLIENT = "cli:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const OTHER_CLIENT = "cli:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+function seat(overrides = {}) {
+  return {
+    agentSessionId: SESSION_ID,
+    processEpoch: "33333333-3333-4333-8333-333333333333",
+    state: "available",
+    unavailableReason: null,
+    writerEpoch: 1,
+    writerClientInstanceId: null,
+    observedAt: "2026-09-02T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function seatEffects(seatResult, clientInstanceId = OWN_CLIENT, session = recoveredSession({ processState: "running" })) {
+  const seatReads = [];
+  const value = createApiAgentJourneyEffects({
+    client: {
+      async listAgentSessions() { return { items: [session] }; },
+      async getAgentSessionTerminalSeat(id) {
+        seatReads.push(id);
+        if (seatResult instanceof Error) throw seatResult;
+        return seatResult;
+      },
+    },
+    requestedAgent: "claude-code",
+    // `null` means "this caller has no client instance id"; `undefined` would
+    // only select the parameter default.
+    ...(clientInstanceId === null ? {} : { clientInstanceId }),
+    async inspectWorkspace() { throw new Error("unused"); },
+    async synchronizeWorkspace() { throw new Error("unused"); },
+    async attach() { throw new Error("unused"); },
+    async authorizeMachineCreate() { return false; },
+    now: () => NOW,
+  });
+  return { effects: value, seatReads };
+}
+
+test("session observation maps the durable writer seat onto attachment", async () => {
+  const signal = new AbortController().signal;
+  for (const [label, seatResult, ownId, expected] of [
+    ["available, nobody holds it", seat(), OWN_CLIENT, { attachment: "detached" }],
+    ["available, another client holds it", seat({ writerClientInstanceId: OTHER_CLIENT }), OWN_CLIENT,
+      { attachment: "attached", attachmentHolder: OTHER_CLIENT }],
+    ["available, this client holds it", seat({ writerClientInstanceId: OWN_CLIENT }), OWN_CLIENT, { attachment: "detached" }],
+    ["available, held, and we have no own id", seat({ writerClientInstanceId: OWN_CLIENT }), null,
+      { attachment: "attached", attachmentHolder: OWN_CLIENT }],
+    ["owner_unrecoverable", seat({ state: "owner_unrecoverable", unavailableReason: "master_not_attested" }), OWN_CLIENT,
+      { attachment: "unknown" }],
+    ["none", seat({ state: "none", processEpoch: null, writerEpoch: 0 }), OWN_CLIENT, { attachment: "unknown" }],
+  ]) {
+    const { effects: fx, seatReads } = seatEffects(seatResult, ownId);
+    const [observed] = await fx.observeAgentSessions({ machineId: MACHINE_ID, signal });
+    assert.deepEqual(seatReads, [SESSION_ID], label);
+    assert.equal(observed.attachment, expected.attachment, label);
+    assert.equal(observed.attachmentHolder, expected.attachmentHolder, label);
+    assert.equal(Object.hasOwn(observed, "attachmentHolder"), expected.attachmentHolder !== undefined, label);
+  }
+});
+
+test("an edge that does not serve the seat route leaves attachment unknown; any other failure propagates", async () => {
+  const signal = new AbortController().signal;
+  for (const code of ["cuna.remote.operation_not_served", "cuna.remote.not_found"]) {
+    const { effects: fx } = seatEffects(new CunaError({ code, message: "absent", exitCode: EXIT_CODES.remote }));
+    const [observed] = await fx.observeAgentSessions({ machineId: MACHINE_ID, signal });
+    assert.equal(observed.attachment, "unknown", code);
+    assert.equal(observed.attachmentHolder, undefined, code);
+  }
+  for (const failure of [
+    new CunaError({ code: "cuna.remote.malformed_response", message: "off contract", exitCode: EXIT_CODES.remote }),
+    new CunaError({ code: "cuna.auth.rejected", message: "refused", exitCode: EXIT_CODES.auth }),
+    new CunaError({ code: "cuna.network.failed", message: "down", exitCode: EXIT_CODES.network }),
+  ]) {
+    const { effects: fx } = seatEffects(failure);
+    await assert.rejects(
+      fx.observeAgentSessions({ machineId: MACHINE_ID, signal }),
+      (error) => error === failure,
+      failure.code,
+    );
+  }
+});
+
+test("only a live session is asked for its seat", async () => {
+  const signal = new AbortController().signal;
+  for (const processState of ["unknown", "starting", "exited", "failed", "terminating", "terminated"]) {
+    const { effects: fx, seatReads } = seatEffects(seat(), OWN_CLIENT, recoveredSession({ processState }));
+    const [observed] = await fx.observeAgentSessions({ machineId: MACHINE_ID, signal });
+    assert.deepEqual(seatReads, [], processState);
+    assert.equal(observed.attachment, "unknown", processState);
+  }
+  for (const processState of ["ready", "running"]) {
+    const { effects: fx, seatReads } = seatEffects(seat(), OWN_CLIENT, recoveredSession({ processState }));
+    const [observed] = await fx.observeAgentSessions({ machineId: MACHINE_ID, signal });
+    assert.deepEqual(seatReads, [SESSION_ID], processState);
+    assert.equal(observed.attachment, "detached", processState);
+  }
+});

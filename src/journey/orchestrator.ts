@@ -212,16 +212,24 @@ function selectionFailure(
               ? "That machine is not running. Start it with `cuna machines start MACHINE_ID --yes`, or omit --machine to let Cuna use or create a running one."
               : "Select an exact machine with --machine NAME."
       : plan.reason === "attachment-unobservable"
-        // Naming the prerequisite instead of implying a retry. Cuna does not
-        // publish per-AgentSession attachment state, so reuse cannot prove the
-        // session is free and abstains rather than racing a terminal that may
-        // already have a writer. Waiting changes nothing, which is exactly why
-        // this must not read as a transient staleness.
-        ? "Cuna cannot yet observe whether an existing session is attached, so it will not reuse one automatically. Attach a known session with --agent-session ID, or start a fresh one with --new-session."
-        : "Select an exact child with --agent-session ID or request --new-session.",
+        // Naming the prerequisite instead of implying a retry. The writer seat
+        // is read from the API; when it reports no attestable PTY (`none`,
+        // `owner_unrecoverable`) or the deployment does not serve the route,
+        // reuse cannot prove the session is free and abstains rather than
+        // racing a terminal that may already have a writer. Waiting changes
+        // nothing, which is exactly why this must not read as staleness.
+        ? "Cuna cannot observe whether the existing session's terminal is free (no attested terminal for its current process, or this API does not publish the seat), so it will not reuse it. Start a fresh one with --new-session, or inspect it with `cuna agent-sessions get ID`."
+        : plan.reason === "already-attached"
+          // The holder is the writer seat's client instance id as the API
+          // recorded it. No CLI flag exposes an observer attach today, and an
+          // explicit --agent-session of a held seat is refused by this same
+          // branch, so the hint names the one route that exists.
+          ? `Another client${plan.kind === "unavailable" && plan.holder !== undefined ? ` (${plan.holder})` : ""} holds the writer seat of the existing session for this workspace. Start a second session with --new-session, or wait until that client detaches.`
+          : "Select an exact child with --agent-session ID or request --new-session.",
     details: {
       target: target === "machine" ? "machine" : "agent_session",
       reason: plan.reason,
+      ...(plan.kind === "unavailable" && plan.holder !== undefined ? { holder: plan.holder } : {}),
       // Which one. Every `unavailable` plan may carry the id it rejected, and
       // dropping it made two different branches indistinguishable from the
       // outside: on 2026-08-30 a refusal reading

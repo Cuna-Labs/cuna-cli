@@ -251,3 +251,63 @@ test("cancellation at every effect boundary stops downstream work and reconciles
     assert.equal(reached.at(-1), phase);
   }
 });
+
+function liveSession(overrides = {}) {
+  return {
+    id: SESSION,
+    machineId: MACHINE,
+    name: "work",
+    agent: "claude-code",
+    workspaceIdentity: BINDING,
+    workspaceGeneration: 4,
+    cwd: "projects/project",
+    authMode: "interactive_login",
+    processState: "running",
+    attachment: "detached",
+    freshness: "fresh",
+    createdAt: "2026-09-02T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("a free exact session is reused without a create; a held one is refused naming its holder", async () => {
+  const reused = effects({
+    async observeAgentSessions(input) { reused.calls.push(["observe-sessions", input]); return [liveSession()]; },
+  });
+  const result = await orchestrateAgentJourney({ intent: intent(), effects: reused, scope: SCOPE });
+  assert.equal(result.agentSessionId, SESSION);
+  assert.deepEqual(reused.calls.map((call) => Array.isArray(call) ? call[0] : call), [
+    "inspect-workspace", "observe-machines", "ready-machine", "sync", "observe-sessions", "ready-session", "attach",
+  ]);
+
+  const holder = "cli:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const held = effects({
+    async observeAgentSessions(input) {
+      held.calls.push(["observe-sessions", input]);
+      return [liveSession({ attachment: "attached", attachmentHolder: holder })];
+    },
+  });
+  await assert.rejects(
+    orchestrateAgentJourney({ intent: intent(), effects: held, scope: SCOPE }),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.journey.authority_unavailable" &&
+      error.details?.reason === "already-attached" &&
+      error.details?.target_id === SESSION &&
+      error.details?.holder === holder &&
+      error.hint.includes(holder) &&
+      error.hint.includes("--new-session"),
+  );
+  assert.deepEqual(held.calls.map((call) => Array.isArray(call) ? call[0] : call), [
+    "inspect-workspace", "observe-machines", "ready-machine", "sync", "observe-sessions",
+  ]);
+
+  const unobservable = effects({
+    async observeAgentSessions() { return [liveSession({ attachment: "unknown" })]; },
+  });
+  await assert.rejects(
+    orchestrateAgentJourney({ intent: intent(), effects: unobservable, scope: SCOPE }),
+    (error) => error.details?.reason === "attachment-unobservable" &&
+      error.details?.target_id === SESSION &&
+      /cannot observe/u.test(error.hint ?? ""),
+  );
+});

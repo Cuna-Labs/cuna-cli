@@ -13,6 +13,7 @@ import {
   decodeAgentSessionItem,
   decodeAgentSessionAuth,
   decodeAgentSessionAuthLogout,
+  decodeAgentSessionTerminalSeat,
   decodeCapabilitySnapshot,
   decodeCredentialRules,
   decodeMachinePage,
@@ -530,6 +531,101 @@ test("AgentSession auth client uses the child route and rejects sibling evidence
   await assert.rejects(
     sibling.getAgentSessionAuth(requested),
     (error) => error instanceof CunaError && error.code === "cuna.remote.malformed_response",
+  );
+});
+
+function terminalSeat(overrides = {}) {
+  return {
+    agent_session_id: "11111111-1111-4111-8111-111111111111",
+    process_epoch: "33333333-3333-4333-8333-333333333333",
+    state: "available",
+    unavailable_reason: null,
+    writer_epoch: 2,
+    writer_client_instance_id: "cli:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    observed_at: "2026-09-02T00:00:01.000Z",
+    ...overrides,
+  };
+}
+
+test("terminal seat decoder accepts every producer state and is closed", () => {
+  const held = decodeAgentSessionTerminalSeat(terminalSeat());
+  assert.deepEqual(held, {
+    agentSessionId: "11111111-1111-4111-8111-111111111111",
+    processEpoch: "33333333-3333-4333-8333-333333333333",
+    state: "available",
+    unavailableReason: null,
+    writerEpoch: 2,
+    writerClientInstanceId: "cli:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    observedAt: "2026-09-02T00:00:01.000Z",
+  });
+  assert.equal(Object.isFrozen(held), true);
+  const free = decodeAgentSessionTerminalSeat(terminalSeat({ writer_client_instance_id: null }));
+  assert.equal(free.writerClientInstanceId, null);
+  const none = decodeAgentSessionTerminalSeat(terminalSeat({
+    process_epoch: null, state: "none", writer_epoch: 0, writer_client_instance_id: null,
+  }));
+  assert.equal(none.state, "none");
+  assert.equal(none.processEpoch, null);
+  assert.equal(none.writerEpoch, 0);
+  const unrecoverable = decodeAgentSessionTerminalSeat(terminalSeat({
+    state: "owner_unrecoverable", unavailable_reason: "master_not_attested",
+  }));
+  assert.equal(unrecoverable.state, "owner_unrecoverable");
+  assert.equal(unrecoverable.unavailableReason, "master_not_attested");
+
+  const { observed_at: _dropped, ...missing } = terminalSeat();
+  for (const [label, shape, predicate] of [
+    ["not an object", "seat", "object"],
+    ["unknown field", terminalSeat({ attachments: 1 }), "exact_key_set"],
+    ["missing field", missing, "exact_key_set"],
+    ["non-uuid session id", terminalSeat({ agent_session_id: "session-1" }), "canonical_uuid"],
+    ["non-uuid process epoch", terminalSeat({ process_epoch: "epoch" }), "canonical_uuid_or_null"],
+    ["unknown state", terminalSeat({ state: "busy" }), "known_enum_value"],
+    ["numeric reason", terminalSeat({ unavailable_reason: 7 }), "string_or_null"],
+    ["negative writer epoch", terminalSeat({ writer_epoch: -1 }), "non_negative_integer"],
+    ["string writer epoch", terminalSeat({ writer_epoch: "2" }), "non_negative_integer"],
+    ["unsafe holder", terminalSeat({ writer_client_instance_id: "cli one\n" }), "client_instance_id_or_null"],
+    ["undefined holder", terminalSeat({ writer_client_instance_id: undefined }), "client_instance_id_or_null"],
+    ["unparseable timestamp", terminalSeat({ observed_at: "yesterday" }), "timestamp"],
+  ]) {
+    assert.throws(
+      () => decodeAgentSessionTerminalSeat(shape),
+      (error) => error instanceof ContractViolation && error.predicate === predicate,
+      label,
+    );
+  }
+});
+
+test("terminal seat client reads the exact child route and rejects a sibling's seat", async () => {
+  const requested = "11111111-1111-4111-8111-111111111111";
+  const requests = [];
+  const client = createCunaApiClient({
+    async request(request) {
+      requests.push(request);
+      return terminalSeat();
+    },
+  });
+  const seat = await client.getAgentSessionTerminalSeat(requested);
+  assert.equal(seat.writerEpoch, 2);
+  assert.deepEqual(requests, [{ method: "GET", path: `/v1/agent-sessions/${requested}/terminal` }]);
+
+  await assert.rejects(
+    client.getAgentSessionTerminalSeat("not-a-uuid"),
+    (error) => error instanceof CunaError && error.code === "cuna.usage.invalid",
+  );
+  assert.equal(requests.length, 1);
+
+  const sibling = createCunaApiClient({
+    async request() {
+      return terminalSeat({ agent_session_id: "44444444-4444-4444-8444-444444444444" });
+    },
+  });
+  await assert.rejects(
+    sibling.getAgentSessionTerminalSeat(requested),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.remote.malformed_response" &&
+      error.details?.operation === `GET /v1/agent-sessions/${requested}/terminal` &&
+      error.details?.field === "agent_session_id",
   );
 });
 

@@ -16,6 +16,7 @@ import {
   decodeAgentSessionAuthLogout,
   decodeAgentSessionItem,
   decodeAgentSessionPage,
+  decodeAgentSessionTerminalSeat,
   decodeApiKeyList,
   decodeApiKeyCreation,
   decodeCapabilitySnapshot,
@@ -35,6 +36,7 @@ import {
   type AgentSessionAuth,
   type AgentSessionAuthLogout,
   type AgentSessionPage,
+  type AgentSessionTerminalSeat,
   type AuditRecord,
   type ApiKeyMetadata,
   type ApiKeyCreation,
@@ -154,6 +156,13 @@ export interface CunaApiClient {
   ): Promise<AgentSession>;
   getAgentSession(id: string, signal?: AbortSignal): Promise<AgentSession>;
   getAgentSessionAuth(id: string, signal?: AbortSignal): Promise<AgentSessionAuth>;
+  /**
+   * `agentSessions.getTerminalSeat`: the durable writer seat of the terminal
+   * for the session's current process epoch. Read-only; it counts no live
+   * attachments, so a deploy that emptied the edge registry cannot make a held
+   * seat look free.
+   */
+  getAgentSessionTerminalSeat(id: string, signal?: AbortSignal): Promise<AgentSessionTerminalSeat>;
   logoutAgentSessionAuth(
     id: string,
     expectedProcessEpoch: string,
@@ -725,6 +734,22 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         );
       }
       return status;
+    },
+    async getAgentSessionTerminalSeat(id, signal) {
+      const safeId = encodeCanonicalUuid(id, "AgentSession ID");
+      const request: HttpRequest = {
+        method: "GET",
+        path: `/v1/agent-sessions/${safeId}/terminal`,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const seat = await fetchDecoded(request, decodeAgentSessionTerminalSeat);
+      if (seat.agentSessionId !== id) {
+        throw malformed(
+          contractViolation("matches_requested_resource", "agent_session_id"),
+          operationLabel(request),
+        );
+      }
+      return seat;
     },
     async logoutAgentSessionAuth(id, expectedProcessEpoch, signal) {
       const safeId = encodeCanonicalUuid(id, "AgentSession ID");

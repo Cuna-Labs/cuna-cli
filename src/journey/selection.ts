@@ -57,6 +57,12 @@ export interface AgentSessionSelectionObservation {
   readonly authMode: AgentAuthMode;
   readonly processState: AgentSessionProcessState;
   readonly attachment: AttachmentStatus;
+  /**
+   * The client instance holding the writer seat, present exactly when
+   * `attachment` is `attached`. Display-only: it lets a refusal name who is
+   * typing, it never authorizes a takeover.
+   */
+  readonly attachmentHolder?: string;
   readonly freshness: AuthorityFreshness;
   readonly createdAt: string;
 }
@@ -150,6 +156,8 @@ export interface UnavailablePlan {
   readonly kind: "unavailable";
   readonly target: "machine" | "agent-session";
   readonly targetId?: string;
+  /** For `already-attached`: the client instance holding the writer seat. */
+  readonly holder?: string;
   readonly reason:
     | "already-attached"
     | "attachment-unobservable"
@@ -252,11 +260,13 @@ function unavailable(
   target: "machine" | "agent-session",
   reason: UnavailablePlan["reason"],
   targetId?: string,
+  holder?: string,
 ): UnavailablePlan {
   return freezePlan({
     kind: "unavailable",
     target,
     ...(targetId === undefined ? {} : { targetId }),
+    ...(holder === undefined ? {} : { holder }),
     reason,
   });
 }
@@ -585,6 +595,11 @@ function validAgentSession(session: AgentSessionSelectionObservation): boolean {
     (session.attachment === "detached" ||
       session.attachment === "attached" ||
       session.attachment === "unknown") &&
+    // A holder is only meaningful on a held seat; one reported beside
+    // `detached` or `unknown` is a mapping defect, not a fact to display.
+    (session.attachmentHolder === undefined
+      ? true
+      : session.attachment === "attached" && isSafeDisplay(session.attachmentHolder)) &&
     (session.freshness === "fresh" || session.freshness === "stale" || session.freshness === "unknown") &&
     Number.isFinite(Date.parse(session.createdAt))
   );
@@ -672,8 +687,10 @@ function sessionAvailabilityRejection(
   if (session.processState !== "ready" && session.processState !== "running") {
     return unavailable("agent-session", "state-not-reusable", session.id);
   }
-  if (session.attachment === "unknown") return unavailable("agent-session", "state-unknown", session.id);
-  if (session.attachment === "attached") return unavailable("agent-session", "already-attached", session.id);
+  if (session.attachment === "unknown") return unavailable("agent-session", "attachment-unobservable", session.id);
+  if (session.attachment === "attached") {
+    return unavailable("agent-session", "already-attached", session.id, session.attachmentHolder);
+  }
   return undefined;
 }
 
@@ -728,25 +745,32 @@ export function planAgentSessionSelection(
 
   const exact = input.agentSessions.filter((session) => isExactSessionKey(session, input));
   /*
-   * Separate "the observation is old" from "this fact is not published at all".
+   * Separate "the observation is old" from "this fact is not published".
    *
    * Both used to answer `authority-observation-stale`, and only one of them was
-   * ever true. `attachment` is a hardcoded `"unknown"` (`api-effects.ts:76`)
-   * because no per-AgentSession attachment authority exists yet, so EVERY exact
-   * match reaches this branch and is refused as stale. Measured in production
+   * ever true. Until 2026-09-02 `attachment` was a hardcoded `"unknown"`
+   * because no per-AgentSession attachment authority existed, so EVERY exact
+   * match reached this branch and was refused. Measured in production
    * 2026-08-30: three runs against machine 20ea0900 refused with
    * `authority-observation-stale` while the matched session's observation was
-   * five seconds old with a valid runtime lease and a running process. Nothing
-   * was stale; the CLI simply cannot see who is attached, and said the wrong
-   * thing about it.
+   * five seconds old with a valid runtime lease and a running process.
+   *
+   * The seat is now read from `GET /v1/agent-sessions/{id}/terminal`, so
+   * `unknown` is no longer the rule: it is a seat whose state is `none` or
+   * `owner_unrecoverable`, or an edge that does not serve the route. Only a
+   * session that is otherwise live (fresh, ready|running) is judged by its
+   * seat; a session that is already unreusable for another reason keeps that
+   * reason.
    *
    * The distinction is not cosmetic. Stale is transient and a retry is the
    * right advice; unobservable is a missing prerequisite, and telling someone
    * to retry it is telling them to wait for something that cannot arrive.
    */
-  if (exact.some((session) => session.attachment === "unknown")) {
-    return unavailable("agent-session", "attachment-unobservable");
-  }
+  const live = exact.filter(
+    (session) =>
+      session.freshness === "fresh" &&
+      (session.processState === "ready" || session.processState === "running"),
+  );
   if (
     exact.some(
       (session) =>
@@ -758,12 +782,7 @@ export function planAgentSessionSelection(
   ) {
     return unavailable("agent-session", "authority-observation-stale");
   }
-  const reusable = exact.filter(
-    (session) =>
-      session.freshness === "fresh" &&
-      (session.processState === "ready" || session.processState === "running") &&
-      session.attachment === "detached",
-  );
+  const reusable = live.filter((session) => session.attachment === "detached");
   if (reusable.length === 1 && reusable[0] !== undefined) {
     return selectedAgentSession(reusable[0], "unique-compatible");
   }
@@ -775,6 +794,18 @@ export function planAgentSessionSelection(
       reason: "multiple-compatible-candidates",
       candidates: sortAgentSessions(reusable),
     });
+  }
+  // No free exact session. A held one is refused by name rather than silently
+  // shadowed by a sibling create: the user asked for THIS workspace's session,
+  // and another client is typing in it. `--new-session` remains the explicit
+  // way to start a second one.
+  const unobservable = live.find((session) => session.attachment === "unknown");
+  if (unobservable !== undefined) {
+    return unavailable("agent-session", "attachment-unobservable", unobservable.id);
+  }
+  const held = live.find((session) => session.attachment === "attached");
+  if (held !== undefined) {
+    return unavailable("agent-session", "already-attached", held.id, held.attachmentHolder);
   }
   return freezePlan({
     kind: "create-required",
