@@ -96,8 +96,14 @@ export const MACHINE_CREATE_REQUEST_BUDGET_MS = 90_000;
  * 15 000 ms and was the only convergence budget in the tree. 30 000 ms is the
  * larger of the two doubled, and one constant replaces both so the two cannot
  * drift apart again.
+ *
+ * Re-measured 2026-09-02 on production: `agent-sessions terminate` was
+ * accepted and the row read `exited` about 36 s later, so a 30 s read-back
+ * reported a false failure (exit 5) for a termination that completed. The
+ * read-back is a cheap poll; 120 s covers a supervisor that has to fence and
+ * flush a live PTY without turning a completed operation into an error.
  */
-export const REMOTE_CONVERGENCE_BUDGET_MS = 30_000;
+export const REMOTE_CONVERGENCE_BUDGET_MS = 120_000;
 
 /** Interval between read-backs while converging. */
 export const REMOTE_CONVERGENCE_POLL_INTERVAL_MS = 500;

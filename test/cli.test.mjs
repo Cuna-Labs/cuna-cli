@@ -2080,9 +2080,9 @@ test("AgentSession termination fails closed only when the terminal observation d
   // read that settles it -- not exit 6 with `retryable: false`.
   assert.equal(exit, EXIT_CODES.network);
   assert.equal(terminations, 1);
-  assert.equal(sleeps, 60);
-  assert.equal(now, 30_000);
-  assert.equal(reads, 61);
+  assert.equal(sleeps, 240);
+  assert.equal(now, 120_000);
+  assert.equal(reads, 241);
   const record = JSON.parse(streams.stderr());
   assert.equal(record.error.code, "cuna.client.convergence_budget_elapsed");
   assert.equal(record.error.retryable, true);

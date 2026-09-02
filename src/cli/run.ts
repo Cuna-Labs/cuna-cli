@@ -747,7 +747,7 @@ function journeyPhaseLabel(phase: AgentJourneyPhase, agent: "claude-code" | "cod
     case "reconcile-machine-create": return "Confirming machine creation";
     case "ready-machine": return "Starting machine";
     case "synchronize-workspace": return "Syncing workspace";
-    case "observe-agent-sessions": return `Finding a ${display} session`;
+    case "observe-agent-sessions": return `Finding ${/^[AEIOU]/u.test(display) ? "an" : "a"} ${display} session`;
     case "create-agent-session": return `Creating ${display} session`;
     case "ready-agent-session": return `Starting ${display}`;
     case "attach": return agent === "opencode"
@@ -1002,18 +1002,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         hint: "Unset the automation credential before running `cuna login` or another interactive command.",
       });
     }
-    if (
+    const browserAuthUnavailable =
       (parsed.command === "login" || parsed.command === "signup") &&
       (writer.structured || !streams.stdinIsTTY || !streams.stdoutIsTTY || streams.stderrIsTTY !== true) &&
       dependencies.humanAuth === undefined &&
-      dependencies.browser === undefined &&
-      (parsed.command === "login" || parsed.command === "signup")
-    ) {
-      throw usageError(
-        "Browser authentication requires an interactive terminal and does not support JSON or redirected output.",
-        "Run `cuna login` directly in a TTY; the one-time link is printed only to the terminal.",
-      );
-    }
+      dependencies.browser === undefined;
+    const browserAuthUsageError = (): CunaError => usageError(
+      "Browser authentication requires an interactive terminal and does not support JSON or redirected output.",
+      "Run `cuna login` directly in a TTY; the one-time link is printed only to the terminal.",
+    );
+    // `signup` always needs the browser. `login` decides after reading the
+    // vault: a profile that is already signed in has nothing to print, and
+    // "already signed in" is the answer, not a usage error (the one-time link
+    // is still never written to redirected output — see the login branch).
+    if (browserAuthUnavailable && parsed.command === "signup") throw browserAuthUsageError();
     let humanAuth = dependencies.humanAuth;
     const getHumanAuth = async (): Promise<HumanAuthService> => {
       if (humanAuth !== undefined) return humanAuth;
@@ -1139,16 +1141,27 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const auth = await getHumanAuth();
         let result;
         let alreadySignedIn = false;
-        try {
-          result = await auth.login(
-            dependencies.signal === undefined ? {} : { signal: dependencies.signal },
-          );
-        } catch (error) {
+        if (browserAuthUnavailable) {
+          // No terminal to print a link to: the only login that can succeed
+          // here is the one that already happened.
+          try {
+            result = await auth.whoami(dependencies.signal);
+          } catch {
+            throw browserAuthUsageError();
+          }
+          alreadySignedIn = true;
+        } else {
+          try {
+            result = await auth.login(
+              dependencies.signal === undefined ? {} : { signal: dependencies.signal },
+            );
+          } catch (error) {
           // Being signed in already is the outcome the user asked for, not a
           // failure: report who they are and how to switch, exit 0.
           if (!(error instanceof CunaError) || error.code !== "cuna.auth.already_signed_in") throw error;
           result = await auth.whoami(dependencies.signal);
           alreadySignedIn = true;
+          }
         }
         const data = Object.freeze({
           ...humanResult(result),
