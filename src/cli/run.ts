@@ -11,7 +11,7 @@ import type { BrowserHandoffReporter } from "../auth/browser-handoff.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
-import { assertApiKeyUsable, resolveConfig, type EffectiveConfig } from "../config/config.js";
+import { assertApiKeyUsable, ensureProfileRecorded, resolveConfig, type EffectiveConfig } from "../config/config.js";
 import {
   executeCommand,
   preflightInvocation,
@@ -94,6 +94,8 @@ export interface RunCliDependencies {
   readonly rootJourneyRunner?: RootJourneyRunner;
   /** Internal root-UI hint; never parsed from or printed to user input. */
   readonly managedWorkspaceMachineId?: string;
+  /** Test seam for the folder a command resolves its workspace binding from. */
+  readonly workspaceRoot?: string;
   readonly automaticJourneyEffectsFactory?: (input: {
     readonly client: CunaApiClient;
     readonly intent: ReconciledAgentJourneyIntent;
@@ -754,6 +756,78 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
   });
 }
 
+// Which batch command deserves a progress line, and what it should say. The
+// label names the task, never the transport (PRD-PM-008 D5-R18). Commands that
+// answer from disk are excluded: a spinner that appears for three milliseconds
+// is noise.
+function batchProgressLabel(parsed: ParsedInvocation): string | undefined {
+  const action = parsed.operands[0];
+  switch (parsed.command) {
+    case "machines":
+      switch (action) {
+        case undefined:
+        case "overview":
+        case "list":
+          return "Loading machines";
+        case "create":
+          return "Creating machine";
+        case "start":
+          return "Starting machine";
+        case "stop":
+          return "Stopping machine";
+        case "pause":
+          return "Pausing machine";
+        case "resume":
+          return "Resuming machine";
+        case "delete":
+          return "Deleting machine";
+        case "update-supervisor":
+          return "Updating terminal supervisor";
+        default:
+          return "Reading your machines";
+      }
+    case "agent-sessions":
+    case "agent":
+      switch (action) {
+        case "create":
+          return "Creating AgentSession";
+        case "terminate":
+          return "Ending AgentSession";
+        case "rename":
+          return "Renaming AgentSession";
+        case "attach":
+          return "Attaching to the AgentSession terminal";
+        default:
+          return "Reading your AgentSessions";
+      }
+    case "api-keys":
+      return action === "create"
+        ? "Creating API key"
+        : action === "revoke"
+          ? "Revoking API key"
+          : "Reading your API keys";
+    case "capabilities":
+      return "Reading what this account can do";
+    case "records":
+      return "Reading your records";
+    case "authorizations":
+      return "Reading your authorizations";
+    case "account":
+    case "workspace":
+      return "Reading your workspace";
+    case "usage":
+      return "Reading your usage";
+    case "doctor":
+      return "Checking this installation";
+    case "self-test":
+      return "Running the self-test";
+    default:
+      // `config`, `version` and `help` answer from disk. Everything unlisted is
+      // routed elsewhere before reaching this dispatch.
+      return undefined;
+  }
+}
+
 function writeJourneyDiscovery(stream: Writable, color: boolean): void {
   if (!color) {
     stream.write("Cuna: finding a machine or AgentSession to open...\n");
@@ -799,6 +873,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   let inlineMachinesProgress: Readonly<InlineProgress> | undefined;
   let inlineJourneyProgress: Readonly<InlineProgress> | undefined;
   let inlineRootProgress: Readonly<InlineProgress> | undefined;
+  let authProgress: Readonly<InlineProgress> | undefined;
+  let batchProgress: Readonly<InlineProgress> | undefined;
   let interactiveRootUi = false;
   let interactiveRootColor = false;
   // Root discovery, an explicit foreground attach, and an automatic provider
@@ -1000,6 +1076,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     const profile = stringOption(parsed, "profile");
     const baseUrl = stringOption(parsed, "base-url");
     const configFile = stringOption(parsed, "config-file");
+    // `cuna login --profile <name>` is the one invocation allowed to resolve a
+    // profile the configuration file does not list yet, because it is the one
+    // that creates it. The profile is written only after the sign-in succeeds.
+    const creatingProfile = parsed.command === "login" && profile !== undefined;
     const config = await resolveConfig({
       platform,
       env: effectiveEnvironment,
@@ -1008,6 +1088,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(baseUrl === undefined ? {} : { baseUrl }),
         ...(configFile === undefined ? {} : { configFile }),
       },
+      ...(creatingProfile ? { allowMissingProfile: true } : {}),
     });
     if (interactiveRoot) {
       inlineRootProgress?.update(config.apiKey === undefined ? "Checking your Cuna sign-in" : "Checking Cuna access");
@@ -1149,11 +1230,33 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           hint: `Unset ${config.apiKeyVariable ?? "CUNA_API_KEY"} before managing the interactive session.`,
         });
       }
+      // These commands unlock the encrypted local session and then wait on the
+      // network. `login` is excluded: it prints a URL and blocks on the person,
+      // and a spinner over a link they must read is worse than silence.
+      // Progress exists only for a real terminal, never in structured output.
+      if (
+        parsed.command !== "login" &&
+        streams.stderrIsTTY === true &&
+        !writer.structured &&
+        authProgress === undefined
+      ) {
+        authProgress = startInlineProgress(
+          streams.stderr,
+          !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+          parsed.command === "logout"
+            ? "Signing out of Cuna"
+            : parsed.command === "signup"
+              ? "Creating your Cuna account"
+              : "Checking your Cuna sign-in",
+        );
+      }
       if (parsed.command === "signup") {
         const result = await (await getHumanAuth()).signup(
           dependencies.signal === undefined ? {} : { signal: dependencies.signal },
         );
         const data = humanResult(result);
+        authProgress?.stop();
+        authProgress = undefined;
         writer.success(
           "signup",
           data,
@@ -1187,11 +1290,19 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           alreadySignedIn = true;
           }
         }
+        // After the sign-in and before the result line, so the sentence the
+        // person reads is already true on the next invocation.
+        const profileCreated = creatingProfile
+          ? await ensureProfileRecorded({ platform, config })
+          : false;
         const data = Object.freeze({
           ...humanResult(result),
           storage_mode: "encrypted-local" as const,
           already_signed_in: alreadySignedIn,
+          ...(creatingProfile ? { profile_created: profileCreated } : {}),
         });
+        authProgress?.stop();
+        authProgress = undefined;
         writer.success(
           "login",
           data,
@@ -1202,6 +1313,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       } else if (parsed.command === "whoami" || parsed.command === "access") {
         const result = await (await getHumanAuth()).whoami(dependencies.signal);
         const data = humanResult(result);
+        authProgress?.stop();
+        authProgress = undefined;
         writer.success(
           parsed.command === "access" ? "access.status" : "whoami",
           data,
@@ -1209,6 +1322,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         );
       } else {
         const result = await (await getHumanAuth()).logout(dependencies.signal);
+        authProgress?.stop();
+        authProgress = undefined;
         writer.success("logout", result, "Signed out of Cuna on this device.");
       }
       return EXIT_CODES.success;
@@ -1651,6 +1766,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       return EXIT_CODES.success;
     }
     const commandClock = dependencies.now ?? Date.now;
+    const batchLabel = batchProgressLabel(parsed);
+    if (batchLabel !== undefined && streams.stderrIsTTY === true && !writer.structured) {
+      batchProgress = startInlineProgress(
+        streams.stderr,
+        !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+        batchLabel,
+      );
+    }
     const result = await executeCommand({
       parsed,
       config,
@@ -1662,13 +1785,21 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         : { convergencePoller: dependencies.convergencePoller }),
       ...(credentialMode === undefined ? {} : { credentialMode }),
       ...(runtimeFeatures === undefined ? {} : { runtimeFeatures }),
+      // Where `agent-sessions create` looks for `.cuna/workspace.json`. Passed
+      // in rather than read inside the command so a test can point it at a
+      // scratch folder.
+      workspaceRoot: dependencies.workspaceRoot ?? process.cwd(),
     });
+    batchProgress?.stop();
+    batchProgress = undefined;
     writer.success(result.command, result.data, result.human);
     return EXIT_CODES.success;
   } catch (unknownError) {
     inlineMachinesProgress?.stop();
     inlineJourneyProgress?.stop();
     inlineRootProgress?.stop();
+    authProgress?.stop();
+    batchProgress?.stop();
     const error = unknownError instanceof CredentialBoundaryError
       ? credentialError(unknownError)
       : unknownError instanceof RuntimeBoundaryError

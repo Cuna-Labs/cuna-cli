@@ -510,3 +510,49 @@ test("the central journey planner never evaluates AgentSessions until one machin
   assert.equal(sessionPlan.target, "agent-session");
   assert.equal(sessionPlan.machineId, MACHINE_A);
 });
+
+test("one usable Machine among same-named siblings is selected, not refused", () => {
+  // A person typed a name that two rows answer to, but only one of them can
+  // serve the request. Refusing here locked them out of a Machine they were
+  // paying for. Nothing is guessed: the survivor is the only candidate that can
+  // host the requested agent.
+  const usable = planMachineSelection(
+    machineInput(
+      [
+        machine({ id: MACHINE_A, name: "production", state: "error" }),
+        machine({ id: MACHINE_B, name: "production", state: "running" }),
+      ],
+      { selector: { kind: "name", value: "production" } },
+    ),
+  );
+  assert.equal(usable.kind, "select", JSON.stringify(usable));
+  assert.equal(usable.machineId, MACHINE_B);
+  assert.equal(usable.source, "explicit");
+
+  // Two usable candidates are still ambiguous: choosing between them would be
+  // a guess.
+  const ambiguous = planMachineSelection(
+    machineInput(
+      [
+        machine({ id: MACHINE_A, name: "production" }),
+        machine({ id: MACHINE_B, name: "production" }),
+      ],
+      { selector: { kind: "name", value: "production" } },
+    ),
+  );
+  assert.equal(ambiguous.kind, "ambiguous");
+  assert.equal(ambiguous.reason, "duplicate-name");
+
+  // None usable keeps its own reason, which names the state rather than the
+  // duplication.
+  const none = planMachineSelection(
+    machineInput(
+      [
+        machine({ id: MACHINE_A, name: "production", state: "error" }),
+        machine({ id: MACHINE_B, name: "production", state: "error" }),
+      ],
+      { selector: { kind: "name", value: "production" } },
+    ),
+  );
+  assert.equal(none.reason, "state-not-reusable");
+});

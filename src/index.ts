@@ -102,6 +102,7 @@ export { parseArgv, type ParsedInvocation } from "./cli/parser.js";
 export {
   DEFAULT_BASE_URL,
   assertApiKeyUsable,
+  ensureProfileRecorded,
   environmentCredentialState,
   publicConfig,
   resolveConfig,

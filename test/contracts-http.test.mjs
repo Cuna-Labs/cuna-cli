@@ -100,7 +100,7 @@ test("Cuna identity decoder is closed and preserves only public account authorit
     workspace: {
       assigned: true,
       id: "22222222-2222-4222-8222-222222222222",
-      usage: { est_spend_usd: 1, est_remaining_usd: 49, note: "estimate" },
+      usage: { est_spend_usd: 1, est_spend_is_lower_bound: true, balance_status: "unavailable", balance_usd: null, balance_unavailable_reason: "no balance endpoint", note: "estimate" },
     },
   });
   assert.deepEqual(decoded, {
@@ -110,7 +110,10 @@ test("Cuna identity decoder is closed and preserves only public account authorit
     workspaceId: "22222222-2222-4222-8222-222222222222",
     workspaceUsage: {
       estimatedSpendUsd: 1,
-      estimatedRemainingUsd: 49,
+      estimatedSpendIsLowerBound: true,
+      balanceStatus: "unavailable",
+      balanceUsd: null,
+      balanceUnavailableReason: "no balance endpoint",
       note: "estimate",
     },
   });
@@ -148,7 +151,7 @@ test("Cuna identity decoder is closed and preserves only public account authorit
     email: "developer@example.test",
     workspace: {
       assigned: true,
-      usage: { est_spend_usd: 1, est_remaining_usd: 49, note: "estimate" },
+      usage: { est_spend_usd: 1, est_spend_is_lower_bound: true, balance_status: "unavailable", balance_usd: null, balance_unavailable_reason: "no balance endpoint", note: "estimate" },
     },
   }), (error) => error instanceof ContractViolation &&
     error.field === "workspace.id" &&
@@ -156,17 +159,22 @@ test("Cuna identity decoder is closed and preserves only public account authorit
 
   // A sibling fault under the same subtree must name a DIFFERENT field. Without
   // this row, one hard-coded `field` would satisfy the assertion above.
+  //
+  // The sibling used to be a `workspace.usage` fault. It is not one any more:
+  // identity no longer fails on the usage subtree, which is deliberate and is
+  // covered by `usage-cannot-take-identity-down.test.mjs`. `workspace.assigned`
+  // is the sibling that still decides whether an identity can be read at all.
   assert.throws(() => decodeCunaIdentity({
     id: "11111111-1111-4111-8111-111111111111",
     email: "developer@example.test",
     workspace: {
-      assigned: true,
+      assigned: "yes",
       id: "22222222-2222-4222-8222-222222222222",
-      usage: { est_spend_usd: 1, est_remaining_usd: 49, note: 7 },
+      usage: { est_spend_usd: 1, est_spend_is_lower_bound: true, balance_status: "unavailable", balance_usd: null, balance_unavailable_reason: "no balance endpoint", note: "estimate" },
     },
   }), (error) => error instanceof ContractViolation &&
-    error.field === "workspace.usage.note" &&
-    error.predicate === "string");
+    error.field === "workspace.assigned" &&
+    error.predicate === "boolean");
 });
 
 test("TC-037-09 records and authorization decoders reject secret and terminal-control disclosure", () => {
@@ -1336,10 +1344,21 @@ test("HTTP errors preserve retryability only from a closed canonical Problem", a
   for (const origin of new Set([
     "https://api.getcuna.com", "https://api.runacode.io", ...API_ORIGINS,
   ])) {
+    // Reconciled 2026-09-02, and the two readings disagreed only about the
+    // label. This asserted `cuna.network.service_unavailable` for a 5xx the
+    // server had marked `retryable: false`: retryability was preserved, but the
+    // code still said the service was unavailable and the exit code stayed 5,
+    // which is documented as "the server is behind". A server that answered
+    // `retryable: false` is not asking anyone to wait, and the measured case is
+    // a provider billing refusal — an account out of money, where waiting can
+    // never help. So a final 5xx now reads `cuna.remote.rejected` at exit 7.
+    // Both readings agree the error is not retryable; that part is unchanged
+    // and is still asserted here.
     await assert.rejects(
       makeTransport(origin, 503, false).request({ method: "GET", path: "/v1/capabilities" }),
       (error) => error instanceof CunaError &&
-        error.code === "cuna.network.service_unavailable" &&
+        error.code === "cuna.remote.rejected" &&
+        error.exitCode === 7 &&
         error.retryable === false &&
         error.details?.reason === "request_failed" &&
         error.details?.request_id === requestId,

@@ -48,6 +48,7 @@ import {
 } from "../machines/provider-availability.js";
 import { classifySessionActionability, displaySessionActionability } from "../machines/session-actionability.js";
 import { isAgentSessionIntendedActive } from "../machines/session-visibility.js";
+import { loadWorkspaceBindingIntent } from "../workspace/binding-store.js";
 import { INITIAL_RUNTIME_GATES, type RuntimeFeatureGate } from "../runtime/contracts.js";
 import { evaluateRuntimeSupport } from "../platform/support.js";
 import { CLI_VERSION } from "../version.js";
@@ -91,6 +92,12 @@ export interface CommandContext {
   readonly capabilityClock?: () => number;
   /** Test seam; production uses the real wall-clock wait below. */
   readonly convergencePoller?: ConvergencePoller;
+  /**
+   * Where to start looking for `.cuna/workspace.json`. Production passes the
+   * process's working directory; tests pass a scratch folder, so no test can
+   * accidentally read the developer's own binding.
+   */
+  readonly workspaceRoot?: string;
   readonly credentialMode?: "automation" | "interactive";
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
 }
@@ -152,10 +159,26 @@ async function convergeOnRemoteState<T>(
   return probe.observation;
 }
 
+/**
+ * The process states in which the child is no longer running. The producer
+ * chooses among all three: a signalled exit, an exit of the process's own
+ * accord, and an ending it could not classify.
+ */
+const AGENT_SESSION_ENDED_PROCESS_STATES: ReadonlySet<AgentSession["processState"]> =
+  new Set(["terminated", "exited", "failed"]);
+
+/**
+ * Whether a termination has actually landed.
+ *
+ * Matching one value of a vocabulary the producer chooses from cannot settle:
+ * any ended process state satisfies this. The conjunction over the other two
+ * fields stays, so a process that merely died on its own is not read as a
+ * completed termination.
+ */
 function agentSessionTerminationConfirmed(session: AgentSession): boolean {
   return session.desiredState === "terminated" &&
     session.requestState === "terminal" &&
-    session.processState === "terminated";
+    AGENT_SESSION_ENDED_PROCESS_STATES.has(session.processState);
 }
 
 /**
@@ -196,6 +219,74 @@ function requireCredential(context: CommandContext): void {
 function requireOperand(operands: readonly string[], index: number, label: string): string {
   const value = operands[index];
   if (value === undefined) throw usageError(`Missing ${label}.`);
+  return value;
+}
+
+/**
+ * A required option's value, or a refusal that says the option is missing.
+ * Absent and malformed are different mistakes: reading an absent option as `""`
+ * and handing it to a shape validator reports the wrong one.
+ */
+/**
+ * The workspace binding this folder is already bound to, for the account this
+ * invocation authenticates as. Read-only: creating a binding means choosing a
+ * local root, an exclusion policy and a project identity, which are the
+ * journey's decisions, so an unbound folder is refused rather than bound here.
+ */
+async function resolveLocalWorkspaceBinding(
+  context: CommandContext,
+): Promise<{ readonly bindingId: string; readonly generation: number }> {
+  const identity = await context.client.getIdentity();
+  const workspaceId = identity.workspaceId;
+  const unbound = (reason: string, hint: string): CunaError => new CunaError({
+    code: "cuna.workspace.binding_required",
+    message: "This folder is not bound to a Cuna Machine.",
+    exitCode: EXIT_CODES.usage,
+    hint,
+    details: { reason, folder: context.workspaceRoot ?? "." },
+  });
+  if (workspaceId === undefined) {
+    throw unbound(
+      "workspace_unassigned",
+      "No Cuna workspace is assigned to this account yet. Run `cuna workspace show` to see where you stand.",
+    );
+  }
+  const loaded = await loadWorkspaceBindingIntent({
+    startPath: context.workspaceRoot ?? ".",
+    profileId: context.config.profile,
+    userId: identity.id,
+    workspaceId,
+  });
+  if (loaded === undefined) {
+    throw unbound(
+      "folder_not_bound",
+      "Run `cuna opencode` (or `cuna claude`, `cuna codex`) in this folder once: that binds the folder to a Machine and records the workspace binding this command needs. Or pass --workspace-binding-id and --workspace-generation yourself.",
+    );
+  }
+  const record = loaded.record;
+  // A folder that has moved is bound to a path that is no longer this one. The
+  // journey knows how to relocate it; a batch mutation must not pretend the
+  // binding still describes where it is running.
+  if (loaded.relocationRequired) {
+    throw unbound(
+      "relocation_required",
+      "This folder has moved since it was bound. Run `cuna opencode` in it once so Cuna can relocate the binding.",
+    );
+  }
+  if (record.generation < 1) {
+    throw unbound(
+      "generation_uncommitted",
+      "This folder is bound but has no committed workspace generation yet. Run `cuna opencode` in this folder once to commit one.",
+    );
+  }
+  return Object.freeze({ bindingId: record.bindingId, generation: record.generation });
+}
+
+function requireOption(parsed: ParsedInvocation, name: string, hint?: string): string {
+  const value = stringOption(parsed, name);
+  if (value === undefined) {
+    throw usageError(`Option --${name} is required.`, hint);
+  }
   return value;
 }
 
@@ -536,7 +627,15 @@ export function preflightInvocation(
       if (scope === "account" && resourceId !== undefined) {
         throw usageError("Option --resource-id is not valid for account scope.");
       }
-      if (scope !== "account") assertPublicId(resourceId ?? "", "resource ID");
+      if (scope !== "account") {
+        // A resource-scoped query names a Machine or an AgentSession, and both
+        // are canonical UUIDs. Refusing the shape here keeps a typo from
+        // travelling to the server and coming back as a contract complaint.
+        assertCanonicalUuid(
+          requireOption(parsed, "resource-id", `A ${scope} capability query is scoped to one resource.`),
+          scope === "machine" ? "machine ID" : "AgentSession ID",
+        );
+      }
       return;
     }
     case "machines":
@@ -553,7 +652,7 @@ export function preflightInvocation(
       if (parsed.operands.length !== 1 || parsed.operands[0] !== "list") {
         throw usageError("authorizations requires the list action.");
       }
-      assertCanonicalUuid(stringOption(parsed, "machine") ?? "", "machine ID");
+      assertCanonicalUuid(requireOption(parsed, "machine", "Run `cuna machines list` to find a machine ID."), "machine ID");
       return;
     case "account":
     case "workspace": {
@@ -581,7 +680,7 @@ export function preflightInvocation(
         rejectUnknownOptions(parsed, ["yes"]);
         if (parsed.operands.length !== 2) throw usageError("api-keys revoke requires exactly one API key ID.");
         requireConfirmation(parsed, "api-keys.revoke");
-        assertCanonicalUuid(parsed.operands[1] ?? "", "API key ID");
+        assertCanonicalUuid(requireOperand(parsed.operands, 1, "API key ID"), "API key ID");
         return;
       }
       if (action === "create") {
@@ -606,7 +705,7 @@ export function preflightInvocation(
       }
       requireConfirmation(parsed, "agent.logout");
       assertCanonicalUuid(
-        stringOption(parsed, "agent-session") ?? "",
+        requireOption(parsed, "agent-session", "Run `cuna agent-sessions list --machine <id>` to find an AgentSession ID."),
         "AgentSession ID",
       );
       return;
@@ -720,7 +819,7 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
   if (action === "list") {
     rejectUnknownOptions(parsed, ["machine", "limit", "cursor"]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions list accepts no operands.");
-    assertMachineId(stringOption(parsed, "machine") ?? "");
+    assertMachineId(requireOption(parsed, "machine", "Run `cuna machines list` to find a machine ID."));
     integerOption(parsed, "limit", 1, 100);
     const cursor = stringOption(parsed, "cursor");
     if (cursor !== undefined && (cursor.length > 512 || /[\p{Cc}\p{Cf}]/u.test(cursor))) {
@@ -741,14 +840,14 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
     ]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions create accepts no operands.");
     requireConfirmation(parsed, "agent-sessions.create");
-    assertMachineId(stringOption(parsed, "machine") ?? "");
-    assertCanonicalUuid(
-      stringOption(parsed, "workspace-binding-id") ?? "",
-      "workspace binding ID",
-    );
-    if (integerOption(parsed, "workspace-generation", 1, Number.MAX_SAFE_INTEGER) === undefined) {
-      throw usageError("Option --workspace-generation is required.");
-    }
+    assertMachineId(requireOption(parsed, "machine", "Run `cuna machines list` to find a machine ID."));
+    // Both workspace options are optional here: absent, they are resolved from
+    // the folder's own binding at execution. Preflight still validates the
+    // shape of whatever WAS supplied, so a malformed value is refused before
+    // any network work — it just no longer refuses their absence.
+    const givenBinding = stringOption(parsed, "workspace-binding-id");
+    if (givenBinding !== undefined) assertCanonicalUuid(givenBinding, "workspace binding ID");
+    integerOption(parsed, "workspace-generation", 1, Number.MAX_SAFE_INTEGER);
     const agent = agentOption(parsed, true);
     if (agent === undefined) throw usageError("Option --agent is required.");
     const cwd = assertSafeDisplayText(stringOption(parsed, "cwd") ?? "/workspace", "workspace path");
@@ -860,7 +959,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     }
     case "authorizations": {
       requireCredential(context);
-      const machineId = assertCanonicalUuid(stringOption(parsed, "machine") ?? "", "machine ID");
+      const machineId = assertCanonicalUuid(requireOption(parsed, "machine", "Run `cuna machines list` to find a machine ID."), "machine ID");
       await requireCapability({
         client,
         scope: "machine",
@@ -920,18 +1019,46 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       requireCredential(context);
       const identity = await client.getIdentity();
       if (identity.workspaceUsage === undefined) {
+        // The refusal lives here, where the figure is read, and nowhere else.
+        // A usage payload this build does not recognise stops this one command;
+        // every other command still gets its identity.
+        if (identity.workspaceUsageProblem !== undefined) {
+          throw new CunaError({
+            code: "cuna.remote.malformed_response",
+            message: "Cuna reported spend in a shape this CLI does not accept.",
+            exitCode: EXIT_CODES.remote,
+            hint: "No figure is shown rather than a wrong one. Every other command is unaffected. " +
+              "Run `cuna version --json` and report it with the details above at " +
+              "https://github.com/Cuna-Labs/cuna-cli/issues.",
+            details: { reason: "workspace_usage_off_contract", detail: identity.workspaceUsageProblem },
+          });
+        }
         throw unsupportedError("workspace usage", "workspace_usage_unavailable");
       }
+      const usage = identity.workspaceUsage;
       const data = Object.freeze({
-        estimated_spend_usd: identity.workspaceUsage.estimatedSpendUsd,
-        estimated_remaining_usd: identity.workspaceUsage.estimatedRemainingUsd,
-        note: identity.workspaceUsage.note,
+        estimated_spend_usd: usage.estimatedSpendUsd,
+        estimated_spend_is_lower_bound: usage.estimatedSpendIsLowerBound,
+        balance_status: usage.balanceStatus,
+        balance_usd: usage.balanceUsd,
+        ...(usage.balanceUnavailableReason === undefined
+          ? {}
+          : { balance_unavailable_reason: usage.balanceUnavailableReason }),
+        note: usage.note,
       });
+      // "At least" is the whole claim and the sentence carries it. A balance is
+      // printed only when the producer says it read one: an unavailable balance
+      // is not zero.
       return Object.freeze({
         command: "usage.show",
         data,
-        human: `$${identity.workspaceUsage.estimatedSpendUsd.toFixed(2)} estimated spend; ` +
-          `$${identity.workspaceUsage.estimatedRemainingUsd.toFixed(2)} estimated remaining. ${identity.workspaceUsage.note}`,
+        human: [
+          `At least $${usage.estimatedSpendUsd.toFixed(2)} spent.`,
+          usage.balanceStatus === "available" && usage.balanceUsd !== null
+            ? `Balance $${usage.balanceUsd.toFixed(2)}.`
+            : "No balance available.",
+          usage.note,
+        ].join(" "),
       });
     }
     case "api-keys": {
@@ -969,7 +1096,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         });
       }
       if (action === "revoke") {
-        const id = assertCanonicalUuid(parsed.operands[1] ?? "", "API key ID");
+        const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "API key ID"), "API key ID");
         await client.revokeApiKey(id);
         const observed = (await client.listApiKeys()).find((key) => key.id === id);
         if (observed !== undefined && observed.revokedAt === null) {
@@ -1083,7 +1210,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       }
       requireConfirmation(parsed, "agent.logout");
       const id = assertCanonicalUuid(
-        stringOption(parsed, "agent-session") ?? "",
+        requireOption(parsed, "agent-session", "Run `cuna agent-sessions list --machine <id>` to find an AgentSession ID."),
         "AgentSession ID",
       );
       const session = await client.getAgentSession(id);
@@ -1535,13 +1662,19 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     // still binds the exact action; discovery must not invent per-action IDs
     // that the producer never advertises.
     await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.lifecycle", now: context.capabilityClock ?? now });
+    const expectedState = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
+    // Read the state first so the result can say whether anything moved. The
+    // transition is still requested either way: this side's idea of the state
+    // and the provider's can diverge, so a start against a Machine we already
+    // call running may be a real repair.
+    const before = await client.getMachine(id);
+    const alreadyInState = before.id === id && before.state === expectedState;
     const machine = await client.transitionMachine(id, action);
     if (machine.id !== id) {
       // An identity contradiction: the producer answered about a different
       // machine. No amount of waiting converges that.
       postconditionUnverified(`machine ${action}`, { machine_id: id, observed_id: machine.id });
     }
-    const expectedState = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
     // A lifecycle transition is asynchronous on the producer, so the state the
     // very next read returns is usually the state BEFORE the transition. Read
     // back until it converges or until the CLI's own budget elapses.
@@ -1563,8 +1696,10 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     });
     return Object.freeze({
       command: `machines.${action}`,
-      data: machineRecord(observed),
-      human: `Machine ${observed.name} is ${observed.state}.`,
+      data: Object.freeze({ ...machineRecord(observed), state_changed: !alreadyInState }),
+      human: alreadyInState
+        ? `Machine ${observed.name} was already ${observed.state}; nothing changed.`
+        : `Machine ${observed.name} is ${observed.state}.`,
     });
   }
   if (action === "delete") {
@@ -1614,7 +1749,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
   if (action === "list") {
     rejectUnknownOptions(parsed, ["machine", "limit", "cursor"]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions list accepts no operands.");
-    const machineId = assertMachineId(stringOption(parsed, "machine") ?? "");
+    const machineId = assertMachineId(requireOption(parsed, "machine", "Run `cuna machines list` to find a machine ID."));
     const limit = integerOption(parsed, "limit", 1, 100);
     const cursor = stringOption(parsed, "cursor");
     const page = await client.listAgentSessions(machineId, {
@@ -1647,17 +1782,22 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     ]);
     if (parsed.operands.length !== 1) throw usageError("agent-sessions create accepts no operands.");
     requireConfirmation(parsed, "agent-sessions.create");
-    const machineId = assertMachineId(stringOption(parsed, "machine") ?? "");
+    const machineId = assertMachineId(requireOption(parsed, "machine", "Run `cuna machines list` to find a machine ID."));
+    // Nothing in the product publishes a binding id, so both options are
+    // resolved from `.cuna/workspace.json`, which the journey commands write.
+    // An explicit flag still wins, so a caller who knows better decides.
+    const givenBindingId = stringOption(parsed, "workspace-binding-id");
+    const givenGeneration = integerOption(parsed, "workspace-generation", 1, Number.MAX_SAFE_INTEGER);
+    // Read the folder only when something is missing: a fully specified
+    // invocation costs no extra round trip.
+    const localBinding = givenBindingId !== undefined && givenGeneration !== undefined
+      ? undefined
+      : await resolveLocalWorkspaceBinding(context);
     const workspaceBindingId = assertCanonicalUuid(
-      stringOption(parsed, "workspace-binding-id") ?? "",
+      givenBindingId ?? localBinding?.bindingId ?? "",
       "workspace binding ID",
     );
-    const workspaceGeneration = integerOption(
-      parsed,
-      "workspace-generation",
-      1,
-      Number.MAX_SAFE_INTEGER,
-    );
+    const workspaceGeneration = givenGeneration ?? localBinding?.generation;
     if (workspaceGeneration === undefined) {
       throw usageError("Option --workspace-generation is required.");
     }

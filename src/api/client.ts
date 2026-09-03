@@ -949,6 +949,27 @@ export async function requireCapability(input: {
     // route now produces. Before the transport read the status before the body,
     // that case arrived as `cuna.remote.malformed_response` and this branch was
     // unreachable against the one deployment that exists.
+    // A 404 means two different things here. On a resource scope it is the
+    // resource saying it does not exist; on the account scope it is the route
+    // saying discovery is not served, because the account always exists.
+    if (
+      error instanceof CunaError &&
+      error.code === "cuna.remote.not_found" &&
+      input.scope !== "account" &&
+      input.resourceId !== undefined
+    ) {
+      const subject = input.scope === "machine" ? "Machine" : "AgentSession";
+      throw new CunaError({
+        code: "cuna.remote.not_found",
+        message: `${subject} ${input.resourceId} does not exist.`,
+        exitCode: EXIT_CODES.remote,
+        hint: input.scope === "machine"
+          ? "Nothing was attempted. Run `cuna machines list` to see the Machines on this account."
+          : "Nothing was attempted. Run `cuna agent-sessions list --machine <id>` to see the AgentSessions on a Machine.",
+        details: { capability_id: input.capabilityId, scope: input.scope, resource_id: input.resourceId },
+        cause: error,
+      });
+    }
     if (
       error instanceof CunaError &&
       (error.code === "cuna.remote.not_found" || error.code === "cuna.remote.operation_not_served")

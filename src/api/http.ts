@@ -334,6 +334,23 @@ function apiError(input: {
       details,
     });
   }
+  // A 5xx the server marked final. `retryable` is the server's own word, so it
+  // decides, not the status class: exit 5 tells a caller to wait, and a refusal
+  // is not something waiting can clear.
+  //
+  // `hint: problem.detail` is load-bearing. One `code` may be emitted from
+  // several sites and the catalogue fixes `title` per code, so `detail` is the
+  // only field that distinguishes them.
+  if (status >= 500 && problem !== undefined && !problem.retryable) {
+    return new CunaError({
+      code: "cuna.remote.rejected",
+      message: problem.title ?? "Cuna rejected the request.",
+      exitCode: EXIT_CODES.remote,
+      hint: problem.detail ?? OFF_CONTRACT_RESPONSE_HINT,
+      retryable: false,
+      details,
+    });
+  }
   if (status === 429 || status >= 500) {
     // A 5xx that carries the server's own sentence (a Problem title, or the
     // legacy `{"error": "<sentence>"}` that `sessions.start` answers) must

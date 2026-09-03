@@ -50,7 +50,7 @@ function fakeClient(overrides = {}) {
         email: "developer@example.test",
         workspaceAssigned: true,
         workspaceId: "22222222-2222-4222-8222-222222222222",
-        workspaceUsage: { estimatedSpendUsd: 1, estimatedRemainingUsd: 49, note: "estimate" },
+        workspaceUsage: { estimatedSpendUsd: 1, estimatedSpendIsLowerBound: true, balanceStatus: "unavailable", balanceUsd: null, balanceUnavailableReason: "no balance endpoint", note: "estimate" },
       };
     },
     async discoverCapabilities() { return capabilitySnapshot([]); },
@@ -874,7 +874,7 @@ test("TC-037-07 account, workspace, and usage expose only the closed public iden
     email: "developer@example.test",
     workspaceAssigned: true,
     workspaceId: "22222222-2222-4222-8222-222222222222",
-    workspaceUsage: { estimatedSpendUsd: 1.25, estimatedRemainingUsd: 48.75, note: "estimate" },
+    workspaceUsage: { estimatedSpendUsd: 1.25, estimatedSpendIsLowerBound: true, balanceStatus: "unavailable", balanceUsd: null, balanceUnavailableReason: "no balance endpoint", note: "estimate" },
   };
   const client = fakeClient({ async getIdentity() { requests.push("identity"); return identity; } });
   const cases = [
@@ -882,7 +882,10 @@ test("TC-037-07 account, workspace, and usage expose only the closed public iden
     [["workspace", "show"], "workspace.show", { assigned: true }],
     [["usage", "show"], "usage.show", {
       estimated_spend_usd: 1.25,
-      estimated_remaining_usd: 48.75,
+      estimated_spend_is_lower_bound: true,
+      balance_status: "unavailable",
+      balance_usd: null,
+      balance_unavailable_reason: "no balance endpoint",
       note: "estimate",
     }],
   ];

@@ -147,6 +147,28 @@ export function resolveCliRoute(parsed: ParsedInvocation): CliRouteDefinition | 
   return undefined;
 }
 
+/**
+ * The actions this registry admits for one command, in registry order. Built
+ * from the registry so the message cannot drift from what the CLI accepts.
+ */
+function registeredActions(command: string): readonly string[] {
+  const actions: string[] = [];
+  for (const route of CLI_ROUTE_REGISTRY) {
+    if (route.command !== command || route.action === undefined) continue;
+    if (!actions.includes(route.action)) actions.push(route.action);
+  }
+  return actions;
+}
+
+/**
+ * Echo what the person typed, bounded and on one line. Sanitizing is the
+ * renderer's job; this only keeps a pasted paragraph out of the message.
+ */
+function echoOperand(value: string): string {
+  const flattened = value.replaceAll(/\s+/gu, " ").trim();
+  return flattened.length <= 40 ? flattened : `${flattened.slice(0, 39)}…`;
+}
+
 /** Fail closed before the command preflight switch can admit an unregistered leaf. */
 export function assertRegisteredCliRoute(parsed: ParsedInvocation): CliRouteDefinition {
   const route = resolveCliRoute(parsed);
@@ -154,9 +176,24 @@ export function assertRegisteredCliRoute(parsed: ParsedInvocation): CliRouteDefi
   const knownCommand = parsed.command !== undefined &&
     CLI_ROUTE_REGISTRY.some((candidate) => candidate.command === parsed.command);
   if (knownCommand) {
-    throw usageError(`Unknown ${parsed.command} action ${parsed.operands[0] ?? "<none>"}.`);
+    // Missing and wrong are different mistakes and read differently. Both name
+    // the actions that exist rather than sending the reader to `--help`.
+    const command = parsed.command as string;
+    const actions = registeredActions(command);
+    const available = actions.length === 0
+      ? undefined
+      : actions.length === 1
+        ? `The only action is \`${actions[0]}\`.`
+        : `Available actions: ${actions.map((action) => `\`${action}\``).join(", ")}.`;
+    const given = parsed.operands[0];
+    throw usageError(
+      given === undefined
+        ? `cuna ${command} requires an action.`
+        : `cuna ${command} has no action ${echoOperand(given)}.`,
+      available,
+    );
   }
-  throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run `cuna --help`.");
+  throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run \`cuna --help\`.");
 }
 
 const BOOLEAN_OPTIONS = new Set([

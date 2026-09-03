@@ -1160,7 +1160,7 @@ function createContractAuthority() {
             { id: "agent_sessions.auth_logout", availability: "supported", interaction: "native", mutation_class: "reversible", surfaces: ["cli"], required_permissions: ["agent_sessions:write"] },
           ] });
         }
-        if (request.method === "GET" && url.pathname === "/v1/me") return send(200, { id: ID, email: "installed@example.test", workspace: { assigned: true, id: WORKSPACE_ID, usage: { est_spend_usd: 1, est_remaining_usd: 49, note: "contract fixture" } } });
+        if (request.method === "GET" && url.pathname === "/v1/me") return send(200, { id: ID, email: "installed@example.test", workspace: { assigned: true, id: WORKSPACE_ID, usage: { est_spend_usd: 1, est_spend_is_lower_bound: true, balance_status: "unavailable", balance_usd: null, balance_unavailable_reason: "no balance endpoint", note: "contract fixture" } } });
         if (request.method === "GET" && url.pathname === "/v1/sessions") return send(200, state.machineDeleted ? [] : [machine()]);
         if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}`) return state.machineDeleted ? send(404, { error: "not_found" }) : send(200, machine());
         if (request.method === "POST" && url.pathname === "/v1/sessions") { state.machineDeleted = false; state.machineStatus = "created"; return send(201, machine()); }

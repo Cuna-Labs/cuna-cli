@@ -296,11 +296,89 @@ export interface CunaIdentity {
   readonly workspaceAssigned: boolean;
   readonly workspaceId?: string;
   readonly workspaceUsage?: {
+    /**
+     * A floor, not a total: spend accrues only while a Machine is running, so a
+     * stopped Machine contributes zero however the provider bills it.
+     */
     readonly estimatedSpendUsd: number;
-    readonly estimatedRemainingUsd: number;
+    readonly estimatedSpendIsLowerBound: true;
+    readonly balanceStatus: "available" | "unavailable";
+    /** `null` whenever `balanceStatus` is `unavailable` -- never zero. */
+    readonly balanceUsd: number | null;
+    /** Present exactly when `balanceStatus` is `unavailable`. */
+    readonly balanceUnavailableReason?: string;
     readonly note: string;
   };
+  /**
+   * Set instead of `workspaceUsage` when the server's usage payload does not
+   * match this contract. Only `cuna usage show` reads it; every other command
+   * proceeds, because knowing who you are does not depend on a spend figure.
+   */
+  readonly workspaceUsageProblem?: string;
   readonly waitlistPosition?: number;
+}
+
+/**
+ * Validate `workspace.usage` and decode it.
+ *
+ * `balance_unavailable_reason` is the one optional key, present exactly when
+ * `balance_status` is `unavailable`. Everything else is required, and this is
+ * closed: a server that adds a field is refused rather than silently displayed.
+ *
+ * Separate from the identity decode on purpose. Usage is read by one command;
+ * identity is read by every command that needs to know who you are. A usage
+ * field this does not recognise must not decide whether a terminal can open.
+ */
+function decodeWorkspaceUsage(usage: Record<string, unknown>): NonNullable<CunaIdentity["workspaceUsage"]> {
+  if (Object.keys(usage).some((key) => ![
+    "est_spend_usd",
+    "est_spend_is_lower_bound",
+    "balance_status",
+    "balance_usd",
+    "balance_unavailable_reason",
+    "note",
+  ].includes(key))) {
+    throw contractViolation("no_unknown_fields", "workspace.usage");
+  }
+  if (typeof usage.est_spend_usd !== "number" || !Number.isFinite(usage.est_spend_usd)) {
+    throw contractViolation("finite_number", "workspace.usage.est_spend_usd");
+  }
+  // A constant, not a flag: `false` would be a different contract.
+  if (usage.est_spend_is_lower_bound !== true) {
+    throw contractViolation("const_true", "workspace.usage.est_spend_is_lower_bound");
+  }
+  if (usage.balance_status !== "available" && usage.balance_status !== "unavailable") {
+    throw contractViolation("balance_status_vocabulary", "workspace.usage.balance_status");
+  }
+  if (usage.balance_status === "available") {
+    if (typeof usage.balance_usd !== "number" || !Number.isFinite(usage.balance_usd)) {
+      throw contractViolation("finite_number", "workspace.usage.balance_usd");
+    }
+    if (usage.balance_unavailable_reason !== undefined) {
+      throw contractViolation("absent_when_available", "workspace.usage.balance_unavailable_reason");
+    }
+  } else {
+    // `null`, not absent and not zero: a zero balance is a real reading.
+    if (usage.balance_usd !== null) {
+      throw contractViolation("null_when_unavailable", "workspace.usage.balance_usd");
+    }
+    if (typeof usage.balance_unavailable_reason !== "string" || usage.balance_unavailable_reason === "") {
+      throw contractViolation("required_when_balance_unavailable", "workspace.usage.balance_unavailable_reason");
+    }
+  }
+  if (typeof usage.note !== "string") {
+    throw contractViolation("string", "workspace.usage.note");
+  }
+  return Object.freeze({
+    estimatedSpendUsd: Number(usage.est_spend_usd),
+    estimatedSpendIsLowerBound: true as const,
+    balanceStatus: usage.balance_status as "available" | "unavailable",
+    balanceUsd: usage.balance_usd as number | null,
+    ...(usage.balance_unavailable_reason === undefined
+      ? {}
+      : { balanceUnavailableReason: String(usage.balance_unavailable_reason) }),
+    note: String(usage.note),
+  });
 }
 
 /**
@@ -337,26 +415,6 @@ export function decodeCunaIdentity(value: unknown): CunaIdentity {
     if (!isObject(value.workspace.usage)) {
       throw contractViolation("required_when_workspace_assigned", "workspace.usage");
     }
-    if (Object.keys(value.workspace.usage).some(
-      (key) => key !== "est_spend_usd" && key !== "est_remaining_usd" && key !== "note",
-    )) {
-      throw contractViolation("no_unknown_fields", "workspace.usage");
-    }
-    if (
-      typeof value.workspace.usage.est_spend_usd !== "number" ||
-      !Number.isFinite(value.workspace.usage.est_spend_usd)
-    ) {
-      throw contractViolation("finite_number", "workspace.usage.est_spend_usd");
-    }
-    if (
-      typeof value.workspace.usage.est_remaining_usd !== "number" ||
-      !Number.isFinite(value.workspace.usage.est_remaining_usd)
-    ) {
-      throw contractViolation("finite_number", "workspace.usage.est_remaining_usd");
-    }
-    if (typeof value.workspace.usage.note !== "string") {
-      throw contractViolation("string", "workspace.usage.note");
-    }
   } else {
     if (workspaceKeys.some((key) => key !== "assigned" && key !== "waitlist_position")) {
       throw contractViolation("no_unknown_fields", "workspace");
@@ -368,6 +426,25 @@ export function decodeCunaIdentity(value: unknown): CunaIdentity {
       throw contractViolation("safe_non_negative_integer", "workspace.waitlist_position");
     }
   }
+  // A usage fault is recorded, not thrown: it stops `cuna usage show` and
+  // nothing else. Letting it throw here took down every command that reads an
+  // identity, including the one that opens a terminal.
+  let decodedUsage: {
+    workspaceUsage?: NonNullable<CunaIdentity["workspaceUsage"]>;
+    workspaceUsageProblem?: string;
+  } = {};
+  if (assigned) {
+    try {
+      decodedUsage = {
+        workspaceUsage: underField("workspace.usage", () =>
+          decodeWorkspaceUsage((value.workspace as Record<string, unknown>).usage as Record<string, unknown>)),
+      };
+    } catch (error) {
+      decodedUsage = {
+        workspaceUsageProblem: error instanceof Error ? error.message : "workspace usage is off contract",
+      };
+    }
+  }
   return Object.freeze({
     id: canonicalUuid(value, "id"),
     email: requiredString(value, "email"),
@@ -375,11 +452,7 @@ export function decodeCunaIdentity(value: unknown): CunaIdentity {
     ...(assigned
       ? {
           workspaceId: underField("workspace", () => canonicalUuid(value.workspace as Record<string, unknown>, "id")),
-          workspaceUsage: Object.freeze({
-            estimatedSpendUsd: Number((value.workspace.usage as Record<string, unknown>).est_spend_usd),
-            estimatedRemainingUsd: Number((value.workspace.usage as Record<string, unknown>).est_remaining_usd),
-            note: String((value.workspace.usage as Record<string, unknown>).note),
-          }),
+          ...decodedUsage,
         }
       : { waitlistPosition: Number(value.workspace.waitlist_position) }),
   });

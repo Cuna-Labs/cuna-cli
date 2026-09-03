@@ -495,7 +495,20 @@ export function planMachineSelection(input: MachineSelectionInput): MachineSelec
           machine.state !== "unknown" &&
           REUSABLE_MACHINE_STATES.has(machine.state),
       );
-      if (compatible.length !== matches.length) return unavailable("machine", "state-not-reusable");
+      // Exactly one usable candidate is an answer, not an ambiguity. Refusing
+      // here left a person locked out of a Machine they were paying for
+      // whenever a same-named sibling was in `error` or a non-reusable state,
+      // even though only one of the two could ever have served the request.
+      // Nothing is guessed: the surviving candidate is the only one that can
+      // host the requested agent.
+      if (compatible.length === 1) {
+        const only = compatible[0];
+        if (only !== undefined) {
+          const rejection = validateSelectedMachine(only);
+          return rejection ?? selectedMachine(only, "explicit");
+        }
+      }
+      if (compatible.length === 0) return unavailable("machine", "state-not-reusable");
       return freezePlan({
         kind: "ambiguous",
         target: "machine",
