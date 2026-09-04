@@ -5,13 +5,24 @@
   "infra_openapi_raw_sha256": "efd4b3312cfdf564a98472e87d30edd511f779c12e4e590ee9546e84f173eb23",
   "infra_openapi_canonical_sha256": "01f3092c40240ab6aa97215b185ed22aa725dd15c50583f04a39bf1f8b7fb26b",
   "producer_repository": "Cuna-Labs/infra",
-  "producer_content_state": "working_tree_product_delta",
-  "producer_base_revision": "7c25a0c83798251f4210794fbd3f8b4e6768eaf0",
-  "producer_full_tree": null,
+  "producer_content_state": "committed",
+  "producer_revision": "f226dfd90d3ac45391b66fd01df2177a1f2092e7",
+  "producer_full_tree": {
+    "object_format": "sha1",
+    "commit": "f226dfd90d3ac45391b66fd01df2177a1f2092e7",
+    "tree": "982ed297337b8c89e4a6e14deab4290712398528",
+    "contract_blob": "d16081c61b6d9246afae5cce9493430a752fc27e"
+  },
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
   "producer_projection_sha256": "7448da55e3f7cc81a2472eeec94061ce328217fb76d61165fadfcd29bd362001",
   "producer_runtime_manifest_sha256": "5fee08330d63cdeaba62f12ddc9bf3b7c47fd3a421c669cc5bcba1512c4d032b",
   "feature_contracts": {
-    "opencode_interactive_only": null
+    "opencode_interactive_only": {
+      "openapi_raw_sha256": "efd4b3312cfdf564a98472e87d30edd511f779c12e4e590ee9546e84f173eb23",
+      "openapi_canonical_sha256": "01f3092c40240ab6aa97215b185ed22aa725dd15c50583f04a39bf1f8b7fb26b",
+      "producer_commit": "f226dfd90d3ac45391b66fd01df2177a1f2092e7",
+      "producer_tree": "982ed297337b8c89e4a6e14deab4290712398528",
+      "producer_contract_blob": "d16081c61b6d9246afae5cce9493430a752fc27e"
+    }
   }
 }
