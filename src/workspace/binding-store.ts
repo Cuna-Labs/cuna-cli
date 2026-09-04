@@ -31,13 +31,15 @@ import type { DurableSchemaEnvelope } from "./schema.js";
 const METADATA_DIRECTORY = ".cuna";
 const BINDING_FILE = "workspace.json";
 const RECORD_TYPE = "cuna.workspace-binding.v2";
+const EXECUTION_RECORD_TYPE = "cuna.workspace-binding.v3";
 const MAXIMUM_RECORD_BYTES = 65_536;
 const DIGEST = /^[a-f0-9]{64}$/u;
 const PROFILE_CONTROL = /[\p{Cc}\p{Cf}]/u;
 const TEMPORARY_RECORD = /^\.workspace\.json\.\d+\.[0-9a-f-]{36}\.tmp$/u;
 
 export interface WorkspaceBindingRecord extends DurableSchemaEnvelope {
-  readonly recordType: typeof RECORD_TYPE;
+  readonly recordType: typeof RECORD_TYPE | typeof EXECUTION_RECORD_TYPE;
+  readonly executionWorkspaceId?: string;
   readonly recordRevision: number;
   readonly profileId: string;
   readonly userId: string;
@@ -59,6 +61,7 @@ export interface WorkspaceBindingRecord extends DurableSchemaEnvelope {
 }
 
 export interface WorkspaceBindingRecordDraft {
+  readonly executionWorkspaceId?: string;
   readonly profileId: string;
   readonly userId: string;
   readonly workspaceId: string;
@@ -311,12 +314,14 @@ async function readOptionalBindingRecord(
 
 function decodeRecord(value: unknown): WorkspaceBindingRecord {
   try {
+    const executionRecord = value !== null && typeof value === "object" && "schemaVersion" in value && value.schemaVersion === 3;
     const source = exactObject(value, [
       "schemaVersion", "minimumReaderVersion", "minimumWriterVersion", "recordType",
       "recordRevision", "profileId", "userId", "workspaceId", "bindingId", "projectId",
       "localInstanceId", "machineId", "policyDigest", "generation", "canonicalLocalRoot",
       "rootIdentity", "remoteRoot", "bindingCreatedAt", "bindingUpdatedAt",
       "recordCreatedAt", "recordUpdatedAt", "integrityDigest",
+      ...(executionRecord ? ["executionWorkspaceId"] : []),
     ]);
     const rootSource = exactObject(source.rootIdentity, [
       "platform", "device", "inode", "birthtimeNanoseconds",
@@ -328,16 +333,17 @@ function decodeRecord(value: unknown): WorkspaceBindingRecord {
       birthtimeNanoseconds: decimal(rootSource.birthtimeNanoseconds),
     });
     const withoutDigest = {
-      schemaVersion: exactInteger(source.schemaVersion, 2, 2),
-      minimumReaderVersion: exactInteger(source.minimumReaderVersion, 1, 1),
-      minimumWriterVersion: exactInteger(source.minimumWriterVersion, 2, 2),
-      recordType: exactString(source.recordType, RECORD_TYPE),
+      schemaVersion: exactInteger(source.schemaVersion, executionRecord ? 3 : 2, executionRecord ? 3 : 2),
+      minimumReaderVersion: exactInteger(source.minimumReaderVersion, executionRecord ? 3 : 1, executionRecord ? 3 : 1),
+      minimumWriterVersion: exactInteger(source.minimumWriterVersion, executionRecord ? 3 : 2, executionRecord ? 3 : 2),
+      recordType: exactString(source.recordType, executionRecord ? EXECUTION_RECORD_TYPE : RECORD_TYPE),
       recordRevision: integer(source.recordRevision, 1),
       profileId: profile(source.profileId),
       userId: publicId(source.userId, "user ID"),
       workspaceId: publicId(source.workspaceId, "workspace ID"),
       bindingId: publicId(source.bindingId, "binding ID"),
       projectId: publicId(source.projectId, "project ID"),
+      ...(executionRecord ? { executionWorkspaceId: executionId(source.executionWorkspaceId) } : {}),
       localInstanceId: publicId(source.localInstanceId, "local instance ID"),
       machineId: publicId(source.machineId, "machine ID"),
       policyDigest: digest(source.policyDigest),
@@ -350,7 +356,7 @@ function decodeRecord(value: unknown): WorkspaceBindingRecord {
       recordCreatedAt: timestamp(source.recordCreatedAt),
       recordUpdatedAt: timestamp(source.recordUpdatedAt),
     };
-    if (withoutDigest.remoteRoot !== `/workspace/projects/${withoutDigest.projectId}`) {
+    if (withoutDigest.remoteRoot !== bindingRemoteRoot(withoutDigest)) {
       throw new TypeError("remote root mismatch");
     }
     if (
@@ -378,7 +384,8 @@ function validateDraft(draft: WorkspaceBindingRecordDraft): void {
     const localInstanceId = publicId(draft.localInstanceId, "local instance ID");
     if (projectId === localInstanceId) throw new TypeError("identity collision");
     publicId(draft.machineId, "machine ID");
-    if (draft.remoteRoot !== `/workspace/projects/${projectId}`) throw new TypeError("remote root mismatch");
+    if (draft.executionWorkspaceId !== undefined) executionId(draft.executionWorkspaceId);
+    if (draft.remoteRoot !== bindingRemoteRoot(draft)) throw new TypeError("remote root mismatch");
     digest(draft.policyDigest);
     integer(draft.generation, 0);
     const bindingCreatedAt = timestamp(draft.bindingCreatedAt);
@@ -454,6 +461,7 @@ function assertStableBindingIdentity(
     current.userId !== next.userId ||
     current.workspaceId !== next.workspaceId ||
     current.bindingId !== next.bindingId ||
+    current.executionWorkspaceId !== next.executionWorkspaceId ||
     current.projectId !== next.projectId ||
     current.localInstanceId !== next.localInstanceId ||
     current.machineId !== next.machineId ||
@@ -481,7 +489,7 @@ function assertRebindIdentity(
     current.workspaceId !== next.workspaceId ||
     current.projectId !== next.projectId ||
     current.localInstanceId !== next.localInstanceId ||
-    current.remoteRoot !== next.remoteRoot ||
+    (next.executionWorkspaceId === undefined && current.remoteRoot !== next.remoteRoot) ||
     current.machineId === next.machineId ||
     current.bindingId === next.bindingId
   ) {
@@ -496,16 +504,17 @@ function createRecordBody(
   now: Date,
 ) {
   return Object.freeze({
-    schemaVersion: 2 as const,
-    minimumReaderVersion: 1 as const,
-    minimumWriterVersion: 2 as const,
-    recordType: RECORD_TYPE,
+    schemaVersion: draft.executionWorkspaceId === undefined ? 2 : 3,
+    minimumReaderVersion: draft.executionWorkspaceId === undefined ? 1 : 3,
+    minimumWriterVersion: draft.executionWorkspaceId === undefined ? 2 : 3,
+    recordType: draft.executionWorkspaceId === undefined ? RECORD_TYPE : EXECUTION_RECORD_TYPE,
     recordRevision: (current?.recordRevision ?? 0) + 1,
     profileId: profile(draft.profileId),
     userId: draft.userId,
     workspaceId: draft.workspaceId,
     bindingId: draft.bindingId,
     projectId: draft.projectId,
+    ...(draft.executionWorkspaceId === undefined ? {} : { executionWorkspaceId: draft.executionWorkspaceId }),
     localInstanceId: draft.localInstanceId,
     machineId: draft.machineId,
     policyDigest: draft.policyDigest,
@@ -811,9 +820,18 @@ function noFollowFlag(): number {
 
 function digestRecord(record: Omit<WorkspaceBindingRecord, "integrityDigest">): string {
   return createHash("sha256")
-    .update("cuna-workspace-binding-record-v2\0")
+    .update(record.schemaVersion === 3 ? "cuna-workspace-binding-record-v3\0" : "cuna-workspace-binding-record-v2\0")
     .update(JSON.stringify(record))
     .digest("hex");
+}
+
+function executionId(value: unknown): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value)) throw new TypeError("execution workspace ID");
+  return value;
+}
+
+function bindingRemoteRoot(value: {projectId: string; executionWorkspaceId?: string}): string {
+  return value.executionWorkspaceId === undefined ? `/workspace/projects/${value.projectId}` : `/workspace/workspaces/${value.executionWorkspaceId}`;
 }
 
 function freezeRecord(record: WorkspaceBindingRecord): WorkspaceBindingRecord {

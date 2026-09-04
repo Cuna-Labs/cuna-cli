@@ -150,6 +150,7 @@ export interface MachineCreateRequest {
 
 export interface WorkspaceBindingAuthority {
   readonly bindingId: string;
+  readonly executionWorkspaceId: string | null;
   readonly workspaceId: string;
   readonly projectId: string;
   readonly localInstanceId: string;
@@ -234,12 +235,13 @@ export function decodeMachineCreateRequest(value: unknown): MachineCreateRequest
 export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindingAuthority {
   if (!isObject(value)) throw contractViolation("object");
   exactKeys(value, [
-    "binding_id", "workspace_id", "project_id", "local_instance_id", "machine_id",
+    "binding_id", "workspace_id", "project_id", "local_instance_id", "machine_id", "execution_workspace_id",
     "remote_root", "exclusion_policy_digest", "active_generation", "active_manifest_root",
     "binding_epoch", "minimum_reader", "minimum_writer", "created_at", "updated_at",
   ]);
   const bindingId = canonicalUuid(value, "binding_id");
   const projectId = canonicalUuid(value, "project_id");
+  const executionWorkspaceId = value.execution_workspace_id === null ? null : canonicalUuid(value, "execution_workspace_id");
   const exclusionPolicyDigest = requiredString(value, "exclusion_policy_digest");
   const activeManifestRoot = requiredString(value, "active_manifest_root");
   const remoteRoot = requiredString(value, "remote_root");
@@ -249,8 +251,8 @@ export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindin
   const bindingEpoch = optionalNumber(value, "binding_epoch");
   const minimumReader = optionalNumber(value, "minimum_reader");
   const minimumWriter = optionalNumber(value, "minimum_writer");
-  if (remoteRoot !== `/workspace/projects/${projectId}`) {
-    throw contractViolation("remote_root_derives_from_project_id", "remote_root");
+  if (remoteRoot !== (executionWorkspaceId === null ? `/workspace/projects/${projectId}` : `/workspace/workspaces/${executionWorkspaceId}`)) {
+    throw contractViolation("remote_root_matches_execution_workspace", "remote_root");
   }
   if (!/^[0-9a-f]{64}$/u.test(exclusionPolicyDigest)) {
     throw contractViolation("sha256_digest", "exclusion_policy_digest");
@@ -274,6 +276,7 @@ export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindin
   if (!Number.isFinite(Date.parse(updatedAt))) throw contractViolation("parsable_timestamp", "updated_at");
   return Object.freeze({
     bindingId,
+    executionWorkspaceId,
     workspaceId: canonicalUuid(value, "workspace_id"),
     projectId,
     localInstanceId: canonicalUuid(value, "local_instance_id"),
@@ -500,6 +503,7 @@ export interface AgentSession {
    */
   readonly workspaceBindingId?: string;
   readonly workspaceGeneration?: number;
+  readonly workspaceFailureCode?: string;
   readonly name: string;
   readonly agent: AgentKind;
   readonly cwd: string;
@@ -578,6 +582,7 @@ function decodeAgentSession(value: unknown): AgentSession {
     "machine_id",
     "workspace_binding_id",
     "workspace_generation",
+    "workspace_failure_code",
     "name",
     "agent",
     "cwd",
@@ -605,6 +610,10 @@ function decodeAgentSession(value: unknown): AgentSession {
   // unreadable during a consumer-first rollback.
   const desiredState = enumField(value, "desired_state", DESIRED_STATES);
   const requestState = enumField(value, "request_state", REQUEST_STATES);
+  const workspaceFailureCode = optionalString(value, "workspace_failure_code");
+  if (workspaceFailureCode !== undefined && (requestState !== "failed" || !/^[a-z][a-z0-9_.]{0,127}$/u.test(workspaceFailureCode))) {
+    throw contractViolation("failed_request_safe_workspace_reason", "workspace_failure_code");
+  }
   const processState = enumField(value, "process_state", PROCESS_STATES);
   const processEpoch = optionalString(value, "process_epoch");
   const runtimeObservedAt = optionalString(value, "runtime_observed_at");
@@ -634,6 +643,7 @@ function decodeAgentSession(value: unknown): AgentSession {
     ...(workspaceBindingId === undefined
       ? {}
       : { workspaceBindingId, workspaceGeneration: workspaceGeneration as number }),
+    ...(workspaceFailureCode === undefined ? {} : { workspaceFailureCode }),
     name: requiredDisplayString(value, "name"),
     agent,
     cwd: requiredDisplayString(value, "cwd"),

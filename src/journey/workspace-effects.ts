@@ -215,6 +215,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
               workspaceId: input.workspaceId,
               bindingId: authority.bindingId,
               projectId: authority.projectId,
+              ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
               localInstanceId: authority.localInstanceId,
               machineId,
               remoteRoot: authority.remoteRoot,
@@ -229,12 +230,16 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           input.onNotice?.(`Rebound this folder to ${await machineDisplayName(input.client, machineId, signal)} · the previous Machine no longer exists`);
         } else {
           authority = await input.client.getWorkspaceBinding(record.bindingId, {
+            ...(record.executionWorkspaceId === undefined ? {} : { executionWorkspaceId: record.executionWorkspaceId }),
             workspaceId: input.workspaceId,
             projectId: record.projectId,
             localInstanceId: record.localInstanceId,
             machineId,
             exclusionPolicyDigest: inspected.policy.exclusionPolicyDigest,
           }, signal);
+          if ((authority.executionWorkspaceId ?? null) !== (record.executionWorkspaceId ?? null) || authority.remoteRoot !== record.remoteRoot) {
+            throw fail("cuna.journey.workspace_binding_conflict", "The server Workspace identity differs from this folder's recorded binding.");
+          }
         }
       } else {
         if (syncMode === "disabled") {
@@ -292,6 +297,20 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         authority.activeGeneration >= 1 &&
         authority.activeManifestRoot === currentManifestRoot
       ) {
+        if (localRecord === undefined || localRecord.generation !== authority.activeGeneration) {
+          await persistWorkspaceBinding({
+            root: inspected.policy.canonicalRoot,
+            binding: {
+              profileId: input.profileId, userId: input.userId, workspaceId: input.workspaceId,
+              bindingId: authority.bindingId, projectId: authority.projectId,
+              ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
+              localInstanceId: authority.localInstanceId, machineId, remoteRoot: authority.remoteRoot,
+              policyDigest: authority.exclusionPolicyDigest, generation: authority.activeGeneration,
+              bindingCreatedAt: authority.createdAt, bindingUpdatedAt: authority.updatedAt,
+            },
+            expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
+          });
+        }
         return Object.freeze({
           bindingId: authority.bindingId,
           workspaceIdentity: authority.bindingId,
@@ -314,6 +333,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         signal,
       });
       const committedAuthority = await input.client.getWorkspaceBinding(authority.bindingId, {
+        ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
         workspaceId: input.workspaceId,
         projectId: authority.projectId,
         localInstanceId: authority.localInstanceId,
@@ -321,6 +341,8 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         exclusionPolicyDigest: authority.exclusionPolicyDigest,
       }, signal);
       if (
+        (committedAuthority.executionWorkspaceId ?? null) !== (authority.executionWorkspaceId ?? null) ||
+        committedAuthority.remoteRoot !== authority.remoteRoot ||
         committedAuthority.activeGeneration !== receipt.generation ||
         committedAuthority.activeManifestRoot !== receipt.manifest_root
       ) {
@@ -338,6 +360,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           workspaceId: input.workspaceId,
           bindingId: committedAuthority.bindingId,
           projectId: committedAuthority.projectId,
+          ...(committedAuthority.executionWorkspaceId == null ? {} : { executionWorkspaceId: committedAuthority.executionWorkspaceId }),
           localInstanceId: committedAuthority.localInstanceId,
           machineId,
           remoteRoot: committedAuthority.remoteRoot,

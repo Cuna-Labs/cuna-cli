@@ -76,6 +76,7 @@ export interface AgentSessionCreateInput {
 }
 
 export interface WorkspaceBindingIdentityInput {
+  readonly executionWorkspaceId?: string;
   readonly workspaceId: string;
   readonly projectId: string;
   readonly localInstanceId: string;
@@ -385,6 +386,7 @@ function validateMachineCreate(input: MachineCreateInput, idempotencyKey: string
 }
 
 function validateWorkspaceBindingIdentity(input: WorkspaceBindingIdentityInput): void {
+  if (input.executionWorkspaceId !== undefined) assertCanonicalUuid(input.executionWorkspaceId, "execution workspace ID");
   assertCanonicalUuid(input.workspaceId, "workspace ID");
   assertCanonicalUuid(input.projectId, "project ID");
   assertCanonicalUuid(input.localInstanceId, "local instance ID");
@@ -403,6 +405,7 @@ function workspaceBindingIdentityMatches(
   expected: WorkspaceBindingIdentityInput,
 ): boolean {
   return actual.workspaceId === expected.workspaceId &&
+    (expected.executionWorkspaceId === undefined || actual.executionWorkspaceId === expected.executionWorkspaceId) &&
     actual.projectId === expected.projectId &&
     actual.localInstanceId === expected.localInstanceId &&
     actual.machineId === expected.machineId &&
@@ -618,6 +621,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
           project_id: input.projectId,
           local_instance_id: input.localInstanceId,
           machine_id: input.machineId,
+          ...(input.executionWorkspaceId === undefined ? {} : { execution_workspace_id: input.executionWorkspaceId }),
           exclusion_policy_digest: input.exclusionPolicyDigest,
           excluded_prefixes: prefixes,
         },

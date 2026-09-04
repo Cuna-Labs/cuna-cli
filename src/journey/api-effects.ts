@@ -386,6 +386,17 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
     async ensureAgentSessionReady({ agentSessionId, signal }) {
       for (let attempt = 0; attempt < CHILD_POLL_LIMIT; attempt += 1) {
         const session = await input.client.getAgentSession(agentSessionId, signal);
+        if (session.requestState === "failed") {
+          if (session.workspaceFailureCode !== undefined) {
+            const messages: Record<string, string> = {
+              "workspace.remote_edits": "Remote edits prevent synchronization. Preserve and reconcile those edits before retrying.",
+              "workspace.replacement_requires_fence": "This Workspace cannot replace its files while writer exclusion is unverified. Its existing files were preserved.",
+              "workspace.materialization_manifest_limit": "This Workspace exceeds the runtime file manifest limit. Reduce the synchronized file set before retrying.",
+            };
+            throw fail("cuna.journey.workspace_materialization_failed", messages[session.workspaceFailureCode] ?? "The runtime could not prepare this Workspace. Its failure code identifies the refused operation.", EXIT_CODES.remote, { reason: session.workspaceFailureCode });
+          }
+          throw fail("cuna.journey.agent_session_failed", "The AgentSession request failed before attach.");
+        }
         if (session.processState === "ready" || session.processState === "running") {
           return Object.freeze({ id: session.id, machineId: session.machineId });
         }
