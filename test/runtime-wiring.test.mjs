@@ -11,6 +11,7 @@ import { createApiTerminalControlPlane } from "../dist/runtime/api-terminal-cont
 import { admitCapability } from "../dist/runtime/capability-gate.js";
 import { CunaRuntimeBoundary } from "../dist/runtime/boundary.js";
 import { RuntimeBoundaryError } from "../dist/runtime/errors.js";
+import { DurableSyncJournal } from "../dist/sync/journal.js";
 import { createUnavailableTerminalControlPlane, validateTerminalGrant } from "../dist/runtime/terminal-transport.js";
 
 const NOW = 1_800_000_000_000;
@@ -547,29 +548,111 @@ test("shutdown retains failed terminal cleanup authority and retries it to compl
   assert.equal(connection.closeCalls.length, 2, "completed shutdown is idempotent");
 });
 
-test("shutdown fences an in-flight sync open and waits until its lease is released", async () => {
+function assertSyncShutdownOutcome(outcome) {
+  if (outcome.error === undefined) {
+    assert.equal(outcome.state, "stopped");
+    return;
+  }
+  assert.ok(outcome.error instanceof AggregateError);
+  assert.equal(outcome.error.errors.length, 1);
+  const deadline = outcome.error.errors[0];
+  assert.ok(deadline instanceof RuntimeBoundaryError);
+  assert.equal(deadline.code, "runtime_cleanup_timeout");
+  assert.equal(deadline.message, "Workspace synchronization is still closing. Retry shutdown to finish cleanup.");
+  assert.equal(deadline.retryable, true);
+  assert.equal(outcome.state, "recovery_required", "a cleanup deadline must not claim stopped");
+}
+
+async function assertSyncLeaseReleased(journalDirectory, bindingId) {
+  await assert.rejects(access(path.join(journalDirectory, "writer.lease")), (error) => error.code === "ENOENT");
+  // File absence alone cannot prove release of the separate writer authority.
+  const successor = await DurableSyncJournal.open({
+    directory: journalDirectory, bindingId, bindingGeneration: 1, ownerId: "successor-owner", clock: () => NOW,
+  });
+  try { assert.equal(successor.fence, 2); } finally { await successor.close(); }
+  await assert.rejects(access(path.join(journalDirectory, "writer.lease")), (error) => error.code === "ENOENT");
+}
+
+test("shutdown fences an in-flight sync open and releases or retains cleanup authority", async () => {
   const directory = await resources.createTempDirectory("cuna-runtime-sync-shutdown-");
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);
   const journalDirectory = path.join(directory, "journal");
+  const opening = assert.rejects(runtime.openSync({
+    configuration: {
+      bindingId: "binding-shutdown", bindingGeneration: 1, canonicalRoot: path.join(directory, "workspace"),
+      policyDigest: `sha256:${"c".repeat(64)}`, epoch: "epoch-shutdown",
+    },
+    journalDirectory, ownerId: "runtime-owner",
+  }), (error) => error instanceof RuntimeBoundaryError && error.code === "runtime_closed");
+  // Observe both outcomes immediately: slow real I/O may exceed the factory's
+  // one-second budget while openSync still owns and completes lease cleanup.
+  const stopping = runtime.shutdown().then(
+    () => ({ state: runtime.daemon.state }),
+    (error) => ({ error, state: runtime.daemon.state }),
+  );
+  await opening;
+  assertSyncShutdownOutcome(await stopping);
+  await assert.rejects(access(path.join(journalDirectory, "writer.lease")), (error) => error.code === "ENOENT");
+  await runtime.shutdown();
+  assert.equal(runtime.daemon.state, "stopped");
+  await assertSyncLeaseReleased(journalDirectory, "binding-shutdown");
+});
+
+test("shutdown deadline preserves a held sync lease until open cleanup settles", async (t) => {
+  const directory = await resources.createTempDirectory("cuna-runtime-sync-shutdown-deadline-");
+  const journalDirectory = path.join(directory, "journal");
+  const { runtime } = createRuntime(new FakeTerminalSystem(), { readyTimeoutMs: 5 });
+  const originalOpen = DurableSyncJournal.open;
+  let releaseOpen;
+  const held = new Promise((resolve) => { releaseOpen = resolve; });
+  let acquired;
+  let failedAcquisition;
+  const entered = new Promise((resolve, reject) => { acquired = resolve; failedAcquisition = reject; });
+  let ownedJournal;
+  const interception = t.mock.method(DurableSyncJournal, "open", async function (input) {
+    try {
+      ownedJournal = await originalOpen.call(this, input);
+      acquired();
+      await held;
+      return ownedJournal;
+    } catch (error) { failedAcquisition(error); throw error; }
+  });
   const opening = runtime.openSync({
     configuration: {
-      bindingId: "binding-shutdown",
-      bindingGeneration: 1,
-      canonicalRoot: path.join(directory, "workspace"),
-      policyDigest: `sha256:${"c".repeat(64)}`,
-      epoch: "epoch-shutdown",
+      bindingId: "binding-held-shutdown", bindingGeneration: 1, canonicalRoot: path.join(directory, "workspace"),
+      policyDigest: `sha256:${"c".repeat(64)}`, epoch: "epoch-held-shutdown",
     },
-    journalDirectory,
-    ownerId: "runtime-owner",
-  });
-  const stopping = runtime.shutdown();
-  await assert.rejects(opening, (error) => error instanceof RuntimeBoundaryError && error.code === "runtime_closed");
-  await stopping;
-  // The lease assertion above is the actual subject of this test. Removing the
-  // tree is teardown, and on Windows it must go through the owned-temp
-  // authority: see the note on `resources` at the top of this file.
-  await assert.rejects(access(path.join(journalDirectory, "writer.lease")), (error) => error.code === "ENOENT");
+    journalDirectory, ownerId: "runtime-owner",
+  }).then((value) => ({ value }), (error) => ({ error }));
+  let stopping;
+  try {
+    await entered; // Real journal/lease exists before the controlled deadline starts.
+    stopping = runtime.shutdown().then(
+      () => ({ state: runtime.daemon.state }),
+      (error) => ({ error, state: runtime.daemon.state }),
+    );
+    const timedOut = await stopping;
+    assert.ok(timedOut.error, "shutdown must not succeed while the owned open is held");
+    assertSyncShutdownOutcome(timedOut);
+    await access(path.join(journalDirectory, "writer.lease"));
+    releaseOpen();
+    const opened = await opening;
+    assert.ok(opened.error instanceof RuntimeBoundaryError);
+    assert.equal(opened.error.code, "runtime_closed");
+    await assert.rejects(access(path.join(journalDirectory, "writer.lease")), (error) => error.code === "ENOENT");
+    await runtime.shutdown();
+    assert.equal(runtime.daemon.state, "stopped");
+    interception.mock.restore();
+    await assertSyncLeaseReleased(journalDirectory, "binding-held-shutdown");
+  } finally {
+    releaseOpen();
+    await opening;
+    await stopping;
+    interception.mock.restore();
+    if (ownedJournal !== undefined) await ownedJournal.close();
+    await runtime.shutdown();
+  }
 });
 
 test("TC-055-13 concurrent attach reserves both tab and AgentSession identities before awaiting", async () => {
@@ -1648,6 +1731,7 @@ test("a writer demoted by a transfer keeps observing; taking the seat back is co
       writerEpoch: input.expectedWriterEpoch + 1,
       writerClientInstanceId: input.clientInstanceId,
       transferPending: false,
+      operationId: input.operationId, operationState: "committed",
     };
   };
   const { runtime, states } = createRuntime(system);
@@ -1671,7 +1755,7 @@ test("a writer demoted by a transfer keeps observing; taking the seat back is co
   );
 
   const asked = await runtime.takeWriter({ tabId: "tab-a" });
-  assert.deepEqual(transfers, [{ agentSessionId: "agent-a", clientInstanceId: "client-1", expectedWriterEpoch: 2 }]);
+  assert.deepEqual(transfers, [{ agentSessionId: "agent-a", clientInstanceId: "client-1", expectedWriterEpoch: 2, operationId: transfers[0].operationId }]);
   assert.equal(asked.accessMode, "observer", "the API's confirmation does not seat the client; the server's notice does");
   assert.equal(asked.writerEpoch, 3);
   assert.equal(asked.writerClientInstanceId, "client-1");
@@ -1890,4 +1974,84 @@ test("a seat held at any point is remembered across reconnects: landing as an ob
   assert.equal(never.createCalls[1].expectedWriterEpoch, undefined, "an observer that never held the seat expects no epoch");
   assert.equal(third.states.at(-1).reason, undefined, "an observer that never held the seat was not demoted");
   await third.runtime.shutdown();
+});
+
+
+test("writer operation retries preserve ID and original epoch until a writer notice", async () => {
+  const system = new FakeTerminalSystem();
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  const calls = [];
+  system.controlPlane.transferTerminalWriter = async (input) => {
+    calls.push(input);
+    if (calls.length === 1) throw Object.assign(new Error("unknown"), { details: { reason: "terminal_writer_outcome_unknown" } });
+    return { agentSessionId: input.agentSessionId, processEpoch: `epoch-${input.agentSessionId}`,
+      writerEpoch: 2, writerClientInstanceId: input.clientInstanceId, transferPending: true,
+      operationId: input.operationId, operationState: "committed" };
+  };
+  const { runtime, states } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    await assert.rejects(runtime.takeWriter({ tabId: "tab-a" }), /unknown/);
+    assert.match(calls[0].operationId, /^[0-9a-f-]{36}$/);
+    const pending = await runtime.takeWriter({ tabId: "tab-a" });
+    assert.equal(pending.accessMode, "observer");
+    await runtime.takeWriter({ tabId: "tab-a" });
+    assert.deepEqual(calls.map(({ operationId, expectedWriterEpoch }) => ({ operationId, expectedWriterEpoch })),
+      Array(3).fill({ operationId: calls[0].operationId, expectedWriterEpoch: 1 }));
+    await assert.rejects(runtime.sendInput(new TextEncoder().encode("early"), "tab-a"), error => error.code === "terminal_observer");
+    system.connections.at(-1).incoming.push(encodeTerminalControl("writer_epoch", 3n, { writerEpoch: 2, writerClientInstanceId: "client-1", accessMode: "writer" }));
+    await waitUntil(() => states.at(-1)?.accessMode === "writer", "notice grants writer");
+    await runtime.takeWriter({ tabId: "tab-a" });
+    assert.equal(calls.length, 3);
+  } finally { await runtime.shutdown(); }
+});
+
+test("writer operation concurrent attempts share one request and a later notice supersedes its reply", async () => {
+  const system = new FakeTerminalSystem();
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  let release; const gate = new Promise(resolve => { release = resolve; }); const calls = [];
+  system.controlPlane.transferTerminalWriter = async input => {
+    calls.push(input); await gate;
+    return { agentSessionId: input.agentSessionId, processEpoch: `epoch-${input.agentSessionId}`, writerEpoch: 2,
+      writerClientInstanceId: input.clientInstanceId, transferPending: false, operationId: input.operationId, operationState: "committed" };
+  };
+  const { runtime, states } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    const first = runtime.takeWriter({ tabId: "tab-a" }); const second = runtime.takeWriter({ tabId: "tab-a" });
+    await waitUntil(() => calls.length > 0, "request dispatched");
+    assert.equal(calls.length, 1);
+    system.connections.at(-1).incoming.push(encodeTerminalControl("writer_epoch", 3n, { writerEpoch: 3, writerClientInstanceId: "client-9", accessMode: "observer" }));
+    await waitUntil(() => states.at(-1)?.writerEpoch === 3, "newer notice received");
+    release(); await Promise.all([first, second]);
+    assert.equal(states.at(-1).writerEpoch, 3); assert.equal(states.at(-1).writerClientInstanceId, "client-9");
+  } finally { release(); await runtime.shutdown(); }
+});
+
+test("writer operation rejects substituted operation and noncommitted result without seating", async () => {
+  for (const substitute of [{ operationId: "00000000-0000-4000-8000-000000000099" }, { operationState: "cancelled" }]) {
+    const system = new FakeTerminalSystem(); system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+    system.controlPlane.transferTerminalWriter = async input => ({ agentSessionId: input.agentSessionId, processEpoch: `epoch-${input.agentSessionId}`,
+      writerEpoch: 2, writerClientInstanceId: input.clientInstanceId, transferPending: false, operationId: input.operationId, operationState: "committed", ...substitute });
+    const { runtime, states } = createRuntime(system);
+    try {
+      await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+      await assert.rejects(runtime.takeWriter({ tabId: "tab-a" }), error => error.code === "grant_scope_mismatch");
+      assert.equal(states.at(-1).accessMode, "observer"); assert.equal(states.at(-1).writerEpoch, 1);
+    } finally { await runtime.shutdown(); }
+  }
+});
+
+test("writer operation cancellation ends its ID while an in-progress refusal retains it", async () => {
+  for (const reason of ["terminal_writer_cancelled", "terminal_writer_transfer_in_progress"]) {
+    const system = new FakeTerminalSystem(); system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 }); const calls = [];
+    system.controlPlane.transferTerminalWriter = async input => { calls.push(input); throw Object.assign(new Error(reason), { details: { reason } }); };
+    const { runtime } = createRuntime(system);
+    try {
+      await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+      await assert.rejects(runtime.takeWriter({ tabId: "tab-a" })); await assert.rejects(runtime.takeWriter({ tabId: "tab-a" }));
+      assert.match(calls[0].operationId, /^[0-9a-f-]{36}$/);
+      assert.equal(calls[0].operationId === calls[1].operationId, reason === "terminal_writer_transfer_in_progress");
+    } finally { await runtime.shutdown(); }
+  }
 });

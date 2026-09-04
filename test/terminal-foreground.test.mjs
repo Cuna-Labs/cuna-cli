@@ -1530,3 +1530,23 @@ test("a take-control refusal survives an unchanged seat heartbeat publish", asyn
   );
   await coordinator.stop();
 });
+
+
+test("writer operation foreground distinguishes cancelled, pending, mismatch and unknown outcomes", async () => {
+  for (const [reason, expected] of [
+    ["terminal_writer_cancelled", "Control transfer cancelled"],
+    ["terminal_writer_transfer_in_progress", "Control transfer is pending"],
+    ["terminal_writer_operation_mismatch", "Control request does not match"],
+    ["terminal_writer_outcome_unknown", "Control outcome is unconfirmed"],
+  ]) {
+    const failure = Object.assign(new Error("Terminal writer transfer refused"), { details: { reason } });
+    const { coordinator, callbacks, calls, host, intents } = harness({ takeWriterError: failure });
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+      host.emitInput(Uint8Array.of(0x1d, 0x77));
+      await waitUntil(() => calls.takeWriter.length === 1, "writer request invoked");
+      await waitUntil(() => decoder.decode(host.writes.at(-1)).includes(expected), reason);
+    } finally { await coordinator.stop(); }
+  }
+});

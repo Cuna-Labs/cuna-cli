@@ -20,6 +20,7 @@ export type RuntimeErrorCode =
   | "session_discontinuous"
   | "stale_fence"
   | "runtime_closed"
+  | "runtime_cleanup_timeout"
   | "process_invalid"
   | "process_failed"
   | "pty_unavailable"

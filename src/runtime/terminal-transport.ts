@@ -57,6 +57,7 @@ export interface TerminalControlPlane {
     readonly signal?: AbortSignal;
   }): Promise<TerminalConnectionGrant>;
   transferTerminalWriter(input: {
+    readonly operationId?: string;
     readonly agentSessionId: string;
     readonly clientInstanceId: string;
     readonly expectedWriterEpoch?: number;

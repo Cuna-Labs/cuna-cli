@@ -189,6 +189,11 @@ interface TerminalEntry {
   heartbeatTimer?: NodeJS.Timeout;
   outputAbort: AbortController;
   reconnectIdempotencyKey?: string;
+  writerTransfer?: {
+    readonly operationId: string;
+    readonly expectedWriterEpoch: number;
+    inFlight?: Promise<RuntimeTerminalSnapshot>;
+  };
 }
 
 export class CunaRuntimeBoundary {
@@ -416,6 +421,9 @@ export class CunaRuntimeBoundary {
       entry.accessMode = ready.payload.accessMode;
       entry.writerEpoch = ready.payload.writerEpoch;
       entry.writerClientInstanceId = ready.payload.accessMode === "writer" ? this.#options.clientInstanceId : null;
+      if (entry.writerTransfer !== undefined && ready.payload.writerEpoch > entry.writerTransfer.expectedWriterEpoch) {
+        delete entry.writerTransfer;
+      }
       entry.heldSeat = ready.payload.accessMode === "writer";
       entry.localActionAcceptance = this.#localActionAcceptance(
         ready.payload.localActionProtocol,
@@ -705,24 +713,47 @@ export class CunaRuntimeBoundary {
     this.#assertReady();
     const entry = this.#requireActiveTerminal(input.tabId);
     if (entry.accessMode === "writer") return snapshot(entry, this.#heartbeatTimeoutMs());
-    const state = await this.#options.controlPlane.transferTerminalWriter({
-      agentSessionId: entry.observation.agentSessionId,
-      clientInstanceId: this.#options.clientInstanceId,
-      expectedWriterEpoch: entry.writerEpoch,
-      ...(input.signal === undefined ? {} : { signal: input.signal }),
-    });
-    if (
-      state.agentSessionId !== entry.observation.agentSessionId ||
-      state.processEpoch !== entry.observation.processEpoch ||
-      state.writerClientInstanceId !== this.#options.clientInstanceId
-    ) {
-      throw runtimeFailure("grant_scope_mismatch", "The writer transfer answered for another terminal or client.");
-    }
-    entry.writerEpoch = state.writerEpoch;
-    entry.writerClientInstanceId = state.writerClientInstanceId;
-    if (state.transferPending) entry.reason = "writer_transfer_pending";
-    this.#publish(entry);
-    return snapshot(entry, this.#heartbeatTimeoutMs());
+    const operation = entry.writerTransfer ?? { operationId: randomUUID(), expectedWriterEpoch: entry.writerEpoch };
+    entry.writerTransfer = operation;
+    if (operation.inFlight !== undefined) return operation.inFlight;
+    operation.inFlight = Promise.resolve().then(async () => {
+      try {
+        const state = await this.#options.controlPlane.transferTerminalWriter({
+          agentSessionId: entry.observation.agentSessionId,
+          clientInstanceId: this.#options.clientInstanceId,
+          expectedWriterEpoch: operation.expectedWriterEpoch,
+          operationId: operation.operationId,
+          ...(input.signal === undefined ? {} : { signal: input.signal }),
+        });
+        if (state.agentSessionId !== entry.observation.agentSessionId ||
+            state.processEpoch !== entry.observation.processEpoch ||
+            state.writerClientInstanceId !== this.#options.clientInstanceId ||
+            state.operationId !== operation.operationId || state.operationState !== "committed" ||
+            state.writerEpoch !== operation.expectedWriterEpoch + 1) {
+          throw runtimeFailure("grant_scope_mismatch", "The writer transfer answered for another terminal, operation, or epoch.");
+        }
+        // A later server notice may already have superseded this HTTP reply.
+        if (entry.writerTransfer === operation && state.writerEpoch >= entry.writerEpoch) {
+          entry.writerEpoch = state.writerEpoch;
+          entry.writerClientInstanceId = state.writerClientInstanceId;
+          if (state.transferPending) entry.reason = "writer_transfer_pending";
+          this.#publish(entry);
+        }
+        return snapshot(entry, this.#heartbeatTimeoutMs());
+      } catch (error) {
+        const reason = typeof error === "object" && error !== null
+          ? (error as { readonly details?: { readonly reason?: unknown } }).details?.reason : undefined;
+        // A missing response or an in-progress operation retains its identity.
+        // A definitive refusal ends this request, without granting input rights.
+        if (entry.writerTransfer === operation && typeof reason === "string" &&
+            ["terminal_writer_cancelled", "terminal_writer_stale", "terminal_writer_unheld",
+              "terminal_writer_already_held", "terminal_writer_operation_mismatch", "invalid_terminal_writer_request"].includes(reason)) {
+          delete entry.writerTransfer;
+        }
+        throw error;
+      }
+    }).finally(() => { delete operation.inFlight; });
+    return operation.inFlight;
   }
 
   async reconnect(input: { readonly tabId: string; readonly signal?: AbortSignal }): Promise<RuntimeTerminalSnapshot> {
@@ -920,6 +951,9 @@ export class CunaRuntimeBoundary {
       entry.accessMode = ready.payload.accessMode;
       entry.writerEpoch = ready.payload.writerEpoch;
       entry.writerClientInstanceId = ready.payload.accessMode === "writer" ? this.#options.clientInstanceId : null;
+      if (entry.writerTransfer !== undefined && ready.payload.writerEpoch > entry.writerTransfer.expectedWriterEpoch) {
+        delete entry.writerTransfer;
+      }
       if (ready.payload.accessMode === "writer") entry.heldSeat = true;
       else if (entry.heldSeat) entry.reason = "writer_transferred";
       else delete entry.reason;
@@ -1149,7 +1183,11 @@ export class CunaRuntimeBoundary {
     }
     for (const pending of pendingSyncOpens) {
       try {
-        const failure = await withOutputDeadline(pending, this.#options.readyTimeoutMs ?? 10_000);
+        const failure = await withOutputDeadline(pending, this.#options.readyTimeoutMs ?? 10_000, () => runtimeFailure(
+          "runtime_cleanup_timeout",
+          "Workspace synchronization is still closing. Retry shutdown to finish cleanup.",
+          { retryable: true },
+        ));
         if (failure !== undefined) failures.push(failure);
       } catch (error) {
         failures.push(error);
@@ -1456,6 +1494,9 @@ export class CunaRuntimeBoundary {
       entry.accessMode = payload.accessMode;
       entry.writerEpoch = payload.writerEpoch;
       entry.writerClientInstanceId = payload.writerClientInstanceId;
+      if (entry.writerTransfer !== undefined && payload.writerEpoch > entry.writerTransfer.expectedWriterEpoch) {
+        delete entry.writerTransfer;
+      }
       if (payload.accessMode === "writer") entry.heldSeat = true;
       if (wasWriter && payload.accessMode !== "writer") entry.reason = "writer_transferred";
       else if (!wasWriter && payload.accessMode === "writer") delete entry.reason;
@@ -1675,14 +1716,16 @@ export class CunaRuntimeBoundary {
   }
 }
 
-async function withOutputDeadline<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+async function withOutputDeadline<T>(operation: Promise<T>, timeoutMs: number,
+  timeoutFailure: () => RuntimeBoundaryError = () => runtimeFailure("terminal_protocol_error", "The terminal output consumer exceeded its bounded deadline."),
+): Promise<T> {
   let timeout: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
       operation,
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(
-          () => reject(runtimeFailure("terminal_protocol_error", "The terminal output consumer exceeded its bounded deadline.")),
+          () => reject(timeoutFailure()),
           timeoutMs,
         );
       }),

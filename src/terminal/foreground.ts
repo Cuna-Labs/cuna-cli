@@ -1749,7 +1749,7 @@ export class ForegroundTerminalCoordinator {
     void runtime.takeWriter({ tabId, signal: this.#lifetimeAbort.signal }).then(
       () => { this.#seatNotice = undefined; },
       (error: unknown) => {
-        this.#seatNotice = `Could not take control: ${error instanceof Error ? error.message : String(error)}`;
+        this.#seatNotice = writerTransferFailureNotice(error);
       },
     ).finally(() => { void this.#render().catch(() => undefined); });
   }
@@ -1901,4 +1901,15 @@ async function abortableDelay(milliseconds: number, signal: AbortSignal): Promis
     }
     signal.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+
+function writerTransferFailureNotice(error: unknown): string {
+  const reason = typeof error === "object" && error !== null
+    ? (error as { readonly details?: { readonly reason?: unknown } }).details?.reason : undefined;
+  if (reason === "terminal_writer_cancelled") return "Control transfer cancelled. Read the terminal state before trying again.";
+  if (reason === "terminal_writer_transfer_in_progress") return "Control transfer is pending. Keep observing; retry checks the same request.";
+  if (reason === "terminal_writer_operation_mismatch") return "Control request does not match its operation. Read the terminal state before trying again.";
+  if (reason === "terminal_writer_outcome_unknown") return "Control outcome is unconfirmed. Keep observing; retry checks the same request.";
+  return `Could not take control: ${error instanceof Error ? error.message : String(error)}`;
 }

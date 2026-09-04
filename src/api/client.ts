@@ -104,6 +104,7 @@ export interface TerminalConnectionCreateInput {
 }
 
 export interface TerminalWriterTransferInput {
+  readonly operationId?: string;
   readonly clientInstanceId: string;
   readonly expectedWriterEpoch?: number;
 }
@@ -896,18 +897,25 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
           exitCode: EXIT_CODES.usage,
         });
       }
-      return fetchDecoded(
+      if (input.operationId !== undefined) assertCanonicalUuid(input.operationId, "writer operation ID");
+      const state = await fetchDecoded(
         {
           method: "POST",
           path: `/v1/agent-sessions/${safeId}/terminal-writer`,
           body: {
             client_instance_id: input.clientInstanceId,
+            ...(input.operationId === undefined ? {} : { operation_id: input.operationId }),
             ...(input.expectedWriterEpoch === undefined ? {} : { expected_writer_epoch: input.expectedWriterEpoch }),
           },
           ...(signal === undefined ? {} : { signal }),
         },
         decodeTerminalWriterState,
       );
+      if (state.agentSessionId !== agentSessionId || state.writerClientInstanceId !== input.clientInstanceId ||
+          (input.operationId !== undefined && state.operationId !== input.operationId)) {
+        throw malformed(contractViolation("matches_requested_resource", "operation_id"), `POST /v1/agent-sessions/${safeId}/terminal-writer`);
+      }
+      return state;
     },
   };
   return Object.freeze(client);

@@ -2997,7 +2997,10 @@
           "terminal_writer_stale",
           "invalid_terminal_writer_request",
           "terminal_writer_authority_unavailable",
-          "terminal_writer_outcome_unknown"
+          "terminal_writer_outcome_unknown",
+          "terminal_writer_transfer_in_progress",
+          "terminal_writer_operation_mismatch",
+          "terminal_writer_cancelled"
         ],
         "requestBody": {
           "required": true,
@@ -3044,7 +3047,7 @@
           }
         ],
         "summary": "Transfer the terminal's writer to another client instance",
-        "description": "Moves the single writing seat of an AgentSession terminal to the named client instance of the same principal: the supervisor fences the current writer epoch (PREPARE), the database moves (writer, epoch) to (client, epoch+1) in one compare-and-swap, and the supervisor activates the new writer (ACTIVATE). The former writer stays attached as an observer. Returns the terminal's durable writer state."
+        "description": "Admits one durable writer operation, fences and drains the predecessor at the supervisor, atomically commits or cancels in the database, and settles that immutable decision. Competing requests are excluded before PREPARE. Lost replies recover the same operation; cancellation never reports HTTP success."
       },
       "parameters": [
         {
@@ -3293,6 +3296,97 @@
             }
           }
         }
+      }
+    },
+    "/v1/execution-workspaces": {
+      "get": {
+        "operationId": "executionWorkspaces.list",
+        "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "workspace_binding_unavailable",
+          "workspace_binding_prerequisite_incomplete",
+          "workspace_binding_invalid_request",
+          "workspace_binding_authority_unavailable"
+        ],
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          },
+          {
+            "name": "machine_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact authenticated canonical workspace binding",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionWorkspaceList"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "workspace_sync:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "summary": "List execution Workspaces in one owned Project and Machine",
+        "description": "Returns at most 50 dedicated execution Workspaces in ascending UUID order. The account Workspace, Project, and Machine must all belong to the current owner and remain authorized. Local bindings are separate identities. A sync generation does not attest filesystem materialization. Supply next_cursor as after for the next page."
       }
     }
   },
@@ -4649,6 +4743,11 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "workspace_failure_code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.]{0,127}$",
+            "description": "Safe reason for failed pre-spawn Workspace delivery, present only when request_state is failed. A refusal does not imply a child process existed. Remote edits and replacement without writer fencing are preserved."
           }
         }
       },
@@ -5412,11 +5511,11 @@
                           "number",
                           "null"
                         ],
-                        "description": "The provider's own balance when balance_status is 'available', and null otherwise. Null means unknown — never zero, and never an assumed grant minus estimated spend. That subtraction once reported 22.12 USD remaining to an account the provider had already cut off at 0.00."
+                        "description": "The provider's own balance when balance_status is 'available', and null otherwise. Null means unknown â€” never zero, and never an assumed grant minus estimated spend. That subtraction once reported 22.12 USD remaining to an account the provider had already cut off at 0.00."
                       },
                       "balance_unavailable_reason": {
                         "type": "string",
-                        "description": "Present exactly when balance_status is 'unavailable'. A renderer must show this instead of a number, never a spinner: no balance can arrive later. It must not tell the reader to check their provider account — Cuna assigns provider accounts it owns, so the reader holds no such account."
+                        "description": "Present exactly when balance_status is 'unavailable'. A renderer must show this instead of a number, never a spinner: no balance can arrive later. It must not tell the reader to check their provider account â€” Cuna assigns provider accounts it owns, so the reader holds no such account."
                       },
                       "note": {
                         "type": "string"
@@ -5542,6 +5641,10 @@
               "maxLength": 4096,
               "description": "Canonical portable relative workspace prefix. Absolute paths, traversal, control characters, backslashes, and device paths are rejected."
             }
+          },
+          "execution_workspace_id": {
+            "$ref": "#/components/schemas/Uuid",
+            "description": "Adopt this existing execution Workspace under the exact same owner, public account Workspace, Project and Machine. Omit to allocate one for a new binding identity. Exact existing binding identities remain unchanged."
           }
         }
       },
@@ -5562,7 +5665,8 @@
           "minimum_reader",
           "minimum_writer",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "execution_workspace_id"
         ],
         "properties": {
           "binding_id": {
@@ -5582,7 +5686,8 @@
           },
           "remote_root": {
             "type": "string",
-            "pattern": "^/workspace/projects/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            "pattern": "^/workspace/(projects|workspaces)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "Exact immutable server-authorized root: /workspace/workspaces/<execution_workspace_id>, or /workspace/projects/<project_id> only when execution_workspace_id is null. A DB generation receipt does not attest materialized files."
           },
           "exclusion_policy_digest": {
             "type": "string",
@@ -5620,6 +5725,17 @@
             "type": "string",
             "format": "date-time",
             "description": "RFC 3339 timestamp. UTC and explicit numeric offsets are accepted."
+          },
+          "execution_workspace_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Durable execution Workspace, independent of the account workspace_id and local binding. Null explicitly identifies an unchanged legacy Project-root binding."
           }
         }
       },
@@ -6603,6 +6719,11 @@
             "type": "integer",
             "minimum": 0,
             "description": "Optional. When present, the transfer is refused with terminal_writer_stale unless the terminal's current writer epoch equals it."
+          },
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional caller-stable transfer operation UUID. Reuse the same UUID and tuple after a missing response. If omitted, the server reuses an active exact-tuple operation or the current committed successor."
           }
         }
       },
@@ -6614,7 +6735,9 @@
           "process_epoch",
           "writer_epoch",
           "writer_client_instance_id",
-          "transfer_pending"
+          "transfer_pending",
+          "operation_id",
+          "operation_state"
         ],
         "properties": {
           "agent_session_id": {
@@ -6636,7 +6759,18 @@
           },
           "transfer_pending": {
             "type": "boolean",
-            "description": "True only when the database moved the epoch but the supervisor did not confirm activation; it converges from the database on its next observation."
+            "description": "True until the exact committed operation has a confirmed durable supervisor settlement acknowledgment. The same operation is reconciled from supervisor heartbeats and reconnects."
+          },
+          "operation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "operation_state": {
+            "type": "string",
+            "enum": [
+              "committed"
+            ],
+            "description": "A successful transfer response names the committed operation. Settled cancellation returns terminal_writer_cancelled instead."
           }
         }
       },
@@ -6969,6 +7103,89 @@
             }
           }
         }
+      },
+      "ExecutionWorkspace": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "execution_workspace_id",
+          "workspace_id",
+          "project_id",
+          "machine_id",
+          "remote_root",
+          "active_generation",
+          "active_manifest_root",
+          "exclusion_policy_digest",
+          "created_at"
+        ],
+        "properties": {
+          "execution_workspace_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "remote_root": {
+            "type": "string",
+            "pattern": "^/workspace/workspaces/[0-9a-f-]{36}$"
+          },
+          "active_generation": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Generation of the committed workspace revision this binding currently points at. 0 is the state a new binding is created in: bound but never synchronized, with no revision behind it. No AgentSession can be created against a binding at generation 0; workspaces.sync.commit mints generation 1 and every commit after it advances by one."
+          },
+          "active_manifest_root": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "exclusion_policy_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 timestamp. UTC and explicit numeric offsets are accepted."
+          }
+        }
+      },
+      "ExecutionWorkspaceList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "$ref": "#/components/schemas/ExecutionWorkspace"
+            }
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
       }
     }
   },
@@ -6992,6 +7209,6 @@
     "responseEncoding": "utf-8",
     "maxResponseBytes": 16777216,
     "followRedirects": false,
-    "sdkOperationCount": 33
+    "sdkOperationCount": 34
   }
 }

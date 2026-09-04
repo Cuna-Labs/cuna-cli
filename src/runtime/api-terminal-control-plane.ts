@@ -83,6 +83,7 @@ export function createApiTerminalControlPlane(input: {
         request.agentSessionId,
         {
           clientInstanceId: request.clientInstanceId,
+          ...(request.operationId === undefined ? {} : { operationId: request.operationId }),
           ...(request.expectedWriterEpoch === undefined
             ? {}
             : { expectedWriterEpoch: request.expectedWriterEpoch }),
