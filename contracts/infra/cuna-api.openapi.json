@@ -2184,151 +2184,6 @@
         ]
       }
     },
-    "/v1/credential-rules": {
-      "get": {
-        "operationId": "console.credentialRules.list",
-        "x-sdk-exposed": false,
-        "responses": {
-          "200": {
-            "$ref": "#/components/responses/Json"
-          },
-          "default": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "x-runa-auth-classes": [
-          "browser_jwt",
-          "programmatic_api_key",
-          "cli_human"
-        ],
-        "x-runa-required-permissions": [
-          "credentials:manage"
-        ],
-        "security": [
-          {
-            "SupabaseJwt": []
-          },
-          {
-            "RunaApiKey": []
-          },
-          {
-            "CunaHumanBearer": []
-          }
-        ]
-      },
-      "post": {
-        "operationId": "console.credentialRules.create",
-        "x-sdk-exposed": false,
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json; charset=utf-8": {
-              "schema": {
-                "$ref": "#/components/schemas/CredentialRule"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "$ref": "#/components/responses/Json"
-          },
-          "default": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "x-runa-auth-classes": [
-          "browser_jwt",
-          "programmatic_api_key",
-          "cli_human"
-        ],
-        "x-runa-required-permissions": [
-          "credentials:manage"
-        ],
-        "security": [
-          {
-            "SupabaseJwt": []
-          },
-          {
-            "RunaApiKey": []
-          },
-          {
-            "CunaHumanBearer": []
-          }
-        ]
-      }
-    },
-    "/v1/credential-rules/{id}": {
-      "delete": {
-        "operationId": "console.credentialRules.delete",
-        "x-sdk-exposed": false,
-        "responses": {
-          "200": {
-            "$ref": "#/components/responses/Ok"
-          },
-          "default": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "x-runa-auth-classes": [
-          "browser_jwt",
-          "programmatic_api_key",
-          "cli_human"
-        ],
-        "x-runa-required-permissions": [
-          "credentials:manage"
-        ],
-        "security": [
-          {
-            "SupabaseJwt": []
-          },
-          {
-            "RunaApiKey": []
-          },
-          {
-            "CunaHumanBearer": []
-          }
-        ]
-      }
-    },
-    "/v1/sessions/{id}/authorizations": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/SessionId"
-        }
-      ],
-      "get": {
-        "operationId": "console.sessionAuthorizations.list",
-        "x-sdk-exposed": false,
-        "responses": {
-          "200": {
-            "$ref": "#/components/responses/Json"
-          },
-          "default": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "x-runa-auth-classes": [
-          "browser_jwt",
-          "programmatic_api_key",
-          "cli_human"
-        ],
-        "x-runa-required-permissions": [
-          "authorizations:read"
-        ],
-        "security": [
-          {
-            "SupabaseJwt": []
-          },
-          {
-            "RunaApiKey": []
-          },
-          {
-            "CunaHumanBearer": []
-          }
-        ]
-      }
-    },
     "/v1/workspace-bindings": {
       "post": {
         "operationId": "workspaceBindings.create",
@@ -3141,7 +2996,8 @@
           "terminal_writer_already_held",
           "terminal_writer_stale",
           "invalid_terminal_writer_request",
-          "terminal_writer_authority_unavailable"
+          "terminal_writer_authority_unavailable",
+          "terminal_writer_outcome_unknown"
         ],
         "requestBody": {
           "required": true,
@@ -3195,6 +3051,249 @@
           "$ref": "#/components/parameters/AgentSessionId"
         }
       ]
+    },
+    "/v1/credential-rules": {
+      "get": {
+        "operationId": "console.credentialRules.list",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "description": "Authoritative configuration metadata. Templates are passed unchanged; runtime injection requires provider verification.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialDefaults"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "credentials:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "unauthenticated",
+          "forbidden",
+          "unsupported_media_type",
+          "credential_rules_invalid",
+          "credential_secret_not_found",
+          "credential_scope_not_found",
+          "credential_revision_conflict",
+          "credential_runtime_unavailable",
+          "credential_provider_rejected",
+          "credential_authority_unavailable",
+          "credential_outcome_unknown"
+        ]
+      },
+      "put": {
+        "operationId": "console.credentialRules.replace",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "description": "Authoritative configuration metadata. Templates are passed unchanged; runtime injection requires provider verification.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialDefaults"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "credentials:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "unauthenticated",
+          "forbidden",
+          "unsupported_media_type",
+          "credential_rules_invalid",
+          "credential_secret_not_found",
+          "credential_scope_not_found",
+          "credential_revision_conflict",
+          "credential_runtime_unavailable",
+          "credential_provider_rejected",
+          "credential_authority_unavailable",
+          "credential_outcome_unknown"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialDefaultsReplacement"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/authorizations": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "console.sessionAuthorizations.list",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "description": "Authoritative configuration metadata. Templates are passed unchanged; runtime injection requires provider verification.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineAuthorizations"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "credentials:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "unauthenticated",
+          "forbidden",
+          "unsupported_media_type",
+          "credential_rules_invalid",
+          "credential_secret_not_found",
+          "credential_scope_not_found",
+          "credential_revision_conflict",
+          "credential_runtime_unavailable",
+          "credential_provider_rejected",
+          "credential_authority_unavailable",
+          "credential_outcome_unknown"
+        ]
+      },
+      "put": {
+        "operationId": "console.sessionAuthorizations.replace",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "description": "Authoritative configuration metadata. Templates are passed unchanged; runtime injection requires provider verification.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineAuthorizations"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "credentials:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "unauthenticated",
+          "forbidden",
+          "unsupported_media_type",
+          "credential_rules_invalid",
+          "credential_secret_not_found",
+          "credential_scope_not_found",
+          "credential_revision_conflict",
+          "credential_runtime_unavailable",
+          "credential_provider_rejected",
+          "credential_authority_unavailable",
+          "credential_outcome_unknown"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineAuthorizationsReplacement"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -4650,7 +4749,8 @@
           },
           "workspace_generation": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "description": "Committed workspace generation to bind this AgentSession to. It is a fencing token compared exactly against the WorkspaceBinding's current active_generation, so it must equal that value. A binding that has never been synchronized reports active_generation 0; no revision exists at generation 0, so 0 is never accepted here. Call workspaces.sync.commit first, which mints generation 1."
           }
         }
       },
@@ -5119,65 +5219,6 @@
           }
         }
       },
-      "CredentialRule": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "host",
-          "credential"
-        ],
-        "properties": {
-          "host": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 2048
-          },
-          "path": {
-            "type": "string",
-            "maxLength": 2048
-          },
-          "credential": {
-            "type": "string",
-            "pattern": "^[A-Z0-9_]{1,64}$"
-          },
-          "header": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
-          },
-          "param": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
-          },
-          "format": {
-            "type": "string",
-            "maxLength": 4096
-          }
-        },
-        "oneOf": [
-          {
-            "required": [
-              "header"
-            ],
-            "not": {
-              "required": [
-                "param"
-              ]
-            }
-          },
-          {
-            "required": [
-              "param"
-            ],
-            "not": {
-              "required": [
-                "header"
-              ]
-            }
-          }
-        ]
-      },
       "ExecRequest": {
         "type": "object",
         "additionalProperties": false,
@@ -5344,15 +5385,38 @@
                     "additionalProperties": false,
                     "required": [
                       "est_spend_usd",
-                      "est_remaining_usd",
+                      "est_spend_is_lower_bound",
+                      "balance_status",
+                      "balance_usd",
                       "note"
                     ],
                     "properties": {
                       "est_spend_usd": {
-                        "type": "number"
+                        "type": "number",
+                        "description": "A FLOOR on spend, in USD, estimated by Cuna from running time at the provider's published rates. Measured against the provider's own 7-day breakdown on 2026-09-02 it covered 51.8% of billed vCPU-hours and 40.2% of billed disk GiB-hours. It accrues only against last_started_at, so a runtime that exists but is not running contributes exactly 0.00 no matter what the provider bills for it; it also misses boot windows, spans that never closed, and runtimes created outside Cuna. This is not a total and no remaining balance may be derived from it."
                       },
-                      "est_remaining_usd": {
-                        "type": "number"
+                      "est_spend_is_lower_bound": {
+                        "const": true,
+                        "description": "Always true today, and required rather than optional so a consumer cannot render est_spend_usd as a settled total by forgetting to look. The console reads it to label the figure 'Estimated spend (at least)'."
+                      },
+                      "balance_status": {
+                        "type": "string",
+                        "enum": [
+                          "available",
+                          "unavailable"
+                        ],
+                        "description": "Whether the provider reported a real balance. Permanently 'unavailable' today: the provider publishes no balance, credit, invoice, payment or usage operation in its public API, so there is nothing to poll and nothing to retry."
+                      },
+                      "balance_usd": {
+                        "type": [
+                          "number",
+                          "null"
+                        ],
+                        "description": "The provider's own balance when balance_status is 'available', and null otherwise. Null means unknown — never zero, and never an assumed grant minus estimated spend. That subtraction once reported 22.12 USD remaining to an account the provider had already cut off at 0.00."
+                      },
+                      "balance_unavailable_reason": {
+                        "type": "string",
+                        "description": "Present exactly when balance_status is 'unavailable'. A renderer must show this instead of a number, never a spinner: no balance can arrive later. It must not tell the reader to check their provider account — Cuna assigns provider accounts it owns, so the reader holds no such account."
                       },
                       "note": {
                         "type": "string"
@@ -5527,7 +5591,8 @@
           "active_generation": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 9007199254740991
+            "maximum": 9007199254740991,
+            "description": "Generation of the committed workspace revision this binding currently points at. 0 is the state a new binding is created in: bound but never synchronized, with no revision behind it. No AgentSession can be created against a binding at generation 0; workspaces.sync.commit mints generation 1 and every commit after it advances by one."
           },
           "active_manifest_root": {
             "type": "string",
@@ -6655,6 +6720,253 @@
             "type": "string",
             "format": "date-time",
             "description": "When the edge read the durable rows. Liveness is `writer_attached`, read from `terminal_connections`; no attachment count is reported because live attachments are process-local to the edge and vanish on deploy."
+          }
+        }
+      },
+      "SecretEgressRule": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "host_pattern",
+          "action",
+          "name",
+          "value_template"
+        ],
+        "properties": {
+          "host_pattern": {
+            "type": "string",
+            "maxLength": 253,
+            "minLength": 1
+          },
+          "path_pattern": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "header",
+              "query"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "value_template": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        }
+      },
+      "CredentialRule": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "secret_id",
+          "host_pattern",
+          "action",
+          "name",
+          "value_template"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "secret_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "host_pattern": {
+            "type": "string",
+            "maxLength": 253,
+            "minLength": 1
+          },
+          "path_pattern": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "header",
+              "query"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "value_template": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        }
+      },
+      "CredentialDefaults": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "rules"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "rules": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/CredentialRule"
+            }
+          }
+        }
+      },
+      "CredentialDefaultsReplacement": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "expected_revision",
+          "rules"
+        ],
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "rules": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/CredentialRule"
+            }
+          }
+        }
+      },
+      "RuntimeSecretConfiguration": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "secret_id",
+          "environment",
+          "egress_rules",
+          "files"
+        ],
+        "properties": {
+          "secret_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "environment": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "value_template"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "value_template": {
+                  "type": "string",
+                  "maxLength": 4096
+                }
+              }
+            }
+          },
+          "egress_rules": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/SecretEgressRule"
+            }
+          },
+          "files": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "value_template"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "minLength": 1
+                },
+                "value_template": {
+                  "type": "string",
+                  "maxLength": 4096
+                }
+              }
+            }
+          }
+        }
+      },
+      "MachineAuthorizations": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "secret_configuration"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "secret_configuration": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/RuntimeSecretConfiguration"
+            }
+          }
+        }
+      },
+      "MachineAuthorizationsReplacement": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "expected_revision",
+          "secret_configuration"
+        ],
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "secret_configuration": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/RuntimeSecretConfiguration"
+            }
           }
         }
       }

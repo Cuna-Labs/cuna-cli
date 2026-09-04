@@ -2,27 +2,16 @@
   "schemaVersion": 2,
   "artifact_file": "contracts/infra/cuna-api.openapi.json",
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
-  "infra_openapi_raw_sha256": "3a2eb85158efc8b9b0cfd949bb42bd4f2c83876a32d6419fc05a14116e7edf54",
-  "infra_openapi_canonical_sha256": "a1d990b8538172dc0fa56162a0beaf9a344c666e72575f0e0593d29808d6ccdb",
+  "infra_openapi_raw_sha256": "efd4b3312cfdf564a98472e87d30edd511f779c12e4e590ee9546e84f173eb23",
+  "infra_openapi_canonical_sha256": "01f3092c40240ab6aa97215b185ed22aa725dd15c50583f04a39bf1f8b7fb26b",
   "producer_repository": "Cuna-Labs/infra",
-  "producer_content_state": "committed",
-  "producer_revision": "43a16c056425a1ad73b9731f569cbc402b765c56",
-  "producer_full_tree": {
-    "object_format": "sha1",
-    "commit": "43a16c056425a1ad73b9731f569cbc402b765c56",
-    "tree": "93f742a1a75454fd8f7bc5a843c6533dfe72d9b9",
-    "contract_blob": "059cb569a948de5456f0f799ad625339a3b7c5fb"
-  },
+  "producer_content_state": "working_tree_product_delta",
+  "producer_base_revision": "7c25a0c83798251f4210794fbd3f8b4e6768eaf0",
+  "producer_full_tree": null,
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
-  "producer_projection_sha256": "a6324587044c440f69d830cd68cca7f09c53bc7f76ab16bc159a36c13fe45f6e",
-  "producer_runtime_manifest_sha256": "944c6587610b4dfe562b4435cd2569a84aebeed7ac41cf291522952c8260bb3c",
+  "producer_projection_sha256": "7448da55e3f7cc81a2472eeec94061ce328217fb76d61165fadfcd29bd362001",
+  "producer_runtime_manifest_sha256": "5fee08330d63cdeaba62f12ddc9bf3b7c47fd3a421c669cc5bcba1512c4d032b",
   "feature_contracts": {
-    "opencode_interactive_only": {
-      "openapi_raw_sha256": "3a2eb85158efc8b9b0cfd949bb42bd4f2c83876a32d6419fc05a14116e7edf54",
-      "openapi_canonical_sha256": "a1d990b8538172dc0fa56162a0beaf9a344c666e72575f0e0593d29808d6ccdb",
-      "producer_commit": "43a16c056425a1ad73b9731f569cbc402b765c56",
-      "producer_tree": "93f742a1a75454fd8f7bc5a843c6533dfe72d9b9",
-      "producer_contract_blob": "059cb569a948de5456f0f799ad625339a3b7c5fb"
-    }
+    "opencode_interactive_only": null
   }
 }
