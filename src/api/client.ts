@@ -55,6 +55,7 @@ import {
   type WorkspaceBindingAuthority,
 } from "./contracts.js";
 import type { HttpRequest, HttpTransport } from "./http.js";
+import { decodeExecutionWorkspacePage, type ExecutionWorkspacePage } from "./execution-workspaces.js";
 import { classifyCapabilitySnapshot, isPermanentSnapshotFault } from "./capability-evidence.js";
 
 export interface MachineCreateInput {
@@ -137,6 +138,7 @@ export interface CunaApiClient {
    */
   replaceMachineSupervisor(id: string, signal?: AbortSignal): Promise<Machine>;
   deleteMachine(id: string): Promise<unknown>;
+  listExecutionWorkspaces(input: { readonly workspaceId: string; readonly projectId: string; readonly machineId: string; readonly after?: string }, signal?: AbortSignal): Promise<ExecutionWorkspacePage>;
   createWorkspaceBinding(
     input: WorkspaceBindingCreateInput,
     idempotencyKey: string,
@@ -593,6 +595,21 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         path: `/v1/sessions/${safeId}`,
         settleWith: "cuna machines list",
       });
+    },
+    async listExecutionWorkspaces(input, signal) {
+      assertCanonicalUuid(input.workspaceId, "workspace ID");
+      assertCanonicalUuid(input.projectId, "project ID");
+      assertCanonicalUuid(input.machineId, "machine ID");
+      if (input.after !== undefined) assertCanonicalUuid(input.after, "execution workspace cursor");
+      const query = new URLSearchParams({ workspace_id: input.workspaceId, project_id: input.projectId, machine_id: input.machineId });
+      if (input.after !== undefined) query.set("after", input.after);
+      const request: HttpRequest = { method: "GET", path: `/v1/execution-workspaces?${query}`, ...(signal === undefined ? {} : { signal }) };
+      const page = await fetchDecoded(request, decodeExecutionWorkspacePage);
+      if (page.items.some(row => row.workspaceId !== input.workspaceId || row.projectId !== input.projectId || row.machineId !== input.machineId ||
+        (input.after !== undefined && row.executionWorkspaceId <= input.after))) {
+        throw malformed(contractViolation("execution_workspace_scope"), operationLabel(request));
+      }
+      return page;
     },
     async createWorkspaceBinding(input, idempotencyKey, signal) {
       validateWorkspaceBindingIdentity(input);
