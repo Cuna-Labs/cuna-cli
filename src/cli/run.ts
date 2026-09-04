@@ -55,6 +55,7 @@ import {
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
 import { runNodeMachinesExplorer, type MachinesExplorerRunner } from "../machines/explorer.js";
+import { runWorkspaceSelectionScreen } from "../workspace/selection-screen.js";
 import { isOpenCodeSupervisorUpgradeReason } from "../machines/opencode-supervisor.js";
 import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
@@ -1388,6 +1389,13 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         }
         return EXIT_CODES.success;
       }
+      if (selection.kind === "workspaces") {
+        const identity = await client.getIdentity(dependencies.signal);
+        if (identity.workspaceId === undefined) throw usageError("This account has no assigned workspace.");
+        const outcome = await runWorkspaceSelectionScreen({ client, profileId: config.profile, userId: identity.id, workspaceId: identity.workspaceId, machineId: selection.machineId, stateDirectory: platform.paths.stateDirectory, platform: platform.kind }, dependencies.workspaceRoot ?? process.cwd(), undefined, dependencies.signal);
+        if (outcome === "cancelled") return EXIT_CODES.success;
+        return await runCli(["machines"], dependencies);
+      }
       if (selection.kind === "attach") {
         const attachLabel = foregroundAttachLabel(selection.agent);
         if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, attachLabel);
@@ -1709,7 +1717,13 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
       }, dependencies.now === undefined ? {} : { now: dependencies.now });
       if (selection !== undefined) {
-        if (selection.kind === "attach") {
+        if (selection.kind === "workspaces") {
+          const identity = await client.getIdentity(dependencies.signal);
+          if (identity.workspaceId === undefined) throw usageError("This account has no assigned workspace.");
+          const outcome = await runWorkspaceSelectionScreen({ client, profileId: config.profile, userId: identity.id, workspaceId: identity.workspaceId, machineId: selection.machineId, stateDirectory: platform.paths.stateDirectory, platform: platform.kind }, dependencies.workspaceRoot ?? process.cwd(), undefined, dependencies.signal);
+          if (outcome === "cancelled") return EXIT_CODES.success;
+          return await runCli(["machines"], dependencies);
+        } else if (selection.kind === "attach") {
           const attachLabel = foregroundAttachLabel(selection.agent);
           const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
           if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, attachLabel);

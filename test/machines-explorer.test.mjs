@@ -6,6 +6,21 @@ import { CunaError, runNodeMachinesExplorer } from "../dist/index.js";
 const MACHINE_ID = "33333333-3333-4333-8333-333333333333";
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 
+test("machine detail exposes the exact Machine Workspace selection action", async () => {
+  const host = new FakeHost();
+  const client = {
+    async listMachines() { return { items: [{ id: MACHINE_ID, name: "workspace-machine", state: "running", agent: "codex" }] }; },
+    async listAgentSessions() { return { items: [] }; },
+  };
+  const operation = runNodeMachinesExplorer({ client, color: false }, { host });
+  await waitUntil(() => host.writes.some(write => write.includes("workspace-machine")), "Machine inventory");
+  host.emitInput([0x1b, 0x5b, 0x43]);
+  await waitUntil(() => host.writes.some(write => write.includes("w Workspaces")), "Workspace action");
+  host.emitInput([0x77]);
+  assert.deepEqual(await operation, { kind: "workspaces", machineId: MACHINE_ID });
+  assert.equal(host.restored, 1);
+});
+
 class FakeHost {
   columns = 120;
   rows = 30;
