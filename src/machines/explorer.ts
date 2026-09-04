@@ -1515,7 +1515,7 @@ function renderNewMachineScreen(
     selectedLine = lines.length;
     lines.push(`❯ ${input.newMachineName}▏`);
     if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
-    lines.push("", " type to edit  ·  Backspace delete  ·  Enter create  ·  Esc back");
+    lines.push("", " type to edit  ·  Backspace delete", " Enter create  ·  Esc back");
   }
   return Object.freeze({
     lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))),

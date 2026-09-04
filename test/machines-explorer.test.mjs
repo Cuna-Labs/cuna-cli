@@ -1384,6 +1384,28 @@ for (const state of ["error", "stopped", "running"]) {
   });
 }
 
+test("machine naming keeps create and cancellation instructions visible at 60 columns", async () => {
+  const host = new FakeHost();
+  host.columns = 60;
+  const operation = runNodeMachinesExplorer({ client: {
+    async listMachines() { return { items: [] }; },
+    async listAgentSessions() { return { items: [] }; },
+    async discoverCapabilities(scope, subjectId) { return capabilitySnapshot(scope, subjectId, [supported("machines.create", "financial")]); },
+  } }, { host });
+  try {
+    await waitUntil(() => host.input !== undefined && lastFrame(host).includes("CUNA  ◆── Machines"), "inventory should render");
+    host.emitInput(Buffer.from("n"));
+    await waitUntil(() => lastFrame(host).includes("❯ OpenCode"), "provider menu should open");
+    host.emitInput([0x0d]);
+    await waitUntil(() => lastFrame(host).includes("Name this Machine"), "name input should open");
+    assert.match(lastFrame(host), /Enter create/u);
+    assert.match(lastFrame(host), /Esc back/u);
+  } finally {
+    host.emitInput([0x03]);
+    await operation;
+  }
+});
+
 function lastFrame(host) {
   return stripAnsi(host.writes.at(-1) ?? "");
 }
