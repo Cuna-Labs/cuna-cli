@@ -57,7 +57,7 @@ function fakeClient(overrides = {}) {
     async listMachines() { return { items: [] }; },
     async getMachine(id) { return { id, name: "fixture-machine", state: "running", agent: "claude-code" }; },
     async listRecords() { return []; },
-    async listAuthorizations() { return []; },
+    async listAuthorizations() { return { revision: 1, secret_configuration: [] }; },
     async listApiKeys() { return []; },
     async createApiKey() { throw new Error("unexpected create API key"); },
     async revokeApiKey() { throw new Error("unexpected revoke API key"); },
@@ -830,14 +830,10 @@ test("TC-037-03/07 records and authorizations remain capability-gated read-only 
     },
     async listAuthorizations(id) {
       observed.push({ kind: "authorizations", id });
-      return [{
-        id: "rule-1",
-        host: "api.example.com",
-        path: "/v1",
-        credential: "ANTHROPIC_API_KEY",
-        target: { kind: "header", name: "Authorization", format: "Bearer ${credential}" },
-        cacheTtlSeconds: 60,
-      }];
+      return { revision: 1, secret_configuration: [{
+        secret_id: recordId, environment: [], files: [],
+        egress_rules: [{ host_pattern: "api.example.com", path_pattern: "/v1", action: "header", name: "Authorization", value_template: "Bearer ${credential}" }],
+      }] };
     },
   });
   const records = memoryStreams();
@@ -858,7 +854,7 @@ test("TC-037-03/07 records and authorizations remain capability-gated read-only 
     now: () => Date.parse("2026-08-08T00:00:00Z"),
     clientFactory: () => client,
   }), EXIT_CODES.success);
-  assert.equal(JSON.parse(authorizations.stdout()).data.items[0].credential, "ANTHROPIC_API_KEY");
+  assert.equal(JSON.parse(authorizations.stdout()).data.secret_configuration[0].secret_id, recordId);
   assert.deepEqual(observed, [
     { kind: "capability", scope: "account", resourceId: undefined },
     { kind: "records" },
@@ -958,7 +954,7 @@ test("TC-037-02 unavailable parity capabilities perform no record or authorizati
       return capabilitySnapshot([], scope, resourceId);
     },
     async listRecords() { effects += 1; return []; },
-    async listAuthorizations() { effects += 1; return []; },
+    async listAuthorizations() { effects += 1; return { revision: 1, secret_configuration: [] }; },
   });
   for (const argv of [
     ["records", "list"],

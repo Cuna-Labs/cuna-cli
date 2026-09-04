@@ -922,19 +922,28 @@ export interface JsonObject {
   readonly [key: string]: JsonValue;
 }
 
-export interface CredentialRuleTarget {
-  readonly kind: "header" | "query";
+export interface SecretEnvironmentInjection {
   readonly name: string;
-  readonly format: string;
+  readonly value_template: string;
 }
-
-export interface CredentialRule {
-  readonly id: string;
-  readonly host: string;
+export interface SecretEgressInjection extends SecretEnvironmentInjection {
+  readonly host_pattern: string;
+  readonly path_pattern?: string | null;
+  readonly action: "header" | "query";
+}
+export interface SecretFileInjection {
   readonly path: string;
-  readonly credential: string;
-  readonly target: CredentialRuleTarget;
-  readonly cacheTtlSeconds: number;
+  readonly value_template: string;
+}
+export interface RuntimeSecretConfiguration {
+  readonly secret_id: string;
+  readonly environment: readonly SecretEnvironmentInjection[];
+  readonly egress_rules: readonly SecretEgressInjection[];
+  readonly files: readonly SecretFileInjection[];
+}
+export interface MachineAuthorizations {
+  readonly revision: number;
+  readonly secret_configuration: readonly RuntimeSecretConfiguration[];
 }
 
 export interface ApiKeyMetadata {
@@ -1028,35 +1037,55 @@ export function decodeAuditRecords(value: unknown): readonly AuditRecord[] {
     underField(`[${index}]`, () => decodeAuditRecord(item))));
 }
 
-function decodeCredentialRule(value: unknown): CredentialRule {
-  if (!isObject(value) || !isObject(value.target)) throw contractViolation("object_with_target_object");
-  exactKeys(value, ["id", "host", "path", "credential", "target", "cache_ttl_secs"]);
-  const targetKeys = Object.keys(value.target);
-  const isHeader = targetKeys.length === 2 && targetKeys.includes("header") && targetKeys.includes("format");
-  const isQuery = targetKeys.length === 2 && targetKeys.includes("param") && targetKeys.includes("format");
-  if (isHeader === isQuery) throw contractViolation("exactly_one_target_kind", "target");
-  const cacheTtlSeconds = value.cache_ttl_secs;
-  if (!Number.isSafeInteger(cacheTtlSeconds) || Number(cacheTtlSeconds) < 0 || Number(cacheTtlSeconds) > 86_400) {
-    throw contractViolation("bounded_cache_ttl_seconds", "cache_ttl_secs");
-  }
-  return Object.freeze({
-    id: safePublicString(value.id, "id", 256),
-    host: safePublicString(value.host, "host", 2048),
-    path: safePublicString(value.path, "path", 2048),
-    credential: safePublicString(value.credential, "credential", 64),
-    target: Object.freeze({
-      kind: isHeader ? "header" : "query",
-      name: safePublicString(isHeader ? value.target.header : value.target.param, "target name", 256),
-      format: safePublicString(value.target.format, "target format", 4096),
-    }),
-    cacheTtlSeconds: Number(cacheTtlSeconds),
-  });
+function injectionName(value: unknown, label: string, maximum: number): string {
+  const text = safePublicString(value, label, maximum);
+  if (text.length === 0) throw contractViolation("nonempty_string", label);
+  return text;
 }
 
-export function decodeCredentialRules(value: unknown): readonly CredentialRule[] {
-  if (!Array.isArray(value) || value.length > 1024) throw contractViolation("bounded_array_length");
-  return Object.freeze(value.map((item, index) =>
-    underField(`[${index}]`, () => decodeCredentialRule(item))));
+function injectionTemplate(value: unknown): string {
+  if (typeof value !== "string" || value.length > 4096) throw contractViolation("bounded_string", "value_template");
+  // Templates are opaque metadata, including multiline file content. Preserve
+  // whitespace without interpreting interpolation; reject terminal controls and
+  // known credential values. Human rendering must quote this string.
+  safePublicString(value.replace(/[\r\n\t]/gu, ""), "value_template", 4096);
+  return value;
+}
+
+function injectionArray<T>(value: unknown, label: string, decode: (item: unknown) => T): readonly T[] {
+  if (!Array.isArray(value) || value.length > 64) throw contractViolation("bounded_array_length", label);
+  return Object.freeze(value.map((item, index) => underField(`${label}[${index}]`, () => decode(item))));
+}
+
+export function decodeMachineAuthorizations(value: unknown): MachineAuthorizations {
+  if (!isObject(value)) throw contractViolation("object");
+  exactKeys(value, ["revision", "secret_configuration"]);
+  if (typeof value.revision !== "number" || !Number.isSafeInteger(value.revision) || value.revision < 1) throw contractViolation("positive_safe_integer", "revision");
+  return Object.freeze({ revision: value.revision, secret_configuration: injectionArray(value.secret_configuration, "secret_configuration", (entry) => {
+    if (!isObject(entry)) throw contractViolation("object");
+    exactKeys(entry, ["secret_id", "environment", "egress_rules", "files"]);
+    return Object.freeze({
+      secret_id: canonicalUuid(entry, "secret_id"),
+      environment: injectionArray(entry.environment, "environment", (item) => {
+        if (!isObject(item)) throw contractViolation("object");
+        exactKeys(item, ["name", "value_template"]);
+        return Object.freeze({ name: injectionName(item.name, "name", 256), value_template: injectionTemplate(item.value_template) });
+      }),
+      egress_rules: injectionArray(entry.egress_rules, "egress_rules", (item): SecretEgressInjection => {
+        if (!isObject(item)) throw contractViolation("object");
+        exactKeys(item, ["host_pattern", "action", "name", "value_template", ...(Object.hasOwn(item, "path_pattern") ? ["path_pattern"] : [])]);
+        if (item.action !== "header" && item.action !== "query") throw contractViolation("known_injection_action", "action");
+        return Object.freeze({ host_pattern: injectionName(item.host_pattern, "host_pattern", 253), action: item.action,
+          name: injectionName(item.name, "name", 256), value_template: injectionTemplate(item.value_template),
+          ...(Object.hasOwn(item, "path_pattern") ? { path_pattern: item.path_pattern === null ? null : safePublicString(item.path_pattern, "path_pattern", 4096) } : {}) });
+      }),
+      files: injectionArray(entry.files, "files", (item) => {
+        if (!isObject(item)) throw contractViolation("object");
+        exactKeys(item, ["path", "value_template"]);
+        return Object.freeze({ path: injectionName(item.path, "path", 4096), value_template: injectionTemplate(item.value_template) });
+      }),
+    });
+  }) });
 }
 
 function optionalTimestamp(value: unknown, label: string): string | null {

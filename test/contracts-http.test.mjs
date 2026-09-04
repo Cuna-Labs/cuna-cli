@@ -15,7 +15,7 @@ import {
   decodeAgentSessionAuthLogout,
   decodeAgentSessionTerminalSeat,
   decodeCapabilitySnapshot,
-  decodeCredentialRules,
+  decodeMachineAuthorizations,
   decodeMachinePage,
   decodeCunaIdentity,
   MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
@@ -190,21 +190,11 @@ test("TC-037-09 records and authorization decoders reject secret and terminal-co
   assert.throws(() => decodeAuditRecords([{ ...record, detail: { token: "cuna_sk_abcdefghijk" } }]));
   assert.throws(() => decodeAuditRecords([{ ...record, summary: "safe\u001b[31m" }]));
 
-  const rule = {
-    id: "rule-1",
-    host: "api.example.com",
-    path: "/v1",
-    credential: "ANTHROPIC_API_KEY",
-    target: { header: "Authorization", format: "Bearer ${credential}" },
-    cache_ttl_secs: 60,
-  };
-  assert.deepEqual(decodeCredentialRules([rule])[0].target, {
-    kind: "header",
-    name: "Authorization",
-    format: "Bearer ${credential}",
-  });
-  assert.throws(() => decodeCredentialRules([{ ...rule, target: { header: "Authorization", param: "key", format: "x" } }]));
-  assert.throws(() => decodeCredentialRules([{ ...rule, host: "api.example.com\nforged" }]));
+  const config = { secret_id: "11111111-1111-4111-8111-111111111111", environment: [], files: [],
+    egress_rules: [{ host_pattern: "api.example.com", action: "header", name: "Authorization", value_template: "Bearer ${credential}" }] };
+  assert.deepEqual(decodeMachineAuthorizations({ revision: 1, secret_configuration: [config] }).secret_configuration[0], config);
+  assert.throws(() => decodeMachineAuthorizations({ revision: 1, secret_configuration: [{ ...config, egress_rules: [{ ...config.egress_rules[0], action: "cookie" }] }] }));
+  assert.throws(() => decodeMachineAuthorizations({ revision: 1, secret_configuration: [{ ...config, egress_rules: [{ ...config.egress_rules[0], host_pattern: "api.example.com\nforged" }] }] }));
 });
 
 test("TC-037-03 read-only parity clients use exact record and authorization routes", async () => {
@@ -213,7 +203,7 @@ test("TC-037-03 read-only parity clients use exact record and authorization rout
   const client = createCunaApiClient({
     async request(request) {
       requests.push(request);
-      return [];
+      return request.path.endsWith("/authorizations") ? { revision: 1, secret_configuration: [] } : [];
     },
   });
   await client.listRecords();

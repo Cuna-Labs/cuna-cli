@@ -1356,6 +1356,34 @@ function supported(id, mutationClass = "reversible") {
   return { id, availability: "supported", interaction: "native", mutationClass, surfaces: ["cli"], requiredPermissions: ["machines:write"] };
 }
 
+for (const state of ["error", "stopped", "running"]) {
+  test(`OpenCode detail runtime waiting advice respects machine state ${state}`, async () => {
+    const host = new FakeHost();
+    const operation = runNodeMachinesExplorer({ client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "runtime-check", state, agent: "opencode" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, subjectId) {
+        return capabilitySnapshot(scope, subjectId, [{ ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: "opencode_runtime_unverified" }]);
+      },
+    } }, { host });
+    try {
+      await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Checking whether"), "inventory should settle");
+      host.emitInput([0x1b, 0x5b, 0x43]);
+      await waitUntil(() => lastFrame(host).includes("CUNA  ◆── runtime-check"), "Right should open detail");
+      const frame = lastFrame(host);
+      if (state === "running") {
+        assert.match(frame, /Keep this Machine running/u, "running negative control retains applicable advice");
+      } else {
+        assert.doesNotMatch(frame, /Keep this Machine running|Checking OpenCode runtime/u, "non-running state cannot promise runtime verification progress");
+        assert.match(frame, new RegExp(` ${state} · observation`, "u"));
+      }
+    } finally {
+      host.emitInput([0x03]);
+      await operation;
+    }
+  });
+}
+
 function lastFrame(host) {
   return stripAnsi(host.writes.at(-1) ?? "");
 }
@@ -1727,3 +1755,97 @@ test("E13-R7: a refresh failure after a successful list keeps the rows and names
   host.emitInput([0x71]);
   assert.equal(await operation, undefined);
 });
+
+// Regression matrix for the real explorer controller. Capability evidence may
+// remain unverified while machine state independently says it cannot run.
+for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protocol_unavailable"]) {
+  for (const state of reason === "opencode_runtime_unverified" ? ["paused", "creating"] : ["running", "error", "stopped", "paused", "creating"]) {
+    test(`runtime advice applicability ${reason} on ${state}`, async () => {
+      const host = new FakeHost();
+      const mutations = [];
+      const operation = runNodeMachinesExplorer({ client: {
+        async listMachines() { return { items: [{ id: MACHINE_ID, name: "state-control", state, agent: "opencode" }] }; },
+        async listAgentSessions() { return { items: [] }; },
+        async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
+        async createAgentSession() { mutations.push("create"); },
+        async transitionMachine() { mutations.push("transition"); },
+        async deleteMachine() { mutations.push("delete"); },
+      } }, { host });
+      try {
+        await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
+        if (state !== "running") assert.doesNotMatch(lastFrame(host), /OpenCode runtime not verified yet|Waiting for this Machine's OpenCode terminal supervisor/u);
+        host.emitInput([0x1b, 0x5b, 0x43]);
+        await waitUntil(() => lastFrame(host).includes("CUNA  ◆── state-control"), "Right opens the machine");
+        if (state === "running") assert.match(lastFrame(host), /Keep this Machine running/u);
+        else assert.doesNotMatch(lastFrame(host), /Keep this Machine running|Checking OpenCode runtime|Waiting for this Machine's OpenCode terminal supervisor/u);
+        host.emitInput([0x1b]);
+        await waitUntil(() => lastFrame(host).includes("CUNA  ◆── Machines"), "Escape returns to inventory");
+        assert.deepEqual(mutations, []);
+      } finally { host.emitInput([0x71]); assert.equal(await operation, undefined); }
+      assert.equal(host.restored, 1);
+    });
+  }
+  test(`failed machine does not suppress explicit creation alternatives because of ${reason}`, async () => {
+    const host = new FakeHost();
+    const operation = runNodeMachinesExplorer({ client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "failed-wait", state: "error", agent: "opencode" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
+    } }, { host });
+    try {
+      await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
+      assert.match(lastFrame(host), /No available machine can open an AgentSession/u);
+      assert.match(lastFrame(host), /Create OpenCode machine/u);
+    } finally { host.emitInput([0x71]); assert.equal(await operation, undefined); }
+  });
+  test(`pending stop replaces runtime waiting advice for ${reason}`, async () => {
+    const host = new FakeHost();
+    let releaseStop;
+    const stopped = new Promise((resolve) => { releaseStop = resolve; });
+    const transitions = [];
+    const operation = runNodeMachinesExplorer({ client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "stop-control", state: "running", agent: "opencode" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [supported("machines.lifecycle"), { ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
+      async transitionMachine(id, action) { transitions.push({ id, action }); await stopped; return {}; },
+      async getMachine(id) { return { id, name: "stop-control", state: "stopped", agent: "opencode" }; },
+    } }, { host });
+    try {
+      await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
+      host.emitInput([0x1b, 0x5b, 0x43]);
+      await waitUntil(() => lastFrame(host).includes("❯ Stop machine"), "Stop is selected explicitly");
+      host.emitInput([0x0d]);
+      await waitUntil(() => transitions.length === 1 && lastFrame(host).includes("Stopping…"), "the stop request is pending");
+      assert.doesNotMatch(lastFrame(host), /Keep this Machine running|Checking OpenCode runtime|Waiting for this Machine's OpenCode terminal supervisor/u);
+      host.emitInput([0x1b, 0x5b, 0x44]);
+      await waitUntil(() => lastFrame(host).includes("CUNA  ◆── Machines"), "Left returns while stop pending");
+      assert.doesNotMatch(lastFrame(host), /Create OpenCode machine|No available machine can open an AgentSession|OpenCode runtime not verified yet|Waiting for this Machine's OpenCode terminal supervisor/u);
+      assert.deepEqual(transitions, [{ id: MACHINE_ID, action: "stop" }]);
+    } finally { releaseStop(); host.emitInput([0x71]); assert.equal(await operation, undefined); }
+  });
+  test(`refresh running to error cannot retain active waiting advice for ${reason}`, async () => {
+    const host = new FakeHost();
+    let state = "running";
+    let releaseCapability;
+    let capabilityReads = 0;
+    const delayed = new Promise((resolve) => { releaseCapability = resolve; });
+    const operation = runNodeMachinesExplorer({ client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "refresh-control", state, agent: "opencode" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, id) {
+        if (++capabilityReads > 1) await delayed;
+        return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: reason }]);
+      },
+    } }, { host });
+    try {
+      await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Refreshing live sessions"), "initial running inventory should finish");
+      state = "error"; host.emitInput([0x72]);
+      await waitUntil(() => capabilityReads > 1 && lastFrame(host).includes("refresh-control  error"), "new state is visible before next capability response");
+      assert.doesNotMatch(lastFrame(host), /OpenCode runtime not verified yet|Waiting for this Machine's OpenCode terminal supervisor/u);
+      host.emitInput([0x1b, 0x5b, 0x43]);
+      await waitUntil(() => lastFrame(host).includes("CUNA  ◆── refresh-control"), "open refreshed machine");
+      assert.doesNotMatch(lastFrame(host), /Keep this Machine running|Checking OpenCode runtime|Waiting for this Machine's OpenCode terminal supervisor/u);
+      assert.match(lastFrame(host), / error · observation/u);
+    } finally { releaseCapability(); host.emitInput([0x71]); assert.equal(await operation, undefined); }
+  });
+}

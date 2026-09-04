@@ -23,7 +23,7 @@ import {
   decodeApiKeyList,
   decodeApiKeyCreation,
   decodeCapabilitySnapshot,
-  decodeCredentialRules,
+  decodeMachineAuthorizations,
   decodeMachineItem,
   decodeMachineCreateRequest,
   decodeMachinePage,
@@ -45,7 +45,7 @@ import {
   type ApiKeyCreation,
   type CapabilityScope,
   type CapabilitySnapshot,
-  type CredentialRule,
+  type MachineAuthorizations,
   type Machine,
   type MachineCreateRequest,
   type MachinePage,
@@ -112,7 +112,7 @@ export interface CunaApiClient {
   listMachines(signal?: AbortSignal): Promise<MachinePage>;
   getMachine(id: string, signal?: AbortSignal): Promise<Machine>;
   listRecords(): Promise<readonly AuditRecord[]>;
-  listAuthorizations(machineId: string): Promise<readonly CredentialRule[]>;
+  listAuthorizations(machineId: string): Promise<MachineAuthorizations>;
   listApiKeys(): Promise<readonly ApiKeyMetadata[]>;
   createApiKey(
     input: { readonly name: string; readonly expiresAt?: string },
@@ -470,7 +470,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const safeId = encodeMachineId(machineId);
       return fetchDecoded(
         { method: "GET", path: `/v1/sessions/${safeId}/authorizations` },
-        decodeCredentialRules,
+        decodeMachineAuthorizations,
       );
     },
     async listApiKeys() {
@@ -950,7 +950,7 @@ export async function requireCapability(input: {
     // that case arrived as `cuna.remote.malformed_response` and this branch was
     // unreachable against the one deployment that exists.
     // A 404 means two different things here. On a resource scope it is the
-    // resource saying it does not exist; on the account scope it is the route
+    // resource saying it is unavailable to this account; on account scope it is the route
     // saying discovery is not served, because the account always exists.
     if (
       error instanceof CunaError &&
@@ -961,7 +961,7 @@ export async function requireCapability(input: {
       const subject = input.scope === "machine" ? "Machine" : "AgentSession";
       throw new CunaError({
         code: "cuna.remote.not_found",
-        message: `${subject} ${input.resourceId} does not exist.`,
+        message: `${subject} ${input.resourceId} is not available to this account.`,
         exitCode: EXIT_CODES.remote,
         hint: input.scope === "machine"
           ? "Nothing was attempted. Run `cuna machines list` to see the Machines on this account."

@@ -149,13 +149,16 @@ try {
   assert.equal(exitResult?.exitCode, 0);
   assert.equal(terminal.buffer.active.type, "normal");
   report = {
-    result: "PASS",
+    result: "UNVERIFIED",
+    reason: "Host rendering and a resize request do not attest the remote PTY dimensions; no owning-boundary resize witness is available.",
     sessionId,
     cliEntrypoint,
     observations: {
       cunaAppbar: presentationMode === "rich",
       providerStyles,
-      resize: true,
+      hostResizeRequested: true,
+      hostCompositionAfterResize: presentationMode === "rich" ? "observed" : "unverified",
+      remotePtyResize: "UNVERIFIED",
       oneCtrlC: true,
       restoredScreen: true,
     },
@@ -192,4 +195,4 @@ await new Promise((resolve, reject) => {
 // All assertions, child exit checks, transcript writes, and ConPTY cleanup have
 // completed. Exit explicitly because this harness embeds node-pty, whose
 // Windows native binding may retain non-enumerable handles across versions.
-process.exit(0);
+process.exit(2);

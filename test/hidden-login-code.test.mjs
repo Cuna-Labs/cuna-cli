@@ -48,7 +48,7 @@ test("hidden login-code input suppresses pasted bytes and restores terminal mode
   assert.doesNotMatch(output.text(), new RegExp(LOGIN_CODE, "u"));
 });
 
-test("successful hidden login releases real process stdin and returns the shell prompt", async () => {
+async function hiddenLoginProcess(retainStdin) {
   const runModuleUrl = new URL("../dist/cli/run.js", import.meta.url).href;
   const processModuleUrl = new URL("../dist/cli/process-entrypoint.js", import.meta.url).href;
   const script = `
@@ -57,31 +57,66 @@ test("successful hidden login releases real process stdin and returns the shell 
     Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
     Object.defineProperty(process.stdin, "isRaw", { configurable: true, writable: true, value: false });
     process.stdin.setRawMode = (mode) => { process.stdin.isRaw = mode; return process.stdin; };
+    if (${retainStdin}) {
+      process.stdin.pause = () => process.stdin;
+      process.stdin.destroy = () => process.stdin;
+    }
     process.exitCode = await runProcessCli(["login"], {
       stdin: process.stdin,
       run: async () => {
-        const code = await readHiddenLoginCode(process.stdin, process.stderr);
+        const reading = readHiddenLoginCode(process.stdin, process.stderr);
+        process.stdout.write("CUNA_LOGIN_READER_READY\\n");
+        const code = await reading;
         if (code !== ${JSON.stringify(LOGIN_CODE)}) throw new Error("login code mismatch");
         return 0;
       },
     });
   `;
   const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
-    stdio: ["pipe", "ignore", "ignore"],
+    stdio: ["pipe", "pipe", "ignore"],
     windowsHide: true,
   });
-  child.stdin.write(`${LOGIN_CODE}\r`);
-
+  const closed = new Promise((resolve, reject) => {
+    child.once("close", (code, signal) => resolve({ code, signal }));
+    child.once("error", reject);
+  });
   let timer;
-  const outcome = await Promise.race([
-    new Promise((resolve) => child.once("close", (code, signal) => resolve({ code, signal }))),
-    new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), 2_000); }),
-  ]);
-  clearTimeout(timer);
-  if (outcome === "timeout") child.kill();
+  try {
+    // Import/startup scheduling is not the stdin-release property. Establish
+    // that this child installed its reader before starting the same 2s bound.
+    const ready = new Promise((resolve) => {
+      let text = "";
+      child.stdout.on("data", (chunk) => {
+        text += chunk.toString("utf8");
+        if (text.includes("CUNA_LOGIN_READER_READY\n")) resolve();
+      });
+    });
+    await Promise.race([
+      ready,
+      closed.then(() => { throw new Error("login fixture exited before reader readiness"); }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("login fixture startup timed out")), 15_000); }),
+    ]);
+    clearTimeout(timer);
+    child.stdin.write(`${LOGIN_CODE}\r`);
+    return await Promise.race([
+      closed,
+      new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), 2_000); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await closed;
+  }
+}
 
-  assert.notEqual(outcome, "timeout", "login must exit without waiting for Ctrl-C or stdin EOF");
+test("successful hidden login releases real process stdin and returns the shell prompt", async () => {
+  const outcome = await hiddenLoginProcess(false);
+  assert.notEqual(outcome, "timeout", "login must exit within 2s after input without Ctrl-C or stdin EOF");
   assert.deepEqual(outcome, { code: 0, signal: null });
+});
+
+test("negative control: retaining stdin still fails the post-input exit deadline", async () => {
+  assert.equal(await hiddenLoginProcess(true), "timeout");
 });
 
 /**

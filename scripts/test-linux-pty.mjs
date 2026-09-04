@@ -6,7 +6,7 @@ import process from "node:process";
 const root = path.resolve(import.meta.dirname, "..");
 function unverified(reason, details = {}) {
   console.log(JSON.stringify({ testId: "T14.2-LINUX", result: "UNVERIFIED", reason, ...details }));
-  process.exit(0);
+  process.exit(2);
 }
 
 let output;
@@ -38,3 +38,6 @@ console.log(JSON.stringify({
   oracle: output.trim(),
   qualification: "Native Linux PTY smoke passed; the complete R14.3 Linux interaction matrix remains UNVERIFIED, so PRD-014 remains Draft.",
 }));
+// Keep the narrower successful smoke record, but the acceptance entrypoint
+// cannot pass while its required interaction matrix has not executed.
+unverified("The complete R14.3 Linux interaction matrix has not executed.");

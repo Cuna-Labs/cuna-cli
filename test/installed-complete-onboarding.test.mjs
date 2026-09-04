@@ -1150,7 +1150,7 @@ function createContractAuthority() {
           return send(200, { schema_version: "1.0", subject_scope: scope, ...(resourceId === null ? {} : { subject_id: resourceId }), observed_at: new Date(now - 100).toISOString(), expires_at: new Date(now + 30_000).toISOString(), etag: "installed-e2e", capabilities: [
             { id: "api_keys.manage", availability: "supported", interaction: "native", mutation_class: "secret_revealing", surfaces: ["cli"], required_permissions: ["api_keys:manage", "auth:interactive"] },
             { id: "records.list", availability: "supported", interaction: "read_only", mutation_class: "none", surfaces: ["cli"], required_permissions: ["records:read"] },
-            { id: "authorizations.list", availability: "supported", interaction: "read_only", mutation_class: "none", surfaces: ["cli"], required_permissions: ["authorizations:read"] },
+            { id: "authorizations.list", availability: "supported", interaction: "read_only", mutation_class: "none", surfaces: ["cli"], required_permissions: ["credentials:manage"] },
             { id: "machines.create", availability: "supported", interaction: "native", mutation_class: "reversible", surfaces: ["cli"], required_permissions: ["machines:write"] },
             { id: "machines.lifecycle", availability: "supported", interaction: "native", mutation_class: "reversible", surfaces: ["cli"], required_permissions: ["machines:write"] },
             { id: "machines.delete", availability: "supported", interaction: "native", mutation_class: "destructive", surfaces: ["cli"], required_permissions: ["machines:write"] },
@@ -1170,7 +1170,7 @@ function createContractAuthority() {
         if (request.method === "POST" && url.pathname === `/v1/sessions/${ID}/stop`) { state.machineStatus = "stopped"; return send(200, machine()); }
         if (request.method === "DELETE" && url.pathname === `/v1/sessions/${ID}`) { state.machineDeleted = true; return send(202, { acknowledged: true }); }
         if (request.method === "GET" && url.pathname === "/v1/records") return send(200, []);
-        if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/authorizations`) return send(200, []);
+        if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/authorizations`) return send(200, { revision: 1, secret_configuration: [] });
         if (request.method === "POST" && url.pathname === `/v1/sessions/${ID}/agent-sessions`) { state.agentTerminated = false; state.agentName = body.name ?? "matrix-agent"; return send(201, agentSession()); }
         if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/agent-sessions`) return send(200, { items: state.agentTerminated ? [] : [agentSession()] });
         const foregroundSession = /^\/v1\/agent-sessions\/(5[0123456]000000-0000-4000-8000-000000000005)$/u.exec(url.pathname);

@@ -25,7 +25,10 @@
  * with a reason, never FAILED -- the same distinction the rest of this file
  * already draws between "could not check" and "checked and false".
  *
- * Exit 0 means every witness below was observed. Any failure prints the last
+ * Grant redemption and echoed text cannot establish remote PTY execution.
+ * Until an owning-boundary challenge is available, attach_pty is UNVERIFIED
+ * and this harness cannot return zero, even when its narrower observations pass.
+ * Any failure prints the last
  * screen and the transcript tail, because a journey runner that reports only
  * "failed" costs a second run to learn anything.
  */
@@ -254,9 +257,9 @@ function exactSessionThisRun() {
  *
  * This reads the database directly, which a product surface must never do — but
  * this is a harness, and the alternative is what happened three times today:
- * a screen-shaped proxy that goes green without an attach. A grant can be
- * issued and never consumed, so `redeemed_at` is the fact, and no field the CLI
- * exposes carries it.
+ * a screen-shaped proxy that goes green without a redeemed grant. Redemption
+ * happens before the supervisor completes attachment; it does not prove PTY
+ * readiness, transport delivery or remote execution.
  *
  * Fails CLOSED. If the query cannot run — no Supabase CLI, no session, wrong
  * project — this returns `undefined`, which the caller reports as unwitnessed.
@@ -293,6 +296,7 @@ function terminalRedeemedThisRun(agentSessionId) {
       // instrument was manufacturing the defect it would then have reported.
       { encoding: "utf8", timeout: 120_000, shell: true, cwd: os.tmpdir() },
     );
+    if (out.status !== 0) return undefined;
     const match = /"redeemed":\s*(\d+)/u.exec(out.stdout ?? "");
     if (match === null) return undefined;
     return Number(match[1]) > 0;
@@ -644,17 +648,11 @@ try {
   // `select … from terminal_connections where issued_at > <run start>` returned
   // zero rows. Nothing was attached.
   //
-  // A grant can be issued and never consumed, so the only durable proof is a
-  // `terminal_connections` row with `redeemed_at` set, bound to the exact
-  // `agent_session_id`. The CLI exposes no command that reads that table, so
-  // this harness cannot check it — and every screen-shaped substitute is
-  // satisfiable without an attach. Emitting an unverifiable green is the exact
-  // failure this runner exists to prevent, so it prints the query instead.
-  // So it asks the durable record instead. `redeemed_at` is the fact: a grant
-  // issued and never consumed is not an attach, and no field the CLI exposes
-  // carries it.
+  // The durable record answers the narrower redemption question. A failed
+  // supervisor attachment after redemption is still compatible with that row,
+  // so retain the missing PTY witness separately below.
   await witness(
-    "attach_pty — a terminal grant was REDEEMED during this run",
+    "terminal_grant_redeemed — the exact session had a redeemed grant during this run",
     () => {
       // `undefined` means the probe could not answer, which is NOT the same as
       // "no attach happened". Returning false here reported a defect whenever
@@ -664,13 +662,20 @@ try {
       return attachProbe === true;
     },
     180_000,
-    () => (attachProbe === undefined ? "the durable attach probe never answered" : undefined),
+    () => (attachProbe === undefined ? "the durable grant redemption probe never answered" : undefined),
   );
+  witnesses.push({
+    name: "attach_pty — remote PTY attachment and execution",
+    observed: false,
+    unwitnessable: true,
+    ms: 0,
+    why: "Grant redemption precedes supervisor attachment. This harness has no run-bound remote-process challenge that excludes local or PTY echo.",
+  });
   // A remote frame styled by the provider, not by Cuna's own chrome. Cuna uses
   // truecolor; this is the ANSI-256 signature of the provider's own TUI, so a
   // pass here cannot be the appbar mistaken for the child.
   await witness(
-    "type_and_see_bytes — styled provider frames arrived from the remote process",
+    "provider_style_rendered — ANSI-256 styled frames reached the host transcript",
     () => /\[(?:0;)?(?:[0-9]+;)*38;5;/u.test(transcript),
     30_000,
   );
@@ -691,7 +696,7 @@ try {
     const beforeTyping = transcript.length;
     child.write(`${probeToken}\r`);
     await witness(
-      "type_and_see_bytes — the exact bytes typed came back from the remote process",
+      "typed_text_rendered — the host transcript contains the submitted text (echo is not remote execution)",
       () => transcript.slice(beforeTyping).includes(probeToken),
       30_000,
     );
@@ -832,13 +837,13 @@ const unwitnessed = witnesses.filter((w) => w.unwitnessable === true);
 if (unwitnessed.length > 0 && unwitnessed.some((w) => w.name.startsWith("attach_pty"))) {
   console.log([
     "",
-    "attach_pty must be verified against the durable record:",
+    "Grant redemption is a prerequisite, not a PTY attachment witness:",
     "  select agent_session_id, state, issued_at, redeemed_at",
     "    from public.terminal_connections",
     `   where machine_id = <this machine> and issued_at > '${new Date(runStartedAt).toISOString()}'`,
     "",
-    "A row with redeemed_at set is an attach. No rows means nothing attached,",
-    "however green everything above reads.",
+    "A redeemed_at row proves grant redemption only. Verify an exact-session",
+    "remote-process challenge and its authoritative result before crediting attach_pty.",
   ].join("\n"));
 }
 console.log(`exit=${JSON.stringify(exitResult ?? null)}`);

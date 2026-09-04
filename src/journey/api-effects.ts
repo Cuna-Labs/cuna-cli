@@ -216,7 +216,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         });
       }));
     },
-    async createMachine({ requestedAgent, idempotencyKey, requestId, signal }) {
+    async createMachine({ requestedAgent, idempotencyKey, requestId, onDispatch, signal }) {
       await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create", now, signal });
       if (!await input.authorizeMachineCreate({ requestedAgent, signal })) {
         throw fail(
@@ -225,6 +225,9 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           EXIT_CODES.policy,
         );
       }
+      // Everything above this line fails before anything is sent: the
+      // capability check and the person's own confirmation.
+      onDispatch();
       const machine = await input.client.createMachine({
         name: `cuna-${requestedAgent}-${requestId.slice(0, 8)}`,
         agent: requestedAgent,

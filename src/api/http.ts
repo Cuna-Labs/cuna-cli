@@ -64,6 +64,40 @@ function isOpenCodeAgentSessionCreate(input: Readonly<{
     input.requestBody.agent === "opencode";
 }
 
+/**
+ * The subject a request path names, when it names one.
+ *
+ * A 404 was answered two different ways depending on how the command reached
+ * the server: the ones that pass a resource-scoped capability check named the
+ * Machine or AgentSession, and the rest got "The requested Cuna resource or
+ * operation was not found." The vaguer half is the half a reader meets straight
+ * after typing an id, which is the worst place for it. One 404, one sentence.
+ */
+function notFoundSubject(path: string): { readonly subject: string; readonly id: string } | undefined {
+  // A resource-scoped capability query carries its subject in the query string
+  // rather than the path, and it is the one command whose entire job is a
+  // resource-scoped question -- so it is the last place that should answer with
+  // the general sentence.
+  const scoped = /^\/v\d+\/capabilities\?(?=.*\bscope=(machine|agent_session)\b)(?=.*\bresource_id=([^&]+))/u.exec(path);
+  if (scoped !== null && scoped[1] !== undefined && scoped[2] !== undefined) {
+    return {
+      subject: scoped[1] === "machine" ? "Machine" : "AgentSession",
+      id: decodeURIComponent(scoped[2]),
+    };
+  }
+  const match = /^\/v\d+\/(sessions|agent-sessions|api-keys|workspace-bindings)\/([^/?]+)/u.exec(path);
+  const id = match?.[2];
+  if (match === null || id === undefined) return undefined;
+  const subject = match[1] === "sessions"
+    ? "Machine"
+    : match[1] === "agent-sessions"
+      ? "AgentSession"
+      : match[1] === "api-keys"
+        ? "API key"
+        : "workspace binding";
+  return { subject, id: decodeURIComponent(id) };
+}
+
 function machineIdFromAgentSessionCreatePath(path: string): string | undefined {
   return AGENT_SESSION_CREATE_PATH.exec(path)?.[1];
 }
@@ -395,12 +429,21 @@ function apiError(input: {
       },
     });
   }
+  const subject = status === 404 ? notFoundSubject(input.path) : undefined;
   return new CunaError({
     code: status === 404 ? "cuna.remote.not_found" : "cuna.remote.rejected",
-    message: status === 404 ? "The requested Cuna resource or operation was not found." : "Cuna rejected the request.",
+    message: status !== 404
+      ? "Cuna rejected the request."
+      : subject === undefined
+        ? "The requested Cuna resource or operation was not found."
+        : `${subject.subject} ${subject.id} is not available to this account.`,
     exitCode: EXIT_CODES.remote,
     hint: status === 404
-      ? "The identifier does not name a resource this account can see. Re-list to get a current one."
+      ? subject?.subject === "Machine"
+        ? "Run `cuna machines list` to see the Machines on this account."
+        : subject?.subject === "AgentSession"
+          ? "Run `cuna agent-sessions list --machine <id>` to see the AgentSessions on a Machine."
+          : "The identifier does not name a resource this account can see. Re-list to get a current one."
       : OFF_CONTRACT_RESPONSE_HINT,
     ...(problem === undefined ? {} : { retryable: problem.retryable }),
     details,

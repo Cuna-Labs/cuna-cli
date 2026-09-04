@@ -968,28 +968,26 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         now: context.capabilityClock ?? context.now,
         allowedInteractions: ["read_only"],
       });
-      const rules = await client.listAuthorizations(machineId);
+      const authorizations = await client.listAuthorizations(machineId);
       const data = Object.freeze({
         machine_id: machineId,
-        items: rules.map((rule) => Object.freeze({
-          id: rule.id,
-          host: rule.host,
-          path: rule.path,
-          credential: rule.credential,
-          target: Object.freeze({
-            kind: rule.target.kind,
-            name: rule.target.name,
-            format: rule.target.format,
-          }),
-          cache_ttl_seconds: rule.cacheTtlSeconds,
-        })),
+        ...authorizations,
+      });
+      const lines = authorizations.secret_configuration.flatMap((configuration) => {
+        const binding = `secret:${configuration.secret_id}`;
+        const items = [
+          ...configuration.environment.map((item) => `environment\t${item.name}\t${JSON.stringify(item.value_template)}\t${binding}`),
+          ...configuration.egress_rules.map((item) => `egress:${item.action}\t${item.host_pattern}\tpath:${JSON.stringify(item.path_pattern) ?? "unspecified"}\t${item.name}\t${JSON.stringify(item.value_template)}\t${binding}`),
+          ...configuration.files.map((item) => `file\t${item.path}\t${JSON.stringify(item.value_template)}\t${binding}`),
+        ];
+        return items.length === 0 ? [`${binding}\tNo injection entries configured.`] : items;
       });
       return Object.freeze({
         command: "authorizations.list",
         data,
-        human: rules.length === 0
-          ? "No injection authorizations are active for this machine."
-          : rules.map((rule) => `${rule.id}\t${rule.host}${rule.path}\t${rule.target.kind}:${rule.target.name}\t${rule.credential}`).join("\n"),
+        human: `Configuration revision ${authorizations.revision}\n${lines.length === 0
+          ? "No inline secret configuration is set for this machine."
+          : lines.join("\n")}`,
       });
     }
     case "account": {

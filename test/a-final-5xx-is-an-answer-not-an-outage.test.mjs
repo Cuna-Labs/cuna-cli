@@ -143,3 +143,89 @@ test("NEGATIVE CONTROL: a 5xx carrying no Problem at all is still an outage", as
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// One 404, one sentence.
+//
+// The same missing resource read two ways depending on how the command reached
+// the server: the paths that pass a resource-scoped capability check named the
+// subject and the id, and the rest answered "The requested Cuna resource or
+// operation was not found." The vaguer half is what a reader meets straight
+// after typing an id.
+// ---------------------------------------------------------------------------
+
+const MISSING = "00000000-0000-4000-8000-000000000009";
+
+/**
+ * A 404 the API itself answered. An EMPTY 404 means something else entirely --
+ * this deployment does not serve the operation -- and that distinction is
+ * asserted by its own control below.
+ */
+function notFoundTransport() {
+  return createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: "cuna_sk_abcdefghijklmnop",
+    fetch: async () => new Response(JSON.stringify({
+      type: "https://api.getcuna.com/problems/not_found",
+      title: "Not found",
+      status: 404,
+      code: "not_found",
+      request_id: REQUEST_ID,
+      retryable: false,
+      action: "none",
+    }), { status: 404, headers: { "content-type": "application/problem+json" } }),
+  });
+}
+
+const SUBJECTS = [
+  [`/v1/sessions/${MISSING}`, `Machine ${MISSING} is not available to this account.`, /cuna machines list/u],
+  [`/v1/agent-sessions/${MISSING}`, `AgentSession ${MISSING} is not available to this account.`, /cuna agent-sessions list/u],
+  [`/v1/api-keys/${MISSING}`, `API key ${MISSING} is not available to this account.`, /Re-list to get a current one/u],
+];
+
+for (const [path, message, hint] of SUBJECTS) {
+  test(`a 404 on ${path.split("/")[2]} names the subject and the id`, async () => {
+    await assert.rejects(
+      notFoundTransport().request({ method: "GET", path }),
+      (error) => {
+        assert.equal(error.code, "cuna.remote.not_found");
+        assert.equal(error.message, message);
+        assert.match(error.hint ?? "", hint);
+        return true;
+      },
+    );
+  });
+}
+
+test("NEGATIVE CONTROL: an EMPTY 404 is a route this deployment does not serve", async () => {
+  // Different fact, different code. A resource that does not exist and an
+  // operation this deployment never implemented must not share a sentence.
+  const empty = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: "cuna_sk_abcdefghijklmnop",
+    fetch: async () => new Response("", { status: 404 }),
+  });
+  await assert.rejects(
+    empty.request({ method: "GET", path: `/v1/sessions/${MISSING}` }),
+    (error) => {
+      assert.equal(error.code, "cuna.remote.operation_not_served");
+      return true;
+    },
+  );
+});
+
+test("NEGATIVE CONTROL: a 404 on a path that names no subject keeps the general sentence", async () => {
+  // The subject is derived from the request path. A path with no resource in it
+  // must not have one invented, and this is what would catch a regex that
+  // matches anything.
+  for (const path of ["/v1/capabilities", "/v1/me", "/v1/sessions"]) {
+    await assert.rejects(
+      notFoundTransport().request({ method: "GET", path }),
+      (error) => {
+        assert.equal(error.code, "cuna.remote.not_found", path);
+        assert.equal(error.message, "The requested Cuna resource or operation was not found.", path);
+        return true;
+      },
+    );
+  }
+});

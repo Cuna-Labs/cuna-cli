@@ -1540,8 +1540,27 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           requestedAgent: journeyAgent,
           inspectWorkspace: workspace.inspectWorkspace,
           synchronizeWorkspace: workspace.synchronizeWorkspace,
-          authorizeMachineCreate: async ({ requestedAgent, signal }) =>
-            (dependencies.authorizeMachineCreate ?? confirmMachineCreate)(requestedAgent, signal),
+          // The spinner and the prompt write to the same row of the same
+          // stream, and the spinner repaints every 90 ms, so a question asked
+          // underneath it is erased before it can be read. What a person sees
+          // is "Creating machine" forever, while the CLI waits for an answer to
+          // a question it never showed. Give the row up, ask, take it back.
+          authorizeMachineCreate: async ({ requestedAgent, signal }) => {
+            const resume = inlineJourneyProgress;
+            inlineJourneyProgress?.stop();
+            inlineJourneyProgress = undefined;
+            try {
+              return await (dependencies.authorizeMachineCreate ?? confirmMachineCreate)(requestedAgent, signal);
+            } finally {
+              if (resume !== undefined && streams.stderrIsTTY === true) {
+                inlineJourneyProgress = startInlineProgress(
+                  streams.stderr,
+                  !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+                  journeyPhaseLabel("create-machine", journeyAgent),
+                );
+              }
+            }
+          },
           attach: async ({ agentSessionId, expectedAgent, signal }) => {
             const presentationMode = selectNodeForegroundPresentation({
               platform: nodePlatform(platform.kind),

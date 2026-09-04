@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { CunaError, EXIT_CODES, memoryStreams, runCli } from "../dist/index.js";
+import { CunaError, EXIT_CODES, memoryStreams, requireCapability, runCli } from "../dist/index.js";
 
 const PLATFORM = Object.freeze({
   kind: "linux",
@@ -138,7 +138,7 @@ test("a mistyped resource id is refused here, not reported as a server-contract 
   }
 });
 
-test("a Machine that does not exist is reported as missing, not as a broken deployment", async () => {
+test("a scoped Machine 404 reports account unavailability without claiming global absence", async () => {
   // Measured before: `cuna machines delete <id that never existed> --yes`
   // answered exit 8, "This Cuna deployment does not expose capability
   // discovery. Update the Cuna server contract before retrying." — a
@@ -168,7 +168,7 @@ test("a Machine that does not exist is reported as missing, not as a broken depl
   const record = JSON.parse(streams.stderr().trim().split("\n").at(-1));
   assert.equal(exit, EXIT_CODES.remote);
   assert.equal(record.error.code, "cuna.remote.not_found");
-  assert.equal(record.error.message, `Machine ${missing} does not exist.`);
+  assert.equal(record.error.message, `Machine ${missing} is not available to this account.`);
   assert.match(record.error.hint, /Nothing was attempted\..*cuna machines list/u);
   assert.doesNotMatch(JSON.stringify(record.error), /does not expose capability discovery/u);
   assert.equal(mutated, false, "a missing Machine must not reach a mutation");
@@ -197,4 +197,41 @@ test("a deployment that truly does not serve discovery still says so", async () 
   const record = JSON.parse(streams.stderr().trim().split("\n").at(-1));
   assert.equal(exit, EXIT_CODES.unsupported);
   assert.equal(record.error.code, "cuna.capability.discovery_unavailable");
+});
+
+test("an AgentSession scoped 404 does not distinguish absent from another owner's resource", async () => {
+  const id = "00000000-0000-4000-8000-000000000009";
+  await assert.rejects(() => requireCapability({
+    client: { async discoverCapabilities() { throw new CunaError({ code: "cuna.remote.not_found", message: "Not found.", exitCode: EXIT_CODES.remote }); } },
+    scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.inspect",
+  }), (error) => error instanceof CunaError && error.code === "cuna.remote.not_found" && error.message === `AgentSession ${id} is not available to this account.`);
+});
+
+// ---------------------------------------------------------------------------
+// Two more, from the command-by-command verification of the installed binary.
+// ---------------------------------------------------------------------------
+
+test("an unknown option reads as unknown whether or not a value follows it", async () => {
+  // These answered differently: `--verbose` was told it required a value and
+  // `--verbose x` was told it was unknown, because the parser assumed anything
+  // outside its boolean set took a value. Whether a name is known and whether
+  // it takes a value are separate questions.
+  for (const argv of [["machines", "list", "--verbose"], ["machines", "list", "--verbose", "x"]]) {
+    const run = await refusal(argv);
+    assert.equal(run.exit, EXIT_CODES.usage, argv.join(" "));
+    assert.equal(run.error?.message, "Unknown option --verbose.", argv.join(" "));
+  }
+});
+
+test("NEGATIVE CONTROL: a known option still gets the answer its own shape deserves", async () => {
+  // If the fix had made every option unknown, or every option boolean, these
+  // three would collapse into one message.
+  const missingValue = await refusal(["machines", "list", "--limit"]);
+  assert.equal(missingValue.error?.message, "Option --limit requires a value.");
+
+  const valueOnBoolean = await refusal(["machines", "list", "--json=1"]);
+  assert.equal(valueOnBoolean.error?.message, "Option --json does not accept a value.");
+
+  const twice = await refusal(["machines", "list", "--limit", "1", "--limit", "2"]);
+  assert.equal(twice.error?.message, "Option --limit was provided more than once.");
 });

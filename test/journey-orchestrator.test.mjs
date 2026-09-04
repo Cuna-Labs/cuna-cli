@@ -142,7 +142,9 @@ test("unknown create outcome reconciles with the exact caller-known request ID",
   let reconciledRequestId;
   const fx = effects({
     async observeMachines() { fx.calls.push("observe-machines"); return []; },
-    async createMachine(input) { createRequestId = input.requestId; throw new Error("lost 201"); },
+    // A lost 201 is a POST-dispatch failure, so the stub has to say so: only
+    // what may have been sent is reconcilable.
+    async createMachine(input) { createRequestId = input.requestId; input.onDispatch(); throw new Error("lost 201"); },
     async reconcileMachineCreate(input) {
       reconciledRequestId = input.requestId;
       fx.calls.push("reconciled");
@@ -159,7 +161,7 @@ test("unreconcilable create outcome fails closed without duplicate creation", as
   let creates = 0;
   const fx = effects({
     async observeMachines() { return []; },
-    async createMachine() { creates += 1; throw new Error("lost response"); },
+    async createMachine(input) { creates += 1; input.onDispatch(); throw new Error("lost response"); },
     async reconcileMachineCreate() { return "unreconcilable"; },
   });
   await assert.rejects(
@@ -335,4 +337,36 @@ test("a free exact session is reused without a create; a held one is refused nam
       error.details?.target_id === SESSION &&
       /cannot observe/u.test(error.hint ?? ""),
   );
+});
+
+test("a refusal before dispatch is the caller's answer, not a server 404", async () => {
+  // The confirmation is asked inside the create effect, so declining fails
+  // BEFORE anything is sent. Reconciling then asks the server about a request
+  // it never received: it answers 404, and that 404 replaces the person's own
+  // decision — exit 7 "the resource was not found" for what they chose at
+  // exit 4, with advice to re-list an id they had just declined to create.
+  let reconciles = 0;
+  const fx = effects({
+    async observeMachines() { return []; },
+    async createMachine() {
+      // `onDispatch` is deliberately NOT called: nothing left the process.
+      throw new CunaError({
+        code: "cuna.journey.machine_create_not_authorized",
+        message: "Machine creation was not authorized.",
+        exitCode: EXIT_CODES.policy,
+      });
+    },
+    async reconcileMachineCreate() { reconciles += 1; return "unreconcilable"; },
+  });
+  await assert.rejects(
+    orchestrateAgentJourney({ intent: intent(), effects: fx, scope: SCOPE }),
+    (error) => {
+      assert.equal(error.code, "cuna.journey.machine_create_not_authorized");
+      assert.equal(error.exitCode, EXIT_CODES.policy);
+      return true;
+    },
+  );
+  // The control that matters: the journey must not have asked the server about
+  // a request it never sent.
+  assert.equal(reconciles, 0);
 });

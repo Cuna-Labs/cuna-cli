@@ -193,7 +193,7 @@ export function assertRegisteredCliRoute(parsed: ParsedInvocation): CliRouteDefi
       available,
     );
   }
-  throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run \`cuna --help\`.");
+  throw usageError(`Unknown command ${parsed.command ?? "<none>"}.`, "Run `cuna --help`.");
 }
 
 const BOOLEAN_OPTIONS = new Set([
@@ -216,6 +216,44 @@ const BOOLEAN_OPTIONS = new Set([
   "all",
 ]);
 
+/**
+ * Every option that takes a value, anywhere in the CLI.
+ *
+ * The parser has to decide whether a token is a flag or a name expecting a
+ * value before any command sees it, and without this it assumed "not boolean,
+ * therefore takes a value". A mistyped flag then got two contradictory answers:
+ * `--verbose` was told it required a value, and `--verbose x` was told it was
+ * unknown. Whether a name is known and whether it takes a value are separate
+ * questions, and the parser can only answer the first from a list it holds.
+ *
+ * A name here that no command accepts is refused later by
+ * `rejectUnknownOptions`, which is per-command and stricter. This set only
+ * decides the shape of the parse.
+ */
+const VALUE_OPTIONS = new Set([
+  "agent",
+  "agent-session",
+  "auth-mode",
+  "base-url",
+  "config-file",
+  "credential-binding",
+  "cursor",
+  "cwd",
+  "expires-at",
+  "idempotency-key",
+  "limit",
+  "machine",
+  "memory-mib",
+  "name",
+  "profile",
+  "resource-id",
+  "scope",
+  "timeout-ms",
+  "vcpus",
+  "workspace-binding-id",
+  "workspace-generation",
+]);
+
 function optionName(raw: string): string {
   if (!/^[a-z][a-z0-9-]*$/u.test(raw)) throw usageError(`Invalid option --${raw}.`);
   return raw;
@@ -236,6 +274,9 @@ export function parseArgv(argv: readonly string[]): ParsedInvocation {
       const separator = token.indexOf("=");
       const name = optionName(token.slice(2, separator === -1 ? undefined : separator));
       if (Object.hasOwn(options, name)) throw usageError(`Option --${name} was provided more than once.`);
+      if (!BOOLEAN_OPTIONS.has(name) && !VALUE_OPTIONS.has(name)) {
+        throw usageError(`Unknown option --${name}.`, "Run `cuna <command> --help` to see the options it accepts.");
+      }
       if (BOOLEAN_OPTIONS.has(name)) {
         if (separator !== -1) throw usageError(`Option --${name} does not accept a value.`);
         options[name] = true;

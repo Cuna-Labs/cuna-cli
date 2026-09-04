@@ -91,6 +91,11 @@ export interface AgentJourneyEffects {
     readonly requestedAgent: AgentKind;
     readonly idempotencyKey: string;
     readonly requestId: string;
+    /**
+     * Called immediately before the create request leaves this process, and
+     * never if it does not. Only what may have been sent can be reconciled.
+     */
+    readonly onDispatch: () => void;
     readonly signal: AbortSignal;
   }): Promise<JourneyMachine>;
   /**
@@ -384,24 +389,31 @@ export async function orchestrateAgentJourney(input: {
         machine: input.intent.machine,
       });
       const requestId = createIdentity.requestId;
+      // Set when the request actually leaves this process. A capability check
+      // or a declined confirmation fails BEFORE that, and reconciling then asks
+      // the server about a request it was never sent: it answers 404, and that
+      // 404 replaces the person's own decision with "the resource was not
+      // found" at exit 7, for what they chose at exit 4.
+      let dispatched = false;
       try {
         machine = await boundary({
           phase: "create-machine", signal, effects: input.effects, ledger,
-          action: () => {
-            // Recorded before dispatch: from here on an interrupted journey has
-            // a request identity to reconcile against.
-            ledger.machineCreateRequestId = requestId;
-            return input.effects.createMachine({
-              requestedAgent: input.intent.agent,
-              idempotencyKey: createIdentity.idempotencyKey,
-              requestId,
-              signal,
-            });
-          },
+          action: () => input.effects.createMachine({
+            requestedAgent: input.intent.agent,
+            idempotencyKey: createIdentity.idempotencyKey,
+            requestId,
+            onDispatch: () => {
+              // From here on an interrupted journey has a request identity to
+              // reconcile against.
+              dispatched = true;
+              ledger.machineCreateRequestId = requestId;
+            },
+            signal,
+          }),
         });
         ledger.createdMachineId = machine.id;
       } catch (createError) {
-        if (signal.aborted) throw createError;
+        if (signal.aborted || !dispatched) throw createError;
         const reconciled = await boundary({
           phase: "reconcile-machine-create", signal, effects: input.effects, ledger,
           action: () => input.effects.reconcileMachineCreate({

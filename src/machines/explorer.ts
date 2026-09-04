@@ -1210,10 +1210,10 @@ function renderMachinesExplorer(input: {
       if (row.sessionsError !== undefined) children.push(`${row.sessionsError}; showing last confirmed sessions`);
       else children.push("No AgentSessions");
       if (row.opencodeSupervisorRepairReason !== undefined) children.push(openCodeRepairSummary(row));
-      if (row.opencodeSupervisorProtocolUnavailable) children.push(openCodeSupervisorProtocolWaitSummary());
+      if (row.opencodeSupervisorProtocolUnavailable && canWaitForOpenCodeRuntime(row)) children.push(openCodeSupervisorProtocolWaitSummary());
       // Only a running machine can be verified; on a stopped or errored one
       // the line is noise the reader cannot act on.
-      if (row.opencodeRuntimeUnverified && row.machine.state === "running") children.push("OpenCode runtime not verified yet");
+      if (row.opencodeRuntimeUnverified && canWaitForOpenCodeRuntime(row)) children.push("OpenCode runtime not verified yet");
       for (const [childIndex, child] of children.entries()) {
         lines.push(`    ${childIndex === children.length - 1 ? "└─" : "├─"} ${child}`);
       }
@@ -1238,10 +1238,10 @@ function renderMachinesExplorer(input: {
       lines.push(`     ${openCodeRepairSummary(row)}`);
       if (hasLegacySupervisorBlockedOpenCodeSession(row)) lines.push(`     ${legacySupervisorRecoveryRoute()}`);
     }
-    if (row.opencodeSupervisorProtocolUnavailable) {
+    if (row.opencodeSupervisorProtocolUnavailable && canWaitForOpenCodeRuntime(row)) {
       lines.push(`     ${openCodeSupervisorProtocolWaitSummary()}`);
     }
-    if (row.opencodeRuntimeUnverified && row.machine.state === "running") {
+    if (row.opencodeRuntimeUnverified && canWaitForOpenCodeRuntime(row)) {
       lines.push("     OpenCode runtime not verified yet");
     }
   }
@@ -1334,12 +1334,12 @@ function renderContextScreen(input: {
       lines.push(" Protected: stop this Machine yourself after ending only the sessions you no longer need.");
     }
   }
-  if (row.opencodeSupervisorProtocolUnavailable) {
+  if (row.opencodeSupervisorProtocolUnavailable && canWaitForOpenCodeRuntime(row)) {
     lines.push("");
     lines.push(` ${openCodeSupervisorProtocolWaitSummary()}`);
     lines.push(" Keep this Machine running; Cuna refreshes status automatically. Press r to check now.");
   }
-  if (row.opencodeRuntimeUnverified) {
+  if (row.opencodeRuntimeUnverified && canWaitForOpenCodeRuntime(row)) {
     lines.push("");
     lines.push(" Checking OpenCode runtime. No new OpenCode session was requested.");
     lines.push(" Keep this Machine running; Cuna refreshes status automatically. Press r to check now.");
@@ -1417,17 +1417,20 @@ function shouldOfferGlobalCreation(
   if (!machinesListed) return false;
   if (rows.length === 0) return true;
   return rows.every((row) => {
+    // A requested transition has its own convergence path. It is not yet
+    // evidence that this Machine is unusable and a replacement is needed.
+    if (row.pendingLifecycle !== undefined) return false;
     // `temporarily_unavailable` is not evidence that another Machine is
     // needed. Do not turn a runtime verification wait into a misleading
     // create affordance (and a possible extra billable resource).
-    if (row.opencodeRuntimeUnverified) return false;
+    if (row.opencodeRuntimeUnverified && canWaitForOpenCodeRuntime(row)) return false;
     // A current supervisor-repair prerequisite names the existing Machine
     // that needs attention. Offering a global OpenCode create beside it turns
     // a safe repair into an accidental extra Machine.
     if (row.opencodeSupervisorRepairReason !== undefined) return false;
     // An unannounced supervisor is a transient observation wait. It is not
     // proof that another Machine is needed or that this one should be changed.
-    if (row.opencodeSupervisorProtocolUnavailable) return false;
+    if (row.opencodeSupervisorProtocolUnavailable && canWaitForOpenCodeRuntime(row)) return false;
     if (row.sessionsLoading === true) return false;
     if (row.sessionsError !== undefined) return false;
     if (row.sessionCreateCapabilityState !== "verified") return false;
@@ -1753,6 +1756,12 @@ function openCodeRepairSummary(row: MachineRow): string {
 
 function openCodeSupervisorProtocolWaitSummary(): string {
   return "Waiting for this Machine's OpenCode terminal supervisor; no new OpenCode session was requested";
+}
+
+function canWaitForOpenCodeRuntime(row: MachineRow): boolean {
+  // Preserve the capability observation, but apply its wait advice only to
+  // a running Machine with no lifecycle request already changing that state.
+  return row.machine.state === "running" && row.pendingLifecycle === undefined;
 }
 
 function isUnobservedLaunchedSession(session: AgentSession): boolean {

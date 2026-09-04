@@ -13,11 +13,11 @@ import xtermHeadless from "@xterm/headless";
 const { Terminal } = xtermHeadless;
 if (process.platform !== "win32") {
   console.log(JSON.stringify({ testId: "T14.2-WIN", result: "UNVERIFIED", reason: "requires Windows x64 ConPTY" }));
-  process.exit(0);
+  process.exit(2);
 }
 if (process.arch !== "x64") {
   console.log(JSON.stringify({ testId: "T14.2-WIN", result: "UNVERIFIED", reason: `Windows ${process.arch} is outside the declared Windows x64 environment` }));
-  process.exit(0);
+  process.exit(2);
 }
 
 const MACHINE_ID = "33333333-3333-4333-8333-333333333333";
@@ -749,4 +749,7 @@ try {
   if (server.listening) await closeServer();
   await rm(sandbox, { recursive: true, force: true });
 }
-process.exit(0);
+// The cases above cover the deterministic slice, as their qualification says.
+// Keep that evidence without turning an unexecuted full acceptance into success.
+console.log(JSON.stringify({ testId: "T14.2-WIN", result: "UNVERIFIED", reason: "The deterministic Windows slice passed; complete PRD-014 acceptance has not executed." }));
+process.exit(2);
