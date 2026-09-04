@@ -1,4 +1,5 @@
 import {createHash} from "node:crypto";
+import {resolve} from "node:path";
 import type {CunaApiClient} from "../api/client.js";
 import type {ExecutionWorkspace} from "../api/execution-workspaces.js";
 import {CunaError,EXIT_CODES} from "../core/errors.js";
@@ -25,7 +26,7 @@ function stableId(text:string):string {
   return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
 }
 export async function readWorkspaceSelectionSource(context:WorkspaceSelectionContext,path:string,signal?:AbortSignal):Promise<WorkspaceBindingRecord> {
-  const loaded=await loadWorkspaceBindingIntent({startPath:path,profileId:context.profileId,userId:context.userId,workspaceId:context.workspaceId});
+  const loaded=await loadWorkspaceBindingIntent({startPath:resolve(path),profileId:context.profileId,userId:context.userId,workspaceId:context.workspaceId});
   if(loaded===undefined)refusal("Choose a folder already linked to this Project. Open an agent in that folder first if the Project has no binding.");
   const record=loaded.record;
   if(record.machineId!==context.machineId)refusal("This folder belongs to another Machine. Select its Machine before managing Workspaces.");
@@ -53,7 +54,7 @@ export async function saveWorkspaceSelection(context:WorkspaceSelectionContext,s
     if(source[key]!==displayedSource[key])refusal("The displayed Project context changed. Go back and reload it before confirming a Workspace.");
   }
   if(JSON.stringify(source.rootIdentity)!==JSON.stringify(displayedSource.rootIdentity))refusal("The Project folder identity changed. Reload it before confirming a Workspace.");
-  const policy=await inspectWorkspaceSyncPolicy({localRoot:destinationPath,filesystemCapabilities:conservativeFilesystemCapabilities(context.platform)});
+  const policy=await inspectWorkspaceSyncPolicy({localRoot:resolve(destinationPath),filesystemCapabilities:conservativeFilesystemCapabilities(context.platform)});
   const existing=await loadWorkspaceBindingIntent({startPath:policy.canonicalRoot,boundaryPath:policy.canonicalRoot,profileId:context.profileId,userId:context.userId,workspaceId:context.workspaceId});
   if(existing!==undefined)refusal("The selected folder already has a Workspace binding. Choose a different folder; its existing binding was preserved.");
   const localInstanceId=stableId(JSON.stringify(["cuna.workspace.selection.v1",context.workspaceId,context.userId,source.projectId,policy.canonicalRoot,context.stateDirectory]));
