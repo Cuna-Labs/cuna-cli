@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { TextDecoder, TextEncoder } from "node:util";
+import { TERMINAL_FRAME_TYPES } from "./generated/terminal-wire-v1.js";
 import { DEPLOYED_WIRE_COMPATIBILITY } from "../core/deployed-wire-compatibility.js";
 
 export const TERMINAL_PROTOCOL = DEPLOYED_WIRE_COMPATIBILITY.terminalProtocol;
@@ -36,27 +37,7 @@ const HEADER_BYTES = 20;
 const MAGIC = Uint8Array.of(0x52, 0x54, 0x50, 0x31); // RTP1
 const CRITICAL_FLAG = 0x01;
 
-export const TERMINAL_FRAME_TYPES = Object.freeze({
-  ready: 1,
-  input: 2,
-  output: 3,
-  resize: 4,
-  signal: 5,
-  heartbeat: 6,
-  exit: 7,
-  error: 8,
-  acknowledgement: 9,
-  resume: 10,
-  local_action_request: 11,
-  local_action_result: 12,
-  local_stream_open: 13,
-  local_stream_data: 14,
-  local_stream_close: 15,
-  local_stream_window_update: 16,
-  // Server -> client: the terminal's writer seat moved (a transfer). Carries
-  // the new writer epoch, who holds it, and this attachment's own access mode.
-  writer_epoch: 17,
-} as const);
+export { TERMINAL_FRAME_TYPES } from "./generated/terminal-wire-v1.js";
 
 export type TerminalFrameType = keyof typeof TERMINAL_FRAME_TYPES;
 export type TerminalConnectionState = "negotiating" | "ready" | "attached" | "draining" | "interrupted" | "closed";
