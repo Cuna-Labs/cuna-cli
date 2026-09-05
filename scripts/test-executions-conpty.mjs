@@ -11,7 +11,7 @@ const {spawn}=createRequire(path.join(root,'test/windows-conpty/package.json'))(
 const directory=await mkdtemp(path.join(tmpdir(),'cuna-executions-menu-'));
 const results=[];
 try{
-  for(const mode of ['root','machines','lost','launch','launch-lost']){
+  for(const mode of ['root','machines','lost','launch','launch-lost','reopen','reopen-absent']){
     const ledger=path.join(directory,mode+'.jsonl');
     const terminal=new xterm.Terminal({allowProposedApi:true,cols:110,rows:26,scrollback:1000});
     let raw='',tail=Promise.resolve(),exit;const inputs=[],screens=[];
@@ -41,6 +41,21 @@ try{
         send('\r');await wait(()=>screen().includes(mode==='launch-lost'?'Command outcome is unconfirmed':'Exit code: 4'),'Single dispatch outcome');
         assert.ok(screen().includes('Recovery ID saved'));
         send('r');await wait(()=>screen().includes('Process ownership: descendants_live'),'Inspect same launched execution');
+      }else if(mode.startsWith('reopen')){
+        const original=results.find(r=>r.mode==='launch-lost');
+        const operationId=original.events.find(e=>e.event==='receipt-before-dispatch').operationId;
+        assert.notEqual(child.pid,original.pid);
+        send('l');await wait(()=>screen().includes(operationId),'Previous process recovery ID discovered');
+        for(let step=0;!screen().includes(`> ${operationId}`)&&step<3;step++){
+          const before=screen();send('\x1b[B');await wait(()=>screen()!==before,'Select saved operation');
+        }
+        assert.ok(screen().includes(`> ${operationId}`));
+        send('\r');await wait(()=>screen().includes(mode==='reopen-absent'?'No matching authoritative execution':'Process ownership: descendants_live'),'Saved ID readback without replay');
+        if(mode==='reopen'){
+          assert.ok(screen().includes(`Execution: ${operationId}`));
+          send('\x1b');await wait(()=>screen().includes('Saved attempts on this computer'),'Back preserves saved selection');
+        }
+        send('\x1b');await wait(()=>screen().includes('exited / descendants_live'),'Return to remote inventory');
       }else{
       send('\x1b[B');await wait(()=>screen().includes('> 20000000'),'Arrow stays within one item');
       send('\r');await wait(()=>screen().includes('Process ownership: descendants_live'),'Exact operation inspected');
@@ -56,13 +71,15 @@ try{
       await wait(()=>screen().includes('Process ownership: descendants_live'),'Narrow terminal shows ownership');
       send('r');await wait(()=>screen().includes('ownership is cleared'),'Readback confirms cleanup without replay');
       }
-      send('\x1b');await wait(()=>screen().includes(mode.startsWith('launch')?'exited / descendants_live':'exited / cleared'),'Back returns to inventory');
+      if(!mode.startsWith('reopen')){
+        send('\x1b');await wait(()=>screen().includes(mode.startsWith('launch')?'exited / descendants_live':'exited / cleared'),'Back returns to inventory');
+      }
       send('\x1b');await wait(()=>screen().includes('execution-menu-fixture'),'Back returns to Machines');
       send('\x03');await Promise.race([exited,new Promise((_,reject)=>{const t=setTimeout(()=>reject(new Error('process did not exit')),10000);t.unref();})]);
       await tail;
       const events=(await readFile(ledger,'utf8')).trim().split('\n').map(JSON.parse);
       results.push({mode,pid:child.pid,inputs,screens,events,exit,raw,rawSha256:createHash('sha256').update(raw).digest('hex')});
-      assert.equal(events.filter(e=>e.method==='POST').length,1);assert.equal(exit.exitCode,0);
+      assert.equal(events.filter(e=>e.method==='POST').length,mode.startsWith('reopen')?0:1);assert.equal(exit.exitCode,0);
       assert.equal(terminal.buffer.active.type,'normal');
     }catch(error){
       if(process.argv[2])await writeFile(path.resolve(process.argv[2])+'.failed.json',JSON.stringify({status:'FAIL',mode,error:String(error),results,current:{inputs,screens,raw,exit}},null,2));

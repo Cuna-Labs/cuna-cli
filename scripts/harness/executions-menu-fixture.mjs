@@ -27,6 +27,10 @@ const recovery=createCunaApiClient({async request(r){
     return {exit_code:4,stdout:'remote fixture output\n',stderr:'',duration_ms:1,stdout_truncated:false,stderr_truncated:false};
   }
   if(launched&&r.path===`/v1/sessions/${id(1)}/executions/${launched}`)return {...row(),operation_id:launched};
+  if(mode.startsWith('reopen')&&r.method==='GET'&&r.path.startsWith(`/v1/sessions/${id(1)}/executions/`)){
+    if(mode==='reopen-absent')throw Error('synthetic absent execution');
+    return {...row(),operation_id:r.path.split('/').at(-1)};
+  }
   if(r.path===`/v1/sessions/${id(1)}/executions`)return {machine_id:id(1),items:[row()],next_cursor:null};
   if(r.path===`/v1/sessions/${id(1)}/executions/${id(2)}/cancel`&&r.method==='POST'){
     cancelled=true;if(mode==='lost')throw new Error('synthetic response loss');return row();

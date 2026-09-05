@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {mkdtemp,readFile,rm} from 'node:fs/promises';
+import {mkdtemp,readFile,rm,writeFile,mkdir,symlink} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {prepareManagedCommand} from '../dist/machines/command-launch.js';
-import {saveExecutionReceipt} from '../dist/machines/execution-receipt.js';
+import {saveExecutionReceipt,listExecutionReceipts} from '../dist/machines/execution-receipt.js';
 import {createPlatformAdapter} from '../dist/platform/adapter.js';
 import {runExecutionsScreen} from '../dist/machines/executions-screen.js';
 const id=n=>`${n}0000000-0000-4000-8000-000000000001`;
@@ -101,4 +101,58 @@ test('interactive CRLF paste needs review and confirmation; disk failure is expl
       if(!diskFailure)assert.deepEqual(sends[0][3].args,['-c','echo one\necho two']);
     }finally{host.key('\x03');await run;assert.equal(host.restored,1);}
   }
+});
+
+test('reopened receipt discovery binds profile, endpoint, principal and Machine',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'cuna-reopened-executions-'));
+  const platform={...createPlatformAdapter(),paths:{stateDirectory:root}};
+  const scope={baseUrl:'https://example.invalid',profile:'default',userId:id(4)};
+  try{
+    assert.deepEqual(await listExecutionReceipts(platform,scope,id(1)),[]);
+    await saveExecutionReceipt(platform,scope,id(1),id(3),id(6));
+    await saveExecutionReceipt(platform,scope,id(5),id(3),id(7));
+    const reopened={...createPlatformAdapter(),paths:{stateDirectory:root}};
+    assert.deepEqual((await listExecutionReceipts(reopened,scope,id(1))).map(r=>r.operationId),[id(6)]);
+    for(const other of [{...scope,profile:'other'},{...scope,userId:id(8)},{...scope,baseUrl:'https://other.invalid'}]){
+      assert.deepEqual(await listExecutionReceipts(reopened,other,id(1)),[]);
+    }
+    const abort=new AbortController();abort.abort();await assert.rejects(listExecutionReceipts(reopened,scope,id(1),abort.signal));
+  }finally{await rm(root,{recursive:true,maxRetries:3,retryDelay:100});}
+});
+
+test('corrupt, foreign and linked receipt files never become remote lookup targets',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'cuna-receipt-validation-'));
+  const platform={...createPlatformAdapter(),paths:{stateDirectory:root}};
+  const scope={baseUrl:'https://example.invalid',profile:'default',userId:id(4)};
+  try{
+    const file=await saveExecutionReceipt(platform,scope,id(1),id(3),id(6));
+    const original=JSON.parse(await readFile(file,'utf8'));
+    for(const change of [{version:2},{operationId:id(7)},{scope:'wrong'},{command:'DO_NOT_DISCLOSE'},{machineId:'../private'}]){
+      await writeFile(file,JSON.stringify({...original,...change}));
+      await assert.rejects(listExecutionReceipts(platform,scope,id(1)),error=>!error.message.includes('DO_NOT_DISCLOSE'));
+    }
+    await rm(file);const linked=join(root,'link-target');await mkdir(linked);
+    await symlink(linked,file,process.platform==='win32'?'junction':'dir');
+    await assert.rejects(listExecutionReceipts(platform,scope,id(1)),/Unsafe execution recovery record/);
+  }finally{await rm(root,{recursive:true,maxRetries:3,retryDelay:100});}
+});
+
+test('saved attempts remain inspectable after reopen and absence never resends or selects a remote neighbor',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'cuna-receipt-screen-'));
+  try{
+    const f=fixture(),host=new Host(),gets=[];
+    f.environment.platform={...createPlatformAdapter(),paths:{stateDirectory:root}};
+    const scope={baseUrl:f.environment.baseUrl,profile:f.environment.profile,userId:f.identity.id};
+    await saveExecutionReceipt(f.environment.platform,scope,id(1),id(3),id(6));
+    f.client.listManagedExecutions=async()=>({machineId:id(1),items:[{operationId:id(7),leaderState:'exited',ownershipState:'cleared'}],nextCursor:null});
+    f.client.getManagedExecution=async(_machine,op)=>{gets.push(op);throw Error('absent');};
+    const run=runExecutionsScreen(f.client,id(1),host,undefined,f.environment);
+    try{
+      await see(host,id(7));host.key('l');await see(host,id(6));assert.doesNotMatch(host.screen,new RegExp(id(7)));
+      host.key('\r');await see(host,'No matching authoritative execution');assert.deepEqual(gets,[id(6)]);
+      host.key('\r');await see(host,'No matching authoritative execution');assert.deepEqual(gets,[id(6),id(6)]);
+      f.identity.id=id(8);host.key('r');await see(host,'No saved attempts');host.key('\r');
+      await new Promise(r=>setTimeout(r,20));assert.deepEqual(gets,[id(6),id(6)]);assert.equal(f.calls.length,0);
+    }finally{host.key('\x03');await run;}
+  }finally{await rm(root,{recursive:true,maxRetries:3,retryDelay:100});}
 });

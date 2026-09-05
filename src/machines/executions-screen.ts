@@ -7,6 +7,7 @@ import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
 import type { ForegroundTerminalHost } from "../terminal/foreground.js";
 import { prepareManagedCommand, type CommandLaunchEnvironment, type PreparedCommand } from "./command-launch.js";
+import { listExecutionReceipts, type ExecutionReceipt } from "./execution-receipt.js";
 
 function wrappedLines(text: string, columns: number): string[] {
   const lines: string[] = [];
@@ -41,6 +42,7 @@ export async function runExecutionsScreen(client: CunaApiClient, machineId: stri
   let receiptPath = "", commandOutput = "", outputOffset = 0;
   let pastedCR = false, invalidInput = false;
   let commandOffset = 0, visibleCommandRows: string[] = [];
+  let localMode = false, localItems: readonly ExecutionReceipt[] = [];
   const textDecoder = new TextDecoder();
   let finish!: (reason: "back" | "cancelled") => void;
   const done = new Promise<"back" | "cancelled">((resolve) => { finish = resolve; });
@@ -75,6 +77,13 @@ export async function runExecutionsScreen(client: CunaApiClient, machineId: stri
         detail.ownershipState === "cleared" ? " Process ownership is cleared." : " Process cleanup is not confirmed.");
       if (detail.reason !== null) lines.push(` Reason: ${detail.reason}`);
       if (confirm) lines.push("", " Cancel this execution and its descendants?", " Enter confirms / Esc returns");
+    } else if (localMode) {
+      lines.push(" Saved attempts on this computer", " A saved ID does not prove the command reached the server.");
+      if (localItems.length === 0) lines.push(" No saved attempts for this account and Machine.");
+      const count = Math.max(1, dimensions.rows - 11), start = Math.max(0, index - count + 1);
+      for (const [offset, item] of localItems.slice(start, start + count).entries()) {
+        lines.push(`${start + offset === index ? " >" : "  "} ${item.operationId}`);
+      }
     } else if (page !== undefined) {
       if (page.items.length === 0) lines.push(" No executions in this page.");
       const count = Math.max(1, Math.floor((dimensions.rows - 9) / 2));
@@ -87,7 +96,9 @@ export async function runExecutionsScreen(client: CunaApiClient, machineId: stri
     lines.push("", busy ? prepared !== undefined ? " Working… Ctrl+C closes observation; remote work may continue." : " Reading remote state… Ctrl+C closes observation." :
       prepared !== undefined ? commandAttempted ? " ↑↓ scroll output / r inspect attempt / Esc back / Ctrl+C close" : " Ctrl+C closes without sending." :
       detail !== undefined ? " r refresh / c cancel / Esc back / Ctrl+C close" :
-        ` ↑↓ select / Enter inspect / r refresh / n next / b previous / Esc back${launchEnvironment ? " / x run" : ""}`);
+        localMode ? " ↑↓ select / Enter inspect / r reload saved IDs / Esc remote list" :
+        " ↑↓ select / Enter inspect / r refresh / n next / b previous / Esc back");
+    if (!busy && prepared === undefined && detail === undefined && !localMode && launchEnvironment) lines.push(" x run command / l saved attempts");
     if (notice) lines.push(notice);
     const frame = "\x1b[H\x1b[2J" + lines.slice(0, Math.max(1, dimensions.rows - 1))
       .map(line => truncateTerminalLine(sanitizeHumanTerminalOutput(line), dimensions.columns)).join("\r\n");
@@ -118,23 +129,38 @@ export async function runExecutionsScreen(client: CunaApiClient, machineId: stri
   };
   const perform = async (action: "list" | "inspect" | "cancel") => {
     if (busy || closed) return;
-    const selectedId = detail?.operationId ?? page?.items[index]?.operationId;
+    const selectedReceipt = localMode ? localItems[index] : undefined;
+    const selectedId = detail?.operationId ?? (localMode ? selectedReceipt?.operationId : page?.items[index]?.operationId);
     if (action !== "list" && selectedId === undefined) return;
     busy = true; notice = ""; render();
     try {
       if (action === "list") {
+        if (localMode && launchEnvironment !== undefined) {
+          const selected = localItems[index]?.operationId;
+          localItems = [];
+          const identity = await client.getIdentity(abort.signal);
+          localItems = await listExecutionReceipts(launchEnvironment.platform,
+            { baseUrl: launchEnvironment.baseUrl, profile: launchEnvironment.profile, userId: identity.id }, machineId, abort.signal);
+          index = Math.max(0, localItems.findIndex(item => item.operationId === selected));
+        } else {
         const selected = page?.items[index]?.operationId;
         page = await client.listManagedExecutions(machineId, cursor === undefined ? {} : { after: cursor }, abort.signal);
         index = Math.max(0, page.items.findIndex(item => item.operationId === selected));
+        }
       } else {
-        detail = action === "cancel" ? await client.cancelManagedExecution(machineId, selectedId!, abort.signal) :
+        const observed = action === "cancel" ? await client.cancelManagedExecution(machineId, selectedId!, abort.signal) :
           await client.getManagedExecution(machineId, selectedId!, abort.signal);
+        if (selectedReceipt !== undefined && observed.executionWorkspaceId !== selectedReceipt.executionWorkspaceId) {
+          throw new Error("The server returned another Workspace for the saved execution ID.");
+        }
+        detail = observed;
         if (action === "cancel") notice = " Cancellation accepted. Refresh to observe cleanup.";
       }
     } catch (error) {
       // Keep the exact selected ID on uncertain cancellation; refresh observes it
       // without replaying the mutation or selecting a neighboring operation.
       notice = action === "cancel" ? " Cancellation not confirmed. Press r to inspect this execution." :
+        localMode && action === "inspect" ? " No matching authoritative execution observed. ID retained; Enter inspects again without resending." :
         error instanceof CunaError ? error.message : " Could not read execution state. Press r to retry.";
     } finally {
       busy = false; confirm = false; render();
@@ -148,6 +174,7 @@ export async function runExecutionsScreen(client: CunaApiClient, machineId: stri
       render();
     } else if (confirm) { confirm = false; render(); }
     else if (detail !== undefined) { detail = undefined; notice = ""; void perform("list"); }
+    else if (localMode) { localMode = false; notice = ""; index = 0; void perform("list"); }
     else close("back");
   };
   const input = host.onInput(bytes => {
@@ -169,7 +196,7 @@ export async function runExecutionsScreen(client: CunaApiClient, machineId: stri
         } else if (!paste && !busy && prepared !== undefined && !commandAttempted && (char === "A" || char === "B")) {
           commandOffset += char === "A" ? -1 : 1; render();
         } else if (!paste && !busy && prepared === undefined && detail === undefined && (char === "A" || char === "B")) {
-          index = Math.max(0, Math.min((page?.items.length ?? 1) - 1, index + (char === "A" ? -1 : 1))); render();
+          index = Math.max(0, Math.min((localMode ? localItems.length : page?.items.length ?? 1) - 1, index + (char === "A" ? -1 : 1))); render();
         }
         sequence = ""; continue;
       }
@@ -212,14 +239,17 @@ export async function runExecutionsScreen(client: CunaApiClient, machineId: stri
         continue;
       }
       if (paste) continue;
-      if (byte === 120 && detail === undefined && launchEnvironment !== undefined) { void launch(); return; }
+      if (byte === 108 && detail === undefined && launchEnvironment !== undefined && !localMode) {
+        localMode = true; index = 0; localItems = []; void perform("list"); return;
+      }
+      if (byte === 120 && detail === undefined && launchEnvironment !== undefined && !localMode) { void launch(); return; }
       if (byte === 13 || byte === 10) { void perform(confirm ? "cancel" : "inspect"); return; }
       if (byte === 114 && !confirm) { void perform(detail === undefined ? "list" : "inspect"); return; }
       if (byte === 99 && detail !== undefined && !confirm) { confirm = true; notice = ""; render(); return; }
-      if (byte === 110 && detail === undefined && page?.nextCursor) {
+      if (byte === 110 && detail === undefined && !localMode && page?.nextCursor) {
         prior.push(cursor); cursor = page.nextCursor; page = undefined; index = 0; void perform("list"); return;
       }
-      if (byte === 98 && detail === undefined && prior.length) {
+      if (byte === 98 && detail === undefined && !localMode && prior.length) {
         cursor = prior.pop(); page = undefined; index = 0; void perform("list"); return;
       }
       if (byte === 127 || byte === 8) { back(); return; }
