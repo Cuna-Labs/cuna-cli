@@ -21,6 +21,42 @@ test("machine detail exposes the exact Machine Workspace selection action", asyn
   assert.equal(host.restored, 1);
 });
 
+test("creation choice selection is reconciled across a deferred session refresh", async () => {
+  const host = new FakeHost();
+  let reads = 0;
+  let resolveSessions;
+  let keyWhileOldCreationFrameVisible = false;
+  const operation = runNodeMachinesExplorer({ client: {
+    async listMachines() { return { items: [{ id: MACHINE_ID, name: "errored-only", state: "error", agent: "opencode" }] }; },
+    async listAgentSessions() {
+      if (++reads === 1) return { items: [] };
+      keyWhileOldCreationFrameVisible = lastFrame(host).includes("Create OpenCode machine");
+      host.emitInput([0x1b, 0x5b, 0x42]);
+      return new Promise(resolve => { resolveSessions = resolve; });
+    },
+    async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [supported("agent_sessions.workspace.create")]); },
+  } }, { host });
+  try {
+    await waitUntil(() => lastFrame(host).includes("Create OpenCode machine") && !lastFrame(host).includes("Refreshing live sessions"), "settled creation choices");
+    host.emitInput([0x1b, 0x5b, 0x42]);
+    await waitUntil(() => lastFrame(host).includes("❯ Create OpenCode machine"), "settled Down selects rendered creation choice");
+    host.emitInput([0x72]);
+    await waitUntil(() => resolveSessions !== undefined && lastFrame(host).includes("Refreshing live sessions"), "deferred refresh is rendered");
+    assert.equal(keyWhileOldCreationFrameVisible, true, "input can arrive before the pending refresh repaint");
+    assert.doesNotMatch(lastFrame(host), /❯ ▾ errored-only/u, "Down preserves navigation through the last painted choices");
+    assert.doesNotMatch(lastFrame(host), /Create OpenCode machine/u, "refresh temporarily removes creation choices");
+    host.emitInput([0x0d]);
+    assert.equal(host.restored, 0, "a retained creation selection cannot execute against pending authority");
+    resolveSessions({ items: [] });
+    await waitUntil(() => lastFrame(host).includes("Create OpenCode machine") && !lastFrame(host).includes("Refreshing live sessions"), "same-state refresh restores creation choices");
+    await waitUntil(() => lastFrame(host).includes("❯ Create OpenCode machine"), "the visible choice selected during refresh is restored");
+  } finally {
+    resolveSessions?.({ items: [] });
+    host.emitInput([0x71]);
+    assert.equal(await operation, undefined);
+  }
+});
+
 class FakeHost {
   columns = 120;
   rows = 30;

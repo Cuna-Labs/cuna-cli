@@ -204,6 +204,7 @@ export async function runNodeMachinesExplorer(
   }
   let rows: readonly MachineRow[] = [];
   let selectedKey: SelectionKey | undefined;
+  let paintedSelectionKeys: readonly SelectionKey[] = [];
   let loadingPhase: LoadingPhase = "machines";
   // A rendered inventory is one completed observation. Keep evaluating that
   // snapshot at the time it was received while a slower refresh is in flight;
@@ -300,6 +301,7 @@ export async function runNodeMachinesExplorer(
             newMachine,
             newMachineName,
           });
+          const frameSelectionKeys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized);
           const visible = selectVisibleLines(frame, terminalRows);
           const painted = paintMachinesExplorer(visible, columns, input.color ?? false);
           const sizeChanged = previousColumns !== undefined && (previousColumns !== columns || previousRows !== terminalRows);
@@ -313,6 +315,7 @@ export async function runNodeMachinesExplorer(
           await host.write(encoder.encode(
             `\u001b[?2026h\u001b[?25l${initialClear}\u001b[H${outputLines.map((line) => `${line}\u001b[K`).join("\r\n")}\u001b[?2026l`,
           ));
+          paintedSelectionKeys = frameSelectionKeys;
         }
       })
       .catch((error) => {
@@ -652,7 +655,9 @@ export async function runNodeMachinesExplorer(
     lifecycleNotice = undefined;
     pendingSupervisorUpdateMachineId = undefined;
     pendingDeleteMachineId = undefined;
-    const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized);
+    // Arrow input refers to the choices the user has actually seen. Refresh
+    // may already have changed the model while its repaint is still queued.
+    const keys = paintedSelectionKeys;
     if (keys.length === 0) return;
     const currentIndex = selectedKey === undefined ? -1 : keys.indexOf(selectedKey);
     const origin = currentIndex < 0 ? (delta > 0 ? -1 : keys.length) : currentIndex;
@@ -663,7 +668,8 @@ export async function runNodeMachinesExplorer(
 
   const reconcileSelection = (): void => {
     const keys = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized);
-    if (selectedKey === undefined || !keys.includes(selectedKey)) selectedKey = keys[0];
+    const pendingCreation = loadingPhase === "sessions" && selectedKey?.startsWith("create:") === true;
+    if (selectedKey === undefined || (!keys.includes(selectedKey) && !pendingCreation)) selectedKey = keys[0];
     render();
   };
 
@@ -951,6 +957,10 @@ export async function runNodeMachinesExplorer(
           }
         }
       } else if (selectedKey?.startsWith("create:") === true) {
+        if (!selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized).includes(selectedKey)) {
+          render();
+          return false;
+        }
         const agent = selectedKey.slice("create:".length) as ActionableProvider;
         selection = Object.freeze({ kind: "launch", agent });
         stop();
