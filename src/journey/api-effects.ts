@@ -391,6 +391,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           if (session.workspaceFailureCode !== undefined) {
             const messages: Record<string, string> = {
               "workspace.remote_edits": "Remote edits prevent synchronization. Preserve and reconcile those edits before retrying.",
+              "workspace.in_use": "This workspace is still in use or waiting for a previous session to finish. Inspect its sessions before retrying.",
               "workspace.replacement_requires_fence": "This Workspace cannot replace its files while writer exclusion is unverified. Its existing files were preserved.",
               "workspace.materialization_manifest_limit": "This Workspace exceeds the runtime file manifest limit. Reduce the synchronized file set before retrying.",
             };

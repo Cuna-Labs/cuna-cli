@@ -2494,6 +2494,32 @@ test("input acceptance scope reconnect releases the bounded current window witho
   } finally { await runtime.shutdown(); }
 });
 
+for (const code of ["opencode_server_exited", "unknown_provider_failure"]) {
+  test(`terminal provider error uses only an exact known message: ${code}`, async () => {
+    const system = new FakeTerminalSystem();
+    const { runtime } = createRuntime(system);
+    try {
+      system.connectionsWithoutReady.add(1);
+      const opening = runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+      const checked = assert.rejects(opening, error => {
+        assert.equal(error.safeDetails?.reason, code);
+        if (code === "opencode_server_exited") {
+          assert.match(error.message, /OpenCode's server stopped.*Inspect this session/);
+          assert.equal(error.retryable, false);
+        } else {
+          assert.equal(error.message, "The Cuna terminal gateway rejected the connection.");
+          assert.equal(error.retryable, true);
+        }
+        return true;
+      });
+      await waitUntil(() => system.connections.length === 1, "initial provider connection");
+      system.connections[0].incoming.push(encodeTerminalControl("error", 0n, { code, retryable: true, safeReason: "provider_unavailable" }));
+      await checked;
+      assert.equal(system.createCalls.length, 1, "no replacement or automatic retry");
+    } finally { await runtime.shutdown(); }
+  });
+}
+
 for (const phase of ["initial", "live", "reconnect"]) {
   test(`input recovery ERROR is permanent and preserves its specific reason: ${phase}`, async () => {
     const system = new FakeTerminalSystem();

@@ -1712,8 +1712,10 @@ export class CunaRuntimeBoundary {
     const payload = decodeTerminalControl(frame);
     return runtimeFailure("terminal_protocol_error", payload.code === "terminal_input_recovery_required"
       ? "Terminal input requires recovery. Reconnecting cannot confirm earlier input delivery."
+      : payload.code === "opencode_server_exited"
+        ? "OpenCode's server stopped. Inspect this session before starting another session."
       : "The Cuna terminal gateway rejected the connection.", {
-      retryable: payload.retryable === true,
+      retryable: payload.code !== "opencode_server_exited" && payload.retryable === true,
       safeDetails: { reason: typeof payload.code === "string" ? payload.code : "terminal_error" },
     });
   }

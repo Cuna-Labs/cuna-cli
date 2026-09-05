@@ -30,6 +30,14 @@ test('failed materialization is a typed terminal outcome before any readiness sl
   await assert.rejects(effects.ensureAgentSessionReady({agentSessionId:id(1),signal:new AbortController().signal}),e=>e.code==='cuna.journey.workspace_materialization_failed'&&e.details.reason==='workspace.remote_edits'&&/remote edits/i.test(e.message));
   assert.equal(reads,1);
 });
+test('workspace owner refusal explains inspection without retrying or replacing the session',async()=>{
+  let reads=0;
+  const effects=createApiAgentJourneyEffects({client:{async getAgentSession(){reads++;return {requestState:'failed',processState:'starting',workspaceFailureCode:'workspace.in_use'};}},requestedAgent:'codex',async sleep(){throw new Error('must not retry known refusal');}});
+  await assert.rejects(effects.ensureAgentSessionReady({agentSessionId:id(1),signal:new AbortController().signal}),e=>
+    e.code==='cuna.journey.workspace_materialization_failed'&&e.details.reason==='workspace.in_use'&&/still in use or waiting for a previous session to finish.*Inspect its sessions/.test(e.message));
+  assert.equal(reads,1);
+});
+
 test('readiness timeout retains the admitted session identity and read-only recovery hint',async()=>{
   let reads=0;
   const effects=createApiAgentJourneyEffects({client:{async getAgentSession(sessionId){
