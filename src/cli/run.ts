@@ -672,13 +672,20 @@ function writeTerminalSupervisorReadiness(
   stream: Writable,
   color: boolean,
   state: TerminalSupervisorReadiness,
+  sessionIds: readonly string[],
 ): void {
   const accent = (value: string): string => color ? `\u001b[38;5;202m\u001b[1m${value}\u001b[0m` : value;
-  const success = (value: string): string => color ? `\u001b[38;5;42m${value}\u001b[0m` : value;
+  const inspection = (): void => {
+    for (const id of sessionIds.slice(0, 4)) {
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(id)) {
+        stream.write(`Inspect: cuna agent-sessions get ${id}\n`);
+      }
+    }
+  };
   if (state === "ended") {
-    stream.write(`${accent("◆ CUNA")}  This AgentSession's process has ended\n`);
-    stream.write("The Machine restarted, so the exact process and terminal cannot be recovered.\n");
-    stream.write(`${success("Cuna did not attach a terminal and did not change the remote AgentSession.")}\n`);
+    stream.write(`${accent("◆ CUNA")}  This AgentSession's terminal cannot be recovered\n`);
+    stream.write("The exact process or retained terminal is no longer available.\n");
+    inspection();
     stream.write("Start a fresh one with `cuna <claude|codex|opencode> --new-session`.\n");
     return;
   }
@@ -692,19 +699,19 @@ function writeTerminalSupervisorReadiness(
     stream.write(`${accent("◆ CUNA")}  Terminal connection not ready\n`);
     stream.write("Cuna could not verify this machine's terminal authority yet.\n");
   } else {
-    stream.write(`${accent("◆ CUNA")}  Waiting for the machine terminal supervisor\n`);
-    stream.write("The machine is reconnecting its terminal control.\n");
+    stream.write(`${accent("◆ CUNA")}  Machine terminal supervisor unavailable\n`);
+    stream.write("Cuna could not verify live terminal control for this AgentSession.\n");
   }
-  if (state === "unverified") {
-    stream.write(`${success("Cuna did not attach a terminal and did not change the remote AgentSession.")}\n`);
-    stream.write("Open this same AgentSession again in a moment.\n");
+  // This error can follow a redeemed connection and an automatic retry. Its
+  // capability reason cannot prove that no earlier connection or effect exists.
+  stream.write("Cuna could not complete this terminal attachment.\n");
+  inspection();
+  if (state === "unverified" || state === "waiting") {
+    stream.write("Check this AgentSession's current state before retrying; it may have ended.\n");
   } else {
-    stream.write(`${success("No terminal connection was created and the remote AgentSession was not changed.")}\n`);
     stream.write(state === "lease_expired"
       ? "Wait for a fresh runtime observation, then open this same AgentSession again.\n"
-      : state === "upgrade_required"
-        ? "After the stopped-machine supervisor update, open this same AgentSession again.\n"
-        : "When the machine terminal control reconnects, open this same AgentSession again.\n");
+      : "After the stopped-machine supervisor update, open this same AgentSession again.\n");
   }
 }
 
@@ -887,6 +894,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   // journey cancellation error from `cuna opencode` before it reached the PTY.
   let interactiveCloseUi = false;
   let interactiveCloseColor = false;
+  let terminalSessionIds: readonly string[] = [];
+  const runForeground: ForegroundSessionRunner = async (input) => {
+    terminalSessionIds = [...input.agentSessionIds];
+    await (dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions)(input);
+  };
   try {
     const parsed = parseArgv(argv);
     if (!booleanOption(parsed, "help") && (booleanOption(parsed, "version") || parsed.command === "version")) {
@@ -1432,7 +1444,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const attachLabel = foregroundAttachLabel(selection.agent);
         if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, attachLabel);
         else streams.stderr.write(`Cuna: ${attachLabel.charAt(0).toLowerCase()}${attachLabel.slice(1)}...\n`);
-        const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
+        const runner = runForeground;
         try {
           await runner({
             client,
@@ -1589,7 +1601,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           },
         });
         stopJourneyWorkspace = () => workspace.stopContinuousSync();
-        const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
+        const runner = runForeground;
         effects = createApiAgentJourneyEffects({
           client,
           requestedAgent: journeyAgent,
@@ -1688,7 +1700,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       if (inlineJourneyProgress !== undefined) inlineJourneyProgress.update(attachLabel);
       else if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, attachLabel);
       else streams.stderr.write(`Cuna: ${attachLabel.toLowerCase()}...\n`);
-      const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
+      const runner = runForeground;
       try {
         await runner({
           client,
@@ -1780,7 +1792,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
           if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, attachLabel);
           else streams.stderr.write(`Cuna: ${attachLabel.charAt(0).toLowerCase()}${attachLabel.slice(1)}...\n`);
-          const foregroundRunner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
+          const foregroundRunner = runForeground;
           try {
             await foregroundRunner({
               client,
@@ -1911,6 +1923,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         streams.stderr,
         interactiveCloseColor && streams.stderrIsTTY === true,
         supervisorReadiness,
+        terminalSessionIds,
       );
       // A process that is gone is a final refusal, not a network condition:
       // retrying cannot change it, so the exit code must not say "retry".

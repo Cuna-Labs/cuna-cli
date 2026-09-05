@@ -95,11 +95,24 @@ export async function runNodeForegroundSessions(
     // foreground composition exactly once; this mints fresh one-use authority
     // and never repeats user input or an established terminal interaction.
     await new Promise<void>((resolve) => setTimeout(resolve, 250));
-    await runNodeForegroundSessionsOnce(input, dependencies);
+    try {
+      await runNodeForegroundSessionsOnce(input, dependencies);
+    } catch (retryError) {
+      if (retryError instanceof RuntimeBoundaryError) {
+        throw new RuntimeBoundaryError({
+          code: retryError.code,
+          message: retryError.message,
+          retryable: retryError.retryable,
+          safeDetails: { ...retryError.safeDetails, prior_attempt_code: error.code },
+          cause: new AggregateError([error, retryError], "Both terminal attachment attempts failed."),
+        });
+      }
+      throw retryError;
+    }
   }
 }
 
-function retryableEarlyTerminalFailure(error: unknown): boolean {
+function retryableEarlyTerminalFailure(error: unknown): error is RuntimeBoundaryError {
   if (!(error instanceof RuntimeBoundaryError) || error.code !== "terminal_disconnected") return false;
   return (error.retryable && /before negotiation completed/u.test(error.message)) ||
     error.message === "The passthrough terminal connection ended." ||

@@ -245,6 +245,39 @@ test("one pre-negotiation ticket race is recovered without repeating user input"
   assert.equal(host.restored, 2);
 });
 
+test("a failed early-terminal retry preserves the first typed failure alongside fresh capability refusal", async () => {
+  const events = [], host = new FakeHost(events), system = terminalSystem(events);
+  const first = runtimeFailure("terminal_disconnected", "The terminal WebSocket failed before negotiation completed.", { retryable: true });
+  const second = runtimeFailure("capability_unknown", "Current terminal authority is unavailable.", {
+    retryable: false, safeDetails: { capability_id: "terminal_connections.create", reason_code: "supervisor_registry_unavailable" },
+  });
+  const discover = system.controlPlane.discoverCapabilities.bind(system.controlPlane);
+  let connections = 0, retryReads = 0;
+  system.controlPlane.discoverCapabilities = async (...args) => {
+    if (connections > 0) { retryReads++; throw second; }
+    return await discover(...args);
+  };
+  await assert.rejects(runNodeForegroundSessions({
+    client: fakeClient(events), baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A],
+    hostPlatform: "win32", presentationMode: "plain",
+  }, {
+    host, controlPlane: system.controlPlane, clock: () => NOW,
+    terminalConnector: { async connect() { connections++; throw first; } },
+  }), error => {
+    assert.equal(error.code, second.code);
+    assert.equal(error.message, second.message);
+    assert.equal(error.retryable, second.retryable);
+    assert.deepEqual(error.safeDetails, { ...second.safeDetails, prior_attempt_code: first.code });
+    assert.ok(error.cause instanceof AggregateError);
+    assert.deepEqual(error.cause.errors, [first, second], "causal order remains available without flattening error messages into safe metadata");
+    return true;
+  });
+  assert.equal(connections, 1, "retry capability refusal precedes another connection");
+  assert.equal(retryReads, 1, "only one bounded retry is attempted");
+  assert.equal(host.acquired, 1);
+  assert.equal(host.restored, 1, "the first attempt is cleaned before retry capability discovery");
+});
+
 test("one early post-ready passthrough close is recovered without another command", async () => {
   const events = [];
   const host = new FakeHost(events);

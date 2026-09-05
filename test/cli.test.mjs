@@ -479,7 +479,7 @@ test("bare cuna explains a replaced terminal link without exposing resume-handle
   assert.doesNotMatch(visible, /terminal_connection_resume_handle_conflict|request_id|Re-read the resource/u);
 });
 
-test("foreground Cuna explains a terminal supervisor that is not ready without creating another terminal", async () => {
+test("foreground Cuna explains unavailable terminal control without asserting unobserved effects", async () => {
   const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
   const exit = await runCli([], {
     streams: interactive.streams,
@@ -506,9 +506,9 @@ test("foreground Cuna explains a terminal supervisor that is not ready without c
 
   assert.equal(exit, EXIT_CODES.policy);
   const visible = stripAnsi(interactive.stderr());
-  assert.match(visible, /CUNA  Waiting for the machine terminal supervisor/u);
-  assert.match(visible, /No terminal connection was created and the remote AgentSession was not changed/u);
-  assert.match(visible, /When the machine terminal control reconnects, open this same AgentSession again/u);
+  assert.match(visible, /CUNA  Machine terminal supervisor unavailable/u);
+  assert.doesNotMatch(visible, /No terminal connection was created|remote AgentSession was not changed/u);
+  assert.match(visible, /Check this AgentSession's current state before retrying; it may have ended/u);
   assert.doesNotMatch(visible, /Error \[/u);
 });
 
@@ -538,8 +538,9 @@ test("foreground Cuna translates a terminal-capability abstention without leakin
   const visible = stripAnsi(interactive.stderr());
   assert.match(visible, /CUNA  Terminal connection not ready/u);
   assert.match(visible, /could not verify this machine's terminal authority yet/u);
-  assert.match(visible, /did not attach a terminal and did not change the remote AgentSession/u);
-  assert.match(visible, /Open this same AgentSession again in a moment/u);
+  assert.match(visible, /Cuna could not complete this terminal attachment/u);
+  assert.doesNotMatch(visible, /did not attach a terminal|did not change the remote AgentSession/u);
+  assert.match(visible, /Check this AgentSession's current state before retrying; it may have ended/u);
   assert.doesNotMatch(visible, /terminal_connections\.create|Error \[/u);
 });
 
@@ -568,7 +569,8 @@ test("bare Cuna keeps the terminal-capability recovery human when Windows expose
   assert.equal(exit, EXIT_CODES.policy);
   const visible = interactive.stderr();
   assert.match(visible, /CUNA  Terminal connection not ready/u);
-  assert.match(visible, /did not attach a terminal and did not change the remote AgentSession/u);
+  assert.match(visible, /Cuna could not complete this terminal attachment/u);
+  assert.doesNotMatch(visible, /did not attach a terminal|did not change the remote AgentSession/u);
   assert.doesNotMatch(visible, /terminal_connections\.create|Error \[/u);
   // Kept out of the regex above on purpose: a control character inside a
   // pattern trips no-control-regex, and suppressing the rule would hide the
@@ -609,12 +611,12 @@ test("foreground Cuna explains an expired AgentSession runtime lease without pre
   const visible = stripAnsi(interactive.stderr());
   assert.match(visible, /CUNA  AgentSession needs a fresh runtime check/u);
   assert.match(visible, /has not recently confirmed that this selected AgentSession is still running/u);
-  assert.match(visible, /No terminal connection was created and the remote AgentSession was not changed/u);
+  assert.doesNotMatch(visible, /No terminal connection was created|remote AgentSession was not changed/u);
   assert.match(visible, /Wait for a fresh runtime observation, then open this same AgentSession again/u);
   assert.doesNotMatch(visible, /reconnecting its terminal control|Error \[/u);
 });
 
-test("foreground Cuna renders an unrecoverable AgentSession as ended with a route, never as a wait", async () => {
+test("foreground Cuna renders an unrecoverable terminal with exact-session recovery, never an invented restart", async () => {
   // Measured 2026-09-02 after edge v147 settled a session across a Machine
   // restart: the edge answered `terminal_owner_unrecoverable` and the CLI said
   // "Terminal connection not ready … Open this same AgentSession again in a
@@ -645,8 +647,10 @@ test("foreground Cuna renders an unrecoverable AgentSession as ended with a rout
 
   assert.equal(exit, EXIT_CODES.policy);
   const visible = stripAnsi(interactive.stderr());
-  assert.match(visible, /CUNA  This AgentSession's process has ended/u);
+  assert.match(visible, /CUNA  This AgentSession's terminal cannot be recovered/u);
   assert.match(visible, /cannot be recovered/u);
+  assert.doesNotMatch(visible, /Machine restarted|machine restarted|No terminal connection was created|remote AgentSession was not changed/u);
+  assert.ok(visible.includes(`cuna agent-sessions get ${FOREGROUND_SESSION_A}`), "recovery inspects the exact selected session before suggesting replacement");
   assert.match(visible, /--new-session/u);
   assert.doesNotMatch(visible, /again in a moment|Wait for a fresh runtime observation|reconnecting its terminal control|Error \[/u);
 });
@@ -679,7 +683,7 @@ test("foreground Cuna recognizes the OpenCode supervisor-upgrade reason without 
   assert.equal(exit, EXIT_CODES.policy);
   const visible = stripAnsi(interactive.stderr());
   assert.match(visible, /CUNA  Machine terminal update needed/u);
-  assert.match(visible, /No terminal connection was created and the remote AgentSession was not changed/u);
+  assert.doesNotMatch(visible, /No terminal connection was created|remote AgentSession was not changed/u);
   assert.doesNotMatch(visible, /Error \[/u);
 });
 
