@@ -248,6 +248,85 @@ function createRuntime(system, extra = {}) {
   return { runtime, states, outputs };
 }
 
+function geometryWire(payload, critical=false) {
+  const bytes=encodeTerminalControl("heartbeat",999n,payload);
+  const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+  view.setUint16(6,18,false);view.setUint8(5,critical?1:0);return bytes;
+}
+
+test("remote geometry is unknown until an exact epoch notice, awaited before following output", async () => {
+  const system=new FakeTerminalSystem();system.seatOnReady.set("agent-a",{accessMode:"observer",writerEpoch:1});
+  let entered=false,release; const events=[];
+  const {runtime}=createRuntime(system,{
+    onTerminalGeometry:async event=>{entered=true;events.push(event.snapshot.geometry);await new Promise(resolve=>{release=resolve;});events.push("resized");},
+    onTerminalOutput:event=>events.push(new TextDecoder().decode(event.bytes)),
+  });
+  try {
+    const first=await runtime.attach({tabId:"tab-a",agentSessionId:"agent-a",columns:60,rows:22});
+    assert.equal(first.geometry,null);
+    const wire=system.connections[0];
+    wire.incoming.push(geometryWire({columns:143,rows:51,writerEpoch:1}));
+    wire.incoming.push(encodeTerminalFrame({type:"output",critical:true,sequence:1n,payload:new TextEncoder().encode("after-size")}));
+    await waitUntil(()=>entered,"geometry callback entered");
+    assert.equal(events.length,1);release();
+    await waitUntil(()=>events.length===3,"output follows completed geometry application");
+    assert.deepEqual(events,[{columns:143,rows:51,writerEpoch:1},"resized","after-size"]);
+    assert.equal(wire.sent.map(decodeTerminalFrame).some(frame=>frame?.type==="resize"),false);
+  } finally { release?.();await runtime.shutdown(); }
+});
+
+test("remote geometry rejects malformed, critical, stale epoch and bounded stalled consumers", async () => {
+  for (const [payload,critical,stall] of [
+    [{columns:0,rows:24,writerEpoch:1},false,false],
+    [{columns:80,rows:24,writerEpoch:2},false,false],
+    [{columns:80,rows:24,writerEpoch:1},true,false],
+    [{columns:80,rows:24,writerEpoch:1,extra:true},false,false],
+    [{columns:80,rows:24,writerEpoch:1},false,true],
+  ]) {
+    const system=new FakeTerminalSystem();let seen=0;let signal;
+    const {runtime,states}=createRuntime(system,{outputDeliveryTimeoutMs:20,onTerminalGeometry:async event=>{seen++;signal=event.signal;if(stall)await new Promise(()=>{});}});
+    try {
+      await runtime.attach({tabId:"tab-a",agentSessionId:"agent-a",columns:80,rows:24});
+      system.connections[0].incoming.push(geometryWire(payload,critical));
+      await waitUntil(()=>states.some(state=>state.state==="failed"),"geometry fails closed");
+      assert.equal(seen,stall?1:0);if(stall)assert.equal(signal.aborted,true);
+    } finally { await runtime.shutdown(); }
+  }
+});
+
+test("same-chunk initial geometry timeout cancels its consumer before failed attach returns", async () => {
+  const system=new FakeTerminalSystem();const connect=system.connector.connect;
+  system.connector.connect=async input=>{
+    const wire=await connect(input);const first=await wire.incoming.next();
+    const geometry=geometryWire({columns:143,rows:51,writerEpoch:1});
+    const combined=new Uint8Array(first.value.length+geometry.length);combined.set(first.value);combined.set(geometry,first.value.length);
+    wire.incoming.push(combined);return wire;
+  };
+  let signal;
+  const {runtime}=createRuntime(system,{outputDeliveryTimeoutMs:20,onTerminalGeometry:async event=>{signal=event.signal;await new Promise(()=>{});}});
+  try {
+    await assert.rejects(runtime.attach({tabId:"tab-a",agentSessionId:"agent-a",columns:60,rows:22}));
+    assert.ok(signal);assert.equal(signal.aborted,true);
+  } finally { await runtime.shutdown(); }
+});
+
+test("reconnect and writer epoch changes invalidate prior authoritative geometry", async () => {
+  const system=new FakeTerminalSystem();const {runtime,states}=createRuntime(system);
+  try {
+    await runtime.attach({tabId:"tab-a",agentSessionId:"agent-a",columns:80,rows:24});
+    system.connections[0].incoming.push(geometryWire({columns:143,rows:51,writerEpoch:1}));
+    await waitUntil(()=>states.at(-1)?.geometry?.columns===143,"initial geometry");
+    system.connections[0].incoming.push(encodeTerminalControl("writer_epoch",1n,{writerEpoch:2,writerClientInstanceId:"other",accessMode:"observer"}));
+    await waitUntil(()=>states.at(-1)?.writerEpoch===2,"new epoch");assert.equal(states.at(-1).geometry,null);
+    system.connections[0].incoming.push(geometryWire({columns:167,rows:59,writerEpoch:2}));
+    await waitUntil(()=>states.at(-1)?.geometry?.columns===167,"new geometry");
+    system.seatOnReady.set("agent-a",{accessMode:"observer",writerEpoch:2});
+    system.connections[0].incoming.close();
+    await waitUntil(()=>states.at(-1)?.state==="interrupted","transport interrupted before reconnect");
+    const next=await runtime.reconnect({tabId:"tab-a"});assert.equal(next.geometry,null);
+  } finally { await runtime.shutdown(); }
+});
+
 test("TC-055-12 foreground readiness remains distinct from daemon and cannot authorize sync", async () => {
   const system = new FakeTerminalSystem();
   const runtime = new CunaRuntimeBoundary({
@@ -2231,3 +2310,52 @@ test("older background capability response cannot overwrite newer transfer refus
     assert.equal(states.at(-1).writerTransferCapability.supported, false);
   } finally { release(); await runtime.shutdown(); }
 });
+
+test('HTTP-ahead writer epoch tolerates older queued noncritical wire notices',async()=>{
+ const system=new FakeTerminalSystem();system.seatOnReady.set('agent-a',{accessMode:'observer',writerEpoch:1});
+ system.controlPlane.transferTerminalWriter=async input=>({agentSessionId:input.agentSessionId,processEpoch:'epoch-'+input.agentSessionId,
+  writerEpoch:2,writerClientInstanceId:input.clientInstanceId,transferPending:true,operationId:input.operationId,operationState:'committed'});
+ const {runtime}=createRuntime(system);
+ try{
+  await runtime.attach({tabId:'tab-a',agentSessionId:'agent-a',columns:60,rows:22});
+  await runtime.takeWriter({tabId:'tab-a'});
+  assert.equal(runtime.listTerminals()[0].writerEpoch,2);
+  assert.equal(runtime.listTerminals()[0].accessMode,'observer','HTTP does not promote local input');
+  assert.equal(runtime.listTerminals()[0].geometry,null,'HTTP epoch change leaves geometry unknown');
+  await assert.rejects(runtime.sendInput(new TextEncoder().encode('forbidden'),'tab-a'),{code:'terminal_observer'});
+  const wire=system.connections[0];
+  const lowerSeat=encodeTerminalControl('writer_epoch',1n,{writerEpoch:1,writerClientInstanceId:'client-1',accessMode:'writer'});lowerSeat[5]=0;
+  wire.incoming.push(lowerSeat);
+  wire.incoming.push(geometryWire({columns:143,rows:51,writerEpoch:1}));
+  wire.incoming.push(encodeTerminalControl('writer_epoch',1n,{writerEpoch:2,writerClientInstanceId:'client-1',accessMode:'writer'}));
+  wire.incoming.push(geometryWire({columns:167,rows:59,writerEpoch:2}));
+  await waitUntil(()=>runtime.listTerminals()[0].state==='failed'||runtime.listTerminals()[0].geometry?.columns===167,'wire settles');
+  assert.equal(runtime.listTerminals()[0].state,'active');
+  assert.equal(runtime.listTerminals()[0].geometry.columns,167);
+  assert.equal(runtime.listTerminals()[0].accessMode,'writer','only current wire notice grants the seat');
+  assert.equal(wire.closeCalls.length,0);
+ }finally{await runtime.shutdown();}
+});
+
+for(const scenario of ['foreign-writer','contradiction','ready-contradiction']){
+ test('writer notice truth: '+scenario,async()=>{
+  const system=new FakeTerminalSystem();
+  if(scenario!=='ready-contradiction')system.seatOnReady.set('agent-a',{accessMode:'observer',writerEpoch:1});
+  const {runtime}=createRuntime(system);
+  try{
+   await runtime.attach({tabId:'tab-a',agentSessionId:'agent-a',columns:60,rows:22});
+   const wire=system.connections[0];
+   if(scenario==='contradiction'){
+    wire.incoming.push(encodeTerminalControl('writer_epoch',1n,{writerEpoch:2,writerClientInstanceId:'client-1',accessMode:'writer'}));
+    await waitUntil(()=>runtime.listTerminals()[0].writerEpoch===2,'first valid notice');
+   }
+   const notice=scenario==='foreign-writer'
+    ?{writerEpoch:2,writerClientInstanceId:'foreign-client',accessMode:'writer'}
+    :{writerEpoch:scenario==='ready-contradiction'?1:2,writerClientInstanceId:'other',accessMode:'observer'};
+   wire.incoming.push(encodeTerminalControl('writer_epoch',2n,notice));
+   await new Promise(resolve=>setTimeout(resolve,20));
+   assert.equal(runtime.listTerminals()[0].state,'failed',scenario);
+   assert.equal(wire.sent.map(decodeTerminalFrame).some(frame=>frame.type==='input'),false);
+  }finally{await runtime.shutdown();}
+ });
+}

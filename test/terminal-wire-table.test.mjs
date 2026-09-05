@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { encodeTerminalFrame, decodeTerminalFrame } from '../dist/terminal/codec.js';
+import { encodeTerminalFrame, decodeTerminalFrame, decodeTerminalControl, assertTerminalFrameLegal } from '../dist/terminal/codec.js';
 
 const names = ['ready', 'input', 'output', 'resize', 'signal', 'heartbeat', 'exit', 'error',
   'acknowledgement', 'resume', 'local_action_request', 'local_action_result', 'local_stream_open',
@@ -31,4 +31,16 @@ test('unknown critical and noncritical frame handling remains unchanged', () => 
   assert.throws(() => decodeTerminalFrame(wire), { code: 'unknown_critical_frame' });
   wire[5] = 0;
   assert.equal(decodeTerminalFrame(wire), undefined);
+});
+
+test('geometry frame18 is noncritical, closed and server-only after READY', () => {
+  const payload=new TextEncoder().encode(JSON.stringify({columns:143,rows:51,writerEpoch:1}));
+  const wire=encodeTerminalFrame({type:'control_state',critical:false,sequence:999n,payload});
+  assert.equal(new DataView(wire.buffer).getUint16(6,false),18);
+  const frame=decodeTerminalFrame(wire);
+  assert.deepEqual(decodeTerminalControl(frame),{columns:143,rows:51,writerEpoch:1});
+  assert.doesNotThrow(()=>assertTerminalFrameLegal('attached','server_to_client',frame.type));
+  assert.throws(()=>assertTerminalFrameLegal('attached','client_to_server',frame.type));
+  assert.throws(()=>decodeTerminalControl({...frame,critical:true}));
+  assert.throws(()=>decodeTerminalControl({...frame,payload:new TextEncoder().encode(JSON.stringify({columns:143,rows:51,writerEpoch:1,extra:true}))}));
 });

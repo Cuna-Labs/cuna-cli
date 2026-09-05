@@ -73,6 +73,12 @@ export interface TerminalWriterEpochPayload {
   readonly accessMode: "writer" | "observer";
 }
 
+export interface TerminalGeometryPayload {
+  readonly columns: number;
+  readonly rows: number;
+  readonly writerEpoch: number;
+}
+
 export interface TerminalLocalActionProtocolOffer {
   readonly name: typeof LOCAL_ACTION_PROTOCOL;
   readonly maxRequestBytes: number;
@@ -307,12 +313,12 @@ const LEGAL_FRAMES: Readonly<
   Record<TerminalConnectionState, Readonly<Record<TerminalFrameDirection, ReadonlySet<TerminalFrameType>>>>
 > = Object.freeze({
   negotiating: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["heartbeat"]), server_to_client: new Set<TerminalFrameType>(["ready", "error"])}),
-  ready: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["resume", "heartbeat"]), server_to_client: new Set<TerminalFrameType>(["ready", "error", "heartbeat", "writer_epoch"])}),
+  ready: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["resume", "heartbeat"]), server_to_client: new Set<TerminalFrameType>(["ready", "error", "heartbeat", "writer_epoch", "control_state"])}),
   attached: Object.freeze({
     client_to_server: new Set<TerminalFrameType>(["input", "resize", "signal", "heartbeat", "resume"]),
-    server_to_client: new Set<TerminalFrameType>(["output", "acknowledgement", "heartbeat", "exit", "error", "ready", "writer_epoch"]),
+    server_to_client: new Set<TerminalFrameType>(["output", "acknowledgement", "heartbeat", "exit", "error", "ready", "writer_epoch", "control_state"]),
   }),
-  draining: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["heartbeat"]), server_to_client: new Set<TerminalFrameType>(["output", "exit", "error", "heartbeat", "writer_epoch"])}),
+  draining: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["heartbeat"]), server_to_client: new Set<TerminalFrameType>(["output", "exit", "error", "heartbeat", "writer_epoch", "control_state"])}),
   interrupted: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["resume"]), server_to_client: new Set<TerminalFrameType>(["ready", "error"])}),
   closed: Object.freeze({ client_to_server: new Set<TerminalFrameType>(), server_to_client: new Set<TerminalFrameType>() }),
 });
@@ -356,12 +362,18 @@ export function decodeTerminalControl(frame: TerminalFrame): Readonly<Record<str
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TerminalProtocolError("invalid_payload", "The terminal control payload must be an object.");
   }
+  if (frame.type === "control_state" && frame.critical) throwInvalidPayload();
   validateControlPayload(frame.type, value as Record<string, unknown>);
   return Object.freeze(value as Record<string, unknown>);
 }
 
 function validateControlPayload(type: TerminalFrameType, value: Record<string, unknown>): void {
   switch (type) {
+    case "control_state":
+      assertKeys(value, ["columns", "rows", "writerEpoch"]);
+      if (!isDimension(value.columns) || !isDimension(value.rows) ||
+        !isBoundedPositiveInteger(value.writerEpoch, Number.MAX_SAFE_INTEGER)) throwInvalidPayload();
+      return;
     case "ready":
       if (
         value.protocol !== TERMINAL_PROTOCOL ||

@@ -26,8 +26,14 @@ const identity = Object.freeze({
 });
 
 test("RTP1 reserves 11-16 for local actions and 17 for the writer seat, and negotiates only the implemented intersection", () => {
-  assert.deepEqual(Object.values(TERMINAL_FRAME_TYPES).slice(-7), [11, 12, 13, 14, 15, 16, 17]);
+  assert.deepEqual([
+    TERMINAL_FRAME_TYPES.local_action_request, TERMINAL_FRAME_TYPES.local_action_result,
+    TERMINAL_FRAME_TYPES.local_stream_open, TERMINAL_FRAME_TYPES.local_stream_data,
+    TERMINAL_FRAME_TYPES.local_stream_close, TERMINAL_FRAME_TYPES.local_stream_window_update,
+    TERMINAL_FRAME_TYPES.writer_epoch,
+  ], [11, 12, 13, 14, 15, 16, 17]);
   assert.equal(TERMINAL_FRAME_TYPES.writer_epoch, 17);
+  assert.equal(TERMINAL_FRAME_TYPES.control_state, 18);
   const acceptance = negotiateTerminalLocalActions({
     name: LOCAL_ACTION_PROTOCOL,
     maxRequestBytes: 65_536,

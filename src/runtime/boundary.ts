@@ -16,6 +16,7 @@ import {
   assertTerminalFrameLegal,
   decodeTerminalControl,
   type TerminalWriterEpochPayload,
+  type TerminalGeometryPayload,
   decodeTerminalFrame,
   encodeTerminalControl,
   encodeTerminalFrame,
@@ -97,6 +98,7 @@ export interface RuntimeTerminalSnapshot {
   readonly accessMode: "writer" | "observer";
   readonly writerEpoch: number;
   readonly writerClientInstanceId: string | null;
+  readonly geometry: TerminalGeometryPayload | null;
   readonly heartbeatObservedAt: number;
   readonly heartbeatExpiresAt: number;
   readonly reason?: string;
@@ -134,6 +136,7 @@ export interface RuntimeBoundaryOptions {
   readonly outputDeliveryTimeoutMs?: number;
   readonly heartbeatTimeoutMs?: number;
   readonly onTerminalReady?: (snapshot: RuntimeTerminalSnapshot) => void | Promise<void>;
+  readonly onTerminalGeometry?: (event: { readonly snapshot: RuntimeTerminalSnapshot; readonly signal: AbortSignal }) => void | Promise<void>;
   readonly onTerminalOutput?: (event: {
     readonly tabId: string;
     readonly agentSessionId: string;
@@ -173,6 +176,8 @@ interface TerminalEntry {
   accessMode: "writer" | "observer";
   writerEpoch: number;
   writerClientInstanceId: string | null;
+  wireWriterNotice: TerminalWriterEpochPayload | undefined;
+  geometry: TerminalGeometryPayload | null;
   /** True once this attachment has held the writing seat by any path. */
   heldSeat: boolean;
   wireSequence: bigint;
@@ -414,6 +419,8 @@ export class CunaRuntimeBoundary {
         accessMode: "observer",
         writerEpoch: 0,
         writerClientInstanceId: null,
+        wireWriterNotice: undefined,
+        geometry: null,
         heldSeat: false,
         sendTail: Promise.resolve(),
         connectionRevision: 1,
@@ -431,6 +438,9 @@ export class CunaRuntimeBoundary {
       entry.accessMode = ready.payload.accessMode;
       entry.writerEpoch = ready.payload.writerEpoch;
       entry.writerClientInstanceId = ready.payload.accessMode === "writer" ? this.#options.clientInstanceId : null;
+      entry.wireWriterNotice = ready.payload.accessMode === "writer" ? Object.freeze({
+        writerEpoch: ready.payload.writerEpoch, writerClientInstanceId: this.#options.clientInstanceId, accessMode: "writer",
+      }) : undefined;
       if (entry.writerTransfer !== undefined && ready.payload.writerEpoch > entry.writerTransfer.expectedWriterEpoch) {
         delete entry.writerTransfer;
       }
@@ -764,6 +774,7 @@ export class CunaRuntimeBoundary {
         }
         // A later server notice may already have superseded this HTTP reply.
         if (entry.writerTransfer === operation && state.writerEpoch >= entry.writerEpoch) {
+          if (state.writerEpoch !== entry.writerEpoch) entry.geometry = null;
           entry.writerEpoch = state.writerEpoch;
           entry.writerClientInstanceId = state.writerClientInstanceId;
           if (state.transferPending) entry.reason = "writer_transfer_pending";
@@ -912,6 +923,8 @@ export class CunaRuntimeBoundary {
         accessMode: "observer",
         writerEpoch: 0,
         writerClientInstanceId: null,
+        wireWriterNotice: undefined,
+        geometry: null,
         heldSeat: false,
       };
       const ready = await this.#awaitReady(candidate, iterator, reconnectAbort.signal);
@@ -984,6 +997,10 @@ export class CunaRuntimeBoundary {
       entry.accessMode = ready.payload.accessMode;
       entry.writerEpoch = ready.payload.writerEpoch;
       entry.writerClientInstanceId = ready.payload.accessMode === "writer" ? this.#options.clientInstanceId : null;
+      entry.wireWriterNotice = ready.payload.accessMode === "writer" ? Object.freeze({
+        writerEpoch: ready.payload.writerEpoch, writerClientInstanceId: this.#options.clientInstanceId, accessMode: "writer",
+      }) : undefined;
+      entry.geometry = null;
       if (entry.writerTransfer !== undefined && ready.payload.writerEpoch > entry.writerTransfer.expectedWriterEpoch) {
         delete entry.writerTransfer;
       }
@@ -1520,6 +1537,36 @@ export class CunaRuntimeBoundary {
       await this.#options.onLocalActionFrame({ tabId: entry.tabId, frame, payload });
       return;
     }
+    if (frame.type === "control_state") {
+      const geometry = decodeTerminalControl(frame) as unknown as TerminalGeometryPayload;
+      // HTTP may reveal a newer committed epoch before an older queued wire
+      // notice arrives. Ignore its geometry without losing the attachment.
+      if (geometry.writerEpoch < entry.writerEpoch) return;
+      if (geometry.writerEpoch !== entry.writerEpoch) {
+        throw runtimeFailure("terminal_protocol_error", "Terminal geometry targets a different writer epoch.");
+      }
+      entry.geometry = geometry;
+      if (this.#options.onTerminalGeometry !== undefined) {
+        const timeoutMs = this.#options.outputDeliveryTimeoutMs ?? 5_000;
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+          throw runtimeFailure("terminal_protocol_error", "The terminal geometry delivery deadline is invalid.");
+        }
+        try {
+          await withOutputDeadline(Promise.resolve(this.#options.onTerminalGeometry({
+            snapshot: snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock()), signal: entry.outputAbort.signal,
+          })), timeoutMs, () => runtimeFailure("terminal_protocol_error", "Terminal geometry application exceeded its bounded deadline."));
+        } catch (error) {
+          // Initial same-chunk delivery runs before the pump exists. Revoke
+          // its consumer here as well, so a timed-out resize cannot later
+          // mutate a viewport after failed attachment cleanup has returned.
+          entry.geometry = null;
+          entry.outputAbort.abort(error);
+          throw error;
+        }
+      }
+      this.#publish(entry);
+      return;
+    }
     if (frame.type === "output") {
       if (frame.sequence <= entry.outputSequence) {
         throw runtimeFailure("terminal_protocol_error", "Terminal output sequence regressed or duplicated.");
@@ -1563,6 +1610,21 @@ export class CunaRuntimeBoundary {
       // The writer seat moved. The server names the new epoch, its holder and
       // this attachment's own mode; the local view follows and says so.
       const payload = decodeTerminalControl(frame) as unknown as TerminalWriterEpochPayload;
+      if (payload.accessMode === "writer" && payload.writerClientInstanceId !== this.#options.clientInstanceId) {
+        throw runtimeFailure("terminal_protocol_error", "The writer notice names another client.");
+      }
+      // Compare wire facts with wire facts. An HTTP response can advance the
+      // request fence, but cannot grant input or contradict a later wire role.
+      if (entry.wireWriterNotice?.writerEpoch === payload.writerEpoch && (
+        entry.wireWriterNotice.accessMode !== payload.accessMode || entry.wireWriterNotice.writerClientInstanceId !== payload.writerClientInstanceId
+      )) {
+        throw runtimeFailure("terminal_protocol_error", "The writer notice contradicts the same wire epoch.");
+      }
+      if (payload.writerEpoch < entry.writerEpoch) {
+        return;
+      }
+      entry.wireWriterNotice = payload;
+      if (payload.writerEpoch !== entry.writerEpoch) entry.geometry = null;
       const wasWriter = entry.accessMode === "writer";
       entry.accessMode = payload.accessMode;
       entry.writerEpoch = payload.writerEpoch;
@@ -1675,7 +1737,7 @@ export class CunaRuntimeBoundary {
    * before anything is sent. An observer tab keeps observing.
    */
   #requireWriterSeat(entry: TerminalEntry): void {
-    if (entry.accessMode !== "writer") {
+    if (entry.accessMode !== "writer" || entry.writerClientInstanceId !== this.#options.clientInstanceId) {
       throw runtimeFailure(
         "terminal_observer",
         "This attachment observes the terminal; input is disabled.",
@@ -1855,6 +1917,7 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000, now = Date.
     accessMode: entry.accessMode,
     writerEpoch: entry.writerEpoch,
     writerClientInstanceId: entry.writerClientInstanceId,
+    geometry: entry.geometry,
     writerTransferCapability: writerTransferCapability(entry.capabilitySnapshot, entry.observation.agentSessionId, now),
     heartbeatObservedAt: entry.lastHeartbeatAt,
     heartbeatExpiresAt: entry.lastHeartbeatAt + heartbeatTimeoutMs,

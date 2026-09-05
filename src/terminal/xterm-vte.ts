@@ -204,6 +204,16 @@ export class XtermViewportAdapter {
     return this.#registry.require(this.#tabId);
   }
 
+  snapshotForHost(columns: number, rows: number): ViewportSnapshot {
+    this.#assertOpen();
+    if (!Number.isSafeInteger(columns) || !Number.isSafeInteger(rows) ||
+      columns < 1 || rows < 1 || columns > 4096 || rows > 4096 || columns * rows > MAX_VIEWPORT_CELLS) {
+      throw new RangeError("The host projection dimensions exceed the viewport budget.");
+    }
+    const current = this.snapshot();
+    return this.#capture(current.outputSequence, current.replayCursor, false, { columns, rows });
+  }
+
   async write(
     bytes: Uint8Array,
     outputSequence: bigint,
@@ -357,17 +367,25 @@ export class XtermViewportAdapter {
     }
   }
 
-  #capture(outputSequence: bigint, replayCursor: bigint, localReflow = false): ViewportSnapshot {
+  #capture(outputSequence: bigint, replayCursor: bigint, localReflow = false,
+    host?: { readonly columns: number; readonly rows: number },
+  ): ViewportSnapshot {
     const buffer = this.#terminal.buffer.active;
     const cells: string[] = [];
     const displayWidths: number[] = [];
     const renderRows: ViewportRenderRun[][] = [];
-    for (let row = 0; row < this.#terminal.rows; row += 1) {
+    const columns = Math.min(this.#terminal.cols, host?.columns ?? this.#terminal.cols);
+    const rows = Math.min(this.#terminal.rows, host?.rows ?? this.#terminal.rows);
+    for (let row = 0; row < rows; row += 1) {
       const line = buffer.getLine(buffer.viewportY + row);
       let visibleWidth = 0;
       if (line !== undefined) {
-        for (let column = 0; column < this.#terminal.cols; column += 1) {
+        for (let column = 0; column < columns; column += 1) {
           const cell = line.getCell(column);
+          const width = cell?.getWidth() ?? 1;
+          if (width === 0) continue;
+          // Do not expose half a wide glyph at the physical host edge.
+          if (column + width > columns) break;
           const characters = cell?.getChars() ?? "";
           // An explicit space is content and may be the final glyph before a
           // split UTF-8 sequence. Only untouched empty cells are invisible.
@@ -417,6 +435,14 @@ export class XtermViewportAdapter {
         cursorVisible: this.#cursorVisible,
       },
     };
+    if (host !== undefined) {
+      return Object.freeze({ ...frame, columns: host.columns, rows: host.rows,
+        cells: Object.freeze(cells), displayWidths: Object.freeze(displayWidths),
+        renderRows: Object.freeze(renderRows.map(row => Object.freeze(row.map(run => Object.freeze(run))))),
+        cursorX: Math.min(host.columns - 1, frame.cursorX), cursorY: Math.min(host.rows - 1, frame.cursorY),
+        modes: Object.freeze({ ...frame.modes, cursorVisible: frame.modes.cursorVisible && frame.cursorX < host.columns && frame.cursorY < host.rows }),
+      });
+    }
     return localReflow
       ? this.#registry.applyLocalReflow(frame)
       : this.#registry.applyRenderedFrame(frame);

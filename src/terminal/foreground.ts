@@ -277,6 +277,7 @@ export class ForegroundTerminalCoordinator {
 
   runtimeCallbacks(): {
     readonly onTerminalReady: (snapshot: RuntimeTerminalSnapshot) => Promise<void>;
+    readonly onTerminalGeometry: (event: { readonly snapshot: RuntimeTerminalSnapshot; readonly signal: AbortSignal }) => Promise<void>;
     readonly onTerminalOutput: (event: {
       readonly tabId: string;
       readonly agentSessionId: string;
@@ -295,6 +296,7 @@ export class ForegroundTerminalCoordinator {
   } {
     return Object.freeze({
       onTerminalReady: async (snapshot) => await this.#terminalReady(snapshot),
+      onTerminalGeometry: async (event) => await this.#terminalGeometry(event.snapshot, event.signal),
       onTerminalOutput: async (event) => await this.#queueTerminalOutput(event),
       onTerminalState: (snapshot) => this.#terminalState(snapshot),
       localActionKinds: (agentSessionId) => this.#localActionKindsForSession(agentSessionId),
@@ -530,6 +532,29 @@ export class ForegroundTerminalCoordinator {
     // local side effect completed. The server ACK is the only condition that
     // clears the cache, so resubmit it once this exact attachment is ready.
     this.#resendPendingRemoteLocalActionResults(snapshot.tabId, this.#localActionIdentity(intent, snapshot));
+  }
+
+  async #terminalGeometry(snapshot: RuntimeTerminalSnapshot, signal: AbortSignal): Promise<void> {
+    const tab = this.#tabs.get(snapshot.tabId);
+    if (tab === undefined || !sameSnapshotBinding(tab.snapshot, snapshot) ||
+      snapshot.geometry === null || snapshot.geometry.writerEpoch !== snapshot.writerEpoch ||
+      snapshot.writerEpoch !== tab.snapshot.writerEpoch) {
+      throw runtimeFailure("grant_scope_mismatch", "Terminal geometry targets an unbound foreground viewport.");
+    }
+    if (signal.aborted) throw signal.reason;
+    // Only observers adopt remote dimensions. The writer owns local fit and
+    // sends its own fenced RESIZE; an older size notice cannot undo that fit.
+    if (snapshot.accessMode === "observer") {
+      try {
+        await raceAbort(tab.viewport.resize(snapshot.geometry.columns, snapshot.geometry.rows), signal);
+      } catch (error) {
+        tab.viewport.dispose();
+        throw error;
+      }
+    }
+    if (signal.aborted || this.#tabs.get(snapshot.tabId) !== tab) return;
+    tab.snapshot = snapshot;
+    await this.#render();
   }
 
   async #queueTerminalOutput(event: {
@@ -1419,7 +1444,7 @@ export class ForegroundTerminalCoordinator {
     const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
     const rows = remoteRows(dimensions.rows);
     for (const [tabId, tab] of this.#tabs) {
-      await tab.viewport.resize(dimensions.columns, rows);
+      if (tab.snapshot.accessMode !== "observer") await tab.viewport.resize(dimensions.columns, rows);
       // An observer renders at the writer's dimensions; it never resizes the
       // PTY. The gateway would close its attachment on the first RESIZE.
       if (
@@ -1509,8 +1534,8 @@ export class ForegroundTerminalCoordinator {
       const activeViewport = this.#tabs.get(activeTabId)?.viewport.snapshot();
       if (
         activeViewport === undefined ||
-        activeViewport.columns !== dimensions.columns ||
-        activeViewport.rows !== remoteRows(dimensions.rows)
+        (this.#tabs.get(activeTabId)?.snapshot.accessMode !== "observer" &&
+          (activeViewport.columns !== dimensions.columns || activeViewport.rows !== remoteRows(dimensions.rows)))
       ) {
         // A host resize becomes observable before the coalesced local VTE and
         // remote PTY resize completes. Rendering the old, wider viewport into
@@ -1524,7 +1549,9 @@ export class ForegroundTerminalCoordinator {
         id: tab.intent.tabId,
         label: tab.intent.label,
         agent: tab.intent.agent,
-        viewport: tab.viewport.snapshot(),
+        viewport: tab.snapshot.accessMode === "observer"
+          ? tab.viewport.snapshotForHost(dimensions.columns, remoteRows(dimensions.rows))
+          : tab.viewport.snapshot(),
       }));
       const frame = renderWorkbenchFrame({
         columns: dimensions.columns,
@@ -1783,7 +1810,9 @@ export class ForegroundTerminalCoordinator {
     if (refusal !== undefined) return refusal;
     return snapshot.reason === "writer_transferred"
       ? "Control moved to another client · Ctrl+] w to take it back"
-      : "Observing (read-only) · Ctrl+] w to take control";
+      : snapshot.geometry == null
+        ? "Observing (read-only) · geometry unknown · Ctrl+] w"
+        : "Observing (read-only) · Ctrl+] w to take control";
   }
 }
 

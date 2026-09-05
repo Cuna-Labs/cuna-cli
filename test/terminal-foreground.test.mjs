@@ -1298,6 +1298,27 @@ test("resize reflows every tab before switching to an inactive viewport", async 
   await coordinator.stop();
 });
 
+test("observer remote geometry drives the headless viewport while host resize sends no remote resize", async () => {
+  const {coordinator,callbacks,calls,host,intents}=harness();
+  host.columns=60;
+  await coordinator.start(intents.slice(0,1));
+  try {
+    const observer={...snapshot(intents[0]),accessMode:"observer",writerEpoch:2,geometry:null};
+    callbacks.onTerminalState(observer);
+    await waitUntil(()=>decoder.decode(host.writes.at(-1)).includes("geometry unknown"),"unknown is displayed");
+    const remote={...observer,geometry:{columns:143,rows:51,writerEpoch:2}};
+    await callbacks.onTerminalGeometry({snapshot:remote,signal:new AbortController().signal});
+    await callbacks.onTerminalOutput(outputEvent(intents[0],1n,encoder.encode("x".repeat(100)+"\r\nREMOTE-SECOND")));
+    assert.equal(coordinator.state,"active");
+    assert.ok(decoder.decode(host.writes.at(-1)).includes("REMOTE-SECOND"),"second remote row stays second; host width never reflows remote rows");
+    const count=calls.resize.length;host.columns=40;host.emitResize();
+    await new Promise(resolve=>setTimeout(resolve,30));
+    assert.equal(calls.resize.length,count);
+    assert.equal(coordinator.state,"active");
+    assert.ok(decoder.decode(host.writes.at(-1)).includes("REMOTE-SECOND"));
+  } finally { await coordinator.stop(); }
+});
+
 test("input backlog is bounded and restoration waits for admitted input to settle", async () => {
   const { coordinator, host, intents, runtime } = harness();
   await coordinator.start(intents.slice(0, 1));

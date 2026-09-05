@@ -32,6 +32,24 @@ function adapter(overrides = {}) {
   };
 }
 
+test("observer host projection clips complete styled cells without reflowing the remote VTE", async () => {
+  const { viewport } = adapter({ columns: 143, rows: 51 });
+  try {
+    await viewport.write(encoder.encode("\u001b[31m" + "x".repeat(59) + "中" + "z".repeat(80) + "\r\nsecond"), 1n, 1n);
+    const before = viewport.snapshot();
+    const projected = viewport.snapshotForHost(60, 22);
+    assert.equal(projected.cells[0], "x".repeat(59), "a wide cell straddling the edge is excluded whole");
+    assert.equal(projected.displayWidths[0], 59);
+    assert.equal(projected.renderRows[0].reduce((n,run)=>n+run.width,0), 59);
+    assert.equal(projected.renderRows[0][0].style.foreground.value, 1);
+    assert.equal(projected.cells[1], "second");
+    assert.equal(projected.columns, 60);
+    assert.deepEqual(viewport.snapshot(), before, "projection never changes geometry, cursor, cells or output position");
+    assert.equal(viewport.snapshotForHost(144, 52).cells[0], before.cells[0]);
+    assert.throws(()=>viewport.snapshotForHost(4097,1));
+  } finally { viewport.dispose(); }
+});
+
 test("headless VTE preserves split UTF-8 and resolves remote control sequences into safe cells", async () => {
   const { viewport } = adapter();
   const payload = encoder.encode("hello \u{1F30E}\r\nsecond");
