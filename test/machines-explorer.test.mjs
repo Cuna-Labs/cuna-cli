@@ -203,7 +203,7 @@ test("capacity that cannot be verified never manufactures a create action while 
     "the capacity abstention should be visible",
   );
   const overview = stripAnsi(host.writes.at(-1));
-  assert.match(overview, /No AgentSessions/u);
+  assert.match(overview, /No sessions/u);
   assert.doesNotMatch(overview, /Create Claude machine|Create OpenCode machine|Create Codex machine/u);
 
   host.emitInput([0x0d]);
@@ -900,7 +900,7 @@ test("machines explorer paints machines before slower AgentSession reads finish"
     },
   }, { host });
   await waitUntil(
-    () => host.writes.some((write) => write.includes("immediate-machine") && write.includes("Loading AgentSessions")),
+    () => host.writes.some((write) => write.includes("immediate-machine") && write.includes("Loading sessions")),
     "the machine row and progress should render before sessions finish",
   );
   assert.equal(host.writes.at(-1).includes("goal0-claude"), false);
@@ -1073,7 +1073,7 @@ test("successful refresh authoritatively removes omitted sessions", async () => 
   }, { host });
   await waitUntil(() => host.writes.some((write) => write.includes("goal0-claude")), "initial membership should render");
   host.emitInput([0x72]);
-  await waitUntil(() => reads === 2 && host.writes.at(-1).includes("No AgentSessions"), "successful empty membership should remove the prior session");
+  await waitUntil(() => reads === 2 && host.writes.at(-1).includes("No sessions"), "successful empty membership should remove the prior session");
   assert.doesNotMatch(host.writes.at(-1), /goal0-claude/u);
   host.emitInput([0x03]);
   await operation;
@@ -1382,7 +1382,7 @@ for (const state of ["error", "stopped", "running"]) {
       },
     } }, { host });
     try {
-      await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Checking whether"), "inventory should settle");
+      await waitUntil(() => lastFrame(host).includes("No sessions") && !lastFrame(host).includes("Checking whether"), "inventory should settle");
       host.emitInput([0x1b, 0x5b, 0x43]);
       await waitUntil(() => lastFrame(host).includes("CUNA  ◆── runtime-check"), "Right should open detail");
       const frame = lastFrame(host);
@@ -1390,7 +1390,7 @@ for (const state of ["error", "stopped", "running"]) {
         assert.match(frame, /Keep this Machine running/u, "running negative control retains applicable advice");
       } else {
         assert.doesNotMatch(frame, /Keep this Machine running|Checking OpenCode runtime/u, "non-running state cannot promise runtime verification progress");
-        assert.match(frame, new RegExp(` ${state} · observation`, "u"));
+        assert.match(frame, new RegExp(` ${state} · record updated`, "u"));
       }
     } finally {
       host.emitInput([0x03]);
@@ -1671,11 +1671,11 @@ test("E13-R5: ├─ appears only when a sibling line follows", async () => {
       },
     },
   }, { host });
-  await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Checking whether"), "the empty tree should settle");
+  await waitUntil(() => lastFrame(host).includes("No sessions") && !lastFrame(host).includes("Checking whether"), "the empty tree should settle");
   const lines = lastFrame(host).split("\r\n");
-  const index = lines.findIndex((line) => line.includes("No AgentSessions"));
+  const index = lines.findIndex((line) => line.includes("No sessions"));
   assert.ok(index >= 0);
-  assert.match(lines[index], /└─ No AgentSessions/u);
+  assert.match(lines[index], /└─ No sessions/u);
   for (const [lineIndex, line] of lines.entries()) {
     if (!line.includes("├─")) continue;
     assert.match(lines[lineIndex + 1] ?? "", /[├└]─/u, `line ${lineIndex} uses ├─ without a sibling below: ${JSON.stringify(line)}`);
@@ -1809,7 +1809,7 @@ for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protoc
         async deleteMachine() { mutations.push("delete"); },
       } }, { host });
       try {
-        await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
+        await waitUntil(() => lastFrame(host).includes("No sessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
         if (state !== "running") assert.doesNotMatch(lastFrame(host), /OpenCode runtime not verified yet|Waiting for this Machine's OpenCode terminal supervisor/u);
         host.emitInput([0x1b, 0x5b, 0x43]);
         await waitUntil(() => lastFrame(host).includes("CUNA  ◆── state-control"), "Right opens the machine");
@@ -1830,7 +1830,7 @@ for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protoc
       async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.workspace.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
     } }, { host });
     try {
-      await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
+      await waitUntil(() => lastFrame(host).includes("No sessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
       assert.match(lastFrame(host), /No available machine can open an AgentSession/u);
       assert.match(lastFrame(host), /Create OpenCode machine/u);
     } finally { host.emitInput([0x71]); assert.equal(await operation, undefined); }
@@ -1848,7 +1848,7 @@ for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protoc
       async getMachine(id) { return { id, name: "stop-control", state: "stopped", agent: "opencode" }; },
     } }, { host });
     try {
-      await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
+      await waitUntil(() => lastFrame(host).includes("No sessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
       host.emitInput([0x1b, 0x5b, 0x43]);
       await waitUntil(() => lastFrame(host).includes("❯ Stop machine"), "Stop is selected explicitly");
       host.emitInput([0x0d]);
@@ -1875,14 +1875,14 @@ for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protoc
       },
     } }, { host });
     try {
-      await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Refreshing live sessions"), "initial running inventory should finish");
+      await waitUntil(() => lastFrame(host).includes("No sessions") && !lastFrame(host).includes("Refreshing live sessions"), "initial running inventory should finish");
       state = "error"; host.emitInput([0x72]);
       await waitUntil(() => capabilityReads > 1 && lastFrame(host).includes("refresh-control  error"), "new state is visible before next capability response");
       assert.doesNotMatch(lastFrame(host), /OpenCode runtime not verified yet|Waiting for this Machine's OpenCode terminal supervisor/u);
       host.emitInput([0x1b, 0x5b, 0x43]);
       await waitUntil(() => lastFrame(host).includes("CUNA  ◆── refresh-control"), "open refreshed machine");
       assert.doesNotMatch(lastFrame(host), /Keep this Machine running|Checking OpenCode runtime|Waiting for this Machine's OpenCode terminal supervisor/u);
-      assert.match(lastFrame(host), / error · observation/u);
+      assert.match(lastFrame(host), / error · record updated time unavailable/u);
     } finally { releaseCapability(); host.emitInput([0x71]); assert.equal(await operation, undefined); }
   });
 }

@@ -1211,7 +1211,7 @@ function renderMachinesExplorer(input: {
     lines.push(`${machineSelected ? "❯" : " "} ${open ? "▾" : "▸"} ${safeLine(row.machine.name)}  ${state}  ${sessions}`);
     if (!open) continue;
     if (row.sessionsLoading === true && row.sessions.length === 0) {
-      lines.push(`    ${loaderLine("Loading AgentSessions", input.animationFrame)}`);
+      lines.push(`    ${loaderLine("Loading sessions", input.animationFrame)}`);
       continue;
     }
     if (row.sessions.length === 0) {
@@ -1221,7 +1221,7 @@ function renderMachinesExplorer(input: {
       // followed was itself suppressed on a non-running Machine.
       const children: string[] = [];
       if (row.sessionsError !== undefined) children.push(`${row.sessionsError}; showing last confirmed sessions`);
-      else children.push("No AgentSessions");
+      else children.push("No sessions");
       if (row.opencodeSupervisorRepairReason !== undefined) children.push(openCodeRepairSummary(row));
       if (row.opencodeSupervisorProtocolUnavailable && canWaitForOpenCodeRuntime(row)) children.push(openCodeSupervisorProtocolWaitSummary());
       // Only a running machine can be verified; on a stopped or errored one
@@ -1306,7 +1306,7 @@ function renderContextScreen(input: {
   lines[0] = machineHeader(screen.kind === "provider"
     ? `${safeLine(row.machine.name)} / ${providerDisplayName(screen.provider)} sessions`
     : safeLine(row.machine.name));
-  lines[1] = ` ${pending === undefined ? safeLine(row.machine.state) : lifecycleLabel(pending)} · observation ${safeLine(row.machine.updatedAt ?? "unversioned")}`;
+  lines[1] = ` ${pending === undefined ? safeLine(row.machine.state) : lifecycleLabel(pending)} · record updated ${safeLine(row.machine.updatedAt ?? "time unavailable")}`;
   lines.push("");
   const actions = pending !== undefined
     ? []
