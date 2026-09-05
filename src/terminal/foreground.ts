@@ -44,6 +44,7 @@ const DETACH = 0x64;
 const HELP = 0x3f;
 const RETRY = 0x72;
 const TAKE_WRITER = 0x77; // Ctrl+] w: take the terminal's one writing seat
+const RETAINED_SIGN_IN = 0x61; // Ctrl+] a: inspect the last retained sign-in link
 const RESIZE_COALESCE_MS = 50;
 const DISCONNECT_FRAME_MS = 30;
 const DISCONNECTING_FRAMES = Object.freeze([
@@ -191,6 +192,9 @@ export class ForegroundTerminalCoordinator {
   readonly #localDetachTabIds = new Set<string>();
   readonly #detachedSessions: DetachedForegroundSession[] = [];
   readonly #browserDetectors = new Map<string, ProviderBrowserActionDetector>();
+  readonly #retainedBrowserDetectors = new Map<string, ProviderBrowserActionDetector>();
+  readonly #retainedBrowserCandidates = new Map<string, LocalBrowserActionRequest>();
+  #retainedPendingRequestId: string | undefined;
   readonly #oauthPasteGuards = new Map<string, ProviderOAuthPasteGuard>();
   readonly #handledBrowserUrls = new Set<string>();
   readonly #browserRequests = new Map<string, LocalBrowserActionRequest>();
@@ -280,6 +284,7 @@ export class ForegroundTerminalCoordinator {
     readonly onTerminalReady: (snapshot: RuntimeTerminalSnapshot) => Promise<void>;
     readonly onTerminalGeometry: (event: { readonly snapshot: RuntimeTerminalSnapshot; readonly signal: AbortSignal }) => Promise<void>;
     readonly onTerminalOutput: (event: {
+      readonly provenance: "live" | "replay_or_unknown";
       readonly tabId: string;
       readonly agentSessionId: string;
       readonly binding: RuntimeTerminalResponse["binding"];
@@ -432,6 +437,9 @@ export class ForegroundTerminalCoordinator {
     for (const tab of this.#tabs.values()) tab.viewport.dispose();
     this.#tabs.clear();
     this.#browserDetectors.clear();
+    this.#retainedBrowserDetectors.clear();
+    this.#retainedBrowserCandidates.clear();
+    this.#retainedPendingRequestId = undefined;
     this.#oauthPasteGuards.clear();
     this.#browserRequests.clear();
     this.#remoteLocalActionTabs.clear();
@@ -476,6 +484,8 @@ export class ForegroundTerminalCoordinator {
     }
     if (previous !== undefined) this.#forgetSeatNoticeOnSeatChange(previous.snapshot, snapshot);
     const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
+    this.#retainedBrowserDetectors.delete(snapshot.tabId);
+    this.#retainedBrowserCandidates.delete(snapshot.tabId);
     if (
       intent.localBrowserActions === true &&
       // OpenCode owns `/connect` inside its remote TUI. PTY text is display
@@ -484,6 +494,13 @@ export class ForegroundTerminalCoordinator {
       (intent.agent === "claude-code" || intent.agent === "codex")
     ) {
       this.#browserDetectors.set(snapshot.tabId, new ProviderBrowserActionDetector({
+        provider: intent.agent,
+        agentSessionId: snapshot.agentSessionId,
+        processEpoch: snapshot.processEpoch,
+        fencingGeneration: snapshot.fencingGeneration,
+        clock: this.#clock,
+      }));
+      this.#retainedBrowserDetectors.set(snapshot.tabId, new ProviderBrowserActionDetector({
         provider: intent.agent,
         agentSessionId: snapshot.agentSessionId,
         processEpoch: snapshot.processEpoch,
@@ -569,6 +586,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   async #queueTerminalOutput(event: {
+    readonly provenance: "live" | "replay_or_unknown";
     readonly tabId: string;
     readonly agentSessionId: string;
     readonly binding: RuntimeTerminalResponse["binding"];
@@ -588,6 +606,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   async #terminalOutput(event: {
+    readonly provenance: "live" | "replay_or_unknown";
     readonly tabId: string;
     readonly agentSessionId: string;
     readonly binding: RuntimeTerminalResponse["binding"];
@@ -599,7 +618,16 @@ export class ForegroundTerminalCoordinator {
     if (tab === undefined || tab.intent.agentSessionId !== event.agentSessionId || !sameSnapshotBinding(tab.snapshot, event.binding)) {
       throw runtimeFailure("grant_scope_mismatch", "Terminal output targets an unbound foreground viewport.");
     }
-    const detected = this.#browserDetectors.get(event.tabId)?.push(event.bytes) ?? [];
+    // Retained output remains visible but cannot acquire fresh local-action
+    // authority. Do not feed it into the streaming detector: a historical
+    // prefix must never combine with a live suffix into a new request.
+    const detected = event.provenance === "live"
+      ? this.#browserDetectors.get(event.tabId)?.push(event.bytes) ?? [] : [];
+    if (event.provenance !== "live") {
+      const retained = this.#retainedBrowserDetectors.get(event.tabId)?.push(event.bytes) ?? [];
+      const latest = retained.at(-1);
+      if (latest !== undefined) this.#retainedBrowserCandidates.set(event.tabId, latest);
+    }
     for (const request of detected) this.#enqueueBrowserAction(event.tabId, tab, request);
     this.#promoteBrowserAction();
     await raceAbort(tab.viewport.write(event.bytes, event.sequence, event.sequence), event.signal);
@@ -888,6 +916,9 @@ export class ForegroundTerminalCoordinator {
       } else if (byte === TAKE_WRITER) {
         await flush();
         this.#takeWriterActiveTab();
+      } else if (byte === RETAINED_SIGN_IN) {
+        await flush();
+        await this.#requestRetainedSignIn();
       } else {
         this.#helpVisible = false;
         target = chordTarget ?? target;
@@ -923,7 +954,9 @@ export class ForegroundTerminalCoordinator {
       this.#pendingBrowserAction = undefined;
       this.#pendingBrowserActionTabId = undefined;
       this.#handledBrowserUrls.add(this.#browserRequestKey(request));
-      this.#browserNotice = "Browser authentication request expired. Retry from the provider.";
+      this.#browserNotice = request.id === this.#retainedPendingRequestId
+        ? "Local permission expired · Ctrl+] a to inspect again · request a new link if the provider rejects it"
+        : "Browser authentication request expired. Retry from the provider.";
       await this.#render();
       return true;
     }
@@ -988,7 +1021,9 @@ export class ForegroundTerminalCoordinator {
             this.#oauthPasteGuards.get(tabId)?.beginCodeCapture();
           }
         }
-        this.#browserNotice = "Browser opened locally. Complete authentication there, then return here.";
+        this.#browserNotice = request.id === this.#retainedPendingRequestId
+          ? "Retained link opened · validity unknown · if rejected, request a new sign-in link in the provider terminal"
+          : "Browser opened locally. Complete authentication there, then return here.";
       }
     } catch {
       const tracked = this.#localActionBroker.get(request.id);
@@ -1004,6 +1039,33 @@ export class ForegroundTerminalCoordinator {
     }
     await this.#render();
     this.#promoteBrowserAction();
+  }
+
+  async #requestRetainedSignIn(): Promise<void> {
+    const tabId = this.#activeTabId;
+    const tab = tabId === undefined ? undefined : this.#tabs.get(tabId);
+    const candidate = tabId === undefined ? undefined : this.#retainedBrowserCandidates.get(tabId);
+    if (tabId === undefined || tab === undefined || this.#pendingBrowserAction !== undefined) return;
+    if (candidate === undefined || candidate.fencingGeneration !== tab.snapshot.fencingGeneration ||
+      candidate.agentSessionId !== tab.snapshot.agentSessionId || candidate.processEpoch !== tab.snapshot.processEpoch) {
+      this.#browserNotice = "No retained sign-in link. Request a new link in the provider terminal.";
+      await this.#render();
+      return;
+    }
+    // Renew only the local permission request, never the provider challenge.
+    // Re-admit the URL against the provider allowlist and current binding.
+    const detector = new ProviderBrowserActionDetector({
+      provider: candidate.provider, agentSessionId: candidate.agentSessionId,
+      processEpoch: candidate.processEpoch, fencingGeneration: candidate.fencingGeneration, clock: this.#clock,
+    });
+    const request = detector.push(new TextEncoder().encode(candidate.url))[0];
+    if (request !== undefined) {
+      this.#handledBrowserUrls.delete(this.#browserRequestKey(request));
+      this.#enqueueBrowserAction(tabId, tab, request);
+      this.#retainedPendingRequestId = request.id;
+      this.#promoteBrowserAction();
+    }
+    await this.#render();
   }
 
   #enqueueBrowserAction(tabId: string, tab: ForegroundTab, request: LocalBrowserActionRequest): void {
@@ -1382,6 +1444,8 @@ export class ForegroundTerminalCoordinator {
     }
     this.#localDetachTabIds.delete(tabId);
     this.#browserDetectors.delete(tabId);
+    this.#retainedBrowserDetectors.delete(tabId);
+    this.#retainedBrowserCandidates.delete(tabId);
     if (this.#pendingBrowserActionTabId === tabId) {
       this.#pendingBrowserAction = undefined;
       this.#pendingBrowserActionTabId = undefined;
@@ -1594,17 +1658,21 @@ export class ForegroundTerminalCoordinator {
               ? {
                 notice: this.#pendingBrowserAction.type === "auth.device.present"
                   ? `${providerName(this.#pendingBrowserAction.provider)} requests device sign-in · code ${this.#pendingBrowserAction.userCode} · Enter/o open · d/Esc deny`
-                  : `${providerName(this.#pendingBrowserAction.provider)} requests browser authentication · Enter/o open · d/Esc deny`,
+                  : this.#pendingBrowserAction.id === this.#retainedPendingRequestId
+                    ? "Retained sign-in link; validity unknown · Enter/o open · d/Esc deny"
+                    : `${providerName(this.#pendingBrowserAction.provider)} requests browser authentication · Enter/o open · d/Esc deny`,
               }
               : this.#helpVisible
                 ? { notice: "Keys: Ctrl+C detach | Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry" +
                     (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
                       ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"
-                      : "") + " | d detach" }
+                      : "") + " | a retained sign-in link | d detach" }
                 : this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) !== undefined
                   ? { notice: this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) as string }
-                  : {}),
+                  : this.#retainedBrowserCandidates.has(activeTabId)
+                    ? { notice: "Sign-in link in history · Ctrl+] a to inspect · if rejected, request a new link in the provider" }
+                    : {}),
       });
       await this.#options.host.write(frame.bytes);
     });

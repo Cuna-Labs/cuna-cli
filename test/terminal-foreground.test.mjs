@@ -99,6 +99,7 @@ function snapshot(intent, generation = 1) {
 function outputEvent(intent, sequence, bytes, generation = 1, signal = new AbortController().signal) {
   const state = snapshot(intent, generation);
   return {
+    provenance: "live",
     tabId: intent.tabId,
     agentSessionId: intent.agentSessionId,
     binding: {
@@ -293,6 +294,73 @@ test("disconnect feedback cadence is bounded to one second total", () => {
     () => new ForegroundTerminalCoordinator({ host, disconnectFrameMs: 251 }),
     /disconnect frame duration must be between 1 and 250 milliseconds/u,
   );
+});
+
+test("historical auth text and cross-boundary fragments cannot create fresh browser consent", async () => {
+  const { coordinator, callbacks, host, intents } = harness();
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+  const emit = async (text, sequence, provenance) => callbacks.onTerminalOutput({
+    ...outputEvent(intents[0], sequence, encoder.encode(text)), provenance,
+  });
+  await emit(`${url}\r\n`, 1n, "replay_or_unknown");
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  await emit("https://platform.claude.com/oauth/", 2n, "replay_or_unknown");
+  await emit("authorize?code=true&state=opaque\r\n", 3n, "live");
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  await emit(url.slice(0, 10), 4n, "live");
+  await emit(`${url.slice(10)}\r\n`, 5n, "live");
+  assert.match(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  await coordinator.stop();
+});
+
+test("a live auth prefix from an old attachment cannot combine with a replacement suffix", async () => {
+  const { coordinator, callbacks, host, intents } = harness();
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  const prefix = "https://platform.claude.com/oauth/";
+  const suffix = "authorize?code=true&state=opaque\r\n";
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(prefix)));
+  await callbacks.onTerminalReady(snapshot(intents[0], 2));
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(suffix), 2));
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 3n, encoder.encode(prefix + suffix), 2));
+  assert.match(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  await coordinator.stop();
+});
+
+test("retained sign-in recovery is explicit, separately consented and attachment scoped", async () => {
+  const opened = [];
+  let now = 1_000;
+  const { coordinator, callbacks, host, intents } = harness({ coordinatorOptions: {
+    browser: { async open(url) { opened.push(url); } }, clock: () => now,
+  } });
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+  for (const [index, text] of [url.slice(0, 15), `${url.slice(15)}\r\n`].entries()) {
+    await callbacks.onTerminalOutput({ ...outputEvent(intents[0], BigInt(index + 1), encoder.encode(text)), provenance: "replay_or_unknown" });
+  }
+  assert.match(decoder.decode(host.writes.at(-1)), /Ctrl\+\] a to inspect/u);
+  assert.deepEqual(opened, []);
+  now += 600_001; // Old local detection expiry cannot invent provider validity.
+  host.emitInput(Uint8Array.of(0x1d, 0x61));
+  await waitUntil(() => /Retained sign-in link; validity unknown/u.test(decoder.decode(host.writes.at(-1))), "explicit inspection requests consent");
+  assert.deepEqual(opened, []);
+  host.emitInput(Uint8Array.of(0x64));
+  await waitUntil(() => /denied/u.test(decoder.decode(host.writes.at(-1))), "retained request can be denied");
+  assert.deepEqual(opened, []);
+  host.emitInput(Uint8Array.of(0x1d, 0x61));
+  await waitUntil(() => /Retained sign-in link; validity unknown/u.test(decoder.decode(host.writes.at(-1))), "retry requires another explicit inspection");
+  host.emitInput(Uint8Array.of(0x0d));
+  await waitUntil(() => opened.length === 1, "separate consent opens retained link");
+  assert.deepEqual(opened, [url]);
+  await callbacks.onTerminalReady(snapshot(intents[0], 2));
+  host.emitInput(Uint8Array.of(0x1d, 0x61));
+  await waitUntil(() => /No retained sign-in link/u.test(decoder.decode(host.writes.at(-1))), "new attachment forgets old candidate");
+  assert.equal(opened.length, 1);
+  await coordinator.stop();
 });
 
 test("Claude OAuth opens once on the local machine only after explicit Cuna approval", async () => {

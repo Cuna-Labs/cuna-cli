@@ -254,6 +254,35 @@ function geometryWire(payload, critical=false) {
   view.setUint16(6,18,false);view.setUint8(5,critical?1:0);return bytes;
 }
 
+test("only an attachment's RESUME-correlated completion proves live output", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime, outputs } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 60, rows: 22 });
+    const wire = system.connections[0];
+    const resume = wire.sent.map(decodeTerminalFrame).find((frame) => frame?.type === "resume");
+    const output = (sequence) => encodeTerminalFrame({ type: "output", critical: true, sequence, payload: Uint8Array.of(65) });
+    wire.incoming.push(output(1n));
+    await waitUntil(() => outputs.length === 1, "legacy output remains visible");
+    assert.equal(outputs[0].provenance, "replay_or_unknown");
+    wire.incoming.push(encodeTerminalControl("heartbeat", resume.sequence - 1n, {}));
+    wire.incoming.push(output(2n));
+    await waitUntil(() => outputs.length === 2, "unrelated heartbeat does not establish boundary");
+    assert.equal(outputs[1].provenance, "replay_or_unknown");
+    wire.incoming.push(encodeTerminalControl("heartbeat", resume.sequence, {}));
+    wire.incoming.push(output(3n));
+    await waitUntil(() => outputs.length === 3, "output after explicit boundary delivered");
+    assert.equal(outputs[2].provenance, "live");
+    await wire.close();
+    await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "old attachment closed");
+    await runtime.reconnect({ tabId: "tab-a" });
+    const replacement = system.connections.at(-1);
+    replacement.incoming.push(output(4n));
+    await waitUntil(() => outputs.length === 4, "replacement output delivered");
+    assert.equal(outputs[3].provenance, "replay_or_unknown");
+  } finally { await runtime.shutdown(); }
+});
+
 test("remote geometry is unknown until an exact epoch notice, awaited before following output", async () => {
   const system=new FakeTerminalSystem();system.seatOnReady.set("agent-a",{accessMode:"observer",writerEpoch:1});
   let entered=false,release; const events=[];

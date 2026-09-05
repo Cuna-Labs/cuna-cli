@@ -139,6 +139,7 @@ export interface RuntimeBoundaryOptions {
   readonly onTerminalReady?: (snapshot: RuntimeTerminalSnapshot) => void | Promise<void>;
   readonly onTerminalGeometry?: (event: { readonly snapshot: RuntimeTerminalSnapshot; readonly signal: AbortSignal }) => void | Promise<void>;
   readonly onTerminalOutput?: (event: {
+    readonly provenance: "live" | "replay_or_unknown";
     readonly tabId: string;
     readonly agentSessionId: string;
     readonly binding: RuntimeTerminalResponse["binding"];
@@ -200,6 +201,8 @@ interface TerminalEntry {
   sendTail: Promise<void>;
   connectionRevision: number;
   heartbeatSequence: bigint;
+  replayBoundarySequence?: bigint;
+  replayBoundaryObserved?: boolean;
   heartbeatSendPending: boolean;
   heartbeatTimer?: NodeJS.Timeout;
   outputAbort: AbortController;
@@ -497,6 +500,8 @@ export class CunaRuntimeBoundary {
       // not include retained output, so request replay only after the ordered
       // resize has reached the same fenced attachment generation.
       entry.wireSequence += 1n;
+      entry.replayBoundarySequence = entry.wireSequence;
+      entry.replayBoundaryObserved = false;
       await connection.send(encodeTerminalControl("resume", entry.wireSequence, {
         resumeHandle: entry.resumeHandle,
         afterOutputSequence: entry.outputSequence.toString(),
@@ -1023,6 +1028,8 @@ export class CunaRuntimeBoundary {
       entry.localActionAcceptance = candidate.localActionAcceptance;
       entry.localActionsNegotiated = candidate.localActionAcceptance !== undefined;
       entry.wireSequence = resumeSequence;
+      entry.replayBoundarySequence = resumeSequence;
+      entry.replayBoundaryObserved = false;
       entry.heartbeatSequence = 0n;
       entry.heartbeatSendPending = false;
       entry.outputAbort = candidate.outputAbort;
@@ -1590,6 +1597,7 @@ export class CunaRuntimeBoundary {
           throw runtimeFailure("terminal_protocol_error", "The terminal output delivery deadline is invalid.");
         }
         await withOutputDeadline(Promise.resolve(this.#options.onTerminalOutput({
+          provenance: entry.replayBoundaryObserved === true ? "live" : "replay_or_unknown",
           tabId: entry.tabId,
           agentSessionId: entry.observation.agentSessionId,
           binding: Object.freeze({
@@ -1702,6 +1710,9 @@ export class CunaRuntimeBoundary {
         throw runtimeFailure("terminal_disconnected", "A late terminal heartbeat cannot revive an expired attachment.", { retryable: true });
       }
       entry.heartbeatSequence = frame.sequence;
+      // The producer emits this exact sequence only after RESUME replay. A
+      // heartbeat request cannot reuse it because client sequences increase.
+      if (frame.sequence === entry.replayBoundarySequence) entry.replayBoundaryObserved = true;
       entry.lastHeartbeatAt = this.#clock();
       this.#scheduleHeartbeatWatchdog(entry, entry.connection, entry.connectionRevision);
       this.#publish(entry);
