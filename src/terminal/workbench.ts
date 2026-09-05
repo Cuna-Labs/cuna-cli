@@ -42,6 +42,39 @@ export class WorkbenchRenderError extends Error {
   }
 }
 
+/** A cell-only projection for the plain observer; it contains no appbar. */
+export function renderBareViewport(viewport: ViewportSnapshot, notice?: string): Uint8Array {
+  if (!Number.isSafeInteger(viewport.columns) || !Number.isSafeInteger(viewport.rows) ||
+    viewport.columns < 1 || viewport.rows < 1 || viewport.columns > 4096 || viewport.rows > 4096) {
+    throw new WorkbenchRenderError("invalid_dimensions", "Observer dimensions are outside the admitted range.");
+  }
+  // A previous raw writer may have changed origin, margins or auto-wrap. The
+  // projected cells own these modes locally and must not inherit those modes.
+  const notices: string[] = [];
+  let remaining = notice === undefined ? "" : safeText(notice);
+  while (remaining.length > 0 && notices.length < Math.max(1, viewport.rows - 1)) {
+    const line = truncate(remaining, viewport.columns);
+    notices.push(line);
+    remaining = remaining.slice(line.length).trimStart();
+  }
+  const contentRows = viewport.rows - notices.length;
+  let text = `${ESC}?25l${ESC}?6l${ESC}r${ESC}?7l`;
+  for (let row = 0; row < contentRows; row += 1) {
+    const cell = viewport.cells[row] ?? "";
+    const width = viewport.displayWidths[row] ?? 0;
+    const runs = viewport.renderRows?.[row];
+    assertViewportCell(cell, width, viewport.columns);
+    if (runs !== undefined) assertViewportRenderRuns(runs, cell, width, viewport.columns);
+    text += `${ESC}${row + 1};1H${ESC}0m${ESC}2K${runs === undefined ? cell : renderStyledRuns(runs)}`;
+  }
+  for (let index = 0; index < notices.length; index += 1) {
+    text += `${ESC}${contentRows + index + 1};1H${ESC}0m${ESC}2K${notices[index]}`;
+  }
+  text += `${ESC}0m${ESC}?7h${ESC}${Math.min(Math.max(0, contentRows - 1), Math.max(0, viewport.cursorY)) + 1};${Math.min(viewport.columns - 1, Math.max(0, viewport.cursorX)) + 1}H`;
+  text += viewport.modes.cursorVisible && viewport.cursorY < contentRows ? `${ESC}?25h` : `${ESC}?25l`;
+  return new TextEncoder().encode(text);
+}
+
 export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame {
   validateDimensions(input.columns, input.rows);
   if (new Set(input.tabs.map((tab) => tab.id)).size !== input.tabs.length) {

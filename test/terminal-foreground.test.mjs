@@ -819,6 +819,36 @@ test("replacement readiness waits for prior-generation host rendering and fences
   await coordinator.stop();
 });
 
+test("same-process readiness retains old cells for delta-only resumed output", async () => {
+  const { coordinator, callbacks, host, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("retained first line\r\n")));
+    await callbacks.onTerminalReady(snapshot(intents[0], 2));
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("new delta line"), 2));
+    assert.match(decoder.decode(host.writes.at(-1)), /retained first line/u);
+    assert.match(decoder.decode(host.writes.at(-1)), /new delta line/u);
+    await callbacks.onTerminalReady(snapshot(intents[0], 2));
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 3n, encoder.encode(" continued"), 2));
+    assert.match(decoder.decode(host.writes.at(-1)), /retained first line/u);
+    assert.match(decoder.decode(host.writes.at(-1)), /new delta line continued/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("foreground rebind refuses foreign process and regressed fence without losing the current model", async () => {
+  const { coordinator, callbacks, host, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("original model\r\n")));
+    await assert.rejects(callbacks.onTerminalReady({ ...snapshot(intents[0], 2), processEpoch: "foreign-process" }));
+    await callbacks.onTerminalReady(snapshot(intents[0], 2));
+    await assert.rejects(callbacks.onTerminalReady(snapshot(intents[0], 1)));
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("still bound"), 2));
+    assert.match(decoder.decode(host.writes.at(-1)), /original model/u);
+    assert.match(decoder.decode(host.writes.at(-1)), /still bound/u);
+  } finally { await coordinator.stop(); }
+});
+
 test("TC-055-07/08 escape help and tab chords stay local while Ctrl+] c sends a remote interrupt", async () => {
   const { coordinator, calls, host, intents } = harness();
   await coordinator.start(intents);
@@ -1469,6 +1499,36 @@ test("an observed tab says so on the notice line, and Ctrl+] w asks the runtime 
     "a demoted writer is told the seat moved",
   );
   await coordinator.stop();
+});
+
+test("retired input uncertainty stays visible while ordinary pending input stays quiet", async () => {
+  const { coordinator, callbacks, host, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    callbacks.onTerminalState({ ...snapshot(intents[0]), inputContinuity: "uncertain", historicalInputUncertainty: false });
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.equal(decoder.decode(host.writes.at(-1)).includes("Prior input uncertain"), false);
+    const historical = { ...snapshot(intents[0]), writerEpoch: 3, inputContinuity: "uncertain", historicalInputUncertainty: true };
+    callbacks.onTerminalState(historical);
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Prior input uncertain"), "retired uncertainty is visible");
+    callbacks.onTerminalState({ ...historical, inputSequence: 15n, acknowledgedInputSequence: 15n });
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.ok(decoder.decode(host.writes.at(-1)).includes("Prior input uncertain"));
+    assert.ok(decoder.decode(host.writes.at(-1)).includes("not resent"));
+  } finally { await coordinator.stop(); }
+});
+
+test("reconnect exhaustion does not hide historical input uncertainty", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 1, reconnectBaseDelayMs: 1 },
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    runtime.reconnect = async input => { calls.reconnect.push(input.tabId); throw new Error("temporarily unavailable"); };
+    callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", historicalInputUncertainty: true, inputContinuity: "uncertain" });
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Reconnect failed"), "bounded recovery failed");
+    assert.match(decoder.decode(host.writes.at(-1)), /Prior input uncertain · not resent/u);
+  } finally { await coordinator.stop(); }
 });
 
 test("a refused seat request is reported on the notice line and does not stop the foreground", async () => {

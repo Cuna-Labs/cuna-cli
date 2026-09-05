@@ -10,8 +10,11 @@ import type {
   ForegroundTerminalRuntime,
   ForegroundTerminalState,
 } from "./foreground.js";
-import { MAX_FOREGROUND_PENDING_INPUT_BYTES, admitForegroundSessionIds } from "./foreground.js";
+import { HISTORICAL_INPUT_NOTICE, MAX_FOREGROUND_PENDING_INPUT_BYTES, admitForegroundSessionIds } from "./foreground.js";
 import type { HostTerminalLease } from "./mode.js";
+import { ViewportRegistry } from "./viewport.js";
+import { XtermViewportAdapter } from "./xterm-vte.js";
+import { renderBareViewport } from "./workbench.js";
 
 const ESCAPE_PREFIX = 0x1d;
 const INTERRUPT = 0x03;
@@ -32,9 +35,9 @@ export interface PassthroughTerminalCoordinatorOptions {
 }
 
 /**
- * A byte-preserving, single-session fallback. It deliberately renders no Cuna
- * appbar, progress, status, or decoration because it has no isolated viewport
- * in which trusted chrome could be kept separate from remote PTY bytes.
+ * A single-session fallback. Ordinary writers retain byte-preserving output;
+ * observers and writers with historical input uncertainty use an isolated cell
+ * projection with bounded local notices. This mode has no Cuna appbar.
  */
 export class PassthroughTerminalCoordinator {
   readonly #options: Readonly<Required<Pick<PassthroughTerminalCoordinatorOptions, "resizeCoalesceMs">> & PassthroughTerminalCoordinatorOptions>;
@@ -66,6 +69,7 @@ export class PassthroughTerminalCoordinator {
   readonly #resolveInitialReady: () => void;
   readonly #lifetimeAbort = new AbortController();
   #startupDetached = false;
+  #viewport: XtermViewportAdapter | undefined;
 
   constructor(options: PassthroughTerminalCoordinatorOptions) {
     const resizeCoalesceMs = options.resizeCoalesceMs ?? RESIZE_COALESCE_MS;
@@ -103,6 +107,7 @@ export class PassthroughTerminalCoordinator {
 
   runtimeCallbacks(): {
     readonly onTerminalReady: (snapshot: RuntimeTerminalSnapshot) => Promise<void>;
+    readonly onTerminalGeometry: (event: { readonly snapshot: RuntimeTerminalSnapshot; readonly signal: AbortSignal }) => Promise<void>;
     readonly onTerminalOutput: (event: {
       readonly tabId: string;
       readonly agentSessionId: string;
@@ -115,6 +120,7 @@ export class PassthroughTerminalCoordinator {
   } {
     return Object.freeze({
       onTerminalReady: async (snapshot) => this.#terminalReady(snapshot),
+      onTerminalGeometry: async (event) => await this.#terminalGeometry(event.snapshot, event.signal),
       onTerminalOutput: async (event) => await this.#queueOutput(event),
       onTerminalState: (snapshot) => this.#terminalState(snapshot),
     });
@@ -230,6 +236,8 @@ export class PassthroughTerminalCoordinator {
     }
     try { await this.#outputTail; } catch (error) { failures.push(error); }
     try { await this.#inputTail; } catch (error) { failures.push(error); }
+    this.#viewport?.dispose();
+    this.#viewport = undefined;
     if (this.#lease !== undefined) {
       try {
         await this.#lease.restore();
@@ -245,7 +253,8 @@ export class PassthroughTerminalCoordinator {
     if (failures.length > 0) throw new AggregateError(failures, "Passthrough terminal cleanup was incomplete.");
   }
 
-  #terminalReady(snapshot: RuntimeTerminalSnapshot): void {
+  async #terminalReady(snapshot: RuntimeTerminalSnapshot): Promise<void> {
+    await this.#outputTail;
     const intent = this.#intent;
     if (intent === undefined || !sameIntent(intent, snapshot)) {
       throw runtimeFailure("grant_scope_mismatch", "Passthrough readiness targets an unbound AgentSession.");
@@ -253,8 +262,95 @@ export class PassthroughTerminalCoordinator {
     if (this.#state !== "starting" && this.#state !== "active") {
       throw runtimeFailure("terminal_disconnected", "Passthrough readiness arrived after terminal ownership ended.");
     }
+    const previous = this.#viewport?.snapshot();
+    if (previous !== undefined) {
+      const binding = { userId: snapshot.userId, machineId: snapshot.machineId,
+        agentSessionId: snapshot.agentSessionId, processEpoch: snapshot.processEpoch,
+        fencingGeneration: snapshot.fencingGeneration };
+      if (previous.binding.fencingGeneration === binding.fencingGeneration && sameEvent(snapshot, {
+        tabId: previous.tabId, agentSessionId: previous.binding.agentSessionId, binding: previous.binding,
+      })) {
+        // A repeated READY for the exact attachment cannot erase consumed cells.
+      } else {
+        await this.#viewport?.rebind(binding);
+      }
+      this.#snapshot = snapshot;
+      this.#resolveInitialReady();
+      return;
+    }
     this.#snapshot = snapshot;
+    const dimensions = admitPassthroughDimensions(this.#options.host.dimensions());
+    this.#viewport = new XtermViewportAdapter({
+      tabId: snapshot.tabId,
+      binding: {
+        userId: snapshot.userId, machineId: snapshot.machineId,
+        agentSessionId: snapshot.agentSessionId, processEpoch: snapshot.processEpoch,
+        fencingGeneration: snapshot.fencingGeneration,
+      },
+      columns: dimensions.columns, rows: dimensions.rows,
+      registry: new ViewportRegistry(), scrollback: 0,
+      // The raw writer's physical terminal answers queries. The shadow model
+      // must never duplicate those responses or emit observer input. A writer
+      // with historical uncertainty uses projection to keep its notice visible.
+      onTerminalResponse: async (response) => {
+        if (this.#snapshot?.accessMode === "writer" && this.#snapshot.historicalInputUncertainty) {
+          await this.#requireRuntime().sendTerminalResponse(response);
+        }
+      },
+    });
     this.#resolveInitialReady();
+  }
+
+  async #terminalGeometry(snapshot: RuntimeTerminalSnapshot, signal: AbortSignal): Promise<void> {
+    const operation = this.#outputTail.then(async () => {
+      const current = this.#snapshot;
+      if (current === undefined || !sameEvent(current, {
+        tabId: snapshot.tabId, agentSessionId: snapshot.agentSessionId,
+        binding: snapshot,
+      }) || current.writerEpoch !== snapshot.writerEpoch || snapshot.geometry === null) {
+        throw runtimeFailure("grant_scope_mismatch", "Plain geometry targets a different attachment or writer epoch.");
+      }
+      if (signal.aborted) throw runtimeFailure("terminal_disconnected", "Plain geometry was cancelled.");
+      const viewport = this.#viewport;
+      if (viewport === undefined) throw runtimeFailure("terminal_disconnected", "Plain geometry has no bound viewport.");
+      const onAbort = (): void => viewport.dispose();
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        await viewport.resize(snapshot.geometry.columns, snapshot.geometry.rows);
+        if (signal.aborted) throw runtimeFailure("terminal_disconnected", "Plain geometry was cancelled.");
+        this.#snapshot = snapshot;
+        if (this.#usesProjection()) await this.#renderObserver();
+      } finally { signal.removeEventListener("abort", onAbort); }
+    });
+    this.#outputTail = operation.then(() => undefined, () => undefined);
+    await operation;
+  }
+
+  async #renderObserver(): Promise<void> {
+    const snapshot = this.#snapshot;
+    if (snapshot === undefined || !this.#usesProjection()) return;
+    const dimensions = admitPassthroughDimensions(this.#options.host.dimensions());
+    const viewport = this.#viewport;
+    if (viewport === undefined) throw runtimeFailure("terminal_disconnected", "The observer viewport is unavailable.");
+    const projection = viewport.snapshotForHost(dimensions.columns, dimensions.rows);
+    const notice = [
+      ...(snapshot.historicalInputUncertainty ? [HISTORICAL_INPUT_NOTICE] : []),
+      ...(viewport.snapshot().columns > dimensions.columns || viewport.snapshot().rows > dimensions.rows || snapshot.historicalInputUncertainty ? ["Local view cropped."] : []),
+    ].join(" · ") || undefined;
+    if (snapshot.geometry == null) {
+      // Do not display host-sized parsed cells as authoritative writer geometry.
+      const { renderRows: _renderRows, ...plain } = projection;
+      const label = "Terminal geometry unknown".slice(0, dimensions.columns);
+      await this.#options.host.write(renderBareViewport({ ...plain,
+        cells: [label], displayWidths: [label.length], modes: { ...plain.modes, cursorVisible: false },
+      }, notice));
+    } else {
+      await this.#options.host.write(renderBareViewport(projection, notice));
+    }
+  }
+
+  #usesProjection(): boolean {
+    return this.#snapshot?.accessMode === "observer" || this.#snapshot?.historicalInputUncertainty === true;
   }
 
   async #queueOutput(event: {
@@ -271,6 +367,14 @@ export class PassthroughTerminalCoordinator {
         throw runtimeFailure("grant_scope_mismatch", "Passthrough output targets an unbound terminal generation.");
       }
       if (event.signal.aborted) throw runtimeFailure("terminal_disconnected", "Passthrough output was cancelled.");
+      const viewport = this.#viewport;
+      if (viewport === undefined) throw runtimeFailure("terminal_disconnected", "Plain output has no bound viewport.");
+      await viewport.write(event.bytes, event.sequence, event.sequence);
+      if (event.signal.aborted) throw runtimeFailure("terminal_disconnected", "Plain output was cancelled.");
+      if (this.#usesProjection()) {
+        await this.#renderObserver();
+        return;
+      }
       this.#observeRemoteModeOutput(event.bytes);
       // This is intentionally the original binary payload. No status, Unicode
       // decoding, VTE interpretation, or trusted chrome is inserted here.
@@ -292,7 +396,16 @@ export class PassthroughTerminalCoordinator {
       // state. That teardown edge is expected and must not become a CLI error.
       return;
     }
+    const previous = this.#snapshot;
     this.#snapshot = snapshot;
+    if (snapshot.state === "active" && this.#usesProjection() &&
+      (previous?.accessMode !== snapshot.accessMode || previous.historicalInputUncertainty !== snapshot.historicalInputUncertainty)) {
+      const operation = this.#outputTail.then(async () => await this.#renderObserver());
+      this.#outputTail = operation.catch((error) => {
+        this.#failure ??= error;
+        void this.stop().catch(() => { this.#state = "failed"; });
+      });
+    }
     if (snapshot.state === "failed" || snapshot.state === "interrupted") {
       this.#failure ??= runtimeFailure("terminal_disconnected", "The passthrough terminal connection ended.");
     }
@@ -384,6 +497,7 @@ export class PassthroughTerminalCoordinator {
     const remote: number[] = [];
     const flush = async (): Promise<void> => {
       if (remote.length === 0) return;
+      if (this.#snapshot?.accessMode !== "writer") { remote.length = 0; return; }
       await this.#requireRuntime().sendInput(Uint8Array.from(remote.splice(0)), target.tabId, target.binding);
     };
     for (const byte of bytes) {
@@ -477,10 +591,12 @@ export class PassthroughTerminalCoordinator {
 
   #queueResize(): void {
     if (this.#state !== "active") return;
+    const authority = this.#snapshot;
+    if (authority === undefined) return;
     if (this.#resizeTimer !== undefined) clearTimeout(this.#resizeTimer);
     this.#resizeTimer = setTimeout(() => {
       this.#resizeTimer = undefined;
-      void this.#applyResize().catch((error) => {
+      void this.#applyResize(authority).catch((error) => {
         this.#failure ??= error;
         void this.stop().catch(() => { this.#state = "failed"; });
       });
@@ -488,9 +604,19 @@ export class PassthroughTerminalCoordinator {
     this.#resizeTimer.unref();
   }
 
-  async #applyResize(): Promise<void> {
+  async #applyResize(authority: RuntimeTerminalSnapshot): Promise<void> {
     const snapshot = this.#snapshot;
-    if (snapshot === undefined || snapshot.state !== "active" || snapshot.resizeCapability !== "live") return;
+    if (snapshot === undefined || snapshot.state !== "active") return;
+    if (snapshot.accessMode === "observer" || authority.accessMode !== "writer" ||
+      snapshot.writerEpoch !== authority.writerEpoch || !sameEvent(snapshot, {
+        tabId: authority.tabId, agentSessionId: authority.agentSessionId, binding: authority,
+      })) {
+      const operation = this.#outputTail.then(async () => await this.#renderObserver());
+      this.#outputTail = operation.then(() => undefined, () => undefined);
+      await operation;
+      return;
+    }
+    if (snapshot.resizeCapability !== "live") return;
     const dimensions = admitPassthroughDimensions(this.#options.host.dimensions());
     await this.#requireRuntime().resize(dimensions.columns, dimensions.rows, snapshot.tabId);
   }
@@ -499,7 +625,8 @@ export class PassthroughTerminalCoordinator {
     snapshot: RuntimeTerminalSnapshot,
     dimensions: { readonly columns: number; readonly rows: number },
   ): Promise<void> {
-    if (snapshot.state !== "active" || snapshot.resizeCapability !== "live") return;
+    if (snapshot.accessMode === "observer") { await this.#renderObserver(); return; }
+    if (snapshot.state !== "active" || snapshot.accessMode !== "writer" || snapshot.resizeCapability !== "live") return;
     // A fullscreen TUI may have painted its base frame before this client
     // attached, leaving replay with cursor-relative deltas only. Force one
     // real size transition and restore the admitted host size so the remote

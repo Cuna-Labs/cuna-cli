@@ -315,3 +315,23 @@ test("terminal query responses are returned to the owning remote session only", 
   assert.match(response.slice(1), /^\[\d+;\d+R$/u);
   viewport.dispose();
 });
+
+test("same-process viewport rebind retains cells and sequence while retiring old query authority", async () => {
+  let entered=false; let release; const gate=new Promise(resolve=>{release=resolve});const replies=[];
+  const {viewport}=adapter({onTerminalResponse:async response=>{replies.push(response);entered=true;await gate;if(response.signal.aborted)throw response.signal.reason;}});
+  try {
+    const write=viewport.write(encoder.encode('PREFIX\x1b[6n'),1n,1n);
+    void write.catch(()=>{});
+    while(!entered)await new Promise(resolve=>setTimeout(resolve,1));
+    const rebinding=viewport.rebind({...binding,fencingGeneration:2});
+    release(); await write; const rebound=await rebinding;
+    assert.equal(replies[0].binding.fencingGeneration,1); assert.equal(replies[0].signal.aborted,true);
+    assert.equal(rebound.cells[0],'PREFIX');assert.equal(rebound.outputSequence,1n);assert.equal(rebound.replayCursor,1n);
+    const delta=await viewport.write(encoder.encode('-DELTA'),2n,2n);
+    assert.equal(delta.cells[0],'PREFIX-DELTA');assert.equal(delta.binding.fencingGeneration,2);
+    for(const next of [{...binding,fencingGeneration:2},{...binding,fencingGeneration:1},{...binding,fencingGeneration:3,processEpoch:'other'},{...binding,fencingGeneration:3,userId:'other'}]){
+      await assert.rejects(viewport.rebind(next),/binding|fence|process/u);
+      assert.equal(viewport.snapshot().cells[0],'PREFIX-DELTA');
+    }
+  }finally{release();viewport.dispose();}
+});

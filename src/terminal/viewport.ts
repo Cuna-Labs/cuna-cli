@@ -7,6 +7,15 @@ export interface ViewportBinding extends AttachmentIdentity {
   readonly fencingGeneration: number;
 }
 
+export function assertViewportRebind(current: ViewportBinding, next: ViewportBinding): void {
+  validateBinding(next);
+  if (current.userId !== next.userId || current.machineId !== next.machineId ||
+    current.agentSessionId !== next.agentSessionId || current.processEpoch !== next.processEpoch ||
+    next.fencingGeneration <= current.fencingGeneration) {
+    throw new ViewportIsolationError("binding_mismatch", "A viewport rebind requires the same process and a higher attachment fence.");
+  }
+}
+
 export interface ViewportModes {
   readonly bracketedPaste: boolean;
   readonly mouse: boolean;
@@ -98,6 +107,14 @@ export class ViewportRegistry {
     const tab = this.require(tabId);
     this.#activeTabId = tabId;
     return tab;
+  }
+
+  rebind(tabId: string, binding: ViewportBinding): ViewportSnapshot {
+    const current = this.require(tabId);
+    assertViewportRebind(current.binding, binding);
+    const next = freezeSnapshot({ ...current, binding });
+    this.#tabs.set(tabId, next);
+    return next;
   }
 
   close(tabId: string): void {

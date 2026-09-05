@@ -2359,3 +2359,102 @@ for(const scenario of ['foreign-writer','contradiction','ready-contradiction']){
   }finally{await runtime.shutdown();}
  });
 }
+
+for (const scope of ["reconnect", "writer_epoch"]) {
+  for (const previouslyAcknowledged of [false, true]) {
+    test(`input acceptance scope ${scope} retains only actual historical uncertainty: ${previouslyAcknowledged}`, async () => {
+      const system = new FakeTerminalSystem();
+      const { runtime } = createRuntime(system);
+      try {
+        await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+        let wire = system.connections[0];
+        await runtime.sendInput(new TextEncoder().encode("old"), "tab-a");
+        const oldSequence = runtime.listTerminals()[0].inputSequence;
+        const ack = sequence => encodeTerminalControl("acknowledgement", 1n, {
+          clientSequence: sequence.toString(), meaning: "durably_accepted_not_executed",
+        });
+        if (previouslyAcknowledged) {
+          wire.incoming.push(ack(oldSequence));
+          await waitUntil(() => runtime.listTerminals()[0].inputContinuity === "complete", "old acceptance ACK");
+        }
+        if (scope === "reconnect") {
+          wire.incoming.close();
+          await waitUntil(() => runtime.listTerminals()[0].state === "interrupted", "old connection closed");
+          assert.equal(runtime.listTerminals()[0].historicalInputUncertainty, !previouslyAcknowledged, "transport loss retires pending input before any reconnect");
+          await runtime.reconnect({ tabId: "tab-a" });
+          wire = system.connections[1];
+          assert.equal(wire.sent.map(decodeTerminalFrame).some(frame => frame.type === "input"), false, "uncertain bytes are never replayed");
+        } else {
+          wire.incoming.push(encodeTerminalControl("writer_epoch", 1n, { writerEpoch: 2, writerClientInstanceId: "other", accessMode: "observer" }));
+          await waitUntil(() => runtime.listTerminals()[0].writerEpoch === 2, "writer loss");
+          wire.incoming.push(encodeTerminalControl("writer_epoch", 2n, { writerEpoch: 3, writerClientInstanceId: "client-1", accessMode: "writer" }));
+          await waitUntil(() => runtime.listTerminals()[0].writerEpoch === 3, "writer reacquired on same attachment");
+        }
+        await runtime.sendInput(new TextEncoder().encode("new"), "tab-a");
+        const freshSequence = runtime.listTerminals()[0].inputSequence;
+        wire.incoming.push(ack(freshSequence));
+        await waitUntil(() => runtime.listTerminals()[0].acknowledgedInputSequence === freshSequence, "fresh scope acceptance ACK");
+        assert.equal(runtime.listTerminals()[0].inputContinuity, previouslyAcknowledged ? "complete" : "uncertain");
+        if (!previouslyAcknowledged) {
+          wire.incoming.push(ack(oldSequence));
+          await new Promise(resolve => setTimeout(resolve, 15));
+          assert.equal(runtime.listTerminals()[0].state, "active", "late retired ACK must not break the current attachment");
+          assert.equal(runtime.listTerminals()[0].inputContinuity, "uncertain", "late receipt cannot erase retired uncertainty");
+        }
+      } finally { await runtime.shutdown(); }
+    });
+  }
+}
+
+test("input acceptance scope reconnect releases the bounded current window without forgetting history", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    for (let index = 0; index < 4096; index++) await runtime.sendInput(new Uint8Array([120]), "tab-a");
+    system.connections[0].incoming.close();
+    await waitUntil(() => runtime.listTerminals()[0].state === "interrupted", "full uncertain window disconnected");
+    await runtime.reconnect({ tabId: "tab-a" });
+    await runtime.sendInput(new Uint8Array([121]), "tab-a");
+    const sequence = runtime.listTerminals()[0].inputSequence;
+    system.connections[1].incoming.push(encodeTerminalControl("acknowledgement", 1n, { clientSequence: sequence.toString(), meaning: "durably_accepted_not_executed" }));
+    await waitUntil(() => runtime.listTerminals()[0].acknowledgedInputSequence === sequence, "new window progresses");
+    assert.equal(runtime.listTerminals()[0].inputContinuity, "uncertain");
+    assert.equal(system.connections[1].sent.map(decodeTerminalFrame).filter(frame => frame.type === "input").length, 1);
+  } finally { await runtime.shutdown(); }
+});
+
+for (const phase of ["initial", "live", "reconnect"]) {
+  test(`input recovery ERROR is permanent and preserves its specific reason: ${phase}`, async () => {
+    const system = new FakeTerminalSystem();
+    const { runtime } = createRuntime(system);
+    const errorFrame = encodeTerminalControl("error", 0n, {
+      code: "terminal_input_recovery_required", retryable: false, safeReason: "input_acceptance_unavailable",
+    });
+    try {
+      if (phase === "initial") {
+        system.connectionsWithoutReady.add(1);
+        const opening = runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+        const checked = assert.rejects(opening, error => error.retryable === false && error.safeDetails?.reason === "terminal_input_recovery_required");
+        await waitUntil(() => system.connections.length === 1, "exact initial connection");
+        system.connections[0].incoming.push(errorFrame); await checked;
+        assert.equal(runtime.listTerminals().length, 0);
+      } else {
+        await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+        if (phase === "reconnect") {
+          system.connections[0].incoming.close();
+          await waitUntil(() => runtime.listTerminals()[0].state === "interrupted", "old transport ended");
+          system.connectionsWithoutReady.add(2);
+          const opening = runtime.reconnect({ tabId: "tab-a" });
+          const checked = assert.rejects(opening, error => error.retryable === false && error.safeDetails?.reason === "terminal_input_recovery_required");
+          await waitUntil(() => system.connections.length === 2, "exact recovery connection");
+          system.connections[1].incoming.push(errorFrame); await checked;
+        } else system.connections[0].incoming.push(errorFrame);
+        await waitUntil(() => runtime.listTerminals()[0].state === "failed", "permanent input recovery refusal");
+        assert.equal(runtime.listTerminals()[0].reason, "terminal_input_recovery_required");
+        await assert.rejects(runtime.reconnect({ tabId: "tab-a" }), error => error.code === "session_conflict");
+      }
+      assert.equal(system.createCalls.length, phase === "reconnect" ? 2 : 1, "no automatic replacement or retry");
+    } finally { await runtime.shutdown(); }
+  });
+}

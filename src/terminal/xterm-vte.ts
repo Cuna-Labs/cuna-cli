@@ -5,6 +5,7 @@ import type { IBufferCell, Terminal as XtermTerminal } from "@xterm/headless";
 import { MAX_TERMINAL_FRAME_BYTES } from "./codec.js";
 import {
   MAX_VIEWPORT_CELLS,
+  assertViewportRebind,
   ViewportRegistry,
   type ViewportBinding,
   type ViewportCellColor,
@@ -116,7 +117,7 @@ export interface XtermViewportOptions {
 
 export class XtermViewportAdapter {
   readonly #tabId: string;
-  readonly #binding: ViewportBinding;
+  #binding: ViewportBinding;
   readonly #registry: ViewportRegistry;
   readonly #terminal: XtermTerminal;
   readonly #encoder = new TextEncoder();
@@ -126,7 +127,7 @@ export class XtermViewportAdapter {
   readonly #clock: () => number;
   readonly #responseDeliveryTimeoutMs: number;
   readonly #resourceBudget: XtermResourceBudget;
-  readonly #responseAbort = new AbortController();
+  #responseAbort = new AbortController();
   #writeTail: Promise<void> = Promise.resolve();
   #pendingWriteBytes = 0;
   #cellExtenderRun = 0;
@@ -202,6 +203,25 @@ export class XtermViewportAdapter {
   snapshot(): ViewportSnapshot {
     this.#assertOpen();
     return this.#registry.require(this.#tabId);
+  }
+
+  async rebind(binding: ViewportBinding): Promise<ViewportSnapshot> {
+    this.#assertOpen();
+    assertViewportRebind(this.#binding, binding);
+    const nextBinding = Object.freeze({ ...binding });
+    // Revoke queued query replies immediately. Their immutable old binding
+    // never gains the new fence, and their cancellation must not destroy the
+    // surviving model. All old writes settle before the binding is changed.
+    this.#responseAbort.abort(new Error("The terminal query's attachment was retired."));
+    const operation = this.#writeTail.then(() => {
+      this.#assertOpen();
+      const snapshot = this.#registry.rebind(this.#tabId, nextBinding);
+      this.#binding = nextBinding;
+      this.#responseAbort = new AbortController();
+      return snapshot;
+    });
+    this.#writeTail = operation.then(() => undefined, () => undefined);
+    return await operation;
   }
 
   snapshotForHost(columns: number, rows: number): ViewportSnapshot {
@@ -303,11 +323,16 @@ export class XtermViewportAdapter {
       this.#responseBatch = undefined;
       if (this.#onTerminalResponse !== undefined) {
         for (const response of responses) {
-          await withDeadline(
-            Promise.resolve(this.#onTerminalResponse(response)),
-            this.#responseDeliveryTimeoutMs,
-            this.#responseAbort.signal,
-          );
+          if (response.signal.aborted) continue;
+          try {
+            await withDeadline(
+              Promise.resolve(this.#onTerminalResponse(response)),
+              this.#responseDeliveryTimeoutMs,
+              response.signal,
+            );
+          } catch (error) {
+            if (!response.signal.aborted || this.#disposed) throw error;
+          }
         }
       }
       return this.#capture(outputSequence, replayCursor);

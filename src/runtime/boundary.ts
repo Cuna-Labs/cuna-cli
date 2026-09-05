@@ -92,6 +92,7 @@ export interface RuntimeTerminalSnapshot {
   readonly inputSequence: bigint;
   readonly acknowledgedInputSequence: bigint;
   readonly inputContinuity: "none" | "complete" | "uncertain";
+  readonly historicalInputUncertainty: boolean;
   readonly outputSequence: bigint;
   readonly outputContinuity: "complete" | "unknown" | "incomplete";
   readonly resizeCapability: "live" | "initial_resize_only";
@@ -185,6 +186,9 @@ interface TerminalEntry {
   acknowledgedInputSequence: bigint;
   inputContinuity: RuntimeTerminalSnapshot["inputContinuity"];
   pendingInputSequences: Set<bigint>;
+  /** Accepted receipts from a later writer/attachment cannot resolve this history. */
+  historicalInputUncertainty: boolean;
+  retiredInputSequence: bigint;
   outputSequence: bigint;
   outputContinuity: RuntimeTerminalSnapshot["outputContinuity"];
   lastHeartbeatAt: number;
@@ -410,6 +414,8 @@ export class CunaRuntimeBoundary {
         acknowledgedInputSequence: 0n,
         inputContinuity: "none",
         pendingInputSequences: new Set(),
+        historicalInputUncertainty: false,
+        retiredInputSequence: 0n,
         outputSequence: 0n,
         outputContinuity: "unknown",
         lastHeartbeatAt: this.#clock(),
@@ -605,6 +611,7 @@ export class CunaRuntimeBoundary {
         entry.connectionRevision += 1;
         entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "Terminal input acknowledgement window was exhausted."));
         entry.state = "interrupted";
+        retireInputAcceptance(entry);
         entry.inputContinuity = "uncertain";
         entry.outputContinuity = "unknown";
         entry.reason = "input_ack_window_exhausted";
@@ -774,7 +781,10 @@ export class CunaRuntimeBoundary {
         }
         // A later server notice may already have superseded this HTTP reply.
         if (entry.writerTransfer === operation && state.writerEpoch >= entry.writerEpoch) {
-          if (state.writerEpoch !== entry.writerEpoch) entry.geometry = null;
+          if (state.writerEpoch !== entry.writerEpoch) {
+            retireInputAcceptance(entry);
+            entry.geometry = null;
+          }
           entry.writerEpoch = state.writerEpoch;
           entry.writerClientInstanceId = state.writerClientInstanceId;
           if (state.transferPending) entry.reason = "writer_transfer_pending";
@@ -807,6 +817,7 @@ export class CunaRuntimeBoundary {
     entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The previous terminal attachment was interrupted."));
     const reconnectRevision = entry.connectionRevision + 1;
     entry.connectionRevision = reconnectRevision;
+    retireInputAcceptance(entry);
     entry.outputContinuity = "unknown";
     delete entry.reason;
     this.#publish(entry);
@@ -1041,9 +1052,9 @@ export class CunaRuntimeBoundary {
         entry.connectionRevision === reconnectRevision &&
         entry.state !== "failed"
       ) {
-        entry.state = "interrupted";
+        entry.state = isPermanentInputRecoveryFailure(error) ? "failed" : "interrupted";
         entry.outputContinuity = "unknown";
-        entry.reason = safeReason(reportedError);
+        entry.reason = safeReason(isPermanentInputRecoveryFailure(error) ? error : reportedError);
         this.#publish(entry);
       }
       throw reportedError;
@@ -1491,6 +1502,7 @@ export class CunaRuntimeBoundary {
         this.#clearHeartbeatWatchdog(entry);
         entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The terminal transport closed."));
         entry.state = "interrupted";
+        retireInputAcceptance(entry);
         entry.outputContinuity = "unknown";
         entry.reason = "transport_closed_without_terminal_exit";
         this.#publish(entry);
@@ -1504,6 +1516,7 @@ export class CunaRuntimeBoundary {
         error instanceof TerminalProtocolError ||
         (error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error")
       ) ? "failed" : "interrupted";
+      retireInputAcceptance(entry);
       entry.outputContinuity = "unknown";
       entry.reason = safeReason(error);
       this.#publish(entry);
@@ -1624,7 +1637,10 @@ export class CunaRuntimeBoundary {
         return;
       }
       entry.wireWriterNotice = payload;
-      if (payload.writerEpoch !== entry.writerEpoch) entry.geometry = null;
+      if (payload.writerEpoch !== entry.writerEpoch) {
+        retireInputAcceptance(entry);
+        entry.geometry = null;
+      }
       const wasWriter = entry.accessMode === "writer";
       entry.accessMode = payload.accessMode;
       entry.writerEpoch = payload.writerEpoch;
@@ -1641,6 +1657,12 @@ export class CunaRuntimeBoundary {
     if (frame.type === "acknowledgement") {
       const payload = decodeTerminalControl(frame);
       const acknowledged = BigInt(String(payload.clientSequence));
+      if (acknowledged <= 0n || payload.meaning !== "durably_accepted_not_executed") {
+        throw runtimeFailure("terminal_protocol_error", "Terminal input acknowledgement is invalid.");
+      }
+      // Sequences remain monotone across this runtime's reconnects. Late
+      // receipts for retired scopes never certify or disrupt the current one.
+      if (acknowledged <= entry.retiredInputSequence) return;
       if (
         acknowledged <= entry.acknowledgedInputSequence ||
         !entry.pendingInputSequences.has(acknowledged) ||
@@ -1652,7 +1674,7 @@ export class CunaRuntimeBoundary {
         if (sequence <= acknowledged) entry.pendingInputSequences.delete(sequence);
       }
       entry.acknowledgedInputSequence = acknowledged;
-      entry.inputContinuity = entry.pendingInputSequences.size === 0 ? "complete" : "uncertain";
+      entry.inputContinuity = entry.pendingInputSequences.size === 0 && !entry.historicalInputUncertainty ? "complete" : "uncertain";
       this.#publish(entry);
       return;
     }
@@ -1688,7 +1710,9 @@ export class CunaRuntimeBoundary {
 
   #remoteTerminalError(frame: TerminalFrame): RuntimeBoundaryError {
     const payload = decodeTerminalControl(frame);
-    return runtimeFailure("terminal_protocol_error", "The Cuna terminal gateway rejected the connection.", {
+    return runtimeFailure("terminal_protocol_error", payload.code === "terminal_input_recovery_required"
+      ? "Terminal input requires recovery. Reconnecting cannot confirm earlier input delivery."
+      : "The Cuna terminal gateway rejected the connection.", {
       retryable: payload.retryable === true,
       safeDetails: { reason: typeof payload.code === "string" ? payload.code : "terminal_error" },
     });
@@ -1801,6 +1825,7 @@ export class CunaRuntimeBoundary {
         this.#clearHeartbeatWatchdog(entry);
         entry.outputAbort.abort(error);
         entry.state = "interrupted";
+        retireInputAcceptance(entry);
         entry.outputContinuity = "unknown";
         entry.reason = "heartbeat_send_failed";
         this.#publish(entry);
@@ -1830,6 +1855,7 @@ export class CunaRuntimeBoundary {
     this.#clearHeartbeatWatchdog(entry);
     entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "The terminal heartbeat expired."));
     entry.state = "interrupted";
+    retireInputAcceptance(entry);
     entry.outputContinuity = "unknown";
     entry.reason = "heartbeat_expired";
     this.#publish(entry);
@@ -1911,6 +1937,7 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000, now = Date.
     inputSequence: entry.inputSequence,
     acknowledgedInputSequence: entry.acknowledgedInputSequence,
     inputContinuity: entry.inputContinuity,
+    historicalInputUncertainty: entry.historicalInputUncertainty,
     outputSequence: entry.outputSequence,
     outputContinuity: entry.outputContinuity,
     resizeCapability: entry.resizeCapability,
@@ -1962,7 +1989,20 @@ async function nextWithTimeout(
   }
 }
 
+function retireInputAcceptance(entry: TerminalEntry): void {
+  entry.historicalInputUncertainty ||= entry.pendingInputSequences.size > 0;
+  if (entry.inputSequence > entry.retiredInputSequence) entry.retiredInputSequence = entry.inputSequence;
+  entry.pendingInputSequences.clear();
+  if (entry.historicalInputUncertainty) entry.inputContinuity = "uncertain";
+}
+
+function isPermanentInputRecoveryFailure(error: unknown): error is RuntimeBoundaryError {
+  return error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error" &&
+    !error.retryable && error.safeDetails?.reason === "terminal_input_recovery_required";
+}
+
 function safeReason(error: unknown): string {
+  if (isPermanentInputRecoveryFailure(error)) return "terminal_input_recovery_required";
   if (error instanceof TerminalProtocolError) return "terminal_protocol_error";
   if (error instanceof RuntimeBoundaryError) return error.code;
   return "transport_failure";

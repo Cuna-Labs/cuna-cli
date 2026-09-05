@@ -29,6 +29,7 @@ import { ViewportRegistry } from "./viewport.js";
 import { XtermViewportAdapter } from "./xterm-vte.js";
 
 const ESCAPE_PREFIX = 0x1d;
+export const HISTORICAL_INPUT_NOTICE = "Prior input uncertain · not resent";
 const INTERRUPT = 0x03;
 const FLOW_RESUME = 0x11;
 const FLOW_PAUSE = 0x13;
@@ -473,7 +474,6 @@ export class ForegroundTerminalCoordinator {
     ) {
       throw runtimeFailure("terminal_disconnected", "Terminal readiness arrived after foreground ownership ended.");
     }
-    previous?.viewport.dispose();
     if (previous !== undefined) this.#forgetSeatNoticeOnSeatChange(previous.snapshot, snapshot);
     const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
     if (
@@ -512,21 +512,32 @@ export class ForegroundTerminalCoordinator {
     if (guardedRequest?.fencingGeneration !== snapshot.fencingGeneration) {
       this.#oauthPasteGuards.delete(snapshot.tabId);
     }
-    const viewport = new XtermViewportAdapter({
+    const binding = {
+      userId: snapshot.userId,
+      machineId: snapshot.machineId,
+      agentSessionId: snapshot.agentSessionId,
+      processEpoch: snapshot.processEpoch,
+      fencingGeneration: snapshot.fencingGeneration,
+    };
+    // A resumed stream contains only output after the retained cursor. Keep
+    // those earlier cells, while retiring the old query-response authority.
+    const viewport = previous?.viewport ?? new XtermViewportAdapter({
       tabId: snapshot.tabId,
-      binding: {
-        userId: snapshot.userId,
-        machineId: snapshot.machineId,
-        agentSessionId: snapshot.agentSessionId,
-        processEpoch: snapshot.processEpoch,
-        fencingGeneration: snapshot.fencingGeneration,
-      },
+      binding,
       columns: dimensions.columns,
       rows: remoteRows(dimensions.rows),
       registry: this.#registry,
       onTerminalResponse: async (response) => await runtime.sendTerminalResponse(response),
       clock: this.#clock,
     });
+    if (previous !== undefined) {
+      const oldBinding = viewport.snapshot().binding;
+      if (!sameSnapshotBinding(snapshot, oldBinding)) await viewport.rebind(binding);
+      if (this.#lifetimeAbort.signal.aborted || this.#tabs.get(snapshot.tabId) !== previous ||
+        (this.#state !== "starting" && this.#state !== "active")) {
+        throw runtimeFailure("terminal_disconnected", "Terminal rebinding completed after foreground ownership ended.");
+      }
+    }
     this.#tabs.set(snapshot.tabId, { intent, snapshot, viewport });
     // A reconnect for the same binding may have dropped the outcome after the
     // local side effect completed. The server ACK is the only condition that
@@ -619,7 +630,11 @@ export class ForegroundTerminalCoordinator {
       }
       if (snapshot.state === "failed" || snapshot.state === "closed" || snapshot.state === "detached") {
         if (snapshot.state === "failed") {
-          this.#recordFailure(runtimeFailure("terminal_disconnected", "A foreground AgentSession terminal failed."));
+          this.#recordFailure(snapshot.reason === "terminal_input_recovery_required"
+            ? runtimeFailure("terminal_protocol_error", "Terminal input requires recovery. Earlier input will not be resent automatically.", {
+              retryable: false, safeDetails: { reason: snapshot.reason },
+            })
+            : runtimeFailure("terminal_disconnected", "A foreground AgentSession terminal failed."));
         }
         this.#localActionBroker.cancelBinding(this.#localActionIdentity(tab.intent, tab.snapshot), "terminal_detached");
         tab.viewport.dispose();
@@ -1567,7 +1582,9 @@ export class ForegroundTerminalCoordinator {
         ...(this.#disconnectNotice !== undefined
           ? { notice: this.#disconnectNotice }
           : this.#browserNotice !== undefined
-            ? { notice: this.#browserNotice }
+            ? { notice: this.#tabs.get(activeTabId)?.snapshot.historicalInputUncertainty === true &&
+                (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === RECONNECT_FAILED_NOTICE)
+              ? `${HISTORICAL_INPUT_NOTICE} · ${this.#browserNotice}` : this.#browserNotice }
             : this.#pendingBrowserAction !== undefined && this.#pendingBrowserActionTabId === activeTabId
               ? {
                 notice: this.#pendingBrowserAction.type === "auth.device.present"
@@ -1804,15 +1821,18 @@ export class ForegroundTerminalCoordinator {
   }
 
   #seatNoticeFor(snapshot: RuntimeTerminalSnapshot | undefined): string | undefined {
-    if (this.#seatNotice !== undefined) return this.#seatNotice;
-    if (snapshot === undefined || snapshot.state !== "active" || snapshot.accessMode !== "observer") return undefined;
+    const historical = snapshot?.historicalInputUncertainty === true ? HISTORICAL_INPUT_NOTICE : undefined;
+    const withHistory = (notice: string | undefined) => historical === undefined ? notice :
+      notice === undefined ? historical : `${historical} · ${notice}`;
+    if (this.#seatNotice !== undefined) return withHistory(this.#seatNotice);
+    if (snapshot === undefined || snapshot.state !== "active" || snapshot.accessMode !== "observer") return historical;
     const refusal = writerCapabilityRefusal(snapshot);
-    if (refusal !== undefined) return refusal;
-    return snapshot.reason === "writer_transferred"
+    if (refusal !== undefined) return withHistory(refusal);
+    return withHistory(snapshot.reason === "writer_transferred"
       ? "Control moved to another client · Ctrl+] w to take it back"
       : snapshot.geometry == null
         ? "Observing (read-only) · geometry unknown · Ctrl+] w"
-        : "Observing (read-only) · Ctrl+] w to take control";
+        : "Observing (read-only) · Ctrl+] w to take control");
   }
 }
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
 
 import { PassthroughTerminalCoordinator } from "../dist/index.js";
 
@@ -80,11 +81,11 @@ function event(bytes, overrides = {}) {
   };
 }
 
-function harness({ deferredAttach = false, deferredInput = false, resizeCapability = "live", detachStateSequence = ["detached"] } = {}) {
+function harness({ deferredAttach = false, deferredInput = false, resizeCapability = "live", accessMode = "writer", detachStateSequence = ["detached"] } = {}) {
   const host = new FakeHost();
   const coordinator = new PassthroughTerminalCoordinator({ host, resizeCoalesceMs: 1 });
   const callbacks = coordinator.runtimeCallbacks();
-  const calls = { attach: [], detach: [], input: [], inputAuthorities: [], resize: [] };
+  const calls = { attach: [], detach: [], input: [], inputAuthorities: [], resize: [], responses: [] };
   let releaseAttach;
   const attachGate = deferredAttach
     ? new Promise((resolve) => { releaseAttach = resolve; })
@@ -98,7 +99,7 @@ function harness({ deferredAttach = false, deferredInput = false, resizeCapabili
     async attach(input) {
       calls.attach.push(input);
       await waitForGateOrAbort(attachGate, input.signal);
-      const ready = snapshot("active", { resizeCapability, accessMode: "writer", writerEpoch: 1 });
+      const ready = snapshot("active", { resizeCapability, accessMode, writerEpoch: 1, geometry: null });
       await callbacks.onTerminalReady(ready);
       return ready;
     },
@@ -115,9 +116,12 @@ function harness({ deferredAttach = false, deferredInput = false, resizeCapabili
       calls.input.push({ tabId, bytes: bytes.slice() });
       await inputGate;
     },
-    async resize(columns, rows, tabId) { calls.resize.push({ columns, rows, tabId }); },
+    async resize(columns, rows, tabId) {
+      if (accessMode === "observer") throw new Error("observer resize forbidden");
+      calls.resize.push({ columns, rows, tabId });
+    },
     switchActive() { return snapshot(); },
-    async sendTerminalResponse() {},
+    async sendTerminalResponse(response) { calls.responses.push(response); },
   };
   coordinator.bindRuntime(runtime);
   return {
@@ -249,7 +253,7 @@ test("passthrough stops interpreting Ctrl+] d after remote output invalidates lo
   const { coordinator, callbacks, calls, host, intent } = harness();
   await coordinator.start([intent]);
   await callbacks.onTerminalOutput(event(encoder.encode("\u001b[?20")));
-  await callbacks.onTerminalOutput(event(encoder.encode("04lremote app disabled framing")));
+  await callbacks.onTerminalOutput(event(encoder.encode("04lremote app disabled framing"), { sequence: 2n }));
   host.emitInput(Uint8Array.of(0x1d, 0x64));
   await waitUntil(() => calls.input.length === 1, "an untrusted chord must remain remote PTY input");
   assert.deepEqual(calls.detach, []);
@@ -329,4 +333,113 @@ test("passthrough retains a failed host lease for explicit restoration retry", a
   await coordinator.waitForStop();
   assert.equal(coordinator.state, "stopped");
   assert.equal(host.restored, 2);
+});
+
+test("plain observer projects remote geometry without resize or query/input effects", async () => {
+  const { Terminal } = await import('@xterm/headless').then(module => module.default);
+  const physical = new Terminal({ cols: 60, rows: 24, allowProposedApi: true });
+  const { coordinator, callbacks, host, calls, intent } = harness({ accessMode: 'observer' });
+  host.columns = 60; host.rows = 24;
+  host.write = async bytes => { host.writes.push(bytes.slice()); await new Promise(resolve => physical.write(bytes, resolve)); };
+  try {
+    await coordinator.start([intent]);
+    assert.equal(coordinator.state, 'active'); assert.deepEqual(calls.resize, []);
+    await callbacks.onTerminalOutput(event(encoder.encode('unknown')));
+    assert.match(physical.buffer.active.getLine(0).translateToString(true), /geometry unknown/u);
+    await callbacks.onTerminalGeometry({ snapshot: snapshot('active', { accessMode:'observer', geometry: { columns:143, rows:51, writerEpoch:1 } }), signal: new AbortController().signal });
+    await callbacks.onTerminalOutput(event(encoder.encode('\x1b[2J\x1b[H' + 'x'.repeat(59) + '中' + 'z'.repeat(39) + '\r\nSECOND\x1b[6n'), { sequence:2n }));
+    const line = row => physical.buffer.active.getLine(row).translateToString(true);
+    assert.equal(line(0), 'x'.repeat(59)); assert.equal(line(1), 'SECOND');
+    host.columns = 40; physical.resize(40,24); host.emitResize();
+    await waitUntil(() => line(0) === 'x'.repeat(40) && line(1) === 'SECOND', 'observer host change must repaint without remote reflow');
+    host.emitInput(encoder.encode('denied'));
+    await new Promise(resolve=>setTimeout(resolve,20));
+    assert.deepEqual(calls.resize, []); assert.deepEqual(calls.input, []);
+    assert.equal(coordinator.state, 'active');
+  } finally { await coordinator.stop(); physical.dispose(); }
+  assert.equal(host.restored,1); assert.equal(host.input,undefined); assert.equal(host.resize,undefined);
+});
+
+test("plain geometry is fenced, awaited before output, and writer demotion retains its model", async () => {
+  const { coordinator, callbacks, host, intent } = harness();
+  await coordinator.start([intent]);
+  const geometry = { columns:143, rows:51, writerEpoch:1 };
+  try {
+    await callbacks.onTerminalGeometry({ snapshot:snapshot('active',{ geometry }), signal:new AbortController().signal });
+    const bytes = encoder.encode('x'.repeat(100)+'\r\nKEPT');
+    await callbacks.onTerminalOutput(event(bytes));
+    assert.deepEqual(host.writes.at(-1),bytes,'writer bytes remain untouched');
+    const observer = snapshot('active',{ accessMode:'observer',writerEpoch:2,geometry:null });
+    callbacks.onTerminalState(observer);
+    let release; const gate = new Promise(resolve=>{release=resolve}); let entered=false;
+    const originalWrite = host.write.bind(host);
+    host.write = async bytes=>{entered=true;await gate;await originalWrite(bytes)};
+    const resize = callbacks.onTerminalGeometry({ snapshot:{...observer,geometry:{...geometry,writerEpoch:2}}, signal:new AbortController().signal });
+    await waitUntil(()=>entered,'geometry paint begins');
+    let delivered=false;
+    const output=callbacks.onTerminalOutput(event(encoder.encode('!'),{sequence:2n})).then(()=>{delivered=true});
+    await new Promise(resolve=>setTimeout(resolve,5)); assert.equal(delivered,false);
+    release(); await resize; await output;
+    assert.match(new TextDecoder().decode(host.writes.at(-1)),/KEPT!/u);
+    await assert.rejects(callbacks.onTerminalGeometry({ snapshot:{...observer,fencingGeneration:2,geometry:{...geometry,writerEpoch:2}},signal:new AbortController().signal }),/different attachment/u);
+  } finally {await coordinator.stop();}
+});
+
+test("plain retired-input notice survives writer regain and new ACK without duplicate query replies", async () => {
+  const { coordinator, callbacks, host, calls, intent } = harness();
+  await coordinator.start([intent]);
+  const geometry = {columns:143,rows:51,writerEpoch:1};
+  try {
+    await callbacks.onTerminalGeometry({snapshot:snapshot('active',{geometry}),signal:new AbortController().signal});
+    const original=encoder.encode('PRESERVED\x1b[6n');
+    await callbacks.onTerminalOutput(event(original));
+    assert.deepEqual(host.writes.at(-1),original);assert.deepEqual(calls.responses,[],'raw writer receives no duplicate VTE reply');
+    assert.equal(new TextDecoder().decode(host.writes.at(-1)).includes('unacknowledged'),false,'ordinary pending input is not historical');
+    const retired=snapshot('active',{accessMode:'observer',writerEpoch:2,geometry:null,historicalInputUncertainty:true});
+    callbacks.onTerminalState(retired);
+    await callbacks.onTerminalGeometry({snapshot:{...retired,geometry:{...geometry,writerEpoch:2}},signal:new AbortController().signal});
+    await callbacks.onTerminalOutput(event(encoder.encode('\x1b[6n'),{sequence:2n}));
+    assert.deepEqual(calls.responses,[],'observer never answers query');
+    assert.match(new TextDecoder().decode(host.writes.at(-1)),/Prior input uncertain/u);
+    const regained={...retired,accessMode:'writer',writerEpoch:3,geometry:null};
+    callbacks.onTerminalState(regained);
+    await callbacks.onTerminalGeometry({snapshot:{...regained,geometry:{...geometry,writerEpoch:3}},signal:new AbortController().signal});
+    await callbacks.onTerminalOutput(event(encoder.encode('!\x1b[6n'),{sequence:3n}));
+    assert.equal(calls.responses.length,1,'projected writer answers query once through fenced runtime');
+    callbacks.onTerminalState({...regained,geometry:{...geometry,writerEpoch:3},inputContinuity:'uncertain',unacknowledgedInputCount:0});
+    await callbacks.onTerminalOutput(event(encoder.encode('?'),{sequence:4n}));
+    const rendered=stripVTControlCharacters(new TextDecoder().decode(host.writes.at(-1)));
+    assert.match(rendered,/PRESERVED!/u);assert.match(rendered,/Prior input uncertain/u);
+    assert.match(rendered,/not resent/u);assert.match(rendered,/Local view cropped/u);
+  }finally{await coordinator.stop();}
+});
+
+
+test("plain same-process READY rebind keeps consumed cells and rejects stale output", async () => {
+  const {coordinator,callbacks,host,intent}=harness({accessMode:'observer'});
+  await coordinator.start([intent]);
+  try {
+    const original=snapshot('active',{accessMode:'observer',geometry:{columns:143,rows:51,writerEpoch:1}});
+    await callbacks.onTerminalGeometry({snapshot:original,signal:new AbortController().signal});
+    await callbacks.onTerminalOutput(event(encoder.encode('PREFIX')));
+    const rebound={...original,fencingGeneration:2,geometry:null};
+    await callbacks.onTerminalReady(rebound);
+    await callbacks.onTerminalGeometry({snapshot:{...rebound,geometry:original.geometry},signal:new AbortController().signal});
+    await assert.rejects(callbacks.onTerminalOutput(event(encoder.encode('STALE'),{sequence:2n})),/unbound terminal generation/u);
+    await callbacks.onTerminalOutput(event(encoder.encode('-DELTA'),{sequence:2n,binding:{...event(new Uint8Array()).binding,fencingGeneration:2}}));
+    assert.match(stripVTControlCharacters(new TextDecoder().decode(host.writes.at(-1))),/PREFIX-DELTA/u);
+    await assert.rejects(callbacks.onTerminalReady({...rebound,processEpoch:'different',fencingGeneration:3}),/same process/u);
+  }finally{await coordinator.stop();}
+});
+
+test("an observer host resize cannot gain writer authority while coalesced", async () => {
+  const {coordinator,callbacks,host,calls,intent}=harness();
+  await coordinator.start([intent]); const before=calls.resize.length;
+  try {
+    callbacks.onTerminalState(snapshot('active',{accessMode:'observer',writerEpoch:2,geometry:null}));
+    host.columns=40;host.emitResize();
+    callbacks.onTerminalState(snapshot('active',{accessMode:'writer',writerEpoch:3,geometry:null}));
+    await new Promise(resolve=>setTimeout(resolve,30));
+    assert.equal(calls.resize.length,before,'resize received as observer cannot be promoted');
+  }finally{await coordinator.stop();}
 });
