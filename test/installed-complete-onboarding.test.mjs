@@ -13,6 +13,7 @@ import { sha256File, verifyEnvelopeFiles } from "../scripts/lib/release-evidence
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const ID = "10000000-0000-4000-8000-000000000001";
+const EXECUTION_ID = "70000000-0000-4000-8000-000000000007";
 const SESSION_ID = "20000000-0000-4000-8000-000000000002";
 const WORKSPACE_ID = "30000000-0000-4000-8000-000000000003";
 const API_KEY_ID = "40000000-0000-4000-8000-000000000004";
@@ -66,6 +67,7 @@ const INSTALLED_E2E_PHASE_TIMEOUTS = Object.freeze({
   "installed-admitted-whoami": 45_000,
   "installed-authenticated-readonly-command-matrix": 10 * INSTALLED_COMMAND_TIMEOUT_MS + CLEANUP_TIMEOUT_MS,
   "installed-machine-lifecycle-command-matrix": 5 * INSTALLED_COMMAND_TIMEOUT_MS + CLEANUP_TIMEOUT_MS,
+  "installed-execution-recovery-command-matrix": 4 * INSTALLED_COMMAND_TIMEOUT_MS + CLEANUP_TIMEOUT_MS,
   "installed-agent-session-command-matrix": 5 * INSTALLED_COMMAND_TIMEOUT_MS + CLEANUP_TIMEOUT_MS,
   "installed-stale-supervisor-evidence-negative": 45_000,
   "installed-explicit-foreground-command-matrix": 120_000,
@@ -701,6 +703,23 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     }
     });
 
+    await runPhase(receipt, "installed-execution-recovery-command-matrix", installedE2ePhaseTimeout("installed-execution-recovery-command-matrix"), async () => {
+      for (const action of ["list", "get", "cancel", "get"]) {
+        const argv = ["executions", action, ...(action === "list" ? [] : [EXECUTION_ID]), "--machine", ID,
+          ...(action === "cancel" ? ["--yes"] : []), "--json"];
+        const result = await invokeInstalled(installedEntrypoint, argv, env, sandbox);
+        assert.equal(result.code, 0, `installed execution ${action} failed: ${safeErrorCode(result.stderr)}`);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.command, `executions.${action}`);
+        const item = action === "list" ? output.data.items[0] : output.data;
+        assert.equal(item.machine_id, ID); assert.equal(item.operation_id, EXECUTION_ID);
+        assert.equal(item.leader_state, "exited"); assert.equal(item.ownership_state, "descendants_live");
+        if (action === "cancel") assert.equal(item.cancel_requested, true);
+        const pair = await installedSessionPairState(user);
+        assert.equal(pair.valid, true, `execution recovery damaged the profile: ${pair.diagnostic}`);
+      }
+    });
+
     await runPhase(receipt, "installed-machine-lifecycle-command-matrix", installedE2ePhaseTimeout("installed-machine-lifecycle-command-matrix"), async () => {
     const successMatrix = [
       ["machines.create", ["machines", "create", "--name", "matrix-machine", "--yes", "--json"]],
@@ -926,6 +945,7 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
 });
 
 const INSTALLED_HELP_TOPICS = Object.freeze([
+  "executions", "executions list", "executions get", "executions cancel",
   "signup", "login", "logout", "whoami", "access", "capabilities",
   "machines", "machines list", "machines create", "machines start", "machines pause",
   "machines resume", "machines stop", "machines update-supervisor", "machines delete", "records", "authorizations",
@@ -937,6 +957,7 @@ const INSTALLED_HELP_TOPICS = Object.freeze([
 ]);
 
 const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
+  "executions list", "executions get", "executions cancel",
   "signup", "login", "logout", "whoami", "access", "capabilities",
   "machines list", "machines create", "machines start", "machines pause", "machines resume", "machines stop", "machines delete",
   "records", "authorizations", "account", "workspace", "usage",
@@ -982,6 +1003,10 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
 ]);
 
 function createContractAuthority() {
+  let executionCancelled = false;
+  const execution = () => ({ operation_id: EXECUTION_ID, machine_id: ID, execution_workspace_id: null,
+    leader_state: "exited", ownership_state: "descendants_live", cancel_requested: executionCancelled,
+    exit_code: 0, duration_ms: 8, reason: null, created_at: "2026-09-05T00:00:00Z", observed_at: "2026-09-05T00:00:01Z" });
   const continuations = new Map();
   const accessContexts = new Map();
   const state = { continuationCounter: 0, continuationPollRequests: 0, legacyContinuationRequests: 0, retiredCodeRenewalRequests: 0, tokenCounter: 0, createdApiKeys: 0, revokedApiKeys: 0, logoutReceipts: 0, idempotencyKeys: [], loginRevoked: false, machineDeleted: false, machineStatus: "running", agentTerminated: false, agentName: "matrix-agent", apiKeyRevoked: false, openCodeSessionRequests: 0, openCodeAgentAuth404Requests: 0, openCodeAgentAuthInvalidEvidenceRequests: 0, openCodeAgentAuthConfiguredRequests: 0 };
@@ -1170,6 +1195,11 @@ function createContractAuthority() {
         if (request.method === "POST" && url.pathname === `/v1/sessions/${ID}/stop`) { state.machineStatus = "stopped"; return send(200, machine()); }
         if (request.method === "DELETE" && url.pathname === `/v1/sessions/${ID}`) { state.machineDeleted = true; return send(202, { acknowledged: true }); }
         if (request.method === "GET" && url.pathname === "/v1/records") return send(200, []);
+        if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/executions`) return send(200, { machine_id: ID, items: [execution()], next_cursor: null });
+        if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/executions/${EXECUTION_ID}`) return send(200, execution());
+        if (request.method === "POST" && url.pathname === `/v1/sessions/${ID}/executions/${EXECUTION_ID}/cancel`) {
+          executionCancelled = true; return send(200, execution());
+        }
         if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/authorizations`) return send(200, { revision: 1, secret_configuration: [] });
         if (request.method === "POST" && url.pathname === `/v1/sessions/${ID}/agent-sessions`) { state.agentTerminated = false; state.agentName = body.name ?? "matrix-agent"; return send(201, agentSession()); }
         if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/agent-sessions`) return send(200, { items: state.agentTerminated ? [] : [agentSession()] });

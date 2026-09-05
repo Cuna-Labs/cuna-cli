@@ -31,6 +31,22 @@ function topic(usage: string, body: string): string {
 }
 
 const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
+  executions: topic(
+    "Usage:\n  cuna executions <list|get|cancel> --machine MACHINE_ID [options]",
+    "Inspect remote commands by their durable execution IDs. Leader state and\nprocess ownership are separate: exited can still have live descendants.\nThese commands do not launch or repeat a command. Use an action's --help.",
+  ),
+  "executions list": topic(
+    "Usage:\n  cuna executions list --machine MACHINE_ID [--execution-workspace-id ID] [--after ID]",
+    "Read up to 50 executions on the exact Machine. Filter by an execution\nWorkspace ID, or continue with the returned --after cursor. No command content\nor output is returned. Reads remain available when new execution is unavailable.",
+  ),
+  "executions get": topic(
+    "Usage:\n  cuna executions get EXECUTION_ID --machine MACHINE_ID",
+    "Read one execution's authoritative leader and ownership states. An unknown\noutcome must be inspected; do not repeat the original command to discover it.",
+  ),
+  "executions cancel": topic(
+    "Usage:\n  cuna executions cancel EXECUTION_ID --machine MACHINE_ID --yes",
+    "Request cancellation of this execution and its descendants. --yes confirms\nthis mutation. Acceptance does not prove cleanup: inspect the same execution\nuntil ownership is cleared. Other executions and AgentSessions are not targets.",
+  ),
   signup: topic(
     "Usage:\n  cuna signup",
     "Create a waitlist-only Cuna account through the browser, paste the displayed\ncuna_login_ code, and store it in the encrypted profile session. Never assigns\ncompute and never starts billing. Accepts no operands and no command options.",

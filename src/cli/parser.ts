@@ -95,6 +95,9 @@ export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
   routed("machines update-supervisor", "machines update-supervisor MACHINE_ID --yes", ["machines", "update-supervisor", "00000000-0000-4000-8000-000000000001", "--yes"], "Update a stopped machine's terminal supervisor"),
   routed("machines delete", "machines delete MACHINE_ID --yes", ["machines", "delete", "00000000-0000-4000-8000-000000000001", "--yes"], "Delete a machine"),
   routed("records list", "records list", ["records", "list"], "List redacted account activity"),
+  routed("executions list", "executions list --machine MACHINE_ID", ["executions", "list", "--machine", "00000000-0000-4000-8000-000000000001"], "List remote commands and their remaining process ownership"),
+  routed("executions get", "executions get EXECUTION_ID --machine MACHINE_ID", ["executions", "get", "00000000-0000-4000-8000-000000000002", "--machine", "00000000-0000-4000-8000-000000000001"], "Inspect one exact remote command"),
+  routed("executions cancel", "executions cancel EXECUTION_ID --machine MACHINE_ID --yes", ["executions", "cancel", "00000000-0000-4000-8000-000000000002", "--machine", "00000000-0000-4000-8000-000000000001", "--yes"], "Request cancellation of one remote command and its descendants"),
   routed("authorizations list", "authorizations list --machine MACHINE_ID", ["authorizations", "list", "--machine", "00000000-0000-4000-8000-000000000001"], "List machine credential rules"),
   routed("account show", "account show", ["account", "show"], "Show the account identity"),
   routed("workspace show", "workspace show", ["workspace", "show"], "Show workspace assignment"),
@@ -231,6 +234,8 @@ const BOOLEAN_OPTIONS = new Set([
  * decides the shape of the parse.
  */
 const VALUE_OPTIONS = new Set([
+  "after",
+  "execution-workspace-id",
   "agent",
   "agent-session",
   "auth-mode",

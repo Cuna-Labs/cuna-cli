@@ -57,6 +57,7 @@ import {
 } from "../runtime/node-foreground-session.js";
 import { runNodeMachinesExplorer, type MachinesExplorerRunner } from "../machines/explorer.js";
 import { runWorkspaceSelectionScreen } from "../workspace/selection-screen.js";
+import { runExecutionsScreen } from "../machines/executions-screen.js";
 import { isOpenCodeSupervisorUpgradeReason } from "../machines/opencode-supervisor.js";
 import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
@@ -403,7 +404,7 @@ function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>>
 
 function needsRemoteCredential(command: string | undefined, foreground: ForegroundSelection | undefined): boolean {
   return command === "capabilities" || command === "machines" || command === "agent-sessions" ||
-    command === "agent" ||
+    command === "agent" || command === "executions" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
     command === "account" || command === "workspace" || command === "usage" ||
     command === "claude" || command === "codex" || command === "opencode" || foreground !== undefined;
@@ -1414,6 +1415,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         }
         return EXIT_CODES.success;
       }
+      if (selection.kind === "executions") {
+        const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal);
+        if (outcome === "cancelled") return EXIT_CODES.success;
+        return await runCli(["machines"], dependencies);
+      }
       if (selection.kind === "workspaces") {
         const identity = await client.getIdentity(dependencies.signal);
         if (identity.workspaceId === undefined) throw usageError("This account has no assigned workspace.");
@@ -1757,7 +1763,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
       }, dependencies.now === undefined ? {} : { now: dependencies.now });
       if (selection !== undefined) {
-        if (selection.kind === "workspaces") {
+        if (selection.kind === "executions") {
+          const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal);
+          if (outcome === "cancelled") return EXIT_CODES.success;
+          return await runCli(["machines"], dependencies);
+        } else if (selection.kind === "workspaces") {
           const identity = await client.getIdentity(dependencies.signal);
           if (identity.workspaceId === undefined) throw usageError("This account has no assigned workspace.");
           const outcome = await runWorkspaceSelectionScreen({ client, profileId: config.profile, userId: identity.id, workspaceId: identity.workspaceId, machineId: selection.machineId, stateDirectory: platform.paths.stateDirectory, platform: platform.kind }, dependencies.workspaceRoot ?? process.cwd(), undefined, dependencies.signal);

@@ -32,6 +32,7 @@ import {
   integerArgument,
 } from "../core/validation.js";
 import { preflightAgentJourneyInvocation } from "../journey/intent.js";
+import type { ManagedExecution } from "../api/managed-executions.js";
 import { listAllMachines } from "../machines/pagination.js";
 import {
   isOpenCodeRuntimeUnverifiedCapabilityRejection,
@@ -698,6 +699,9 @@ export function preflightInvocation(
     case "agent-sessions":
       preflightAgentSessions(parsed);
       return;
+    case "executions":
+      preflightExecutions(parsed);
+      return;
     case "agent": {
       rejectUnknownOptions(parsed, ["agent-session", "yes"]);
       if (parsed.operands.length !== 1 || parsed.operands[0] !== "logout") {
@@ -1200,6 +1204,8 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     }
     case "agent-sessions":
       return executeAgentSessions(context);
+    case "executions":
+      return executeExecutions(context);
     case "agent": {
       requireCredential(context);
       rejectUnknownOptions(parsed, ["agent-session", "yes"]);
@@ -1738,6 +1744,75 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     return Object.freeze({ command: "machines.delete", data: { id, acknowledged: true }, human: `Delete acknowledged for ${id}.` });
   }
   throw usageError(`Unknown machines action ${action}.`);
+}
+
+function preflightExecutions(parsed: ParsedInvocation): void {
+  const action = parsed.operands[0];
+  rejectUnknownOptions(parsed, action === "list" ? ["machine", "execution-workspace-id", "after"] :
+    action === "cancel" ? ["machine", "yes"] : ["machine"]);
+  assertMachineId(requireOption(parsed, "machine", "Run `cuna machines list` to find a Machine ID."));
+  if (action === "list") {
+    if (parsed.operands.length !== 1) throw usageError("executions list accepts no operands.");
+    for (const name of ["execution-workspace-id", "after"]) {
+      const value = stringOption(parsed, name);
+      if (value !== undefined) assertCanonicalUuid(value, name);
+    }
+    return;
+  }
+  if ((action !== "get" && action !== "cancel") || parsed.operands.length !== 2) {
+    throw usageError("executions requires list, get EXECUTION_ID, or cancel EXECUTION_ID.");
+  }
+  assertCanonicalUuid(requireOperand(parsed.operands, 1, "execution ID"), "execution ID");
+  if (action === "cancel") requireConfirmation(parsed, "executions.cancel");
+}
+
+function executionRecord(item: ManagedExecution): Readonly<Record<string, unknown>> {
+  return Object.freeze({ operation_id: item.operationId, machine_id: item.machineId,
+    execution_workspace_id: item.executionWorkspaceId, leader_state: item.leaderState, ownership_state: item.ownershipState,
+    cancel_requested: item.cancelRequested, exit_code: item.exitCode, duration_ms: item.durationMs,
+    reason: item.reason, created_at: item.createdAt, observed_at: item.observedAt });
+}
+
+function executionLine(item: ManagedExecution): string {
+  return `${item.operationId}\tleader=${item.leaderState}\townership=${item.ownershipState}` +
+    `\tworkspace=${item.executionWorkspaceId ?? "legacy"}` +
+    (item.exitCode === null ? "" : `\texit=${item.exitCode}`) +
+    (item.cancelRequested ? "\tcancellation requested" : "") +
+    (item.reason === null ? "" : `\t${item.reason}`);
+}
+
+async function executeExecutions(context: CommandContext): Promise<CommandResult> {
+  preflightExecutions(context.parsed);
+  requireCredential(context);
+  const { parsed, client } = context;
+  const machineId = requireOption(parsed, "machine");
+  const action = parsed.operands[0];
+  // Recovery reads and cancellation remain usable without a live supervisor.
+  // The server authorizes exact ownership; machines.exec availability describes
+  // new admission and must not hide an outstanding operation during an outage.
+  if (action === "list") {
+    const executionWorkspaceId = stringOption(parsed, "execution-workspace-id");
+    const after = stringOption(parsed, "after");
+    const page = await client.listManagedExecutions(machineId, {
+      ...(executionWorkspaceId === undefined ? {} : { executionWorkspaceId }), ...(after === undefined ? {} : { after }),
+    });
+    return Object.freeze({ command: "executions.list", data: { machine_id: page.machineId,
+      items: page.items.map(executionRecord), next_cursor: page.nextCursor },
+      human: `Remote executions on Machine ${machineId}\n` +
+        (page.items.length === 0 ? "No executions in this page." : page.items.map(executionLine).join("\n")) +
+        (page.nextCursor === null ? "" : `\nNext: cuna executions list --machine ${machineId}` +
+          (executionWorkspaceId === undefined ? "" : ` --execution-workspace-id ${executionWorkspaceId}`) + ` --after ${page.nextCursor}`),
+    });
+  }
+  const operationId = requireOperand(parsed.operands, 1, "execution ID");
+  const item = action === "cancel" ? await client.cancelManagedExecution(machineId, operationId) :
+    await client.getManagedExecution(machineId, operationId);
+  const followup = `cuna executions get ${operationId} --machine ${machineId}`;
+  return Object.freeze({ command: `executions.${action}`, data: executionRecord(item),
+    human: (action === "cancel" ? "Cancellation accepted.\n" : "") + executionLine(item) +
+      (item.ownershipState === "cleared" ? "\nProcess ownership is cleared." :
+        `\nProcess cleanup is not confirmed. Inspect: ${followup}`),
+  });
 }
 
 async function executeAgentSessions(context: CommandContext): Promise<CommandResult> {

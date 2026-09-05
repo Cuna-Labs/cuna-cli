@@ -57,6 +57,7 @@ import {
 } from "./contracts.js";
 import type { HttpRequest, HttpTransport } from "./http.js";
 import { decodeExecutionWorkspacePage, type ExecutionWorkspacePage } from "./execution-workspaces.js";
+import { decodeManagedExecution, decodeManagedExecutionPage, type ManagedExecution, type ManagedExecutionPage } from "./managed-executions.js";
 import { decodeMachineDefaultWorkspace, decodeAgentSessionWorkspaceContext, decodeAgentSessionWorkspaceEnvelope,
   type MachineDefaultWorkspace, type AgentSessionWorkspaceContext, type AgentSessionWorkspaceEnvelope } from "./remote-workspace.js";
 import { classifyCapabilitySnapshot, isPermanentSnapshotFault } from "./capability-evidence.js";
@@ -146,6 +147,9 @@ export interface CunaApiClient {
    */
   replaceMachineSupervisor(id: string, signal?: AbortSignal): Promise<Machine>;
   deleteMachine(id: string): Promise<unknown>;
+  listManagedExecutions(machineId: string, input?: { readonly executionWorkspaceId?: string; readonly after?: string }, signal?: AbortSignal): Promise<ManagedExecutionPage>;
+  getManagedExecution(machineId: string, operationId: string, signal?: AbortSignal): Promise<ManagedExecution>;
+  cancelManagedExecution(machineId: string, operationId: string, signal?: AbortSignal): Promise<ManagedExecution>;
   listExecutionWorkspaces(input: { readonly workspaceId: string; readonly projectId: string; readonly machineId: string; readonly after?: string }, signal?: AbortSignal): Promise<ExecutionWorkspacePage>;
   createWorkspaceBinding(
     input: WorkspaceBindingCreateInput,
@@ -606,6 +610,38 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         path: `/v1/sessions/${safeId}`,
         settleWith: "cuna machines list",
       });
+    },
+    async listManagedExecutions(machineId, input = {}, signal) {
+      const safeId = encodeMachineId(machineId);
+      const query = new URLSearchParams();
+      if (input.executionWorkspaceId !== undefined) query.set("execution_workspace_id", assertCanonicalUuid(input.executionWorkspaceId, "execution Workspace ID"));
+      if (input.after !== undefined) query.set("after", assertCanonicalUuid(input.after, "execution cursor"));
+      const request: HttpRequest = { method: "GET", path: `/v1/sessions/${safeId}/executions${query.size ? `?${query}` : ""}`,
+        ...(signal === undefined ? {} : { signal }) };
+      const page = await fetchDecoded(request, decodeManagedExecutionPage);
+      if (page.machineId !== machineId || page.items.some(item =>
+        (input.executionWorkspaceId !== undefined && item.executionWorkspaceId !== input.executionWorkspaceId) ||
+        (input.after !== undefined && item.operationId <= input.after))) {
+        throw malformed(contractViolation("managed_execution_scope"), operationLabel(request));
+      }
+      return page;
+    },
+    async getManagedExecution(machineId, operationId, signal) {
+      const path = `/v1/sessions/${encodeMachineId(machineId)}/executions/${encodeCanonicalUuid(operationId, "execution ID")}`;
+      const request: HttpRequest = { method: "GET", path, ...(signal === undefined ? {} : { signal }) };
+      const result = await fetchDecoded(request, decodeManagedExecution);
+      if (result.machineId !== machineId || result.operationId !== operationId) throw malformed(contractViolation("managed_execution_scope"), operationLabel(request));
+      return result;
+    },
+    async cancelManagedExecution(machineId, operationId, signal) {
+      const path = `/v1/sessions/${encodeMachineId(machineId)}/executions/${encodeCanonicalUuid(operationId, "execution ID")}/cancel`;
+      const request: HttpRequest = { method: "POST", path, body: {},
+        settleWith: `cuna executions get ${operationId} --machine ${machineId}`, ...(signal === undefined ? {} : { signal }) };
+      const result = await fetchDecoded(request, decodeManagedExecution);
+      if (result.machineId !== machineId || result.operationId !== operationId || !result.cancelRequested) {
+        throw malformed(contractViolation("managed_execution_cancellation"), operationLabel(request));
+      }
+      return result;
     },
     async listExecutionWorkspaces(input, signal) {
       assertCanonicalUuid(input.workspaceId, "workspace ID");

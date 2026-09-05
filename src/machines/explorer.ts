@@ -151,7 +151,7 @@ export interface MachinesExplorerSelection {
   readonly agent: ActionableProvider;
 }
 
-export type MachinesExplorerResult = MachinesExplorerSelection | Readonly<{ readonly kind: "workspaces"; readonly machineId: string }> | Readonly<{
+export type MachinesExplorerResult = MachinesExplorerSelection | Readonly<{ readonly kind: "executions"; readonly machineId: string }> | Readonly<{ readonly kind: "workspaces"; readonly machineId: string }> | Readonly<{
   readonly kind: "launch";
   readonly agent: ActionableProvider;
   readonly machineId?: string;
@@ -770,6 +770,11 @@ export async function runNodeMachinesExplorer(
 
   const applyKey = (byte: number): boolean => {
     if (closingNotice !== undefined) return true;
+    if (byte === 0x65 && inputSequence === "none" && (navigation.screen.kind === "machine" || navigation.screen.kind === "provider")) {
+      selection = Object.freeze({ kind: "executions", machineId: navigation.screen.machineId });
+      stop();
+      return true;
+    }
     if (byte === 0x77 && inputSequence === "none" && (navigation.screen.kind === "machine" || navigation.screen.kind === "provider")) {
       selection = Object.freeze({ kind: "workspaces", machineId: navigation.screen.machineId });
       stop();
@@ -1361,7 +1366,7 @@ function renderContextScreen(input: {
   if (input.refreshError !== undefined) lines.push("", input.refreshError);
   if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
   if (input.lifecycleNotice !== undefined) lines.push("", ` ${input.lifecycleNotice}`);
-  lines.push("", " w Workspaces", " ↑↓ move  ·  ←→ navigate  ·  Enter select  ·  Esc/Backspace back  ·  q quit");
+  lines.push("", " w Workspaces  ·  e Executions", " ↑↓ move  ·  ←→ navigate  ·  Enter select  ·  Esc/Backspace back  ·  q quit");
   return Object.freeze({
     lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))),
     ...(selectedLine === undefined ? {} : { selectedLine }),
