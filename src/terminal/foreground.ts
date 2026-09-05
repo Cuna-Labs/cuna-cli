@@ -634,7 +634,11 @@ export class ForegroundTerminalCoordinator {
             ? runtimeFailure("terminal_protocol_error", "Terminal input requires recovery. Earlier input will not be resent automatically.", {
               retryable: false, safeDetails: { reason: snapshot.reason },
             })
-            : runtimeFailure("terminal_disconnected", "A foreground AgentSession terminal failed."));
+            : snapshot.reason === "terminal_protocol_error"
+              ? runtimeFailure("terminal_protocol_error", "Cuna could not safely process the terminal stream. Inspect this session before reconnecting.", {
+                retryable: false,
+              })
+              : runtimeFailure("terminal_disconnected", "A foreground AgentSession terminal failed."));
         }
         this.#localActionBroker.cancelBinding(this.#localActionIdentity(tab.intent, tab.snapshot), "terminal_detached");
         tab.viewport.dispose();

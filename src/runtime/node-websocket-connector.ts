@@ -7,7 +7,9 @@ import type {
 
 const MAX_MESSAGE_BYTES = 1_048_596;
 const MAX_QUEUED_BYTES = 16 * 1024 * 1024;
-const MAX_QUEUED_MESSAGES = 1_024;
+// Storage is bounded by bytes and fixed slabs, independently of WebSocket
+// message fragmentation. A slab also stays below the decoder's batch limits.
+const RECEIVE_SLAB_BYTES = 16 * 1024;
 const MAX_BUFFERED_SEND_BYTES = 8 * 1024 * 1024;
 const MAX_PENDING_CONVERSION_BYTES = 16 * 1024 * 1024;
 const MAX_PENDING_CONVERSION_MESSAGES = 64;
@@ -20,7 +22,7 @@ interface ByteWaiter {
 }
 
 class BoundedByteQueue implements AsyncIterableIterator<Uint8Array> {
-  readonly #values: Uint8Array[] = [];
+  readonly #values: { bytes: Uint8Array; length: number }[] = [];
   readonly #waiters: ByteWaiter[] = [];
   #queuedBytes = 0;
   #closed = false;
@@ -39,10 +41,18 @@ class BoundedByteQueue implements AsyncIterableIterator<Uint8Array> {
     if (this.#queuedBytes + value.byteLength > MAX_QUEUED_BYTES) {
       throw runtimeFailure("terminal_protocol_error", "The terminal receive queue exceeded its bounded memory budget.");
     }
-    if (this.#values.length >= MAX_QUEUED_MESSAGES) {
-      throw runtimeFailure("terminal_protocol_error", "The terminal receive queue exceeded its bounded message budget.");
+    let offset = 0;
+    while (offset < value.byteLength) {
+      let slab = this.#values.at(-1);
+      if (slab === undefined || slab.length === RECEIVE_SLAB_BYTES) {
+        slab = { bytes: new Uint8Array(RECEIVE_SLAB_BYTES), length: 0 };
+        this.#values.push(slab);
+      }
+      const length = Math.min(RECEIVE_SLAB_BYTES - slab.length, value.byteLength - offset);
+      slab.bytes.set(value.subarray(offset, offset + length), slab.length);
+      slab.length += length;
+      offset += length;
     }
-    this.#values.push(value);
     this.#queuedBytes += value.byteLength;
   }
 
@@ -68,8 +78,8 @@ class BoundedByteQueue implements AsyncIterableIterator<Uint8Array> {
   next(): Promise<IteratorResult<Uint8Array>> {
     const value = this.#values.shift();
     if (value !== undefined) {
-      this.#queuedBytes -= value.byteLength;
-      return Promise.resolve({ done: false, value });
+      this.#queuedBytes -= value.length;
+      return Promise.resolve({ done: false, value: value.bytes.subarray(0, value.length) });
     }
     if (this.#failure !== undefined) return Promise.reject(this.#failure);
     if (this.#closed) return Promise.resolve({ done: true, value: undefined });

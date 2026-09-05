@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { createNodeWebSocketConnector } from "../dist/runtime/node-websocket-connector.js";
 import { RuntimeBoundaryError } from "../dist/runtime/errors.js";
+import { TerminalFrameDecoder, encodeTerminalFrame } from "../dist/terminal/codec.js";
 
 const TERMINAL_ID = "55555555-5555-4555-8555-555555555555";
 const URL = `wss://api.getcuna.com/v1/terminal-connections/${TERMINAL_ID}/stream`;
@@ -203,6 +204,89 @@ test("Blob size and pending conversion count are bounded before asynchronous all
   }
   await assert.rejects(boundedConnection.receive()[Symbol.asyncIterator]().next(), /conversion queue exceeded/u);
   assert.equal(boundedSocket.closeCalls.at(-1).code, 1009);
+});
+
+test("paced small replay stays lossless under a stalled consumer within the byte budget", async () => {
+  // Model the boundary awaiting an output sink: transport delivery continues
+  // while that consumer is blocked. Pace conversion to exclude its 64-item cap.
+  const replayMessages = 1_025;
+  const bytesPerMessage = 32;
+  const connect = async () => {
+    const connection = await createNodeWebSocketConnector({ WebSocket: FakeWebSocket })
+      .connect({ url: URL, token: TOKEN, protocol: "runa.terminal.v1" });
+    return { connection, socket: FakeWebSocket.instances.at(-1), iterator: connection.receive()[Symbol.asyncIterator]() };
+  };
+  const deliver = async (socket, bytes) => {
+    socket.dispatchEvent(new MessageEvent("message", { data: bytes.buffer }));
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  const stalled = await connect();
+  for (let index = 0; index < replayMessages; index += 1) {
+    await deliver(stalled.socket, new Uint8Array(bytesPerMessage));
+  }
+  assert.equal(replayMessages * bytesPerMessage, 32_800);
+  await stalled.connection.close();
+  let replayed = 0;
+  for await (const bytes of stalled.iterator) {
+    assert.ok(bytes.byteLength <= 16 * 1024);
+    assert.ok(bytes.every((byte) => byte === 0));
+    replayed += bytes.byteLength;
+  }
+  assert.equal(replayed, 32_800);
+  assert.equal(stalled.socket.closeCalls.length, 1);
+
+  // Negative control: the exact same message schedule is accepted when the
+  // sink drains each chunk instead of waiting on a paint before consuming it.
+  const draining = await connect();
+  let applied = 0;
+  for (let index = 0; index < replayMessages; index += 1) {
+    await deliver(draining.socket, new Uint8Array(bytesPerMessage).fill(index % 256));
+    const item = await draining.iterator.next();
+    assert.equal(item.value[0], index % 256);
+    applied += item.value.byteLength;
+  }
+  assert.equal(applied, 32_800);
+  assert.equal(draining.socket.closeCalls.length, 0);
+  await draining.connection.close();
+
+  // Discriminating control: unchanged total bytes, one transport message.
+  const combined = await connect();
+  await deliver(combined.socket, new Uint8Array(applied));
+  await combined.connection.close();
+  let combinedBytes = 0;
+  for await (const bytes of combined.iterator) combinedBytes += bytes.byteLength;
+  assert.equal(combinedBytes, applied);
+  assert.equal(combined.socket.closeCalls.length, 1);
+});
+
+test("receive slabs preserve split headers, large payloads and interleaved control frame order", async () => {
+  const connection = await createNodeWebSocketConnector({ WebSocket: FakeWebSocket })
+    .connect({ url: URL, token: TOKEN, protocol: "runa.terminal.v1" });
+  const socket = FakeWebSocket.instances.at(-1);
+  const expected = Array.from({ length: 1_100 }, (_, index) => ({
+    type: index % 11 === 0 ? "heartbeat" : "output",
+    critical: true,
+    sequence: BigInt(index),
+    payload: index === 550 ? new Uint8Array(80_000).fill(0xff) : Uint8Array.of(index % 256),
+  }));
+  for (const frame of expected) {
+    const wire = encodeTerminalFrame(frame);
+    for (const bytes of [wire.slice(0, 7), wire.slice(7)]) {
+      socket.dispatchEvent(new MessageEvent("message", { data: bytes.buffer }));
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  assert.equal(socket.closeCalls.length, 0);
+  await connection.close();
+  const decoder = new TerminalFrameDecoder();
+  const actual = [];
+  for await (const bytes of connection.receive()) actual.push(...decoder.push(bytes));
+  assert.equal(actual.length, expected.length);
+  actual.forEach((frame, index) => {
+    assert.equal(frame.type, expected[index].type);
+    assert.equal(frame.sequence, expected[index].sequence);
+    assert.deepEqual(frame.payload, expected[index].payload);
+  });
 });
 
 test("TC-055-16 receive overflow and stalled Blob conversion fail immediately and close the transport", async () => {

@@ -783,6 +783,17 @@ test("a split local prefix remains bound to its original tab across asynchronous
   await coordinator.stop();
 });
 
+test("foreground retains a protocol failure without exposing arbitrary remote reasons", async () => {
+  for (const reason of ["terminal_protocol_error", "untrusted-secret-reason"]) {
+    const { coordinator, callbacks, intents } = harness();
+    await coordinator.start(intents.slice(0, 1));
+    callbacks.onTerminalState({ ...snapshot(intents[0]), state: "failed", reason });
+    await coordinator.waitForStop();
+    assert.equal(coordinator.failure.code, reason === "terminal_protocol_error" ? "terminal_protocol_error" : "terminal_disconnected");
+    assert.doesNotMatch(coordinator.failure.message, /untrusted-secret-reason/u);
+  }
+});
+
 test("host output backpressure is awaited before terminal output is acknowledged", async () => {
   const { coordinator, callbacks, host, intents } = harness();
   await coordinator.start(intents.slice(0, 1));
