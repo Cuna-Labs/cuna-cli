@@ -1549,7 +1549,10 @@ export class ForegroundTerminalCoordinator {
 
   #queueResize(): void {
     if (this.#state !== "active") return;
-    if (this.#resizeTimer !== undefined) clearTimeout(this.#resizeTimer);
+    // Output also requests reconciliation while geometry differs. Preserve the
+    // first deadline so continuous output cannot postpone every paint; the
+    // callback reads the latest host dimensions when it runs.
+    if (this.#resizeTimer !== undefined) return;
     this.#resizeTimer = setTimeout(() => {
       this.#resizeTimer = undefined;
       void this.#applyResize().catch((error) => {
