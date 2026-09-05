@@ -560,7 +560,11 @@ export async function runNodeMachinesExplorer(
       // stale value captured before awaiting the API. Otherwise an arrow press
       // during refresh appears to work and then jumps back to the machine row.
       const currentSelection = selectedKey;
-      selectedKey = currentSelection !== undefined && visibleKeys.includes(currentSelection)
+      // Session refresh temporarily withholds creation choices. Preserve the
+      // user's existing choice here as well as during later partial responses;
+      // Enter still requires current authority before it can execute.
+      const pendingCreation = rows.length > 0 && currentSelection?.startsWith("create:") === true;
+      selectedKey = currentSelection !== undefined && (visibleKeys.includes(currentSelection) || pendingCreation)
         ? currentSelection
         : visibleKeys[0];
       loadingPhase = rows.length === 0 ? undefined : "sessions";
