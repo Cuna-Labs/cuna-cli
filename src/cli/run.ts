@@ -566,6 +566,10 @@ function runtimeError(error: RuntimeBoundaryError): CunaError {
     code: `cuna.runtime.${error.code}`,
     message: error.message,
     exitCode,
+    ...(error.code === "terminal_history_gap" && typeof error.safeDetails?.agent_session_id === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(error.safeDetails.agent_session_id)
+      ? { hint: `Inspect this session with \`cuna agent-sessions get ${error.safeDetails.agent_session_id}\`.` }
+      : {}),
     retryable: error.retryable,
     ...(error.safeDetails === undefined ? {} : { details: error.safeDetails }),
     cause: error,

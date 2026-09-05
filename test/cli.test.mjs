@@ -3020,6 +3020,23 @@ test("explicit agent shorthand rejects ambiguous or misleading input before effe
   }
 });
 
+test("history gap CLI error names read-only exact-session inspection without inferring process exit", async () => {
+  const { terminalHistoryGap } = await import("../dist/runtime/errors.js");
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const exit = await runCli(["codex", "--agent-session", FOREGROUND_SESSION_A], {
+    streams: streams.streams, platform,
+    env: { CUNA_API_KEY: API_KEY, TERM: "xterm-256color" },
+    clientFactory: () => fakeClient(),
+    foregroundTerminalRunner: async () => { throw terminalHistoryGap(FOREGROUND_SESSION_A); },
+  });
+  assert.equal(exit, EXIT_CODES.remote);
+  const text = stripAnsi(streams.stderr());
+  assert.match(text, /cuna.runtime.terminal_history_gap/u);
+  assert.ok(text.includes(`cuna agent-sessions get ${FOREGROUND_SESSION_A}`));
+  assert.match(text, /agent's current state is unknown/u);
+  assert.doesNotMatch(text, /new-session|session stopped|process exited/u);
+});
+
 test("agent shorthand shows truthful preparation feedback before configuration or network work completes", async () => {
   let releaseConfig;
   const configGate = new Promise((resolve) => { releaseConfig = resolve; });

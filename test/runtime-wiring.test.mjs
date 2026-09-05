@@ -2523,6 +2523,41 @@ test("input acceptance scope reconnect releases the bounded current window witho
   } finally { await runtime.shutdown(); }
 });
 
+for (const variant of ["gap", "unknown", "wrong-reason", "missing-reason"]) {
+  const gap = variant === "gap";
+  test(`real codec error projects retained history gap through foreground: ${variant}`, async () => {
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const { ForegroundTerminalCoordinator } = await import("../dist/terminal/foreground.js");
+    const coordinator = new ForegroundTerminalCoordinator({ host: {
+      dimensions: () => ({ columns: 80, rows: 24 }),
+      async acquire() { return { async restore() {} }; },
+      async write() {}, onInput() { return () => {}; }, onResize() { return () => {}; },
+    } });
+    const system = new FakeTerminalSystem();
+    const { runtime } = createRuntime(system, coordinator.runtimeCallbacks());
+    coordinator.bindRuntime(runtime);
+    try {
+      await coordinator.start([{ tabId: "tab-a", agentSessionId: sessionId, label: "synthetic", agent: "codex" }]);
+      const payload = {
+        code: variant === "unknown" ? "unknown_provider_failure" : "continuity_incomplete",
+        retryable: false, ...(variant === "missing-reason" ? {} : { safeReason: gap ? "retained_output_gap" : "untrusted-message" }),
+      };
+      system.connections[0].incoming.push(variant === "missing-reason"
+        ? encodeTerminalFrame({ type: "error", sequence: 1n, payload: new TextEncoder().encode(JSON.stringify(payload)) })
+        : encodeTerminalControl("error", 1n, payload));
+      await waitUntil(() => coordinator.failure !== undefined, "foreground receives typed runtime failure");
+      assert.equal(coordinator.failure.code, gap ? "terminal_history_gap" : "terminal_protocol_error");
+      assert.equal(coordinator.failure.retryable, false);
+      if (gap) {
+        assert.equal(coordinator.failure.safeDetails.process_state, "unknown");
+        assert.equal(coordinator.failure.safeDetails.agent_session_id, sessionId);
+        assert.match(coordinator.failure.message, /earlier output is no longer available.*agent's current state is unknown/u);
+      }
+      assert.equal(system.connections.length, 1, "no automatic replacement attachment");
+    } finally { await coordinator.stop(); await runtime.shutdown(); }
+  });
+}
+
 for (const code of ["opencode_server_exited", "unknown_provider_failure"]) {
   test(`terminal provider error uses only an exact known message: ${code}`, async () => {
     const system = new FakeTerminalSystem();
@@ -2577,6 +2612,41 @@ for (const phase of ["initial", "live", "reconnect"]) {
         } else system.connections[0].incoming.push(errorFrame);
         await waitUntil(() => runtime.listTerminals()[0].state === "failed", "permanent input recovery refusal");
         assert.equal(runtime.listTerminals()[0].reason, "terminal_input_recovery_required");
+        await assert.rejects(runtime.reconnect({ tabId: "tab-a" }), error => error.code === "session_conflict");
+      }
+      assert.equal(system.createCalls.length, phase === "reconnect" ? 2 : 1, "no automatic replacement or retry");
+    } finally { await runtime.shutdown(); }
+  });
+}
+
+for (const phase of ["initial", "live", "reconnect"]) {
+  test(`history gap ERROR is permanent and preserves its specific reason: ${phase}`, async () => {
+    const system = new FakeTerminalSystem();
+    const { runtime } = createRuntime(system);
+    const errorFrame = encodeTerminalControl("error", 0n, {
+      code: "continuity_incomplete", retryable: false, safeReason: "retained_output_gap",
+    });
+    try {
+      if (phase === "initial") {
+        system.connectionsWithoutReady.add(1);
+        const opening = runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+        const checked = assert.rejects(opening, error => error.retryable === false && error.safeDetails?.reason === "retained_output_gap");
+        await waitUntil(() => system.connections.length === 1, "exact initial connection");
+        system.connections[0].incoming.push(errorFrame); await checked;
+        assert.equal(runtime.listTerminals().length, 0);
+      } else {
+        await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+        if (phase === "reconnect") {
+          system.connections[0].incoming.close();
+          await waitUntil(() => runtime.listTerminals()[0].state === "interrupted", "old transport ended");
+          system.connectionsWithoutReady.add(2);
+          const opening = runtime.reconnect({ tabId: "tab-a" });
+          const checked = assert.rejects(opening, error => error.retryable === false && error.safeDetails?.reason === "retained_output_gap");
+          await waitUntil(() => system.connections.length === 2, "exact recovery connection");
+          system.connections[1].incoming.push(errorFrame); await checked;
+        } else system.connections[0].incoming.push(errorFrame);
+        await waitUntil(() => runtime.listTerminals()[0].state === "failed", "permanent input recovery refusal");
+        assert.equal(runtime.listTerminals()[0].reason, "terminal_history_gap");
         await assert.rejects(runtime.reconnect({ tabId: "tab-a" }), error => error.code === "session_conflict");
       }
       assert.equal(system.createCalls.length, phase === "reconnect" ? 2 : 1, "no automatic replacement or retry");

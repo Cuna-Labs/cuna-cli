@@ -20,7 +20,7 @@ import {
   type LocalActionSnapshot,
 } from "../local-actions/index.js";
 import type { TerminalAttachmentAdmission } from "../runtime/terminal-transport.js";
-import { RuntimeBoundaryError, runtimeFailure } from "../runtime/errors.js";
+import { RuntimeBoundaryError, runtimeFailure, terminalHistoryGap } from "../runtime/errors.js";
 import type { HostTerminalLease } from "./mode.js";
 import { assertCanonicalUuid } from "../core/validation.js";
 import { buildAppbarModel, type AppbarModel, type StatusEvidence } from "./appbar.js";
@@ -661,7 +661,7 @@ export class ForegroundTerminalCoordinator {
       }
       if (snapshot.state === "failed" || snapshot.state === "closed" || snapshot.state === "detached") {
         if (snapshot.state === "failed") {
-          this.#recordFailure(snapshot.reason === "terminal_input_recovery_required"
+          this.#recordFailure(snapshot.reason === "terminal_history_gap" ? terminalHistoryGap(snapshot.agentSessionId) : snapshot.reason === "terminal_input_recovery_required"
             ? runtimeFailure("terminal_protocol_error", "Terminal input requires recovery. Earlier input will not be resent automatically.", {
               retryable: false, safeDetails: { reason: snapshot.reason },
             })

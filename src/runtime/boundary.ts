@@ -29,7 +29,7 @@ import {
 
 import { admitCapability, writerTransferCapability, type WriterTransferCapability } from "./capability-gate.js";
 import type { CapabilitySnapshot } from "../api/contracts.js";
-import { RuntimeBoundaryError, runtimeFailure } from "./errors.js";
+import { RuntimeBoundaryError, runtimeFailure, terminalHistoryGap } from "./errors.js";
 import {
   assertReadyPayloadMatches,
   assertRemoteAgentSessionEvidence,
@@ -1059,9 +1059,9 @@ export class CunaRuntimeBoundary {
         entry.connectionRevision === reconnectRevision &&
         entry.state !== "failed"
       ) {
-        entry.state = isPermanentInputRecoveryFailure(error) ? "failed" : "interrupted";
+        entry.state = isPermanentInputRecoveryFailure(error) || isHistoryGap(error) ? "failed" : "interrupted";
         entry.outputContinuity = "unknown";
-        entry.reason = safeReason(isPermanentInputRecoveryFailure(error) ? error : reportedError);
+        entry.reason = safeReason(isPermanentInputRecoveryFailure(error) || isHistoryGap(error) ? error : reportedError);
         this.#publish(entry);
       }
       throw reportedError;
@@ -1459,7 +1459,7 @@ export class CunaRuntimeBoundary {
         const frame = frames[index];
         if (frame === undefined) continue;
         assertTerminalFrameLegal("negotiating", "server_to_client", frame.type);
-        if (frame.type === "error") throw this.#remoteTerminalError(frame);
+        if (frame.type === "error") throw this.#remoteTerminalError(frame, entry.observation.agentSessionId);
         if (frame.type !== "ready") continue;
         const payload = decodeTerminalControl(frame);
         assertReadyPayloadMatches(payload, entry.observation);
@@ -1521,7 +1521,7 @@ export class CunaRuntimeBoundary {
       entry.outputAbort.abort(error);
       entry.state = (
         error instanceof TerminalProtocolError ||
-        (error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error")
+        (error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error") || isHistoryGap(error)
       ) ? "failed" : "interrupted";
       retireInputAcceptance(entry);
       entry.outputContinuity = "unknown";
@@ -1699,7 +1699,7 @@ export class CunaRuntimeBoundary {
       this.#terminals.delete(entry.tabId);
       return;
     }
-    if (frame.type === "error") throw this.#remoteTerminalError(frame);
+    if (frame.type === "error") throw this.#remoteTerminalError(frame, entry.observation.agentSessionId);
     if (frame.type === "heartbeat") {
       decodeTerminalControl(frame);
       if (frame.sequence <= entry.heartbeatSequence) {
@@ -1719,8 +1719,11 @@ export class CunaRuntimeBoundary {
     }
   }
 
-  #remoteTerminalError(frame: TerminalFrame): RuntimeBoundaryError {
+  #remoteTerminalError(frame: TerminalFrame, agentSessionId: string): RuntimeBoundaryError {
     const payload = decodeTerminalControl(frame);
+    if (payload.code === "continuity_incomplete" && payload.safeReason === "retained_output_gap") {
+      return terminalHistoryGap(agentSessionId);
+    }
     return runtimeFailure("terminal_protocol_error", payload.code === "terminal_input_recovery_required"
       ? "Terminal input requires recovery. Reconnecting cannot confirm earlier input delivery."
       : payload.code === "opencode_server_exited"
@@ -2012,6 +2015,10 @@ function retireInputAcceptance(entry: TerminalEntry): void {
 function isPermanentInputRecoveryFailure(error: unknown): error is RuntimeBoundaryError {
   return error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error" &&
     !error.retryable && error.safeDetails?.reason === "terminal_input_recovery_required";
+}
+
+function isHistoryGap(error: unknown): error is RuntimeBoundaryError {
+  return error instanceof RuntimeBoundaryError && error.code === "terminal_history_gap";
 }
 
 function safeReason(error: unknown): string {
