@@ -196,6 +196,7 @@ export class ForegroundTerminalCoordinator {
   readonly #retainedBrowserCandidates = new Map<string, LocalBrowserActionRequest>();
   #retainedPendingRequestId: string | undefined;
   readonly #oauthPasteGuards = new Map<string, ProviderOAuthPasteGuard>();
+  readonly #oauthPrefixTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #handledBrowserUrls = new Set<string>();
   readonly #browserRequests = new Map<string, LocalBrowserActionRequest>();
   readonly #remoteLocalActionTabs = new Map<string, string>();
@@ -415,6 +416,8 @@ export class ForegroundTerminalCoordinator {
     this.#removeAbort?.();
     this.#removeAbort = undefined;
     if (this.#resizeTimer !== undefined) clearTimeout(this.#resizeTimer);
+    for (const timer of this.#oauthPrefixTimers.values()) clearTimeout(timer);
+    this.#oauthPrefixTimers.clear();
     this.#resizeTimer = undefined;
     this.#removeInput?.();
     this.#removeResize?.();
@@ -527,7 +530,7 @@ export class ForegroundTerminalCoordinator {
       ? this.#pendingBrowserAction
       : undefined;
     if (guardedRequest?.fencingGeneration !== snapshot.fencingGeneration) {
-      this.#oauthPasteGuards.delete(snapshot.tabId);
+      this.#setOAuthPasteGuard(snapshot.tabId);
     }
     const binding = {
       userId: snapshot.userId,
@@ -809,7 +812,7 @@ export class ForegroundTerminalCoordinator {
     });
   }
 
-  async #routeInput(bytes: Uint8Array, receiptTarget: ForegroundInputTarget | undefined): Promise<void> {
+  async #routeInput(bytes: Uint8Array, receiptTarget: ForegroundInputTarget | undefined, releasedPrefix = false): Promise<void> {
     const runtime = this.#requireRuntime();
     if (bytes.includes(INTERRUPT)) {
       const active = this.#pendingBrowserAction === undefined
@@ -819,10 +822,10 @@ export class ForegroundTerminalCoordinator {
       this.#pendingBrowserAction = undefined;
       this.#pendingBrowserActionTabId = undefined;
       this.#browserNotice = undefined;
-    } else if (await this.#routeBrowserActionInput(bytes, receiptTarget)) {
+    } else if (!releasedPrefix && await this.#routeBrowserActionInput(bytes, receiptTarget)) {
       return;
     }
-    const guarded = this.#guardProviderOAuthPaste(bytes, receiptTarget);
+    const guarded = releasedPrefix ? { bytes, blocked: false } : this.#guardProviderOAuthPaste(bytes, receiptTarget);
     if (guarded.blocked) {
       this.#browserNotice = "That is the sign-in link, not the code. Approve access in the browser, then paste only the code shown on the final page.";
       await this.#render();
@@ -1104,7 +1107,7 @@ export class ForegroundTerminalCoordinator {
     }
     this.#browserRequests.set(request.id, request);
     if (request.type === "browser.open") {
-      this.#oauthPasteGuards.set(tabId, new ProviderOAuthPasteGuard(request));
+      this.#setOAuthPasteGuard(tabId, new ProviderOAuthPasteGuard(request));
     }
   }
 
@@ -1198,7 +1201,7 @@ export class ForegroundTerminalCoordinator {
       return;
     }
     if (browserRequest.type === "browser.open") {
-      this.#oauthPasteGuards.set(event.tabId, new ProviderOAuthPasteGuard(browserRequest));
+      this.#setOAuthPasteGuard(event.tabId, new ProviderOAuthPasteGuard(browserRequest));
     }
     this.#promoteBrowserAction();
     await this.#render();
@@ -1348,6 +1351,15 @@ export class ForegroundTerminalCoordinator {
     return `${request.agentSessionId}:${request.processEpoch}:${request.fencingGeneration}:${request.type}:${request.url}`;
   }
 
+  #setOAuthPasteGuard(tabId: string, guard?: ProviderOAuthPasteGuard): void {
+    const timer = this.#oauthPrefixTimers.get(tabId);
+    if (timer !== undefined) clearTimeout(timer);
+    this.#oauthPrefixTimers.delete(tabId);
+    this.#oauthPasteGuards.get(tabId)?.reset();
+    if (guard === undefined) this.#oauthPasteGuards.delete(tabId);
+    else this.#oauthPasteGuards.set(tabId, guard);
+  }
+
   #guardProviderOAuthPaste(
     bytes: Uint8Array,
     target: ForegroundInputTarget | undefined,
@@ -1358,6 +1370,30 @@ export class ForegroundTerminalCoordinator {
     const guard = this.#oauthPasteGuards.get(target.tabId);
     if (guard === undefined) return { bytes, blocked: false };
     const result = guard.push(bytes);
+    const previousTimer = this.#oauthPrefixTimers.get(target.tabId);
+    if (!guard.hasPendingPrefix && previousTimer !== undefined) {
+      clearTimeout(previousTimer);
+      this.#oauthPrefixTimers.delete(target.tabId);
+    } else if (this.#state === "active" && guard.hasPendingPrefix && previousTimer === undefined) {
+      const timer = setTimeout(() => {
+        this.#oauthPrefixTimers.delete(target.tabId);
+        const operation = this.#inputTail.then(async () => {
+          const tab = this.#tabs.get(target.tabId);
+          if (this.#state !== "active" || tab === undefined || tab.snapshot.state !== "active" || this.#activeTabId !== target.tabId ||
+            this.#oauthPasteGuards.get(target.tabId) !== guard || !sameSnapshotBinding(tab.snapshot, target.binding)) return;
+          const prefix = guard.releasePendingPrefix();
+          if (prefix.byteLength > 0) await this.#routeInput(prefix, target, true);
+        });
+        this.#inputTail = operation.catch((error) => {
+          if (error instanceof RuntimeBoundaryError &&
+            ["session_unknown", "terminal_disconnected", "terminal_observer"].includes(error.code)) return;
+          this.#recordFailure(error);
+          void this.stop().catch(() => { this.#state = "failed"; });
+        });
+      }, 35);
+      timer.unref?.();
+      this.#oauthPrefixTimers.set(target.tabId, timer);
+    }
     if (result.forward.length === 1) return { bytes: result.forward[0]!, blocked: result.blocked };
     if (result.forward.length === 0) return { bytes: new Uint8Array(), blocked: result.blocked };
     const length = result.forward.reduce((total, chunk) => total + chunk.byteLength, 0);
@@ -1451,7 +1487,7 @@ export class ForegroundTerminalCoordinator {
       this.#pendingBrowserActionTabId = undefined;
       this.#browserNotice = undefined;
     }
-    this.#oauthPasteGuards.delete(tabId);
+    this.#setOAuthPasteGuard(tabId);
 
     // The runtime boundary publishes a detached snapshot before resolving. Keep
     // this fallback so the coordinator contract remains safe with any runtime

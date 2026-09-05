@@ -82,6 +82,8 @@ export class ProviderOAuthPasteGuard {
   readonly #requestUrl: string;
   readonly #requestUrlBytes: Uint8Array;
   #startPrefix: number[] = [];
+  #forwardedStartPrefix = 0;
+  #pasteForwardedPrefix = 0;
   #pasteBytes: number[] | undefined;
   #endMatch = 0;
   #disabled = false;
@@ -126,7 +128,8 @@ export class ProviderOAuthPasteGuard {
       if (this.#pasteBytes !== undefined) {
         if (this.#pasteBytes.length >= MAX_GUARDED_PASTE_BYTES) {
           flushOutput();
-          forward.push(Uint8Array.from(this.#pasteBytes));
+          forward.push(Uint8Array.from(this.#pasteBytes.slice(this.#pasteForwardedPrefix)));
+          this.#pasteForwardedPrefix = 0;
           this.#pasteBytes = undefined;
           this.#endMatch = 0;
           this.#disabled = true;
@@ -137,16 +140,20 @@ export class ProviderOAuthPasteGuard {
         this.#endMatch = advanceMarkerMatch(BRACKETED_PASTE_END, this.#endMatch, byte);
         if (this.#endMatch === BRACKETED_PASTE_END.byteLength) {
           const paste = Uint8Array.from(this.#pasteBytes);
+          const forwardedPrefix = this.#pasteForwardedPrefix;
+          this.#pasteForwardedPrefix = 0;
           this.#pasteBytes = undefined;
           this.#endMatch = 0;
           if (this.#isProviderUrlPaste(paste)) {
             blocked = true;
           } else if (this.#captureCodes) {
             flushOutput();
-            forward.push(capturedCodeBytes(paste));
+            // Once marker bytes have escaped, preserve the original framing;
+            // inventing an extra Enter could execute input in a changed prompt.
+            forward.push(forwardedPrefix === 0 ? capturedCodeBytes(paste) : paste.subarray(forwardedPrefix));
           } else {
             flushOutput();
-            forward.push(paste);
+            forward.push(paste.subarray(forwardedPrefix));
           }
         }
         continue;
@@ -164,13 +171,16 @@ export class ProviderOAuthPasteGuard {
         if (this.#startPrefix.length === BRACKETED_PASTE_START.byteLength) {
           flushOutput();
           this.#pasteBytes = this.#startPrefix;
+          this.#pasteForwardedPrefix = this.#forwardedStartPrefix;
+          this.#forwardedStartPrefix = 0;
           this.#startPrefix = [];
           this.#endMatch = 0;
         }
         continue;
       }
 
-      output.push(...this.#startPrefix);
+      output.push(...this.#startPrefix.slice(this.#forwardedStartPrefix));
+      this.#forwardedStartPrefix = 0;
       this.#startPrefix = [];
       if (byte === BRACKETED_PASTE_START[0]) this.#startPrefix.push(byte);
       else output.push(byte);
@@ -186,6 +196,19 @@ export class ProviderOAuthPasteGuard {
     this.#pasteBytes = undefined;
     this.#endMatch = 0;
     this.#disabled = false;
+    this.#forwardedStartPrefix = 0;
+    this.#pasteForwardedPrefix = 0;
+  }
+
+  get hasPendingPrefix(): boolean {
+    return this.#startPrefix.length > this.#forwardedStartPrefix;
+  }
+
+  /** Release only marker bytes; retain recognition so a late URL cannot leak. */
+  releasePendingPrefix(): Uint8Array {
+    const bytes = Uint8Array.from(this.#startPrefix.slice(this.#forwardedStartPrefix));
+    this.#forwardedStartPrefix = this.#startPrefix.length;
+    return bytes;
   }
 
   /** Commit a complete pasted provider code as opaque bytes plus exactly one CR. */

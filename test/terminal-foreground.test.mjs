@@ -363,6 +363,46 @@ test("retained sign-in recovery is explicit, separately consented and attachment
   await coordinator.stop();
 });
 
+test("OAuth guard releases Escape promptly, blocks delayed URL paste, and cancels old-binding timers", async () => {
+  for (const end of ["normal", "rebind", "stop", "replacement"]) {
+    const { coordinator, callbacks, calls, host, intents } = harness();
+    intents[0].localBrowserActions = true;
+    await coordinator.start(intents.slice(0, 1));
+    const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+    host.emitInput(Uint8Array.of(0x64));
+    await waitUntil(() => /denied/u.test(decoder.decode(host.writes.at(-1))), "deny request but retain paste protection");
+    host.emitInput(Uint8Array.of(0x1b));
+    if (end === "replacement") {
+      await new Promise((resolve) => setImmediate(resolve));
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(`${url}&next=true\r\n`)));
+      host.emitInput(Uint8Array.of(0x64));
+      await waitUntil(() => /denied/u.test(decoder.decode(host.writes.at(-1))), "deny replacement request");
+      host.emitInput(Uint8Array.of(0x1b));
+    }
+    if (end === "rebind") await callbacks.onTerminalReady(snapshot(intents[0], 2));
+    if (end === "stop") await coordinator.stop();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(calls.input.length, end === "normal" || end === "replacement" ? 1 : 0, end);
+    if (end === "normal") {
+      assert.equal(calls.input[0].text, "\u001b");
+      host.emitInput(encoder.encode(`[200~${url}\u001b[201~`));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(calls.input.length, 1, "late URL bytes never escape");
+      host.emitInput(encoder.encode("\u001b[A"));
+      await waitUntil(() => calls.input.length === 2, "ordinary arrow reaches provider");
+      assert.equal(calls.input[1].text, "\u001b[A");
+      host.emitInput(Uint8Array.of(0x1b));
+      await waitUntil(() => calls.input.length === 3, "opaque paste prefix is released");
+      host.emitInput(encoder.encode("[200~opaque\u0003text\u001b[201~"));
+      await waitUntil(() => calls.input.length === 4, "opaque paste remainder reaches provider");
+      assert.equal(calls.input[3].text, "[200~opaque\u0003text\u001b[201~");
+      assert.deepEqual(calls.detach, []);
+    }
+    if (end !== "stop") await coordinator.stop();
+  }
+});
+
 test("Claude OAuth opens once on the local machine only after explicit Cuna approval", async () => {
   const opened = [];
   const { coordinator, callbacks, calls, host, intents } = harness({

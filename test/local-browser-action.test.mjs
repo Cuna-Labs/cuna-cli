@@ -19,6 +19,33 @@ const pasteStart = encoder.encode("\u001b[200~");
 const pasteEnd = encoder.encode("\u001b[201~");
 const claudeUrl = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
 
+test("bounded Escape release retains delayed paste recognition without duplicating marker bytes", () => {
+  const guard = new ProviderOAuthPasteGuard(browserRequest());
+  assert.deepEqual(guard.push(Uint8Array.of(0x1b)).forward, []);
+  assert.deepEqual(guard.releasePendingPrefix(), Uint8Array.of(0x1b));
+  assert.equal(guard.releasePendingPrefix().length, 0);
+  assert.deepEqual(guard.push(encoder.encode("[A")).forward, [encoder.encode("[A")]);
+  for (let split = 1; split < pasteStart.length; split += 1) {
+    for (const payload of [claudeUrl, "opaque-code", "\u0003literal-paste"]) {
+      const delayedPaste = new ProviderOAuthPasteGuard(browserRequest());
+      delayedPaste.push(pasteStart.slice(0, split));
+      const released = delayedPaste.releasePendingPrefix();
+      const result = delayedPaste.push(encoder.encode(`${new TextDecoder().decode(pasteStart.slice(split))}${payload}\u001b[201~`));
+      assert.equal(result.blocked, payload === claudeUrl);
+      const forwarded = Buffer.concat([released, ...result.forward]);
+      assert.deepEqual(forwarded, payload === claudeUrl ? Buffer.from(pasteStart.slice(0, split)) : Buffer.from(`\u001b[200~${payload}\u001b[201~`));
+    }
+  }
+  const capture = new ProviderOAuthPasteGuard(browserRequest());
+  capture.beginCodeCapture();
+  capture.push(Uint8Array.of(0x1b));
+  capture.releasePendingPrefix();
+  assert.deepEqual(capture.push(encoder.encode("[200~opaque\u001b[201~")).forward,
+    [encoder.encode("[200~opaque\u001b[201~")], "a released marker cannot justify a synthetic Enter");
+  assert.deepEqual(capture.push(encoder.encode("\u001b[200~opaque\u001b[201~")).forward,
+    [encoder.encode("opaque\r")], "normal complete code paste retains its existing commit behavior");
+});
+
 function browserRequest(overrides = {}) {
   return {
     id: "action-1",
