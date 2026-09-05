@@ -144,7 +144,7 @@ function renderTabs(tabs: readonly WorkbenchTab[], activeTabId: string, columns:
 function renderTruth(model: AppbarModel, agent: WorkbenchTab["agent"], columns: number): string {
   const values = [
     projection("terminal", model.attachment),
-    projection(providerAuthLabel(agent), model.providerAuthentication),
+    providerAuthProjection(providerAuthLabel(agent), model.providerAuthentication),
   ];
   if (model.cost !== undefined) values.push(metric("cost", model.cost, (value) => `$${value.toFixed(2)}`));
   if (model.tokensSaved !== undefined) values.push(metric("tokens saved", model.tokensSaved, String));
@@ -160,7 +160,13 @@ function renderCompact(
   const active = tabs.find((tab) => tab.id === activeTabId);
   const identity = active === undefined ? "session" : `${agentLabel(active.agent)} ${safeText(active.label)}`;
   const provider = active === undefined ? "provider auth" : providerAuthLabel(active.agent);
-  return truncate(` CUNA  ${identity}  \u00b7  ${projection("terminal", model.attachment)}  \u00b7  ${projection(provider, model.providerAuthentication)}`, columns);
+  return truncate(` CUNA  ${identity}  \u00b7  ${projection("terminal", model.attachment)}  \u00b7  ${providerAuthProjection(provider, model.providerAuthentication)}`, columns);
+}
+
+function providerAuthProjection(label: string, value: TruthProjection<string>): string {
+  return value.status === "stale"
+    ? `${label} status not refreshed`
+    : projection(label, value);
 }
 
 function projection(label: string, value: TruthProjection<string>): string {

@@ -684,11 +684,12 @@ test("expired auxiliary observations never replace live foreground attachment tr
 
   now = 180;
   callbacks.onTerminalState(snapshot(authoritativeIntent));
-  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Claude auth stale"), "expired provider evidence should render stale");
+  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Claude auth status not refreshed"), "expired provider evidence should describe observation freshness");
   frame = decoder.decode(host.writes.at(-1));
   assert.doesNotMatch(frame, /machine |session |sync /u);
   assert.match(frame, /terminal attached/u);
-  assert.match(frame, /Claude auth stale/u);
+  assert.match(frame, /Claude auth status not refreshed/u);
+  assert.doesNotMatch(frame, /auth authenticated|auth expired|login required/u);
   await coordinator.stop();
 });
 
