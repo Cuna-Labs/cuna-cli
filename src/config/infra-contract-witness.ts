@@ -3,27 +3,16 @@ export const INFRA_OPENAPI_CONTRACT_IDENTITY = Object.freeze({
   "schemaVersion": 2,
   "artifact_file": "contracts/infra/cuna-api.openapi.json",
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
-  "infra_openapi_raw_sha256": "6b8358a0a84bcb53a79ca78c7ca6f5ce9e3d8454145f13f2ccc8cb0bead0e0bf",
-  "infra_openapi_canonical_sha256": "49361049f7226583f85b2b9aa4b9ca5b309d30282dde62539d24905c8907a654",
+  "infra_openapi_raw_sha256": "24c7e7411797c2768b7cf408210ba64abdc118e9e215586157169ae52075635f",
+  "infra_openapi_canonical_sha256": "0473d9db2be6996a307bd7c74adf19ef81283da0a48186f6a8a758cc6fe91f13",
   "producer_repository": "Cuna-Labs/infra",
-  "producer_content_state": "committed",
-  "producer_revision": "da6ddbbccb4ec6fbea1a4458014f7dc6f030a770",
-  "producer_full_tree": {
-    "object_format": "sha1",
-    "commit": "da6ddbbccb4ec6fbea1a4458014f7dc6f030a770",
-    "tree": "fd560b2529139e51f62678dc826482d1d9491457",
-    "contract_blob": "12e47fbae6c21448c9402fcc4d8e2233495502d8"
-  },
+  "producer_content_state": "working_tree_product_delta",
+  "producer_base_revision": "7c3e09ef7896607a8d7a42e9146baf35e5f8f7b3",
+  "producer_full_tree": null,
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
-  "producer_projection_sha256": "467aa5e6d96a090dc752ac881a64d2b2480df2cc4e333b9b6770f28ed2b47a94",
-  "producer_runtime_manifest_sha256": "5fe7b33855875d077255f8dfb7ddc44ee5002047ba2b4765de849cf56bac975a",
+  "producer_projection_sha256": "4978f9671f9f3162c4a7c3421f914590d79e988a27491ec1bab71f1519116e24",
+  "producer_runtime_manifest_sha256": "39d4a167c7b607b4a01793950f301d19f9173b2424fc306b3bd3108d2ca3be0d",
   "feature_contracts": {
-    "opencode_interactive_only": {
-      "openapi_raw_sha256": "6b8358a0a84bcb53a79ca78c7ca6f5ce9e3d8454145f13f2ccc8cb0bead0e0bf",
-      "openapi_canonical_sha256": "49361049f7226583f85b2b9aa4b9ca5b309d30282dde62539d24905c8907a654",
-      "producer_commit": "da6ddbbccb4ec6fbea1a4458014f7dc6f030a770",
-      "producer_tree": "fd560b2529139e51f62678dc826482d1d9491457",
-      "producer_contract_blob": "12e47fbae6c21448c9402fcc4d8e2233495502d8"
-    }
+    "opencode_interactive_only": null
   }
 } as const);

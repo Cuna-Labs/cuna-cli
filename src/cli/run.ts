@@ -2,6 +2,7 @@ import { Writable } from "node:stream";
 import { createInterface } from "node:readline/promises";
 import { mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { launchRemoteWorkspaceSession } from "../journey/remote-workspace.js";
 import { join, resolve } from "node:path";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
@@ -1007,7 +1008,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     let journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "opencode"
       ? preflightAgentJourneyInvocation(parsed)
       : undefined;
-    if (journeyIntent?.target === "reconcile" && journeyIntent.localPath === undefined) {
+    const remoteMenuLaunch = journeyIntent?.target === "reconcile" && journeyIntent.newSession &&
+      dependencies.managedWorkspaceMachineId !== undefined && journeyIntent.localPath === undefined;
+    if (journeyIntent?.target === "reconcile" && journeyIntent.localPath === undefined && !remoteMenuLaunch) {
       const homeDirectory = platformHomeDirectory(effectiveEnvironment, process.platform);
       if (homeDirectory !== undefined && sameHostPath(process.cwd(), homeDirectory, process.platform)) {
         // Keep HOME safe without forcing every machine to share one local
@@ -1525,6 +1528,21 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         });
       }
       const journeyScope = Object.freeze({ userId: identity.id, workspaceId });
+      if (remoteMenuLaunch && dependencies.managedWorkspaceMachineId !== undefined) {
+        const agentSessionId = await launchRemoteWorkspaceSession({
+          client, machineId: dependencies.managedWorkspaceMachineId, workspaceId, agent: journeyAgent,
+          onProgress: (label) => inlineJourneyProgress?.update(label),
+          ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+          ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+        });
+        inlineJourneyProgress?.stop();
+        inlineJourneyProgress = undefined;
+        return await runCli([
+          journeyAgent === "claude-code" ? "claude" : journeyAgent,
+          "--agent-session", agentSessionId,
+          ...(booleanOption(parsed, "no-color") ? ["--no-color"] : []),
+        ], { ...dependencies, ...(humanAuth === undefined ? {} : { humanAuth }) });
+      }
       if (dependencies.automaticJourneyEffectsFactory !== undefined) {
         effects = dependencies.automaticJourneyEffectsFactory({
           client,

@@ -1525,6 +1525,7 @@ test("API terminal control plane derives fresh public observation and sends only
 
 test("API terminal control plane preserves structural identity but does not preempt backend attach authority", async () => {
   const base = {
+    cwd: "/workspace",
     id: "agent-a",
     machineId: "22222222-2222-4222-8222-222222222222",
     processState: "running",
@@ -1575,6 +1576,7 @@ test("API terminal control plane preserves structural identity but does not pree
 
 test("API terminal control plane accepts a backend-current lease renewed after an older observation", async () => {
   const session = {
+    cwd: "/workspace",
     id: "agent-a",
     machineId: "22222222-2222-4222-8222-222222222222",
     processState: "running",

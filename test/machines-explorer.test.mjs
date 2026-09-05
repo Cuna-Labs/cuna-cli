@@ -257,7 +257,7 @@ test("terminated visible sessions remain selectable but Right never opens the pr
           expiresAt: new Date(now + 30_000).toISOString(),
           etag: "session-create",
           capabilities: [{
-            id: "agent_sessions.create",
+            id: "agent_sessions.workspace.create",
             availability: "supported",
             interaction: "native",
             mutationClass: "reversible",
@@ -347,7 +347,7 @@ test("machine-menu selection remains on New session when refresh inserts another
           expiresAt: new Date(now + 30_000).toISOString(),
           etag: `session-create-${sessionReads}`,
           capabilities: [{
-            id: "agent_sessions.create",
+            id: "agent_sessions.workspace.create",
             availability: "supported",
             interaction: "native",
             mutationClass: "reversible",
@@ -429,7 +429,7 @@ test("a stopped OpenCode Machine offers only an explicit, double-confirmed super
           expiresAt: new Date(now + 30_000).toISOString(),
           etag: "open-repair",
           capabilities: [{
-            id: "agent_sessions.create",
+            id: "agent_sessions.workspace.create",
             availability: "unsupported",
             interaction: "native",
             mutationClass: "reversible",
@@ -468,7 +468,7 @@ test("a running OpenCode repair stays protected and never selects Stop on Enter"
           expiresAt: new Date(now + 30_000).toISOString(),
           etag: "open-protected",
           capabilities: [{
-            id: "agent_sessions.create",
+            id: "agent_sessions.workspace.create",
             availability: "unsupported",
             interaction: "native",
             mutationClass: "reversible",
@@ -517,7 +517,7 @@ test("a first OpenCode process observation remains distinct from the next-sessio
           expiresAt: new Date(now + 30_000).toISOString(),
           etag: "open-existing-upgrade",
           capabilities: [{
-            id: "agent_sessions.create",
+            id: "agent_sessions.workspace.create",
             availability: "unsupported",
             interaction: "native",
             mutationClass: "reversible",
@@ -580,7 +580,7 @@ test("a launched unknown OpenCode session names the legacy-supervisor recovery r
           expiresAt: new Date(now + 30_000).toISOString(),
           etag: "open-legacy",
           capabilities: [{
-            id: "agent_sessions.create",
+            id: "agent_sessions.workspace.create",
             availability: "unsupported",
             interaction: "native",
             mutationClass: "reversible",
@@ -635,7 +635,7 @@ test("an unannounced OpenCode supervisor is a retryable wait, not a terminal upd
           expiresAt: new Date(now + 30_000).toISOString(),
           etag: "open-heartbeat",
           capabilities: [{
-            id: "agent_sessions.create",
+            id: "agent_sessions.workspace.create",
             availability: "temporarily_unavailable",
             interaction: "native",
             mutationClass: "reversible",
@@ -685,7 +685,7 @@ test("bare explorer offers machine creation when every observed machine is unusa
           expiresAt: new Date(Date.now() + 30_000).toISOString(),
           etag: "runtime-unavailable",
           capabilities: [{
-            id: "agent_sessions.create",
+            id: "agent_sessions.workspace.create",
             availability: "temporarily_unavailable",
             interaction: "native",
             mutationClass: "reversible",
@@ -730,7 +730,7 @@ test("OpenCode runtime verification waits rather than offering another machine",
           expiresAt: new Date(Date.now() + 30_000).toISOString(),
           etag: "runtime-verifying",
           capabilities: [{
-            id: "agent_sessions.create",
+            id: "agent_sessions.workspace.create",
             availability: "temporarily_unavailable",
             interaction: "native",
             mutationClass: "reversible",
@@ -1378,7 +1378,7 @@ for (const state of ["error", "stopped", "running"]) {
       async listMachines() { return { items: [{ id: MACHINE_ID, name: "runtime-check", state, agent: "opencode" }] }; },
       async listAgentSessions() { return { items: [] }; },
       async discoverCapabilities(scope, subjectId) {
-        return capabilitySnapshot(scope, subjectId, [{ ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: "opencode_runtime_unverified" }]);
+        return capabilitySnapshot(scope, subjectId, [{ ...supported("agent_sessions.workspace.create"), availability: "temporarily_unavailable", reasonCode: "opencode_runtime_unverified" }]);
       },
     } }, { host });
     try {
@@ -1441,7 +1441,7 @@ test("E13-R1: n always offers New machine, walks provider then default name, and
         scopes.push(scope);
         return scope === "account"
           ? capabilitySnapshot("account", undefined, [supported("machines.create", "financial")])
-          : capabilitySnapshot("machine", resourceId, [supported("agent_sessions.create")]);
+          : capabilitySnapshot("machine", resourceId, [supported("agent_sessions.workspace.create")]);
       },
       async createMachine() { throw new Error("the screen must not create the Machine itself"); },
     },
@@ -1499,7 +1499,7 @@ test("E13-R1 negative: an unavailable machines.create capability renders the rea
       async discoverCapabilities(scope, resourceId) {
         return scope === "account"
           ? capabilitySnapshot("account", undefined, [{ ...supported("machines.create", "financial"), availability: "unsupported", reasonCode: "machine_quota_exhausted" }])
-          : capabilitySnapshot("machine", resourceId, [supported("agent_sessions.create")]);
+          : capabilitySnapshot("machine", resourceId, [supported("agent_sessions.workspace.create")]);
       },
       async createMachine() { creates += 1; throw new Error("unreachable"); },
     },
@@ -1568,7 +1568,7 @@ test("E13-R3: Start survives the response budget, shows Starting…, and converg
       async listMachines() { return { items: [{ id: MACHINE_ID, name: "paused-dev", state, agent: "claude-code" }] }; },
       async listAgentSessions() { return { items: [] }; },
       async discoverCapabilities(scope, resourceId) {
-        return capabilitySnapshot(scope, resourceId, [supported("machines.lifecycle"), supported("agent_sessions.create")]);
+        return capabilitySnapshot(scope, resourceId, [supported("machines.lifecycle"), supported("agent_sessions.workspace.create")]);
       },
       async transitionMachine(id, action) {
         transitions.push(action);
@@ -1609,7 +1609,7 @@ test("E13-R3 negative: a transition that never converges leaves the screen alive
       async listMachines() { return { items: [{ id: MACHINE_ID, name: "sticky", state: "running", agent: "codex" }] }; },
       async listAgentSessions() { return { items: [] }; },
       async discoverCapabilities(scope, resourceId) {
-        return capabilitySnapshot(scope, resourceId, [supported("machines.lifecycle"), supported("agent_sessions.create")]);
+        return capabilitySnapshot(scope, resourceId, [supported("machines.lifecycle"), supported("agent_sessions.workspace.create")]);
       },
       async transitionMachine(id) { return { id, name: "sticky", state: "stopping", agent: "codex" }; },
       async getMachine(id) { return { id, name: "sticky", state: "running", agent: "codex" }; },
@@ -1664,7 +1664,7 @@ test("E13-R5: ├─ appears only when a sibling line follows", async () => {
       async listAgentSessions() { return { items: [] }; },
       async discoverCapabilities(scope, resourceId) {
         return capabilitySnapshot(scope, resourceId, [{
-          ...supported("agent_sessions.create"),
+          ...supported("agent_sessions.workspace.create"),
           availability: "temporarily_unavailable",
           reasonCode: "opencode_runtime_unverified",
         }]);
@@ -1803,7 +1803,7 @@ for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protoc
       const operation = runNodeMachinesExplorer({ client: {
         async listMachines() { return { items: [{ id: MACHINE_ID, name: "state-control", state, agent: "opencode" }] }; },
         async listAgentSessions() { return { items: [] }; },
-        async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
+        async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.workspace.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
         async createAgentSession() { mutations.push("create"); },
         async transitionMachine() { mutations.push("transition"); },
         async deleteMachine() { mutations.push("delete"); },
@@ -1827,7 +1827,7 @@ for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protoc
     const operation = runNodeMachinesExplorer({ client: {
       async listMachines() { return { items: [{ id: MACHINE_ID, name: "failed-wait", state: "error", agent: "opencode" }] }; },
       async listAgentSessions() { return { items: [] }; },
-      async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
+      async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.workspace.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
     } }, { host });
     try {
       await waitUntil(() => lastFrame(host).includes("No AgentSessions") && !lastFrame(host).includes("Refreshing live sessions"), "inventory should finish");
@@ -1843,7 +1843,7 @@ for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protoc
     const operation = runNodeMachinesExplorer({ client: {
       async listMachines() { return { items: [{ id: MACHINE_ID, name: "stop-control", state: "running", agent: "opencode" }] }; },
       async listAgentSessions() { return { items: [] }; },
-      async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [supported("machines.lifecycle"), { ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
+      async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [supported("machines.lifecycle"), { ...supported("agent_sessions.workspace.create"), availability: "temporarily_unavailable", reasonCode: reason }]); },
       async transitionMachine(id, action) { transitions.push({ id, action }); await stopped; return {}; },
       async getMachine(id) { return { id, name: "stop-control", state: "stopped", agent: "opencode" }; },
     } }, { host });
@@ -1871,7 +1871,7 @@ for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protoc
       async listAgentSessions() { return { items: [] }; },
       async discoverCapabilities(scope, id) {
         if (++capabilityReads > 1) await delayed;
-        return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.create"), availability: "temporarily_unavailable", reasonCode: reason }]);
+        return capabilitySnapshot(scope, id, [{ ...supported("agent_sessions.workspace.create"), availability: "temporarily_unavailable", reasonCode: reason }]);
       },
     } }, { host });
     try {

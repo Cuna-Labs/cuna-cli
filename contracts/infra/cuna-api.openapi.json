@@ -1575,10 +1575,18 @@
                   "$ref": "#/components/schemas/ExecResult"
                 }
               }
+            },
+            "headers": {
+              "X-Cuna-Execution-Id": {
+                "description": "Durable execution operation identity. Leader completion does not release descendant ownership.",
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
             }
           },
           "default": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Problem"
           }
         },
         "x-runa-auth-classes": [
@@ -1599,7 +1607,30 @@
           {
             "CunaHumanBearer": []
           }
-        ]
+        ],
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "managed_exec_authority_unavailable",
+          "managed_exec_default_unavailable",
+          "managed_exec_request_invalid",
+          "managed_exec_operation_mismatch",
+          "managed_exec_cwd_invalid",
+          "managed_exec_legacy_view_unavailable",
+          "managed_exec_workspace_unavailable",
+          "managed_exec_ticket_refused",
+          "managed_exec_not_found",
+          "managed_exec_observation_refused",
+          "managed_exec_control_unavailable",
+          "managed_exec_capacity",
+          "managed_exec_outcome_unknown",
+          "managed_exec_protocol_invalid",
+          "managed_exec_timeout",
+          "managed_exec_cancelled",
+          "managed_exec_recovery_required",
+          "managed_exec_result_unavailable",
+          "resource_not_found"
+        ],
+        "description": "Run a buffered command through the managed supervisor. The six-field result describes the command leader; background descendants remain registered until natural exit or explicit execution cancellation. No automatic replay after an unknown outcome. Admission requires an authorized isolated Workspace path; unavailable legacy paths or unrecorded default cwd fail closed."
       }
     },
     "/v1/sessions/{id}/checkpoint": {
@@ -3387,6 +3418,416 @@
         ],
         "summary": "List execution Workspaces in one owned Project and Machine",
         "description": "Returns at most 50 dedicated execution Workspaces in ascending UUID order. The account Workspace, Project, and Machine must all belong to the current owner and remain authorized. Local bindings are separate identities. A sync generation does not attest filesystem materialization. Supply next_cursor as after for the next page."
+      }
+    },
+    "/v1/sessions/{id}/executions": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "get": {
+        "operationId": "executions.list",
+        "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "managed_exec_authority_unavailable",
+          "managed_exec_default_unavailable",
+          "managed_exec_request_invalid",
+          "managed_exec_operation_mismatch",
+          "managed_exec_cwd_invalid",
+          "managed_exec_legacy_view_unavailable",
+          "managed_exec_workspace_unavailable",
+          "managed_exec_ticket_refused",
+          "managed_exec_not_found",
+          "managed_exec_observation_refused",
+          "managed_exec_control_unavailable",
+          "managed_exec_capacity",
+          "managed_exec_outcome_unknown",
+          "managed_exec_protocol_invalid",
+          "managed_exec_timeout",
+          "managed_exec_cancelled",
+          "managed_exec_recovery_required",
+          "managed_exec_result_unavailable",
+          "resource_not_found"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "machines:exec"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "description": "Bounded owner-scoped execution inventory without command content or output.",
+        "responses": {
+          "200": {
+            "description": "Bounded owner-scoped execution inventory without command content or output.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedExecutionPage"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Uuid"
+            }
+          },
+          {
+            "name": "execution_workspace_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Uuid"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{id}/executions/{operationId}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        },
+        {
+          "name": "operationId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "executions.get",
+        "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "managed_exec_authority_unavailable",
+          "managed_exec_default_unavailable",
+          "managed_exec_request_invalid",
+          "managed_exec_operation_mismatch",
+          "managed_exec_cwd_invalid",
+          "managed_exec_legacy_view_unavailable",
+          "managed_exec_workspace_unavailable",
+          "managed_exec_ticket_refused",
+          "managed_exec_not_found",
+          "managed_exec_observation_refused",
+          "managed_exec_control_unavailable",
+          "managed_exec_capacity",
+          "managed_exec_outcome_unknown",
+          "managed_exec_protocol_invalid",
+          "managed_exec_timeout",
+          "managed_exec_cancelled",
+          "managed_exec_recovery_required",
+          "managed_exec_result_unavailable",
+          "resource_not_found"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "machines:exec"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "description": "Current leader and ownership state for one exact owned execution.",
+        "responses": {
+          "200": {
+            "description": "Current leader and ownership state for one exact owned execution.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedExecution"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/executions/{operationId}/cancel": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        },
+        {
+          "name": "operationId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "executions.cancel",
+        "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "managed_exec_authority_unavailable",
+          "managed_exec_default_unavailable",
+          "managed_exec_request_invalid",
+          "managed_exec_operation_mismatch",
+          "managed_exec_cwd_invalid",
+          "managed_exec_legacy_view_unavailable",
+          "managed_exec_workspace_unavailable",
+          "managed_exec_ticket_refused",
+          "managed_exec_not_found",
+          "managed_exec_observation_refused",
+          "managed_exec_control_unavailable",
+          "managed_exec_capacity",
+          "managed_exec_outcome_unknown",
+          "managed_exec_protocol_invalid",
+          "managed_exec_timeout",
+          "managed_exec_cancelled",
+          "managed_exec_recovery_required",
+          "managed_exec_result_unavailable",
+          "resource_not_found"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "machines:exec"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "description": "Record durable cancellation. The response does not prove that descendants have stopped; inspect ownership_state until authoritative cleanup.",
+        "responses": {
+          "200": {
+            "description": "Record durable cancellation. The response does not prove that descendants have stopped; inspect ownership_state until authoritative cleanup.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedExecution"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/ManagedExecutionCancel"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/default-workspace": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "get": {
+        "operationId": "sessions.defaultWorkspace.get",
+        "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "default_workspace_unavailable",
+          "default_workspace_invalid_request",
+          "default_workspace_authority_unavailable"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "machines:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "summary": "Read the owned Machine default remote Workspace",
+        "description": "Returns the server-owned default location and current publication state without requiring a local binding. Existing Machines without a default return typed absence. A pending publication never authorizes execution.",
+        "responses": {
+          "200": {
+            "description": "Owned default execution Workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineDefaultWorkspace"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/workspace-agent-sessions": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "post": {
+        "operationId": "agentSessions.createInWorkspace",
+        "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentSessionWorkspaceCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Durable remote Workspace launch intent; no process readiness before exact supervisor observation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentSessionWorkspaceEnvelope"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "agent_sessions:create"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "summary": "Create an AgentSession in an owned remote execution Workspace"
+      }
+    },
+    "/v1/agent-sessions/{id}/workspace-context": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AgentSessionId"
+        }
+      ],
+      "get": {
+        "operationId": "agentSessions.workspaceContext.get",
+        "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "responses": {
+          "200": {
+            "description": "Exact AgentSession admission context, independently recoverable after reconnect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentSessionWorkspaceContext"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "agent_sessions:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "summary": "Read the immutable execution Workspace identity of an owned AgentSession"
       }
     }
   },
@@ -7186,6 +7627,366 @@
             ]
           }
         }
+      },
+      "ManagedExecution": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "machine_id",
+          "execution_workspace_id",
+          "leader_state",
+          "ownership_state",
+          "cancel_requested",
+          "exit_code",
+          "duration_ms",
+          "reason",
+          "created_at",
+          "observed_at"
+        ],
+        "properties": {
+          "operation_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "execution_workspace_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "leader_state": {
+            "type": "string",
+            "enum": [
+              "admitted",
+              "running",
+              "exited",
+              "refused",
+              "unknown"
+            ]
+          },
+          "ownership_state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "allocated",
+              "descendants_live",
+              "cleanup_pending",
+              "cleared",
+              "unknown"
+            ]
+          },
+          "cancel_requested": {
+            "type": "boolean"
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^managed_exec_[a-z_]{1,80}$"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "observed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "ManagedExecutionPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "machine_id",
+          "items",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "$ref": "#/components/schemas/ManagedExecution"
+            }
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        }
+      },
+      "ManagedExecutionCancel": {
+        "type": "object",
+        "additionalProperties": false,
+        "maxProperties": 0
+      },
+      "MachineDefaultWorkspace": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "execution_workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "remote_root": {
+            "type": "string",
+            "pattern": "^/workspace/workspaces/[0-9a-f-]{36}$",
+            "maxLength": 128
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "machine_create"
+            ]
+          },
+          "initialization": {
+            "type": "string",
+            "enum": [
+              "empty"
+            ]
+          },
+          "machine_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,18})$"
+          },
+          "workspace_generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "manifest_root": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "policy_digest": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "publication_status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "ready",
+              "conflict",
+              "failed"
+            ]
+          },
+          "publication_epoch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^workspace\\.[a-z0-9_]{1,64}$"
+          }
+        },
+        "required": [
+          "machine_id",
+          "workspace_id",
+          "project_id",
+          "execution_workspace_id",
+          "remote_root",
+          "origin",
+          "initialization",
+          "machine_generation",
+          "workspace_generation",
+          "manifest_root",
+          "policy_digest",
+          "publication_status",
+          "publication_epoch",
+          "reason"
+        ],
+        "description": "Server-created remote Workspace, independent of local context bindings. Empty describes initialization only; subsequent workspace generations may contain user data. Only ready attests current publication. This read does not create a Workspace or materialize files."
+      },
+      "AgentSessionWorkspaceCreate": {
+        "type": "object",
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "properties": {
+              "agent": {
+                "const": "opencode"
+              },
+              "auth_mode": {
+                "const": "interactive_login"
+              }
+            },
+            "required": [
+              "agent",
+              "auth_mode"
+            ],
+            "not": {
+              "required": [
+                "credential_binding_id"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "agent": {
+                "enum": [
+                  "claude-code",
+                  "codex",
+                  "openclaw"
+                ]
+              }
+            }
+          }
+        ],
+        "required": [
+          "agent",
+          "cwd",
+          "workspace_generation",
+          "execution_workspace_id"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "agent": {
+            "enum": [
+              "claude-code",
+              "codex",
+              "opencode",
+              "openclaw"
+            ]
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 1024,
+            "pattern": "^/workspace(?:/.*)?$"
+          },
+          "auth_mode": {
+            "enum": [
+              "interactive_login",
+              "credential_binding"
+            ]
+          },
+          "credential_binding_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "workspace_generation": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Committed workspace generation to bind this AgentSession to. It is a fencing token compared exactly against the WorkspaceBinding's current active_generation, so it must equal that value. A binding that has never been synchronized reports active_generation 0; no revision exists at generation 0, so 0 is never accepted here. Call workspaces.sync.commit first, which mints generation 1."
+          },
+          "execution_workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        }
+      },
+      "AgentSessionWorkspaceContext": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agent_session_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "execution_workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "workspace_generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "remote_root": {
+            "type": "string",
+            "pattern": "^/workspace/workspaces/[0-9a-f-]{36}$",
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "agent_session_id",
+          "machine_id",
+          "execution_workspace_id",
+          "workspace_generation",
+          "remote_root"
+        ]
+      },
+      "AgentSessionWorkspaceEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agent_session": {
+            "$ref": "#/components/schemas/AgentSession"
+          },
+          "execution_workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "workspace_generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "remote_root": {
+            "type": "string",
+            "pattern": "^/workspace/workspaces/[0-9a-f-]{36}$",
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "agent_session",
+          "execution_workspace_id",
+          "workspace_generation",
+          "remote_root"
+        ]
       }
     }
   },
@@ -7209,6 +8010,6 @@
     "responseEncoding": "utf-8",
     "maxResponseBytes": 16777216,
     "followRedirects": false,
-    "sdkOperationCount": 34
+    "sdkOperationCount": 40
   }
 }

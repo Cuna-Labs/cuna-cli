@@ -311,7 +311,9 @@ test("`cuna login --profile <name>` creates the profile the flag names", async (
     assert.equal(next.baseUrl, DEFAULT_BASE_URL);
     assert.equal(next.developmentProfile, false);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    // Windows can report ENOTEMPTY while removal of an already-unlinked child
+    // is still settling. Bound native rm retries; a persistent residue fails.
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   }
 });
 

@@ -380,6 +380,43 @@ test("no-args remains help off-TTY but a real TTY infers and attaches the select
   assert.doesNotMatch(progressOutput, /Cuna: attaching to Claude/u);
 });
 
+test("both interactive menus create in the selected remote Workspace without local synchronization", async () => {
+  for (const argv of [[], ["machines"]]) {
+    const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+    const attached = [], created = [];
+    const root = `/workspace/workspaces/${FOREGROUND_SESSION_D}`;
+    const session = { id: FOREGROUND_SESSION_A, machineId: MACHINE_ID, agent: "codex", cwd: root,
+      authMode: "interactive_login", requestState: "launched", processState: "running" };
+    const client = fakeClient({
+      async discoverCapabilities(scope, id) {
+        return capabilitySnapshot([
+          ["machines.default_workspace.read", "read_only"], ["agent_sessions.workspace.create", "native"],
+          ["agent_sessions.workspace.read", "read_only"],
+        ].map(([id, interaction]) => ({ id, interaction, availability: "supported", mutationClass: "none", surfaces: ["cli"], requiredPermissions: [] })), scope, id);
+      },
+      async getMachineDefaultWorkspace(id) {
+        assert.equal(id, MACHINE_ID);
+        return { machineId: id, workspaceId: FOREGROUND_SESSION_B, executionWorkspaceId: FOREGROUND_SESSION_D,
+          remoteRoot: root, workspaceGeneration: 1, publicationStatus: "ready" };
+      },
+      async createAgentSessionInWorkspace(id, input) { created.push({ id, input }); return { agentSession: session }; },
+      async getAgentSessionWorkspaceContext(id) { return { agentSessionId: id, machineId: MACHINE_ID, executionWorkspaceId: FOREGROUND_SESSION_D, remoteRoot: root, workspaceGeneration: 1 }; },
+      async getAgentSession() { return session; },
+    });
+    const select = async () => ({ kind: "launch", agent: "codex", machineId: MACHINE_ID, machineName: "chosen", newSession: true });
+    const exit = await runCli(argv, { streams: interactive.streams, platform, env: { CUNA_API_KEY: API_KEY },
+      now: () => Date.parse("2026-08-08T00:00:00.000Z"), clientFactory: () => client,
+      rootJourneyRunner: select, machinesExplorerRunner: select,
+      automaticJourneyEffectsFactory: () => { throw new Error("local synchronization must not run"); },
+      foregroundTerminalRunner: async input => { attached.push(input); },
+    });
+    assert.equal(exit, EXIT_CODES.success, interactive.stderr());
+    assert.equal(created.length, 1); assert.equal(created[0].id, MACHINE_ID);
+    assert.equal(created[0].input.workspaceBindingId, undefined);
+    assert.deepEqual(attached.map(a => a.agentSessionIds), [[FOREGROUND_SESSION_A]]);
+  }
+});
+
 test("bare cuna paints a neutral loader before a delayed local sign-in check", async () => {
   const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
   let resolveToken;

@@ -1,4 +1,6 @@
 import type { CunaApiClient } from "../api/client.js";
+import type { AgentSessionWorkspaceContext } from "../api/remote-workspace.js";
+import { admitCapability } from "./capability-gate.js";
 
 import { runtimeFailure } from "./errors.js";
 import type {
@@ -11,6 +13,7 @@ export function createApiTerminalControlPlane(input: {
   readonly clock?: () => number;
 }): TerminalControlPlane {
   const clock = input.clock ?? Date.now;
+  const workspaceContexts = new Map<string, AgentSessionWorkspaceContext>();
   return Object.freeze({
     discoverCapabilities: (scope: "agent_session", resourceId: string, signal?: AbortSignal) =>
       input.client.discoverCapabilities(scope, resourceId, signal),
@@ -22,6 +25,7 @@ export function createApiTerminalControlPlane(input: {
       ]);
       if (
         !identity.workspaceAssigned ||
+        session.id !== agentSessionId ||
         session.processEpoch === undefined ||
         session.runtimeObservedAt === undefined ||
         session.runtimeExpiresAt === undefined
@@ -30,6 +34,24 @@ export function createApiTerminalControlPlane(input: {
           "remote_state_unproven",
           "The AgentSession has no process identity for terminal attachment.",
         );
+      }
+      const previous = workspaceContexts.get(agentSessionId);
+      if (previous !== undefined || session.cwd.startsWith("/workspace/workspaces/")) {
+        const capabilities = await input.client.discoverCapabilities("agent_session", agentSessionId, signal);
+        admitCapability(capabilities, { id: "agent_sessions.workspace.read", scope: "agent_session",
+          subjectId: agentSessionId, surface: "cli", interaction: "read_only" }, clock());
+        const context = await input.client.getAgentSessionWorkspaceContext(agentSessionId, signal);
+        if (context.agentSessionId !== agentSessionId || context.machineId !== session.machineId ||
+            context.remoteRoot !== `/workspace/workspaces/${context.executionWorkspaceId}` ||
+            !(session.cwd === context.remoteRoot || session.cwd.startsWith(`${context.remoteRoot}/`)) ||
+            session.cwd.split("/").some((part) => part === "." || part === "..") ||
+            (previous !== undefined && (context.executionWorkspaceId !== previous.executionWorkspaceId ||
+              context.workspaceGeneration !== previous.workspaceGeneration || context.remoteRoot !== previous.remoteRoot ||
+              context.machineId !== previous.machineId))) {
+          throw runtimeFailure("session_discontinuous",
+            "The AgentSession Workspace changed. Reconnect cannot substitute its admitted Workspace.");
+        }
+        workspaceContexts.set(agentSessionId, Object.freeze({ ...context }));
       }
       return Object.freeze({
         authority: "cuna_agent_session_supervisor",

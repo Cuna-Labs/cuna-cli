@@ -1063,7 +1063,10 @@ async function observeSessionCreateCapability(
   }
   try {
     const snapshot = await client.discoverCapabilities("machine", machineId, signal);
-    const decision = decideCapability(snapshot, "agent_sessions.create", now);
+    if (snapshot.subjectScope !== "machine" || snapshot.subjectId !== machineId) {
+      return Object.freeze({ canCreateSession: false, state: "unverified", reason: "subject_scope_mismatch" });
+    }
+    const decision = decideCapability(snapshot, "agent_sessions.workspace.create", now, ["native"]);
     const expiresAt = Date.parse(snapshot.expiresAt);
     return Object.freeze({
       canCreateSession: decision.status === "supported",

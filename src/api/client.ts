@@ -57,6 +57,8 @@ import {
 } from "./contracts.js";
 import type { HttpRequest, HttpTransport } from "./http.js";
 import { decodeExecutionWorkspacePage, type ExecutionWorkspacePage } from "./execution-workspaces.js";
+import { decodeMachineDefaultWorkspace, decodeAgentSessionWorkspaceContext, decodeAgentSessionWorkspaceEnvelope,
+  type MachineDefaultWorkspace, type AgentSessionWorkspaceContext, type AgentSessionWorkspaceEnvelope } from "./remote-workspace.js";
 import { classifyCapabilitySnapshot, isPermanentSnapshotFault } from "./capability-evidence.js";
 
 export interface MachineCreateInput {
@@ -84,6 +86,10 @@ export interface WorkspaceBindingIdentityInput {
   readonly localInstanceId: string;
   readonly machineId: string;
   readonly exclusionPolicyDigest: string;
+}
+
+export interface AgentSessionWorkspaceCreateInput extends Omit<AgentSessionCreateInput, "workspaceBindingId"> {
+  readonly executionWorkspaceId: string;
 }
 
 export interface WorkspaceBindingCreateInput extends WorkspaceBindingIdentityInput {
@@ -152,6 +158,9 @@ export interface CunaApiClient {
     signal?: AbortSignal,
   ): Promise<WorkspaceBindingAuthority>;
   listAgentSessions(machineId: string, options?: PageOptions, signal?: AbortSignal): Promise<AgentSessionPage>;
+  getMachineDefaultWorkspace(machineId: string, signal?: AbortSignal): Promise<MachineDefaultWorkspace>;
+  getAgentSessionWorkspaceContext(id: string, signal?: AbortSignal): Promise<AgentSessionWorkspaceContext>;
+  createAgentSessionInWorkspace(machineId: string, input: AgentSessionWorkspaceCreateInput, idempotencyKey: string, signal?: AbortSignal): Promise<AgentSessionWorkspaceEnvelope>;
   createAgentSession(
     machineId: string,
     input: AgentSessionCreateInput,
@@ -304,8 +313,7 @@ function validatePageOptions(options: PageOptions, resource = "AgentSession"): R
   });
 }
 
-function validateAgentSessionCreate(input: AgentSessionCreateInput): void {
-  assertCanonicalUuid(input.workspaceBindingId, "workspace binding ID");
+function validateAgentSessionCreate(input: Omit<AgentSessionCreateInput, "workspaceBindingId">): void {
   if (!Number.isSafeInteger(input.workspaceGeneration) || input.workspaceGeneration < 1) {
     throw new CunaError({
       code: "cuna.usage.invalid",
@@ -697,6 +705,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
     },
     async createAgentSession(machineId, input, idempotencyKey, signal) {
       const safeId = encodeMachineId(machineId);
+      assertCanonicalUuid(input.workspaceBindingId, "workspace binding ID");
       validateAgentSessionCreate(input);
       const request: HttpRequest = {
         method: "POST",
@@ -725,6 +734,38 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         },
         operationLabel(request),
       );
+    },
+    async getMachineDefaultWorkspace(machineId, signal) {
+      const request: HttpRequest = {method:"GET",path:`/v1/sessions/${encodeMachineId(machineId)}/default-workspace`,...(signal === undefined ? {} : {signal})};
+      const workspace=await fetchDecoded(request,decodeMachineDefaultWorkspace);
+      if(workspace.machineId !== machineId) throw malformed(contractViolation("matches_requested_resource","machine_id"),operationLabel(request));
+      return workspace;
+    },
+    async getAgentSessionWorkspaceContext(id, signal) {
+      const request: HttpRequest = {method:"GET",path:`/v1/agent-sessions/${encodeCanonicalUuid(id,"AgentSession ID")}/workspace-context`,...(signal === undefined ? {} : {signal})};
+      const context=await fetchDecoded(request,decodeAgentSessionWorkspaceContext);
+      if(context.agentSessionId !== id) throw malformed(contractViolation("matches_requested_resource","agent_session_id"),operationLabel(request));
+      return context;
+    },
+    async createAgentSessionInWorkspace(machineId, input, idempotencyKey, signal) {
+      const safeId=encodeMachineId(machineId);
+      assertCanonicalUuid(input.executionWorkspaceId,"execution Workspace ID");
+      assertIdempotencyKey(idempotencyKey);
+      validateAgentSessionCreate(input);
+      const root=`/workspace/workspaces/${input.executionWorkspaceId}`;
+      if ((input.cwd !== root && !input.cwd.startsWith(`${root}/`)) || input.cwd.includes("\\") || input.cwd.split("/").includes(".") ||
+          input.agent === "openclaw" || input.authMode !== "interactive_login" || input.credentialBindingId !== undefined) {
+        throw new CunaError({code:"cuna.usage.invalid",message:"Remote Workspace sessions require their exact remote path and interactive agent login.",exitCode:EXIT_CODES.usage});
+      }
+      const request: HttpRequest = {method:"POST",path:`/v1/sessions/${safeId}/workspace-agent-sessions`,idempotencyKey,
+        settleWith:`cuna agent-sessions list --machine ${machineId}`,body:{...(input.name === undefined ? {} : {name:input.name}),agent:input.agent,cwd:input.cwd,
+          execution_workspace_id:input.executionWorkspaceId,workspace_generation:input.workspaceGeneration,auth_mode:input.authMode},...(signal === undefined ? {} : {signal})};
+      const result=await fetchDecoded(request,decodeAgentSessionWorkspaceEnvelope);
+      if(result.agentSession.machineId !== machineId || result.executionWorkspaceId !== input.executionWorkspaceId || result.workspaceGeneration !== input.workspaceGeneration ||
+          result.agentSession.cwd !== input.cwd || result.agentSession.agent !== input.agent || result.agentSession.authMode !== input.authMode) {
+        throw malformed(contractViolation("matches_requested_resource","execution_workspace_id"),operationLabel(request));
+      }
+      return result;
     },
     async inspectAgentSessionCreate(idempotencyKey, signal) {
       assertIdempotencyKey(idempotencyKey);

@@ -44,7 +44,7 @@ function sessionCreateCapability() {
     expiresAt: new Date(NOW + 30_000).toISOString(),
     etag: "session-create",
     capabilities: [{
-      id: "agent_sessions.create",
+      id: "agent_sessions.workspace.create",
       availability: "supported",
       interaction: "native",
       mutationClass: "reversible",
