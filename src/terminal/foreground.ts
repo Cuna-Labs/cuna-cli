@@ -759,6 +759,7 @@ export class ForegroundTerminalCoordinator {
         // Typing into an observed terminal is refused, not fatal: the seat is
         // someone else's. Say so on the notice line and keep observing.
         this.#seatNotice = error.message;
+        this.#helpVisible = false;
         void this.#render().catch(() => undefined);
         return;
       }
@@ -1787,6 +1788,8 @@ export class ForegroundTerminalCoordinator {
     if (tabId === undefined || runtime === undefined) return;
     const tab = this.#tabs.get(tabId);
     if (tab === undefined || tab.snapshot.state !== "active") return;
+    // New action feedback replaces help; the user can reopen help afterward.
+    this.#helpVisible = false;
     if (tab.snapshot.accessMode === "writer") {
       this.#seatNotice = "You already hold this terminal's writer seat.";
       void this.#render().catch(() => undefined);
@@ -1804,6 +1807,7 @@ export class ForegroundTerminalCoordinator {
       () => { this.#seatNotice = undefined; },
       (error: unknown) => {
         this.#seatNotice = writerTransferFailureNotice(error);
+        this.#helpVisible = false;
       },
     ).finally(() => { void this.#render().catch(() => undefined); });
   }

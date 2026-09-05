@@ -763,6 +763,8 @@ try {
           await context.waitUntil(() => context.screen().includes('ACCEPTED "safe-input"'), "writer input did not reach the provider fixture");
         } else {
           await context.waitUntil(() => context.screen().includes("supervisor_writer_operation_unavailable"), "fresh unsupported capability did not render its typed refusal");
+          context.child.write("\u001d?");
+          await context.waitUntil(() => context.screen().includes("Keys: Ctrl+C detach"), "observer help did not open");
           context.child.write("x");
           await context.waitUntil(() => context.screen().includes("Fixture observer input is disabled."), "observer input did not render its refusal");
         }

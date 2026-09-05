@@ -1548,6 +1548,82 @@ test("a refused seat request is reported on the notice line and does not stop th
 
 const OBSERVER_REFUSAL = "This attachment observes the terminal; press Ctrl+] w to take control.";
 
+test("observer input refusal remains visible when escape help was already open", async () => {
+  let observing = false;
+  const { coordinator, callbacks, calls, host, intents } = harness({
+    sendInputError: () => observing ? runtimeFailure("terminal_observer", OBSERVER_REFUSAL) : undefined,
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    const observer = { ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 };
+    callbacks.onTerminalState(observer);
+    observing = true;
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+C detach"), "help opens for the observer");
+    const beforeHeartbeat = host.writes.length;
+    callbacks.onTerminalState({ ...observer, heartbeatObservedAt: 150, heartbeatExpiresAt: 250 });
+    await waitUntil(() => host.writes.length > beforeHeartbeat, "heartbeat is rendered");
+    assert.match(decoder.decode(host.writes.at(-1)), /Keys: Ctrl\+C detach/u, "help remains visible without a transient refusal");
+    assert.equal(calls.input.length, 0, "opening help never sends provider input");
+    host.emitInput(Uint8Array.of(0x78));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes(OBSERVER_REFUSAL), "input refusal must be visible above existing help");
+    assert.equal(calls.input.length, 0, "the rejected observer byte is not accepted by the provider");
+    assert.equal(coordinator.state, "active", "a refused byte does not end observation");
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+C detach"), "the user can reopen help after reading a refusal");
+    host.emitInput(Uint8Array.of(0x79));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes(OBSERVER_REFUSAL), "a new rejection interrupts reopened help again");
+    assert.equal(calls.input.length, 0);
+  } finally { await coordinator.stop(); }
+});
+
+test("take-control progress and rejection replace open help without preventing help from reopening", async () => {
+  for (const expired of [false, true]) {
+    const { coordinator, callbacks, calls, host, intents, runtime } = harness();
+    let rejectTransfer;
+    const pending = new Promise((_, reject) => { rejectTransfer = reject; });
+    void pending.catch(() => undefined);
+    runtime.takeWriter = async ({ tabId }) => { calls.takeWriter.push(tabId); await pending; };
+    const frame = () => decoder.decode(host.writes.at(-1));
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2,
+        writerTransferCapability: { supported: true, reasonCode: null, expiresAt: Date.now() + (expired ? -1 : 60_000) } });
+      host.emitInput(Uint8Array.of(0x1d, 0x3f));
+      await waitUntil(() => frame().includes("Keys: Ctrl+C detach"), "help opens before requesting control");
+      host.emitInput(Uint8Array.of(0x1d, 0x77));
+      await waitUntil(() => calls.takeWriter.length === 1 && frame().includes(expired ? "Checking control" : "Taking control"), "new control progress replaces help");
+      assert.equal(frame().includes("Keys: Ctrl+C detach"), false);
+      rejectTransfer(new Error("Fixture control refused"));
+      await waitUntil(() => frame().includes("Could not take control: Fixture control refused"), "the asynchronous refusal is visible");
+      host.emitInput(Uint8Array.of(0x1d, 0x3f));
+      await waitUntil(() => frame().includes("Keys: Ctrl+C detach"), "help can reopen after the control refusal");
+      host.emitInput(Uint8Array.of(0x1d, 0x77));
+      await waitUntil(() => calls.takeWriter.length === 2 && frame().includes("Could not take control: Fixture control refused"), "another explicit request replaces reopened help");
+      assert.equal(calls.input.length, 0, "local control actions never send provider text");
+      assert.equal(coordinator.state, "active");
+    } finally { rejectTransfer(new Error("Fixture cleanup")); await coordinator.stop(); }
+  }
+});
+
+test("an immediate unsupported control refusal replaces help and preserves observer gating", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness();
+  const frame = () => decoder.decode(host.writes.at(-1));
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2,
+      writerTransferCapability: { supported: false, reasonCode: "supervisor_writer_operation_unavailable", expiresAt: Date.now() + 60_000 } });
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => frame().includes("Keys: Ctrl+C detach"), "help opens for unsupported control");
+    host.emitInput(Uint8Array.of(0x1d, 0x77));
+    await waitUntil(() => frame().includes("Control unavailable: supervisor_writer_operation_unavailable"), "the immediate refusal replaces help");
+    assert.equal(calls.takeWriter.length, 0);
+    assert.equal(calls.input.length, 0);
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => frame().includes("Keys: Ctrl+C detach"), "help remains intentionally accessible after refusal");
+  } finally { await coordinator.stop(); }
+});
+
 test("unavailable or unknown writer capability disables the chord and renders its reason", async () => {
   for (const capability of [undefined, { supported: false, reasonCode: "supervisor_writer_operation_unavailable", expiresAt: Date.now() }, { supported: false, reasonCode: "capability_unknown", expiresAt: Date.now() - 1 }]) {
     const { coordinator, callbacks, calls, host, intents } = harness();
