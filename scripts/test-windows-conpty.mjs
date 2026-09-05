@@ -108,6 +108,9 @@ const server = createServer(async (request, response) => {
       capabilities: [{ id: "agent_sessions.create", availability: "supported", interaction: "native", mutation_class: "reversible", surfaces: ["cli"], required_permissions: ["agent_sessions:write"] }],
     });
   }
+  if (request.method === "GET" && url.pathname === `/v1/sessions/${MACHINE_ID}/executions`) {
+    return send(response, 200, { machine_id: MACHINE_ID, items: [], next_cursor: null });
+  }
   return send(response, 404, { error: "unexpected_route", path: url.pathname });
 });
 
@@ -716,6 +719,36 @@ try {
   } finally {
     agentSessionScenario = "default";
   }
+
+  results.push(await runConptyCase({
+    testId: "T14.3-WIN-EXECUTIONS-RETURN-ATTACH", args: [machinesToForegroundFixture, configFile, "--bare", "--executions-return"], environment: cliEnvironment,
+    async drive(context) {
+      await context.waitUntil(() => context.screen().includes("❯ ▾ conpty-界-🦊"), "root did not select the fixture Machine");
+      context.child.write("\r");
+      await context.waitUntil(() => context.screen().includes("◆── conpty-界-🦊") && context.screen().includes("Claude  sessions"), "Machine actions did not render");
+      context.child.write("e");
+      await context.waitUntil(() => context.screen().includes("Remote executions") && context.screen().includes("No executions"), "Executions list did not finish loading");
+      context.child.write("\u001b");
+      await context.waitUntil(() => context.screen().includes("◆── Machines") && context.screen().includes("❯ ▾ conpty-界-🦊"), "Escape did not return to Machines");
+      context.child.write("\u001b[B");
+      await context.waitUntil(() => context.screen().includes("❯   ├─ Claude · claude-live"), "Down did not select the existing session after Executions");
+      context.child.write("\r");
+      await context.waitUntil(() => context.screen().includes("FLOW_PROVIDER_ANSI256") && context.screen().includes("❯ Continue"), "foreground did not acquire the terminal after Executions");
+      // The provider fixture emits this receipt only from its sendInput callback.
+      // A rendered initial frame alone cannot establish working native input.
+      context.child.write("input-ok\r");
+      await context.waitUntil(() => /PASTED [0-9]+/u.test(context.screen()), "native input disappeared after the Executions return");
+      context.observations.inputReceipt = context.screen();
+      context.child.write("\u0003");
+      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("Ctrl-C did not detach after Executions return")), 2_000))]);
+    },
+    async oracle({ finalState, transcript }) {
+      assert.equal(finalState.exitCode, 0, "Executions return attach exited nonzero");
+      assert.equal(finalState.activeScreen, "normal", "Executions return attach did not restore the normal screen");
+      assert.match(transcript(), /PASTED 8 input-ok input-ok/u, "foreground did not receive exactly the submitted input");
+      assert.match(transcript(), /NATIVE_RESTORE_QUIESCENT [0-9]+/u, "native reading was not stopped before every normal-mode restoration");
+    },
+  }));
 
   results.push(await runConptyCase({
     testId: "T14.3-WIN-NO-COLOR-CTRL-C", args: [entrypoint, "machines", "--config-file", configFile, "--no-color"], environment: { ...cliEnvironment, NO_COLOR: "1" },
