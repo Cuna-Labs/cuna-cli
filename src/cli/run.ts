@@ -1416,7 +1416,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         return EXIT_CODES.success;
       }
       if (selection.kind === "executions") {
-        const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal);
+        const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal,
+          { platform, baseUrl: config.baseUrl, profile: config.profile });
         if (outcome === "cancelled") return EXIT_CODES.success;
         return await runCli(["machines"], dependencies);
       }
@@ -1764,7 +1765,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }, dependencies.now === undefined ? {} : { now: dependencies.now });
       if (selection !== undefined) {
         if (selection.kind === "executions") {
-          const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal);
+          const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal,
+            { platform, baseUrl: config.baseUrl, profile: config.profile });
           if (outcome === "cancelled") return EXIT_CODES.success;
           return await runCli(["machines"], dependencies);
         } else if (selection.kind === "workspaces") {

@@ -11,7 +11,7 @@ const {spawn}=createRequire(path.join(root,'test/windows-conpty/package.json'))(
 const directory=await mkdtemp(path.join(tmpdir(),'cuna-executions-menu-'));
 const results=[];
 try{
-  for(const mode of ['root','machines','lost']){
+  for(const mode of ['root','machines','lost','launch','launch-lost']){
     const ledger=path.join(directory,mode+'.jsonl');
     const terminal=new xterm.Terminal({allowProposedApi:true,cols:110,rows:26,scrollback:1000});
     let raw='',tail=Promise.resolve(),exit;const inputs=[],screens=[];
@@ -26,6 +26,22 @@ try{
       await wait(()=>screen().includes('execution-menu-fixture'),'Machine listed');
       send('\r');await wait(()=>screen().includes('e Executions'),'Machine actions expose recovery');
       send('e');await wait(()=>screen().includes('exited / descendants_live'),'Inventory preserves descendant ownership');
+      if(mode.startsWith('launch')){
+        send('x');await wait(()=>screen().includes('Command (kept only in memory)'),'Remote command editor');
+        child.resize(60,20);terminal.resize(60,20);inputs.push({resize:{columns:60,rows:20},timestamp:new Date().toISOString()});
+        await wait(()=>screen().includes('Local files are not synchronized'),'Narrow launch shows remote context');
+        send('\x1b[200~printf "hello"\nprintf "world"\x1b[201~');
+        await wait(()=>screen().includes('printf "world"'),'Multiline paste remains editable');
+        assert.ok(!screen().includes('Enter sends once'));
+        send('\r');await wait(()=>screen().includes('Enter sends once'),'Separate command review');
+        send('\x1b');await wait(()=>screen().includes('Enter reviews'),'Escape returns to editing');
+        send('\x7f');await wait(()=>screen().includes('printf "world')&&!screen().includes('printf "world"'),'Backspace edits command');
+        send('"');await wait(()=>screen().includes('printf "world"'),'Literal text restores command');
+        send('\r');await wait(()=>screen().includes('Enter sends once'),'Review restored command');
+        send('\r');await wait(()=>screen().includes(mode==='launch-lost'?'Command outcome is unconfirmed':'Exit code: 4'),'Single dispatch outcome');
+        assert.ok(screen().includes('Recovery ID saved'));
+        send('r');await wait(()=>screen().includes('Process ownership: descendants_live'),'Inspect same launched execution');
+      }else{
       send('\x1b[B');await wait(()=>screen().includes('> 20000000'),'Arrow stays within one item');
       send('\r');await wait(()=>screen().includes('Process ownership: descendants_live'),'Exact operation inspected');
       send('\x1b[200~c\r\x1b[201~');await new Promise(r=>setTimeout(r,100));await tail;
@@ -39,7 +55,8 @@ try{
       child.resize(60,20);terminal.resize(60,20);inputs.push({resize:{columns:60,rows:20},timestamp:new Date().toISOString()});
       await wait(()=>screen().includes('Process ownership: descendants_live'),'Narrow terminal shows ownership');
       send('r');await wait(()=>screen().includes('ownership is cleared'),'Readback confirms cleanup without replay');
-      send('\x1b');await wait(()=>screen().includes('exited / cleared'),'Back returns to inventory');
+      }
+      send('\x1b');await wait(()=>screen().includes(mode.startsWith('launch')?'exited / descendants_live':'exited / cleared'),'Back returns to inventory');
       send('\x1b');await wait(()=>screen().includes('execution-menu-fixture'),'Back returns to Machines');
       send('\x03');await Promise.race([exited,new Promise((_,reject)=>{const t=setTimeout(()=>reject(new Error('process did not exit')),10000);t.unref();})]);
       await tail;
