@@ -1548,8 +1548,8 @@ test("a refused seat request is reported on the notice line and does not stop th
 
 const OBSERVER_REFUSAL = "This attachment observes the terminal; press Ctrl+] w to take control.";
 
-test("unavailable or expired writer capability disables the chord and renders its reason", async () => {
-  for (const capability of [undefined, { supported: false, reasonCode: "supervisor_writer_operation_unavailable", expiresAt: Date.now() }, { supported: true, reasonCode: null, expiresAt: Date.now() - 1 }]) {
+test("unavailable or unknown writer capability disables the chord and renders its reason", async () => {
+  for (const capability of [undefined, { supported: false, reasonCode: "supervisor_writer_operation_unavailable", expiresAt: Date.now() }, { supported: false, reasonCode: "capability_unknown", expiresAt: Date.now() - 1 }]) {
     const { coordinator, callbacks, calls, host, intents } = harness();
     try {
       await coordinator.start(intents.slice(0, 1));
@@ -1564,6 +1564,24 @@ test("unavailable or expired writer capability disables the chord and renders it
       host.emitInput(Uint8Array.of(0x77));
       await new Promise(resolve => setTimeout(resolve, 15));
       assert.equal(calls.takeWriter.length, 0);
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("expired writer evidence permits a fresh check without promoting the observer", async () => {
+  for (const capability of [
+    { supported: true, reasonCode: null, expiresAt: Date.now() - 1 },
+    { supported: false, reasonCode: "capability_snapshot_expired", expiresAt: Date.now() - 1 },
+  ]) {
+    const { coordinator, callbacks, calls, host, intents } = harness();
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerTransferCapability: capability });
+      host.emitInput(Uint8Array.of(0x1d, 0x77));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.deepEqual(calls.takeWriter, ["tab-a"], "expired UI evidence must reach the runtime's fresh admission check");
+      await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("recheck control"), "observer retains the capability refresh action");
+      assert.match(decoder.decode(host.writes.at(-1)), /Observing/u, "request completion alone must not promote the observer");
     } finally { await coordinator.stop(); }
   }
 });

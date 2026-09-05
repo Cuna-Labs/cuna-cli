@@ -1594,7 +1594,9 @@ export class ForegroundTerminalCoordinator {
               : this.#helpVisible
                 ? { notice: "Keys: Ctrl+C detach | Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry" +
                     (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
-                     writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined ? " | w take control" : "") + " | d detach" }
+                     writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
+                      ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"
+                      : "") + " | d detach" }
                 : this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) !== undefined
                   ? { notice: this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) as string }
                   : {}),
@@ -1796,7 +1798,7 @@ export class ForegroundTerminalCoordinator {
       void this.#render().catch(() => undefined);
       return;
     }
-    this.#seatNotice = "Taking control…";
+    this.#seatNotice = writerCapabilityNeedsRefresh(tab.snapshot) ? "Checking control…" : "Taking control…";
     void this.#render().catch(() => undefined);
     void runtime.takeWriter({ tabId, signal: this.#lifetimeAbort.signal }).then(
       () => { this.#seatNotice = undefined; },
@@ -1828,6 +1830,7 @@ export class ForegroundTerminalCoordinator {
     if (snapshot === undefined || snapshot.state !== "active" || snapshot.accessMode !== "observer") return historical;
     const refusal = writerCapabilityRefusal(snapshot);
     if (refusal !== undefined) return withHistory(refusal);
+    if (writerCapabilityNeedsRefresh(snapshot)) return withHistory("Observing (read-only) · Ctrl+] w to recheck control");
     return withHistory(snapshot.reason === "writer_transferred"
       ? "Control moved to another client · Ctrl+] w to take it back"
       : snapshot.geometry == null
@@ -1965,8 +1968,17 @@ async function abortableDelay(milliseconds: number, signal: AbortSignal): Promis
 }
 
 
+function writerCapabilityNeedsRefresh(snapshot: RuntimeTerminalSnapshot): boolean {
+  const capability = snapshot.writerTransferCapability;
+  return capability !== undefined && Number.isFinite(capability.expiresAt) && capability.expiresAt <= Date.now() &&
+    (capability.supported || capability.reasonCode === "capability_snapshot_expired");
+}
+
 function writerCapabilityRefusal(snapshot: RuntimeTerminalSnapshot): string | undefined {
   const capability = snapshot.writerTransferCapability;
+  // This enables only the refresh action. Runtime.takeWriter discovers and
+  // admits fresh, scoped evidence before it can dispatch a transfer request.
+  if (writerCapabilityNeedsRefresh(snapshot)) return undefined;
   if (capability?.supported === true && capability.expiresAt > Date.now()) return undefined;
   return `Control unavailable: ${capability?.reasonCode ?? (capability?.supported ? "capability_snapshot_expired" : "capability_unknown")}`;
 }

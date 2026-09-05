@@ -33,6 +33,7 @@ const entrypoint = path.join(root, "dist", "bin", "cuna.js");
 const providerFixture = path.join(root, "scripts", "harness", "provider-ctrl-c-fixture.mjs");
 const richFixture = path.join(root, "scripts", "harness", "cuna-rich-conpty-fixture.mjs");
 const machinesToForegroundFixture = path.join(root, "scripts", "harness", "machines-to-foreground-fixture.mjs");
+const writerRefreshFixture = path.join(root, "scripts", "harness", "writer-refresh-fixture.mjs");
 const sandbox = await mkdtemp(path.join(tmpdir(), "cuna-conpty-"));
 const configFile = path.join(sandbox, "config.json");
 const mutationLedger = [];
@@ -749,6 +750,35 @@ try {
       assert.match(transcript(), /NATIVE_RESTORE_QUIESCENT [0-9]+/u, "native reading was not stopped before every normal-mode restoration");
     },
   }));
+
+  for (const mode of ["supported", "unsupported"]) {
+    results.push(await runConptyCase({
+      testId: `T14.3-WIN-WRITER-REFRESH-${mode.toUpperCase()}`, args: [writerRefreshFixture, mode],
+      async drive(context) {
+        await context.waitUntil(() => context.screen().includes("EXPIRED_OBSERVER_READY") && context.screen().includes("recheck control"), "expired observer did not offer capability recheck");
+        context.child.write("\u001dw");
+        if (mode === "supported") {
+          await context.waitUntil(() => context.screen().includes("WRITER_READY"), "fresh capability and writer notice did not enable control");
+          context.child.write("safe-input");
+          await context.waitUntil(() => context.screen().includes('ACCEPTED "safe-input"'), "writer input did not reach the provider fixture");
+        } else {
+          await context.waitUntil(() => context.screen().includes("supervisor_writer_operation_unavailable"), "fresh unsupported capability did not render its typed refusal");
+          context.child.write("x");
+          await context.waitUntil(() => context.screen().includes("Fixture observer input is disabled."), "observer input did not render its refusal");
+        }
+        context.child.write("\u0003");
+        await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("writer refresh Ctrl-C did not detach")), 2_000))]);
+      },
+      async oracle({ finalState, transcript }) {
+        assert.equal(finalState.exitCode, 0);
+        assert.equal(finalState.activeScreen, "normal");
+        const receipt = /WRITER_REFRESH_RESULT (\{[^\r\n]+\})/u.exec(transcript());
+        assert.ok(receipt, "writer refresh fixture result missing");
+        assert.deepEqual(JSON.parse(receipt[1]), { mode, discoveries: 1, transfers: mode === "supported" ? 1 : 0,
+          acceptedBytes: mode === "supported" ? 10 : 0, accessMode: mode === "supported" ? "writer" : "observer" });
+      },
+    }));
+  }
 
   results.push(await runConptyCase({
     testId: "T14.3-WIN-NO-COLOR-CTRL-C", args: [entrypoint, "machines", "--config-file", configFile, "--no-color"], environment: { ...cliEnvironment, NO_COLOR: "1" },

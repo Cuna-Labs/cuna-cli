@@ -2086,6 +2086,74 @@ test("writer transfer refuses unavailable exact-session capability before dispat
   }
 });
 
+test("expired writer snapshot refreshes exact-session evidence before transfer and waits for the seat notice", async () => {
+  const system = new FakeTerminalSystem(); let now = NOW;
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  system.controlPlane.discoverCapabilities = async (_scope, id) => capabilitySnapshot(id, { expiresAt: new Date(NOW + 1_000).toISOString() });
+  const { runtime, states } = createRuntime(system, { clock: () => now });
+  const reads = [], transfers = [];
+  try {
+    const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    now += 1_001;
+    assert.ok(attached.writerTransferCapability.expiresAt < now);
+    system.controlPlane.discoverCapabilities = async (scope, id) => {
+      reads.push({ scope, id });
+      return capabilitySnapshot(id, { observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 59_000).toISOString(), etag: "fresh-writer-evidence" });
+    };
+    system.controlPlane.transferTerminalWriter = async request => {
+      transfers.push(request);
+      return { agentSessionId: request.agentSessionId, processEpoch: "epoch-agent-a", writerEpoch: 2,
+        writerClientInstanceId: request.clientInstanceId, transferPending: false,
+        operationId: request.operationId, operationState: "committed" };
+    };
+    const requested = await runtime.takeWriter({ tabId: "tab-a" });
+    assert.deepEqual(reads, [{ scope: "agent_session", id: "agent-a" }]);
+    assert.equal(transfers.length, 1);
+    assert.equal(transfers[0].capabilityEvidence.snapshotEtag, "fresh-writer-evidence");
+    assert.equal(transfers[0].capabilityEvidence.subjectId, "agent-a");
+    assert.ok(transfers[0].capabilityEvidence.expiresAt > now);
+    assert.equal(transfers[0].expectedWriterEpoch, 1);
+    assert.equal(requested.accessMode, "observer");
+    await assert.rejects(runtime.sendInput(Uint8Array.of(65), "tab-a"), error => error.code === "terminal_observer");
+    system.connections[0].incoming.push(encodeTerminalControl("writer_epoch", 3n, {
+      writerEpoch: 2, writerClientInstanceId: "client-1", accessMode: "writer",
+    }));
+    await waitUntil(() => states.at(-1)?.accessMode === "writer", "fresh transfer is seated by its server notice");
+    await runtime.sendInput(Uint8Array.of(66), "tab-a");
+    assert.equal(decodeTerminalFrame(system.connections[0].sent.at(-1)).type, "input");
+  } finally { await runtime.shutdown(); }
+});
+
+test("expired writer snapshot cannot authorize transfer when refreshed evidence is refused", async () => {
+  for (const variant of ["unknown", "unsupported", "expired", "sibling"]) {
+    const system = new FakeTerminalSystem(); let now = NOW;
+    system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+    system.controlPlane.discoverCapabilities = async (_scope, id) => capabilitySnapshot(id, { expiresAt: new Date(NOW + 1_000).toISOString() });
+    const { runtime } = createRuntime(system, { clock: () => now });
+    let transfers = 0; const reads = [];
+    try {
+      const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+      now += 1_001;
+      assert.ok(attached.writerTransferCapability.expiresAt < now);
+      system.controlPlane.discoverCapabilities = async (scope, id) => {
+        reads.push({ scope, id });
+        const evidence = capabilitySnapshot(variant === "sibling" ? "agent-b" : id, {
+          observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 59_000).toISOString(),
+        });
+        if (variant === "unknown" || variant === "unsupported") evidence.capabilities[1].availability = variant;
+        if (variant === "expired") evidence.expiresAt = new Date(now).toISOString();
+        return evidence;
+      };
+      system.controlPlane.transferTerminalWriter = async () => { transfers++; throw new Error("unexpected transfer"); };
+      const expected = { unknown: "capability_unknown", unsupported: "capability_unsupported", expired: "capability_snapshot_expired", sibling: "capability_scope_mismatch" }[variant];
+      await assert.rejects(runtime.takeWriter({ tabId: "tab-a" }), error => error.code === expected, variant);
+      assert.deepEqual(reads, [{ scope: "agent_session", id: "agent-a" }]);
+      assert.equal(transfers, 0, variant);
+      await assert.rejects(runtime.sendInput(Uint8Array.of(65), "tab-a"), error => error.code === "terminal_observer");
+    } finally { await runtime.shutdown(); }
+  }
+});
+
 test("heartbeat renews exact writer capability and keeps unavailable leases disabled", async () => {
   const system = new FakeTerminalSystem(); let now = NOW; let reads = 0;
   system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
