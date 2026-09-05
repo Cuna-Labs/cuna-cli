@@ -426,6 +426,8 @@ export function createHumanAuthService(input: {
    */
   readonly browserHandoff: BrowserHandoffReporter;
   readonly readLoginCode: (signal?: AbortSignal) => Promise<string>;
+  /** Local input passed validation; this does not attest remote sign-in or storage. */
+  readonly onLoginCodeAccepted?: () => void;
   readonly clock?: () => number;
   readonly random?: RandomSource;
   readonly uuid?: () => string;
@@ -661,6 +663,7 @@ export function createHumanAuthService(input: {
           hint: "Copy the complete cuna_login_ code shown by app.getcuna.com and paste it once.",
         });
       }
+      input.onLoginCodeAccepted?.();
       const exchange = await input.client.exchange({
         id: issued.id,
         clientInstanceId,

@@ -875,6 +875,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   let inlineJourneyProgress: Readonly<InlineProgress> | undefined;
   let inlineRootProgress: Readonly<InlineProgress> | undefined;
   let authProgress: Readonly<InlineProgress> | undefined;
+  let stopAuthProgressCancellation: (() => void) | undefined;
   let batchProgress: Readonly<InlineProgress> | undefined;
   let interactiveRootUi = false;
   let interactiveRootColor = false;
@@ -1155,6 +1156,25 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         // where to go" cannot be proven independently of each other.
         browserHandoff: createTerminalBrowserHandoffReporter(streams.stderr),
         readLoginCode: dependencies.readLoginCode ?? promptLoginCode,
+        onLoginCodeAccepted: () => {
+          // Keep the browser link and hidden reader still. Only validated input
+          // starts completion feedback; remote exchange and storage may still fail.
+          if (parsed.command === "login" && streams.stderrIsTTY === true &&
+              !writer.structured && dependencies.signal?.aborted !== true && authProgress === undefined) {
+            authProgress = startInlineProgress(
+              streams.stderr,
+              !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+              "Completing Cuna sign-in",
+            );
+            const signal = dependencies.signal;
+            if (signal !== undefined) {
+              const stopping = () => authProgress?.update("Stopping Cuna sign-in");
+              signal.addEventListener("abort", stopping, { once: true });
+              stopAuthProgressCancellation = () => signal.removeEventListener("abort", stopping);
+              if (signal.aborted) stopping();
+            }
+          }
+        },
         ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
       });
       return humanAuth;
@@ -1304,6 +1324,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         });
         authProgress?.stop();
         authProgress = undefined;
+        stopAuthProgressCancellation?.();
+        stopAuthProgressCancellation = undefined;
         writer.success(
           "login",
           data,
@@ -1832,6 +1854,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     inlineJourneyProgress?.stop();
     inlineRootProgress?.stop();
     authProgress?.stop();
+    stopAuthProgressCancellation?.();
     batchProgress?.stop();
     const error = unknownError instanceof CredentialBoundaryError
       ? credentialError(unknownError)
