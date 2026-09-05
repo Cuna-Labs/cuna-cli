@@ -188,7 +188,7 @@ function exchangeClock() {
 function fixture(overrides = {}) {
   const backend = overrides.backend ?? new MemoryBackend();
   const clock = overrides.clock ?? (() => NOW);
-  const vault = new CredentialVault({ backend, clock, platform: "linux" });
+  const vault = overrides.vault ?? new CredentialVault({ backend, clock, platform: "linux" });
   const client = overrides.client ?? fakeClient();
   const opened = [];
   const handoff = [];
@@ -209,6 +209,95 @@ function fixture(overrides = {}) {
   });
   return { backend, vault, client, opened, handoff, service };
 }
+
+for (const distinctService of [false, true]) {
+  test(`coalesced rejected refresh admits the real vault snapshot; distinct service=${distinctService}`, async () => {
+    const first = fixture();
+    await first.service.login();
+    const second = distinctService ? fixture({ vault: first.vault, backend: first.backend }) : first;
+    let release;
+    let entered;
+    const gate = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    let exchanges = 0;
+    first.client.exchange = async () => { exchanges++; entered(); await gate; return exchangeResult({ accessToken: AT_2 }); };
+    const one = first.service.refreshRejectedAccessToken(AT);
+    await started;
+    const two = second.service.refreshRejectedAccessToken(AT);
+    const results = Promise.all([one, two]);
+    release();
+    assert.deepEqual(await results, [AT_2, AT_2]);
+    assert.equal(exchanges, 1);
+    assert.equal(first.backend.values.size, 1);
+  });
+}
+
+test("rejected refresh cannot reuse a normal acquisition flight's retained rejected token", async () => {
+  const original = fixture();
+  await original.service.login();
+  const normal = fixture({ vault: original.vault, backend: original.backend });
+  const rejected = fixture({ vault: original.vault, backend: original.backend });
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const read = original.backend.read.bind(original.backend);
+  original.backend.read = async target => { entered(); await gate; return read(target); };
+  let exchanges = 0;
+  rejected.client.exchange = async () => { exchanges++; return exchangeResult({ accessToken: AT_2 }); };
+  const one = normal.service.acquireAccessToken();
+  await started;
+  const two = rejected.service.refreshRejectedAccessToken(AT);
+  const results = Promise.all([one, two]);
+  release();
+  assert.deepEqual(await results, [AT, AT_2]);
+  assert.equal(exchanges, 1, "one bounded rejection-aware exchange follows retained authority");
+});
+
+test("cancelling a rejected refresh waiter cannot cancel a coalesced peer", async () => {
+  const subject = fixture();
+  await subject.service.login();
+  const peer = fixture({ vault: subject.vault, backend: subject.backend });
+  const controller = new AbortController();
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  subject.client.exchange = async input => {
+    entered(); await gate;
+    assert.notEqual(input.signal?.aborted, true);
+    return exchangeResult({ accessToken: AT_2 });
+  };
+  const one = subject.service.refreshRejectedAccessToken(AT, controller.signal);
+  const cancelled = assert.rejects(one, error => error.code === "cuna.auth.cancelled");
+  await started;
+  const two = peer.service.refreshRejectedAccessToken(AT);
+  controller.abort();
+  await cancelled;
+  release();
+  assert.equal(await two, AT_2);
+});
+
+test("repeated unsatisfied joined snapshots stop after one retry with non-mutating recovery guidance", async () => {
+  const subject = fixture();
+  await subject.service.login();
+  const refresh = subject.vault.refresh.bind(subject.vault);
+  let attempts = 0;
+  // Model two consecutive foreign refresh owners retaining the refused bearer,
+  // while keeping real vault snapshot construction, disposal and revision logic.
+  subject.vault.refresh = async binding => {
+    attempts++;
+    return refresh(binding, async () => ({ status: "retained" }));
+  };
+  await assert.rejects(subject.service.refreshRejectedAccessToken(AT), error => {
+    assert.equal(error.code, "cuna.auth.reexchange_unknown");
+    assert.equal(error.hint, "Open `cuna` and choose the existing Machine and session to reconnect.");
+    assert.ok(!JSON.stringify(error).includes(AT));
+    return true;
+  });
+  assert.equal(attempts, 2);
+  assert.equal(subject.backend.values.size, 1);
+});
 
 // POLICY CHANGED, deliberately. This test used to assert that the bearer never
 // reached disk. It does now, inside the SAME AES-GCM envelope that already

@@ -750,7 +750,7 @@ export function createHumanAuthService(input: {
     }
   }
 
-  async function reexchangeAccess(signal?: AbortSignal, rejectedToken?: string): Promise<void> {
+  async function reexchangeAccess(signal?: AbortSignal, rejectedToken?: string, joinedRetry = false): Promise<void> {
     assertNotCancelled(signal);
     // `vault.refresh` already reads, validates, and locks the exact encrypted
     // record before invoking this callback. An initial `vault.load` duplicated
@@ -858,6 +858,21 @@ export function createHumanAuthService(input: {
       });
       try {
         capturedRevision = snapshot.revision;
+        // Another service sharing this vault can own the refresh callback.
+        // Admit its returned authority through the same stored-token checks;
+        // a joined flight must never hand back the bearer this caller rejected.
+        if (captured === undefined) {
+          const stored = snapshot.material.withBytes((bytes) => decodeStored(bytes, input.config));
+          const reusable = usableStoredAccess(stored, now(), rejectedToken);
+          if (Date.parse(stored.loginCodeExpiresAt) > now() && reusable !== undefined) {
+            captured = {
+              material: SecretMaterial.fromUtf8(reusable.token),
+              expiresAt: Date.parse(reusable.expiresAt),
+              profile: stored.profile,
+              sessionId: stored.sessionId,
+            };
+          }
+        }
       } finally {
         snapshot.material.dispose();
       }
@@ -880,9 +895,17 @@ export function createHumanAuthService(input: {
       }
       throw error;
     }
+    if (captured === undefined && !joinedRetry) {
+      // The joined flight may have retained the rejected token. Its vault
+      // snapshot is now released; permit one fresh, rejection-aware attempt.
+      return await reexchangeAccess(signal, rejectedToken, true);
+    }
     if (captured === undefined || capturedRevision === undefined || !Number.isSafeInteger(capturedRevision) || capturedRevision < 1) {
       captured?.material.dispose();
-      throw authError("cuna.auth.reexchange_unknown", "Cuna could not establish a new in-memory access token.", { retryable: true });
+      throw authError("cuna.auth.reexchange_unknown", "Cuna could not establish a new in-memory access token.", {
+        retryable: true,
+        hint: "Open `cuna` and choose the existing Machine and session to reconnect.",
+      });
     }
     access?.material.dispose();
     access = { ...captured, revision: capturedRevision };
@@ -929,7 +952,9 @@ export function createHumanAuthService(input: {
     // token is dead, so joining it can return that same string and spin the
     // 401 forever. Always start a fresh one that carries the rejection.
     assertNotCancelled(signal);
-    const created = reexchangeAccess(signal, rejectedAccessToken);
+    // Cancellation belongs to this waiter, not to other callers sharing the
+    // vault refresh. waitForReexchange still releases a cancelled caller.
+    const created = reexchangeAccess(undefined, rejectedAccessToken);
     reexchangeFlight = created;
     void created.then(
       () => { if (reexchangeFlight === created) reexchangeFlight = undefined; },
