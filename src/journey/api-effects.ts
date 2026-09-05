@@ -287,6 +287,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         }
         let seat: AgentSessionTerminalSeat;
         try {
+          await requireCapability({ client: input.client, scope: "agent_session", resourceId: session.id, capabilityId: "terminal_seats.read", allowedInteractions: ["read_only"], now, signal });
           seat = await input.client.getAgentSessionTerminalSeat(session.id, signal);
         } catch (error) {
           if (isSeatUnserved(error)) return sessionObservation(session, { attachment: "unknown" });

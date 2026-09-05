@@ -26,7 +26,8 @@ import {
   type TerminalLocalActionProtocolAcceptance,
 } from "../terminal/codec.js";
 
-import { admitCapability } from "./capability-gate.js";
+import { admitCapability, writerTransferCapability, type WriterTransferCapability } from "./capability-gate.js";
+import type { CapabilitySnapshot } from "../api/contracts.js";
 import { RuntimeBoundaryError, runtimeFailure } from "./errors.js";
 import {
   assertReadyPayloadMatches,
@@ -76,6 +77,7 @@ export interface ForegroundRuntimeLifecycleSnapshot {
 }
 
 export interface RuntimeTerminalSnapshot {
+  readonly writerTransferCapability?: WriterTransferCapability;
   readonly tabId: string;
   readonly viewId: string;
   readonly userId: string;
@@ -155,6 +157,10 @@ export interface RuntimeBoundaryOptions {
 }
 
 interface TerminalEntry {
+  capabilitySnapshot: CapabilitySnapshot;
+  capabilityReadRevision: number;
+  capabilityRefresh?: Promise<void>;
+  nextCapabilityRefreshAt?: number;
   readonly tabId: string;
   viewId: string;
   observation: RemoteAgentSessionEvidence;
@@ -205,6 +211,7 @@ export class CunaRuntimeBoundary {
   readonly #views = new LocalClientViewRegistry();
   readonly #syncRegistry = new SyncSupervisorRegistry();
   readonly #terminals = new Map<string, TerminalEntry>();
+  readonly #pendingConnectionRequests = new Map<string, Parameters<TerminalControlPlane["createTerminalConnection"]>[0]>();
   readonly #pendingTerminalTabs = new Set<string>();
   readonly #pendingAgentSessions = new Set<string>();
   readonly #pendingAttaches = new Map<string, {
@@ -353,6 +360,7 @@ export class CunaRuntimeBoundary {
     let completionFailure: unknown | undefined;
     try {
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
+      await this.#cancelConnectionRequests(input.agentSessionId);
       const admitted = await this.#admitRemoteTerminal(input.agentSessionId, attachAbort.signal);
       if (input.expectedAdmission !== undefined) {
         this.#assertAttachmentAdmissionContinuity(input.expectedAdmission, admitted, "preflight");
@@ -381,6 +389,8 @@ export class CunaRuntimeBoundary {
         throw runtimeFailure("grant_scope_mismatch", "The terminal transport accepted a different Cuna terminal session.");
       }
       entry = {
+        capabilitySnapshot: revalidated.capabilitySnapshot,
+        capabilityReadRevision: 0,
         tabId: input.tabId,
         viewId: `pending:${grant.terminalSessionId}`,
         observation: revalidated.observation,
@@ -477,14 +487,15 @@ export class CunaRuntimeBoundary {
         ...(entry.localActionAcceptance === undefined ? {} : { localActionProtocol: entry.localActionAcceptance }),
       }));
       entry.localActionsNegotiated = entry.localActionAcceptance !== undefined;
-      await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs()));
+      await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock()));
       this.#assertOpen();
       for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
       this.#assertOpen();
       this.#scheduleHeartbeatWatchdog(entry, connection, entry.connectionRevision);
       this.#publish(entry);
       entry.pump = this.#pump(entry, connection, entry.connectionRevision, iterator);
-      return snapshot(entry, this.#heartbeatTimeoutMs());
+      this.#forgetConnectionRequests(input.agentSessionId);
+      return snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock());
     } catch (error) {
       let reportedError: unknown = error;
       if (entry !== undefined && !this.#closed && entry.state !== "closed" && entry.state !== "detached") {
@@ -501,6 +512,10 @@ export class CunaRuntimeBoundary {
           completionFailure = cleanupError;
           reportedError = new AggregateError([error, cleanupError], "Terminal attachment failed and its transport cleanup was incomplete.");
         }
+      }
+      try { await this.#cancelConnectionRequests(input.agentSessionId); } catch (cleanupError) {
+        completionFailure = cleanupError;
+        reportedError = new AggregateError([reportedError, cleanupError], "Terminal attachment failed and issuance cancellation is unconfirmed.");
       }
       throw reportedError;
     } finally {
@@ -520,14 +535,14 @@ export class CunaRuntimeBoundary {
       throw runtimeFailure("terminal_disconnected", "The selected terminal tab is not attachable.");
     }
     this.#activeTabId = tabId;
-    return snapshot(entry, this.#heartbeatTimeoutMs());
+    return snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock());
   }
 
   refreshTerminalLiveness(tabId = this.#activeTabId): RuntimeTerminalSnapshot {
     this.#assertReady();
     const entry = this.#requireTerminal(tabId ?? "");
     this.#assertHeartbeatFresh(entry);
-    return snapshot(entry, this.#heartbeatTimeoutMs());
+    return snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock());
   }
 
   async sendInput(
@@ -543,7 +558,7 @@ export class CunaRuntimeBoundary {
       // leave the attachment observing.
       throw runtimeFailure(
         "terminal_observer",
-        "This attachment observes the terminal; press Ctrl+] w to take control.",
+        "This attachment observes the terminal; input is disabled.",
       );
     }
     if (expectedBinding !== undefined && !sameEntryBinding(entry, expectedBinding)) {
@@ -712,13 +727,28 @@ export class CunaRuntimeBoundary {
   async takeWriter(input: { readonly tabId: string; readonly signal?: AbortSignal }): Promise<RuntimeTerminalSnapshot> {
     this.#assertReady();
     const entry = this.#requireActiveTerminal(input.tabId);
-    if (entry.accessMode === "writer") return snapshot(entry, this.#heartbeatTimeoutMs());
+    if (entry.accessMode === "writer") return snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock());
     const operation = entry.writerTransfer ?? { operationId: randomUUID(), expectedWriterEpoch: entry.writerEpoch };
     entry.writerTransfer = operation;
     if (operation.inFlight !== undefined) return operation.inFlight;
     operation.inFlight = Promise.resolve().then(async () => {
       try {
+        const revision = entry.connectionRevision;
+        const capabilityReadRevision = ++entry.capabilityReadRevision;
+        const evidence = await this.#options.controlPlane.discoverCapabilities("agent_session", entry.observation.agentSessionId, input.signal);
+        this.#assertReady();
+        if (entry.state !== "active" || entry.connectionRevision !== revision) throw runtimeFailure("terminal_disconnected", "The terminal changed while writer capability was checked.");
+        if (entry.writerTransfer !== operation) {
+          if (entry.accessMode === "writer") return snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock());
+          throw runtimeFailure("session_conflict", "A writer notice superseded this control request. Read the current terminal state.");
+        }
+        if (entry.capabilityReadRevision !== capabilityReadRevision) throw runtimeFailure("capability_unknown", "A newer capability observation superseded this read.");
+        entry.capabilitySnapshot = evidence;
+        this.#publish(entry);
+        const capabilityEvidence = admitCapability(evidence, { id: "terminal_writers.transfer", scope: "agent_session", subjectId: entry.observation.agentSessionId, interaction: "native" }, this.#clock());
+        if (input.signal !== undefined) throwIfAborted(input.signal, "Writer transfer was cancelled before dispatch.");
         const state = await this.#options.controlPlane.transferTerminalWriter({
+          capabilityEvidence,
           agentSessionId: entry.observation.agentSessionId,
           clientInstanceId: this.#options.clientInstanceId,
           expectedWriterEpoch: operation.expectedWriterEpoch,
@@ -739,7 +769,7 @@ export class CunaRuntimeBoundary {
           if (state.transferPending) entry.reason = "writer_transfer_pending";
           this.#publish(entry);
         }
-        return snapshot(entry, this.#heartbeatTimeoutMs());
+        return snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock());
       } catch (error) {
         const reason = typeof error === "object" && error !== null
           ? (error as { readonly details?: { readonly reason?: unknown } }).details?.reason : undefined;
@@ -787,11 +817,12 @@ export class CunaRuntimeBoundary {
       settle: settleReconnect,
       removeInputAbort,
     });
-    entry.reconnectIdempotencyKey ??= this.#idempotencyKey();
     let connection: TerminalWireConnection | undefined;
     let completionFailure: unknown | undefined;
     try {
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
+      await this.#cancelConnectionRequests(entry.observation.agentSessionId);
+      entry.reconnectIdempotencyKey ??= this.#idempotencyKey();
       const admitted = await this.#admitRemoteTerminal(entry.observation.agentSessionId, reconnectAbort.signal);
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
       if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
@@ -866,6 +897,7 @@ export class CunaRuntimeBoundary {
       const nextDecoder = new TerminalFrameDecoder();
       const candidate: TerminalEntry = {
         ...entry,
+        capabilitySnapshot: revalidated.capabilitySnapshot,
         observation: revalidated.observation,
         connection,
         decoder: nextDecoder,
@@ -939,6 +971,7 @@ export class CunaRuntimeBoundary {
       entry.connection = connection;
       this.#clearHeartbeatWatchdog(entry);
       entry.observation = revalidated.observation;
+      entry.capabilitySnapshot = revalidated.capabilitySnapshot;
       entry.decoder = nextDecoder;
       entry.fencingGeneration = ready.payload.fencingGeneration;
       entry.capabilities = grant.capabilities;
@@ -968,12 +1001,13 @@ export class CunaRuntimeBoundary {
       entry.lastHeartbeatAt = candidate.lastHeartbeatAt;
       entry.state = "active";
       entry.outputContinuity = "unknown";
-      await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs()));
+      await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock()));
       for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
       this.#scheduleHeartbeatWatchdog(entry, connection, reconnectRevision);
       this.#publish(entry);
       entry.pump = this.#pump(entry, connection, reconnectRevision, iterator);
-      return snapshot(entry, this.#heartbeatTimeoutMs());
+      this.#forgetConnectionRequests(entry.observation.agentSessionId);
+      return snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock());
     } catch (error) {
       let reportedError: unknown = error;
       if (connection !== undefined) {
@@ -981,6 +1015,10 @@ export class CunaRuntimeBoundary {
           completionFailure = cleanupError;
           reportedError = new AggregateError([error, cleanupError], "Terminal reconnection failed and its replacement transport cleanup was incomplete.");
         }
+      }
+      try { await this.#cancelConnectionRequests(entry.observation.agentSessionId); } catch (cleanupError) {
+        completionFailure = cleanupError;
+        reportedError = new AggregateError([reportedError, cleanupError], "Terminal reconnect failed and issuance cancellation is unconfirmed.");
       }
       if (
         entry.connectionRevision === reconnectRevision &&
@@ -1029,7 +1067,7 @@ export class CunaRuntimeBoundary {
   }
 
   listTerminals(): readonly RuntimeTerminalSnapshot[] {
-    return Object.freeze([...this.#terminals.values()].map((entry) => snapshot(entry, this.#heartbeatTimeoutMs())));
+    return Object.freeze([...this.#terminals.values()].map((entry) => snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock())));
   }
 
   async openSync(input: {
@@ -1196,6 +1234,9 @@ export class CunaRuntimeBoundary {
     for (const handle of this.#syncHandles.values()) {
       try { await handle.close(); } catch (error) { failures.push(error); }
     }
+    for (const subject of new Set([...this.#pendingConnectionRequests.values()].map(request => request.agentSessionId))) {
+      try { await this.#cancelConnectionRequests(subject); } catch (error) { failures.push(error); }
+    }
     if (this.#mode === "foreground") {
       this.#foreground = Object.freeze({
         state: failures.length === 0 ? "stopped" : "cleanup_failed",
@@ -1216,6 +1257,7 @@ export class CunaRuntimeBoundary {
   }
 
   async #admitRemoteTerminal(agentSessionId: string, signal?: AbortSignal): Promise<{
+    readonly capabilitySnapshot: CapabilitySnapshot;
     readonly capability: ReturnType<typeof admitCapability>;
     readonly observation: RemoteAgentSessionEvidence;
   }> {
@@ -1232,7 +1274,7 @@ export class CunaRuntimeBoundary {
       expectedAgentSessionId: agentSessionId,
       now: this.#clock(),
     });
-    return Object.freeze({ capability, observation });
+    return Object.freeze({ capability, observation, capabilitySnapshot: snapshot });
   }
 
   #assertAttachmentAdmissionContinuity(
@@ -1295,8 +1337,8 @@ export class CunaRuntimeBoundary {
     signal?: AbortSignal,
     seat: { readonly accessMode: "writer" | "observer"; readonly expectedWriterEpoch?: number } = { accessMode: "writer" },
   ): Promise<TerminalConnectionGrant> {
-    const request = (accessMode: "writer" | "observer", key: string): Promise<TerminalConnectionGrant> =>
-      this.#options.controlPlane.createTerminalConnection({
+    const request = (accessMode: "writer" | "observer", key: string): Promise<TerminalConnectionGrant> => {
+      const ownedRequest = {
         agentSessionId: observation.agentSessionId,
         protocol: TERMINAL_PROTOCOL,
         clientInstanceId: this.#options.clientInstanceId,
@@ -1308,7 +1350,10 @@ export class CunaRuntimeBoundary {
           ? { expectedWriterEpoch: seat.expectedWriterEpoch }
           : {}),
         ...(signal === undefined ? {} : { signal }),
-      });
+      };
+      this.#pendingConnectionRequests.set(key, ownedRequest);
+      return this.#options.controlPlane.createTerminalConnection(ownedRequest);
+    };
     let grant: TerminalConnectionGrant;
     try {
       grant = await request(seat.accessMode, idempotencyKey);
@@ -1318,6 +1363,7 @@ export class CunaRuntimeBoundary {
       // failing: the terminal is still visible, and Ctrl+] w asks for the
       // seat later through the transfer the server arbitrates.
       if (seat.accessMode !== "writer" || !writerSeatUnavailable(error)) throw error;
+      this.#pendingConnectionRequests.delete(idempotencyKey);
       grant = await request("observer", this.#idempotencyKey());
     }
     return validateTerminalGrant({
@@ -1326,6 +1372,33 @@ export class CunaRuntimeBoundary {
       requiredCapabilities: ["acknowledgement", "heartbeat", "resume", "live_resize"],
       now: this.#clock(),
     });
+  }
+
+  #forgetConnectionRequests(agentSessionId: string): void {
+    for (const [key, request] of this.#pendingConnectionRequests) {
+      if (request.agentSessionId === agentSessionId) this.#pendingConnectionRequests.delete(key);
+    }
+  }
+
+  async #cancelConnectionRequests(agentSessionId: string): Promise<void> {
+    for (const [key, request] of this.#pendingConnectionRequests) {
+      if (request.agentSessionId !== agentSessionId) continue;
+      const signal = AbortSignal.timeout(this.#options.readyTimeoutMs ?? 10_000);
+      try {
+        await withOutputDeadline(this.#options.controlPlane.cancelTerminalConnection({ ...request, signal }), this.#options.readyTimeoutMs ?? 10_000, () => runtimeFailure(
+          "runtime_cleanup_timeout", "Terminal issuance cancellation is unconfirmed. Retry cleanup with the original request.", { retryable: true },
+        ));
+      } catch (error) {
+        const reason = (error as { readonly details?: { readonly reason?: string } })?.details?.reason;
+        // This endpoint fences unredeemed issuance only. A redeemed connection
+        // is closed through the owned socket; cancellation cannot detach it.
+        if (reason !== "terminal_connection_already_redeemed") throw error;
+      }
+      this.#pendingConnectionRequests.delete(key);
+      for (const entry of this.#terminals.values()) {
+        if (entry.observation.agentSessionId === agentSessionId && entry.reconnectIdempotencyKey === key) delete entry.reconnectIdempotencyKey;
+      }
+    }
   }
 
   async #awaitReady(
@@ -1547,6 +1620,7 @@ export class CunaRuntimeBoundary {
       entry.heartbeatSequence = frame.sequence;
       entry.lastHeartbeatAt = this.#clock();
       this.#scheduleHeartbeatWatchdog(entry, entry.connection, entry.connectionRevision);
+      this.#publish(entry);
     }
   }
 
@@ -1559,7 +1633,20 @@ export class CunaRuntimeBoundary {
   }
 
   #publish(entry: TerminalEntry): void {
-    this.#options.onTerminalState?.(snapshot(entry, this.#heartbeatTimeoutMs()));
+    const now = this.#clock();
+    if (!this.#closed && entry.state === "active" && entry.capabilityRefresh === undefined &&
+        now >= (entry.nextCapabilityRefreshAt ?? 0) && now >= Date.parse(entry.capabilitySnapshot.expiresAt) - 5_000) {
+      const revision = entry.connectionRevision;
+      const capabilityReadRevision = ++entry.capabilityReadRevision;
+      entry.nextCapabilityRefreshAt = now + 5_000;
+      entry.capabilityRefresh = this.#options.controlPlane.discoverCapabilities("agent_session", entry.observation.agentSessionId, AbortSignal.timeout(5_000)).then(evidence => {
+        if (!this.#closed && entry.state === "active" && entry.connectionRevision === revision && entry.capabilityReadRevision === capabilityReadRevision) {
+          entry.capabilitySnapshot = evidence;
+          this.#publish(entry);
+        }
+      }).catch(() => { /* Existing lease expires closed; later heartbeat may refresh it. */ }).finally(() => { delete entry.capabilityRefresh; });
+    }
+    this.#options.onTerminalState?.(snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock()));
   }
 
   #localActionAcceptance(
@@ -1591,7 +1678,7 @@ export class CunaRuntimeBoundary {
     if (entry.accessMode !== "writer") {
       throw runtimeFailure(
         "terminal_observer",
-        "This attachment observes the terminal; press Ctrl+] w to take control.",
+        "This attachment observes the terminal; input is disabled.",
       );
     }
   }
@@ -1747,7 +1834,7 @@ function writerSeatUnavailable(error: unknown): boolean {
   return reason === "terminal_writer_held" || reason === "terminal_writer_stale";
 }
 
-function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000): RuntimeTerminalSnapshot {
+function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000, now = Date.now()): RuntimeTerminalSnapshot {
   return Object.freeze({
     tabId: entry.tabId,
     viewId: entry.viewId,
@@ -1768,6 +1855,7 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000): RuntimeTer
     accessMode: entry.accessMode,
     writerEpoch: entry.writerEpoch,
     writerClientInstanceId: entry.writerClientInstanceId,
+    writerTransferCapability: writerTransferCapability(entry.capabilitySnapshot, entry.observation.agentSessionId, now),
     heartbeatObservedAt: entry.lastHeartbeatAt,
     heartbeatExpiresAt: entry.lastHeartbeatAt + heartbeatTimeoutMs,
     ...(entry.reason === undefined ? {} : { reason: entry.reason }),

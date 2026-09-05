@@ -90,6 +90,7 @@ function snapshot(intent, generation = 1) {
     resizeCapability: "live",
     accessMode: "writer",
     writerEpoch: 1,
+    writerTransferCapability: { supported: true, reasonCode: null, expiresAt: Date.now() + 60_000 },
     heartbeatObservedAt: 100,
     heartbeatExpiresAt: 200,
   };
@@ -1465,6 +1466,26 @@ test("a refused seat request is reported on the notice line and does not stop th
 });
 
 const OBSERVER_REFUSAL = "This attachment observes the terminal; press Ctrl+] w to take control.";
+
+test("unavailable or expired writer capability disables the chord and renders its reason", async () => {
+  for (const capability of [undefined, { supported: false, reasonCode: "supervisor_writer_operation_unavailable", expiresAt: Date.now() }, { supported: true, reasonCode: null, expiresAt: Date.now() - 1 }]) {
+    const { coordinator, callbacks, calls, host, intents } = harness();
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerTransferCapability: capability });
+      const reason = capability?.reasonCode ?? (capability?.supported ? "capability_snapshot_expired" : "capability_unknown");
+      await waitUntil(() => decoder.decode(host.writes.at(-1)).includes(reason), "capability refusal rendered");
+      assert.equal(decoder.decode(host.writes.at(-1)).includes("Ctrl+] w"), false);
+      host.columns = 200;
+      host.emitInput(Uint8Array.of(0x1d));
+      await new Promise(resolve => setTimeout(resolve, 15));
+      assert.equal(decoder.decode(host.writes.at(-1)).includes("w take control"), false, "prefix help cannot advertise unsupported transfer");
+      host.emitInput(Uint8Array.of(0x77));
+      await new Promise(resolve => setTimeout(resolve, 15));
+      assert.equal(calls.takeWriter.length, 0);
+    } finally { await coordinator.stop(); }
+  }
+});
 
 test("a refused keystroke's notice yields to every later seat change", async () => {
   let observing = false;

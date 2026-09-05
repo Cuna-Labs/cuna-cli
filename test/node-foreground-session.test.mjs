@@ -305,7 +305,17 @@ function terminalSystem(events, availability = () => "supported") {
   let connectFailuresRemaining = 0;
   const grants = new Map();
   const activeQueues = new Set();
+  const issuedRequests = new Map();
+  const cancelledRequests = [];
   const controlPlane = {
+    async cancelTerminalConnection(input) {
+      const { signal, ...request } = input;
+      assert.ok(issuedRequests.has(input.idempotencyKey), "cleanup names an issued request");
+      assert.deepEqual(request, issuedRequests.get(input.idempotencyKey), "cleanup preserves original subject/body/key");
+      assert.equal(signal.aborted, false, "cleanup has independent bounded cancellation");
+      cancelledRequests.push(request);
+      return { cancelled: true };
+    },
     async discoverCapabilities(_scope, id) {
       events.push(`capability:${id}`);
       return capability(id, availability(id));
@@ -315,6 +325,8 @@ function terminalSystem(events, availability = () => "supported") {
       return observation(id);
     },
     async createTerminalConnection(input) {
+      const { signal: _signal, ...request } = input;
+      issuedRequests.set(input.idempotencyKey, request);
       events.push(`grant:${input.agentSessionId}`);
       generation += 1;
       const terminalSessionId = `00000000-0000-4000-8000-${String(generation).padStart(12, "0")}`;
@@ -372,6 +384,7 @@ function terminalSystem(events, availability = () => "supported") {
   };
   return {
     controlPlane,
+    cancelledRequests,
     terminalConnector,
     failNextConnections(count) { connectFailuresRemaining = count; },
     interruptActiveConnections() {

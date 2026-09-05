@@ -859,6 +859,11 @@ function decodeTerminalCapability(value: unknown): TerminalConnectionCapability 
   return Object.freeze({ name, availability });
 }
 
+export function decodeTerminalConnectionCancellation(value: unknown): { readonly cancelled: true } {
+  if (!isObject(value) || value.cancelled !== true || Object.keys(value).some(key => key !== "cancelled")) throw contractViolation("terminal_connection_cancellation");
+  return Object.freeze({ cancelled: true });
+}
+
 export function decodeTerminalConnectionGrant(value: unknown): TerminalConnectionGrant {
   if (!isObject(value)) throw contractViolation("object");
   const allowed = new Set([

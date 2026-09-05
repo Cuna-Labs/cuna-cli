@@ -273,10 +273,11 @@ function seat(overrides = {}) {
   };
 }
 
-function seatEffects(seatResult, clientInstanceId = OWN_CLIENT, session = recoveredSession({ processState: "running" })) {
+function seatEffects(seatResult, clientInstanceId = OWN_CLIENT, session = recoveredSession({ processState: "running" }), capabilityOverride = {}) {
   const seatReads = [];
   const value = createApiAgentJourneyEffects({
     client: {
+      async discoverCapabilities(scope, id) { const value = capability(); return { ...value, subjectScope: scope, subjectId: id, capabilities: [{ ...value.capabilities[0], id: "terminal_seats.read", interaction: "read_only" }], ...capabilityOverride }; },
       async listAgentSessions() { return { items: [session] }; },
       async getAgentSessionTerminalSeat(id) {
         seatReads.push(id);
@@ -320,6 +321,14 @@ test("session observation maps the durable writer seat onto attachment", async (
     assert.equal(observed.attachment, expected.attachment, label);
     assert.equal(observed.attachmentHolder, expected.attachmentHolder, label);
     assert.equal(Object.hasOwn(observed, "attachmentHolder"), expected.attachmentHolder !== undefined, label);
+  }
+});
+
+test("seat discovery refuses missing, stale, or sibling capability without reading the seat", async () => {
+  for (const override of [{ capabilities: [] }, { subjectId: MACHINE_ID }, { expiresAt: new Date(NOW).toISOString() }]) {
+    const { effects: fx, seatReads } = seatEffects(seat(), OWN_CLIENT, recoveredSession({ processState: "running" }), override);
+    await assert.rejects(fx.observeAgentSessions({ machineId: MACHINE_ID, signal: new AbortController().signal }), error => error.code.startsWith("cuna.capability."));
+    assert.deepEqual(seatReads, []);
   }
 });
 

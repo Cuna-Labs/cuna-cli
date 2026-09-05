@@ -4894,13 +4894,13 @@
               "writer",
               "observer"
             ],
-            "description": "Optional N-1 writer request. Observer issuance currently returns terminal_observer_output_unavailable because output fanout is not implemented."
+            "description": "Requested attachment role. Observer attachments receive terminal output but cannot send input, resize, or signals. Writer authority is fenced by the server-owned current writer epoch. Attachment availability is scoped to the exact AgentSession and its live supervisor."
           },
           "expected_writer_epoch": {
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991,
-            "description": "Optional current-writer fence for same-client reissue. Cross-client writer transfer is intentionally unavailable until the supervisor acknowledges an execution-time fence."
+            "description": "Optional expected current writer epoch used to reject stale attachment requests. Moving writer authority to another client uses agentSessions.transferTerminalWriter and requires durable supervisor settlement; issuing a connection grant does not authorize a cross-client transfer."
           }
         }
       },

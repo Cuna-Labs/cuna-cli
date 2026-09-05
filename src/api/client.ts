@@ -30,6 +30,7 @@ import {
   decodeOk,
   decodeCunaIdentity,
   decodeTerminalConnectionGrant,
+  decodeTerminalConnectionCancellation,
   decodeTerminalWriterState,
   decodeWorkspaceBindingAuthority,
   type TerminalWriterState,
@@ -188,6 +189,7 @@ export interface CunaApiClient {
     input: TerminalWriterTransferInput,
     signal?: AbortSignal,
   ): Promise<TerminalWriterState>;
+  cancelTerminalConnection(agentSessionId: string, input: TerminalConnectionCreateInput, idempotencyKey: string, signal?: AbortSignal): Promise<{ readonly cancelled: true }>;
 }
 
 /**
@@ -877,6 +879,22 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         },
         decodeTerminalConnectionGrant,
       );
+    },
+    async cancelTerminalConnection(agentSessionId, input, idempotencyKey, signal) {
+      const safeId = encodeCanonicalUuid(agentSessionId, "AgentSession ID");
+      assertIdempotencyKey(idempotencyKey);
+      if (input.protocol !== TERMINAL_PROTOCOL || !/^[A-Za-z0-9._:-]{1,256}$/u.test(input.clientInstanceId) ||
+          (input.accessMode !== undefined && !["writer", "observer"].includes(input.accessMode)) ||
+          (input.expectedWriterEpoch !== undefined && (!Number.isSafeInteger(input.expectedWriterEpoch) || input.expectedWriterEpoch < 0))) {
+        throw contractViolation("terminal_connection_cancellation_request");
+      }
+      if (input.resumeHandle !== undefined) assertCanonicalUuid(input.resumeHandle, "Terminal resume handle");
+      return fetchDecoded({ method: "POST", path: `/v1/agent-sessions/${safeId}/terminal-connections/cancel`,
+        body: { protocol: input.protocol, client_instance_id: input.clientInstanceId,
+          ...(input.resumeHandle === undefined ? {} : { resume_handle: input.resumeHandle }),
+          ...(input.accessMode === undefined ? {} : { access_mode: input.accessMode }),
+          ...(input.expectedWriterEpoch === undefined ? {} : { expected_writer_epoch: input.expectedWriterEpoch }) },
+        idempotencyKey, ...(signal === undefined ? {} : { signal }) }, decodeTerminalConnectionCancellation);
     },
     async transferTerminalWriter(agentSessionId, input, signal) {
       const safeId = encodeCanonicalUuid(agentSessionId, "AgentSession ID");

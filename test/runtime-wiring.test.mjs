@@ -46,14 +46,14 @@ function capabilitySnapshot(agentSessionId, overrides = {}) {
     observedAt: new Date(NOW - 1_000).toISOString(),
     expiresAt: new Date(NOW + 59_000).toISOString(),
     etag: `etag-${agentSessionId}`,
-    capabilities: [{
-      id: CAPABILITY_ID,
+    capabilities: [CAPABILITY_ID, "terminal_writers.transfer"].map(id => ({
+      id,
       availability: "supported",
       interaction: "native",
       mutationClass: "reversible",
       surfaces: ["cli"],
       requiredPermissions: ["terminal.connect"],
-    }],
+    })),
     ...overrides,
   };
 }
@@ -183,6 +183,7 @@ class FakeTerminalSystem {
     };
     this.controlPlane = {
       discoverCapabilities: async (_scope, resourceId) => capabilitySnapshot(resourceId),
+      cancelTerminalConnection: async () => ({ cancelled: true }),
       observeAgentSession: async (agentSessionId) => observation(agentSessionId, this.epochs.get(agentSessionId)),
       createTerminalConnection: async (input) => {
         this.createCalls.push(input);
@@ -1755,7 +1756,9 @@ test("a writer demoted by a transfer keeps observing; taking the seat back is co
   );
 
   const asked = await runtime.takeWriter({ tabId: "tab-a" });
-  assert.deepEqual(transfers, [{ agentSessionId: "agent-a", clientInstanceId: "client-1", expectedWriterEpoch: 2, operationId: transfers[0].operationId }]);
+  assert.deepEqual(transfers.map(({ capabilityEvidence: _capabilityEvidence, ...request }) => request), [{ agentSessionId: "agent-a", clientInstanceId: "client-1", expectedWriterEpoch: 2, operationId: transfers[0].operationId }]);
+  assert.equal(transfers[0].capabilityEvidence.capabilityId, "terminal_writers.transfer");
+  assert.equal(transfers[0].capabilityEvidence.subjectId, "agent-a");
   assert.equal(asked.accessMode, "observer", "the API's confirmation does not seat the client; the server's notice does");
   assert.equal(asked.writerEpoch, 3);
   assert.equal(asked.writerClientInstanceId, "client-1");
@@ -1977,6 +1980,115 @@ test("a seat held at any point is remembered across reconnects: landing as an ob
 });
 
 
+test("writer transfer refuses unavailable exact-session capability before dispatch", async () => {
+  for (const variant of ["missing", "legacy", "sibling", "expired"]) {
+    const system = new FakeTerminalSystem();
+    system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+    let calls = 0;
+    system.controlPlane.transferTerminalWriter = async () => { calls++; throw new Error("unexpected transfer"); };
+    const { runtime } = createRuntime(system);
+    try {
+      await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+      system.controlPlane.discoverCapabilities = async () => {
+        const value = capabilitySnapshot(variant === "sibling" ? "agent-b" : "agent-a");
+        if (variant === "missing") value.capabilities.pop();
+        if (variant === "legacy") value.capabilities[1] = { ...value.capabilities[1], availability: "unsupported", reasonCode: "supervisor_writer_operation_unavailable" };
+        if (variant === "expired") value.expiresAt = new Date(NOW).toISOString();
+        return value;
+      };
+      await assert.rejects(runtime.takeWriter({ tabId: "tab-a" }), error =>
+        error instanceof RuntimeBoundaryError && error.code.startsWith("capability_") &&
+        (variant !== "legacy" || error.safeDetails?.reason_code === "supervisor_writer_operation_unavailable"));
+      assert.equal(calls, 0, variant);
+      await assert.rejects(runtime.sendInput(new Uint8Array([65]), "tab-a"), error => error.code === "terminal_observer");
+    } finally { await runtime.shutdown(); }
+  }
+});
+
+test("heartbeat renews exact writer capability and keeps unavailable leases disabled", async () => {
+  const system = new FakeTerminalSystem(); let now = NOW; let reads = 0;
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  const { runtime, states } = createRuntime(system, { clock: () => now, heartbeatTimeoutMs: 120_000 });
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    system.controlPlane.discoverCapabilities = async (_scope, id) => {
+      reads++;
+      const value = capabilitySnapshot(id, { observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 59_000).toISOString() });
+      if (reads === 1) value.capabilities[1] = { ...value.capabilities[1], availability: "unsupported", reasonCode: "supervisor_writer_operation_unavailable" };
+      return value;
+    };
+    now += 54_000;
+    system.connections[0].incoming.push(encodeTerminalControl("heartbeat", 1n, {}));
+    await waitUntil(() => states.at(-1)?.writerTransferCapability?.reasonCode === "supervisor_writer_operation_unavailable", "unsupported refreshed lease");
+    assert.equal(reads, 1);
+    now += 54_000;
+    system.connections[0].incoming.push(encodeTerminalControl("heartbeat", 2n, {}));
+    await waitUntil(() => states.at(-1)?.writerTransferCapability?.supported === true, "support renewed");
+    assert.equal(reads, 2);
+    assert.equal(states.at(-1).accessMode, "observer");
+  } finally { await runtime.shutdown(); }
+});
+
+test("lost terminal issuance is cancelled with its original request despite failed capability discovery", async () => {
+  const system = new FakeTerminalSystem();
+  let issued; const cancellations = [];
+  system.controlPlane.createTerminalConnection = async request => {
+    issued = request;
+    system.controlPlane.discoverCapabilities = async () => { throw new Error("discovery offline"); };
+    throw new Error("issuance response lost");
+  };
+  system.controlPlane.cancelTerminalConnection = async request => { cancellations.push(request); return { cancelled: true }; };
+  const { runtime } = createRuntime(system);
+  try {
+    await assert.rejects(runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 }), /issuance response lost/);
+    assert.equal(cancellations.length, 1);
+    const { signal: originalSignal, ...original } = issued;
+    const { signal: recoverySignal, ...recovery } = cancellations[0];
+    assert.deepEqual(recovery, original);
+    assert.notEqual(recoverySignal, originalSignal);
+    assert.equal(recoverySignal.aborted, false);
+    assert.equal(system.connections.length, 0);
+  } finally { await runtime.shutdown(); }
+});
+
+test("unconfirmed issuance cancellation retains the exact key for shutdown recovery", async () => {
+  const system = new FakeTerminalSystem(); const cancellations = [];
+  system.controlPlane.createTerminalConnection = async () => { throw new Error("issuance response lost"); };
+  system.controlPlane.cancelTerminalConnection = async request => {
+    cancellations.push(request);
+    if (cancellations.length === 1) throw new Error("cancellation response lost");
+    return { cancelled: true };
+  };
+  const { runtime } = createRuntime(system);
+  await assert.rejects(runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 }), /cancellation is unconfirmed/);
+  await runtime.shutdown();
+  assert.equal(cancellations.length, 2);
+  assert.equal(cancellations[0].idempotencyKey, cancellations[1].idempotencyKey);
+  assert.equal(cancellations[0].agentSessionId, cancellations[1].agentSessionId);
+});
+
+test("a confirmed cancelled reconnect issuance never reuses its fenced key", async () => {
+  const system = new FakeTerminalSystem(); const cancelled = []; const requests = [];
+  const create = system.controlPlane.createTerminalConnection;
+  const { runtime } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    await system.connections[0].close();
+    await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted", "original connection interrupted");
+    system.controlPlane.createTerminalConnection = async request => {
+      requests.push(request);
+      if (requests.length === 1) throw new Error("lost reconnect issuance");
+      assert.equal(cancelled.some(item => item.idempotencyKey === request.idempotencyKey), false, "new issuance cannot reuse a cancellation tombstone");
+      return create(request);
+    };
+    system.controlPlane.cancelTerminalConnection = async request => { cancelled.push(request); return { cancelled: true }; };
+    await assert.rejects(runtime.reconnect({ tabId: "tab-a" }), /lost reconnect issuance/);
+    assert.equal(cancelled[0].idempotencyKey, requests[0].idempotencyKey);
+    await runtime.reconnect({ tabId: "tab-a" });
+    assert.notEqual(requests[0].idempotencyKey, requests[1].idempotencyKey);
+  } finally { await runtime.shutdown(); }
+});
+
 test("writer operation retries preserve ID and original epoch until a writer notice", async () => {
   const system = new FakeTerminalSystem();
   system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
@@ -1993,6 +2105,11 @@ test("writer operation retries preserve ID and original epoch until a writer not
     await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
     await assert.rejects(runtime.takeWriter({ tabId: "tab-a" }), /unknown/);
     assert.match(calls[0].operationId, /^[0-9a-f-]{36}$/);
+    const discover = system.controlPlane.discoverCapabilities;
+    system.controlPlane.discoverCapabilities = async () => { throw new Error("capability offline"); };
+    await assert.rejects(runtime.takeWriter({ tabId: "tab-a" }), /capability offline/);
+    assert.equal(calls.length, 1);
+    system.controlPlane.discoverCapabilities = discover;
     const pending = await runtime.takeWriter({ tabId: "tab-a" });
     assert.equal(pending.accessMode, "observer");
     await runtime.takeWriter({ tabId: "tab-a" });
@@ -2054,4 +2171,63 @@ test("writer operation cancellation ends its ID while an in-progress refusal ret
       assert.equal(calls[0].operationId === calls[1].operationId, reason === "terminal_writer_transfer_in_progress");
     } finally { await runtime.shutdown(); }
   }
+});
+
+test("held issuance cancellation reports cleanup timeout and retains original key", async () => {
+  const system = new FakeTerminalSystem(); let release; const gate = new Promise(resolve => { release = resolve; }); const calls = [];
+  system.controlPlane.createTerminalConnection = async () => { throw new Error("issuance lost"); };
+  system.controlPlane.cancelTerminalConnection = async request => { calls.push(request); if (calls.length === 1) await gate; return { cancelled: true }; };
+  const { runtime } = createRuntime(system, { readyTimeoutMs: 20 });
+  try {
+    await assert.rejects(runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 }), error =>
+      error instanceof AggregateError && error.errors.some(nested => nested instanceof RuntimeBoundaryError && nested.code === "runtime_cleanup_timeout" && nested.retryable && /issuance cancellation/.test(nested.message)));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].signal.aborted, true);
+  } finally { release(); await runtime.shutdown(); }
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].idempotencyKey, calls[1].idempotencyKey);
+});
+
+test("writer notice during capability read prevents a superseded operation POST", async () => {
+  for (const accessMode of ["writer", "observer"]) {
+    const system = new FakeTerminalSystem(); system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+    let release; const gate = new Promise(resolve => { release = resolve; }); let reads = 0; let calls = 0;
+    system.controlPlane.transferTerminalWriter = async () => { calls++; throw new Error("superseded POST"); };
+    const { runtime, states } = createRuntime(system);
+    try {
+      await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+      system.controlPlane.discoverCapabilities = async () => { reads++; await gate; return capabilitySnapshot("agent-a"); };
+      const outcome = runtime.takeWriter({ tabId: "tab-a" }).then(value => ({ value }), error => ({ error }));
+      await waitUntil(() => reads === 1, "capability read held");
+      system.connections[0].incoming.push(encodeTerminalControl("writer_epoch", 3n, { writerEpoch: 2, writerClientInstanceId: accessMode === "writer" ? "client-1" : "other-client", accessMode }));
+      await waitUntil(() => states.at(-1)?.writerEpoch === 2, "new authority received");
+      release(); const result = await outcome;
+      assert.equal(calls, 0);
+      if (accessMode === "writer") assert.equal(result.value?.accessMode, "writer");
+      else assert.equal(result.error?.code, "session_conflict");
+    } finally { release(); await runtime.shutdown(); }
+  }
+});
+
+test("older background capability response cannot overwrite newer transfer refusal", async () => {
+  const system = new FakeTerminalSystem(); system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  let now = NOW; let release; const gate = new Promise(resolve => { release = resolve; }); let reads = 0;
+  const { runtime, states } = createRuntime(system, { clock: () => now, heartbeatTimeoutMs: 120_000 });
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    system.controlPlane.discoverCapabilities = async () => {
+      const read = ++reads;
+      const evidence = capabilitySnapshot("agent-a", { observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 59_000).toISOString() });
+      if (read === 1) await gate;
+      else evidence.capabilities[1] = { ...evidence.capabilities[1], availability: "unsupported", reasonCode: "supervisor_writer_operation_unavailable" };
+      return evidence;
+    };
+    now += 54_000;
+    system.connections[0].incoming.push(encodeTerminalControl("heartbeat", 1n, {}));
+    await waitUntil(() => reads === 1, "background read held");
+    await assert.rejects(runtime.takeWriter({ tabId: "tab-a" }), error => error.code === "capability_unsupported");
+    release(); await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(states.at(-1).writerTransferCapability.reasonCode, "supervisor_writer_operation_unavailable");
+    assert.equal(states.at(-1).writerTransferCapability.supported, false);
+  } finally { release(); await runtime.shutdown(); }
 });

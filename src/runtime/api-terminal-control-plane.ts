@@ -79,17 +79,28 @@ export function createApiTerminalControlPlane(input: {
     async transferTerminalWriter(
       request: Parameters<TerminalControlPlane["transferTerminalWriter"]>[0],
     ) {
-      return input.client.transferTerminalWriter(
-        request.agentSessionId,
-        {
-          clientInstanceId: request.clientInstanceId,
-          ...(request.operationId === undefined ? {} : { operationId: request.operationId }),
-          ...(request.expectedWriterEpoch === undefined
-            ? {}
-            : { expectedWriterEpoch: request.expectedWriterEpoch }),
-        },
-        request.signal,
-      );
+      if (request.capabilityEvidence.capabilityId !== "terminal_writers.transfer" ||
+          request.capabilityEvidence.scope !== "agent_session" ||
+          request.capabilityEvidence.subjectId !== request.agentSessionId ||
+          request.capabilityEvidence.expiresAt <= clock()) {
+        throw runtimeFailure("capability_snapshot_expired", "Writer transfer requires a fresh capability for this exact AgentSession.");
+      }
+      return input.client.transferTerminalWriter(request.agentSessionId, {
+        clientInstanceId: request.clientInstanceId,
+        ...(request.operationId === undefined ? {} : { operationId: request.operationId }),
+        ...(request.expectedWriterEpoch === undefined ? {} : { expectedWriterEpoch: request.expectedWriterEpoch }),
+      }, request.signal);
+    },
+    async cancelTerminalConnection(request: Parameters<TerminalControlPlane["createTerminalConnection"]>[0]) {
+      // Recovery of this already-authorized issuance: an expired lease or a
+      // failed discovery read must not prevent fencing its unredeemed grant.
+      // Server authorization still applies to the same subject and request key.
+      return input.client.cancelTerminalConnection(request.agentSessionId, {
+        protocol: request.protocol, clientInstanceId: request.clientInstanceId,
+        ...(request.resumeHandle === undefined ? {} : { resumeHandle: request.resumeHandle }),
+        ...(request.accessMode === undefined ? {} : { accessMode: request.accessMode }),
+        ...(request.expectedWriterEpoch === undefined ? {} : { expectedWriterEpoch: request.expectedWriterEpoch }),
+      }, request.idempotencyKey, request.signal);
     },
   });
 }

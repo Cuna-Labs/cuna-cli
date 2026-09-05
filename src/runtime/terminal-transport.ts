@@ -43,6 +43,7 @@ export type {
 } from "../api/contracts.js";
 
 export interface TerminalControlPlane {
+  cancelTerminalConnection(input: Parameters<TerminalControlPlane["createTerminalConnection"]>[0]): Promise<{ readonly cancelled: true }>;
   discoverCapabilities(scope: "agent_session", resourceId: string, signal?: AbortSignal): Promise<CapabilitySnapshot>;
   observeAgentSession(agentSessionId: string, signal?: AbortSignal): Promise<RemoteAgentSessionEvidence>;
   createTerminalConnection(input: {
@@ -57,6 +58,7 @@ export interface TerminalControlPlane {
     readonly signal?: AbortSignal;
   }): Promise<TerminalConnectionGrant>;
   transferTerminalWriter(input: {
+    readonly capabilityEvidence: CapabilityAdmission;
     readonly operationId?: string;
     readonly agentSessionId: string;
     readonly clientInstanceId: string;
@@ -92,6 +94,7 @@ export function createUnavailableTerminalControlPlane(): TerminalControlPlane {
     discoverCapabilities: unavailable,
     observeAgentSession: unavailable,
     createTerminalConnection: unavailable,
+    cancelTerminalConnection: unavailable,
     transferTerminalWriter: unavailable,
   });
 }

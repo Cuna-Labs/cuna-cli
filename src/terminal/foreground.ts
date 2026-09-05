@@ -1548,7 +1548,9 @@ export class ForegroundTerminalCoordinator {
                   : `${providerName(this.#pendingBrowserAction.provider)} requests browser authentication · Enter/o open · d/Esc deny`,
               }
               : this.#helpVisible
-                ? { notice: "Keys: Ctrl+C detach | Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry | w take control | d detach" }
+                ? { notice: "Keys: Ctrl+C detach | Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry" +
+                    (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
+                     writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined ? " | w take control" : "") + " | d detach" }
                 : this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) !== undefined
                   ? { notice: this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) as string }
                   : {}),
@@ -1744,6 +1746,12 @@ export class ForegroundTerminalCoordinator {
       void this.#render().catch(() => undefined);
       return;
     }
+    const refusal = writerCapabilityRefusal(tab.snapshot);
+    if (refusal !== undefined) {
+      this.#seatNotice = refusal;
+      void this.#render().catch(() => undefined);
+      return;
+    }
     this.#seatNotice = "Taking control…";
     void this.#render().catch(() => undefined);
     void runtime.takeWriter({ tabId, signal: this.#lifetimeAbort.signal }).then(
@@ -1763,12 +1771,16 @@ export class ForegroundTerminalCoordinator {
    */
   #forgetSeatNoticeOnSeatChange(before: RuntimeTerminalSnapshot, after: RuntimeTerminalSnapshot): void {
     if (this.#seatNotice === undefined) return;
-    if (before.accessMode !== after.accessMode || before.reason !== after.reason) this.#seatNotice = undefined;
+    if (before.accessMode !== after.accessMode || before.reason !== after.reason ||
+        before.writerTransferCapability?.supported !== after.writerTransferCapability?.supported ||
+        before.writerTransferCapability?.reasonCode !== after.writerTransferCapability?.reasonCode) this.#seatNotice = undefined;
   }
 
   #seatNoticeFor(snapshot: RuntimeTerminalSnapshot | undefined): string | undefined {
     if (this.#seatNotice !== undefined) return this.#seatNotice;
     if (snapshot === undefined || snapshot.state !== "active" || snapshot.accessMode !== "observer") return undefined;
+    const refusal = writerCapabilityRefusal(snapshot);
+    if (refusal !== undefined) return refusal;
     return snapshot.reason === "writer_transferred"
       ? "Control moved to another client · Ctrl+] w to take it back"
       : "Observing (read-only) · Ctrl+] w to take control";
@@ -1904,7 +1916,16 @@ async function abortableDelay(milliseconds: number, signal: AbortSignal): Promis
 }
 
 
+function writerCapabilityRefusal(snapshot: RuntimeTerminalSnapshot): string | undefined {
+  const capability = snapshot.writerTransferCapability;
+  if (capability?.supported === true && capability.expiresAt > Date.now()) return undefined;
+  return `Control unavailable: ${capability?.reasonCode ?? (capability?.supported ? "capability_snapshot_expired" : "capability_unknown")}`;
+}
+
 function writerTransferFailureNotice(error: unknown): string {
+  if (error instanceof RuntimeBoundaryError && error.code.startsWith("capability_")) {
+    return `Control unavailable: ${String(error.safeDetails?.reason_code ?? error.code)}`;
+  }
   const reason = typeof error === "object" && error !== null
     ? (error as { readonly details?: { readonly reason?: unknown } }).details?.reason : undefined;
   if (reason === "terminal_writer_cancelled") return "Control transfer cancelled. Read the terminal state before trying again.";

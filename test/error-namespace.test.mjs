@@ -74,6 +74,11 @@ function isOfflineContractSyncGuard(label, relative, line) {
     CONTRACT_SYNC_EARLIER_BRAND_GUARDS.has(line.trim());
 }
 
+function isGeneratedTerminalProtocol(label, relative, line) {
+  return label === "src" && relative === "terminal/generated/terminal-wire-v1.ts" &&
+    line.trim() === `export const TERMINAL_WIRE_PROTOCOL = ${JSON.stringify(DEPLOYED_WIRE_COMPATIBILITY.terminalProtocol)} as const;`;
+}
+
 async function sourceFiles(directory) {
   const found = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -130,6 +135,7 @@ test("earlier-brand runtime literals exist only in the exact deployed wire autho
           }
         }
         if (isOfflineContractSyncGuard(label, relative, line)) continue;
+        if (isGeneratedTerminalProtocol(label, relative, line)) continue;
         if (!EARLIER_BRAND_LITERAL.test(unclassified)) continue;
         unexplained.push(`${label}/${relative}:${index + 1}: ${line.trim()}`);
       }
@@ -140,6 +146,15 @@ test("earlier-brand runtime literals exist only in the exact deployed wire autho
     [],
     `Earlier-brand runtime literals must be classified as deployed wire compatibility.\n${unexplained.join("\n")}`,
   );
+});
+
+test("generated protocol exception admits only its exact file and declaration", () => {
+  const line = `export const TERMINAL_WIRE_PROTOCOL = ${JSON.stringify(DEPLOYED_WIRE_COMPATIBILITY.terminalProtocol)} as const;`;
+  assert.equal(isGeneratedTerminalProtocol("src", "terminal/generated/terminal-wire-v1.ts", line), true);
+  assert.equal(isGeneratedTerminalProtocol("src", "terminal/copied-wire.ts", line), false);
+  assert.equal(isGeneratedTerminalProtocol("scripts", "terminal/generated/terminal-wire-v1.ts", line), false);
+  assert.equal(isGeneratedTerminalProtocol("src", "terminal/generated/terminal-wire-v1.ts", line.replace("runa.terminal.v1", "runa.terminal.v2")), false);
+  assert.equal(isGeneratedTerminalProtocol("src", "terminal/generated/terminal-wire-v1.ts", `${line} const copied = "runa.auth.";`), false);
 });
 
 test("the public error class is Cuna-only", () => {
