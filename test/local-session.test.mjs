@@ -277,7 +277,7 @@ test("a batched inspection failure is raised at the enforcement site without a s
     assert.equal((await backend.probe()).status, "unavailable");
     failBatch = false;
     assert.deepEqual(Buffer.from(await backend.read("ignored")), secret, "the failure did not outlive its operation");
-  } finally { await rm(directory, { recursive: true, force: true }); }
+  } finally { await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); }
 });
 
 test("an authority without batching is inspected path by path within one operation and afresh across operations", { skip: process.platform !== "win32" }, async () => {
@@ -300,7 +300,7 @@ test("an authority without batching is inspected path by path within one operati
     assert.equal(counters.single - before, 3, "the key is read for the digest and again for the write from one observation");
     assert.equal(compliant.delete(`file:${paths.sessionFile}`), true);
     await assert.rejects(backend.read("ignored"), (error) => error?.code === "credential_backend_unverified");
-  } finally { await rm(directory, { recursive: true, force: true }); }
+  } finally { await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); }
 });
 
 function waitForChild(child, phase) {
