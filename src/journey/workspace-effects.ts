@@ -146,8 +146,19 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       unsubscribeSupervisor = undefined;
       await current?.stop();
     },
-    async inspectWorkspace({ localPath }) {
+    async inspectWorkspace({ localPath, syncMode, signal }) {
+      signal.throwIfAborted();
       const inspected = await inspect(localPath);
+      if (syncMode !== "disabled") {
+        // Reject local content before provisioning. This result is deliberately
+        // discarded: synchronization must scan again against current files.
+        await computeWorkspaceManifestRoot({
+          localRoot: inspected.policy.canonicalRoot,
+          filesystemCapabilities: input.filesystemCapabilities,
+          signal,
+        });
+      }
+      signal.throwIfAborted();
       // The canonical root leaves this layer because the machine-create request
       // identity is derived from it. Recomputing it in the orchestrator would
       // make two answers to "which project is this", and the create identity

@@ -83,7 +83,9 @@ export async function computeWorkspaceManifestRoot(input: {
   readonly filesystemCapabilities: FilesystemCapabilities;
   readonly manifestLimits?: SynchronizeLocalWorkspaceInput["manifestLimits"];
   readonly allowSafeRelativeSymlinks?: boolean;
+  readonly signal?: AbortSignal;
 }): Promise<string> {
+  input.signal?.throwIfAborted();
   const root = await canonicalWorkspaceRoot(input.localRoot);
   const policy = compileExclusionPolicy(
     await readProjectExclusionPolicy(root),
@@ -93,6 +95,7 @@ export async function computeWorkspaceManifestRoot(input: {
     root,
     policy,
     capabilities: input.filesystemCapabilities,
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
     ...(input.manifestLimits === undefined ? {} : { limits: input.manifestLimits }),
     ...(input.allowSafeRelativeSymlinks === undefined
       ? {}
