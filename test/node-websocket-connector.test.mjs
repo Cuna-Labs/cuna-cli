@@ -131,6 +131,31 @@ test("abort during the open event cannot escape the handshake cancellation fence
   assert.equal(AbortAfterOpenWebSocket.instances[0].closeCalls.at(-1).reason, "cuna_cancelled");
 });
 
+for (const count of [65, 4097]) for (const waiting of [false, true]) for (const coalesced of [false, true]) {
+  test(`${count} synchronous binary frames preserve every byte; waiting=${waiting}; coalesced=${coalesced}`, async () => {
+    const connector = createNodeWebSocketConnector({ WebSocket: FakeWebSocket });
+    const connection = await connector.connect({ url: URL, token: TOKEN, protocol: "runa.terminal.v1" });
+    const socket = FakeWebSocket.instances.at(-1);
+    const frames = Array.from({ length: count }, (_, i) => encodeTerminalFrame({ type: "output", sequence: BigInt(i + 1), payload: Uint8Array.of(i) }));
+    const bytes = Buffer.concat(frames);
+    try {
+      const iterator = connection.receive()[Symbol.asyncIterator]();
+      const first = waiting ? iterator.next() : undefined;
+      for (const frame of coalesced ? [bytes] : frames) {
+        const owned = Uint8Array.from(frame);
+        socket.dispatchEvent(new MessageEvent("message", { data: owned.buffer }));
+      }
+      const decoder = new TerminalFrameDecoder();
+      const received = [];
+      if (first) { const chunk = (await first).value; assert.ok(chunk.byteLength <= 16 * 1024); received.push(...decoder.push(chunk)); }
+      while (received.length < frames.length) received.push(...decoder.push((await iterator.next()).value));
+      assert.deepEqual(received.map(f => f.sequence), frames.map((_, i) => BigInt(i + 1)));
+      assert.deepEqual(received.map(f => f.payload[0]), frames.map((_, i) => i % 256));
+      assert.equal(socket.closeCalls.length, 0);
+    } finally { await connection.close({ code: 1000, reason: "test_complete" }); }
+  });
+}
+
 test("asynchronous Blob conversion preserves WebSocket arrival order", async () => {
   FakeWebSocket.instances.length = 0;
   const connector = createNodeWebSocketConnector({ WebSocket: FakeWebSocket });
@@ -160,6 +185,69 @@ test("asynchronous Blob conversion preserves WebSocket arrival order", async () 
   assert.deepEqual([...receivedSecond.value], [2]);
   await connection.close();
 });
+
+test("synchronous views are copied and cannot overtake an earlier Blob", async () => {
+  const connection = await createNodeWebSocketConnector({ WebSocket: FakeWebSocket }).connect({ url: URL, token: TOKEN, protocol: "runa.terminal.v1" });
+  const socket = FakeWebSocket.instances.at(-1);
+  try {
+    const iterator = connection.receive()[Symbol.asyncIterator]();
+    const pending = iterator.next();
+    const original = Uint8Array.of(99, 7, 98);
+    socket.dispatchEvent(new MessageEvent("message", { data: original.subarray(1, 2) }));
+    original.fill(0);
+    assert.deepEqual([...(await pending).value], [7], "direct waiter owns a copy of the selected view bytes");
+    let release;
+    const blob = new Blob([Uint8Array.of(8)]);
+    blob.arrayBuffer = () => new Promise(resolve => { release = resolve; });
+    socket.dispatchEvent(new MessageEvent("message", { data: blob }));
+    socket.dispatchEvent(new MessageEvent("message", { data: Uint8Array.of(9).buffer }));
+    await new Promise(resolve => setImmediate(resolve));
+    release(Uint8Array.of(8).buffer);
+    const first = (await iterator.next()).value;
+    const values = [...first];
+    while (values.length < 2) values.push(...(await iterator.next()).value);
+    assert.deepEqual(values, [8, 9]);
+  } finally { await connection.close({ code: 1000, reason: "test_complete" }); }
+});
+
+test("waiting readers, queued remainder and later messages preserve byte order", async () => {
+  const connection = await createNodeWebSocketConnector({ WebSocket: FakeWebSocket }).connect({ url: URL, token: TOKEN, protocol: "runa.terminal.v1" });
+  const socket = FakeWebSocket.instances.at(-1);
+  try {
+    const iterator = connection.receive()[Symbol.asyncIterator]();
+    const waiters = [iterator.next(), iterator.next()];
+    const input = Uint8Array.from({ length: 40_000 }, (_, i) => i % 251);
+    socket.dispatchEvent(new MessageEvent("message", { data: input.buffer }));
+    socket.dispatchEvent(new MessageEvent("message", { data: Uint8Array.of(255).buffer }));
+    const chunks = (await Promise.all(waiters)).map(item => item.value);
+    let size = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    while (size < input.byteLength + 1) { const chunk = (await iterator.next()).value; chunks.push(chunk); size += chunk.byteLength; }
+    assert.ok(chunks.every(chunk => chunk.byteLength <= 16 * 1024));
+    assert.deepEqual(Buffer.concat(chunks), Buffer.concat([input, Uint8Array.of(255)]));
+  } finally { await connection.close({ code: 1000, reason: "test_complete" }); }
+});
+
+for (const overflow of [false, true]) {
+  test(`near-capacity queue admits whole messages or fails without partial success; overflow=${overflow}`, async () => {
+    const connection = await createNodeWebSocketConnector({ WebSocket: FakeWebSocket }).connect({ url: URL, token: TOKEN, protocol: "runa.terminal.v1" });
+    const socket = FakeWebSocket.instances.at(-1);
+    try {
+      const mib = 1024 * 1024;
+      for (let i = 0; i < 15; i++) socket.dispatchEvent(new MessageEvent("message", { data: new Uint8Array(mib).buffer }));
+      socket.dispatchEvent(new MessageEvent("message", { data: new Uint8Array(mib - 10).buffer }));
+      socket.dispatchEvent(new MessageEvent("message", { data: new Uint8Array(overflow ? 11 : 10).fill(1).buffer }));
+      const iterator = connection.receive()[Symbol.asyncIterator]();
+      if (overflow) {
+        await assert.rejects(iterator.next(), /receive queue exceeded/u);
+        await assert.rejects(iterator.next(), /receive queue exceeded/u);
+      } else {
+        let total = 0; let ones = 0;
+        while (total < 16 * mib) { const bytes = (await iterator.next()).value; total += bytes.length; ones += bytes.reduce((sum, b) => sum + b, 0); }
+        assert.equal(total, 16 * mib); assert.equal(ones, 10); assert.equal(socket.closeCalls.length, 0);
+      }
+    } finally { await connection.close({ code: 1000, reason: "test_complete" }); }
+  });
+}
 
 test("remote close drains an already-delivered asynchronous Blob before ending the receive stream", async () => {
   FakeWebSocket.instances.length = 0;
