@@ -27,13 +27,15 @@ function fixture() {
   return {input,client,workspace,session,calls};
 }
 test('remote launch waits for publication and attaches only the admitted ready identity',async()=>{
-  const f=fixture();let reads=0;
+  const f=fixture();let reads=0;const progress=[];
+  f.input.onProgress=message=>progress.push(message);
   f.client.getMachineDefaultWorkspace=async()=>({...f.workspace,publicationStatus:++reads===1?'pending':'ready'});
   assert.equal(await launchRemoteWorkspaceSession(f.input),'session');
   assert.equal(reads,2);const create=f.calls.find(c=>c[0]==='create');
   assert.deepEqual(create.slice(1),['machine',{agent:'codex',cwd:f.workspace.remoteRoot,
     executionWorkspaceId:'execution',workspaceGeneration:1,authMode:'interactive_login'},'one-key']);
   assert.deepEqual(f.calls.filter(c=>c[0]==='session'),[['session','session']]);
+  assert.deepEqual(progress,['Preparing remote workspace · no local sync','Starting Codex remotely · no local sync','Waiting for Codex remotely · no local sync']);
 });
 test('lost create reply recovers exact context without creating a sibling',async()=>{
   const f=fixture();let posts=0;

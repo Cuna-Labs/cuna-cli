@@ -381,8 +381,21 @@ test("no-args remains help off-TTY but a real TTY infers and attaches the select
 });
 
 test("both interactive menus create in the selected remote Workspace without local synchronization", async () => {
+  const { Terminal } = (await import("@xterm/headless")).default;
   for (const argv of [[], ["machines"]]) {
+    for (const columns of [60, 80, 100, 160]) {
     const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+    interactive.streams.stderr.columns = columns;
+    const physical = new Terminal({ cols: columns, rows: 30, allowProposedApi: true });
+    let consumed = 0;
+    const observedRows = [];
+    const checkRow = async () => {
+      const text = interactive.stderr();
+      await new Promise((resolve) => physical.write(text.slice(consumed), resolve));
+      consumed = text.length;
+      observedRows.push({ columns: physical.cols, row: physical.buffer.active.cursorY,
+        extraRows: Array.from({ length: 29 }, (_, index) => physical.buffer.active.getLine(index + 1)?.translateToString(true) ?? "").filter(Boolean).length });
+    };
     const attached = [], created = [];
     const root = `/workspace/workspaces/${FOREGROUND_SESSION_D}`;
     const session = { id: FOREGROUND_SESSION_A, machineId: MACHINE_ID, agent: "codex", cwd: root,
@@ -399,7 +412,12 @@ test("both interactive menus create in the selected remote Workspace without loc
         return { machineId: id, workspaceId: FOREGROUND_SESSION_B, executionWorkspaceId: FOREGROUND_SESSION_D,
           remoteRoot: root, workspaceGeneration: 1, publicationStatus: "ready" };
       },
-      async createAgentSessionInWorkspace(id, input) { created.push({ id, input }); return { agentSession: session }; },
+      async createAgentSessionInWorkspace(id, input) {
+        created.push({ id, input });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await checkRow();
+        return { agentSession: session };
+      },
       async getAgentSessionWorkspaceContext(id) { return { agentSessionId: id, machineId: MACHINE_ID, executionWorkspaceId: FOREGROUND_SESSION_D, remoteRoot: root, workspaceGeneration: 1 }; },
       async getAgentSession() { return session; },
     });
@@ -408,12 +426,26 @@ test("both interactive menus create in the selected remote Workspace without loc
       now: () => Date.parse("2026-08-08T00:00:00.000Z"), clientFactory: () => client,
       rootJourneyRunner: select, machinesExplorerRunner: select,
       automaticJourneyEffectsFactory: () => { throw new Error("local synchronization must not run"); },
-      foregroundTerminalRunner: async input => { attached.push(input); },
+      foregroundTerminalRunner: async input => {
+        attached.push(input);
+        input.onProgress("界🙂 e\u0301 ".repeat(50));
+        await checkRow();
+        physical.resize(60, 30);
+        interactive.streams.stderr.columns = 60;
+        input.onProgress("界🙂 e\u0301 ".repeat(51));
+        await checkRow();
+      },
     });
     assert.equal(exit, EXIT_CODES.success, interactive.stderr());
     assert.equal(created.length, 1); assert.equal(created[0].id, MACHINE_ID);
     assert.equal(created[0].input.workspaceBindingId, undefined);
     assert.deepEqual(attached.map(a => a.agentSessionIds), [[FOREGROUND_SESSION_A]]);
+    for (const observation of observedRows) {
+      assert.equal(observation.row, 0, `progress wrapped at ${observation.columns} columns`);
+      assert.equal(observation.extraRows, 0, `progress left old rows at ${observation.columns} columns`);
+    }
+    physical.dispose();
+    }
   }
 });
 

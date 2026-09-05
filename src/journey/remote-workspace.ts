@@ -32,7 +32,7 @@ export async function launchRemoteWorkspaceSession(input: {
   const timeout = (operation: string) => observationBudgetElapsed({ kind: "response", operation,
     budgetMs: REMOTE_CONVERGENCE_BUDGET_MS, settleWith: `cuna agent-sessions list --machine ${input.machineId}` });
   await gate("machines.default_workspace.read", true);
-  input.onProgress?.("Waiting for remote Workspace publication");
+  input.onProgress?.("Preparing remote workspace · no local sync");
   const started = now();
   let workspace: MachineDefaultWorkspace;
   for (;;) {
@@ -47,7 +47,8 @@ export async function launchRemoteWorkspaceSession(input: {
     await sleep(500, signal);
   }
   await gate("agent_sessions.workspace.create");
-  input.onProgress?.(`Creating ${input.agent} in remote Workspace ${workspace.executionWorkspaceId} (local files are not synchronized)`);
+  const agentName = input.agent === "claude-code" ? "Claude Code" : input.agent === "opencode" ? "OpenCode" : "Codex";
+  input.onProgress?.(`Starting ${agentName} remotely · no local sync`);
   const request = { agent: input.agent, cwd: workspace.remoteRoot, executionWorkspaceId: workspace.executionWorkspaceId,
     workspaceGeneration: workspace.workspaceGeneration, authMode: "interactive_login" as const };
   const create = async () => (await input.client.createAgentSessionInWorkspace(input.machineId, request, key, signal)).agentSession;
@@ -71,7 +72,7 @@ export async function launchRemoteWorkspaceSession(input: {
   const context = await input.client.getAgentSessionWorkspaceContext(sessionId, signal);
   if (context.agentSessionId !== sessionId || context.machineId !== input.machineId || context.executionWorkspaceId !== workspace.executionWorkspaceId ||
       context.workspaceGeneration !== workspace.workspaceGeneration || context.remoteRoot !== workspace.remoteRoot) throw mismatch();
-  input.onProgress?.(`Waiting for remote session ${sessionId}`);
+  input.onProgress?.(`Waiting for ${agentName} remotely · no local sync`);
   const admittedAt = now();
   for (;;) {
     signal.throwIfAborted();

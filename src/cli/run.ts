@@ -1,4 +1,5 @@
 import { Writable } from "node:stream";
+import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
 import { createInterface } from "node:readline/promises";
 import { mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -734,7 +735,11 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
   let frame = 0;
   let label = initialLabel;
   let stopped = false;
+  let lastColumns = 0;
+  let lastCells = 0;
   const paint = (): void => {
+    const observedColumns = (stream as Writable & { columns?: number }).columns;
+    const columns = Number.isSafeInteger(observedColumns) && observedColumns! > 1 ? observedColumns! : 80;
     const elapsed = Date.now() - startedAt;
     // A spinner alone is too easy to mistake for a frozen cursor on slower
     // Windows terminals. Keep the phase honest, then add a small, actionable
@@ -745,10 +750,17 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
         ? " · still working"
         : "";
     const text = `◆ CUNA  ${frames[frame % frames.length]} ${label}${slowHint}  ${bars[frame % bars.length]}`;
-    const styled = color
+    const fitted = truncateTerminalLine(text, columns - 1);
+    const styled = color && fitted === text
       ? `\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;202m${frames[frame % frames.length]}\u001b[0m \u001b[38;5;255m\u001b[1m${label}\u001b[0m\u001b[38;5;245m${slowHint}\u001b[0m  \u001b[38;5;208m${bars[frame % bars.length]}\u001b[0m`
-      : text;
+      : color ? `\u001b[38;5;255m${fitted}\u001b[0m` : fitted;
+    if (lastColumns > columns && lastCells >= columns) {
+      // A terminal resize can reflow our previously single row before repaint.
+      for (let row = 0; row < Math.floor(lastCells / columns); row += 1) stream.write("\r\u001b[2K\u001b[1A");
+    }
     stream.write(`\r\u001b[2K${styled}`);
+    lastColumns = columns;
+    lastCells = terminalCellWidth(fitted);
     frame += 1;
   };
   paint();
@@ -767,6 +779,9 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
       }
       // Clear the spinner row, leave the line behind, resume spinning below it.
       stream.write(`\r${String.fromCharCode(0x1b)}[2K${line}\n`);
+      // The previous row now belongs to the persistent note, not the spinner.
+      lastColumns = 0;
+      lastCells = 0;
       paint();
     },
     stop() {
