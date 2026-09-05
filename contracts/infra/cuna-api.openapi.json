@@ -5766,6 +5766,10 @@
           "command"
         ],
         "properties": {
+          "operation_id": {
+            "$ref": "#/components/schemas/Uuid",
+            "description": "Optional client-chosen durable execution identity. Retain it before sending the command so an unknown outcome can be inspected without replay. Existing execution IDs never authorize a second process start."
+          },
           "command": {
             "type": "string",
             "minLength": 1
