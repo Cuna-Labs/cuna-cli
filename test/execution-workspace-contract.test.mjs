@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {decodeWorkspaceBindingAuthority,decodeAgentSessionItem} from '../dist/api/contracts.js';
 import {createApiAgentJourneyEffects} from '../dist/journey/api-effects.js';
+import {createOutputWriter} from '../dist/cli/output.js';
 import {createWorkspaceJourneyEffects,conservativeFilesystemCapabilities} from '../dist/journey/workspace-effects.js';
 import {inspectWorkspaceSyncPolicy,computeWorkspaceManifestRoot} from '../dist/sync/workspace-sync-product-service.js';
 import {createCunaApiClient} from '../dist/api/client.js';
@@ -28,6 +29,25 @@ test('failed materialization is a typed terminal outcome before any readiness sl
   const effects=createApiAgentJourneyEffects({client:{async getAgentSession(){reads++;return {requestState:'failed',processState:'starting',workspaceFailureCode:'workspace.remote_edits'};}},requestedAgent:'codex',async sleep(){throw new Error('must not wait after known failure');}});
   await assert.rejects(effects.ensureAgentSessionReady({agentSessionId:id(1),signal:new AbortController().signal}),e=>e.code==='cuna.journey.workspace_materialization_failed'&&e.details.reason==='workspace.remote_edits'&&/remote edits/i.test(e.message));
   assert.equal(reads,1);
+});
+test('readiness timeout retains the admitted session identity and read-only recovery hint',async()=>{
+  let reads=0;
+  const effects=createApiAgentJourneyEffects({client:{async getAgentSession(sessionId){
+    assert.equal(sessionId,id(1));reads++;assert.ok(reads<=100,'readiness must stop waiting');
+    return {requestState:'runtime_claimed',processState:'unknown'};
+  }},requestedAgent:'opencode',async sleep(){}});
+  await assert.rejects(effects.ensureAgentSessionReady({agentSessionId:id(1),signal:new AbortController().signal}),error=>{
+    assert.equal(error.code,'cuna.journey.agent_session_ready_timeout');
+    assert.equal(error.exitCode,5);
+    assert.equal(error.details.agent_session_id,id(1));
+    assert.match(error.hint,new RegExp(`cuna agent-sessions get ${id(1)}`));
+    assert.match(error.message,/may still be pending/i);
+    let rendered='';
+    createOutputWriter({json:false,streams:{stdoutIsTTY:true,stdout:{write(){}},stderr:{write(value){rendered+=value;}}}}).error('opencode',error);
+    assert.match(rendered,new RegExp(`Next: .*cuna agent-sessions get ${id(1)}`));
+    return true;
+  });
+  assert.ok(reads>0);
 });
 test('materialization failure code is accepted only on a failed request and without unsafe text',()=>{
   const session={id:id(1),machine_id:id(5),name:'session',agent:'codex',cwd:'/workspace',auth_mode:'interactive_login',desired_state:'running',request_state:'failed',process_state:'starting',row_version:1,created_at:'2026-09-04T00:00:00Z',updated_at:'2026-09-04T00:00:00Z',workspace_failure_code:'workspace.remote_edits'};

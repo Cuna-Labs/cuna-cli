@@ -406,7 +406,13 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         }
         await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
       }
-      throw fail("cuna.journey.agent_session_ready_timeout", "AgentSession readiness remained unproven.", EXIT_CODES.network);
+      throw new CunaError({
+        code: "cuna.journey.agent_session_ready_timeout",
+        message: "Cuna stopped waiting for AgentSession readiness. The remote request may still be pending.",
+        exitCode: EXIT_CODES.network,
+        hint: `Inspect the existing request before starting another session: cuna agent-sessions get ${agentSessionId}`,
+        details: { agent_session_id: agentSessionId },
+      });
     },
     attach: input.attach,
     async reconcileCancellation({ ledger, signal }) {
