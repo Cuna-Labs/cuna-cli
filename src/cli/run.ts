@@ -108,6 +108,8 @@ export interface RunCliDependencies {
     readonly signal?: AbortSignal;
   }) => AgentJourneyEffects;
   readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal) => Promise<boolean>;
+  /** Internal navigation context; direct command refusals retain their exit code. */
+  readonly returnToMachinesOnCreateDeclined?: boolean;
 }
 
 async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal): Promise<boolean> {
@@ -384,6 +386,16 @@ function commandLabel(argv: readonly string[]): string {
   } catch {
     return "root";
   }
+}
+
+function menuInvocationOptions(parsed: ReturnType<typeof parseArgv>): readonly string[] {
+  const args: string[] = [];
+  for (const name of ["profile", "base-url", "config-file", "timeout-ms"]) {
+    const value = stringOption(parsed, name);
+    if (value !== undefined) args.push(`--${name}`, value);
+  }
+  if (booleanOption(parsed, "no-color")) args.push("--no-color");
+  return args;
 }
 
 function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>> {
@@ -1512,8 +1524,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ? await runCli(noColor ? ["--no-color"] : [], dependencies)
           : exit;
       }
-      return await runCli(rootJourneyArgv(selection, { noColor: booleanOption(parsed, "no-color") }), {
+      return await runCli([...rootJourneyArgv(selection), ...menuInvocationOptions(parsed)], {
         ...dependencies,
+        returnToMachinesOnCreateDeclined: true,
         ...(selection.machineId === undefined ? {} : { managedWorkspaceMachineId: selection.machineId }),
         ...(humanAuth === undefined ? {} : { humanAuth }),
       });
@@ -1673,6 +1686,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           }
         },
       });
+      let creationDeclined = false;
       try {
         await orchestrateAgentJourney({
           intent: journeyIntent,
@@ -1680,10 +1694,21 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           scope: journeyScope,
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
         });
+      } catch (error) {
+        if (dependencies.returnToMachinesOnCreateDeclined === true && streams.stdinIsTTY === true &&
+          dependencies.signal?.aborted !== true && error instanceof CunaError &&
+          error.code === "cuna.journey.machine_create_not_authorized") {
+          creationDeclined = true;
+        } else throw error;
       } finally {
         inlineJourneyProgress?.stop();
         inlineJourneyProgress = undefined;
         await stopJourneyWorkspace?.();
+      }
+      if (creationDeclined) {
+        return await runCli(["machines", ...menuInvocationOptions(parsed)], {
+          ...dependencies, returnToMachinesOnCreateDeclined: false,
+        });
       }
       return EXIT_CODES.success;
     }
@@ -1821,8 +1846,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
             inlineRootProgress = undefined;
           }
         } else if (selection.kind === "launch") {
-          return await runCli(rootJourneyArgv(selection, { noColor: booleanOption(parsed, "no-color") }), {
+          return await runCli([...rootJourneyArgv(selection), ...menuInvocationOptions(parsed)], {
             ...dependencies,
+            returnToMachinesOnCreateDeclined: true,
             ...(selection.machineId === undefined ? {} : { managedWorkspaceMachineId: selection.machineId }),
           });
         } else if (selection.kind === "supervisor-update") {

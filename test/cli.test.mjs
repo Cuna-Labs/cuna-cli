@@ -2827,6 +2827,60 @@ test("AgentSession capability subject mismatch blocks mutation before the client
   assert.equal(JSON.parse(streams.stderr()).error.details.reason, "subject_scope_mismatch");
 });
 
+test("menu creation decline returns to Machines while direct and unrelated refusals remain failures", async () => {
+  for (const mode of ["root", "machines", "direct", "other-policy", "aborted"]) {
+    const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+    const controller = new AbortController();
+    const calls = { menu: 0, declined: 0, dispatched: 0, reconcile: 0, sessions: 0, attached: 0 };
+    const configs = [];
+    const configFile = "C:\\fixture\\chosen-config.json";
+    const invocationOptions = mode === "root" ? [] : ["--profile", "review", "--base-url", "https://review.example.test", "--config-file", configFile, "--timeout-ms", "4321", "--no-color"];
+    const select = async (input) => {
+      calls.menu += 1;
+      if (mode !== "root") assert.equal(input.color, false);
+      return calls.menu === 1 ? { kind: "launch", agent: "opencode", newSession: true } : undefined;
+    };
+    const exit = await runCli([...(mode === "direct" ? ["opencode", ".", "--new", "--no-sync"] : mode === "root" ? [] : ["machines"]), ...invocationOptions], {
+      streams: streams.streams, platform: { ...platform, async readSafeConfig(path) {
+        if (mode === "root") return { exists: false };
+        assert.equal(path, configFile);
+        return { exists: true, text: JSON.stringify({ profiles: { default: {}, review: { development: true } } }) };
+      } }, env: { CUNA_API_KEY: API_KEY }, signal: controller.signal,
+      clientFactory: (config, timeoutMs) => {
+        configs.push({ profile: config.profile, baseUrl: config.baseUrl, configFile: config.configFile, timeoutMs });
+        return fakeClient({ async createMachine() { calls.dispatched += 1; throw new Error("unexpected mutation"); } });
+      },
+      rootJourneyRunner: select, machinesExplorerRunner: select,
+      automaticJourneyEffectsFactory: () => ({
+        async inspectWorkspace() { return { canonicalLocalRoot: "C:\\work\\project" }; },
+        async observeMachines() { return []; },
+        async createMachine() {
+          calls.declined += 1;
+          if (mode === "aborted") controller.abort(new Error("interrupted"));
+          throw new CunaError({ code: mode === "other-policy" ? "cuna.policy.other_refusal" : "cuna.journey.machine_create_not_authorized",
+            message: "Machine creation was not authorized.", exitCode: EXIT_CODES.policy });
+        },
+        async reconcileMachineCreate() { calls.reconcile += 1; return "unreconcilable"; },
+        async ensureMachineReady() { throw new Error("unexpected readiness"); },
+        async synchronizeWorkspace() { throw new Error("unexpected sync"); },
+        async observeAgentSessions() { calls.sessions += 1; return []; },
+        async createAgentSession() { calls.sessions += 1; throw new Error("unexpected session creation"); },
+        async ensureAgentSessionReady() { throw new Error("unexpected session readiness"); },
+        async attach() { calls.attached += 1; },
+        async reconcileCancellation() {},
+      }),
+    });
+    const returnsToMenu = mode === "root" || mode === "machines";
+    assert.equal(calls.menu, returnsToMenu ? 2 : mode === "direct" ? 0 : 1, `${mode}: ${streams.stderr()}`);
+    assert.equal(exit, returnsToMenu || mode === "aborted" ? EXIT_CODES.success : EXIT_CODES.policy, mode);
+    assert.equal(calls.declined, 1, mode);
+    assert.equal(calls.dispatched + calls.reconcile + calls.sessions + calls.attached, 0, mode);
+    assert.equal(configs.length, returnsToMenu ? 3 : mode === "direct" ? 1 : 2, mode);
+    if (mode !== "root") for (const config of configs) assert.deepEqual(config, { profile: "review", baseUrl: "https://review.example.test", configFile, timeoutMs: 4321 });
+    if (returnsToMenu) assert.doesNotMatch(streams.stderr(), /Error \[/u);
+  }
+});
+
 test("valid automatic agent intents execute the effects-fenced journey and exact attach", async () => {
   const cases = [
     [
