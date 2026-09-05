@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 import {createCunaApiClient} from '../dist/api/client.js';
-import {decodeManagedExecution,decodeManagedExecutionPage} from '../dist/api/managed-executions.js';
+import {decodeManagedExecution,decodeManagedExecutionPage,decodeManagedCommandResult} from '../dist/api/managed-executions.js';
 import {parseArgv} from '../dist/cli/parser.js';
 import {preflightInvocation,executeCommand} from '../dist/commands/commands.js';
 
@@ -13,6 +13,52 @@ const row={operation_id:id(2),machine_id:id(1),execution_workspace_id:id(3),lead
 const page={machine_id:id(1),items:[row],next_cursor:null};
 function setup(response=page){const requests=[];return {requests,client:createCunaApiClient({async request(r){requests.push(r);return typeof response==='function'?response(r):response;}})};}
 const context=(argv,client)=>({parsed:parseArgv(argv),client,now:0,credentialMode:'interactive',config:{}});
+const command={command:'printf',args:['%s','literal ; argument'],cwd:`/workspace/workspaces/${id(3)}`,timeoutSecs:5};
+const commandResult={exit_code:7,stdout:'output\n',stderr:'diagnostic\n',duration_ms:9,stdout_truncated:false,stderr_truncated:true};
+
+test('launch sends the preallocated operation ID with literal arguments and an exact recovery command',async()=>{
+  const {client,requests}=setup(commandResult);const signal=new AbortController().signal;
+  const result=await client.executeManagedCommand(id(1),id(2),command,signal);
+  assert.deepEqual(requests[0],{method:'POST',path:`/v1/sessions/${id(1)}/exec`,body:{
+    operation_id:id(2),command:'printf',args:['%s','literal ; argument'],cwd:command.cwd,timeout_secs:5},
+    budgetMs:10000,settleWith:`cuna executions get ${id(2)} --machine ${id(1)}`,signal});
+  assert.equal(result.exitCode,7);assert.equal(result.stderrTruncated,true);
+  assert.equal(Object.hasOwn(result,'ownershipState'),false,'a result cannot invent process cleanup');
+  const contract=JSON.parse(await readFile(new URL('../contracts/infra/cuna-api.openapi.json',import.meta.url),'utf8'));
+  assert.equal(contract.components.schemas.ExecRequest.properties.operation_id.$ref,'#/components/schemas/Uuid');
+  assert.deepEqual(Object.keys(commandResult).sort(),[...contract.components.schemas.ExecResult.required].sort());
+});
+
+test('invalid launch rejects before transport without echoing command contents',async()=>{
+  const {client,requests}=setup(commandResult);
+  for(const change of [{command:''},{command:'private\0value'},{args:['private\0value']},{args:'private'},
+    {cwd:'/workspace'},{cwd:command.cwd+'/../sibling'},{cwd:command.cwd+'/.'},{cwd:command.cwd+'\\file'},
+    {cwd:command.cwd+'\nforged'},{timeoutSecs:0},{timeoutSecs:601},{timeoutSecs:1.5}]){
+    await assert.rejects(client.executeManagedCommand(id(1),id(2),{...command,...change}),error=>{
+      assert.equal(error.code,'cuna.usage.invalid');assert.doesNotMatch(error.message,/private|forged/);return true;
+    });
+  }
+  await assert.rejects(client.executeManagedCommand(id(1),'invalid',command));
+  await assert.rejects(client.executeManagedCommand('invalid',id(2),command));
+  assert.equal(requests.length,0);
+});
+
+test('unknown launch outcome is never automatically replayed or replaced by a new ID',async()=>{
+  const {client,requests}=setup(()=>{throw new Error('synthetic response loss');});
+  await assert.rejects(client.executeManagedCommand(id(1),id(2),command),/synthetic response loss/);
+  assert.equal(requests.length,1);assert.equal(requests[0].body.operation_id,id(2));
+  assert.equal(requests[0].settleWith,`cuna executions get ${id(2)} --machine ${id(1)}`);
+});
+
+test('result decoder retains output as data and refuses malformed completion evidence',()=>{
+  const output='\x1b]52;c;ZmFrZQ==\x07';
+  assert.equal(decodeManagedCommandResult({...commandResult,stdout:output}).stdout,output);
+  for(const change of [{exit_code:0.5},{exit_code:null},{duration_ms:-1},{duration_ms:Number.MAX_SAFE_INTEGER+1},
+    {stdout:[]},{stderr:null},{stdout_truncated:0},{stderr_truncated:'false'},{operation_id:id(2)}]){
+    assert.throws(()=>decodeManagedCommandResult({...commandResult,...change}));
+  }
+  for(const key of Object.keys(commandResult)){const value={...commandResult};delete value[key];assert.throws(()=>decodeManagedCommandResult(value));}
+});
 
 test('managed execution fixture matches all producer fields; exit retains descendant ownership',async()=>{
   const contract=JSON.parse(await readFile(new URL('../contracts/infra/cuna-api.openapi.json',import.meta.url),'utf8'));

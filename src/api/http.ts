@@ -650,7 +650,9 @@ function transportFailure(input: {
     code: "cuna.network.failed",
     message: "The Cuna request was sent, but the connection failed before an authoritative result was received.",
     exitCode: EXIT_CODES.network,
-    hint: "Check connectivity to the API origin shown by `cuna config get`. A mutating request may still have been applied; re-read the resource before re-issuing it.",
+    hint: request.settleWith === undefined
+      ? "Check connectivity to the API origin shown by `cuna config get`. A mutating request may still have been applied; re-read the resource before re-issuing it."
+      : `The operation may still have been applied. Inspect its outcome with \`${request.settleWith}\` before re-issuing it.`,
     retryable: request.method === "GET",
     details: {
       method: request.method,

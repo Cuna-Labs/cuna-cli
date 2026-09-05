@@ -1,4 +1,4 @@
-import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { EXIT_CODES, CunaError, usageError } from "../core/errors.js";
 import {
   MACHINE_CREATE_REQUEST_BUDGET_MS,
   MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
@@ -58,6 +58,7 @@ import {
 import type { HttpRequest, HttpTransport } from "./http.js";
 import { decodeExecutionWorkspacePage, type ExecutionWorkspacePage } from "./execution-workspaces.js";
 import { decodeManagedExecution, decodeManagedExecutionPage, type ManagedExecution, type ManagedExecutionPage } from "./managed-executions.js";
+import { decodeManagedCommandResult, type ManagedCommandInput, type ManagedCommandResult } from "./managed-executions.js";
 import { decodeMachineDefaultWorkspace, decodeAgentSessionWorkspaceContext, decodeAgentSessionWorkspaceEnvelope,
   type MachineDefaultWorkspace, type AgentSessionWorkspaceContext, type AgentSessionWorkspaceEnvelope } from "./remote-workspace.js";
 import { classifyCapabilitySnapshot, isPermanentSnapshotFault } from "./capability-evidence.js";
@@ -147,6 +148,7 @@ export interface CunaApiClient {
    */
   replaceMachineSupervisor(id: string, signal?: AbortSignal): Promise<Machine>;
   deleteMachine(id: string): Promise<unknown>;
+  executeManagedCommand(machineId: string, operationId: string, input: ManagedCommandInput, signal?: AbortSignal): Promise<ManagedCommandResult>;
   listManagedExecutions(machineId: string, input?: { readonly executionWorkspaceId?: string; readonly after?: string }, signal?: AbortSignal): Promise<ManagedExecutionPage>;
   getManagedExecution(machineId: string, operationId: string, signal?: AbortSignal): Promise<ManagedExecution>;
   cancelManagedExecution(machineId: string, operationId: string, signal?: AbortSignal): Promise<ManagedExecution>;
@@ -610,6 +612,27 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         path: `/v1/sessions/${safeId}`,
         settleWith: "cuna machines list",
       });
+    },
+    async executeManagedCommand(machineId, operationId, input, signal) {
+      const safeId = encodeMachineId(machineId);
+      assertCanonicalUuid(operationId, "execution ID");
+      if (typeof input.command !== "string" || input.command.length === 0 || input.command.includes("\0") ||
+          (input.args !== undefined && (!Array.isArray(input.args) || input.args.some(arg => typeof arg !== "string" || arg.includes("\0")))) ||
+          typeof input.cwd !== "string" ||
+          !/^\/workspace\/workspaces\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\/|$)/u.test(input.cwd) ||
+          input.cwd.includes("\\") || input.cwd.split("/").some(part => part === "." || part === "..") || /[\p{Cc}\p{Cf}]/u.test(input.cwd) ||
+          (input.timeoutSecs !== undefined && (!Number.isSafeInteger(input.timeoutSecs) || input.timeoutSecs < 1 || input.timeoutSecs > 600))) {
+        throw usageError("Invalid managed command request.", "Choose an exact remote Workspace path and a timeout from 1 to 600 seconds.");
+      }
+      const body = { operation_id: operationId, command: input.command,
+        ...(input.args === undefined ? {} : { args: [...input.args] }), cwd: input.cwd,
+        ...(input.timeoutSecs === undefined ? {} : { timeout_secs: input.timeoutSecs }) };
+      if (Buffer.byteLength(JSON.stringify(body)) > 8 * 1024 * 1024) throw usageError("Managed command request exceeds 8 MiB.");
+      const request: HttpRequest = { method: "POST", path: `/v1/sessions/${safeId}/exec`, body,
+        budgetMs: (input.timeoutSecs ?? 120) * 1000 + 5000,
+        settleWith: `cuna executions get ${operationId} --machine ${machineId}`,
+        ...(signal === undefined ? {} : { signal }) };
+      return fetchDecoded(request, decodeManagedCommandResult);
     },
     async listManagedExecutions(machineId, input = {}, signal) {
       const safeId = encodeMachineId(machineId);

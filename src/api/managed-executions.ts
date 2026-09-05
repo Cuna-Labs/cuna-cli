@@ -1,5 +1,33 @@
 import { contractViolation } from "../core/validation.js";
 
+export interface ManagedCommandInput {
+  readonly command: string;
+  readonly args?: readonly string[];
+  readonly cwd: string;
+  readonly timeoutSecs?: number;
+}
+
+export interface ManagedCommandResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly durationMs: number;
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
+}
+
+/** Output remains data; the terminal renderer must escape control sequences. */
+export function decodeManagedCommandResult(value: unknown): ManagedCommandResult {
+  const row = object(value, ["exit_code", "stdout", "stderr", "duration_ms", "stdout_truncated", "stderr_truncated"]);
+  if (!Number.isSafeInteger(row.exit_code) || !Number.isSafeInteger(row.duration_ms) || Number(row.duration_ms) < 0 ||
+      typeof row.stdout !== "string" || typeof row.stderr !== "string" ||
+      typeof row.stdout_truncated !== "boolean" || typeof row.stderr_truncated !== "boolean") {
+    throw contractViolation("managed_command_result");
+  }
+  return Object.freeze({ exitCode: row.exit_code as number, stdout: row.stdout, stderr: row.stderr,
+    durationMs: row.duration_ms as number, stdoutTruncated: row.stdout_truncated, stderrTruncated: row.stderr_truncated });
+}
+
 export interface ManagedExecution {
   readonly operationId: string;
   readonly machineId: string;
