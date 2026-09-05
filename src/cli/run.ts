@@ -728,6 +728,26 @@ function writeTerminalSupervisorReadiness(
   }
 }
 
+function inlineProgressColumns(stream: Writable): number {
+  const tty = stream as Writable & {
+    columns?: number;
+    _handle?: { getWindowSize?: (size: number[]) => number };
+  };
+  // Node 24 on Windows can retain stale public columns after ConPTY resize.
+  // Read this stream's native TTY observation without changing its prototype
+  // or cached fields. This guarded private API depends on the supported Node
+  // engine; absent/failed/malformed observations retain the ordinary fallback.
+  if (process.platform === "win32" && typeof tty._handle?.getWindowSize === "function") {
+    try {
+      const size: number[] = [];
+      if (tty._handle.getWindowSize(size) === 0 && size.length === 2 &&
+        Number.isSafeInteger(size[0]) && size[0]! >= 2 && size[0]! <= 4096 &&
+        Number.isSafeInteger(size[1]) && size[1]! >= 1 && size[1]! <= 4096) return size[0]!;
+    } catch { /* An unavailable native observation does not break progress. */ }
+  }
+  return Number.isSafeInteger(tty.columns) && tty.columns! >= 2 && tty.columns! <= 4096 ? tty.columns! : 80;
+}
+
 function startInlineProgress(stream: Writable, color: boolean, initialLabel = "Loading machines"): Readonly<InlineProgress> {
   const frames = ["◐", "◓", "◑", "◒"];
   const bars = ["━╺━━━━", "━━╺━━━", "━━━╺━━", "━━━━╺━", "━━━━━╺", "━━━━╸━", "━━━╸━━", "━━╸━━━"];
@@ -738,8 +758,7 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
   let lastColumns = 0;
   let lastCells = 0;
   const paint = (): void => {
-    const observedColumns = (stream as Writable & { columns?: number }).columns;
-    const columns = Number.isSafeInteger(observedColumns) && observedColumns! > 1 ? observedColumns! : 80;
+    const columns = inlineProgressColumns(stream);
     const elapsed = Date.now() - startedAt;
     // A spinner alone is too easy to mistake for a frozen cursor on slower
     // Windows terminals. Keep the phase honest, then add a small, actionable

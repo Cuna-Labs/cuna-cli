@@ -383,9 +383,19 @@ test("no-args remains help off-TTY but a real TTY infers and attaches the select
 test("both interactive menus create in the selected remote Workspace without local synchronization", async () => {
   const { Terminal } = (await import("@xterm/headless")).default;
   for (const argv of [[], ["machines"]]) {
-    for (const columns of [60, 80, 100, 160]) {
+    for (const { columns, nativeMode } of [
+      ...[60, 80, 100, 160].map(columns => ({ columns, nativeMode: "absent" })),
+      ...(process.platform === "win32" ? ["fresh", "failed", "malformed", "throws"].map(nativeMode => ({ columns: 100, nativeMode })) : []),
+    ]) {
     const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
     interactive.streams.stderr.columns = columns;
+    let nativeColumns = columns;
+    if (nativeMode !== "absent") interactive.streams.stderr._handle = { getWindowSize(size) {
+      if (nativeMode === "throws") throw new Error("synthetic native observation unavailable");
+      if (nativeMode === "failed") return -1;
+      size.push(nativeMode === "malformed" ? Number.NaN : nativeColumns, 30);
+      return 0;
+    } };
     const physical = new Terminal({ cols: columns, rows: 30, allowProposedApi: true });
     let consumed = 0;
     const observedRows = [];
@@ -431,7 +441,8 @@ test("both interactive menus create in the selected remote Workspace without loc
         input.onProgress("界🙂 e\u0301 ".repeat(50));
         await checkRow();
         physical.resize(60, 30);
-        interactive.streams.stderr.columns = 60;
+        nativeColumns = 60;
+        if (nativeMode !== "fresh") interactive.streams.stderr.columns = 60;
         input.onProgress("界🙂 e\u0301 ".repeat(51));
         await checkRow();
       },
