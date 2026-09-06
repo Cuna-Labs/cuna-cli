@@ -1559,7 +1559,7 @@ export class ForegroundTerminalCoordinator {
     const tabId = this.#activeTabId;
     if (tabId === undefined) return undefined;
     const tab = this.#tabs.get(tabId);
-    if (tab === undefined || tab.snapshot.state !== "active") return undefined;
+    if (tab === undefined || tab.snapshot.state !== "active" || tab.snapshot.terminalView?.ready === false) return undefined;
     return Object.freeze({
       tabId,
       binding: Object.freeze({
@@ -1639,7 +1639,9 @@ export class ForegroundTerminalCoordinator {
     ) return;
 
     const runtime = this.#requireRuntime();
-    if (repaintAfterReplay) {
+    // Canonical views supply a complete fresh rendering stream. Legacy repaint
+    // input must not enter their provider, especially before view readiness.
+    if (repaintAfterReplay && snapshot.terminalView === undefined) {
       // A fullscreen provider may have painted before initial attach, so
       // replay can contain only later cursor-relative deltas. Trigger SIGWINCH
       // with a bounded row bounce, then restore the exact isolated viewport.
@@ -1654,7 +1656,7 @@ export class ForegroundTerminalCoordinator {
       ) return;
     }
     await runtime.resize(dimensions.columns, rows, snapshot.tabId);
-    if (repaintAfterReplay) {
+    if (repaintAfterReplay && snapshot.terminalView === undefined) {
       const afterResize = this.#tabs.get(snapshot.tabId);
       if (
         afterResize !== tab ||

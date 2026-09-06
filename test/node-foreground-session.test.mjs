@@ -6,7 +6,7 @@ import {
   selectNodeForegroundPresentation,
 } from "../dist/runtime/node-foreground-session.js";
 import { CunaError, EXIT_CODES } from "../dist/core/errors.js";
-import { encodeTerminalControl, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
+import { encodeTerminalControl, encodeTerminalFrame, decodeTerminalFrame, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
 import { runtimeFailure } from "../dist/runtime/errors.js";
 
 const NOW = 1_800_000_000_000;
@@ -152,6 +152,7 @@ test("attach progress hands off before terminal ownership", async () => {
   await operation;
   assert.ok(events.indexOf(`get:${SESSION_A}`) < events.indexOf("progress:stop"));
   assert.ok(events.indexOf("progress:stop") < events.indexOf("host:acquire"));
+  assert.equal(system.offers[0], "cuna.terminal-view.v1", "legacy raw READY remains accepted after the optional offer");
 });
 
 // PRD-PM-008 E14-D6. Detaching with Ctrl+] d used to print nothing, so the
@@ -333,11 +334,13 @@ class AsyncByteQueue {
   }
 }
 
-function terminalSystem(events, availability = () => "supported") {
+function terminalSystem(events, availability = () => "supported", canonical = false) {
   let generation = 0;
   let connectFailuresRemaining = 0;
   const grants = new Map();
   const activeQueues = new Set();
+  const offers = [];
+  const sent = [];
   const issuedRequests = new Map();
   const cancelledRequests = [];
   const controlPlane = {
@@ -388,6 +391,7 @@ function terminalSystem(events, availability = () => "supported") {
   const terminalConnector = {
     async connect(input) {
       events.push("wire:connect");
+      offers.push(input.terminalViewProtocol);
       if (connectFailuresRemaining > 0) {
         connectFailuresRemaining -= 1;
         throw new Error("replacement unavailable");
@@ -405,18 +409,21 @@ function terminalSystem(events, availability = () => "supported") {
         resizeCapability: "live",
         accessMode: "writer",
         writerEpoch: 1,
+        ...(canonical ? {terminalViewProtocol:{name:"cuna.terminal-view.v1",operation:"new",history:"current_view"}} : {}),
       }));
       events.push("wire:connected");
       return {
         connectionId: terminalSessionId,
         receive: () => queue,
-        async send() {},
+        async send(bytes) { sent.push(decodeTerminalFrame(bytes)); },
         async close() { events.push(`wire:close:${terminalSessionId}`); activeQueues.delete(queue); queue.close(); },
       };
     },
   };
   return {
     controlPlane,
+    offers, sent,
+    push(bytes) { for (const queue of activeQueues) queue.push(bytes); },
     cancelledRequests,
     terminalConnector,
     failNextConnections(count) { connectFailuresRemaining = count; },
@@ -1431,4 +1438,28 @@ test("TC-055-07 no-color foreground rendering emits no color control sequences",
   controller.abort();
   await assert.rejects(operation, /cancelled/u);
   assert.equal(host.writes.every((bytes) => !new TextDecoder().decode(bytes).includes("48;2;")), true);
+});
+
+
+test("default Windows foreground factory offers canonical views and waits for current view", async () => {
+  const events=[];const host=new FakeHost(events);const system=terminalSystem(events,()=>"supported",true);
+  const operation=runNodeForegroundSessions({client:fakeClient(events),baseUrl:"https://api.getcuna.com",agentSessionIds:[SESSION_A],hostPlatform:"win32"}, {host,environment:{},controlPlane:system.controlPlane,terminalConnector:system.terminalConnector,clock:()=>NOW});
+  void operation.catch(()=>undefined);
+  try {
+    await waitUntil(()=>host.writes.some(b=>new TextDecoder().decode(b).includes("Restoring terminal")),"factory must show restoring before current view");
+    assert.equal(system.offers[0],"cuna.terminal-view.v1");
+    host.emitInput(Uint8Array.of(65));
+    await new Promise(resolve=>setTimeout(resolve,20));
+    assert.equal(system.sent.filter(f=>f.type==="input").length,0);
+    const viewId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    system.push(encodeTerminalControl("view_started",0n,{protocol:"cuna.terminal-view.v1",operation:"new",viewId,columns:80,rows:22}));
+    system.push(encodeTerminalFrame({type:"output",critical:false,sequence:1n,payload:new TextEncoder().encode("CURRENT VIEW")}));
+    await waitUntil(()=>host.writes.some(b=>new TextDecoder().decode(b).includes("CURRENT VIEW")),"factory awaited renderer must consume current view");
+    assert.ok(new TextDecoder().decode(host.writes.at(-1)).includes("Restoring terminal"));
+    system.push(encodeTerminalControl("view_ready",0n,{viewId,afterOutputSequence:"1"}));
+    await waitUntil(()=>!new TextDecoder().decode(host.writes.at(-1)).includes("Restoring terminal"),"factory leaves restoring after ready");
+    host.emitInput(Uint8Array.of(66));
+    await waitUntil(()=>system.sent.some(f=>f.type==="input"),"ready view permits user input");
+    assert.deepEqual([...system.sent.find(f=>f.type==="input").payload],[66]);
+  } finally {host.emitInput(Uint8Array.of(3));await operation;}
 });

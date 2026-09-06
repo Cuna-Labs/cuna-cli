@@ -270,6 +270,7 @@ async function runNodeForegroundSessionsOnce(
   const callbacks = coordinator.runtimeCallbacks();
   const runtime = new CunaRuntimeBoundary({
     mode: "foreground",
+    canonicalTerminalViews: presentationMode === "rich",
     controlPlane,
     terminalConnector: dependencies.terminalConnector ?? createNodeWebSocketConnector(),
     allowedCunaOrigins: [allowedOrigin],
