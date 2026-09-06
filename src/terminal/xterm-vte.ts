@@ -119,9 +119,9 @@ export class XtermViewportAdapter {
   readonly #tabId: string;
   #binding: ViewportBinding;
   readonly #registry: ViewportRegistry;
-  readonly #terminal: XtermTerminal;
+  #terminal: XtermTerminal;
   readonly #encoder = new TextEncoder();
-  readonly #complexityDecoder = new TextDecoder();
+  #complexityDecoder = new TextDecoder();
   readonly #scrollback: number;
   readonly #onTerminalResponse: XtermViewportOptions["onTerminalResponse"];
   readonly #clock: () => number;
@@ -177,6 +177,10 @@ export class XtermViewportAdapter {
       try { this.#registry.close(options.tabId); } catch { /* the registry may not have opened */ }
       throw error;
     }
+    this.#configureTerminal();
+  }
+
+  #configureTerminal(): void {
     for (const identifier of CONTAINED_OSC_IDENTIFIERS) {
       // Cuna renders cells only. Consuming non-cell metadata prevents remote
       // title, hyperlink, and clipboard state from entering trusted host UI or
@@ -191,7 +195,7 @@ export class XtermViewportAdapter {
       if (params.some((value) => value === 25 || (Array.isArray(value) && value.includes(25)))) this.#cursorVisible = false;
       return false;
     });
-    if (options.onTerminalResponse !== undefined) {
+    if (this.#onTerminalResponse !== undefined) {
       this.#terminal.onData((value) => this.#queueTerminalResponse("data", this.#encoder.encode(value)));
       this.#terminal.onBinary((value) => this.#queueTerminalResponse(
         "binary",
@@ -219,6 +223,44 @@ export class XtermViewportAdapter {
       this.#binding = nextBinding;
       this.#responseAbort = new AbortController();
       return snapshot;
+    });
+    this.#writeTail = operation.then(() => undefined, () => undefined);
+    return await operation;
+  }
+
+  async resetForCurrentView(binding: ViewportBinding, columns: number, rows: number): Promise<ViewportSnapshot> {
+    this.#assertOpen();
+    assertViewportRebind(this.#binding, binding);
+    assertBufferBudget(columns, rows, this.#scrollback);
+    const nextBinding = Object.freeze({ ...binding });
+    this.#responseAbort.abort(new Error("The terminal rendering view was retired."));
+    const operation = this.#writeTail.then(() => {
+      this.#assertOpen();
+      // Recheck after queued transitions; never weaken the attachment fence.
+      assertViewportRebind(this.#binding, nextBinding);
+      try {
+        this.#resourceBudget.resize(this.#tabId, bufferCells(columns, rows, this.#scrollback));
+        this.#terminal.dispose();
+        this.#terminal = new Terminal({ cols: columns, rows, allowProposedApi: true,
+          scrollback: this.#scrollback, convertEol: false });
+        this.#complexityDecoder = new TextDecoder();
+        this.#cellExtenderRun = 0;
+        this.#responseBatch = undefined;
+        this.#responseBatchBytes = 0;
+        this.#responseOverflow = false;
+        this.#responseWindowStartedAt = this.#clock();
+        this.#responseWindowEvents = 0;
+        this.#responseWindowBytes = 0;
+        this.#cursorVisible = true;
+        this.#configureTerminal();
+        const snapshot = this.#registry.resetForCurrentView(this.#tabId, nextBinding, columns, rows);
+        this.#binding = nextBinding;
+        this.#responseAbort = new AbortController();
+        return snapshot;
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
     });
     this.#writeTail = operation.then(() => undefined, () => undefined);
     return await operation;

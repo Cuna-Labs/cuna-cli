@@ -117,6 +117,20 @@ export class ViewportRegistry {
     return next;
   }
 
+  resetForCurrentView(tabId: string, binding: ViewportBinding, columns: number, rows: number): ViewportSnapshot {
+    const current = this.require(tabId);
+    assertViewportRebind(current.binding, binding);
+    validateDimensions(columns, rows);
+    const next = freezeSnapshot({
+      tabId, binding, columns, rows, outputSequence: 0n, replayCursor: 0n,
+      cells: Array.from({ length: rows }, () => ""),
+      displayWidths: Array.from({ length: rows }, () => 0), cursorX: 0, cursorY: 0,
+      modes: { bracketedPaste: false, mouse: false, alternateScreen: false, cursorVisible: true },
+    });
+    this.#tabs.set(tabId, next);
+    return next;
+  }
+
   close(tabId: string): void {
     this.require(tabId);
     this.#tabs.delete(tabId);

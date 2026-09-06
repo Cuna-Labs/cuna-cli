@@ -9,6 +9,65 @@ import {
 } from "../dist/index.js";
 
 const encoder = new TextEncoder();
+
+for (const [name, prefix] of [
+  ["UTF8", Uint8Array.of(0xe4, 0xb8)],
+  ["CSI", encoder.encode("\x1b[31;")],
+  ["OSC", encoder.encode("\x1b]52;c;unfinished")],
+]) test(`fresh current view discards pending ${name} parser state and sequence`, async () => {
+  const { viewport, registry } = adapter();
+  try {
+    await viewport.write(encoder.encode("old\r\nscroll\x1b[?1049h\x1b[?2004h\x1b[?25l"), 90n, 90n);
+    await viewport.write(prefix, 91n, 91n);
+    registry.open("other", binding, 20, 3); registry.select("other");
+    const reset = await viewport.resetForCurrentView({ ...binding, fencingGeneration: 2 }, 30, 4);
+    assert.equal(registry.active().tabId, "other");
+    assert.equal(reset.outputSequence, 0n); assert.equal(reset.replayCursor, 0n);
+    assert.deepEqual(reset.cells, ["", "", "", ""]);
+    assert.equal(reset.modes.bracketedPaste, false); assert.equal(reset.modes.cursorVisible, true);
+    assert.equal(reset.modes.alternateScreen, false);
+    const current = await viewport.write(encoder.encode("NEW"), 1n, 1n);
+    assert.equal(current.cells[0], "NEW"); assert.equal(current.outputSequence, 1n);
+    assert.equal(current.renderRows[0][0].style.foreground, null);
+  } finally { viewport.dispose(); }
+});
+
+test("fresh view aborts old response authority immediately and drains queued writes", async () => {
+  let release; let entered = false; const replies = [];
+  const gate = new Promise(resolve => { release = resolve; });
+  const { viewport } = adapter({ onTerminalResponse: async response => {
+    replies.push(response); entered = true; await gate;
+    if (response.signal.aborted) throw response.signal.reason;
+  } });
+  try {
+    const old = viewport.write(encoder.encode("OLD\x1b[6n"), 20n, 20n);
+    const deadline = Date.now() + 1_000;
+    while (!entered && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 1));
+    assert.equal(entered, true, "old query callback must start within one second");
+    const queued = viewport.write(encoder.encode("QUEUED\x1b[6n"), 21n, 21n);
+    const fresh = viewport.resetForCurrentView({ ...binding, fencingGeneration: 2 }, 40, 6);
+    assert.equal(replies[0].signal.aborted, true);
+    release(); await old; await queued; await fresh;
+    assert.equal(viewport.snapshot().cells[0], "");
+    await viewport.write(encoder.encode("NEW\x1b[6n"), 1n, 1n);
+    assert.equal(replies.at(-1).binding.fencingGeneration, 2);
+    assert.equal(replies.at(-1).signal.aborted, false);
+  } finally { release(); viewport.dispose(); }
+});
+
+test("invalid fresh-view binding or geometry preserves current state", async () => {
+  const { viewport } = adapter();
+  try {
+    await viewport.write(encoder.encode("KEEP"), 8n, 8n);
+    const before = viewport.snapshot();
+    for (const next of [binding, { ...binding, fencingGeneration: 2, processEpoch: "other" }]) {
+      await assert.rejects(viewport.resetForCurrentView(next, 40, 6));
+      assert.deepEqual(viewport.snapshot(), before);
+    }
+    await assert.rejects(viewport.resetForCurrentView({ ...binding, fencingGeneration: 2 }, 0, 6));
+    assert.deepEqual(viewport.snapshot(), before);
+  } finally { viewport.dispose(); }
+});
 const binding = {
   userId: "user-1",
   machineId: "machine-1",
