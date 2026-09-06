@@ -462,6 +462,7 @@ function agentSessionRecord(session: AgentSession, machine?: Machine, now?: numb
     desired_state: session.desiredState,
     request_state: session.requestState,
     process_state: session.processState,
+    ...(session.terminalReason === undefined ? {} : { terminal_reason: session.terminalReason }),
     ...(session.processEpoch === undefined ? {} : { process_epoch: session.processEpoch }),
     ...(session.runtimeObservedAt === undefined ? {} : { runtime_observed_at: session.runtimeObservedAt }),
     ...(session.runtimeExpiresAt === undefined ? {} : { runtime_expires_at: session.runtimeExpiresAt }),

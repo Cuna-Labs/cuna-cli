@@ -2305,6 +2305,44 @@ test("agent-sessions get shows all three states when they disagree", async () =>
   assert.equal(settledState, "terminated", settledStreams.stdout());
 });
 
+test("agent-sessions get surfaces the safe terminal reason in JSON", async () => {
+  // Production 2026-09-06 (AgentSession 1b2d0154): the Edge wire carried
+  // terminal_reason but the JSON serializer's explicit field list dropped it,
+  // so a person running `cuna agent-sessions get --json` never saw why a
+  // session ended. The field is a closed enum and only set on terminal states.
+  const sessionId = "44444444-4444-4444-8444-444444444444";
+  const streams = memoryStreams({});
+  const exit = await runCli(["agent-sessions", "get", sessionId, "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getAgentSession(id) {
+        return agentSession({
+          id,
+          desiredState: "running",
+          requestState: "terminal",
+          processState: "exited",
+          terminalReason: "canonical_launch_interrupted",
+        });
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(JSON.parse(streams.stdout()).data.terminal_reason, "canonical_launch_interrupted");
+  // NEGATIVE CONTROL: a session with no reason must not carry the key at all.
+  const bareStreams = memoryStreams({});
+  await runCli(["agent-sessions", "get", sessionId, "--json"], {
+    streams: bareStreams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getAgentSession(id) { return agentSession({ id, processState: "running" }); },
+    }),
+  });
+  assert.equal("terminal_reason" in JSON.parse(bareStreams.stdout()).data, false);
+});
+
 test("AgentSession create keeps auth mode explicit and rename is capability-gated", async () => {
   const machineId = "22222222-2222-4222-8222-222222222222";
   const sessionId = "11111111-1111-4111-8111-111111111111";

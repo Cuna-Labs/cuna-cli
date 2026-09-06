@@ -3,27 +3,27 @@ export const INFRA_OPENAPI_CONTRACT_IDENTITY = Object.freeze({
   "schemaVersion": 2,
   "artifact_file": "contracts/infra/cuna-api.openapi.json",
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
-  "infra_openapi_raw_sha256": "6fbd9f65bcdf999b885f072389750d429a8e04e0b82b6b8e94c4b1dc411d9704",
-  "infra_openapi_canonical_sha256": "7c2e76a8f345ff2e6e812a6394a490567ee9f7cf527bb8059e2e1dafa9614b31",
+  "infra_openapi_raw_sha256": "055962e6f17370295f8ea64cf8a276e9d92e0456b9eb50880a0ea96cebcf4fe5",
+  "infra_openapi_canonical_sha256": "6d22c53a8790d63b7eb5ecd40f90945f2de187651ccdd7543cce4524d4d9cd64",
   "producer_repository": "Cuna-Labs/infra",
   "producer_content_state": "committed",
-  "producer_revision": "df0150dd8585f5d14ae8345992e57f0edca8e15e",
+  "producer_revision": "15a40840f8c0f927a9192b725b660e98fda77dcf",
   "producer_full_tree": {
     "object_format": "sha1",
-    "commit": "df0150dd8585f5d14ae8345992e57f0edca8e15e",
-    "tree": "fdd7ec47a7e4309c2fc8a1d3911236b51ede91e6",
-    "contract_blob": "82b006585c9f700a74dd4d822b257ec9ce3cbb32"
+    "commit": "15a40840f8c0f927a9192b725b660e98fda77dcf",
+    "tree": "43010494c831904df771c6bb5c04d10425e81ff2",
+    "contract_blob": "8dd8e0d5a7eda9a1d9033158efda77fe1cb0d979"
   },
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
-  "producer_projection_sha256": "63ac1ef2def78c2a0d3e27cc44420bcdc5e1fb372210b6fcfaafbac9f0107a6c",
-  "producer_runtime_manifest_sha256": "74aecca73114e10914f94c0616468ad336bad15fa3e2f53e60d6c1a38a0719f0",
+  "producer_projection_sha256": "2748cb6d5a7b6d4f1efa389ca1a739d34940422ae350359367a982d9f261694e",
+  "producer_runtime_manifest_sha256": "f4876ae0d960a16673858ab58c4944cd0f7bb58cae5e665938ad9a8a50020487",
   "feature_contracts": {
     "opencode_interactive_only": {
-      "openapi_raw_sha256": "6fbd9f65bcdf999b885f072389750d429a8e04e0b82b6b8e94c4b1dc411d9704",
-      "openapi_canonical_sha256": "7c2e76a8f345ff2e6e812a6394a490567ee9f7cf527bb8059e2e1dafa9614b31",
-      "producer_commit": "df0150dd8585f5d14ae8345992e57f0edca8e15e",
-      "producer_tree": "fdd7ec47a7e4309c2fc8a1d3911236b51ede91e6",
-      "producer_contract_blob": "82b006585c9f700a74dd4d822b257ec9ce3cbb32"
+      "openapi_raw_sha256": "055962e6f17370295f8ea64cf8a276e9d92e0456b9eb50880a0ea96cebcf4fe5",
+      "openapi_canonical_sha256": "6d22c53a8790d63b7eb5ecd40f90945f2de187651ccdd7543cce4524d4d9cd64",
+      "producer_commit": "15a40840f8c0f927a9192b725b660e98fda77dcf",
+      "producer_tree": "43010494c831904df771c6bb5c04d10425e81ff2",
+      "producer_contract_blob": "8dd8e0d5a7eda9a1d9033158efda77fe1cb0d979"
     }
   }
 } as const);

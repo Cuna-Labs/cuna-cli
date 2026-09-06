@@ -5189,6 +5189,24 @@
             "type": "string",
             "pattern": "^[a-z][a-z0-9_.]{0,127}$",
             "description": "Safe reason for failed pre-spawn Workspace delivery, present only when request_state is failed. A refusal does not imply a child process existed. Remote edits and replacement without writer fencing are preserved."
+          },
+          "terminal_reason": {
+            "type": "string",
+            "enum": [
+              "process_exited",
+              "process_not_observed",
+              "owner_unrecoverable",
+              "opencode_server_exited",
+              "terminal_model_terminated_unobserved",
+              "session_executable_allowlist",
+              "session_executable_unavailable",
+              "session_executable_permissions",
+              "session_executable_owner",
+              "session_executable_location",
+              "canonical_launch_interrupted",
+              "machine_restarted"
+            ],
+            "description": "Optional safe reason from an accepted terminal process observation; emitted only for exited, failed or terminated. Absent for legacy or unrecognized reasons. This is not provider output or an exit status."
           }
         }
       },
@@ -5956,11 +5974,11 @@
                           "number",
                           "null"
                         ],
-                        "description": "The provider's own balance when balance_status is 'available', and null otherwise. Null means unknown â€” never zero, and never an assumed grant minus estimated spend. That subtraction once reported 22.12 USD remaining to an account the provider had already cut off at 0.00."
+                        "description": "The provider's own balance when balance_status is 'available', and null otherwise. Null means unknown \u00e2\u20ac\u201d never zero, and never an assumed grant minus estimated spend. That subtraction once reported 22.12 USD remaining to an account the provider had already cut off at 0.00."
                       },
                       "balance_unavailable_reason": {
                         "type": "string",
-                        "description": "Present exactly when balance_status is 'unavailable'. A renderer must show this instead of a number, never a spinner: no balance can arrive later. It must not tell the reader to check their provider account â€” Cuna assigns provider accounts it owns, so the reader holds no such account."
+                        "description": "Present exactly when balance_status is 'unavailable'. A renderer must show this instead of a number, never a spinner: no balance can arrive later. It must not tell the reader to check their provider account \u00e2\u20ac\u201d Cuna assigns provider accounts it owns, so the reader holds no such account."
                       },
                       "note": {
                         "type": "string"
