@@ -2705,6 +2705,26 @@ for (const phase of ["initial", "live", "reconnect"]) {
   });
 }
 
+test("a remote ERROR frame's bounded code is kept beside the protocol failure; unbounded text is not", async () => {
+  // Production 2026-09-06 (AgentSession 4ce7fd8d): the supervisor failed every
+  // attached view with `view.lease_expired`, and the CLI could only say
+  // `terminal_protocol_error`. The remote code is a rendering aid, never the
+  // failure classification, and only an identifier-shaped code survives.
+  for (const [code, expected] of [["view.lease_expired", "view.lease_expired"], ["Not An Identifier; secret=x", undefined]]) {
+    const system = new FakeTerminalSystem();
+    const { runtime } = createRuntime(system);
+    try {
+      await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+      system.connections[0].incoming.push(encodeTerminalControl("error", 0n, { code, retryable: false, safeReason: code }));
+      await waitUntil(() => runtime.listTerminals()[0].state === "failed", "remote error fails the attachment");
+      const terminal = runtime.listTerminals()[0];
+      assert.equal(terminal.reason, "terminal_protocol_error");
+      assert.equal(terminal.remoteReason, expected);
+      assert.equal(system.createCalls.length, 1, "no automatic replacement or retry");
+    } finally { await runtime.shutdown(); }
+  }
+});
+
 for (const phase of ["initial", "live", "reconnect"]) {
   test(`history gap ERROR is permanent and preserves its specific reason: ${phase}`, async () => {
     const system = new FakeTerminalSystem();

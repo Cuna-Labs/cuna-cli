@@ -104,6 +104,14 @@ export interface RuntimeTerminalSnapshot {
   readonly heartbeatObservedAt: number;
   readonly heartbeatExpiresAt: number;
   readonly reason?: string;
+  /**
+   * The safe code the remote side gave for a `failed` state, when it gave one
+   * (`view.lease_expired`, `opencode_server_exited`, ...). `reason` alone said
+   * only `terminal_protocol_error` for every remote ERROR frame, so a lapsed
+   * lease, a dead provider and a decode fault all rendered the same sentence
+   * (production 2026-09-06, AgentSession 4ce7fd8d).
+   */
+  readonly remoteReason?: string;
 }
 
 export interface RuntimeTerminalResponse {
@@ -202,6 +210,7 @@ interface TerminalEntry {
   localActionsNegotiated: boolean;
   localActionAcceptance: TerminalLocalActionProtocolAcceptance | undefined;
   reason?: string;
+  remoteReason?: string;
   pump?: Promise<void>;
   sendTail: Promise<void>;
   connectionRevision: number;
@@ -1549,6 +1558,9 @@ export class CunaRuntimeBoundary {
       retireInputAcceptance(entry);
       entry.outputContinuity = "unknown";
       entry.reason = safeReason(error);
+      const remoteReason = remoteSafeReason(error);
+      if (remoteReason === undefined) delete entry.remoteReason;
+      else entry.remoteReason = remoteReason;
       this.#publish(entry);
       await connection.close({ code: 1002, reason: "cuna_terminal_protocol_failure" }).catch(() => undefined);
     }
@@ -2035,7 +2047,19 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000, now = Date.
     heartbeatObservedAt: entry.lastHeartbeatAt,
     heartbeatExpiresAt: entry.lastHeartbeatAt + heartbeatTimeoutMs,
     ...(entry.reason === undefined ? {} : { reason: entry.reason }),
+    ...(entry.remoteReason === undefined ? {} : { remoteReason: entry.remoteReason }),
   });
+}
+
+/**
+ * The remote side's own code for a failure, only when it is a bounded
+ * identifier: `#remoteTerminalError` stores the ERROR frame's `code` under
+ * `safeDetails.reason`, and nothing else is ever rendered from a remote frame.
+ */
+function remoteSafeReason(error: unknown): string | undefined {
+  if (!(error instanceof RuntimeBoundaryError)) return undefined;
+  const reason = error.safeDetails?.reason;
+  return typeof reason === "string" && reason !== error.code && /^[a-z][a-z0-9_.]{0,63}$/u.test(reason) ? reason : undefined;
 }
 
 function sameEntryBinding(entry: TerminalEntry, binding: RuntimeTerminalResponse["binding"]): boolean {

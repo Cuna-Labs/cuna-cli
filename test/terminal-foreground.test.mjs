@@ -927,6 +927,22 @@ test("foreground retains a protocol failure without exposing arbitrary remote re
   }
 });
 
+test("foreground names the remote side's own safe code for a protocol failure and nothing else", async () => {
+  // Production 2026-09-06 (AgentSession 4ce7fd8d): a lapsed supervisor lease
+  // (`view.lease_expired`) and a dead OpenCode server both rendered the same
+  // "could not safely process the terminal stream" sentence. The remote code
+  // is bounded by the boundary before it reaches here; the foreground only
+  // renders what the snapshot carries.
+  const { coordinator, callbacks, intents } = harness();
+  await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "failed", reason: "terminal_protocol_error", remoteReason: "view.lease_expired" });
+  await coordinator.waitForStop();
+  assert.equal(coordinator.failure.code, "terminal_protocol_error");
+  assert.match(coordinator.failure.message, /view\.lease_expired/u);
+  assert.match(coordinator.failure.message, /Inspect this session before reconnecting/u);
+  assert.equal(coordinator.failure.safeDetails?.reason, "view.lease_expired");
+});
+
 test("host output backpressure is awaited before terminal output is acknowledged", async () => {
   const { coordinator, callbacks, host, intents } = harness();
   await coordinator.start(intents.slice(0, 1));

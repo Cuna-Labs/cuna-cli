@@ -691,8 +691,11 @@ export class ForegroundTerminalCoordinator {
               retryable: false, safeDetails: { reason: snapshot.reason },
             })
             : snapshot.reason === "terminal_protocol_error"
-              ? runtimeFailure("terminal_protocol_error", "Cuna could not safely process the terminal stream. Inspect this session before reconnecting.", {
+              ? runtimeFailure("terminal_protocol_error", snapshot.remoteReason === undefined
+                ? "Cuna could not safely process the terminal stream. Inspect this session before reconnecting."
+                : `The remote terminal ended the stream: ${snapshot.remoteReason}. Inspect this session before reconnecting.`, {
                 retryable: false,
+                ...(snapshot.remoteReason === undefined ? {} : { safeDetails: { reason: snapshot.remoteReason } }),
               })
               : runtimeFailure("terminal_disconnected", "A foreground AgentSession terminal failed."));
         }
