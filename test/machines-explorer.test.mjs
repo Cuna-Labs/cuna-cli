@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CunaError, runNodeMachinesExplorer } from "../dist/index.js";
+import { CunaError, decideCapability, runNodeMachinesExplorer } from "../dist/index.js";
 
 const MACHINE_ID = "33333333-3333-4333-8333-333333333333";
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
@@ -1924,3 +1924,81 @@ for (const reason of ["opencode_runtime_unverified", "opencode_supervisor_protoc
     } finally { releaseCapability(); host.emitInput([0x71]); assert.equal(await operation, undefined); }
   });
 }
+
+for (const clockCase of ["delayed", "future", "stale"]) {
+  test(`delete capability uses receipt clock: ${clockCase}`, { timeout: 5000 }, async () => {
+    const host = new FakeHost(); let now = Date.now(); const requestTime = now; let armed = false; let resolveDiscovery; let deletes = 0;
+    const operation = runNodeMachinesExplorer({ client: {
+      async listMachines() { return { items: deletes ? [] : [{ id: MACHINE_ID, name: "clock", state: "error", agent: "opencode" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, id) {
+        if (armed) await new Promise(resolve => { resolveDiscovery = resolve; });
+        const snapshot = { ...capabilitySnapshot(scope, id, [supported("machines.delete", "destructive")]),
+          observedAt: new Date(now + (clockCase === "future" ? 6000 : -1000)).toISOString(),
+          expiresAt: new Date(now + (clockCase === "stale" ? -1 : 30000)).toISOString() };
+        if (clockCase === "delayed" && now > requestTime) assert.equal(decideCapability(snapshot, "machines.delete", requestTime).reason, "future_observation", "old pre-request clock reproduces refusal with identical evidence");
+        return snapshot;
+      },
+      async deleteMachine() { deletes++; },
+      async getMachine() { throw new CunaError({ code: "cuna.remote.not_found", message: "gone", exitCode: 7 }); },
+    } }, { host, now: () => now, convergence: { pollIntervalMs: 1, budgetMs: 1000 } });
+    try {
+      await waitUntil(() => lastFrame(host).includes("clock  error") && !lastFrame(host).includes("Refreshing live sessions"), "inventory settled");
+      host.emitInput([13]); await waitUntil(() => lastFrame(host).includes("Delete machine"), "detail");
+      host.emitInput([13]); await waitUntil(() => lastFrame(host).includes("Press Enter again"), "confirmation");
+      armed = true; host.emitInput([13]); await waitUntil(() => resolveDiscovery !== undefined, "discovery pending");
+      now += 7000; armed = false; resolveDiscovery();
+      if (clockCase === "delayed") await waitUntil(() => deletes === 1, "late fresh observation accepted");
+      else { await waitUntil(() => lastFrame(host).includes("Nothing was requested"), "invalid observation refused"); assert.equal(deletes, 0); }
+    } finally { resolveDiscovery?.(); host.emitInput([3]); await operation; }
+  });
+}
+
+for (const change of ["epoch", "name", "state", "unchanged"]) {
+test(`delete confirmation across deferred refresh: ${change}`, { timeout: 5000 }, async () => {
+  const host = new FakeHost(); let reads = 0; let resolveSessions; let deletes = 0; let name = "stable"; let state = "error";
+  const operation = runNodeMachinesExplorer({ client: {
+    async listMachines() { return { items: deletes ? [] : [{ id: MACHINE_ID, name, state, agent: "opencode" }] }; },
+    async listAgentSessions() { if (++reads > 1) return new Promise(resolve => { resolveSessions = resolve; }); return { items: [agentSession()] }; },
+    async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [supported("machines.delete", "destructive")]); },
+    async deleteMachine() { deletes++; },
+    async getMachine() { throw new CunaError({ code: "cuna.remote.not_found", message: "gone", exitCode: 7 }); },
+  } }, { host });
+  try {
+    await waitUntil(() => lastFrame(host).includes("stable  error") && !lastFrame(host).includes("Refreshing machine"), "settled");
+    host.emitInput([13]); await waitUntil(() => lastFrame(host).includes("Delete machine"), "detail");
+    host.emitInput([13]); await waitUntil(() => lastFrame(host).includes("Press Enter again"), "armed");
+    host.emitInput([114]); await waitUntil(() => resolveSessions !== undefined && lastFrame(host).includes("Refreshing machine"), "refresh pending");
+    host.emitInput([13]); assert.equal(deletes, 0);
+    resolveSessions({ items: [agentSession()] });
+    await waitUntil(() => !lastFrame(host).includes("Refreshing machine") && lastFrame(host).includes("Press Enter again"), "unchanged refresh retains prompt");
+    if (change === "unchanged") {
+      host.emitInput([13]); await waitUntil(() => deletes === 1, "unchanged refresh permits exactly one delete");
+    } else {
+      if (change === "name") name = "renamed";
+      if (change === "state") state = "stopped";
+      resolveSessions = undefined; host.emitInput([114]); await waitUntil(() => resolveSessions !== undefined && lastFrame(host).includes("Refreshing machine"), "next refresh pending");
+      resolveSessions({ items: [agentSession(change === "epoch" ? { processEpoch: "epoch-2", rowVersion: 2, updatedAt: new Date().toISOString() } : {})] });
+      await waitUntil(() => !lastFrame(host).includes("Refreshing machine") && !lastFrame(host).includes("Press Enter again"), "meaningful change invalidates");
+      host.emitInput([13]); await waitUntil(() => lastFrame(host).includes("Press Enter again"), "new confirmation required"); assert.equal(deletes, 0);
+    }
+  } finally { resolveSessions?.({ items: [] }); host.emitInput([3]); await operation; }
+});
+}
+
+test("session-create discovery samples the clock after delayed response", { timeout: 5000 }, async () => {
+  const host = new FakeHost(); let now = Date.now(); let release;
+  const operation = runNodeMachinesExplorer({ client: {
+    async listMachines() { return { items: [{ id: MACHINE_ID, name: "late-create", state: "running", agent: "codex" }] }; },
+    async listAgentSessions() { return { items: [] }; },
+    async discoverCapabilities(scope, id) {
+      await new Promise(resolve => { release = resolve; });
+      return { ...capabilitySnapshot(scope, id, [supported("agent_sessions.workspace.create")]), observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 30000).toISOString() };
+    },
+  } }, { host, now: () => now });
+  try {
+    await waitUntil(() => release !== undefined, "discovery in flight"); now += 7000; release();
+    host.emitInput([13]);
+    await waitUntil(() => lastFrame(host).includes("New Codex session"), "fresh late session-create capability accepted");
+  } finally { release?.(); host.emitInput([3]); await operation; }
+});

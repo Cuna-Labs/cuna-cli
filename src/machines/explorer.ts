@@ -233,7 +233,9 @@ export async function runNodeMachinesExplorer(
    */
   let lifecycleNotice: string | undefined;
   let pendingSupervisorUpdateMachineId: string | undefined;
-  let pendingDeleteMachineId: string | undefined;
+  let pendingDelete: { fingerprint: string; notice: string } | undefined;
+  const deleteFingerprint = (row: MachineRow): string => JSON.stringify([row.machine.id, row.machine.name, row.machine.state,
+    row.sessions.map(session => [session.id, session.processEpoch]).sort((a, b) => String(a[0]).localeCompare(String(b[0])))]);
   let newMachine: NewMachineState = Object.freeze({ capability: "checking" });
   let newMachineName = "";
   let closingNotice: string | undefined;
@@ -276,6 +278,11 @@ export async function runNodeMachinesExplorer(
 
   const render = (): void => {
     if (stopped) return;
+    if (pendingDelete !== undefined) {
+      const screen = navigation.screen;
+      const target = screen.kind === "machine" ? rows.find(row => row.machine.id === screen.machineId) : undefined;
+      if (target === undefined || selectedKey !== "machine-lifecycle:delete" || deleteFingerprint(target) !== pendingDelete.fingerprint) pendingDelete = undefined;
+    }
     renderRequested = true;
     if (renderInFlight) return;
     renderInFlight = true;
@@ -295,7 +302,7 @@ export async function runNodeMachinesExplorer(
             navigation,
             machinesListed: initialized,
             refreshError,
-            interactionNotice,
+            interactionNotice: pendingDelete?.notice ?? interactionNotice,
             lifecycleNotice,
             closingNotice,
             newMachine,
@@ -380,7 +387,7 @@ export async function runNodeMachinesExplorer(
     selectedKey = undefined;
     render();
     const capabilityId = action === "delete" ? "machines.delete" : "machines.lifecycle";
-    const decision = await decideExplorerCapability(input.client, "machine", machineId, capabilityId, dependencies.now?.() ?? Date.now(), requestSignal);
+    const decision = await decideExplorerCapability(input.client, "machine", machineId, capabilityId, () => dependencies.now?.() ?? Date.now(), requestSignal);
     if (isClosing()) return;
     if (decision.status !== "supported") {
       settle();
@@ -458,12 +465,12 @@ export async function runNodeMachinesExplorer(
     interactionNotice = undefined;
     lifecycleNotice = undefined;
     pendingSupervisorUpdateMachineId = undefined;
-    pendingDeleteMachineId = undefined;
+    pendingDelete = undefined;
     navigation = reduceMachineFirstNavigation(navigation, { type: "open-new-machine" });
     newMachine = Object.freeze({ capability: "checking" });
     selectedKey = undefined;
     render();
-    void decideExplorerCapability(input.client, "account", undefined, "machines.create", dependencies.now?.() ?? Date.now(), requestSignal)
+    void decideExplorerCapability(input.client, "account", undefined, "machines.create", () => dependencies.now?.() ?? Date.now(), requestSignal)
       .then((decision) => {
         if (isClosing()) return;
         newMachine = decision.status === "supported"
@@ -524,9 +531,6 @@ export async function runNodeMachinesExplorer(
       listFailure = undefined;
       clearListRetry();
       interactionNotice = undefined;
-      // The delete prompt lives in `interactionNotice`; once a refresh has
-      // taken it off the screen, the next Enter must ask again, not delete.
-      pendingDeleteMachineId = undefined;
       const capabilityNow = dependencies.now?.() ?? Date.now();
       const loaded = machines.map((machine): MachineRow => {
         const previous = previousRows.get(machine.id);
@@ -605,7 +609,7 @@ export async function runNodeMachinesExplorer(
         const capabilityTask = observeSessionCreateCapability(
           input.client,
           machine.id,
-          dependencies.now?.() ?? Date.now(),
+          () => dependencies.now?.() ?? Date.now(),
           requestSignal,
         ).then((capability) => {
           if (stopped || closingNotice !== undefined) return;
@@ -658,7 +662,7 @@ export async function runNodeMachinesExplorer(
     interactionNotice = undefined;
     lifecycleNotice = undefined;
     pendingSupervisorUpdateMachineId = undefined;
-    pendingDeleteMachineId = undefined;
+    pendingDelete = undefined;
     // Arrow input refers to the choices the user has actually seen. Refresh
     // may already have changed the model while its repaint is still queued.
     const keys = paintedSelectionKeys;
@@ -681,7 +685,7 @@ export async function runNodeMachinesExplorer(
     interactionNotice = undefined;
     lifecycleNotice = undefined;
     pendingSupervisorUpdateMachineId = undefined;
-    pendingDeleteMachineId = undefined;
+    pendingDelete = undefined;
     const previous = navigation;
     const previousScreen = previous.screen;
     navigation = reduceMachineFirstNavigation(navigation, { type: "back" });
@@ -735,7 +739,7 @@ export async function runNodeMachinesExplorer(
 
   const goForward = (): void => {
     pendingSupervisorUpdateMachineId = undefined;
-    pendingDeleteMachineId = undefined;
+    pendingDelete = undefined;
     if (selectedKey?.startsWith("new-machine:") === true && navigation.screen.kind === "new-machine") {
       chooseNewMachineProvider(selectedKey.slice("new-machine:".length) as ActionableProvider);
       return;
@@ -886,20 +890,21 @@ export async function runNodeMachinesExplorer(
           selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized)[0];
           render();
         } else if (action?.kind === "start" || action?.kind === "stop") {
-          pendingDeleteMachineId = undefined;
+          pendingDelete = undefined;
           void runLifecycle(action.machineId, action.kind).catch((error) => { failure ??= error; stop(); });
         } else if (action?.kind === "delete") {
           // E13-R2: double confirmation, like the supervisor repair, naming
           // the Machine and what disappears with it. No request before the
           // second Enter; any move or back re-arms it.
-          if (pendingDeleteMachineId !== action.machineId) {
-            pendingDeleteMachineId = action.machineId;
-            const sessionCount = row?.sessions.length ?? 0;
-            interactionNotice = `Press Enter again to delete ${safeLine(row?.machine.name ?? "this Machine")} and its ${sessionCount} AgentSession${sessionCount === 1 ? "" : "s"}. This cannot be undone.`;
+          if (row === undefined || refreshInFlight || row.sessionsLoading === true || row.sessionsError !== undefined || refreshError !== undefined) return false;
+          const fingerprint = deleteFingerprint(row);
+          if (pendingDelete?.fingerprint !== fingerprint) {
+            const sessionCount = row.sessions.length;
+            pendingDelete = { fingerprint, notice: `Press Enter again to delete ${safeLine(row.machine.name)} and its ${sessionCount} AgentSession${sessionCount === 1 ? "" : "s"}. This cannot be undone.` };
             render();
             return false;
           }
-          pendingDeleteMachineId = undefined;
+          pendingDelete = undefined;
           interactionNotice = undefined;
           void runLifecycle(action.machineId, "delete").catch((error) => { failure ??= error; stop(); });
         } else if (action?.kind === "supervisor-blocked") {
@@ -1065,7 +1070,7 @@ export async function runNodeMachinesExplorer(
 async function observeSessionCreateCapability(
   client: CunaApiClient,
   machineId: string,
-  now: number,
+  now: () => number,
   signal?: AbortSignal,
 ): Promise<Readonly<{
   readonly canCreateSession: boolean;
@@ -1085,7 +1090,7 @@ async function observeSessionCreateCapability(
     if (snapshot.subjectScope !== "machine" || snapshot.subjectId !== machineId) {
       return Object.freeze({ canCreateSession: false, state: "unverified", reason: "subject_scope_mismatch" });
     }
-    const decision = decideCapability(snapshot, "agent_sessions.workspace.create", now, ["native"]);
+    const decision = decideCapability(snapshot, "agent_sessions.workspace.create", now(), ["native"]);
     const expiresAt = Date.parse(snapshot.expiresAt);
     return Object.freeze({
       canCreateSession: decision.status === "supported",
@@ -1586,7 +1591,7 @@ async function decideExplorerCapability(
   scope: "account" | "machine",
   resourceId: string | undefined,
   capabilityId: string,
-  now: number,
+  now: () => number,
   signal?: AbortSignal,
 ): Promise<Readonly<{ readonly status: "supported" | "unsupported" | "temporarily_unavailable" | "unknown"; readonly reason?: string }>> {
   if (typeof client.discoverCapabilities !== "function") {
@@ -1597,7 +1602,7 @@ async function decideExplorerCapability(
     if (snapshot.subjectScope !== scope || (scope !== "account" && snapshot.subjectId !== resourceId)) {
       return Object.freeze({ status: "unknown", reason: "subject_scope_mismatch" });
     }
-    const decision = decideCapability(snapshot, capabilityId, now);
+    const decision = decideCapability(snapshot, capabilityId, now());
     return decision.status === "supported"
       ? Object.freeze({ status: "supported" })
       : Object.freeze({ status: decision.status, ...(decision.reason === undefined ? {} : { reason: decision.reason }) });
