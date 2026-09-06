@@ -282,6 +282,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   runtimeCallbacks(): {
+    readonly onTerminalViewStarted: (event: { readonly snapshot: RuntimeTerminalSnapshot; readonly columns: number; readonly rows: number; readonly signal: AbortSignal }) => Promise<void>;
     readonly onTerminalReady: (snapshot: RuntimeTerminalSnapshot) => Promise<void>;
     readonly onTerminalGeometry: (event: { readonly snapshot: RuntimeTerminalSnapshot; readonly signal: AbortSignal }) => Promise<void>;
     readonly onTerminalOutput: (event: {
@@ -303,6 +304,7 @@ export class ForegroundTerminalCoordinator {
   } {
     return Object.freeze({
       onTerminalReady: async (snapshot) => await this.#terminalReady(snapshot),
+      onTerminalViewStarted: async (event) => await this.#terminalViewStarted(event),
       onTerminalGeometry: async (event) => await this.#terminalGeometry(event.snapshot, event.signal),
       onTerminalOutput: async (event) => await this.#queueTerminalOutput(event),
       onTerminalState: (snapshot) => this.#terminalState(snapshot),
@@ -552,7 +554,7 @@ export class ForegroundTerminalCoordinator {
     });
     if (previous !== undefined) {
       const oldBinding = viewport.snapshot().binding;
-      if (!sameSnapshotBinding(snapshot, oldBinding)) await viewport.rebind(binding);
+      if (snapshot.terminalView === undefined && !sameSnapshotBinding(snapshot, oldBinding)) await viewport.rebind(binding);
       if (this.#lifetimeAbort.signal.aborted || this.#tabs.get(snapshot.tabId) !== previous ||
         (this.#state !== "starting" && this.#state !== "active")) {
         throw runtimeFailure("terminal_disconnected", "Terminal rebinding completed after foreground ownership ended.");
@@ -563,6 +565,29 @@ export class ForegroundTerminalCoordinator {
     // local side effect completed. The server ACK is the only condition that
     // clears the cache, so resubmit it once this exact attachment is ready.
     this.#resendPendingRemoteLocalActionResults(snapshot.tabId, this.#localActionIdentity(intent, snapshot));
+  }
+
+  async #terminalViewStarted(event: { readonly snapshot: RuntimeTerminalSnapshot; readonly columns: number; readonly rows: number; readonly signal: AbortSignal }): Promise<void> {
+    const { snapshot, signal } = event;
+    const tab = this.#tabs.get(snapshot.tabId);
+    if (signal.aborted || tab === undefined || tab.snapshot.fencingGeneration !== snapshot.fencingGeneration) throw runtimeFailure("terminal_disconnected", "Terminal view reset targets a retired attachment.");
+    const abort = () => { if (this.#tabs.get(snapshot.tabId) === tab) tab.viewport.dispose(); };
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+      const current = tab.viewport.snapshot();
+      if (current.binding.fencingGeneration === snapshot.fencingGeneration) {
+        if (current.outputSequence !== 0n || current.replayCursor !== 0n) throw runtimeFailure("terminal_protocol_error", "Initial terminal view is not empty.");
+        await raceAbort(tab.viewport.resize(event.columns, event.rows), signal);
+      } else {
+        await raceAbort(tab.viewport.resetForCurrentView({
+          userId: snapshot.userId, machineId: snapshot.machineId,
+          agentSessionId: snapshot.agentSessionId, processEpoch: snapshot.processEpoch,
+          fencingGeneration: snapshot.fencingGeneration,
+        }, event.columns, event.rows), signal);
+      }
+      if (signal.aborted || this.#tabs.get(snapshot.tabId) !== tab) throw runtimeFailure("terminal_disconnected", "Terminal view reset completed after retirement.");
+    } catch (error) { abort(); throw error; }
+    finally { signal.removeEventListener("abort", abort); }
   }
 
   async #terminalGeometry(snapshot: RuntimeTerminalSnapshot, signal: AbortSignal): Promise<void> {
@@ -1689,6 +1714,8 @@ export class ForegroundTerminalCoordinator {
         color: this.#options.color ?? true,
         ...(this.#disconnectNotice !== undefined
           ? { notice: this.#disconnectNotice }
+          : this.#tabs.get(activeTabId)?.snapshot.state === "active" && this.#tabs.get(activeTabId)?.snapshot.terminalView?.ready === false
+            ? { notice: "Restoring terminal\u2026" }
           : this.#browserNotice !== undefined
             ? { notice: this.#tabs.get(activeTabId)?.snapshot.historicalInputUncertainty === true &&
                 (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === RECONNECT_FAILED_NOTICE)

@@ -142,6 +142,7 @@ class FakeTerminalSystem {
         const grant = this.grants.get(input.token);
         assert.ok(grant, "connector receives a producer-issued token");
         const ready = encodeTerminalControl("ready", 1n, {
+          ...(this.canonicalViews ? { terminalViewProtocol: { name: "cuna.terminal-view.v1", operation: "new", history: "current_view" } } : {}),
           protocol: TERMINAL_PROTOCOL,
           agentSessionId: grant.agentSessionId,
           processEpoch: grant.processEpoch,
@@ -165,6 +166,7 @@ class FakeTerminalSystem {
             initial.set(frame, ready.byteLength);
           }
         }
+        if (initial !== undefined && this.extraFramesOnReady !== undefined) initial = Buffer.concat([initial, ...this.extraFramesOnReady]);
         let connection;
         connection = new FakeWireConnection(grant.terminalSessionId, initial, async (bytes) => {
           if (decodeTerminalFrame(bytes)?.type !== "resume") return;
@@ -253,6 +255,90 @@ function geometryWire(payload, critical=false) {
   const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
   view.setUint16(6,18,false);view.setUint8(5,critical?1:0);return bytes;
 }
+
+const VIEW_ID = "11111111-2222-4333-8444-555555555555";
+const viewStart = (id = VIEW_ID) => encodeTerminalControl("view_started", 0n, { protocol: "cuna.terminal-view.v1", operation: "new", viewId: id, columns: 80, rows: 24 });
+const viewReady = (sequence = "1", id = VIEW_ID) => encodeTerminalControl("view_ready", 0n, { viewId: id, afterOutputSequence: sequence });
+const viewOutput = (sequence = 1n) => encodeTerminalFrame({ type: "output", critical: true, sequence, payload: new TextEncoder().encode("CURRENT") });
+
+test("canonical view waits for reset and rendered boundary, then reconnect starts at one", async () => {
+  const system = new FakeTerminalSystem(); system.canonicalViews = true;
+  let release; let resetEntered = false;
+  const resetGate = new Promise(resolve => { release = resolve; });
+  const { runtime, outputs } = createRuntime(system, { canonicalTerminalViews: true,
+    onTerminalViewStarted: async () => { resetEntered = true; await resetGate; } });
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    assert.equal(system.connectCalls[0].terminalViewProtocol, "cuna.terminal-view.v1");
+    assert.equal(runtime.listTerminals()[0].outputContinuity, "unknown");
+    await assert.rejects(runtime.sendInput(new Uint8Array([65]), "tab-a"));
+    const connection = system.connections[0]; connection.incoming.push(Buffer.concat([viewStart(), viewOutput(), viewReady()]));
+    await waitUntil(() => resetEntered, "reset entered"); assert.equal(outputs.length, 0);
+    release(); await waitUntil(() => runtime.listTerminals()[0].terminalView.ready, "canonical ready");
+    assert.equal(runtime.listTerminals()[0].outputContinuity, "unknown");
+    await runtime.sendInput(new Uint8Array([65]), "tab-a");
+    assert.equal(outputs[0].provenance, "replay_or_unknown");
+    connection.incoming.push(viewOutput(2n)); await waitUntil(() => outputs.length === 2, "live delta");
+    assert.equal(outputs[1].provenance, "live");
+    await connection.close(); await waitUntil(() => runtime.listTerminals()[0].state === "interrupted", "interrupted");
+    await runtime.reconnect({ tabId: "tab-a" });
+    const next = system.connections[1]; const resume = next.sent.map(decodeTerminalFrame).find(x => x.type === "resume");
+    assert.equal(decodeTerminalControl(resume).afterOutputSequence, "0");
+    assert.equal(runtime.listTerminals()[0].outputSequence, 0n);
+    next.incoming.push(Buffer.concat([viewStart("22222222-2222-4333-8444-555555555555"), viewOutput(), viewReady("1", "22222222-2222-4333-8444-555555555555")]));
+    await waitUntil(() => outputs.length === 3, "fresh output one"); assert.equal(outputs[2].sequence, 1n);
+  } finally { release(); await runtime.shutdown(); }
+});
+
+for (const [name, frames] of [
+  ["output before start", [viewOutput()]], ["duplicate start", [viewStart(), viewStart()]],
+  ["sequence gap", [viewStart(), viewOutput(2n)]],
+  ["cross-view ready", [viewStart(), viewOutput(), viewReady("1", "22222222-2222-4333-8444-555555555555")]],
+  ["wrong ready boundary", [viewStart(), viewOutput(), viewReady("2")]],
+  ["duplicate ready", [viewStart(), viewOutput(), viewReady(), viewReady()]],
+]) test(`canonical view refuses ${name}`, async () => {
+  const system = new FakeTerminalSystem(); system.canonicalViews = true;
+  const { runtime } = createRuntime(system, { canonicalTerminalViews: true, onTerminalViewStarted: async () => {} });
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    system.connections[0].incoming.push(Buffer.concat(frames));
+    await waitUntil(() => runtime.listTerminals()[0].state === "failed", name);
+  } finally { await runtime.shutdown(); }
+});
+
+test("canonical missing readiness fails by deadline despite an open transport", async () => {
+  const system = new FakeTerminalSystem(); system.canonicalViews = true;
+  const { runtime } = createRuntime(system, { canonicalTerminalViews: true, readyTimeoutMs: 30, onTerminalViewStarted: async () => {} });
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    await waitUntil(() => runtime.listTerminals()[0].state === "failed", "missing view deadline");
+  } finally { await runtime.shutdown(); }
+});
+
+test("same-packet canonical ready waits for delayed output consumption", async () => {
+  const system=new FakeTerminalSystem();system.canonicalViews=true;
+  system.extraFramesOnReady=[viewStart(),viewOutput(),viewReady()];
+  let entered=false;let release;const gate=new Promise(resolve=>{release=resolve;});
+  const {runtime}=createRuntime(system,{canonicalTerminalViews:true,onTerminalViewStarted:async()=>{},onTerminalOutput:async()=>{entered=true;await gate;}});
+  try {
+    const attaching=runtime.attach({tabId:"tab-a",agentSessionId:"agent-a",columns:80,rows:24});
+    await waitUntil(()=>entered,"output consumer entered");
+    assert.equal(runtime.listTerminals()[0].terminalView.ready,false);
+    await assert.rejects(runtime.sendInput(new Uint8Array([65]),"tab-a"));
+    release();const result=await attaching;assert.equal(result.terminalView.ready,true);
+  } finally {release();await runtime.shutdown();}
+});
+
+test("canonical fragmented bytes preserve exact start/output/ready ordering", async () => {
+  const system=new FakeTerminalSystem();system.canonicalViews=true;
+  const {runtime,outputs}=createRuntime(system,{canonicalTerminalViews:true,onTerminalViewStarted:async()=>{}});
+  try {
+    await runtime.attach({tabId:"tab-a",agentSessionId:"agent-a",columns:80,rows:24});
+    for(const byte of Buffer.concat([viewStart(),viewOutput(),viewReady()]))system.connections[0].incoming.push(Uint8Array.of(byte));
+    await waitUntil(()=>runtime.listTerminals()[0].terminalView.ready,"fragmented ready");
+    assert.equal(outputs.length,1);assert.equal(outputs[0].sequence,1n);
+  } finally {await runtime.shutdown();}
+});
 
 test("only an attachment's RESUME-correlated completion proves live output", async () => {
   const system = new FakeTerminalSystem();

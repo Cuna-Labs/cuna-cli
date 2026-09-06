@@ -1,7 +1,19 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { encodeTerminalFrame, decodeTerminalFrame, decodeTerminalControl, assertTerminalFrameLegal } from '../dist/terminal/codec.js';
+import { encodeTerminalFrame, encodeTerminalControl, decodeTerminalFrame, decodeTerminalControl, assertTerminalFrameLegal } from '../dist/terminal/codec.js';
+
+test('canonical view controls are critical, sequence-zero, closed and geometry-bounded', () => {
+  const viewId='11111111-2222-4333-8444-555555555555';
+  const start={protocol:'cuna.terminal-view.v1',operation:'new',viewId,columns:4096,rows:1};
+  const decode=(type,payload,sequence=0n,critical=true)=>decodeTerminalControl(decodeTerminalFrame(encodeTerminalFrame({type,sequence,critical,payload:new TextEncoder().encode(JSON.stringify(payload))})));
+  assert.deepEqual(decode('view_started',start),start);
+  for(const payload of [{...start,columns:4097},{...start,rows:100},{...start,viewId:viewId.toUpperCase()+'X'},{...start,extra:true}])assert.throws(()=>decode('view_started',payload));
+  assert.throws(()=>decode('view_started',start,1n));assert.throws(()=>decode('view_started',start,0n,false));
+  for(const afterOutputSequence of ['0','01','18446744073709551616'])assert.throws(()=>decode('view_ready',{viewId,afterOutputSequence}));
+  assert.deepEqual(decode('view_ready',{viewId,afterOutputSequence:'1'}),{viewId,afterOutputSequence:'1'});
+  assert.throws(()=>decode('resume',{resumeHandle:'resume',afterOutputSequence:'1',terminalViewProtocol:{name:'cuna.terminal-view.v1',operation:'new'}}));
+});
 
 const names = ['ready', 'input', 'output', 'resize', 'signal', 'heartbeat', 'exit', 'error',
   'acknowledgement', 'resume', 'local_action_request', 'local_action_result', 'local_stream_open',

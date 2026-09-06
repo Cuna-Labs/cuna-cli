@@ -9,6 +9,13 @@ const TERMINAL_ID = "55555555-5555-4555-8555-555555555555";
 const URL = `wss://api.getcuna.com/v1/terminal-connections/${TERMINAL_ID}/stream`;
 const TOKEN = `runa_tc_${"A".repeat(43)}`;
 
+test("canonical view is an explicit offer while selected WebSocket protocol remains RTP1", async () => {
+  const connector=createNodeWebSocketConnector({WebSocket:FakeWebSocket});
+  const connection=await connector.connect({url:URL,token:TOKEN,protocol:"runa.terminal.v1",terminalViewProtocol:"cuna.terminal-view.v1"});
+  try { assert.deepEqual(FakeWebSocket.instances.at(-1).protocols,["runa.terminal.v1",`runa.auth.${TOKEN}`,"cuna.terminal-view.v1"]); }
+  finally {await connection.close();}
+});
+
 function closeEvent(code, reason) {
   const event = new Event("close");
   Object.defineProperties(event, {

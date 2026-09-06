@@ -76,6 +76,7 @@ export interface TerminalWireConnection {
 
 export interface TerminalConnector {
   connect(input: {
+    readonly terminalViewProtocol?: "cuna.terminal-view.v1";
     readonly url: string;
     readonly token: string;
     readonly protocol: typeof TERMINAL_PROTOCOL;

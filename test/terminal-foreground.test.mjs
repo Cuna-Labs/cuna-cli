@@ -11,6 +11,31 @@ const decoder = new TextDecoder();
 const SESSION_A = "11111111-1111-4111-8111-111111111111";
 const SESSION_B = "22222222-2222-4222-8222-222222222222";
 
+test("canonical foreground resets the parser at higher fence and initial blank view uses real geometry", async () => {
+  const {coordinator,callbacks,host,intents}=harness();
+  try {
+    await coordinator.start(intents.slice(0,1));
+    const first={...snapshot(intents[0]),accessMode:"observer",terminalView:{viewId:"11111111-2222-4333-8444-555555555555",ready:false}};
+    await callbacks.onTerminalReady(first);
+    callbacks.onTerminalState(first);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.match(decoder.decode(host.writes.at(-1)), /Restoring terminal/);
+    await callbacks.onTerminalViewStarted({snapshot:first,columns:70,rows:20,signal:new AbortController().signal});
+    await callbacks.onTerminalOutput(outputEvent(intents[0],99n,encoder.encode("OLD\x1b]52;c;pending")));
+    const next={...snapshot(intents[0],2),accessMode:"observer",terminalView:{viewId:"22222222-2222-4333-8444-555555555555",ready:false}};
+    await callbacks.onTerminalReady(next);
+    await callbacks.onTerminalViewStarted({snapshot:next,columns:60,rows:18,signal:new AbortController().signal});
+    await callbacks.onTerminalOutput(outputEvent(intents[0],1n,encoder.encode("NEW CURRENT VIEW"),2));
+    assert.match(decoder.decode(host.writes.at(-1)),/NEW CURRENT VIEW/);
+    assert.doesNotMatch(decoder.decode(host.writes.at(-1)),/OLD/);
+    callbacks.onTerminalState({...next, terminalView:{...next.terminalView,ready:true}});
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /Restoring terminal/);
+    const stale=new AbortController();stale.abort(new Error("retired"));
+    await assert.rejects(callbacks.onTerminalViewStarted({snapshot:first,columns:70,rows:20,signal:stale.signal}));
+  } finally {await coordinator.stop();}
+});
+
 async function waitForGateOrAbort(gate, signal) {
   if (gate === undefined) return;
   await new Promise((resolve, reject) => {

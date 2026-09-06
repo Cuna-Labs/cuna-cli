@@ -156,7 +156,8 @@ export function createNodeWebSocketConnector(input: {
       const authProtocol = `${DEPLOYED_WIRE_COMPATIBILITY.websocketAuthPrefix}${request.token}`;
       let socket: WebSocket;
       try {
-        socket = new WebSocketAuthority(request.url, [request.protocol, authProtocol]);
+        socket = new WebSocketAuthority(request.url, [request.protocol, authProtocol,
+          ...(request.terminalViewProtocol === undefined ? [] : [request.terminalViewProtocol])]);
       } catch (error) {
         throw runtimeFailure("terminal_disconnected", "Cuna could not start the terminal WebSocket handshake.", {
           retryable: true,

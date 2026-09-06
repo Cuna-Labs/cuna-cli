@@ -78,6 +78,7 @@ export interface ForegroundRuntimeLifecycleSnapshot {
 }
 
 export interface RuntimeTerminalSnapshot {
+  readonly terminalView?: { readonly viewId: string | null; readonly ready: boolean };
   readonly writerTransferCapability?: WriterTransferCapability;
   readonly tabId: string;
   readonly viewId: string;
@@ -125,6 +126,8 @@ export interface RuntimeSyncHandle {
 }
 
 export interface RuntimeBoundaryOptions {
+  readonly canonicalTerminalViews?: boolean;
+  readonly onTerminalViewStarted?: (event: { readonly snapshot: RuntimeTerminalSnapshot; readonly columns: number; readonly rows: number; readonly signal: AbortSignal }) => void | Promise<void>;
   readonly mode?: RuntimeBoundaryMode;
   readonly controlPlane: TerminalControlPlane;
   readonly terminalConnector: TerminalConnector;
@@ -168,6 +171,8 @@ interface TerminalEntry {
   nextCapabilityRefreshAt?: number;
   readonly tabId: string;
   viewId: string;
+  terminalView?: { viewId: string | null; ready: boolean };
+  terminalViewDeadline?: ReturnType<typeof setTimeout>;
   observation: RemoteAgentSessionEvidence;
   state: RuntimeTerminalState;
   connection: TerminalWireConnection;
@@ -390,6 +395,7 @@ export class CunaRuntimeBoundary {
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
       connection = await this.#options.terminalConnector.connect({
+        ...(this.#options.canonicalTerminalViews === true ? { terminalViewProtocol: "cuna.terminal-view.v1" as const } : {}),
         url: grant.connectUrl,
         token: grant.connectToken,
         protocol: TERMINAL_PROTOCOL,
@@ -439,6 +445,10 @@ export class CunaRuntimeBoundary {
       };
       const iterator = connection.receive()[Symbol.asyncIterator]();
       const ready = await this.#awaitReady(entry, iterator, attachAbort.signal);
+      if (ready.payload.terminalViewProtocol !== undefined) {
+        if (this.#options.canonicalTerminalViews !== true) throw runtimeFailure("terminal_protocol_error", "Unrequested terminal view protocol.");
+        entry.terminalView = { viewId: null, ready: false };
+      }
       this.#assertOpen();
       entry.lastHeartbeatAt = this.#clock();
       entry.heartbeatSequence = 0n;
@@ -473,7 +483,7 @@ export class CunaRuntimeBoundary {
         rows: input.rows,
       });
       entry.state = "active";
-      entry.outputContinuity = "complete";
+      entry.outputContinuity = entry.terminalView === undefined ? "complete" : "unknown";
       this.#terminals.set(input.tabId, entry);
       this.#activeTabId ??= input.tabId;
       // READY proves that the PTY exists; it does not prove that its default
@@ -505,10 +515,12 @@ export class CunaRuntimeBoundary {
       await connection.send(encodeTerminalControl("resume", entry.wireSequence, {
         resumeHandle: entry.resumeHandle,
         afterOutputSequence: entry.outputSequence.toString(),
+        ...(entry.terminalView === undefined ? {} : { terminalViewProtocol: { name: "cuna.terminal-view.v1", operation: "new" } }),
         ...(entry.localActionAcceptance === undefined ? {} : { localActionProtocol: entry.localActionAcceptance }),
       }));
       entry.localActionsNegotiated = entry.localActionAcceptance !== undefined;
       await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock()));
+      this.#armTerminalViewDeadline(entry);
       this.#assertOpen();
       for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
       this.#assertOpen();
@@ -610,8 +622,10 @@ export class CunaRuntimeBoundary {
   }
 
   async #sendTerminalBytes(entry: TerminalEntry, bytes: Uint8Array): Promise<void> {
+    if (entry.terminalView !== undefined && !entry.terminalView.ready) throw runtimeFailure("terminal_protocol_error", "The current terminal view is not ready for input.");
     const payload = bytes.slice();
     await this.#enqueueTerminalSend(entry, async (authority) => {
+      if (entry.terminalView !== undefined && !entry.terminalView.ready) throw runtimeFailure("terminal_protocol_error", "The current terminal view is not ready for input.");
       if (entry.pendingInputSequences.size >= 4_096) {
         entry.connectionRevision += 1;
         entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "Terminal input acknowledgement window was exhausted."));
@@ -913,6 +927,7 @@ export class CunaRuntimeBoundary {
         url: grant.connectUrl,
         token: grant.connectToken,
         protocol: TERMINAL_PROTOCOL,
+        ...(this.#options.canonicalTerminalViews === true ? { terminalViewProtocol: "cuna.terminal-view.v1" as const } : {}),
         signal: reconnectAbort.signal,
       });
       throwIfAborted(reconnectAbort.signal, "Terminal reconnection was cancelled.");
@@ -944,6 +959,8 @@ export class CunaRuntimeBoundary {
         heldSeat: false,
       };
       const ready = await this.#awaitReady(candidate, iterator, reconnectAbort.signal);
+      if (entry.terminalView !== undefined && ready.payload.terminalViewProtocol === undefined) throw runtimeFailure("terminal_protocol_error", "A canonical view cannot resume as a raw stream.");
+      if (ready.payload.terminalViewProtocol !== undefined && this.#options.canonicalTerminalViews !== true) throw runtimeFailure("terminal_protocol_error", "Unrequested terminal view protocol.");
       candidate.lastHeartbeatAt = this.#clock();
       candidate.localActionAcceptance = this.#localActionAcceptance(
         ready.payload.localActionProtocol,
@@ -977,7 +994,8 @@ export class CunaRuntimeBoundary {
       const resumeSequence = resizeSequence + 1n;
       await connection.send(encodeTerminalControl("resume", resumeSequence, {
         resumeHandle: grant.resumeHandle,
-        afterOutputSequence: entry.outputSequence.toString(),
+        afterOutputSequence: ready.payload.terminalViewProtocol === undefined ? entry.outputSequence.toString() : "0",
+        ...(ready.payload.terminalViewProtocol === undefined ? {} : { terminalViewProtocol: { name: "cuna.terminal-view.v1", operation: "new" } }),
         ...(candidate.localActionAcceptance === undefined ? {} : { localActionProtocol: candidate.localActionAcceptance }),
       }));
       if (entry.connectionRevision !== reconnectRevision || entry.state !== "reconnecting" || this.#closed) {
@@ -998,6 +1016,10 @@ export class CunaRuntimeBoundary {
         rows: previous.rows,
       });
       entry.connection = connection;
+      if (ready.payload.terminalViewProtocol !== undefined) {
+        entry.terminalView = { viewId: null, ready: false };
+        entry.outputSequence = 0n;
+      }
       this.#clearHeartbeatWatchdog(entry);
       entry.observation = revalidated.observation;
       entry.capabilitySnapshot = revalidated.capabilitySnapshot;
@@ -1037,6 +1059,7 @@ export class CunaRuntimeBoundary {
       entry.state = "active";
       entry.outputContinuity = "unknown";
       await this.#options.onTerminalReady?.(snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock()));
+      this.#armTerminalViewDeadline(entry);
       for (const frame of ready.bufferedFrames) await this.#handleAttachedFrame(entry, frame);
       this.#scheduleHeartbeatWatchdog(entry, connection, reconnectRevision);
       this.#publish(entry);
@@ -1531,6 +1554,23 @@ export class CunaRuntimeBoundary {
     }
   }
 
+  #armTerminalViewDeadline(entry: TerminalEntry): void {
+    if (entry.terminalViewDeadline !== undefined) clearTimeout(entry.terminalViewDeadline);
+    if (entry.terminalView === undefined) return;
+    const revision = entry.connectionRevision;
+    entry.terminalViewDeadline = setTimeout(() => {
+      if (this.#closed || entry.connectionRevision !== revision || entry.state !== "active" || entry.terminalView?.ready === true) return;
+      const failure = runtimeFailure("terminal_protocol_error", "The current terminal view did not become ready before its deadline.");
+      entry.outputAbort.abort(failure);
+      entry.state = "failed";
+      entry.outputContinuity = "incomplete";
+      retireInputAcceptance(entry);
+      this.#publish(entry);
+      void entry.connection.close({ code: 1002, reason: "cuna_terminal_view_timeout" }).catch(() => undefined);
+    }, this.#options.readyTimeoutMs ?? 5_000);
+    entry.terminalViewDeadline.unref();
+  }
+
   async #handleAttachedFrame(entry: TerminalEntry, frame: TerminalFrame): Promise<void> {
     assertTerminalFrameLegal("attached", "server_to_client", frame.type, entry.localActionsNegotiated);
     if (isLocalActionFrameType(frame.type)) {
@@ -1587,7 +1627,36 @@ export class CunaRuntimeBoundary {
       this.#publish(entry);
       return;
     }
+    if (frame.type === "view_started") {
+      const payload = decodeTerminalControl(frame);
+      if (entry.terminalView === undefined || entry.terminalView.viewId !== null) throw runtimeFailure("terminal_protocol_error", "Unexpected or duplicate terminal view start.");
+      entry.terminalView.viewId = String(payload.viewId);
+      if (this.#options.onTerminalViewStarted === undefined) throw runtimeFailure("terminal_protocol_error", "The terminal view has no reset consumer.");
+      const authority = entry.outputAbort;
+      const revision = entry.connectionRevision;
+      try {
+        const timeoutMs = this.#options.outputDeliveryTimeoutMs ?? 5_000;
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw runtimeFailure("terminal_protocol_error", "The terminal view reset deadline is invalid.");
+        await withOutputDeadline(Promise.resolve(this.#options.onTerminalViewStarted({
+          snapshot: snapshot(entry, this.#heartbeatTimeoutMs(), this.#clock()),
+          columns: Number(payload.columns), rows: Number(payload.rows), signal: authority.signal,
+        })), timeoutMs);
+        if (authority.signal.aborted || entry.connectionRevision !== revision || entry.state !== "active") throw runtimeFailure("terminal_disconnected", "Terminal view reset completed after its attachment retired.");
+      } catch (error) { authority.abort(error); throw error; }
+      return;
+    }
+    if (frame.type === "view_ready") {
+      const payload = decodeTerminalControl(frame);
+      if (entry.terminalView === undefined || entry.terminalView.viewId === null || entry.terminalView.ready ||
+        payload.viewId !== entry.terminalView.viewId || entry.outputSequence < 1n ||
+        payload.afterOutputSequence !== entry.outputSequence.toString()) throw runtimeFailure("terminal_protocol_error", "Terminal view readiness does not match consumed output.");
+      entry.terminalView.ready = true;
+      if (entry.terminalViewDeadline !== undefined) clearTimeout(entry.terminalViewDeadline);
+      this.#publish(entry);
+      return;
+    }
     if (frame.type === "output") {
+      if (entry.terminalView !== undefined && (entry.terminalView.viewId === null || frame.sequence !== entry.outputSequence + 1n)) throw runtimeFailure("terminal_protocol_error", "Canonical terminal output is not contiguous within a started view.");
       if (frame.sequence <= entry.outputSequence) {
         throw runtimeFailure("terminal_protocol_error", "Terminal output sequence regressed or duplicated.");
       }
@@ -1597,7 +1666,7 @@ export class CunaRuntimeBoundary {
           throw runtimeFailure("terminal_protocol_error", "The terminal output delivery deadline is invalid.");
         }
         await withOutputDeadline(Promise.resolve(this.#options.onTerminalOutput({
-          provenance: entry.replayBoundaryObserved === true ? "live" : "replay_or_unknown",
+          provenance: (entry.terminalView === undefined ? entry.replayBoundaryObserved === true : entry.terminalView.ready) ? "live" : "replay_or_unknown",
           tabId: entry.tabId,
           agentSessionId: entry.observation.agentSessionId,
           binding: Object.freeze({
@@ -1942,6 +2011,7 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000, now = Date.
   return Object.freeze({
     tabId: entry.tabId,
     viewId: entry.viewId,
+    ...(entry.terminalView === undefined ? {} : { terminalView: Object.freeze({ ...entry.terminalView }) }),
     userId: entry.observation.userId,
     machineId: entry.observation.machineId,
     workspaceBindingId: entry.observation.workspaceBindingId,

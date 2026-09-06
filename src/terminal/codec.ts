@@ -51,6 +51,7 @@ export interface TerminalFrame {
 }
 
 export interface TerminalReadyPayload {
+  readonly terminalViewProtocol?: { readonly name: "cuna.terminal-view.v1"; readonly operation: "new"; readonly history: "current_view" };
   readonly protocol: typeof TERMINAL_PROTOCOL;
   readonly machineId?: string;
   readonly machineGeneration?: string;
@@ -93,6 +94,7 @@ export interface TerminalLocalActionProtocolAcceptance {
 }
 
 export interface TerminalResumePayload {
+  readonly terminalViewProtocol?: { readonly name: "cuna.terminal-view.v1"; readonly operation: "new" };
   readonly resumeHandle: string;
   readonly afterOutputSequence: string;
   readonly localActionProtocol?: TerminalLocalActionProtocolAcceptance;
@@ -316,7 +318,7 @@ const LEGAL_FRAMES: Readonly<
   ready: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["resume", "heartbeat"]), server_to_client: new Set<TerminalFrameType>(["ready", "error", "heartbeat", "writer_epoch", "control_state"])}),
   attached: Object.freeze({
     client_to_server: new Set<TerminalFrameType>(["input", "resize", "signal", "heartbeat", "resume"]),
-    server_to_client: new Set<TerminalFrameType>(["output", "acknowledgement", "heartbeat", "exit", "error", "ready", "writer_epoch", "control_state"]),
+    server_to_client: new Set<TerminalFrameType>(["output", "acknowledgement", "heartbeat", "exit", "error", "ready", "writer_epoch", "control_state", "view_started", "view_ready"]),
   }),
   draining: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["heartbeat"]), server_to_client: new Set<TerminalFrameType>(["output", "exit", "error", "heartbeat", "writer_epoch", "control_state"])}),
   interrupted: Object.freeze({ client_to_server: new Set<TerminalFrameType>(["resume"]), server_to_client: new Set<TerminalFrameType>(["ready", "error"])}),
@@ -363,6 +365,7 @@ export function decodeTerminalControl(frame: TerminalFrame): Readonly<Record<str
     throw new TerminalProtocolError("invalid_payload", "The terminal control payload must be an object.");
   }
   if (frame.type === "control_state" && frame.critical) throwInvalidPayload();
+  if ((frame.type === "view_started" || frame.type === "view_ready") && (!frame.critical || frame.sequence !== 0n)) throwInvalidPayload();
   validateControlPayload(frame.type, value as Record<string, unknown>);
   return Object.freeze(value as Record<string, unknown>);
 }
@@ -388,9 +391,10 @@ function validateControlPayload(type: TerminalFrameType, value: Record<string, u
       assertKeys(
         value,
         ["protocol", "agentSessionId", "processEpoch", "fencingGeneration", "resizeCapability", "accessMode", "writerEpoch"],
-        ["machineId", "machineGeneration", "workspaceBindingId", "workspaceBindingGeneration", "localActionProtocol"],
+        ["machineId", "machineGeneration", "workspaceBindingId", "workspaceBindingGeneration", "localActionProtocol", "terminalViewProtocol"],
       );
       validateReadyIdentity(value);
+      if (value.terminalViewProtocol !== undefined) validateTerminalViewProtocol(value.terminalViewProtocol, true);
       if (value.localActionProtocol !== undefined) validateLocalActionOffer(value.localActionProtocol);
       return;
     case "writer_epoch":
@@ -424,9 +428,23 @@ function validateControlPayload(type: TerminalFrameType, value: Record<string, u
       assertKeys(value, []);
       return;
     case "resume":
-      assertKeys(value, ["resumeHandle", "afterOutputSequence"], ["localActionProtocol"]);
+      assertKeys(value, ["resumeHandle", "afterOutputSequence"], ["localActionProtocol", "terminalViewProtocol"]);
       if (!isIdentifier(value.resumeHandle) || !isUint64String(value.afterOutputSequence)) throwInvalidPayload();
+      if (value.terminalViewProtocol !== undefined) {
+        validateTerminalViewProtocol(value.terminalViewProtocol, false);
+        if (value.afterOutputSequence !== "0") throwInvalidPayload();
+      }
       if (value.localActionProtocol !== undefined) validateLocalActionAcceptance(value.localActionProtocol);
+      return;
+    case "view_started":
+      assertKeys(value, ["protocol", "operation", "viewId", "columns", "rows"]);
+      if (value.protocol !== "cuna.terminal-view.v1" || value.operation !== "new" ||
+        !isCanonicalViewId(value.viewId) || !isBoundedPositiveInteger(value.columns, 4096) || !isBoundedPositiveInteger(value.rows, 4096) ||
+        Number(value.columns) * Number(value.rows) > 250_000) throwInvalidPayload();
+      return;
+    case "view_ready":
+      assertKeys(value, ["viewId", "afterOutputSequence"]);
+      if (!isCanonicalViewId(value.viewId) || !isUint64String(value.afterOutputSequence) || !/^[1-9][0-9]*$/u.test(value.afterOutputSequence)) throwInvalidPayload();
       return;
     case "local_action_request":
       validateLocalActionRequestFrame(value);
@@ -561,6 +579,18 @@ function validateLocalActionIdentity(identity: Record<string, unknown>): void {
     !isIdentifier(identity.agentSessionId) || !isIdentifier(identity.processEpoch) ||
     !isBoundedPositiveInteger(identity.fencingGeneration, Number.MAX_SAFE_INTEGER)
   ) throwInvalidPayload();
+}
+
+function isCanonicalViewId(value: unknown): boolean {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value);
+}
+
+function validateTerminalViewProtocol(value: unknown, ready: boolean): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throwInvalidPayload();
+  const record = value as Record<string, unknown>;
+  assertKeys(record, ready ? ["name", "operation", "history"] : ["name", "operation"]);
+  if (record.name !== "cuna.terminal-view.v1" || record.operation !== "new" ||
+    (ready && record.history !== "current_view")) throwInvalidPayload();
 }
 
 function validateReadyIdentity(value: Record<string, unknown>): void {
