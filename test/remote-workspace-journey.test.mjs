@@ -72,6 +72,20 @@ test('terminal or substituted session state never becomes an attachment',async()
     await assert.rejects(launchRemoteWorkspaceSession(f.input));
   }
 });
+test('failed real-session observation preserves reason and exact inspection target without another create',async()=>{
+  const f=fixture();
+  f.client.getAgentSession=async()=>({...f.session,processState:'failed',terminalReason:'canonical_launch_interrupted'});
+  await assert.rejects(launchRemoteWorkspaceSession(f.input),e=>{
+    assert.equal(e.code,'cuna.journey.agent_session_failed');
+    assert.equal(e.details.reason,'canonical_launch_interrupted');
+    assert.equal(e.details.agent_session_id,'session');
+    assert.match(e.message,/could not complete the agent launch/);
+    assert.match(e.hint,/cuna agent-sessions get session/);
+    return true;
+  });
+  assert.equal(f.calls.filter(c=>c[0]==='create').length,1);
+});
+
 test('foreign Machine context refuses even when session and Workspace IDs match',async()=>{
   const f=fixture();const read=f.client.getAgentSessionWorkspaceContext;
   f.client.getAgentSessionWorkspaceContext=async id=>({...await read(id),machineId:'other'});

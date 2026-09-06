@@ -1,4 +1,5 @@
 import type { AgentSession, AgentSessionTerminalSeat, Machine } from "../api/contracts.js";
+import { sessionFailure } from "./session-failure.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import { isObservationBudgetCode } from "../core/observation-budget.js";
@@ -397,13 +398,13 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
             };
             throw fail("cuna.journey.workspace_materialization_failed", messages[session.workspaceFailureCode] ?? "The runtime could not prepare this Workspace. Its failure code identifies the refused operation.", EXIT_CODES.remote, { reason: session.workspaceFailureCode });
           }
-          throw fail("cuna.journey.agent_session_failed", "The AgentSession request failed before attach.");
+          throw sessionFailure(session, "The AgentSession request failed before attach.");
         }
         if (session.processState === "ready" || session.processState === "running") {
           return Object.freeze({ id: session.id, machineId: session.machineId });
         }
         if (["exited", "failed", "terminated"].includes(session.processState)) {
-          throw fail("cuna.journey.agent_session_failed", "The AgentSession reached a terminal state before attach.");
+          throw sessionFailure(session, "The AgentSession reached a terminal state before attach.");
         }
         await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
       }

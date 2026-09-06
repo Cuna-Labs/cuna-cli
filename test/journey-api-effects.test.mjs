@@ -59,6 +59,31 @@ function effects(client, requestedAgent = "claude-code") {
   });
 }
 
+test("session readiness exposes safe terminal cause and retains existing-session recovery", async () => {
+  for (const requestState of ["failed", "terminal"]) {
+    const e = effects({ async getAgentSession() { return recoveredSession({requestState, processState:"failed", terminalReason:"canonical_launch_interrupted"}); } });
+    await assert.rejects(e.ensureAgentSessionReady({agentSessionId:SESSION_ID}), error => {
+      assert.equal(error.details.reason, "canonical_launch_interrupted");
+      assert.equal(error.details.agent_session_id, SESSION_ID);
+      assert.match(error.hint, new RegExp(SESSION_ID));
+      assert.match(error.message, /could not complete the agent launch/);
+      return true;
+    });
+  }
+});
+
+test("unknown and absent runtime reasons cannot leak provider text into journey errors", async () => {
+  for (const terminalReason of [undefined, "credential_secret_text"]) {
+    const e = effects({ async getAgentSession() { return recoveredSession({processState:"failed", terminalReason}); } });
+    await assert.rejects(e.ensureAgentSessionReady({agentSessionId:SESSION_ID}), error => {
+      assert.equal(error.details.reason, undefined);
+      assert.doesNotMatch(error.message, /credential_secret_text/);
+      assert.equal(error.message, "The AgentSession reached a terminal state before attach.");
+      return true;
+    });
+  }
+});
+
 test("machine observation rejects a provider mismatch before capability discovery", async () => {
   let capabilityReads = 0;
   const observed = await createApiAgentJourneyEffects({

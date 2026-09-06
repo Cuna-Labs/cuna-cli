@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { sessionFailure } from "./session-failure.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { requireCapability, type CunaApiClient } from "../api/client.js";
 import type { AgentSession } from "../api/contracts.js";
@@ -79,8 +80,7 @@ export async function launchRemoteWorkspaceSession(input: {
     session = await input.client.getAgentSession(sessionId, signal);
     validate(session);
     if (session.requestState === "failed" || ["exited", "failed", "terminated"].includes(session.processState)) {
-      throw new CunaError({ code: "cuna.journey.agent_session_failed", message: "The remote session ended before attachment.",
-        exitCode: EXIT_CODES.remote, details: { agent_session_id: sessionId } });
+      throw sessionFailure(session, "The remote session ended before attachment.");
     }
     if (session.processState === "ready" || session.processState === "running") return sessionId;
     if (now() - admittedAt >= REMOTE_CONVERGENCE_BUDGET_MS) throw timeout("remote session readiness");

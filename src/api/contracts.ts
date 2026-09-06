@@ -1,3 +1,4 @@
+import { isTerminalReason, type TerminalReason } from "./terminal-reason.js";
 import {
   containsCredentialValue,
   isApiKeyDisplayPrefix,
@@ -504,6 +505,7 @@ export interface AgentSession {
   readonly workspaceBindingId?: string;
   readonly workspaceGeneration?: number;
   readonly workspaceFailureCode?: string;
+  readonly terminalReason?: TerminalReason;
   readonly name: string;
   readonly agent: AgentKind;
   readonly cwd: string;
@@ -583,6 +585,7 @@ function decodeAgentSession(value: unknown): AgentSession {
     "workspace_binding_id",
     "workspace_generation",
     "workspace_failure_code",
+    "terminal_reason",
     "name",
     "agent",
     "cwd",
@@ -615,6 +618,11 @@ function decodeAgentSession(value: unknown): AgentSession {
     throw contractViolation("failed_request_safe_workspace_reason", "workspace_failure_code");
   }
   const processState = enumField(value, "process_state", PROCESS_STATES);
+  const terminalReason = optionalString(value, "terminal_reason");
+  if (terminalReason !== undefined &&
+      (!isTerminalReason(terminalReason) || !["exited", "failed", "terminated"].includes(processState))) {
+    throw contractViolation("terminal_state_safe_reason", "terminal_reason");
+  }
   const processEpoch = optionalString(value, "process_epoch");
   const runtimeObservedAt = optionalString(value, "runtime_observed_at");
   const runtimeExpiresAt = optionalString(value, "runtime_expires_at");
@@ -644,6 +652,7 @@ function decodeAgentSession(value: unknown): AgentSession {
       ? {}
       : { workspaceBindingId, workspaceGeneration: workspaceGeneration as number }),
     ...(workspaceFailureCode === undefined ? {} : { workspaceFailureCode }),
+    ...(terminalReason === undefined ? {} : { terminalReason: terminalReason as TerminalReason }),
     name: requiredDisplayString(value, "name"),
     agent,
     cwd: requiredDisplayString(value, "cwd"),

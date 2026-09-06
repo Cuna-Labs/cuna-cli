@@ -360,6 +360,20 @@ test("TC-037-03 API-key create, list and revoke use exact public routes and clos
   assert.throws(() => decodeApiKeyCreation({ ...replayed, idempotency_replayed: false }));
 });
 
+test("terminal reasons decode only reviewed codes on terminal process observations", () => {
+  for (const process_state of ["exited", "failed", "terminated"]) {
+    const decoded = decodeAgentSessionItem(agentSession({ process_state, terminal_reason: "canonical_launch_interrupted" }));
+    assert.equal(decoded.terminalReason, "canonical_launch_interrupted");
+  }
+  assert.equal(decodeAgentSessionItem(agentSession()).terminalReason, undefined);
+  for (const process_state of ["unknown", "starting", "ready", "running", "terminating"]) {
+    assert.throws(() => decodeAgentSessionItem(agentSession({ process_state, terminal_reason: "process_exited" })));
+  }
+  for (const terminal_reason of ["secret_value", "error: credential", "", "x".repeat(8192)]) {
+    assert.throws(() => decodeAgentSessionItem(agentSession({ process_state: "failed", terminal_reason })));
+  }
+});
+
 function agentSession(overrides = {}) {
   return {
     id: "11111111-1111-4111-8111-111111111111",
