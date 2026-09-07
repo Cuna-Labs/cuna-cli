@@ -3829,6 +3829,1026 @@
         ],
         "summary": "Read the immutable execution Workspace identity of an owned AgentSession"
       }
+    },
+    "/v1/collaboration/1/invitations/{id}/accept": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "collaboration.acceptInvitation",
+        "summary": "Accept a recipient-bound invitation",
+        "description": "Returns an immutable operation receipt, not a live session access grant. Retry an uncertain result with the same operation identity.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "invitation_request_invalid",
+          "invitation_permission_denied",
+          "invitation_unavailable",
+          "invitation_operation_conflict",
+          "invitation_authority_changed",
+          "invitation_transition_invalid",
+          "membership_revision_conflict",
+          "membership_unavailable",
+          "invitation_service_unavailable",
+          "invitation_response_invalid"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CollaborationInvitationAcceptRequestV1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Historical operation receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationInvitationAcceptanceReceiptV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/invitations/{id}/revoke": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "collaboration.revokeInvitation",
+        "summary": "Revoke a recipient-bound invitation",
+        "description": "Returns an immutable operation receipt, not a live session access grant. Retry an uncertain result with the same operation identity.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "invitation_request_invalid",
+          "invitation_permission_denied",
+          "invitation_unavailable",
+          "invitation_operation_conflict",
+          "invitation_authority_changed",
+          "invitation_transition_invalid",
+          "membership_revision_conflict",
+          "membership_unavailable",
+          "invitation_service_unavailable",
+          "invitation_response_invalid"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CollaborationInvitationRevokeRequestV1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Historical operation receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationInvitationRevocationReceiptV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/invitations/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "collaboration.inspectInvitation",
+        "summary": "Inspect invitation metadata",
+        "description": "Read secret-free invitation history as verified recipient or original issuer still owning the Project. Pending is not admission authority.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "invitation_request_invalid",
+          "invitation_permission_denied",
+          "invitation_unavailable",
+          "invitation_operation_conflict",
+          "invitation_authority_changed",
+          "invitation_transition_invalid",
+          "membership_revision_conflict",
+          "membership_unavailable",
+          "invitation_service_unavailable",
+          "invitation_response_invalid"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Historical operation receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationInvitationMetadataV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/projects/{id}/invitations": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "collaboration.issueInvitation",
+        "summary": "Create a recipient-bound invitation",
+        "description": "First confirmed creation returns its secret once; retry returns already_created without secret. A lost initial delivery requires explicit replacement, never reconstruction.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "invitation_request_invalid",
+          "invitation_permission_denied",
+          "invitation_unavailable",
+          "invitation_operation_conflict",
+          "invitation_authority_changed",
+          "invitation_transition_invalid",
+          "membership_revision_conflict",
+          "membership_unavailable",
+          "invitation_service_unavailable",
+          "invitation_response_invalid",
+          "invitation_expiry_invalid",
+          "invitation_limit_reached",
+          "invitation_policy_unavailable",
+          "invitation_rate_limited"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CollaborationInvitationIssueRequestV1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Historical operation receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationInvitationDeliveryV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/invitations/{id}/replace": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "collaboration.replaceInvitation",
+        "summary": "Atomically replace an invitation and deliver its secret once",
+        "description": "First confirmed creation returns its secret once; retry returns already_created without secret. A lost initial delivery requires explicit replacement, never reconstruction.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "invitation_request_invalid",
+          "invitation_permission_denied",
+          "invitation_unavailable",
+          "invitation_operation_conflict",
+          "invitation_authority_changed",
+          "invitation_transition_invalid",
+          "membership_revision_conflict",
+          "membership_unavailable",
+          "invitation_service_unavailable",
+          "invitation_response_invalid",
+          "invitation_expiry_invalid",
+          "invitation_limit_reached",
+          "invitation_policy_unavailable",
+          "invitation_rate_limited"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CollaborationInvitationReplaceRequestV1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Historical operation receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationInvitationDeliveryV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/agent-sessions/{id}/grants/set": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "collaboration.setSessionGrant",
+        "summary": "Set session access policy",
+        "description": "Returns a historical policy operation receipt. It is not a terminal admission token or proof of connected-client revocation. Retry uncertain results with the same operation identity.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "session_grant_request_invalid",
+          "session_grant_permission_denied",
+          "session_grant_unavailable",
+          "session_grant_revision_conflict",
+          "session_grant_operation_conflict",
+          "session_grant_response_invalid",
+          "session_grant_service_unavailable"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CollaborationSessionGrantSetRequestV1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Historical operation receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationSessionGrantReceiptV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/agent-sessions/{id}/grants/revoke": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "collaboration.revokeSessionGrant",
+        "summary": "Revoke session access policy",
+        "description": "Returns a historical policy operation receipt. It is not a terminal admission token or proof of connected-client revocation. Retry uncertain results with the same operation identity.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "session_grant_request_invalid",
+          "session_grant_permission_denied",
+          "session_grant_unavailable",
+          "session_grant_revision_conflict",
+          "session_grant_operation_conflict",
+          "session_grant_response_invalid",
+          "session_grant_service_unavailable"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CollaborationSessionGrantRevokeRequestV1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Historical operation receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationSessionGrantRevocationReceiptV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/agent-sessions/{id}/grant": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "collaboration.inspectSessionGrant",
+        "summary": "Inspect the authenticated caller's session access policy",
+        "description": "Fresh policy snapshot only. Does not acquire a writer seat, authorize terminal admission or substitute for execution-time grant checks.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "session_grant_request_invalid",
+          "session_grant_permission_denied",
+          "session_grant_unavailable",
+          "session_grant_service_unavailable",
+          "session_grant_response_invalid"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Historical operation receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationSessionGrantSnapshotV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/projects/{projectId}/members/{subjectId}/withdraw": {
+      "parameters": [
+        {
+          "name": "projectId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        },
+        {
+          "name": "subjectId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "collaboration.withdrawMembership",
+        "summary": "Suspend or revoke existing project membership",
+        "description": "Owner-authorized withdrawal of an existing membership only; role is retained by the server. No creation or reactivation. Retry an uncertain result with the same operation identity and unchanged request. Returns a historical policy receipt, not proof of connected-client revocation. Request-invalid errors use 422, permission denial 403, unavailable membership 404, operation/revision/transition conflicts 409, invalid upstream response 502, and service unavailability 503. Authentication failures use the shared authentication problem response.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "membership_request_invalid",
+          "membership_permission_denied",
+          "membership_unavailable",
+          "membership_operation_conflict",
+          "membership_revision_conflict",
+          "membership_transition_invalid",
+          "membership_response_invalid",
+          "membership_service_unavailable"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CollaborationMembershipWithdrawRequestV1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Historical operation receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationMembershipPolicyReceiptV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/projects/{projectId}/members": {
+      "parameters": [
+        {
+          "name": "projectId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        },
+        {
+          "name": "after_subject",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        },
+        {
+          "name": "page_size",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          }
+        }
+      ],
+      "get": {
+        "operationId": "collaboration.inspectMemberships",
+        "summary": "Inspect project membership policy inventory",
+        "description": "Current owner authorization is checked for every page. Rows are ordered by subject UUID; next_after is the last visible UUID only when further rows exist. A page is a policy snapshot, not proof of terminal admission or effective connected-client revocation.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "membership_request_invalid",
+          "membership_permission_denied",
+          "membership_unavailable",
+          "membership_response_invalid",
+          "membership_service_unavailable"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded membership policy page.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationMembershipInventoryV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/projects/{projectId}/agent-sessions": {
+      "parameters": [
+        {
+          "name": "projectId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "maxLength": 2048,
+            "pattern": "^cdc1\\.[A-Za-z0-9_-]+$"
+          }
+        },
+        {
+          "name": "page_size",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          }
+        }
+      ],
+      "get": {
+        "operationId": "collaboration.discoverSessions",
+        "summary": "Discover sessions explicitly shared with the current account",
+        "description": "Each page rechecks active membership and explicit live observation grants. Empty pages may carry an opaque continuation cursor. Listing never authorizes terminal admission. Cursors expire after five minutes and are bound to principal, project and page size.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "discovery_request_invalid",
+          "discovery_permission_denied",
+          "discovery_unavailable",
+          "discovery_response_invalid",
+          "discovery_service_unavailable",
+          "discovery_cursor_invalid",
+          "discovery_aborted"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded currently shared session identities.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationAgentSessionPageV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/agent-sessions/{id}/observer-attachments": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "collaboration.issueObserverAttachment",
+        "summary": "Issue a single-use read-only observer attachment for the authenticated guest",
+        "description": "Requires the caller’s own live observe grant, a permitted observe_existing provider decision and a current public audience receipt. Returns the one-time stream secret once. Never grants input, resize or signals and never exposes the owner’s terminal replay.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "observer_attachment_request_invalid",
+          "observer_attachment_unavailable",
+          "observer_attachment_owner_refused",
+          "provider_decision_unavailable",
+          "public_audience_unavailable",
+          "audience_decision_unavailable",
+          "edge_incarnation_unavailable",
+          "observer_attachment_service_unavailable",
+          "observer_attachment_response_invalid"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "operation_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                  },
+                  "client_instance_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Issuance receipt. The secret is present exactly once, on first issuance; a replay of the same operation returns the same receipt without it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationObserverAttachmentIssueV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/agent-sessions/{id}/observer-endpoints/{endpointId}/revocation": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        {
+          "name": "endpointId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "collaboration.inspectObserverRevocation",
+        "summary": "Read the effective state of a guest observer endpoint revocation",
+        "description": "Owner-side truth for CUNA-COL-025-R3: pending_retirement until the Edge that owned the guest transport acknowledges the closed socket durably; effective afterwards. A control-plane row alone never renders effective.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "observer_revocation_request_invalid",
+          "observer_revocation_unavailable",
+          "observer_revocation_service_unavailable",
+          "observer_revocation_response_invalid"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current revocation state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationObserverRevocationStateV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/projects/{projectId}/members/{subjectId}/observer-endpoints": {
+      "parameters": [
+        {
+          "name": "projectId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        },
+        {
+          "name": "subjectId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "collaboration.listObserverEndpoints",
+        "summary": "List a member’s observer endpoints on the caller’s project",
+        "description": "Owner-side inventory of guest observer endpoints (pending, active or retired) for one project member, so revocation can be tracked to its effective acknowledgement. Read-only; no admission.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "observer_endpoint_inventory_request_invalid",
+          "observer_endpoint_inventory_unavailable",
+          "observer_endpoint_inventory_service_unavailable",
+          "observer_endpoint_inventory_response_invalid"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current inventory.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationObserverEndpointInventoryV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5098,6 +6118,10 @@
             "$ref": "#/components/schemas/Uuid",
             "description": "Immutable canonical WorkspaceBinding selected for this AgentSession. Omitted only for legacy rows created before binding authority; never contains a private sync namespace."
           },
+          "project_id": {
+            "$ref": "#/components/schemas/Uuid",
+            "description": "Project that owns the Workspace this AgentSession runs in, resolved server-side from its canonical WorkspaceBinding or its execution Workspace. Omitted when the AgentSession names neither, which means the Project is unknown rather than absent. It is the session's own Project, which is not in general the Machine default Workspace's Project."
+          },
           "workspace_generation": {
             "type": "integer",
             "minimum": 1,
@@ -5974,11 +6998,11 @@
                           "number",
                           "null"
                         ],
-                        "description": "The provider's own balance when balance_status is 'available', and null otherwise. Null means unknown \u00e2\u20ac\u201d never zero, and never an assumed grant minus estimated spend. That subtraction once reported 22.12 USD remaining to an account the provider had already cut off at 0.00."
+                        "description": "The provider's own balance when balance_status is 'available', and null otherwise. Null means unknown â€” never zero, and never an assumed grant minus estimated spend. That subtraction once reported 22.12 USD remaining to an account the provider had already cut off at 0.00."
                       },
                       "balance_unavailable_reason": {
                         "type": "string",
-                        "description": "Present exactly when balance_status is 'unavailable'. A renderer must show this instead of a number, never a spinner: no balance can arrive later. It must not tell the reader to check their provider account \u00e2\u20ac\u201d Cuna assigns provider accounts it owns, so the reader holds no such account."
+                        "description": "Present exactly when balance_status is 'unavailable'. A renderer must show this instead of a number, never a spinner: no balance can arrive later. It must not tell the reader to check their provider account â€” Cuna assigns provider accounts it owns, so the reader holds no such account."
                       },
                       "note": {
                         "type": "string"
@@ -8009,6 +9033,1909 @@
           "workspace_generation",
           "remote_root"
         ]
+      },
+      "CollaborationWriterRequestV1": {
+        "type": "object",
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "client_instance_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+          },
+          "process_epoch": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "expected_writer_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "membership_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "grant_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "operation_id",
+          "client_instance_id",
+          "process_epoch",
+          "expected_writer_epoch",
+          "membership_revision",
+          "grant_revision"
+        ],
+        "additionalProperties": false
+      },
+      "CollaborationWriterResponseV1": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "operation": {
+            "type": "object",
+            "properties": {
+              "agent_session_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "process_epoch": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "writer_epoch": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "writer_client_instance_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+              },
+              "transfer_pending": {
+                "type": "boolean"
+              },
+              "operation_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "operation_state": {
+                "type": "string",
+                "const": "committed"
+              }
+            },
+            "required": [
+              "agent_session_id",
+              "process_epoch",
+              "writer_epoch",
+              "writer_client_instance_id",
+              "transfer_pending",
+              "operation_id",
+              "operation_state"
+            ],
+            "additionalProperties": false
+          },
+          "authority": {
+            "type": "object",
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "process_epoch": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "authority_generation": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+              },
+              "owner_principal_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "writer": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "type": "string",
+                        "const": "unknown"
+                      },
+                      "reason": {
+                        "type": "string",
+                        "enum": [
+                          "not_observed",
+                          "authority_unavailable",
+                          "scope_changed"
+                        ]
+                      },
+                      "observed_at": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "state",
+                      "reason",
+                      "observed_at"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "type": "string",
+                        "const": "none"
+                      },
+                      "writer_epoch": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "observation_revision": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "observed_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "state",
+                      "writer_epoch",
+                      "observation_revision",
+                      "observed_at"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "type": "string",
+                        "const": "present"
+                      },
+                      "principal_id": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                      },
+                      "client_id": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+                      },
+                      "writer_epoch": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "observation_revision": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "observed_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "state",
+                      "principal_id",
+                      "client_id",
+                      "writer_epoch",
+                      "observation_revision",
+                      "observed_at"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "provider": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "type": "string",
+                        "const": "unknown"
+                      },
+                      "reason": {
+                        "type": "string",
+                        "enum": [
+                          "not_observed",
+                          "authority_unavailable",
+                          "scope_changed"
+                        ]
+                      },
+                      "verified_at": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "state",
+                      "reason",
+                      "verified_at"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "type": "string",
+                        "const": "observed"
+                      },
+                      "provider_context_id": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                      },
+                      "context_revision": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "auth_method": {
+                        "type": "string",
+                        "enum": [
+                          "interactive_login",
+                          "credential_binding"
+                        ]
+                      },
+                      "masked_identity": {
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256,
+                            "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "verified_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "state",
+                      "provider_context_id",
+                      "context_revision",
+                      "auth_method",
+                      "masked_identity",
+                      "verified_at"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "required": [
+              "session_id",
+              "process_epoch",
+              "authority_generation",
+              "owner_principal_id",
+              "writer",
+              "provider"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "version",
+          "operation",
+          "authority"
+        ],
+        "additionalProperties": false
+      },
+      "CollaborationInvitationAcceptRequestV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "secret"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "secret": {
+            "type": "string",
+            "minLength": 52,
+            "maxLength": 52,
+            "pattern": "^cuna_inv_[A-Za-z0-9_-]{43}$"
+          }
+        }
+      },
+      "CollaborationInvitationRevokeRequestV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        }
+      },
+      "CollaborationInvitationAcceptanceReceiptV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "invitation_id",
+          "operation_id",
+          "recipient_id",
+          "project_id",
+          "membership_revision",
+          "role"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "acceptance_receipt"
+          },
+          "invitation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "recipient_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "membership_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "observer",
+              "collaborator"
+            ]
+          }
+        }
+      },
+      "CollaborationInvitationRevocationReceiptV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "invitation_id",
+          "operation_id",
+          "state"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "revocation_receipt"
+          },
+          "invitation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "revoked",
+              "expired"
+            ]
+          }
+        }
+      },
+      "CollaborationInvitationMetadataV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "invitation_id",
+          "project_id",
+          "recipient_id",
+          "role",
+          "state",
+          "expires_at"
+        ],
+        "properties": {
+          "version": {
+            "const": "1",
+            "type": "string"
+          },
+          "kind": {
+            "const": "invitation_metadata",
+            "type": "string"
+          },
+          "invitation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "recipient_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "observer",
+              "collaborator"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "accepted",
+              "expired",
+              "revoked"
+            ]
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "description": "Historical metadata only. Pending does not establish current acceptability or a session grant."
+      },
+      "CollaborationInvitationIssueRequestV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "invitation_id",
+          "recipient_id",
+          "role",
+          "expires_at"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "invitation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "recipient_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "observer",
+              "collaborator"
+            ]
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CollaborationInvitationDeliveryV1": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "kind",
+              "invitation_id",
+              "operation_id",
+              "secret"
+            ],
+            "properties": {
+              "version": {
+                "type": "string",
+                "const": "1"
+              },
+              "kind": {
+                "type": "string",
+                "const": "created"
+              },
+              "invitation_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "operation_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "secret": {
+                "type": "string",
+                "minLength": 52,
+                "maxLength": 52,
+                "pattern": "^cuna_inv_[A-Za-z0-9_-]{43}$"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "kind",
+              "invitation_id",
+              "operation_id"
+            ],
+            "properties": {
+              "version": {
+                "type": "string",
+                "const": "1"
+              },
+              "kind": {
+                "type": "string",
+                "const": "already_created"
+              },
+              "invitation_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "operation_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              }
+            }
+          }
+        ]
+      },
+      "CollaborationInvitationReplaceRequestV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "invitation_id",
+          "expires_at"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "invitation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CollaborationSessionGrantSetRequestV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "subject_id",
+          "expected_revision",
+          "permission",
+          "expires_at"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "subject_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740990
+          },
+          "permission": {
+            "type": "string",
+            "enum": [
+              "observe",
+              "request_control"
+            ]
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|[+-]\\d{2}:\\d{2})$"
+          }
+        }
+      },
+      "CollaborationSessionGrantRevokeRequestV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "subject_id",
+          "expected_revision"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "subject_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740990
+          }
+        }
+      },
+      "CollaborationSessionGrantReceiptV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "operation_id",
+          "agent_session_id",
+          "subject_id",
+          "grant_revision",
+          "permission",
+          "state",
+          "expires_at"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "session_grant_policy_receipt"
+          },
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "subject_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "grant_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "permission": {
+            "type": "string",
+            "enum": [
+              "observe",
+              "request_control"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "const": "active"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|[+-]\\d{2}:\\d{2})$"
+          }
+        }
+      },
+      "CollaborationSessionGrantRevocationReceiptV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "operation_id",
+          "agent_session_id",
+          "subject_id",
+          "grant_revision",
+          "state"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "session_grant_policy_receipt"
+          },
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "subject_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "grant_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "state": {
+            "type": "string",
+            "const": "revoked"
+          }
+        }
+      },
+      "CollaborationSessionGrantSnapshotV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "actor_id",
+          "infrastructure_owner_id",
+          "agent_session_id",
+          "project_id",
+          "grant_revision",
+          "membership_revision",
+          "authority_generation",
+          "session_incarnation",
+          "permission",
+          "expires_at"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "session_grant_snapshot"
+          },
+          "actor_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "infrastructure_owner_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "grant_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "membership_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "authority_generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "session_incarnation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "permission": {
+            "type": "string",
+            "enum": [
+              "observe",
+              "request_control"
+            ]
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|[+-]\\d{2}:\\d{2})$"
+          }
+        }
+      },
+      "SharedAttachmentAuthorityV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "grant",
+          "registration_id",
+          "provider",
+          "audience",
+          "attachment"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "shared_attachment_authority"
+          },
+          "grant": {
+            "$ref": "#/components/schemas/CollaborationSessionGrantSnapshotV1"
+          },
+          "registration_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "provider": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "context_id",
+              "context_revision",
+              "principal_id",
+              "agent_session_id",
+              "decision_id",
+              "decision_revision",
+              "mode"
+            ],
+            "properties": {
+              "context_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "context_revision": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "principal_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "agent_session_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "decision_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "decision_revision": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "observe_existing",
+                  "control_existing"
+                ]
+              }
+            }
+          },
+          "audience": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "decision_id",
+              "revision",
+              "replay_generation",
+              "state",
+              "sanitization_receipt_id",
+              "stream_id",
+              "cursor_domain",
+              "first_output_sequence"
+            ],
+            "properties": {
+              "decision_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "replay_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "state": {
+                "type": "string",
+                "const": "sharing"
+              },
+              "sanitization_receipt_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "stream_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "cursor_domain": {
+                "type": "string",
+                "const": "sanitized_audience_stream_v1"
+              },
+              "first_output_sequence": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,19}$",
+                "description": "Inclusive sequence in the named sanitized audience stream, not raw process replay or attachment-local rendering sequence. Decoder enforces uint64 range."
+              }
+            }
+          },
+          "attachment": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "terminal_connection_id",
+              "tenant_id",
+              "machine_id",
+              "execution_workspace_id",
+              "process_epoch",
+              "client_instance_id",
+              "attachment_generation",
+              "logical_terminal_id",
+              "terminal_attachment_id",
+              "terminal_attachment_state_generation",
+              "process_start_identity",
+              "resume_handle_digest",
+              "control_generation",
+              "control_lease_id",
+              "account_workspace_id",
+              "sync_namespace_id",
+              "workspace_generation",
+              "binding"
+            ],
+            "properties": {
+              "terminal_connection_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "tenant_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "machine_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "execution_workspace_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "process_epoch": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "client_instance_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+              },
+              "attachment_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "logical_terminal_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "terminal_attachment_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "terminal_attachment_state_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "process_start_identity": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,31}$"
+              },
+              "resume_handle_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "control_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "control_lease_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "account_workspace_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "sync_namespace_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "workspace_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "binding": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "direct"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind",
+                      "binding_id",
+                      "binding_epoch"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "dedicated_binding"
+                      },
+                      "binding_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                      },
+                      "binding_epoch": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 9007199254740991
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "description": "Internal immutable binding for a registered shared attachment. Structural validity is not admission authority. The issuer must validate current grant, provider decision and sanitized replay audience, persist registration before issuance, and bind its digest to redemption. No shared transport is enabled by this schema."
+      },
+      "ProviderLaunchBindingV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "context_id",
+          "context_revision",
+          "principal_id",
+          "session_incarnation",
+          "agent_session_id",
+          "process_epoch",
+          "agent",
+          "auth_mode",
+          "credential_binding_id"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "context_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "context_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "session_incarnation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "process_epoch": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "agent": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "codex",
+              "opencode",
+              "openclaw"
+            ]
+          },
+          "auth_mode": {
+            "type": "string",
+            "enum": [
+              "interactive_login",
+              "credential_binding"
+            ]
+          },
+          "credential_binding_id": {
+            "oneOf": [
+              {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "description": "Internal immutable provider context binding to one process launch. Not provider authentication evidence. Requires explicit negotiated dispatch and durable recovery binding; legacy launch must not silently accept or discard this object."
+      },
+      "CollaborationMembershipWithdrawRequestV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "expected_revision",
+          "action"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740990
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "suspend",
+              "revoke"
+            ]
+          }
+        }
+      },
+      "CollaborationMembershipPolicyReceiptV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "operation_id",
+          "project_id",
+          "subject_id",
+          "previous_revision",
+          "membership_revision",
+          "role",
+          "state"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "membership_policy_receipt"
+          },
+          "operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "subject_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "previous_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740990
+          },
+          "membership_revision": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 9007199254740991
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "observer",
+              "collaborator"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "suspended",
+              "revoked"
+            ]
+          }
+        },
+        "description": "Immutable historical membership policy result, not a live access grant or proof of connected-client revocation."
+      },
+      "CollaborationMembershipInventoryV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "project_id",
+          "members",
+          "next_after"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "membership_inventory"
+          },
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "members": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "subject_id",
+                "role",
+                "status",
+                "membership_revision"
+              ],
+              "properties": {
+                "subject_id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                },
+                "role": {
+                  "type": "string",
+                  "enum": [
+                    "observer",
+                    "collaborator"
+                  ]
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "suspended",
+                    "revoked"
+                  ]
+                },
+                "membership_revision": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          },
+          "next_after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        },
+        "description": "Owner-only bounded policy snapshot for this page. Includes suspended and revoked memberships. Continuation pages are not one atomic global snapshot; revisions must be checked when mutating. Contains no live terminal authority."
+      },
+      "CollaborationAgentSessionPageV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "project_id",
+          "items",
+          "next_cursor"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "collaboration_agent_session_page"
+          },
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "agent_session_id"
+              ],
+              "properties": {
+                "agent_session_id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 2048,
+            "pattern": "^cdc1\\.[A-Za-z0-9_-]+$"
+          }
+        }
+      },
+      "SupervisorPublicAudienceControlV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "version",
+          "request_id",
+          "action",
+          "agent_session_id",
+          "process_epoch",
+          "logical_terminal_id",
+          "process_start_identity",
+          "lease_id",
+          "lease_expires_at"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "public_audience_control"
+          },
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "publish",
+              "private"
+            ]
+          },
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "process_epoch": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "logical_terminal_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "process_start_identity": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,31}$"
+          },
+          "lease_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "lease_expires_at": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        },
+        "description": "Internal exact-peer command. Owner publication authorization and current runtime identity are server prerequisites. Request ID correlates an attempt; uncertain publish must not be automatically retried."
+      },
+      "SupervisorPublicAudienceReceiptV1": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "agent_session_id",
+              "process_epoch",
+              "logical_terminal_id",
+              "process_start_identity",
+              "state",
+              "stream_id",
+              "generation",
+              "starting_sequence",
+              "reset_source_revision"
+            ],
+            "properties": {
+              "agent_session_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "process_epoch": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "logical_terminal_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "process_start_identity": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,31}$"
+              },
+              "state": {
+                "type": "string",
+                "const": "producer_public"
+              },
+              "stream_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "generation": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,19}$",
+                "description": "Canonical uint64 decimal. Consumers must additionally enforce value <=18446744073709551615."
+              },
+              "starting_sequence": {
+                "type": "string",
+                "pattern": "^(0|[1-9][0-9]{0,19})$",
+                "description": "Canonical uint64 decimal. Consumers must additionally enforce value <=18446744073709551615.",
+                "const": "0"
+              },
+              "reset_source_revision": {
+                "type": "string",
+                "pattern": "^(0|[1-9][0-9]{0,19})$",
+                "description": "Canonical uint64 decimal. Consumers must additionally enforce value <=18446744073709551615."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "agent_session_id",
+              "process_epoch",
+              "logical_terminal_id",
+              "process_start_identity",
+              "state"
+            ],
+            "properties": {
+              "agent_session_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "process_epoch": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "logical_terminal_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "process_start_identity": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,31}$"
+              },
+              "state": {
+                "type": "string",
+                "const": "producer_private"
+              }
+            }
+          }
+        ],
+        "description": "Producer observation only, never guest admission or downstream sink-drain acknowledgement. Public generations must be positive; publication starts before any frame at sequence zero."
+      },
+      "SupervisorPublicAudienceObservedV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "version",
+          "request_id",
+          "action",
+          "agent_session_id",
+          "process_epoch",
+          "logical_terminal_id",
+          "process_start_identity",
+          "lease_id",
+          "result"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "public_audience_observed"
+          },
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "publish",
+              "private"
+            ]
+          },
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "process_epoch": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "logical_terminal_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "process_start_identity": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,31}$"
+          },
+          "lease_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "status",
+                  "receipt"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "const": "observed"
+                  },
+                  "receipt": {
+                    "$ref": "#/components/schemas/SupervisorPublicAudienceReceiptV1"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "status",
+                  "reason"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "const": "unavailable"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "enum": [
+                      "busy",
+                      "runtime_unavailable",
+                      "identity_changed",
+                      "lease_expired",
+                      "publication_interrupted",
+                      "producer_unavailable"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "description": "Accepted only from the exact authenticated control peer and pending request identity. Action and receipt state must match. Contains no display bytes or secrets."
+      },
+      "CollaborationObserverAttachmentIssueV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attachment_id",
+          "endpoint_id",
+          "expires_at",
+          "stream_url"
+        ],
+        "properties": {
+          "attachment_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "endpoint_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "stream_url": {
+            "type": "string",
+            "pattern": "^/v1/collaboration/1/observer-attachments/[0-9a-f-]{36}/stream$",
+            "description": "Relative path of the guest observer WebSocket stream; the one-time secret is presented as the runa.auth.<secret> subprotocol."
+          },
+          "secret": {
+            "type": "string",
+            "pattern": "^cuna_so_[!-~]{8,504}$",
+            "description": "Present exactly once on first issuance; a retry of the same operation returns already_issued without it."
+          }
+        }
+      },
+      "CollaborationObserverRevocationStateV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "endpoint_id",
+          "state",
+          "retired_at",
+          "acknowledged_at",
+          "reason"
+        ],
+        "properties": {
+          "endpoint_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "active",
+              "pending_retirement",
+              "effective"
+            ]
+          },
+          "retired_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "acknowledged_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "grant_revoked",
+              "observer_revoked",
+              "attachment_expired",
+              "session_ended",
+              "session_terminated",
+              "edge_shutdown",
+              null
+            ]
+          }
+        }
+      },
+      "CollaborationObserverEndpointInventoryV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "project_id",
+          "subject_id",
+          "endpoints"
+        ],
+        "properties": {
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "subject_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "endpoints": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "agent_session_id",
+                "endpoint_id",
+                "state"
+              ],
+              "properties": {
+                "agent_session_id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "endpoint_id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "pending_endpoint",
+                    "active",
+                    "retired"
+                  ]
+                }
+              }
+            }
+          }
+        }
       }
     }
   },
