@@ -504,6 +504,13 @@ export interface AgentSession {
    */
   readonly workspaceBindingId?: string;
   readonly workspaceGeneration?: number;
+  /**
+   * Project that owns the Workspace this AgentSession runs in, resolved by the
+   * server from whichever Workspace the session names. Absent means the server
+   * could not name one, which is unknown rather than none. It is the session's
+   * own Project and is NOT in general the Machine default Workspace's Project.
+   */
+  readonly projectId?: string;
   readonly workspaceFailureCode?: string;
   readonly terminalReason?: TerminalReason;
   readonly name: string;
@@ -584,6 +591,7 @@ function decodeAgentSession(value: unknown): AgentSession {
     "machine_id",
     "workspace_binding_id",
     "workspace_generation",
+    "project_id",
     "workspace_failure_code",
     "terminal_reason",
     "name",
@@ -641,6 +649,15 @@ function decodeAgentSession(value: unknown): AgentSession {
   ) {
     throw contractViolation("workspace_binding_identity_shape");
   }
+  // The Project is the server's answer about this exact session, so the CLI
+  // checks its shape and otherwise carries it through untouched. Absent stays
+  // absent: a session whose Workspace the server cannot resolve has an unknown
+  // Project, and inventing one here would let a caller scope work to a Project
+  // the session does not belong to.
+  const projectId = optionalString(value, "project_id");
+  if (projectId !== undefined && !UUID.test(projectId)) {
+    throw contractViolation("project_identity_shape", "project_id");
+  }
   const rowVersion = optionalNumber(value, "row_version");
   if (rowVersion === undefined || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
     throw contractViolation("safe_non_negative_integer", "row_version");
@@ -651,6 +668,7 @@ function decodeAgentSession(value: unknown): AgentSession {
     ...(workspaceBindingId === undefined
       ? {}
       : { workspaceBindingId, workspaceGeneration: workspaceGeneration as number }),
+    ...(projectId === undefined ? {} : { projectId }),
     ...(workspaceFailureCode === undefined ? {} : { workspaceFailureCode }),
     ...(terminalReason === undefined ? {} : { terminalReason: terminalReason as TerminalReason }),
     name: requiredDisplayString(value, "name"),
