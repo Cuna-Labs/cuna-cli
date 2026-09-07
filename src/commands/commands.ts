@@ -29,6 +29,7 @@ import {
   assertMachineId,
   assertPublicId,
   assertSafeDisplayText,
+  ContractViolation,
   integerArgument,
 } from "../core/validation.js";
 import { preflightAgentJourneyInvocation } from "../journey/intent.js";
@@ -553,7 +554,34 @@ function truncationFooter(nextCursor: string | undefined): readonly string[] {
 interface MachineOverviewRow {
   readonly machine: Machine;
   readonly sessions: readonly AgentSession[];
-  readonly sessionsError?: "sessions_unavailable";
+  readonly sessionsError?: string;
+}
+
+/**
+ * A bounded, safe token naming WHY a machine's AgentSessions could not be read.
+ *
+ * The overview used to report the constant `sessions_unavailable` for every
+ * cause. On 2026-09-07 an Edge release added a field this CLI's decoder did not
+ * know, so every read failed `no_unknown_fields` — and the overview said only
+ * "unavailable", which named nothing and pointed nowhere. Diagnosing it needed a
+ * different command. A refusal that cannot be told apart from any other refusal
+ * is not a report.
+ *
+ * Only vocabulary the CLI itself mints is rendered: an error code, or a
+ * contract predicate and the key path that failed. No message text, no server
+ * body, no field values — the reason must never become a channel for data the
+ * server chose. The result is capped so a hostile or absurd token cannot flood
+ * a terminal row.
+ */
+function safeSessionsErrorReason(error: unknown): string {
+  const bound = (value: string) => value.slice(0, 64);
+  if (error instanceof ContractViolation) {
+    return bound(error.field === undefined
+      ? `contract:${error.predicate}`
+      : `contract:${error.predicate}:${error.field}`);
+  }
+  if (error instanceof CunaError) return bound(error.code);
+  return "unknown";
 }
 
 function renderMachineOverview(
@@ -573,7 +601,7 @@ function renderMachineOverview(
     const opencode = `OpenCode ${counts.opencode.running}/${counts.opencode.total} running`;
     const providerCounts = `${opencode} · ${claude} · ${codex}`;
     const header = `▾ ${machine.name}  ${machine.state}  ${provider.displayName} ${providerVerdict(provider)}  ${providerCounts}`;
-    if (sessionsError !== undefined) return [header, "  └─ AgentSessions unavailable"];
+    if (sessionsError !== undefined) return [header, `  └─ AgentSessions unavailable (${sessionsError})`];
     if (sessions.length === 0) return [header, "  └─ No AgentSessions"];
     return [
       header,
@@ -1490,11 +1518,11 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
           .slice()
           .sort((left, right) => left.agent.localeCompare(right.agent) || left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
         return Object.freeze({ machine, sessions: Object.freeze(sessions) });
-      } catch {
+      } catch (error) {
         return Object.freeze({
           machine,
           sessions: Object.freeze([]),
-          sessionsError: "sessions_unavailable" as const,
+          sessionsError: safeSessionsErrorReason(error),
         });
       }
     }));

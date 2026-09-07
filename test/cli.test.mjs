@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { CunaError, EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
+import { ContractViolation, CunaError, EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
 import { CREDENTIAL_BACKEND_PROTOCOL } from "../dist/credentials/contracts.js";
 
 const API_KEY = "cuna_sk_abcdefghijklmnop";
@@ -233,7 +233,9 @@ test("machines overview degrades one AgentSession child-read failure without los
   }), EXIT_CODES.success);
   const items = JSON.parse(json.stdout()).data.items;
   assert.equal(items.length, 2);
-  assert.equal(items.find((item) => item.id === failedId).agent_sessions_error, "sessions_unavailable");
+  // A cause the CLI has no vocabulary for renders as "unknown", never as the
+  // upstream message. The discriminating cases are in the test below.
+  assert.equal(items.find((item) => item.id === failedId).agent_sessions_error, "unknown");
   assert.deepEqual(items.find((item) => item.id === failedId).agent_sessions, []);
   assert.equal(items.find((item) => item.id === healthyId).agent_sessions[0].name, "healthy-codex");
   assert.doesNotMatch(json.stdout(), /private upstream failure/u);
@@ -248,6 +250,66 @@ test("machines overview degrades one AgentSession child-read failure without los
   }), EXIT_CODES.success);
   assert.match(human.stdout(), /partial[\s\S]*AgentSessions unavailable/u);
   assert.match(human.stdout(), /healthy[\s\S]*healthy-codex/u);
+});
+
+/*
+ * Why a machine's AgentSessions could not be read must be distinguishable.
+ *
+ * The overview reported the single constant "sessions_unavailable" for every
+ * cause. On 2026-09-07 an Edge release added a field this decoder did not know,
+ * every read failed no_unknown_fields, and the overview said only
+ * "unavailable" — naming nothing and pointing nowhere. Diagnosing it took a
+ * different command entirely.
+ *
+ * Each case below carries a DIFFERENT cause and asserts a DIFFERENT rendered
+ * reason, so collapsing them back to one constant turns this red. The last two
+ * assertions are the safety half: the reason is vocabulary the CLI itself
+ * mints, so no upstream message may appear in it.
+ */
+test("the overview names why AgentSessions could not be read, and tells the causes apart", async () => {
+  const drift = "55555555-5555-4555-8555-555555555555";
+  const typed = "66666666-6666-4666-8666-666666666666";
+  const opaque = "77777777-7777-4777-8777-777777777777";
+  const client = fakeClient({
+    async listMachines() {
+      return { items: [
+        { id: drift, name: "contract-drift", state: "running", agent: "opencode" },
+        { id: typed, name: "typed-refusal", state: "running", agent: "codex" },
+        { id: opaque, name: "no-vocabulary", state: "running", agent: "claude-code" },
+      ] };
+    },
+    async listAgentSessions(machineId) {
+      if (machineId === drift) throw new ContractViolation("no_unknown_fields", "items[0]");
+      if (machineId === typed) {
+        throw new CunaError({
+          code: "cuna.remote.unavailable",
+          message: "upstream said something private",
+          exitCode: EXIT_CODES.internal,
+        });
+      }
+      throw new Error("private upstream failure nobody should read");
+    },
+  });
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "--json"], {
+    streams: json.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  const reason = (id) =>
+    JSON.parse(json.stdout()).data.items.find((item) => item.id === id).agent_sessions_error;
+
+  assert.equal(reason(drift), "contract:no_unknown_fields:items[0]");
+  assert.equal(reason(typed), "cuna.remote.unavailable");
+  assert.equal(reason(opaque), "unknown");
+  // Three causes, three reasons: the report actually discriminates.
+  assert.equal(new Set([reason(drift), reason(typed), reason(opaque)]).size, 3);
+
+  // The reason never carries what upstream said.
+  assert.doesNotMatch(json.stdout(), /private upstream failure/u);
+  assert.doesNotMatch(json.stdout(), /something private/u);
 });
 
 test("machines explorer selection attaches through the shared foreground runner", async () => {
