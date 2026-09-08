@@ -145,38 +145,9 @@ test("OpenCode machine observation preserves a supervisor-repair blocker without
   });
 });
 
-test("uncertain AgentSession create recovers by the exact original idempotency key", async () => {
-  const calls = [];
-  const client = {
-    async discoverCapabilities() { return capability(); },
-    async createAgentSession() {
-      calls.push("create");
-      throw new CunaError({
-        code: "cuna.client.response_budget_elapsed",
-        message: "unknown dispatch",
-        exitCode: EXIT_CODES.network,
-      });
-    },
-    async inspectAgentSessionCreate(key) {
-      calls.push(["inspect", key]);
-      return recoveredSession();
-    },
-  };
-  const result = await effects(client).createAgentSession({
-    machineId: MACHINE_ID,
-    agent: "claude-code",
-    authMode: "interactive_login",
-    workspace: {
-      bindingId: BINDING_ID,
-      workspaceIdentity: BINDING_ID,
-      generation: 7,
-      remoteCwd: "/workspace/projects/project",
-    },
-    idempotencyKey: "stable-agent-create-key",
-    signal: new AbortController().signal,
-  });
-  assert.deepEqual(result, { id: SESSION_ID, machineId: MACHINE_ID });
-  assert.deepEqual(calls, ["create", ["inspect", "stable-agent-create-key"]]);
+test("native launch without canonical published Workspace refuses before V1 dispatch", async () => {
+ const client={async discoverCapabilities(){return capability();},async createAgentSession(){assert.fail('V1 forbidden');},async inspectAgentSessionCreate(){assert.fail('V1 forbidden');}};
+ await assert.rejects(effects(client).createAgentSession({machineId:MACHINE_ID,agent:'claude-code',authMode:'interactive_login',workspace:{bindingId:BINDING_ID,workspaceIdentity:BINDING_ID,generation:7,remoteCwd:'/workspace/projects/project'},idempotencyKey:'old-key',signal:new AbortController().signal}),{code:'cuna.provider.v2_unavailable'});
 });
 
 test("OpenCode supervisor capability rejection happens before any create dispatch", async () => {
@@ -248,39 +219,6 @@ test("OpenCode runtime verification remains a transient no-create result", async
   assert.equal(creates, 0);
 });
 
-test("recovered AgentSession with substituted authority is rejected before attach", async () => {
-  const client = {
-    async discoverCapabilities() { return capability(); },
-    async createAgentSession() {
-      throw new CunaError({
-        code: "cuna.network.failed",
-        message: "unknown dispatch",
-        exitCode: EXIT_CODES.network,
-      });
-    },
-    async inspectAgentSessionCreate() {
-      return recoveredSession({ machineId: "44444444-4444-4444-8444-444444444444" });
-    },
-  };
-  await assert.rejects(
-    effects(client).createAgentSession({
-      machineId: MACHINE_ID,
-      agent: "claude-code",
-      authMode: "interactive_login",
-      workspace: {
-        bindingId: BINDING_ID,
-        workspaceIdentity: BINDING_ID,
-        generation: 7,
-        remoteCwd: "/workspace/projects/project",
-      },
-      idempotencyKey: "stable-agent-create-key",
-      signal: new AbortController().signal,
-    }),
-    (error) =>
-      error instanceof CunaError &&
-      error.code === "cuna.journey.agent_session_create_authority_mismatch",
-  );
-});
 
 const OWN_CLIENT = "cli:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const OTHER_CLIENT = "cli:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -397,12 +335,13 @@ test("only a live session is asked for its seat", async () => {
     assert.equal(observed.attachment, "detached", processState);
   }
 });
-test('explicit published Workspace OpenCode uses V2 preset and exact same-key uncertain replay without old create or inspect',async()=>{
+for(const agent of ['opencode','codex','claude-code'])test(`explicit published Workspace ${agent} uses V2 preset and exact same-key uncertain replay without old create or inspect`,async()=>{
  const stateDirectory=await mkdtemp(join(tmpdir(),'cuna-v2-launch-'));
  const calls=[];const execution='44444444-4444-4444-8444-444444444444';const workspace={bindingId:BINDING_ID,workspaceIdentity:BINDING_ID,executionWorkspaceId:execution,generation:7,remoteCwd:`/workspace/workspaces/${execution}`};
- const client={async discoverCapabilities(){return capability();},async createAgentSession(){throw Error('old create forbidden');},async inspectAgentSessionCreate(){throw Error('old inspect forbidden');},async createProviderSessionV2(machine,request){calls.push({machine,request});if(calls.length===1)throw new CunaError({code:'cuna.network.failed',message:'lost',exitCode:EXIT_CODES.network});return{agentSession:recoveredSession({agent:'opencode',cwd:workspace.remoteCwd,workspaceBindingId:undefined,workspaceGeneration:undefined})};}};
- const effect=createApiAgentJourneyEffects({client,requestedAgent:'opencode',providerLaunchState:{stateDirectory,ownerId:'owner',workspaceId:'account'},inspectWorkspace:async()=>({canonicalLocalRoot:'x'}),synchronizeWorkspace:async()=>workspace,attach:async()=>{},authorizeMachineCreate:async()=>false,now:()=>NOW,selectProviderPreset:async()=>({label:'Selected preset',profile_id:'55555555-5555-4555-8555-555555555555',profile_revision:2})});
- assert.equal((await effect.createAgentSession({machineId:MACHINE_ID,agent:'opencode',authMode:'interactive_login',workspace,idempotencyKey:'random-journey-agent',signal:new AbortController().signal})).id,SESSION_ID);
+ const client={async discoverCapabilities(){return capability();},async createAgentSession(){throw Error('old create forbidden');},async inspectAgentSessionCreate(){throw Error('old inspect forbidden');},async createProviderSessionV2(machine,request){calls.push({machine,request});if(calls.length===1)throw new CunaError({code:'cuna.network.failed',message:'lost',exitCode:EXIT_CODES.network});return{agentSession:recoveredSession({agent,cwd:workspace.remoteCwd,workspaceBindingId:undefined,workspaceGeneration:undefined})};}};
+ const effect=createApiAgentJourneyEffects({client,requestedAgent:agent,providerLaunchState:{stateDirectory,ownerId:'owner',workspaceId:'account'},inspectWorkspace:async()=>({canonicalLocalRoot:'x'}),synchronizeWorkspace:async()=>workspace,attach:async()=>{},authorizeMachineCreate:async()=>false,now:()=>NOW,selectProviderPreset:async()=>({kind:agent==='opencode'?'provider_preset':'native_interactive',agent,label:'Selected preset',profile_id:'55555555-5555-4555-8555-555555555555',profile_revision:2})});
+ assert.equal((await effect.createAgentSession({machineId:MACHINE_ID,agent,authMode:'interactive_login',workspace,idempotencyKey:'random-journey-agent',signal:new AbortController().signal})).id,SESSION_ID);
+ assert.equal(calls[0].request.agent,agent);
  assert.equal(calls.length,2);assert.deepEqual(calls[0],calls[1]);assert.equal(calls[0].request.execution_workspace_id,execution);assert.equal(calls[0].request.workspace_generation,7);assert.equal(calls[0].request.profile_revision,2);assert.match(calls[0].request.operation_id,/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
- await assert.rejects(effect.createAgentSession({machineId:MACHINE_ID,agent:'opencode',authMode:'interactive_login',workspace:{...workspace,executionWorkspaceId:undefined},idempotencyKey:'x',signal:new AbortController().signal}),e=>e.code==='cuna.provider.v2_unavailable');assert.equal(calls.length,2);await rm(stateDirectory,{recursive:true,force:true});
+ await assert.rejects(effect.createAgentSession({machineId:MACHINE_ID,agent,authMode:'interactive_login',workspace:{...workspace,executionWorkspaceId:undefined},idempotencyKey:'x',signal:new AbortController().signal}),e=>e.code==='cuna.provider.v2_unavailable');assert.equal(calls.length,2);await rm(stateDirectory,{recursive:true,force:true});
 });

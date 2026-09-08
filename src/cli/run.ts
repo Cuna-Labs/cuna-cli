@@ -98,6 +98,7 @@ export interface RunCliDependencies {
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
   readonly foregroundTerminalRunner?: ForegroundSessionRunner;
   readonly machinesExplorerRunner?: MachinesExplorerRunner;
+  readonly providerScreenRunner?: typeof runProviderScreen;
   readonly rootJourneyRunner?: RootJourneyRunner;
   /** Internal root-UI hint; never parsed from or printed to user input. */
   readonly managedWorkspaceMachineId?: string;
@@ -1490,7 +1491,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         return EXIT_CODES.success;
       }
       if (selection.kind === "provider-check") {
-        await runProviderScreen(client,{kind:"check",sessionId:selection.agentSessionId},undefined,dependencies.signal);
+        await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"check",sessionId:selection.agentSessionId},undefined,dependencies.signal);
         return await runCli(["machines"],dependencies);
       }
       if (selection.kind === "executions") {
@@ -1615,12 +1616,13 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }
       const journeyScope = Object.freeze({ userId: identity.id, workspaceId });
       if (remoteMenuLaunch && dependencies.managedWorkspaceMachineId !== undefined) {
-        if (journeyAgent !== "opencode") throw new CunaError({code:"cuna.provider.v2_unavailable",message:"New V2 sessions currently support the OpenCode provider preset only. Existing sessions can still be opened.",exitCode:EXIT_CODES.usage});
         inlineJourneyProgress?.stop(); inlineJourneyProgress = undefined;
-        const preset=await runProviderScreen(client,{kind:"preset"},undefined,dependencies.signal);
+        const preset=await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"preset",agent:journeyAgent},undefined,dependencies.signal);
         if(preset===undefined)return EXIT_CODES.success;
         const agentSessionId = await launchRemoteWorkspaceSession({
           preset,
+          providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id},
+          confirmNew:async()=>{const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal:dependencies.signal})).trim());}finally{prompt.close();}},
           client, machineId: dependencies.managedWorkspaceMachineId, workspaceId, agent: journeyAgent,
           onProgress: (label) => inlineJourneyProgress?.update(label),
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
@@ -1677,7 +1679,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           requestedAgent: journeyAgent,
           confirmNewProviderLaunch:async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal})).trim());}finally{prompt.close();}},
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
-          selectProviderPreset: async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const preset=await runProviderScreen(client,{kind:"preset"},undefined,signal);if(!preset)throw new CunaError({code:"cuna.provider.selection_cancelled",message:"Provider selection cancelled. The synchronized Workspace is preserved.",exitCode:EXIT_CODES.usage});return preset;},
+          selectProviderPreset: async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const preset=await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"preset",agent:journeyAgent},undefined,signal);if(!preset)throw new CunaError({code:"cuna.provider.selection_cancelled",message:"Provider selection cancelled. The synchronized Workspace is preserved.",exitCode:EXIT_CODES.usage});return preset;},
           inspectWorkspace: workspace.inspectWorkspace,
           synchronizeWorkspace: workspace.synchronizeWorkspace,
           // The spinner and the prompt write to the same row of the same
@@ -1862,7 +1864,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }, dependencies.now === undefined ? {} : { now: dependencies.now });
       if (selection !== undefined) {
         if (selection.kind === "provider-check") {
-        await runProviderScreen(client,{kind:"check",sessionId:selection.agentSessionId},undefined,dependencies.signal);
+        await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"check",sessionId:selection.agentSessionId},undefined,dependencies.signal);
         return await runCli(["machines"],dependencies);
       }
       if (selection.kind === "executions") {

@@ -443,6 +443,7 @@ test("no-args remains help off-TTY but a real TTY infers and attaches the select
 });
 
 test("both interactive menus create in the selected remote Workspace without local synchronization", async () => {
+  const remoteState=await mkdtemp(join(tmpdir(),"cuna-menu-native-"));let iteration=0;
   const { Terminal } = (await import("@xterm/headless")).default;
   for (const argv of [[], ["machines"]]) {
     for (const { columns, nativeMode } of [
@@ -484,7 +485,7 @@ test("both interactive menus create in the selected remote Workspace without loc
         return { machineId: id, workspaceId: FOREGROUND_SESSION_B, executionWorkspaceId: FOREGROUND_SESSION_D,
           remoteRoot: root, workspaceGeneration: 1, publicationStatus: "ready" };
       },
-      async createAgentSessionInWorkspace(id, input) {
+      async createProviderSessionV2(id, input) {
         created.push({ id, input });
         await new Promise((resolve) => setTimeout(resolve, 100));
         await checkRow();
@@ -494,9 +495,11 @@ test("both interactive menus create in the selected remote Workspace without loc
       async getAgentSession() { return session; },
     });
     const select = async () => ({ kind: "launch", agent: "codex", machineId: MACHINE_ID, machineName: "chosen", newSession: true });
-    const exit = await runCli(argv, { streams: interactive.streams, platform, env: { CUNA_API_KEY: API_KEY },
+    const exit = await runCli(argv, { streams: interactive.streams, env: { CUNA_API_KEY: API_KEY },
       now: () => Date.parse("2026-08-08T00:00:00.000Z"), clientFactory: () => client,
       rootJourneyRunner: select, machinesExplorerRunner: select,
+      platform:{...platform,paths:{...platform.paths,stateDirectory:join(remoteState,String(iteration++))}},
+      providerScreenRunner: async (_client,mode) => {assert.equal(mode.agent,"codex");return {kind:"native_interactive",agent:"codex",label:"Codex native",profile_id:FOREGROUND_SESSION_C,profile_revision:1};},
       automaticJourneyEffectsFactory: () => { throw new Error("local synchronization must not run"); },
       foregroundTerminalRunner: async input => {
         attached.push(input);
@@ -512,6 +515,7 @@ test("both interactive menus create in the selected remote Workspace without loc
     assert.equal(exit, EXIT_CODES.success, interactive.stderr());
     assert.equal(created.length, 1); assert.equal(created[0].id, MACHINE_ID);
     assert.equal(created[0].input.workspaceBindingId, undefined);
+    assert.equal(created[0].input.agent,"codex");assert.equal(created[0].input.execution_workspace_id,FOREGROUND_SESSION_D);
     assert.deepEqual(attached.map(a => a.agentSessionIds), [[FOREGROUND_SESSION_A]]);
     for (const observation of observedRows) {
       assert.equal(observation.row, 0, `progress wrapped at ${observation.columns} columns`);
@@ -520,6 +524,7 @@ test("both interactive menus create in the selected remote Workspace without loc
     physical.dispose();
     }
   }
+  await rm(remoteState,{recursive:true,force:true});
 });
 
 test("bare cuna paints a neutral loader before a delayed local sign-in check", async () => {
@@ -2994,6 +2999,8 @@ test("menu creation decline returns to Machines while direct and unrelated refus
         return fakeClient({ async createMachine() { calls.dispatched += 1; throw new Error("unexpected mutation"); } });
       },
       rootJourneyRunner: select, machinesExplorerRunner: select,
+
+
       automaticJourneyEffectsFactory: () => ({
         async inspectWorkspace() { return { canonicalLocalRoot: "C:\\work\\project" }; },
         async observeMachines() { return []; },

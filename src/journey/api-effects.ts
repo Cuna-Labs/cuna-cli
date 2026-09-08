@@ -1,11 +1,10 @@
 import {withProviderLaunchIntent} from "./provider-launch-intent.js";
 import type {ProviderPreset} from "../api/provider-v2.js";
-import {createPublishedProviderSessionV2} from "./remote-workspace.js";
+import {createPublishedProviderSessionV2,requireMatchingPreset} from "./remote-workspace.js";
 import type { AgentSession, AgentSessionTerminalSeat, Machine } from "../api/contracts.js";
 import { sessionFailure } from "./session-failure.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
-import { isObservationBudgetCode } from "../core/observation-budget.js";
 import {
   isOpenCodeRuntimeUnverifiedCapabilityRejection,
   isOpenCodeSupervisorUpgradeReason,
@@ -303,7 +302,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         return sessionObservation(session, attachmentFromSeat(seat, input.clientInstanceId));
       })));
     },
-    async createAgentSession({ machineId, agent, authMode, credentialBindingId, workspace, idempotencyKey, signal }) {
+    async createAgentSession({ machineId, agent, authMode, credentialBindingId, workspace, signal }) {
       try {
         await requireCapability({
           client: input.client,
@@ -330,74 +329,16 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         }
         throw error;
       }
-      if(agent==='opencode'){
-        if(authMode!=='interactive_login'||credentialBindingId!==undefined||!workspace.executionWorkspaceId||workspace.generation<1||!input.selectProviderPreset)throw fail('cuna.provider.v2_unavailable','OpenCode requires a selected V2 preset and a published execution Workspace.');
+      if(agent==='opencode'||agent==='codex'||agent==='claude-code'){
+        if(authMode!=='interactive_login'||credentialBindingId!==undefined||!workspace.executionWorkspaceId||workspace.generation<1||!input.selectProviderPreset)throw fail('cuna.provider.v2_unavailable','The agent requires a selected V2 profile and a published execution Workspace.');
         const preset=await input.selectProviderPreset(signal);
+        requireMatchingPreset(agent,preset);
         if(!input.providerLaunchState)throw fail('cuna.provider.v2_unavailable','Durable provider launch state is unavailable.');
         const executionWorkspaceId=workspace.executionWorkspaceId;
-        const session=await withProviderLaunchIntent({...input.providerLaunchState,machineId,executionWorkspaceId,confirmNew:async()=>await input.confirmNewProviderLaunch?.(signal)??false,intent:{executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,profileId:preset.profile_id,profileRevision:preset.profile_revision,agent,authMode},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId,preset,operationId,executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,signal})});
+        const session=await withProviderLaunchIntent({...input.providerLaunchState,machineId,executionWorkspaceId,confirmNew:async()=>await input.confirmNewProviderLaunch?.(signal)??false,intent:{executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,profileId:preset.profile_id,profileRevision:preset.profile_revision,agent,authMode},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId,agent,preset,operationId,executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,signal})});
         return Object.freeze({id:session.id,machineId:session.machineId});
       }
-      const createInput = {
-        agent,
-        cwd: workspace.remoteCwd,
-        workspaceBindingId: workspace.bindingId,
-        workspaceGeneration: workspace.generation,
-        authMode,
-        ...(credentialBindingId === undefined ? {} : { credentialBindingId }),
-      } as const;
-      let session: AgentSession;
-      try {
-        session = await input.client.createAgentSession(
-          machineId,
-          createInput,
-          idempotencyKey,
-          signal,
-        );
-      } catch (error) {
-        // "Uncertain" means no authoritative answer reached us. Read the
-        // authority rather than a literal so a third budget kind cannot leave
-        // this recovery path behind.
-        const uncertain =
-          error instanceof CunaError &&
-          (isObservationBudgetCode(error.code) || error.code === "cuna.network.failed");
-        if (!uncertain || signal.aborted) throw error;
-        try {
-          session = await input.client.inspectAgentSessionCreate(idempotencyKey, signal);
-        } catch (inspectionError) {
-          if (
-            !(inspectionError instanceof CunaError) ||
-            inspectionError.code !== "agent_session_not_found" ||
-            signal.aborted
-          ) {
-            throw inspectionError;
-          }
-          // The first dispatch may have failed before durable admission. A
-          // replay with the exact same key and canonical intent serializes on
-          // the producer's idempotency authority and cannot create a sibling.
-          session = await input.client.createAgentSession(
-            machineId,
-            createInput,
-            idempotencyKey,
-            signal,
-          );
-        }
-      }
-      if (
-        session.machineId !== machineId ||
-        session.agent !== agent ||
-        session.cwd !== workspace.remoteCwd ||
-        session.workspaceBindingId !== workspace.bindingId ||
-        session.workspaceGeneration !== workspace.generation ||
-        session.authMode !== authMode
-      ) {
-        throw fail(
-          "cuna.journey.agent_session_create_authority_mismatch",
-          "Recovered AgentSession authority does not match the requested canonical intent.",
-          EXIT_CODES.conflict,
-        );
-      }
-      return Object.freeze({ id: session.id, machineId: session.machineId });
+      throw fail('cuna.provider.v2_unavailable','This agent has no supported canonical V2 launch profile.');
     },
     async ensureAgentSessionReady({ agentSessionId, signal }) {
       for (let attempt = 0; attempt < CHILD_POLL_LIMIT; attempt += 1) {
@@ -438,12 +379,6 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       }
       if (ledger.createdAgentSessionId !== undefined) {
         await input.client.getAgentSession(ledger.createdAgentSessionId, signal).catch(() => undefined);
-      } else if(input.requestedAgent!=="opencode") {
-        // Read-only recovery proves whether a cancelled in-flight create
-        // durably admitted a child; it never creates a new AgentSession.
-        await input.client
-          .inspectAgentSessionCreate(`${ledger.idempotencyKey}-agent`, signal)
-          .catch(() => undefined);
       }
       // An absent request identity proves no create was dispatched, so there is
       // nothing to reconcile. It used to be present unconditionally, which made

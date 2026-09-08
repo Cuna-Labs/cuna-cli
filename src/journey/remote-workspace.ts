@@ -1,5 +1,5 @@
 import type { ProviderPreset } from "../api/provider-v2.js";
-import { randomUUID } from "node:crypto";
+import {withProviderLaunchIntent} from "./provider-launch-intent.js";
 import { sessionFailure } from "./session-failure.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { requireCapability, type CunaApiClient } from "../api/client.js";
@@ -19,13 +19,14 @@ export async function launchRemoteWorkspaceSession(input: {
   readonly onProgress?: (message: string) => void;
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
-  readonly idempotencyKey?: string;
+  readonly providerLaunchState: {stateDirectory:string;ownerId:string};
+  readonly confirmNew?:()=>Promise<boolean>;
 }): Promise<string> {
-  if (input.agent !== "opencode") throw new CunaError({code:"cuna.provider.v2_unavailable",message:"V2 provider presets currently support OpenCode only.",exitCode:EXIT_CODES.usage});
+  requireMatchingPreset(input.agent,input.preset);
   const now = input.now ?? Date.now;
   const sleep = input.sleep ?? (async (ms, signal) => { await delay(ms, undefined, { signal }); });
   const signal = input.signal ?? new AbortController().signal;
-  const key = input.idempotencyKey ?? randomUUID();
+
   const gate = async (capabilityId: string, readOnly = false) => {
     signal.throwIfAborted();
     await requireCapability({ client: input.client, scope: "machine", resourceId: input.machineId,
@@ -50,9 +51,9 @@ export async function launchRemoteWorkspaceSession(input: {
     if (now() - started >= REMOTE_CONVERGENCE_BUDGET_MS) throw timeout("remote Workspace publication");
     await sleep(500, signal);
   }
-  const agentName = "OpenCode";
-  input.onProgress?.("Starting OpenCode with the selected expected provider preset");
-  let session = await createPublishedProviderSessionV2({client:input.client,machineId:input.machineId,preset:input.preset,operationId:key,executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,signal});
+  const agentName = input.agent === "opencode" ? "OpenCode" : input.agent === "codex" ? "Codex" : "Claude";
+  input.onProgress?.(`Starting ${agentName} with the selected profile`);
+  let session = await withProviderLaunchIntent({...input.providerLaunchState,workspaceId:input.workspaceId,machineId:input.machineId,executionWorkspaceId:workspace.executionWorkspaceId,...(input.confirmNew?{confirmNew:input.confirmNew}:{}),intent:{executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,profileId:input.preset.profile_id,profileRevision:input.preset.profile_revision,agent:input.agent,authMode:"interactive_login"},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId:input.machineId,agent:input.agent,preset:input.preset,operationId,executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,signal})});
   const sessionId = session.id;
   const validate = (value: AgentSession) => {
     if (value.id !== sessionId || value.machineId !== input.machineId || value.agent !== input.agent ||
@@ -76,11 +77,16 @@ export async function launchRemoteWorkspaceSession(input: {
 }
 
 /** Shared canonical admission for already published remote or synchronized Workspaces. */
-export async function createPublishedProviderSessionV2(input:{client:CunaApiClient;machineId:string;preset:ProviderPreset;operationId:string;executionWorkspaceId:string;generation:number;cwd:string;signal:AbortSignal}):Promise<AgentSession>{
- const request={operation_id:input.operationId,cwd:input.cwd,execution_workspace_id:input.executionWorkspaceId,workspace_generation:input.generation,profile_id:input.preset.profile_id,profile_revision:input.preset.profile_revision};
+export async function createPublishedProviderSessionV2(input:{client:CunaApiClient;machineId:string;agent:"opencode"|"codex"|"claude-code";preset:ProviderPreset;operationId:string;executionWorkspaceId:string;generation:number;cwd:string;signal:AbortSignal}):Promise<AgentSession>{
+ requireMatchingPreset(input.agent,input.preset);
+ const request={agent:input.agent,operation_id:input.operationId,cwd:input.cwd,execution_workspace_id:input.executionWorkspaceId,workspace_generation:input.generation,profile_id:input.preset.profile_id,profile_revision:input.preset.profile_revision};
  const create=async()=>(await input.client.createProviderSessionV2(input.machineId,request,input.signal)).agentSession;
  let session:AgentSession;
  try{session=await create();}catch(error){if(!(error instanceof CunaError)||!(isObservationBudgetCode(error.code)||error.code==='cuna.network.failed')||input.signal.aborted)throw error;session=await create();}
- if(session.machineId!==input.machineId||session.agent!=='opencode'||session.cwd!==input.cwd||session.authMode!=='interactive_login'||session.workspaceBindingId!==undefined||session.workspaceGeneration!==undefined)throw new CunaError({code:'cuna.journey.agent_session_create_authority_mismatch',message:'The admitted session does not match the selected published Workspace.',exitCode:EXIT_CODES.conflict});
+ if(session.machineId!==input.machineId||session.agent!==input.agent||session.cwd!==input.cwd||session.authMode!=='interactive_login'||session.workspaceBindingId!==undefined||session.workspaceGeneration!==undefined)throw new CunaError({code:'cuna.journey.agent_session_create_authority_mismatch',message:'The admitted session does not match the selected published Workspace.',exitCode:EXIT_CODES.conflict});
  return session;
+}
+
+export function requireMatchingPreset(agent:string,preset:ProviderPreset):void {
+ if(preset.agent!==agent || (agent==='opencode' ? preset.kind!=='provider_preset' : preset.kind!=='native_interactive'))throw new CunaError({code:'cuna.provider.profile_agent_mismatch',message:'Select a profile for the requested agent.',exitCode:EXIT_CODES.usage});
 }

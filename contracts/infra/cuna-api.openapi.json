@@ -5446,6 +5446,477 @@
           }
         ]
       }
+    },
+    "/v1/collaboration/2/agent-sessions/{id}/observe-grants": {
+      "post": {
+        "operationId": "createSessionObserveGrantV2",
+        "summary": "Grant a current project observer access to one session",
+        "description": "Canonical V2 authority only. Immutable operation receipts are not evidence of current stream admission. Responses are not cached.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionObserveGrantV2Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validated V2 receipt; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionObserveGrantV2Receipt"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/observe-grants/{id}/inspect": {
+      "post": {
+        "operationId": "inspectSessionObserveGrantV2",
+        "summary": "Inspect current session observation authority",
+        "description": "Canonical V2 authority only. Immutable operation receipts are not evidence of current stream admission. Responses are not cached. The service requires collaboration:manage OR collaboration:accept, and validates the actor against the grant.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage",
+          "collaboration:accept"
+        ],
+        "x-runa-permission-mode": "any",
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InspectSessionObserveGrantV2Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validated V2 receipt; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionObserveGrantV2Receipt"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/observe-grants/{id}/revoke": {
+      "post": {
+        "operationId": "revokeSessionObserveGrantV2",
+        "summary": "Revoke observation and report endpoint retirement",
+        "description": "Canonical V2 authority only. Immutable operation receipts are not evidence of current stream admission. Responses are not cached.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeSessionObserveGrantV2Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validated V2 receipt; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionObserveGrantV2Receipt"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/projects/{id}/observers": {
+      "post": {
+        "operationId": "listProjectObserversV2",
+        "summary": "List current project observer memberships",
+        "description": "Canonical V2 authority only. Immutable operation receipts are not evidence of current stream admission. Responses are not cached.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListProjectObserversV2Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validated V2 receipt; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectObserversV2Receipt"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/projects/{id}/observer-sessions": {
+      "post": {
+        "operationId": "listObserverSessionsV2",
+        "summary": "List current session observation grants for the recipient",
+        "description": "Canonical V2 only. Listing grants does not establish stream admission. Responses are not cached.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListObserverSessionsV2Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validated V2 receipt; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObserverSessionsV2Receipt"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/observe-grants/{id}/attachments": {
+      "post": {
+        "operationId": "issueObserverAttachmentV2",
+        "summary": "Issue a single-use observer stream attachment",
+        "description": "Canonical V2 only. Listing grants does not establish stream admission. Responses are not cached.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueObserverAttachmentV2Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validated V2 receipt; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObserverAttachmentV2Receipt"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/agent-sessions/{id}/audience": {
+      "post": {
+        "operationId": "prepareSessionAudienceV2",
+        "summary": "Confirm the current session audience",
+        "description": "Canonical V2 only. Listing grants does not establish stream admission. Responses are not cached.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareSessionAudienceV2Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validated V2 receipt; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrepareSessionAudienceV2Receipt"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -7236,6 +7707,10 @@
           },
           "url": {
             "$ref": "#/components/schemas/RuntimeUrl"
+          },
+          "create_operation": {
+            "$ref": "#/components/schemas/MachineCreateRequest",
+            "description": "Durable creation operation when retained. Unknown requires reconciliation; it does not establish provider absence or continued creation."
           }
         }
       },
@@ -12111,14 +12586,16 @@
           "items": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 1,
+            "maxItems": 3,
             "items": {
               "type": "object",
               "additionalProperties": false,
               "required": [
                 "label",
                 "profile_id",
-                "profile_revision"
+                "profile_revision",
+                "kind",
+                "agent"
               ],
               "properties": {
                 "label": {
@@ -12134,8 +12611,52 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 9007199254740991
+                },
+                "kind": {
+                  "enum": [
+                    "provider_preset",
+                    "native_interactive"
+                  ]
+                },
+                "agent": {
+                  "enum": [
+                    "opencode",
+                    "codex",
+                    "claude-code"
+                  ]
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "kind": {
+                        "const": "provider_preset"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "agent": {
+                        "const": "opencode"
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "agent": {
+                        "enum": [
+                          "codex",
+                          "claude-code"
+                        ]
+                      }
+                    }
+                  }
+                }
+              ]
             }
           }
         }
@@ -12471,6 +12992,582 @@
             "$ref": "#/components/schemas/ProjectInvitationRefusalV2"
           }
         ]
+      },
+      "CreateSessionObserveGrantV2Request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "operation_id",
+          "subject_principal_id",
+          "expected_membership_revision",
+          "expires_at_ms"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "operation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "subject_principal_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "expected_membership_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "expires_at_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 253402300799999
+          }
+        }
+      },
+      "InspectSessionObserveGrantV2Request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          }
+        }
+      },
+      "RevokeSessionObserveGrantV2Request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "operation_id",
+          "expected_revision"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "operation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        }
+      },
+      "SessionObserveGrantV2Receipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "grant_id",
+          "revision",
+          "owner_principal_id",
+          "subject_principal_id",
+          "agent_session_id",
+          "session_incarnation",
+          "project_id",
+          "authority_epoch",
+          "membership_revision",
+          "state",
+          "expires_at",
+          "revocation_state"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "kind": {
+            "type": "string",
+            "const": "session_observe_grant"
+          },
+          "grant_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "owner_principal_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "subject_principal_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "agent_session_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "session_incarnation": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "project_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "authority_epoch": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "membership_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "active",
+              "revoked",
+              "expired"
+            ]
+          },
+          "expires_at": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 253402300799999
+          },
+          "revocation_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "effective_pending",
+              "effective",
+              null
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "active"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "revocation_state": {
+                  "type": "null"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "revocation_state": {
+                  "type": "string",
+                  "enum": [
+                    "effective_pending",
+                    "effective"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ListProjectObserversV2Request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "after_principal_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "default": null
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          }
+        }
+      },
+      "ProjectObserversV2Receipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "project_id",
+          "authority_epoch",
+          "items",
+          "next_after_principal_id"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "kind": {
+            "type": "string",
+            "const": "project_observers"
+          },
+          "project_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "authority_epoch": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "principal_id",
+                "membership_revision",
+                "recipient_email"
+              ],
+              "properties": {
+                "principal_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "membership_revision": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "recipient_email": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "email",
+                  "maxLength": 254
+                }
+              }
+            }
+          },
+          "next_after_principal_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      },
+      "ListObserverSessionsV2Request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          },
+          "after_grant_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        }
+      },
+      "ObserverSessionsV2Receipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "project_id",
+          "items",
+          "next_after_grant_id"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          },
+          "kind": {
+            "const": "observer_sessions"
+          },
+          "project_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/SessionObserveGrantV2Receipt"
+            }
+          },
+          "next_after_grant_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "IssueObserverAttachmentV2Request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "operation_id",
+          "client_instance_id"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          },
+          "operation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "client_instance_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9._:-]+$"
+          }
+        }
+      },
+      "ObserverAttachmentV2Receipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "attachment_id",
+          "expires_at",
+          "secret",
+          "stream_path"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          },
+          "attachment_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "expires_at": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "secret": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          },
+          "stream_path": {
+            "type": "string",
+            "pattern": "^/v1/collaboration/2/observer-attachments/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/stream$"
+          }
+        }
+      },
+      "PrepareSessionAudienceV2Request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "operation_id",
+          "action"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          },
+          "operation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "action": {
+            "enum": [
+              "publish",
+              "private"
+            ]
+          }
+        }
+      },
+      "ObservedSessionAudienceResponseV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "version",
+          "request_id",
+          "action",
+          "agent_session_id",
+          "session_incarnation",
+          "process_epoch",
+          "runtime_lease_id",
+          "logical_terminal_id",
+          "process_start_identity",
+          "expected_generation",
+          "result"
+        ],
+        "properties": {
+          "type": {
+            "const": "session_audience_response_v2"
+          },
+          "version": {
+            "const": "2"
+          },
+          "request_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "action": {
+            "enum": [
+              "publish",
+              "private"
+            ]
+          },
+          "agent_session_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "session_incarnation": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "process_epoch": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "runtime_lease_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "logical_terminal_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "process_start_identity": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,31}$"
+          },
+          "expected_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "status",
+                  "state",
+                  "stream_id",
+                  "generation",
+                  "first_sequence"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  },
+                  "state": {
+                    "const": "public"
+                  },
+                  "stream_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                  },
+                  "generation": {
+                    "type": "string",
+                    "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$"
+                  },
+                  "first_sequence": {
+                    "const": "1"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "status",
+                  "state",
+                  "generation"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  },
+                  "state": {
+                    "const": "private"
+                  },
+                  "generation": {
+                    "type": "string",
+                    "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "PrepareSessionAudienceV2Receipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "response"
+        ],
+        "properties": {
+          "state": {
+            "const": "observed"
+          },
+          "response": {
+            "$ref": "#/components/schemas/ObservedSessionAudienceResponseV2"
+          }
+        }
       }
     }
   },
