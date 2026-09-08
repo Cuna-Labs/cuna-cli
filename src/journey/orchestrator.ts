@@ -30,6 +30,7 @@ export interface JourneyMachine {
 }
 
 export interface JourneyWorkspaceReceipt {
+  readonly executionWorkspaceId?: string;
   readonly bindingId: string;
   readonly workspaceIdentity: string;
   readonly generation: number;

@@ -1,3 +1,6 @@
+import {withProviderLaunchIntent} from "./provider-launch-intent.js";
+import type {ProviderPreset} from "../api/provider-v2.js";
+import {createPublishedProviderSessionV2} from "./remote-workspace.js";
 import type { AgentSession, AgentSessionTerminalSeat, Machine } from "../api/contracts.js";
 import { sessionFailure } from "./session-failure.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
@@ -23,6 +26,9 @@ const CHILD_POLL_LIMIT = 90;
 
 export interface ApiAgentJourneyEffectsInput {
   readonly client: CunaApiClient;
+  readonly confirmNewProviderLaunch?: (signal:AbortSignal)=>Promise<boolean>;
+  readonly providerLaunchState?: {readonly stateDirectory:string;readonly ownerId:string;readonly workspaceId:string};
+  readonly selectProviderPreset?: (signal:AbortSignal)=>Promise<ProviderPreset>;
   /** The only provider executable this journey may select a machine for. */
   readonly requestedAgent: "claude-code" | "codex" | "opencode";
   /**
@@ -324,6 +330,14 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         }
         throw error;
       }
+      if(agent==='opencode'){
+        if(authMode!=='interactive_login'||credentialBindingId!==undefined||!workspace.executionWorkspaceId||workspace.generation<1||!input.selectProviderPreset)throw fail('cuna.provider.v2_unavailable','OpenCode requires a selected V2 preset and a published execution Workspace.');
+        const preset=await input.selectProviderPreset(signal);
+        if(!input.providerLaunchState)throw fail('cuna.provider.v2_unavailable','Durable provider launch state is unavailable.');
+        const executionWorkspaceId=workspace.executionWorkspaceId;
+        const session=await withProviderLaunchIntent({...input.providerLaunchState,machineId,executionWorkspaceId,confirmNew:async()=>await input.confirmNewProviderLaunch?.(signal)??false,intent:{executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,profileId:preset.profile_id,profileRevision:preset.profile_revision,agent,authMode},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId,preset,operationId,executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,signal})});
+        return Object.freeze({id:session.id,machineId:session.machineId});
+      }
       const createInput = {
         agent,
         cwd: workspace.remoteCwd,
@@ -424,7 +438,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       }
       if (ledger.createdAgentSessionId !== undefined) {
         await input.client.getAgentSession(ledger.createdAgentSessionId, signal).catch(() => undefined);
-      } else {
+      } else if(input.requestedAgent!=="opencode") {
         // Read-only recovery proves whether a cancelled in-flight create
         // durably admitted a child; it never creates a new AgentSession.
         await input.client

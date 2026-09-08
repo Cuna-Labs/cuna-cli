@@ -1664,6 +1664,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         effects = createApiAgentJourneyEffects({
           client,
           requestedAgent: journeyAgent,
+          confirmNewProviderLaunch:async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal})).trim());}finally{prompt.close();}},
+          providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
+          selectProviderPreset: async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const preset=await runProviderScreen(client,{kind:"preset"},undefined,signal);if(!preset)throw new CunaError({code:"cuna.provider.selection_cancelled",message:"Provider selection cancelled. The synchronized Workspace is preserved.",exitCode:EXIT_CODES.usage});return preset;},
           inspectWorkspace: workspace.inspectWorkspace,
           synchronizeWorkspace: workspace.synchronizeWorkspace,
           // The spinner and the prompt write to the same row of the same

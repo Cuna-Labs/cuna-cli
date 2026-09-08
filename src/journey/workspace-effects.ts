@@ -281,7 +281,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         if (authority.activeGeneration < 1) {
           throw fail("cuna.journey.workspace_generation_unavailable", "--no-sync cannot attach until the binding has a committed workspace generation.", EXIT_CODES.policy);
         }
-        return Object.freeze({ bindingId: authority.bindingId, workspaceIdentity: authority.bindingId, generation: authority.activeGeneration, remoteCwd: authority.remoteRoot });
+        return Object.freeze({ ...(authority.executionWorkspaceId==null?{}:{executionWorkspaceId:authority.executionWorkspaceId}), bindingId: authority.bindingId, workspaceIdentity: authority.bindingId, generation: authority.activeGeneration, remoteCwd: authority.remoteRoot });
       }
 
       // A generation is a witness to workspace content. If the content has not
@@ -324,6 +324,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         }
         return Object.freeze({
           bindingId: authority.bindingId,
+          ...(authority.executionWorkspaceId==null?{}:{executionWorkspaceId:authority.executionWorkspaceId}),
           workspaceIdentity: authority.bindingId,
           generation: authority.activeGeneration,
           remoteCwd: authority.remoteRoot,
@@ -398,7 +399,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           try { listener(snapshot); } catch { /* Status observers never own synchronization correctness. */ }
         }
       });
-      return Object.freeze({ bindingId: persisted.bindingId, workspaceIdentity: persisted.bindingId, generation: persisted.generation, remoteCwd: persisted.remoteRoot });
+      return Object.freeze({ ...(persisted.executionWorkspaceId===undefined?{}:{executionWorkspaceId:persisted.executionWorkspaceId}), bindingId: persisted.bindingId, workspaceIdentity: persisted.bindingId, generation: persisted.generation, remoteCwd: persisted.remoteRoot });
     },
   };
   return Object.freeze(effects);

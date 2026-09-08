@@ -52,15 +52,7 @@ export async function launchRemoteWorkspaceSession(input: {
   }
   const agentName = "OpenCode";
   input.onProgress?.("Starting OpenCode with the selected expected provider preset");
-  const request = { operation_id: key, cwd: workspace.remoteRoot, execution_workspace_id: workspace.executionWorkspaceId,
-    workspace_generation: workspace.workspaceGeneration, profile_id: input.preset.profile_id, profile_revision: input.preset.profile_revision };
-  const create = async () => (await input.client.createProviderSessionV2(input.machineId, request, signal)).agentSession;
-  let session: AgentSession;
-  try { session = await create(); } catch (error) {
-    if (!(error instanceof CunaError) || !(isObservationBudgetCode(error.code) || error.code === "cuna.network.failed") || signal.aborted) throw error;
-    // The canonical RPC atomically replays this exact operation; never inspect a V1 operation.
-    session = await create();
-  }
+  let session = await createPublishedProviderSessionV2({client:input.client,machineId:input.machineId,preset:input.preset,operationId:key,executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,signal});
   const sessionId = session.id;
   const validate = (value: AgentSession) => {
     if (value.id !== sessionId || value.machineId !== input.machineId || value.agent !== input.agent ||
@@ -81,4 +73,14 @@ export async function launchRemoteWorkspaceSession(input: {
     if (now() - admittedAt >= REMOTE_CONVERGENCE_BUDGET_MS) throw timeout("remote session readiness");
     await sleep(500, signal);
   }
+}
+
+/** Shared canonical admission for already published remote or synchronized Workspaces. */
+export async function createPublishedProviderSessionV2(input:{client:CunaApiClient;machineId:string;preset:ProviderPreset;operationId:string;executionWorkspaceId:string;generation:number;cwd:string;signal:AbortSignal}):Promise<AgentSession>{
+ const request={operation_id:input.operationId,cwd:input.cwd,execution_workspace_id:input.executionWorkspaceId,workspace_generation:input.generation,profile_id:input.preset.profile_id,profile_revision:input.preset.profile_revision};
+ const create=async()=>(await input.client.createProviderSessionV2(input.machineId,request,input.signal)).agentSession;
+ let session:AgentSession;
+ try{session=await create();}catch(error){if(!(error instanceof CunaError)||!(isObservationBudgetCode(error.code)||error.code==='cuna.network.failed')||input.signal.aborted)throw error;session=await create();}
+ if(session.machineId!==input.machineId||session.agent!=='opencode'||session.cwd!==input.cwd||session.authMode!=='interactive_login'||session.workspaceBindingId!==undefined||session.workspaceGeneration!==undefined)throw new CunaError({code:'cuna.journey.agent_session_create_authority_mismatch',message:'The admitted session does not match the selected published Workspace.',exitCode:EXIT_CODES.conflict});
+ return session;
 }
