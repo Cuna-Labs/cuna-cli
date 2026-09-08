@@ -1,3 +1,4 @@
+import { ContractViolation } from "../core/validation.js";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 
@@ -274,13 +275,37 @@ function unreconcilableCreate(cause: unknown): CunaError {
 }
 
 function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
+  // Only fixed vocabulary and opaque UUIDs cross this diagnostic boundary.
+  const codes = new Set(["cuna.network.failed", "cuna.network.service_unavailable", "cuna.network.rate_limited", "cuna.remote.rejected", "cuna.remote.conflict", "cuna.remote.not_found", "cuna.remote.operation_not_served", "cuna.remote.malformed_response", "cuna.provider.v2_unavailable", "cuna.provider.selection_cancelled", "cuna.provider.pending_intent_conflict", "cuna.provider.intent_history_full", "cuna.journey.agent_session_create_authority_mismatch"]);
+  const reasons = new Set(["invalid_provider_session_request", "provider_session_v2_invalid_input", "provider_session_v2_credentials_unavailable", "provider_session_v2_scope_unavailable", "provider_session_v2_profile_unavailable", "provider_session_v2_receipt_invalid", "provider_session_v2_authority_unavailable", "provider_session_v2_operation_conflict", "provider_session_v2_profile_mismatch", "provider_session_v2_capacity_exceeded", "provider_session_v2_machine_not_running"]);
+  const predicates = new Set(["provider_v2_create", "provider_v2_create_scope", "provider_v2_schema", "provider_v2_exact_contract", "contract_decode_failed", "matches_requested_resource", "response_within_size_limit"]);
+  const details: Record<string,string|number> = {recovery:"exhausted"};
+  const own=(value:object,key:string):unknown=>{const descriptor=Object.getOwnPropertyDescriptor(value,key);return descriptor&&"value" in descriptor?descriptor.value:undefined;};
+  if(cause instanceof ContractViolation){
+    const predicate=own(cause,"predicate");
+    if(typeof predicate==="string"&&predicates.has(predicate))details.predicate=predicate;
+    // Response decoder violations are wrapped by fetchDecoded. This plain exact-contract
+    // violation in the create boundary comes from providerSessionBody before transport.
+    if(predicate==="provider_v2_exact_contract")details.failure_stage="local_pre_admission";
+  }
+  if(cause instanceof CunaError){
+    const code=own(cause,"code");if(typeof code==="string"&&codes.has(code))details.cause_code=code;
+    const raw=own(cause,"details");if(raw&&typeof raw==="object"){
+      const status=own(raw,"http_status");if(typeof status==="number"&&Number.isInteger(status)&&status>=400&&status<=599)details.http_status=status;
+      const reason=own(raw,"reason");if(typeof reason==="string"&&reasons.has(reason))details.cause_reason=reason;
+      const predicate=own(raw,"predicate");if(typeof predicate==="string"&&predicates.has(predicate))details.predicate=predicate;
+      for(const key of ["operation_id","request_id"]){const value=own(raw,key);if(typeof value==="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value))details[key]=value;}
+    }
+    if(typeof code==="string"&&["cuna.provider.v2_unavailable","cuna.provider.selection_cancelled","cuna.provider.pending_intent_conflict","cuna.provider.intent_history_full"].includes(code))details.failure_stage="local_pre_admission";
+  }
+  const diagnostic=[details.cause_code,details.cause_reason,details.http_status,details.predicate].filter(value=>value!==undefined).join(" / ");
   return new CunaError({
     code: "cuna.journey.agent_session_create_outcome_unreconcilable",
-    message: "Cuna cannot prove whether the AgentSession create request committed.",
+    message: (details.failure_stage==="local_pre_admission"?"Local launch preparation refused before this attempt dispatched; any earlier launch remains unresolved.":"Cuna cannot prove whether the AgentSession create request committed.")+(diagnostic?" Diagnostic: "+diagnostic+".":""),
     exitCode: EXIT_CODES.remote,
     retryable: false,
     hint: "Do not request another child with a new key. Retry recovery with the original journey identity.",
-    details: { recovery: "exhausted" },
+    details,
     cause,
   });
 }
