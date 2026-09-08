@@ -298,6 +298,17 @@ function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
     }
     if(typeof code==="string"&&["cuna.provider.v2_unavailable","cuna.provider.selection_cancelled","cuna.provider.pending_intent_conflict","cuna.provider.intent_history_full"].includes(code))details.failure_stage="local_pre_admission";
   }
+  if(details.cause_code==="cuna.remote.conflict"&&details.http_status===409&&details.cause_reason==="agent_session_memory_capacity"){
+    return new CunaError({
+      code:"cuna.agent.memory_capacity",
+      message:"The selected Machine does not have enough available memory to start this OpenCode session.",
+      exitCode:EXIT_CODES.conflict,
+      retryable:false,
+      hint:"Inspect the Machine's running sessions. If appropriate, stop an unneeded session to free memory, then repeat this command with the same Workspace and preset to resume the recorded launch. Its pending operation identity is preserved; do not request a different launch to bypass this refusal.",
+      details:{...details,recovery:"pending_identity_preserved"},
+      cause,
+    });
+  }
   const diagnostic=[details.cause_code,details.cause_reason,details.http_status,details.predicate].filter(value=>value!==undefined).join(" / ");
   return new CunaError({
     code: "cuna.journey.agent_session_create_outcome_unreconcilable",
@@ -311,9 +322,8 @@ function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
 }
 
 /**
- * A typed 409 from the create authority settles this create attempt: it did
- * not commit.  It must not be converted into the generic "cannot prove"
- * result, which is reserved for a missing authoritative response.
+ * Only the specifically recognized supervisor preflight refusal is passed
+ * through here. An HTTP status alone does not establish non-commit.
  */
 function isProvenAgentSessionCreateRejection(cause: unknown): cause is CunaError {
   return cause instanceof CunaError &&
