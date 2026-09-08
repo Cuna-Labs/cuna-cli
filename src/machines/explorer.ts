@@ -99,7 +99,7 @@ interface MachineRow {
   /** Current capability evidence says OpenCode is still being verified. */
   readonly opencodeRuntimeUnverified: boolean;
   /** E13-R3: a Start/Stop/Delete issued from this screen that has not converged. */
-  readonly pendingLifecycle?: LifecycleAction | undefined;
+  readonly pendingLifecycle?: LifecycleAction | "recover" | undefined;
 }
 
 type SelectionKey =
@@ -107,7 +107,7 @@ type SelectionKey =
   | `session:${string}`
   | `machine-provider:${ActionableProvider}`
   | `machine-create:${ActionableProvider}`
-  | `machine-lifecycle:${LifecycleAction}`
+  | `machine-lifecycle:${LifecycleAction | "recover"}`
   | `machine-supervisor:${"blocked" | "update"}`
   | `provider-session:${string}`
   | `create:${ActionableProvider}`
@@ -370,6 +370,36 @@ export async function runNodeMachinesExplorer(
     const timer = setTimeout(resolve, Math.max(0, ms));
     timer.unref();
   });
+
+  const recoverCreation = async (machineId: string): Promise<void> => {
+    const row = rows.find(candidate => candidate.machine.id === machineId);
+    const operation = row?.machine.createOperation;
+    if (row === undefined || row.pendingLifecycle !== undefined || operation?.machineId !== machineId
+      || !machineContextActions(row, snapshotObservedAt).some(action => action.kind === "recover")) return;
+    updateMachineRow(machineId, { pendingLifecycle: "recover" });
+    lifecycleNotice = undefined;
+    selectedKey = undefined;
+    render();
+    try {
+      const result = await input.client.reconcileMachineCreateRequest(operation.id, requestSignal);
+      if (result.id !== operation.id || result.machineId !== machineId) throw new Error("Mismatched recovery response");
+      const observed = await input.client.getMachine(machineId, requestSignal);
+      if (observed.id !== machineId) throw new Error("Mismatched Machine response");
+      if (isClosing()) return;
+      updateMachineRow(machineId, { machine: observed });
+      lifecycleNotice = observed.state === "running"
+        ? `${safeLine(observed.name)} is running.`
+        : `Creation recovery is ${result.state}. Refresh or Recover creation again to check the same Machine.`;
+    } catch (error) {
+      if (isClosing()) return;
+      lifecycleNotice = error instanceof CunaError
+        ? `${error.code}: ${safeLine(error.message)}${error.hint === undefined ? "" : ` ${safeLine(error.hint)}`}`
+        : "Could not confirm creation recovery. Refresh to check the same Machine.";
+    } finally {
+      updateMachineRow(machineId, { pendingLifecycle: undefined });
+      if (!isClosing()) reconcileSelection();
+    }
+  };
 
   /**
    * E13-R2/R3. Run Start, Stop or Delete in place: capability gate, one
@@ -893,6 +923,9 @@ export async function runNodeMachinesExplorer(
           });
           selectedKey = selectableKeys(rows, expanded, snapshotObservedAt, navigation, initialized)[0];
           render();
+        } else if (action?.kind === "recover") {
+          pendingDelete = undefined;
+          void recoverCreation(action.machineId).catch((error) => { failure ??= error; stop(); });
         } else if (action?.kind === "start" || action?.kind === "stop") {
           pendingDelete = undefined;
           void runLifecycle(action.machineId, action.kind).catch((error) => { failure ??= error; stop(); });
@@ -1559,7 +1592,8 @@ function renderNewMachineScreen(
   });
 }
 
-function lifecycleLabel(action: LifecycleAction): string {
+function lifecycleLabel(action: LifecycleAction | "recover"): string {
+  if (action === "recover") return "Recovering creation…";
   return action === "start" ? "Starting…" : action === "stop" ? "Stopping…" : "Deleting…";
 }
 

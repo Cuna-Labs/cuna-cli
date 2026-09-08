@@ -117,6 +117,7 @@ export function decodeCapabilitySnapshot(value: unknown): CapabilitySnapshot {
 }
 
 export interface Machine {
+  readonly createOperation?: MachineCreateRequest;
   readonly id: string;
   readonly name: string;
   readonly state: string;
@@ -169,6 +170,12 @@ export interface WorkspaceBindingAuthority {
 
 function decodeMachine(value: unknown): Machine {
   if (!isObject(value)) throw contractViolation("object");
+  const id = canonicalUuid(value, "id");
+  const createOperation = value.create_operation === undefined ? undefined
+    : underField("create_operation", () => decodeMachineCreateRequest(value.create_operation));
+  if (createOperation !== undefined && createOperation.machineId !== id) {
+    throw contractViolation("matches_machine_id", "create_operation.machine_id");
+  }
   const state = optionalDisplayString(value, "state") ?? optionalDisplayString(value, "status") ?? "unknown";
   const memoryMiB = optionalNumber(value, "memory_mib");
   const vcpus = optionalNumber(value, "vcpus");
@@ -176,7 +183,8 @@ function decodeMachine(value: unknown): Machine {
   const createdAt = optionalString(value, "created_at");
   const updatedAt = optionalString(value, "updated_at");
   return Object.freeze({
-    id: canonicalUuid(value, "id"),
+    id,
+    ...(createOperation === undefined ? {} : { createOperation }),
     name: optionalDisplayString(value, "name") ?? optionalDisplayString(value, "slug") ?? requiredString(value, "id"),
     state,
     ...(agent === undefined ? {} : { agent }),

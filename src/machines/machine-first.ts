@@ -27,6 +27,7 @@ export type MachineFirstNavigationEvent =
   | Readonly<{ readonly type: "quit" }>;
 
 export type MachineContextAction =
+  | Readonly<{ readonly kind: "recover"; readonly label: "Recover creation"; readonly machineId: string }>
   | Readonly<{ readonly kind: "start"; readonly label: "Start"; readonly machineId: string }>
   | Readonly<{ readonly kind: "stop"; readonly label: "Stop"; readonly machineId: string }>
   /**
@@ -122,6 +123,10 @@ export function resolveMachineContextActions(
       Object.freeze({ kind: "start", label: "Start", machineId: machine.id }),
       remove,
     ]);
+  }
+  if (machine.state === "creating" && machine.createOperation?.machineId === machine.id
+    && ["in_progress", "unknown", "provider_succeeded"].includes(machine.createOperation.state)) {
+    return Object.freeze([Object.freeze({ kind: "recover", label: "Recover creation", machineId: machine.id }), remove]);
   }
   // `error`, `creating`, `deleted`, or any state this client does not know:
   // no transition is offered, but the console's Delete still is.

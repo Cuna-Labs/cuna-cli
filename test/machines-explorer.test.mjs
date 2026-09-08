@@ -2009,3 +2009,40 @@ test('p checks the exact selected session without attaching or creating',async()
  await waitUntil(()=>stripAnsi(host.writes.at(-1)).includes('Enter/'),'session selected');host.emitInput([112]);
  assert.deepEqual(await operation,{kind:'provider-check',agentSessionId:SESSION_ID});assert.equal(host.restored,1);
 });
+
+for (const state of ["in_progress", "unknown", "provider_succeeded"]) {
+  test(`Recover creation resumes bound ${state} operation without allocation`, async () => {
+    const { decodeMachineItem } = await import("../dist/index.js");
+    const operationId = "44444444-4444-4444-8444-444444444444";
+    const wire = { id: operationId, machine_id: MACHINE_ID, state, retryable: true, action: "reconcile", updated_at: new Date().toISOString() };
+    const machine = decodeMachineItem({ id: MACHINE_ID, name: "recover-me", state: "creating", create_operation: wire });
+    assert.throws(() => decodeMachineItem({ ...machine, create_operation: { ...wire, machine_id: SESSION_ID } }));
+    const host = new FakeHost();
+    const calls = [];
+    let complete;
+    const client = {
+      async listMachines() { return { items: [machine] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async reconcileMachineCreateRequest(id) { calls.push(["reconcile", id]); await new Promise(resolve => { complete = resolve; }); return { ...machine.createOperation, state: "settled" }; },
+      async getMachine(id) { calls.push(["get", id]); return { ...machine, state: "running" }; },
+      async createMachine() { assert.fail("recovery must not allocate"); },
+    };
+    const result = runNodeMachinesExplorer({ client, color: false }, { host });
+    try {
+      await waitUntil(() => lastFrame(host).includes("recover-me"), "inventory");
+      host.emitInput([0x1b, 0x5b, 0x43]);
+      await waitUntil(() => lastFrame(host).includes("Recover creation"), "recovery action");
+      host.emitInput([0x0d]);
+      await waitUntil(() => complete !== undefined && lastFrame(host).includes("Recovering creation"), "pending recovery");
+      host.emitInput([0x0d]);
+      assert.equal(calls.length, 1, "pending recovery cannot execute twice");
+      complete();
+      await waitUntil(() => lastFrame(host).includes("recover-me is running"), "same Machine reloaded");
+      assert.deepEqual(calls, [["reconcile", operationId], ["get", MACHINE_ID]]);
+    } finally {
+      complete?.();
+      host.emitInput([0x71]);
+      await result;
+    }
+  });
+}
