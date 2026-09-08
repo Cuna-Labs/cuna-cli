@@ -3846,7 +3846,7 @@
       "post": {
         "operationId": "collaboration.acceptInvitation",
         "summary": "Accept a recipient-bound invitation",
-        "description": "Returns an immutable operation receipt, not a live session access grant. Retry an uncertain result with the same operation identity.",
+        "description": "Requires no secret: the caller must already be signed in as the named, email-confirmed recipient. Returns an immutable operation receipt, not a live session access grant. Retry an uncertain result with the same operation identity. Attempts are bounded per actor.",
         "x-sdk-exposed": false,
         "x-runa-error-model": "problem",
         "x-runa-problem-codes": [
@@ -3859,7 +3859,9 @@
           "membership_revision_conflict",
           "membership_unavailable",
           "invitation_service_unavailable",
-          "invitation_response_invalid"
+          "invitation_response_invalid",
+          "invitation_policy_unavailable",
+          "invitation_rate_limited"
         ],
         "x-runa-auth-classes": [
           "browser_jwt",
@@ -4848,6 +4850,601 @@
             "$ref": "#/components/responses/Problem"
           }
         }
+      }
+    },
+    "/v1/collaboration/1/agent-sessions/{id}/grants/{subjectId}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        {
+          "name": "subjectId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "collaboration.inspectOwnedSessionGrant",
+        "summary": "Inspect a subject grant as current session owner",
+        "description": "Fresh policy snapshot only. Does not acquire a writer seat, authorize terminal admission or substitute for execution-time grant checks.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "session_grant_request_invalid",
+          "session_grant_permission_denied",
+          "session_grant_unavailable",
+          "session_grant_service_unavailable",
+          "session_grant_response_invalid"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current stored policy revision for CAS; not an admission receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationOwnedSessionGrantSnapshotV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/1/agent-sessions/{id}/grants/{subjectId}/revocation": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        {
+          "name": "subjectId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "collaboration.inspectOwnedSessionGrantRevocation",
+        "summary": "Inspect complete observation drain for an exact revoked grant revision",
+        "description": "Fresh policy snapshot only. Does not acquire a writer seat, authorize terminal admission or substitute for execution-time grant checks.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "session_grant_request_invalid",
+          "session_grant_permission_denied",
+          "session_grant_unavailable",
+          "session_grant_service_unavailable",
+          "session_grant_response_invalid"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revision-bound observation drain snapshot; never-admitted endpoints are not transport acknowledgements.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollaborationOwnedSessionGrantRevocationV1"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "expected_revision",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/agent-sessions/{id}/provider-observations": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AgentSessionId"
+        }
+      ],
+      "post": {
+        "operationId": "agentSessions.providerObservationV2",
+        "summary": "Refresh private owner provider selection observation",
+        "description": "Obtain a bounded technical observation for the exact owned live AgentSession. It grants no collaboration or provider permission; unavailable is an honest result, never a cached predecessor fact.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "agent_sessions:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderObservationRequestV2"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Fresh bounded observation or explicit unavailability.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                },
+                "description": "Provider observations are never cacheable."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderObservationResponseV2"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/2/sessions/{id}/workspace-agent-sessions": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "post": {
+        "operationId": "agentSessions.createProviderSessionV2",
+        "summary": "Create an owned V2 provider-profile AgentSession in a dedicated Workspace",
+        "description": "Select an existing immutable provider profile revision during fresh session creation. Creation neither grants provider permission nor proves launch, readiness or observed provider configuration.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "agent_sessions:create"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderSessionCreateRequestV2"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Exact creation and unobserved immutable selection receipt.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderSessionCreateResponseV2"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/2/provider-profiles/catalog": {
+      "post": {
+        "operationId": "providerProfiles.catalogV2",
+        "summary": "Prepare the server-selected OpenCode desired profile catalog",
+        "description": "Idempotently mint the configured immutable desired profile and return its selection coordinates only after the trusted mint receipt is validated. The preset is OpenCode Zen / Big Pickle. This establishes neither live provider configuration nor a login, entitlement, or private-launch policy permission.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "agent_sessions:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderProfileCatalogRequestV2"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Server-selected immutable desired preset coordinates.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderProfileCatalogResponseV2"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/collaboration/2/projects/{id}/invitations": {
+      "post": {
+        "operationId": "issueProjectInvitationV2",
+        "summary": "Create an observer invitation for a verified email recipient",
+        "description": "Canonical V2 only. Invitation receipts do not grant terminal access or establish current membership. No email is sent by this operation.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectInvitationIssueRequestV2"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verified receipt or opaque refusal; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectInvitationIssuedV2"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/invitations/{id}/inspect": {
+      "post": {
+        "operationId": "inspectProjectInvitationV2",
+        "summary": "Inspect an invitation as its issuer or intended recipient",
+        "description": "Canonical V2 only. Invitation receipts do not grant terminal access or establish current membership. No email is sent by this operation.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectInvitationInspectRequestV2"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verified receipt or opaque refusal; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectInvitationInspectResponseV2"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/invitations/{id}/accept": {
+      "post": {
+        "operationId": "acceptProjectInvitationV2",
+        "summary": "Accept an invitation with the intended verified account",
+        "description": "Canonical V2 only. Invitation receipts do not grant terminal access or establish current membership. No email is sent by this operation.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectInvitationActionRequestV2"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verified receipt or opaque refusal; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectInvitationAcceptResponseV2"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/collaboration/2/invitations/{id}/revoke": {
+      "post": {
+        "operationId": "revokeProjectInvitationV2",
+        "summary": "Revoke a pending invitation",
+        "description": "Canonical V2 only. Invitation receipts do not grant terminal access or establish current membership. No email is sent by this operation.",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectInvitationActionRequestV2"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verified receipt or opaque refusal; no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectInvitationRevokedV2"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        ]
       }
     }
   },
@@ -9349,22 +9946,16 @@
       },
       "CollaborationInvitationAcceptRequestV1": {
         "type": "object",
+        "description": "Acceptance carries no secret. The link carries the invitation id alone, and acceptance is gated on being signed in as the named, email-confirmed recipient.",
         "additionalProperties": false,
         "required": [
-          "operation_id",
-          "secret"
+          "operation_id"
         ],
         "properties": {
           "operation_id": {
             "type": "string",
             "format": "uuid",
             "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-          },
-          "secret": {
-            "type": "string",
-            "minLength": 52,
-            "maxLength": 52,
-            "pattern": "^cuna_inv_[A-Za-z0-9_-]{43}$"
           }
         }
       },
@@ -9479,12 +10070,50 @@
       "CollaborationInvitationMetadataV1": {
         "type": "object",
         "additionalProperties": false,
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "recipient_id"
+            ],
+            "properties": {
+              "recipient_binding": {
+                "const": "principal_bound"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "recipient_email"
+            ],
+            "properties": {
+              "recipient_binding": {
+                "const": "email_pending"
+              },
+              "state": {
+                "enum": [
+                  "pending",
+                  "expired",
+                  "revoked"
+                ]
+              }
+            },
+            "not": {
+              "type": "object",
+              "required": [
+                "recipient_id"
+              ]
+            }
+          }
+        ],
         "required": [
           "version",
           "kind",
           "invitation_id",
           "project_id",
-          "recipient_id",
+          "recipient_binding",
+          "issuer_id",
           "role",
           "state",
           "expires_at"
@@ -9513,6 +10142,19 @@
             "format": "uuid",
             "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
           },
+          "recipient_binding": {
+            "type": "string",
+            "enum": [
+              "principal_bound",
+              "email_pending"
+            ]
+          },
+          "recipient_email": {
+            "type": "string",
+            "format": "email",
+            "pattern": "^[^\\s@]+@[^\\s@]+$",
+            "maxLength": 255
+          },
           "role": {
             "type": "string",
             "enum": [
@@ -9529,12 +10171,25 @@
               "revoked"
             ]
           },
+          "issuer_id": {
+            "description": "Account that issued this invitation. An identifier, never a display name.",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "issuer_email": {
+            "description": "Login email of the issuing account, the only value in this product a person can recognise. ABSENT when that account is deleted, unconfirmed or has no email: absent means unknown, and a consumer must say the sender is unknown rather than substitute a placeholder or render issuer_id in its place.",
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 320,
+            "pattern": "^[^\\s@]{1,64}@[^\\s@]{1,255}$"
+          },
           "expires_at": {
             "type": "string",
             "format": "date-time"
           }
         },
-        "description": "Historical metadata only. Pending does not establish current acceptability or a session grant."
+        "description": "Historical metadata only. Pending does not establish current acceptability or a session grant. Carries the issuer of this one invitation, disclosed to its named recipient and to the issuer; it is not a directory read and exposes no other account attribute."
       },
       "CollaborationInvitationIssueRequestV1": {
         "type": "object",
@@ -9542,7 +10197,7 @@
         "required": [
           "operation_id",
           "invitation_id",
-          "recipient_id",
+          "recipient_email",
           "role",
           "expires_at"
         ],
@@ -9557,10 +10212,11 @@
             "format": "uuid",
             "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
           },
-          "recipient_id": {
+          "recipient_email": {
             "type": "string",
-            "format": "uuid",
-            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            "format": "email",
+            "pattern": "^[^\\s@]+@[^\\s@]+$",
+            "maxLength": 255
           },
           "role": {
             "type": "string",
@@ -9584,8 +10240,7 @@
               "version",
               "kind",
               "invitation_id",
-              "operation_id",
-              "secret"
+              "operation_id"
             ],
             "properties": {
               "version": {
@@ -9605,12 +10260,6 @@
                 "type": "string",
                 "format": "uuid",
                 "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-              },
-              "secret": {
-                "type": "string",
-                "minLength": 52,
-                "maxLength": 52,
-                "pattern": "^cuna_inv_[A-Za-z0-9_-]{43}$"
               }
             }
           },
@@ -10936,6 +11585,892 @@
             }
           }
         }
+      },
+      "CollaborationOwnedSessionGrantSnapshotV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "agent_session_id",
+          "subject_id",
+          "state",
+          "grant_revision",
+          "permission",
+          "expires_at"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "owned_session_grant_snapshot"
+          },
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "subject_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "absent",
+              "active",
+              "revoked",
+              "expired",
+              "inactive"
+            ]
+          },
+          "grant_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "permission": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "observe",
+                  "request_control"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "state": {
+                "const": "absent"
+              },
+              "grant_revision": {
+                "const": 0
+              },
+              "permission": {
+                "type": "null"
+              },
+              "expires_at": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "state": {
+                "enum": [
+                  "active",
+                  "revoked",
+                  "expired",
+                  "inactive"
+                ]
+              },
+              "grant_revision": {
+                "minimum": 1
+              },
+              "permission": {
+                "type": "string"
+              },
+              "expires_at": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "Owner-only policy read for mutation CAS; no transport admission or effective revocation acknowledgement."
+      },
+      "CollaborationOwnedSessionGrantRevocationV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "agent_session_id",
+          "subject_id",
+          "expected_revision",
+          "state",
+          "total_endpoints",
+          "pending_endpoints",
+          "never_admitted_endpoints"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1"
+          },
+          "kind": {
+            "type": "string",
+            "const": "owned_session_grant_revocation"
+          },
+          "agent_session_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "subject_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "effective",
+              "authority_changed"
+            ]
+          },
+          "total_endpoints": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "pending_endpoints": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "never_admitted_endpoints": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        }
+      },
+      "ProviderObservationRequestV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          }
+        }
+      },
+      "ProviderObservationResponseV2": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "state",
+              "agent_session_id",
+              "process_epoch",
+              "observed_at_ms",
+              "valid_until_ms",
+              "provider",
+              "dispatch_id",
+              "session_incarnation",
+              "profile_selection_id",
+              "profile_id",
+              "observation_id",
+              "profile_revision",
+              "profile_revision_sha256",
+              "observation_revision"
+            ],
+            "properties": {
+              "version": {
+                "const": "2"
+              },
+              "state": {
+                "const": "observed"
+              },
+              "agent_session_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              "process_epoch": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              "observed_at_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "valid_until_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "provider": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "upstream_provider",
+                  "agent_version",
+                  "model",
+                  "effective_config_sha256",
+                  "adapter_identity_sha256"
+                ],
+                "properties": {
+                  "upstream_provider": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+                  },
+                  "agent_version": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$"
+                  },
+                  "model": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+                  },
+                  "effective_config_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "adapter_identity_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                }
+              },
+              "dispatch_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              "session_incarnation": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "profile_selection_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "profile_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "observation_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "profile_revision": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "profile_revision_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "observation_revision": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "state",
+              "reason"
+            ],
+            "properties": {
+              "version": {
+                "const": "2"
+              },
+              "state": {
+                "const": "unavailable"
+              },
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "runtime_unavailable",
+                  "invalid_scope",
+                  "request_unavailable",
+                  "transport_unavailable",
+                  "response_unavailable",
+                  "receipt_unavailable",
+                  "current_fact_unavailable"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ProviderSessionCreateRequestV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "operation_id",
+          "execution_workspace_id",
+          "workspace_generation",
+          "agent",
+          "cwd",
+          "auth_mode",
+          "profile_id",
+          "profile_revision"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          },
+          "operation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "execution_workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "workspace_generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "agent": {
+            "enum": [
+              "claude-code",
+              "codex",
+              "opencode"
+            ]
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 1024,
+            "pattern": "^/workspace/workspaces/[0-9a-f-]+(?:/.*)?$"
+          },
+          "auth_mode": {
+            "const": "interactive_login"
+          },
+          "profile_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "profile_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        },
+        "description": "operation_id is the sole stable idempotency identity. Retry the identical request with the same UUIDv4. The profile is immutable expected configuration, never a provider permission or login fact."
+      },
+      "ProviderSessionCreateResponseV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "agent_session",
+          "execution_workspace_id",
+          "workspace_generation",
+          "remote_root",
+          "selection"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          },
+          "agent_session": {
+            "$ref": "#/components/schemas/AgentSession"
+          },
+          "execution_workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "workspace_generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "remote_root": {
+            "type": "string",
+            "pattern": "^/workspace/workspaces/[0-9a-f-]+$"
+          },
+          "selection": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "kind",
+              "profile_selection_id",
+              "operation_id",
+              "agent_session_id",
+              "session_incarnation",
+              "machine_id",
+              "profile_id",
+              "profile_revision",
+              "profile_revision_sha256",
+              "configuration_state"
+            ],
+            "properties": {
+              "version": {
+                "const": "2"
+              },
+              "kind": {
+                "const": "provider_profile_selection"
+              },
+              "profile_selection_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "operation_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "agent_session_id": {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              "session_incarnation": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "machine_id": {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              "profile_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "profile_revision": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "profile_revision_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "configuration_state": {
+                "const": "unobserved"
+              }
+            }
+          }
+        }
+      },
+      "ProviderProfileCatalogRequestV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          }
+        }
+      },
+      "ProviderProfileCatalogResponseV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "items"
+        ],
+        "properties": {
+          "version": {
+            "const": "2"
+          },
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "label",
+                "profile_id",
+                "profile_revision"
+              ],
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160
+                },
+                "profile_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                },
+                "profile_revision": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          }
+        }
+      },
+      "ProjectInvitationActionRequestV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "operation_id"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "operation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        }
+      },
+      "ProjectInvitationInspectRequestV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          }
+        }
+      },
+      "ProjectInvitationIssueRequestV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "operation_id",
+          "recipient_email",
+          "role",
+          "expires_at_ms"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "operation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "recipient_email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 254
+          },
+          "role": {
+            "type": "string",
+            "const": "observer"
+          },
+          "expires_at_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 253402300799999
+          },
+          "replaces_invitation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ProjectInvitationIssuedV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "invitation_id",
+          "recipient_email",
+          "project_id",
+          "authority_epoch",
+          "role",
+          "state",
+          "expires_at"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "kind": {
+            "type": "string",
+            "const": "project_invitation"
+          },
+          "invitation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "recipient_email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 254
+          },
+          "project_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "authority_epoch": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "role": {
+            "type": "string",
+            "const": "observer"
+          },
+          "state": {
+            "type": "string",
+            "const": "pending"
+          },
+          "expires_at": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 253402300799999
+          }
+        }
+      },
+      "ProjectInvitationRefusalV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "code"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "kind": {
+            "type": "string",
+            "const": "invitation_refusal"
+          },
+          "code": {
+            "type": "string",
+            "const": "unavailable"
+          }
+        }
+      },
+      "ProjectInvitationAcceptedV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "invitation_id",
+          "project_id",
+          "principal_id",
+          "role",
+          "state",
+          "membership_revision"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "kind": {
+            "type": "string",
+            "const": "invitation_acceptance"
+          },
+          "invitation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "project_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "principal_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "role": {
+            "type": "string",
+            "const": "observer"
+          },
+          "state": {
+            "type": "string",
+            "const": "active"
+          },
+          "membership_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        }
+      },
+      "ProjectInvitationRevokedV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "invitation_id",
+          "state"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "kind": {
+            "type": "string",
+            "const": "project_invitation"
+          },
+          "invitation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "revoked",
+              "expired"
+            ]
+          }
+        }
+      },
+      "ProjectInvitationInspectedV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kind",
+          "invitation_id",
+          "recipient_email",
+          "project_id",
+          "authority_epoch",
+          "role",
+          "state",
+          "expires_at",
+          "recipient_binding"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "2"
+          },
+          "kind": {
+            "type": "string",
+            "const": "project_invitation"
+          },
+          "invitation_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "recipient_email": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "email",
+                "maxLength": 254
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "project_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "authority_epoch": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "role": {
+            "type": "string",
+            "const": "observer"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "accepted",
+              "expired",
+              "revoked"
+            ]
+          },
+          "expires_at": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 253402300799999
+          },
+          "recipient_binding": {
+            "type": "string",
+            "enum": [
+              "email_pending",
+              "principal_bound"
+            ]
+          }
+        }
+      },
+      "ProjectInvitationInspectResponseV2": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ProjectInvitationInspectedV2"
+          },
+          {
+            "$ref": "#/components/schemas/ProjectInvitationRefusalV2"
+          }
+        ]
+      },
+      "ProjectInvitationAcceptResponseV2": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ProjectInvitationAcceptedV2"
+          },
+          {
+            "$ref": "#/components/schemas/ProjectInvitationRefusalV2"
+          }
+        ]
       }
     }
   },

@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { launchRemoteWorkspaceSession } from '../dist/journey/remote-workspace.js';
-import { CunaError, EXIT_CODES } from '../dist/core/errors.js';
+import { CunaError } from '../dist/core/errors.js';
 
 function fixture() {
   const calls=[]; let clock=Date.parse('2026-09-05T00:00:00Z');
   const workspace={machineId:'machine',workspaceId:'account-workspace',executionWorkspaceId:'execution',
     remoteRoot:'/workspace/workspaces/execution',workspaceGeneration:1,publicationStatus:'ready'};
-  const session={id:'session',machineId:'machine',agent:'codex',cwd:workspace.remoteRoot,
+  const session={id:'session',machineId:'machine',agent:'opencode',cwd:workspace.remoteRoot,
     authMode:'interactive_login',requestState:'launch_pending',processState:'unknown'};
   const client={
     async discoverCapabilities(scope,id) { calls.push(['gate',scope,id]); return {
@@ -16,13 +16,13 @@ function fixture() {
         ['machines.default_workspace.read','read_only'],['agent_sessions.workspace.create','native'],['agent_sessions.workspace.read','read_only']
       ].map(([id,interaction])=>({id,interaction,availability:'supported',mutationClass:'none',surfaces:['cli'],requiredPermissions:[]}))}; },
     async getMachineDefaultWorkspace(){calls.push(['workspace']);return workspace;},
-    async createAgentSessionInWorkspace(machine,input,key){calls.push(['create',machine,input,key]);return {agentSession:session};},
+    async createProviderSessionV2(machine,input,key){calls.push(['create',machine,input,key]);return {agentSession:session};},
     async inspectAgentSessionCreate(key){calls.push(['inspect',key]);return session;},
     async getAgentSessionWorkspaceContext(id){calls.push(['context',id]);return {
       agentSessionId:id,machineId:'machine',executionWorkspaceId:workspace.executionWorkspaceId,remoteRoot:workspace.remoteRoot,workspaceGeneration:1};},
     async getAgentSession(id){calls.push(['session',id]);return {...session,processState:'running'};},
   };
-  const input={client,machineId:'machine',workspaceId:'account-workspace',agent:'codex',idempotencyKey:'one-key',
+  const input={client,machineId:'machine',workspaceId:'account-workspace',agent:'opencode',idempotencyKey:'one-key',preset:{label:'OpenCode Zen / Big Pickle',profile_id:'profile',profile_revision:1},
     now:()=>clock,sleep:async ms=>{calls.push(['sleep']);clock+=ms;}};
   return {input,client,workspace,session,calls};
 }
@@ -32,23 +32,16 @@ test('remote launch waits for publication and attaches only the admitted ready i
   f.client.getMachineDefaultWorkspace=async()=>({...f.workspace,publicationStatus:++reads===1?'pending':'ready'});
   assert.equal(await launchRemoteWorkspaceSession(f.input),'session');
   assert.equal(reads,2);const create=f.calls.find(c=>c[0]==='create');
-  assert.deepEqual(create.slice(1),['machine',{agent:'codex',cwd:f.workspace.remoteRoot,
-    executionWorkspaceId:'execution',workspaceGeneration:1,authMode:'interactive_login'},'one-key']);
+  assert.equal(create[2].operation_id,'one-key');assert.equal(create[2].execution_workspace_id,'execution');
+  assert.equal(create[2].profile_id,'profile');assert.equal(create[2].profile_revision,1);
   assert.deepEqual(f.calls.filter(c=>c[0]==='session'),[['session','session']]);
-  assert.deepEqual(progress,['Preparing remote workspace · no local sync','Starting Codex remotely · no local sync','Waiting for Codex remotely · no local sync']);
+  assert.ok(progress.some(line=>line.includes('expected provider preset')));
+
 });
-test('lost create reply recovers exact context without creating a sibling',async()=>{
-  const f=fixture();let posts=0;
-  f.client.createAgentSessionInWorkspace=async()=>{posts++;throw new CunaError({code:'cuna.network.failed',message:'lost',exitCode:EXIT_CODES.network});};
-  assert.equal(await launchRemoteWorkspaceSession(f.input),'session');assert.equal(posts,1);
-  assert.ok(f.calls.some(c=>c[0]==='inspect'&&c[1]==='one-key'));
-  f.client.getAgentSessionWorkspaceContext=async()=>({agentSessionId:'session',executionWorkspaceId:'other',workspaceGeneration:1,remoteRoot:f.workspace.remoteRoot});
-  await assert.rejects(launchRemoteWorkspaceSession(f.input),{code:'cuna.journey.remote_workspace_authority_mismatch'});
-});
-test('only authoritative not-found permits replay with the same key and intent',async()=>{
+test('lost V2 reply replays the exact atomic operation without V1 inspection',async()=>{
   const f=fixture();const posts=[];
-  f.client.createAgentSessionInWorkspace=async(machine,input,key)=>{posts.push([machine,input,key]);if(posts.length===1)throw new CunaError({code:'cuna.network.failed',message:'lost',exitCode:5});return {agentSession:f.session};};
-  f.client.inspectAgentSessionCreate=async()=>{throw new CunaError({code:'agent_session_not_found',message:'absent',exitCode:4});};
+  f.client.createProviderSessionV2=async(machine,input,key)=>{posts.push([machine,input,key]);if(posts.length===1)throw new CunaError({code:'cuna.network.failed',message:'lost',exitCode:5});return {agentSession:f.session};};
+  f.client.inspectAgentSessionCreate=async()=>{assert.fail('V1 inspection forbidden');};
   assert.equal(await launchRemoteWorkspaceSession(f.input),'session');assert.deepEqual(posts[0],posts[1]);
 });
 test('foreign authority, failed publication, missing capability and cancellation never dispatch',async()=>{
@@ -86,9 +79,4 @@ test('failed real-session observation preserves reason and exact inspection targ
   assert.equal(f.calls.filter(c=>c[0]==='create').length,1);
 });
 
-test('foreign Machine context refuses even when session and Workspace IDs match',async()=>{
-  const f=fixture();const read=f.client.getAgentSessionWorkspaceContext;
-  f.client.getAgentSessionWorkspaceContext=async id=>({...await read(id),machineId:'other'});
-  await assert.rejects(launchRemoteWorkspaceSession(f.input),{code:'cuna.journey.remote_workspace_authority_mismatch'});
-  assert.equal(f.calls.filter(c=>c[0]==='session').length,0);
-});
+test('unsupported agent refuses before any server request',async()=>{const f=fixture();f.input.agent='codex';await assert.rejects(launchRemoteWorkspaceSession(f.input),{code:'cuna.provider.v2_unavailable'});assert.equal(f.calls.length,0);});

@@ -1,3 +1,4 @@
+import { providerSessionBody, decodeProviderPresets, decodeProviderObservation, decodeProviderSession, type ProviderPreset, type ProviderObservation, type ProviderSessionInput } from "./provider-v2.js";
 import { EXIT_CODES, CunaError, usageError } from "../core/errors.js";
 import {
   MACHINE_CREATE_REQUEST_BUDGET_MS,
@@ -164,6 +165,9 @@ export interface CunaApiClient {
     signal?: AbortSignal,
   ): Promise<WorkspaceBindingAuthority>;
   listAgentSessions(machineId: string, options?: PageOptions, signal?: AbortSignal): Promise<AgentSessionPage>;
+  getProviderPresetsV2(signal?: AbortSignal): Promise<readonly ProviderPreset[]>;
+  createProviderSessionV2(machineId: string, input: ProviderSessionInput, signal?: AbortSignal): Promise<AgentSessionWorkspaceEnvelope>;
+  checkProviderV2(sessionId: string, epoch: string, signal?: AbortSignal): Promise<ProviderObservation>;
   getMachineDefaultWorkspace(machineId: string, signal?: AbortSignal): Promise<MachineDefaultWorkspace>;
   getAgentSessionWorkspaceContext(id: string, signal?: AbortSignal): Promise<AgentSessionWorkspaceContext>;
   createAgentSessionInWorkspace(machineId: string, input: AgentSessionWorkspaceCreateInput, idempotencyKey: string, signal?: AbortSignal): Promise<AgentSessionWorkspaceEnvelope>;
@@ -793,6 +797,16 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         },
         operationLabel(request),
       );
+    },
+    async getProviderPresetsV2(signal) {
+      return fetchDecoded({method:"POST",path:"/v1/collaboration/2/provider-profiles/catalog",body:{version:"2"},...(signal===undefined?{}:{signal})},decodeProviderPresets);
+    },
+    async createProviderSessionV2(machineId,input,signal) {
+      assertCanonicalUuid(input.operation_id,"operation ID");assertCanonicalUuid(input.profile_id,"profile ID");
+      return fetchDecoded({method:"POST",path:`/v1/collaboration/2/sessions/${encodeMachineId(machineId)}/workspace-agent-sessions`,body:providerSessionBody(input),...(signal===undefined?{}:{signal})},value=>decodeProviderSession(value,machineId,input));
+    },
+    async checkProviderV2(sessionId,epoch,signal) {
+      return fetchDecoded({method:"POST",path:`/v1/collaboration/2/agent-sessions/${encodeCanonicalUuid(sessionId,"AgentSession ID")}/provider-observations`,body:{version:"2"},...(signal===undefined?{}:{signal})},value=>decodeProviderObservation(value,sessionId,epoch));
     },
     async getMachineDefaultWorkspace(machineId, signal) {
       const request: HttpRequest = {method:"GET",path:`/v1/sessions/${encodeMachineId(machineId)}/default-workspace`,...(signal === undefined ? {} : {signal})};

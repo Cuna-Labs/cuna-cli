@@ -1,3 +1,4 @@
+import type { ProviderPreset } from "../api/provider-v2.js";
 import { randomUUID } from "node:crypto";
 import { sessionFailure } from "./session-failure.js";
 import { setTimeout as delay } from "node:timers/promises";
@@ -10,6 +11,7 @@ import { isObservationBudgetCode, observationBudgetElapsed, REMOTE_CONVERGENCE_B
 /** A remote-only launch never creates a local workspace binding. */
 export async function launchRemoteWorkspaceSession(input: {
   readonly client: CunaApiClient;
+  readonly preset: ProviderPreset;
   readonly machineId: string;
   readonly workspaceId: string;
   readonly agent: "claude-code" | "codex" | "opencode";
@@ -19,6 +21,7 @@ export async function launchRemoteWorkspaceSession(input: {
   readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly idempotencyKey?: string;
 }): Promise<string> {
+  if (input.agent !== "opencode") throw new CunaError({code:"cuna.provider.v2_unavailable",message:"V2 provider presets currently support OpenCode only.",exitCode:EXIT_CODES.usage});
   const now = input.now ?? Date.now;
   const sleep = input.sleep ?? (async (ms, signal) => { await delay(ms, undefined, { signal }); });
   const signal = input.signal ?? new AbortController().signal;
@@ -47,19 +50,16 @@ export async function launchRemoteWorkspaceSession(input: {
     if (now() - started >= REMOTE_CONVERGENCE_BUDGET_MS) throw timeout("remote Workspace publication");
     await sleep(500, signal);
   }
-  await gate("agent_sessions.workspace.create");
-  const agentName = input.agent === "claude-code" ? "Claude Code" : input.agent === "opencode" ? "OpenCode" : "Codex";
-  input.onProgress?.(`Starting ${agentName} remotely · no local sync`);
-  const request = { agent: input.agent, cwd: workspace.remoteRoot, executionWorkspaceId: workspace.executionWorkspaceId,
-    workspaceGeneration: workspace.workspaceGeneration, authMode: "interactive_login" as const };
-  const create = async () => (await input.client.createAgentSessionInWorkspace(input.machineId, request, key, signal)).agentSession;
+  const agentName = "OpenCode";
+  input.onProgress?.("Starting OpenCode with the selected expected provider preset");
+  const request = { operation_id: key, cwd: workspace.remoteRoot, execution_workspace_id: workspace.executionWorkspaceId,
+    workspace_generation: workspace.workspaceGeneration, profile_id: input.preset.profile_id, profile_revision: input.preset.profile_revision };
+  const create = async () => (await input.client.createProviderSessionV2(input.machineId, request, signal)).agentSession;
   let session: AgentSession;
   try { session = await create(); } catch (error) {
     if (!(error instanceof CunaError) || !(isObservationBudgetCode(error.code) || error.code === "cuna.network.failed") || signal.aborted) throw error;
-    try { session = await input.client.inspectAgentSessionCreate(key, signal); } catch (inspectionError) {
-      if (!(inspectionError instanceof CunaError) || inspectionError.code !== "agent_session_not_found" || signal.aborted) throw inspectionError;
-      session = await create();
-    }
+    // The canonical RPC atomically replays this exact operation; never inspect a V1 operation.
+    session = await create();
   }
   const sessionId = session.id;
   const validate = (value: AgentSession) => {
@@ -68,11 +68,6 @@ export async function launchRemoteWorkspaceSession(input: {
         value.workspaceBindingId !== undefined || value.workspaceGeneration !== undefined) throw mismatch();
   };
   validate(session);
-  await requireCapability({ client: input.client, scope: "agent_session", resourceId: sessionId,
-    capabilityId: "agent_sessions.workspace.read", now, signal, allowedInteractions: ["read_only"] });
-  const context = await input.client.getAgentSessionWorkspaceContext(sessionId, signal);
-  if (context.agentSessionId !== sessionId || context.machineId !== input.machineId || context.executionWorkspaceId !== workspace.executionWorkspaceId ||
-      context.workspaceGeneration !== workspace.workspaceGeneration || context.remoteRoot !== workspace.remoteRoot) throw mismatch();
   input.onProgress?.(`Waiting for ${agentName} remotely · no local sync`);
   const admittedAt = now();
   for (;;) {

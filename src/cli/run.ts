@@ -1,3 +1,4 @@
+import { runProviderScreen } from "../machines/provider-screen.js";
 import { Writable } from "node:stream";
 import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
 import { createInterface } from "node:readline/promises";
@@ -1477,6 +1478,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         }
         return EXIT_CODES.success;
       }
+      if (selection.kind === "provider-check") {
+        await runProviderScreen(client,{kind:"check",sessionId:selection.agentSessionId},undefined,dependencies.signal);
+        return await runCli(["machines"],dependencies);
+      }
       if (selection.kind === "executions") {
         const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal,
           { platform, baseUrl: config.baseUrl, profile: config.profile });
@@ -1599,16 +1604,19 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }
       const journeyScope = Object.freeze({ userId: identity.id, workspaceId });
       if (remoteMenuLaunch && dependencies.managedWorkspaceMachineId !== undefined) {
+        if (journeyAgent !== "opencode") throw new CunaError({code:"cuna.provider.v2_unavailable",message:"New V2 sessions currently support the OpenCode provider preset only. Existing sessions can still be opened.",exitCode:EXIT_CODES.usage});
+        inlineJourneyProgress?.stop(); inlineJourneyProgress = undefined;
+        const preset=await runProviderScreen(client,{kind:"preset"},undefined,dependencies.signal);
+        if(preset===undefined)return EXIT_CODES.success;
         const agentSessionId = await launchRemoteWorkspaceSession({
+          preset,
           client, machineId: dependencies.managedWorkspaceMachineId, workspaceId, agent: journeyAgent,
           onProgress: (label) => inlineJourneyProgress?.update(label),
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
-        inlineJourneyProgress?.stop();
-        inlineJourneyProgress = undefined;
         return await runCli([
-          journeyAgent === "claude-code" ? "claude" : journeyAgent,
+          journeyAgent,
           "--agent-session", agentSessionId,
           ...(booleanOption(parsed, "no-color") ? ["--no-color"] : []),
         ], { ...dependencies, ...(humanAuth === undefined ? {} : { humanAuth }) });
@@ -1839,7 +1847,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
       }, dependencies.now === undefined ? {} : { now: dependencies.now });
       if (selection !== undefined) {
-        if (selection.kind === "executions") {
+        if (selection.kind === "provider-check") {
+        await runProviderScreen(client,{kind:"check",sessionId:selection.agentSessionId},undefined,dependencies.signal);
+        return await runCli(["machines"],dependencies);
+      }
+      if (selection.kind === "executions") {
           const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal,
             { platform, baseUrl: config.baseUrl, profile: config.profile });
           if (outcome === "cancelled") return EXIT_CODES.success;

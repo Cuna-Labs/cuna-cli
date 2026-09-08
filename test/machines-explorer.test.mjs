@@ -2002,3 +2002,10 @@ test("session-create discovery samples the clock after delayed response", { time
     await waitUntil(() => lastFrame(host).includes("New Codex session"), "fresh late session-create capability accepted");
   } finally { release?.(); host.emitInput([3]); await operation; }
 });
+
+test('p checks the exact selected session without attaching or creating',async()=>{
+ const host=new FakeHost();const operation=runNodeMachinesExplorer({client:{async listMachines(){return {items:[{id:MACHINE_ID,name:'goal0',state:'running',agent:'claude-code'}]};},async listAgentSessions(){return {items:[agentSession()]};}}},{host});
+ await waitUntil(()=>host.writes.some(write=>write.includes('goal0-claude')),'session rendered');host.emitInput([27,91,66]);
+ await waitUntil(()=>stripAnsi(host.writes.at(-1)).includes('Enter/'),'session selected');host.emitInput([112]);
+ assert.deepEqual(await operation,{kind:'provider-check',agentSessionId:SESSION_ID});assert.equal(host.restored,1);
+});

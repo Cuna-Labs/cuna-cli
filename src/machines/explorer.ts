@@ -151,7 +151,7 @@ export interface MachinesExplorerSelection {
   readonly agent: ActionableProvider;
 }
 
-export type MachinesExplorerResult = MachinesExplorerSelection | Readonly<{ readonly kind: "executions"; readonly machineId: string }> | Readonly<{ readonly kind: "workspaces"; readonly machineId: string }> | Readonly<{
+export type MachinesExplorerResult = Readonly<{ readonly kind: "provider-check"; readonly agentSessionId: string }> | MachinesExplorerSelection | Readonly<{ readonly kind: "executions"; readonly machineId: string }> | Readonly<{ readonly kind: "workspaces"; readonly machineId: string }> | Readonly<{
   readonly kind: "launch";
   readonly agent: ActionableProvider;
   readonly machineId?: string;
@@ -854,6 +854,10 @@ export async function runNodeMachinesExplorer(
     if (byte === 0x6b) moveSelection(-1);
     else if (byte === 0x6a) moveSelection(1);
     else if (byte === 0x08 || byte === 0x7f || byte === 0x62) goBack();
+    else if (byte === 0x70) {
+      const session=rows.flatMap(row=>row.sessions).find(item=>selectedKey===`session:${item.id}`||selectedKey?.endsWith(`:${item.id}`)===true);
+      if(session){selection=Object.freeze({kind:"provider-check",agentSessionId:session.id});stop();return true;}
+    }
     else if (byte === 0x6e && navigation.screen.kind === "machines") openNewMachine();
     else if (byte === 0x0d || byte === 0x0a || byte === 0x20) {
       if (navigation.screen.kind === "new-machine") {
@@ -1385,7 +1389,7 @@ function renderContextScreen(input: {
   if (input.refreshError !== undefined) lines.push("", input.refreshError);
   if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
   if (input.lifecycleNotice !== undefined) lines.push("", ` ${input.lifecycleNotice}`);
-  lines.push("", " w Workspaces  ·  e Executions", " ↑↓ move  ·  ←→ navigate  ·  Enter select  ·  Esc/Backspace back  ·  q quit");
+  lines.push("", " p Check provider  ·  w Workspaces  ·  e Executions", " ↑↓ move  ·  ←→ navigate  ·  Enter select  ·  Esc/Backspace back  ·  q quit");
   return Object.freeze({
     lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))),
     ...(selectedLine === undefined ? {} : { selectedLine }),
@@ -1478,7 +1482,7 @@ function overviewFooter(
   now: number,
 ): string {
   // E13-R1: `n new machine` is on every overview footer, whatever is selected.
-  const tail = "n new machine  ·  r refresh  ·  q quit";
+  const tail = "p Check provider  ·  n new machine  ·  r refresh  ·  q quit";
   if (selectedKey?.startsWith("machine:") === true) {
     return ` ↑↓ move  ·  Enter/→ manage machine  ·  ${tail}`;
   }

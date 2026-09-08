@@ -4,6 +4,7 @@ import { runNodeMachinesExplorer } from "../machines/explorer.js";
 import type { ActionableProvider } from "../machines/provider-availability.js";
 
 export type RootJourneySelection =
+  | Readonly<{ readonly kind: "provider-check"; readonly agentSessionId: string }>
   | Readonly<{ readonly kind: "executions"; readonly machineId: string }>
   | Readonly<{ readonly kind: "workspaces"; readonly machineId: string }>
   | Readonly<{ readonly kind: "attach"; readonly agentSessionId: string; readonly agent: ActionableProvider }>
