@@ -1,3 +1,5 @@
+import {observerApi} from "../api/observer-v2.js";
+import {runObserverScreen} from "../runtime/observer-screen.js";
 import { runProviderScreen } from "../machines/provider-screen.js";
 import { Writable } from "node:stream";
 import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
@@ -417,7 +419,7 @@ function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>>
 }
 
 function needsRemoteCredential(command: string | undefined, foreground: ForegroundSelection | undefined): boolean {
-  return command === "capabilities" || command === "machines" || command === "agent-sessions" ||
+  return command === "observe" || command === "capabilities" || command === "machines" || command === "agent-sessions" ||
     command === "agent" || command === "executions" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
     command === "account" || command === "workspace" || command === "usage" ||
@@ -1068,6 +1070,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // environment. This keeps credential and profile selection deterministic
     // across embedded invocations.
     if (parsed.command !== undefined) preflightInvocation(parsed, (dependencies.now ?? Date.now)());
+    if(parsed.command==="observe"&&(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true))throw usageError("observe requires an interactive terminal; JSON and redirected output are unsupported.");
 
     let journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "opencode"
       ? preflightAgentJourneyInvocation(parsed)
@@ -1442,6 +1445,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     }) : undefined;
     const client = dependencies.clientFactory?.(config, effectiveTimeoutMs) ?? createCunaApiClient(httpTransport!);
+    if(parsed.command==="observe"){
+      if(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true||credentialMode!=="interactive"||!httpTransport)throw usageError("observe requires an interactive terminal and human login.");
+      // This process owns its initial principal. Checks around admission do not watch
+      // another process changing local credentials; established streams rely on server authority.
+      const identity=await client.getIdentity(dependencies.signal);
+      await runObserverScreen(observerApi(httpTransport,identity.id,stringOption(parsed,"project")!,async()=>(await client.getIdentity(dependencies.signal)).id),config.baseUrl,undefined,dependencies.signal);
+      return EXIT_CODES.success;
+    }
     if (interactiveRoot) {
       const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
       interactiveRootColor = color;

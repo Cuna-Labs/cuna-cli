@@ -646,6 +646,10 @@ export function preflightInvocation(
         throw unsupportedError("configuration mutation", "config_writes_not_implemented");
       }
       return;
+    case "observe":
+      rejectUnknownOptions(parsed,["project"]);
+      if(parsed.operands.length!==0)throw usageError("observe accepts no operands.");
+      assertCanonicalUuid(stringOption(parsed,"project")??"","Project ID");return;
     case "capabilities": {
       rejectUnknownOptions(parsed, ["scope", "resource-id"]);
       if (parsed.operands.length !== 0) throw usageError("capabilities accepts no operands.");

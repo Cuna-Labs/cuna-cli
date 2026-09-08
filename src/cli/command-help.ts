@@ -67,6 +67,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "Usage:\n  cuna access status",
     "Print the account context as one tab-separated line: identity, admission, then\nworkspace state. `cuna whoami` runs the same read and prints the same line; only\nthe --json record name differs (access.status against whoami). The status action\nis required. No command options.",
   ),
+  observe: topic("Usage:\n  cuna observe --project PROJECT_ID", "Discover sessions shared with your signed-in account and select one read-only view. Requires an interactive terminal and human login. Escape or Ctrl+C closes only this local view. Reconnect requests fresh admission; no keyboard, resize or signal is sent to the agent."),
   capabilities: topic(
     "Usage:\n  cuna capabilities [--scope SCOPE] [--resource-id ID]",
     [

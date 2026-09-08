@@ -84,6 +84,7 @@ export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
   routed("logout", "logout", ["logout"], "Revoke the current interactive login"),
   routed("whoami", "whoami", ["whoami"], "Show the current account context"),
   routed("access status", "access status", ["access", "status"], "Show the same account context whoami prints, recorded as access.status"),
+  routed("observe", "observe --project PROJECT_ID", ["observe","--project","00000000-0000-4000-8000-000000000001"], "Observe an authorized shared session read-only"),
   routed("capabilities", "capabilities", ["capabilities"], "Inspect live server capability truth"),
   routed("machines", "machines", ["machines"], "Browse machines and AgentSessions interactively"),
   routed("machines list", "machines list", ["machines", "list"], "List exact machine resources"),
@@ -234,6 +235,7 @@ const BOOLEAN_OPTIONS = new Set([
  * decides the shape of the parse.
  */
 const VALUE_OPTIONS = new Set([
+  "project",
   "after",
   "execution-workspace-id",
   "agent",

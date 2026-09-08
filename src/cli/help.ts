@@ -155,6 +155,7 @@ Available now:
   machines delete ID                   Delete when server-advertised
   records list                         List redacted account activity records
   account show                         Show the public account identity
+  observe --project PROJECT_ID         Observe an authorized shared session read-only
   workspace show                       Show assignment or waitlist state
   usage show                           Show authoritative workspace estimates
   authorizations list --machine ID     List active credential injection rules
