@@ -49,7 +49,7 @@ function capability() {
   };
 }
 
-function effects(client, requestedAgent = "claude-code") {
+function effects(client, requestedAgent = "claude-code", overrides = {}) {
   return createApiAgentJourneyEffects({
     client,
     requestedAgent,
@@ -59,6 +59,7 @@ function effects(client, requestedAgent = "claude-code") {
     async authorizeMachineCreate() { return false; },
     now: () => NOW,
     async sleep() {},
+    ...overrides,
   });
 }
 
@@ -345,3 +346,50 @@ for(const agent of ['opencode','codex','claude-code'])test(`explicit published W
  assert.equal(calls.length,2);assert.deepEqual(calls[0],calls[1]);assert.equal(calls[0].request.execution_workspace_id,execution);assert.equal(calls[0].request.workspace_generation,7);assert.equal(calls[0].request.profile_revision,2);assert.match(calls[0].request.operation_id,/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
  await assert.rejects(effect.createAgentSession({machineId:MACHINE_ID,agent,authMode:'interactive_login',workspace:{...workspace,executionWorkspaceId:undefined},idempotencyKey:'x',signal:new AbortController().signal}),e=>e.code==='cuna.provider.v2_unavailable');assert.equal(calls.length,2);await rm(stateDirectory,{recursive:true,force:true});
 });
+
+
+function terminalCapability(availability = "supported", reasonCode) {
+  const snapshot = capability();
+  return { ...snapshot, subjectScope: "agent_session", subjectId: SESSION_ID,
+    capabilities: [{ ...snapshot.capabilities[0], id: "terminal_connections.create", availability,
+      ...(reasonCode === undefined ? {} : { reasonCode }) }] };
+}
+
+test("ready process waits for exact terminal registration without launching again", async () => {
+  const calls = [];
+  let reads = 0;
+  const e = effects({
+    async getAgentSession(id) { calls.push(["session", id]); return recoveredSession({ processState: "running" }); },
+    async discoverCapabilities(scope, id) { calls.push(["capability", scope, id]); return ++reads === 1
+      ? terminalCapability("unknown", "supervisor_registry_unavailable") : terminalCapability(); },
+  }, "claude-code", { async sleep() { calls.push(["wait"]); } });
+  assert.deepEqual(await e.ensureAgentSessionReady({ agentSessionId: SESSION_ID, signal: new AbortController().signal }), { id: SESSION_ID, machineId: MACHINE_ID });
+  assert.deepEqual(calls, [["session", SESSION_ID], ["capability", "agent_session", SESSION_ID], ["wait"],
+    ["session", SESSION_ID], ["capability", "agent_session", SESSION_ID]]);
+});
+
+test("terminal registration wait respects cancellation", async () => {
+  const controller = new AbortController();
+  const cancelled = new Error("cancelled");
+  let reads = 0;
+  const e = effects({
+    async getAgentSession() { reads++; return recoveredSession({ processState: "running" }); },
+    async discoverCapabilities() { return terminalCapability("unknown", "supervisor_registry_unavailable"); },
+  }, "claude-code", { async sleep() { controller.abort(cancelled); throw controller.signal.reason; } });
+  await assert.rejects(e.ensureAgentSessionReady({ agentSessionId: SESSION_ID, signal: controller.signal }), error => error === cancelled);
+  assert.equal(reads, 1);
+});
+
+for (const refusal of ["terminal_owner_unrecoverable", "subject_mismatch", "expired"]) {
+  test(`terminal registration refuses ${refusal} without waiting`, async () => {
+    const snapshot = refusal === "terminal_owner_unrecoverable"
+      ? terminalCapability("temporarily_unavailable", refusal) : terminalCapability();
+    if (refusal === "subject_mismatch") snapshot.subjectId = MACHINE_ID;
+    if (refusal === "expired") snapshot.expiresAt = new Date(NOW - 1).toISOString();
+    const e = effects({
+      async getAgentSession() { return recoveredSession({ processState: "running" }); },
+      async discoverCapabilities() { return snapshot; },
+    }, "claude-code", { async sleep() { assert.fail("permanent or expired evidence must not be retried"); } });
+    await assert.rejects(e.ensureAgentSessionReady({ agentSessionId: SESSION_ID, signal: new AbortController().signal }), error => error instanceof CunaError && error.code.startsWith("cuna.capability."));
+  });
+}

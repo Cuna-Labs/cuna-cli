@@ -342,6 +342,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
     },
     async ensureAgentSessionReady({ agentSessionId, signal }) {
       for (let attempt = 0; attempt < CHILD_POLL_LIMIT; attempt += 1) {
+        if (signal?.aborted) throw signal.reason;
         const session = await input.client.getAgentSession(agentSessionId, signal);
         if (session.requestState === "failed") {
           if (session.workspaceFailureCode !== undefined) {
@@ -355,8 +356,25 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           }
           throw sessionFailure(session, "The AgentSession request failed before attach.");
         }
+        if (signal?.aborted) throw signal.reason;
+        if (session.id !== agentSessionId) {
+          throw fail("cuna.journey.session_identity_mismatch", "The readiness observation describes a different AgentSession.");
+        }
         if (session.processState === "ready" || session.processState === "running") {
-          return Object.freeze({ id: session.id, machineId: session.machineId });
+          // A durable process acknowledgement can precede the registry's exact
+          // PTY attachment. Wait for that authority without dispatching again.
+          try {
+            await requireCapability({ client: input.client, scope: "agent_session", resourceId: agentSessionId,
+              capabilityId: "terminal_connections.create", allowedInteractions: ["native"], now, signal });
+            if (signal?.aborted) throw signal.reason;
+            return Object.freeze({ id: session.id, machineId: session.machineId });
+          } catch (error) {
+            if (signal?.aborted) throw signal.reason;
+            if (!(error instanceof CunaError
+              && ["cuna.capability.unknown", "cuna.capability.temporarily_unavailable"].includes(error.code)
+              && error.details?.capability_id === "terminal_connections.create"
+              && ["supervisor_registry_unavailable", "agent_session_not_ready", "runtime_lease_expired"].includes(String(error.details?.reason)))) throw error;
+          }
         }
         if (["exited", "failed", "terminated"].includes(session.processState)) {
           throw sessionFailure(session, "The AgentSession reached a terminal state before attach.");
