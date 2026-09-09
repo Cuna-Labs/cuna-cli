@@ -5917,6 +5917,176 @@
           }
         ]
       }
+    },
+    "/v1/me/workspace-admission": {
+      "get": {
+        "operationId": "me.workspaceAdmission.get",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "account:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current required terms",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "required_terms_version"
+                  ],
+                  "properties": {
+                    "required_terms_version": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 80
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-problem-codes": [
+          "unauthenticated",
+          "forbidden",
+          "account_admission_identity_unavailable",
+          "account_admission_state_unavailable"
+        ]
+      },
+      "post": {
+        "operationId": "me.workspaceAdmission.request",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "account:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current caller workspace admission or waitlist position",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "assigned",
+                    "workspace_id",
+                    "waitlist_position"
+                  ],
+                  "properties": {
+                    "assigned": {
+                      "type": "boolean"
+                    },
+                    "workspace_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "uuid"
+                    },
+                    "waitlist_position": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 1
+                    }
+                  },
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "assigned": {
+                          "const": true
+                        },
+                        "workspace_id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "waitlist_position": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    {
+                      "properties": {
+                        "assigned": {
+                          "const": false
+                        },
+                        "workspace_id": {
+                          "type": "null"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-problem-codes": [
+          "unauthenticated",
+          "forbidden",
+          "account_admission_identity_unavailable",
+          "account_admission_state_unavailable",
+          "account_admission_terms_mismatch",
+          "account_admission_request_invalid",
+          "account_admission_receipt_invalid"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "accepted_terms_version"
+                ],
+                "properties": {
+                  "accepted_terms_version": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
