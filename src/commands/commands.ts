@@ -36,6 +36,15 @@ import { preflightAgentJourneyInvocation } from "../journey/intent.js";
 import type { ManagedExecution } from "../api/managed-executions.js";
 import { listAllMachines } from "../machines/pagination.js";
 import {
+  classifyLiveSupervisorUpdateFailure,
+  liveSupervisorSessionOutcomeLabel,
+  liveSupervisorUpdateNotes,
+  summarizeLiveSupervisorUpdate,
+  type LiveSupervisorUpdateNotes,
+} from "../machines/live-supervisor-update.js";
+import type { SupervisorLiveUpdate } from "../api/supervisor-live-update.js";
+import type { PlatformAdapter } from "../platform/adapter.js";
+import {
   isOpenCodeRuntimeUnverifiedCapabilityRejection,
   isOpenCodeSupervisorRepairCapabilityRejection,
   isOpenCodeSupervisorUpgradeCapabilityRejection,
@@ -102,6 +111,14 @@ export interface CommandContext {
   readonly workspaceRoot?: string;
   readonly credentialMode?: "automation" | "interactive";
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
+  /**
+   * Where `machines live-update-supervisor` keeps its local note about an
+   * update whose outcome it never saw. Optional so every existing caller and
+   * test is unchanged; the command refuses rather than proceeding without it,
+   * because dispatching a mutation it cannot record is the one thing the
+   * requirement forbids.
+   */
+  readonly platform?: PlatformAdapter;
 }
 
 function productionConvergencePoller(): ConvergencePoller {
@@ -815,6 +832,33 @@ export function preflightInvocation(
   }
 }
 
+/**
+ * `machines live-update-supervisor` admits two disjoint intents, and one shared
+ * `--yes` would have made them one.
+ *
+ * `--yes` confirms a mutation on a running Machine. `--forget-unknown` sends
+ * nothing at all: it drops this installation's local note about an outcome it
+ * never saw. Accepting them together would let "confirm the update" read as
+ * "and clear whatever is outstanding first", which is precisely the silent
+ * resolution-by-repetition this command must not perform.
+ */
+function preflightLiveUpdateSupervisor(parsed: ParsedInvocation): { readonly forgetUnknown: boolean } {
+  rejectUnknownOptions(parsed, ["yes", "forget-unknown"]);
+  if (parsed.operands.length !== 2) {
+    throw usageError("machines live-update-supervisor requires exactly one machine ID.");
+  }
+  const forgetUnknown = booleanOption(parsed, "forget-unknown");
+  if (forgetUnknown && booleanOption(parsed, "yes")) {
+    throw usageError(
+      "machines live-update-supervisor accepts either --yes or --forget-unknown, not both.",
+      "Clearing the local record of an unknown outcome is a separate decision from starting a new update. Run --forget-unknown alone, read the Machine and its AgentSessions, then decide.",
+    );
+  }
+  if (!forgetUnknown) requireConfirmation(parsed, "machines.live-update-supervisor");
+  assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
+  return Object.freeze({ forgetUnknown });
+}
+
 function preflightMachines(parsed: ParsedInvocation): void {
   if (parsed.operands.length === 0) {
     rejectUnknownOptions(parsed, []);
@@ -845,6 +889,10 @@ function preflightMachines(parsed: ParsedInvocation): void {
     if (parsed.operands.length !== 2) throw usageError("machines update-supervisor requires exactly one machine ID.");
     requireConfirmation(parsed, "machines.update-supervisor");
     assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
+    return;
+  }
+  if (action === "live-update-supervisor") {
+    preflightLiveUpdateSupervisor(parsed);
     return;
   }
   if (action === "start" || action === "pause" || action === "resume" || action === "stop" || action === "delete") {
@@ -1514,6 +1562,251 @@ async function verifyVirtualTerminalInterop(): Promise<boolean> {
   }
 }
 
+/**
+ * Where this installation keeps its note about an in-place update it dispatched
+ * and never saw settle.
+ *
+ * The adapter is optional on `CommandContext`, and its absence is a refusal
+ * rather than a silent fall-through: dispatching a mutation this command could
+ * not record would leave the next invocation free to repeat it.
+ */
+function liveUpdateNotesFor(
+  context: CommandContext,
+  platform: PlatformAdapter | undefined,
+): LiveSupervisorUpdateNotes {
+  // Two conditions, one refusal. The adapter may be absent entirely, or it may
+  // predate the exclusive-create primitive the reservation is built on — and a
+  // store that can only read-then-write is not a reservation at all.
+  if (platform === undefined || typeof platform.createExclusiveConfig !== "function") {
+    throw new CunaError({
+      code: "cuna.machine.live_supervisor_update_unrecordable",
+      message: "Cuna cannot record an in-place supervisor update on this host.",
+      exitCode: EXIT_CODES.internal,
+      hint: "Nothing was sent. This command reserves a local record before it dispatches, so that a second invocation cannot repeat an update whose outcome is unknown, and it will not start one it cannot reserve.",
+      details: { reason: platform === undefined ? "no_platform_adapter" : "no_exclusive_reservation" },
+    });
+  }
+  // Scoped by the API origin alone. The profile is deliberately absent: the
+  // suppression protects a Machine, and selecting a different local profile
+  // against the same API must not clear it.
+  return liveSupervisorUpdateNotes(platform, { baseUrl: context.config.baseUrl });
+}
+
+function outstandingLiveUpdate(machineId: string, dispatchedAt: string): CunaError {
+  return new CunaError({
+    code: "cuna.machine.live_supervisor_update_outcome_unknown",
+    message: `An in-place supervisor update for Machine ${machineId} dispatched at ${dispatchedAt} has no known outcome on this computer.`,
+    exitCode: EXIT_CODES.conflict,
+    // Two authoritative reads and one local acknowledgement. Repeating the
+    // update is deliberately absent from this list, and so is switching
+    // profiles: the record covers this Machine on this API for every profile.
+    hint: `Read the Machine with \`cuna machines list\` and its AgentSessions with \`cuna agent-sessions list --machine ${machineId}\`. When you have decided what happened, clear this record with \`cuna machines live-update-supervisor ${machineId} --forget-unknown\`. Cuna will not repeat the update to find out, and another profile on this computer will not either.`,
+    retryable: false,
+    details: { machine_id: machineId, dispatched_at: dispatchedAt, outcome: "unknown" },
+  });
+}
+
+/**
+ * `machines live-update-supervisor` — the running-Machine supervisor update.
+ *
+ * The three rules that shape this function, in the order they bind:
+ *
+ *   1. Preservation is conditional on the SERVER's preflight, never on anything
+ *      read here. The local state check below is a cheap refusal that names the
+ *      other command; it is not the authority and does not weaken one.
+ *   2. A 200 is an account, not a success. Every AgentSession outcome is
+ *      reported, and anything other than `preserved` is said plainly.
+ *   3. An outcome this process did not learn is `unknown`. It is never retried,
+ *      never reconciled with a second mutation, and never resolved by falling
+ *      back to the stopped-Machine replacement.
+ */
+async function executeLiveUpdateSupervisor(context: CommandContext): Promise<CommandResult> {
+  const { parsed, client, now } = context;
+  const { forgetUnknown } = preflightLiveUpdateSupervisor(parsed);
+  const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
+  const notes = liveUpdateNotesFor(context, context.platform);
+
+  if (forgetUnknown) {
+    // `discard`, not `settle`. This is a person saying "I have looked and I am
+    // done with this record", which is the one caller allowed to remove a
+    // record it did not create -- including one whose bytes cannot be read,
+    // which is the state the dispatch path's own hint sends people here for.
+    const reading = await notes.read(id);
+    const removed = await notes.discard(id);
+    const readable = reading.state !== "unreadable";
+    const unchanged = "Nothing was sent, and this establishes nothing about whether that update applied: it is not a cancellation and Cuna did not ask the server anything.";
+    return Object.freeze({
+      command: "machines.live-update-supervisor",
+      data: Object.freeze({
+        machine_id: id,
+        local_record_cleared: removed,
+        record_readable: readable,
+        ...(reading.state === "outstanding" ? { dispatched_at: reading.note.dispatchedAt } : {}),
+        // Present only if the note carried the label. It is shown, never used.
+        ...(reading.state === "outstanding" && reading.note.account !== undefined
+          ? { account: reading.note.account }
+          : {}),
+        ...(reading.state === "unreadable" ? { unreadable_reason: reading.reason } : {}),
+        server_state_changed: false,
+        // The exclusion is keyed by API origin and Machine, so this is what was
+        // cleared -- not "this profile's" record.
+        scope: "api_origin_and_machine",
+      }),
+      human: reading.state === "none"
+        ? `No local record of an unknown in-place supervisor update exists for Machine ${id} on ${context.config.baseUrl}. Nothing was sent and nothing changed.`
+        : reading.state === "unreadable"
+          ? `Cleared an unreadable local record for Machine ${id} (${reading.reason}). Cuna could not tell you when that update was dispatched, only that this computer was holding something for this Machine. ${unchanged}`
+          : `Cleared this computer's record of the in-place supervisor update dispatched for Machine ${id} at ${reading.note.dispatchedAt}. It covered every profile on this computer. ${unchanged}`,
+    });
+  }
+
+  const reading = await notes.read(id);
+  if (reading.state === "outstanding") throw outstandingLiveUpdate(id, reading.note.dispatchedAt);
+  if (reading.state === "unreadable") {
+    // Fail closed and name the way out. The record may describe a dispatch that
+    // is still in flight, so this is not a corrupt file to step over.
+    throw new CunaError({
+      code: "cuna.machine.live_supervisor_update_record_unreadable",
+      message: `This computer holds a supervisor update record for Machine ${id} that Cuna cannot read.`,
+      exitCode: EXIT_CODES.conflict,
+      hint: `Nothing was sent. That record may describe an update whose outcome is still unknown, so Cuna will not act past it. Read \`cuna machines list\` and \`cuna agent-sessions list --machine ${id}\`, then clear it with \`cuna machines live-update-supervisor ${id} --forget-unknown\`, which works on an unreadable record.`,
+      retryable: false,
+      details: {
+        machine_id: id,
+        record_path: reading.path,
+        reason: reading.reason,
+        outcome: "unknown",
+      },
+    });
+  }
+
+  // The same `machines:update` authority the stopped-boundary replacement takes.
+  // The deliberately unsupported AgentSession-create capability is NOT
+  // substituted for it: this operation is not an OpenCode remediation.
+  await requireCapability({
+    client, scope: "machine", resourceId: id, capabilityId: "machines.lifecycle",
+    now: context.capabilityClock ?? now,
+  });
+  const current = await client.getMachine(id);
+  if (current.state !== "running") {
+    throw new CunaError({
+      code: "cuna.machine.live_supervisor_update_requires_running",
+      message: "The in-place supervisor update replaces the supervisor while the Machine keeps running.",
+      exitCode: EXIT_CODES.conflict,
+      hint: `Cuna will not start ${current.name} to satisfy this command. For a stopped Machine use \`cuna machines update-supervisor ${id} --yes\`, which is the separate stopped-boundary action.`,
+      details: { machine_id: id, observed_state: current.state },
+    });
+  }
+
+  const dispatchedAt = new Date(now).toISOString();
+  // The reservation is the gate, not the read above. Between that read and this
+  // line another process on this computer may have taken the slot, and only an
+  // exclusive create can say which of them did. `undefined` means it lost.
+  const reserved = await notes.reserve(id, dispatchedAt);
+  if (reserved === undefined) {
+    const rival = await notes.read(id);
+    throw rival.state === "outstanding"
+      ? outstandingLiveUpdate(id, rival.note.dispatchedAt)
+      : new CunaError({
+        code: "cuna.machine.live_supervisor_update_already_reserved",
+        message: `Another Cuna process on this computer is already updating the supervisor of Machine ${id}.`,
+        exitCode: EXIT_CODES.conflict,
+        hint: "Nothing was sent. Let that invocation finish and read its answer; two in-place updates of one Machine must not run together.",
+        retryable: false,
+        details: { machine_id: id, outcome: "not_sent" },
+      });
+  }
+  let result: SupervisorLiveUpdate;
+  try {
+    result = await client.updateMachineSupervisorInPlace(id);
+  } catch (error) {
+    const disposition = classifyLiveSupervisorUpdateFailure(error);
+    // Dropping the note is bookkeeping; the outcome is the answer. A local
+    // filesystem fault must never replace the producer's own refusal with a
+    // story about this computer's state directory, and a note that survives
+    // fails in the safe direction: the next attempt refuses and names the reads.
+    //
+    // Bound to THIS dispatch: `settle` removes the record only when the record
+    // is the one this invocation created. A record another process wrote after
+    // an owner cleared ours is not ours to remove, and removing it would admit
+    // a third dispatch while the second is still outstanding.
+    const drop = async (): Promise<void> => {
+      try { await notes.settle(id, dispatchedAt); } catch { /* the outcome below is the answer */ }
+    };
+    if (disposition === "unchanged") {
+      // The producer refused before it sent an installer, an enrollment or a
+      // control change. There is nothing outstanding to remember, and its own
+      // words are already the best available explanation.
+      await drop();
+      throw error;
+    }
+    if (disposition === "applied_with_ended_sessions") {
+      await drop();
+      throw new CunaError({
+        code: "cuna.machine.live_supervisor_update_ended_sessions",
+        message: `The in-place supervisor update on Machine ${id} was installed and ended AgentSessions.`,
+        exitCode: EXIT_CODES.conflict,
+        hint: `${error instanceof CunaError && error.hint !== undefined ? error.hint : "The update cannot be undone."} Repeating this command is not a recovery path. Read \`cuna agent-sessions list --machine ${id}\`.`,
+        retryable: false,
+        details: { machine_id: id, outcome: "applied_with_ended_sessions" },
+        cause: error,
+      });
+    }
+    // Unknown. The note stays exactly where `reserve` put it.
+    throw outstandingLiveUpdate(id, dispatchedAt);
+  }
+
+  const summary = summarizeLiveSupervisorUpdate(result);
+  // A 200 the producer only emits with every session decided. If a deployment
+  // ever answers 200 with an `unknown` in it, that is still an outcome this
+  // computer does not know, so the note survives and the result says so.
+  if (!summary.anyUnknown) await notes.settle(id, dispatchedAt);
+
+  const sessions = result.sessions.map((session) => Object.freeze({
+    agent_session_id: session.agentSessionId,
+    process_epoch: session.processEpoch,
+    outcome: session.outcome,
+  }));
+  const lines = result.sessions.map((session) =>
+    `  ${session.agentSessionId} ${liveSupervisorSessionOutcomeLabel(session.outcome)}`);
+  const headline = summary.total === 0
+    ? `Cuna installed a new terminal supervisor on ${result.machine.name} without stopping it. No AgentSession existed on it, so nothing was preserved or lost.`
+    : summary.allPreserved
+      ? `Cuna installed a new terminal supervisor on ${result.machine.name} without stopping it, and all ${summary.total} AgentSessions were preserved.`
+      : `Cuna installed a new terminal supervisor on ${result.machine.name} without stopping it. ${summary.preserved} of ${summary.total} AgentSessions were preserved; this update is not complete.`;
+  return Object.freeze({
+    command: "machines.live-update-supervisor",
+    data: Object.freeze({
+      machine: machineRecord(result.machine),
+      control_generation: result.controlGeneration,
+      artifact_sha256: result.artifactSha256,
+      installed_at: result.installedAt,
+      agent_sessions: Object.freeze(sessions),
+      summary: Object.freeze({
+        total: summary.total,
+        preserved: summary.preserved,
+        exited: summary.exited,
+        ended: summary.ended,
+        unknown: summary.unknown,
+        all_preserved: summary.allPreserved,
+      }),
+      // An installed supervisor is software, not an authorization. Stated in the
+      // record because a caller reading only `--json` gets no prose.
+      grants_observation_or_control: false,
+      establishes_provider_login: false,
+    }),
+    human: [
+      headline,
+      `Control generation ${result.controlGeneration}, artifact ${result.artifactSha256}, installed ${result.installedAt}.`,
+      ...(lines.length === 0 ? [] : ["AgentSession custody:", ...lines]),
+      "This installed software only. It grants no observation or control of any AgentSession and signs no provider in.",
+      ...(summary.anyUnknown
+        ? [`Cuna could not re-read ${summary.unknown} of ${summary.total} AgentSessions, so this computer's record of this update stays open. Clear it with \`cuna machines live-update-supervisor ${id} --forget-unknown\` once you have read them.`]
+        : []),
+    ].join("\n"),
+  });
+}
+
 async function executeMachines(context: CommandContext): Promise<CommandResult> {
   const { parsed, client, now } = context;
   requireCredential(context);
@@ -1694,6 +1987,9 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
       data: machineRecord(updated),
       human: `Cuna confirmed a new terminal supervisor for ${updated.name}; the Machine is ${updated.state}.`,
     });
+  }
+  if (action === "live-update-supervisor") {
+    return executeLiveUpdateSupervisor(context);
   }
   if (action === "start" || action === "pause" || action === "resume" || action === "stop") {
     rejectUnknownOptions(parsed, ["yes"]);

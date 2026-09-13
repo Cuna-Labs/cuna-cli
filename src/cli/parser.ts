@@ -95,6 +95,7 @@ export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
   routed("machines resume", "machines resume MACHINE_ID --yes", ["machines", "resume", "00000000-0000-4000-8000-000000000001", "--yes"], "Resume a machine"),
   routed("machines stop", "machines stop MACHINE_ID --yes", ["machines", "stop", "00000000-0000-4000-8000-000000000001", "--yes"], "Stop a machine"),
   routed("machines update-supervisor", "machines update-supervisor MACHINE_ID --yes", ["machines", "update-supervisor", "00000000-0000-4000-8000-000000000001", "--yes"], "Update a stopped machine's terminal supervisor"),
+  routed("machines live-update-supervisor", "machines live-update-supervisor MACHINE_ID --yes", ["machines", "live-update-supervisor", "00000000-0000-4000-8000-000000000001", "--yes"], "Update a running machine's terminal supervisor in place and report each AgentSession's custody"),
   routed("machines delete", "machines delete MACHINE_ID --yes", ["machines", "delete", "00000000-0000-4000-8000-000000000001", "--yes"], "Delete a machine"),
   routed("records list", "records list", ["records", "list"], "List redacted account activity"),
   routed("executions list", "executions list --machine MACHINE_ID", ["executions", "list", "--machine", "00000000-0000-4000-8000-000000000001"], "List remote commands and their remaining process ownership"),
@@ -219,6 +220,11 @@ const BOOLEAN_OPTIONS = new Set([
   // value option, swallows the next token, and answers "Option --all requires
   // a value" — a usage error about a flag that takes none.
   "all",
+  // `machines live-update-supervisor --forget-unknown`. Drops this
+  // installation's local note about an update whose outcome it never saw. It
+  // sends nothing and settles nothing on the server; it is the acknowledgement
+  // that makes the next explicit attempt possible.
+  "forget-unknown",
 ]);
 
 /**

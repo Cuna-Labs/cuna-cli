@@ -850,6 +850,14 @@ function batchProgressLabel(parsed: ParsedInvocation): string | undefined {
           return "Deleting machine";
         case "update-supervisor":
           return "Updating terminal supervisor";
+        case "live-update-supervisor":
+          // Deliberately an attempt, not an outcome. The earlier label read
+          // "keeping sessions", which promised the one thing the server has not
+          // decided yet: preservation is conditional on a preflight that has not
+          // run when this line is painted. It is bounded by the request budget
+          // behind it, and the spinner stops when the answer arrives or that
+          // budget elapses -- never on its own.
+          return "Checking this machine and attempting an in-place supervisor update";
         default:
           return "Reading your machines";
       }
@@ -1999,6 +2007,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // in rather than read inside the command so a test can point it at a
       // scratch folder.
       workspaceRoot: dependencies.workspaceRoot ?? process.cwd(),
+      // The one batch command that keeps a durable local note across
+      // invocations needs the same adapter every other on-disk state uses.
+      platform,
     });
     batchProgress?.stop();
     batchProgress = undefined;

@@ -38,6 +38,28 @@ export interface PlatformAdapter {
    * file and preserves every key it already holds.
    */
   writeSafeConfig(path: string, text: string, maximumBytes: number): Promise<void>;
+  /**
+   * Create the file only if the name is free, and answer which happened.
+   *
+   * `writeSafeConfig` is an atomic REPLACE: it opens a unique temporary sibling
+   * with `O_EXCL` and renames it over the target, so it never fails because the
+   * target exists. That is the right primitive for configuration, and the wrong
+   * one for a slot two processes contend for — a caller that reads, finds the
+   * slot free, and then writes is performing check-then-act, and two processes
+   * interleaved that way both believe they hold it. Measured: two real OS
+   * processes, one state directory, both reserved.
+   *
+   * This is the compare-and-swap that shape needs. The TARGET itself is opened
+   * with `O_CREAT|O_EXCL|O_NOFOLLOW`, which the kernel resolves atomically, so
+   * exactly one caller can win however the two are scheduled.
+   *
+   * Returns `true` when this call created the file and `false` when the name was
+   * already taken. `false` is an ordinary answer, not a fault: the caller owns
+   * the product sentence for "someone else holds this", and an errno is not it.
+   * Every other failure is the same typed configuration-file refusal
+   * `writeSafeConfig` raises.
+   */
+  createExclusiveConfig(path: string, text: string, maximumBytes: number): Promise<boolean>;
 }
 
 export interface PlatformEnvironment {
@@ -187,6 +209,58 @@ async function writeSafeConfig(
   }
 }
 
+/**
+ * The exclusive-create half of the pair above.
+ *
+ * Deliberately NOT built on `writeSafeConfig`: there is no sequence of replace
+ * plus check that is atomic, and adding a pre-read here would reintroduce the
+ * exact race this exists to close. The single `open` is the whole mechanism.
+ *
+ * `assertReplaceableConfigFile` is not called either, and its absence is the
+ * point — it returns quietly when the path does not exist, which is the only
+ * case that reaches the `open` at all, and it would otherwise leave a window
+ * between its own `lstat` and the create.
+ */
+async function createExclusiveConfig(
+  path: string,
+  text: string,
+  maximumBytes: number,
+): Promise<boolean> {
+  if (Buffer.byteLength(text, "utf8") > maximumBytes) throw configFileError("oversized");
+  try {
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  } catch (error) {
+    throw configFileError("unwritable", error);
+  }
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(
+      path,
+      fileConstants.O_WRONLY | fileConstants.O_CREAT | fileConstants.O_EXCL | fileConstants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch (error) {
+    // The name was taken between this caller deciding to take it and trying to.
+    // That is the answer, not a failure.
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw configFileError("unwritable", error);
+  }
+  try {
+    await handle.writeFile(text, { encoding: "utf8" });
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await chmod(path, 0o600);
+    return true;
+  } catch (error) {
+    try { await handle?.close(); } catch { /* the create already failed */ }
+    // A half-written slot would block this Machine forever with bytes nobody
+    // can read, so the failed create takes its own file with it.
+    try { await unlink(path); } catch { /* it may never have been created */ }
+    throw configFileError("unwritable", error);
+  }
+}
+
 function configFileError(reason: string, cause?: unknown): CunaError {
   return new CunaError({
     code: "cuna.config.unsafe_file",
@@ -218,6 +292,8 @@ export function createPlatformAdapter(input?: Partial<PlatformEnvironment>): Pla
       readSafeConfig(kind, environment.userId, path, maximumBytes),
     writeSafeConfig: (path, text, maximumBytes) =>
       writeSafeConfig(kind, environment.userId, path, text, maximumBytes),
+    createExclusiveConfig: (path, text, maximumBytes) =>
+      createExclusiveConfig(path, text, maximumBytes),
   };
   return Object.freeze(adapter);
 }

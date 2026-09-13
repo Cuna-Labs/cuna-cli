@@ -1,19 +1,30 @@
 import type { AgentSession, AgentSessionAuthState, Machine } from "../api/contracts.js";
 import { machineProviderAvailability } from "./provider-availability.js";
-import { isAgentSessionIntendedActive } from "./session-visibility.js";
-
-const MAX_FUTURE_SKEW_MS = 5_000;
+import { isAgentSessionIntendedActive, readRuntimeWindow } from "./session-visibility.js";
 
 export type SessionBaseState = "attachable" | "starting" | "login-required" | "stale" | "failed" | "terminated" | "unsupported";
 export type SessionRefreshStatus = "idle" | "pending";
 export type SessionRecoveryAction = "attach" | "wait" | "authenticate" | "refresh" | "show-failure" | "none";
+/**
+ * `runtime_lease_current` and `runtime_lease_expired` were `runtime_evidence_*`.
+ *
+ * The word was wrong in a way that mattered. What this classifier tests at the
+ * end is the runtime LEASE window, and a lease renewal that carries no fresh
+ * observation moves it on its own. Calling the result "evidence current" told a
+ * reader that something had recently observed the process, which the row does
+ * not say, and the timestamps beside it now let a caller see the difference
+ * instead of inferring it from a name.
+ *
+ * `runtime_evidence_missing` and `runtime_evidence_invalid` keep their names:
+ * they really are about the evidence fields, not about the window.
+ */
 export type SessionActionReasonCode =
-  | "runtime_evidence_current"
+  | "runtime_lease_current"
   | "launch_pending"
   | "provider_authentication_required"
   | "runtime_evidence_missing"
   | "runtime_evidence_invalid"
-  | "runtime_evidence_expired"
+  | "runtime_lease_expired"
   | "session_failed"
   | "termination_intended"
   | "machine_not_running"
@@ -27,6 +38,16 @@ export interface SessionActionability {
   readonly reasonCode: SessionActionReasonCode;
   readonly observationRevision: number;
   readonly canAttach: boolean;
+  /**
+   * When the producer last observed this process, and how old that is at `now`.
+   * Present only once the runtime timestamps parse. Reported so a caller can
+   * show "last seen 4 h ago" beside an open lease; NO threshold is applied to
+   * it here, because no producer contract publishes one.
+   */
+  readonly lastObservedAt?: string;
+  readonly observationAgeMs?: number;
+  /** The lease window's end. Distinct from the observation above. */
+  readonly leaseExpiresAt?: string;
 }
 
 export interface SessionActionabilityInput {
@@ -44,12 +65,18 @@ interface ClassifiedBase {
 
 export function classifySessionActionability(input: SessionActionabilityInput): SessionActionability {
   const classified = classifyBase(input);
+  // Carried on every result, not only the attachable one: a `stale` row is
+  // exactly where "when was it last seen" is the question being asked.
+  const runtimeWindow = readRuntimeWindow(input.session, input.now);
   return Object.freeze({
     ...classified,
     refreshStatus: input.refreshStatus ?? "idle",
     recoveryAction: recoveryFor(classified.baseState),
     observationRevision: input.session.rowVersion,
     canAttach: classified.baseState === "attachable",
+    ...(runtimeWindow.lastObservedAt === undefined ? {} : { lastObservedAt: runtimeWindow.lastObservedAt }),
+    ...(runtimeWindow.observationAgeMs === undefined ? {} : { observationAgeMs: runtimeWindow.observationAgeMs }),
+    ...(runtimeWindow.leaseExpiresAt === undefined ? {} : { leaseExpiresAt: runtimeWindow.leaseExpiresAt }),
   });
 }
 
@@ -97,18 +124,18 @@ function classifyBase(input: SessionActionabilityInput): ClassifiedBase {
   if (session.processState !== "ready" && session.processState !== "running") {
     return result("stale", "runtime_evidence_invalid");
   }
-  if (session.processEpoch === undefined || session.runtimeObservedAt === undefined || session.runtimeExpiresAt === undefined) {
-    return result("stale", "runtime_evidence_missing");
-  }
-  const observedAt = Date.parse(session.runtimeObservedAt);
-  const expiresAt = Date.parse(session.runtimeExpiresAt);
-  if (!Number.isFinite(observedAt) || !Number.isFinite(expiresAt) ||
-      observedAt > now + MAX_FUTURE_SKEW_MS || expiresAt <= observedAt) {
-    return result("stale", "runtime_evidence_invalid");
-  }
-  return expiresAt > now
-    ? result("attachable", "runtime_evidence_current")
-    : result("stale", "runtime_evidence_expired");
+  if (session.processEpoch === undefined) return result("stale", "runtime_evidence_missing");
+  // One parser for both timestamps, shared with `session-visibility.ts`.
+  const runtimeWindow = readRuntimeWindow(session, now);
+  if (runtimeWindow.kind === "missing") return result("stale", "runtime_evidence_missing");
+  if (runtimeWindow.kind === "invalid") return result("stale", "runtime_evidence_invalid");
+  // The lease decides whether attaching is worth attempting, exactly as before:
+  // the server's capability snapshot and terminal grant remain the authority
+  // that admits or refuses the attach, and nothing here is narrowed by the age
+  // of the observation carried alongside.
+  return runtimeWindow.kind === "lease_current"
+    ? result("attachable", "runtime_lease_current")
+    : result("stale", "runtime_lease_expired");
 }
 
 function result(baseState: SessionBaseState, reasonCode: SessionActionReasonCode): ClassifiedBase {

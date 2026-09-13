@@ -149,6 +149,30 @@ export interface HttpRequest {
    * that something is unknown, which is a dead end.
    */
   readonly settleWith?: string;
+  /**
+   * Whether the transport may send this request a second time on its own.
+   *
+   * Defaults to `true`, which is the behavior every operation had and keeps:
+   * one immediate re-dispatch when the failure carries a `connect`-phase
+   * witness, because nothing was written and re-sending is free.
+   *
+   * Set to `false` by an operation that has NEITHER a durable server-side
+   * operation identity NOR an idempotency key, where a second POST the caller
+   * never asked for cannot be recognised or reconciled by anyone. For those,
+   * "was it sent?" is decided by `transportFailurePhase` walking an error's
+   * `cause` chain and `AggregateError.errors` depth-first and returning
+   * `connect` for the first witness found ANYWHERE in it — no ordering guard,
+   * no position requirement. A post-write reset whose cause names `connect` is
+   * therefore classified not-sent. That heuristic is fine when a replay is
+   * idempotent; it must not be the thing that decides whether a Machine's
+   * supervisor is replaced twice.
+   *
+   * This suppresses only the AUTOMATIC re-dispatch. The failure still surfaces
+   * as the same `cuna.network.failed` with `retryable: true` and
+   * `remote_outcome: "not_sent"`, so a person may still retry — and their retry
+   * passes the command's own gate, which the transport's does not.
+   */
+  readonly automaticRedispatch?: boolean;
 }
 
 export interface HttpTransport {
@@ -879,6 +903,11 @@ export function createHttpTransport(input: {
           } catch (error) {
             if (error instanceof CunaError || error instanceof CredentialBoundaryError) throw error;
             if (controller.signal.aborted) throw error;
+            // Checked BEFORE the phase classification, deliberately. For an
+            // operation that opted out there is no error shape that licenses a
+            // second send, so the walk over `cause`/`errors` never runs and
+            // cannot decide anything.
+            if (request.automaticRedispatch === false) throw error;
             if (transportFailurePhase(error) !== "connect") throw error;
             attempts += 1;
             return await dispatch(bearer);

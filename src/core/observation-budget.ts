@@ -104,6 +104,34 @@ export const MACHINE_CREATE_REQUEST_BUDGET_MS = 90_000;
 export const MACHINE_LIFECYCLE_REQUEST_BUDGET_MS = 60_000;
 
 /**
+ * `POST /v1/sessions/{id}/supervisor/live-update` replaces a RUNNING Machine's
+ * supervisor in place, and it does five bounded remote steps before it answers.
+ *
+ * DERIVATION, summed from the producer's own declared timeouts rather than from
+ * a wall-clock sample, because no live run of this operation has been observed
+ * from this CLI yet and a constant invented from nothing cannot be refuted:
+ *
+ *   30 s  pre-install session-custody observation
+ *           (`MACHINE_SUPERVISOR_LIVE_CONTINUITY_TIMEOUT_SECONDS`)
+ *   10 s  exec-readiness probe (`MACHINE_SUPERVISOR_EXEC_READY_TIMEOUT_MS`)
+ *   90 s  the installer itself, on the live-process path
+ *           (`MACHINE_SUPERVISOR_LIVE_EXEC_TIMEOUT_SECONDS`)
+ *   15 s  waiting for the exact new control to acknowledge
+ *           (`MACHINE_SUPERVISOR_ACK_TIMEOUT_MS`)
+ *   30 s  the post-install custody re-read, same bound as the first
+ *   ----
+ *  175 s  before the provider read, the Machine reads and the edge's own work.
+ *
+ * 240 000 ms is that sum with a ~37% margin. It is deliberately ABOVE the
+ * `--timeout-ms` ceiling of 120 000: a caller who passes that flag overrides
+ * this budget downward and will abort a dispatch that is still in flight, which
+ * this command must then report as an unknown outcome rather than a failure.
+ * That is why the budget lives here with its derivation instead of being the
+ * lifecycle constant reused one command too far.
+ */
+export const SUPERVISOR_LIVE_UPDATE_REQUEST_BUDGET_MS = 240_000;
+
+/**
  * How long the CLI reads back before it stops judging a postcondition.
  *
  * DERIVATION. Measured 2026-08-19: a deleted machine was still `present` on an

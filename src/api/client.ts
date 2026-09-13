@@ -3,6 +3,7 @@ import { EXIT_CODES, CunaError, usageError } from "../core/errors.js";
 import {
   MACHINE_CREATE_REQUEST_BUDGET_MS,
   MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
+  SUPERVISOR_LIVE_UPDATE_REQUEST_BUDGET_MS,
 } from "../core/observation-budget.js";
 import { OFF_CONTRACT_RESPONSE_HINT } from "../core/product-web.js";
 import {
@@ -56,6 +57,7 @@ import {
   type TerminalConnectionGrant,
   type WorkspaceBindingAuthority,
 } from "./contracts.js";
+import { decodeSupervisorLiveUpdate, type SupervisorLiveUpdate } from "./supervisor-live-update.js";
 import type { HttpRequest, HttpTransport } from "./http.js";
 import { decodeExecutionWorkspacePage, type ExecutionWorkspacePage } from "./execution-workspaces.js";
 import { decodeManagedExecution, decodeManagedExecutionPage, type ManagedExecution, type ManagedExecutionPage } from "./managed-executions.js";
@@ -148,6 +150,18 @@ export interface CunaApiClient {
    * that replacing it is safe from a cached Machine row.
    */
   replaceMachineSupervisor(id: string, signal?: AbortSignal): Promise<Machine>;
+  /**
+   * `sessions.updateSupervisorInPlace`: replace a RUNNING Machine's supervisor
+   * without stopping it. A second operation, not a relaxation of the one above:
+   * the stopped-boundary guards on `replaceMachineSupervisor` are untouched.
+   *
+   * The server owns every preflight — it measures the Machine's boot, unit,
+   * artifacts and each live session's process, PTY and stored master before the
+   * installer runs and re-measures them under the install lock. A 200 carries
+   * one custody outcome per AgentSession that existed beforehand; it is not a
+   * promise that all of them survived, and callers must read the outcomes.
+   */
+  updateMachineSupervisorInPlace(id: string, signal?: AbortSignal): Promise<SupervisorLiveUpdate>;
   deleteMachine(id: string): Promise<unknown>;
   executeManagedCommand(machineId: string, operationId: string, input: ManagedCommandInput, signal?: AbortSignal): Promise<ManagedCommandResult>;
   listManagedExecutions(machineId: string, input?: { readonly executionWorkspaceId?: string; readonly after?: string }, signal?: AbortSignal): Promise<ManagedExecutionPage>;
@@ -608,6 +622,35 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         throw malformed(contractViolation("matches_requested_resource", "id"), operationLabel(request));
       }
       return machine;
+    },
+    async updateMachineSupervisorInPlace(id, signal) {
+      const safeId = encodeMachineId(id);
+      const request: HttpRequest = {
+        method: "POST",
+        path: `/v1/sessions/${safeId}/supervisor/live-update`,
+        // Both reads a caller needs after an unknown outcome, and neither of
+        // them repeats the mutation.
+        settleWith: `cuna agent-sessions list --machine ${id}`,
+        budgetMs: SUPERVISOR_LIVE_UPDATE_REQUEST_BUDGET_MS,
+        // This operation carries no request body and no idempotency key, and
+        // the producer keeps no durable identity for it, so a second POST is
+        // indistinguishable from a first one at every layer. The transport's
+        // automatic connect-phase re-dispatch happens below the command's
+        // duplicate-suppression gate and below the local record, so it would be
+        // the one dispatch this CLI cannot see. It is off for this request and
+        // unchanged for every other.
+        automaticRedispatch: false,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const result = await fetchDecoded(request, decodeSupervisorLiveUpdate);
+      // The path id is the Machine, so the Machine in the body must be the one
+      // that was asked about. Without this, a producer answering about a sibling
+      // would have its control generation and artifact digest reported as this
+      // Machine's.
+      if (result.machine.id !== id) {
+        throw malformed(contractViolation("matches_requested_resource", "machine.id"), operationLabel(request));
+      }
+      return result;
     },
     async deleteMachine(id) {
       const safeId = encodeMachineId(id);

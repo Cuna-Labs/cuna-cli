@@ -61,6 +61,26 @@ export {
   type TerminalConnectionCapability,
   type TerminalConnectionGrant,
 } from "./api/contracts.js";
+export {
+  SUPERVISOR_LIVE_UPDATE_WIRE,
+  decodeSupervisorLiveUpdate,
+  type SupervisorLiveUpdate,
+  type SupervisorLiveUpdateOutcome,
+  type SupervisorLiveUpdateSession,
+} from "./api/supervisor-live-update.js";
+export {
+  classifyLiveSupervisorUpdateFailure,
+  liveSupervisorSessionOutcomeLabel,
+  liveSupervisorUpdateNotes,
+  summarizeLiveSupervisorUpdate,
+  type LiveSupervisorUpdateDisposition,
+  type LiveSupervisorUpdateNote,
+  type LiveSupervisorUpdateNotes,
+  type LiveSupervisorUpdateReading,
+  type LiveSupervisorUpdateScope,
+  type LiveSupervisorUpdateSettlement,
+  type LiveSupervisorUpdateSummary,
+} from "./machines/live-supervisor-update.js";
 export { createHttpTransport, type HttpRequest, type HttpTransport } from "./api/http.js";
 export { createPkceAuthorization, type PkceAuthorization } from "./auth/pkce.js";
 export {
@@ -132,6 +152,7 @@ export {
   DEFAULT_REQUEST_BUDGET_MS,
   MACHINE_CREATE_REQUEST_BUDGET_MS,
   MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
+  SUPERVISOR_LIVE_UPDATE_REQUEST_BUDGET_MS,
   OBSERVATION_BUDGET_CODES,
   REMOTE_CONVERGENCE_BUDGET_MS,
   REMOTE_CONVERGENCE_POLL_INTERVAL_MS,
