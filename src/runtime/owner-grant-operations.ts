@@ -9,9 +9,10 @@ import {assertCanonicalUuid} from '../core/validation.js';
  *
  * Modelled on `machines/execution-receipt.ts`: one immutable file per operation
  * ID, written BEFORE the request is dispatched, so a process that dies between
- * dispatch and answer still knows which authority it may have created. Nothing
- * secret is persisted -- only UUIDs, integers and the operation kind. No bearer,
- * no email, no session name, no grant secret.
+ * dispatch and answer still knows which authority it may have created or which
+ * session it may have started sharing. Nothing secret is persisted -- only
+ * UUIDs, integers and the operation kind and action. No bearer, no email, no
+ * session name, no grant secret.
  *
  * A record's presence means "the outcome of this exact operation is unknown
  * here". It is never permission to replay: replay is an explicit human action
@@ -33,13 +34,27 @@ export interface PendingRevokeOperation {
   readonly grantId:string;readonly agentSessionId:string;readonly subjectPrincipalId:string;
   readonly expectedRevision:number;
 }
-export type PendingOwnerGrantOperation=PendingCreateOperation|PendingRevokeOperation;
-export type OwnerGrantOperationIntent=Omit<PendingCreateOperation,'version'|'scope'>|Omit<PendingRevokeOperation,'version'|'scope'>;
+/**
+ * An unanswered publish or return-to-private.
+ *
+ * It carries no subject: publication is a property of the session, not of one
+ * member. The action is part of the durable identity because
+ * `issue_collab_v2_session_audience_request` refuses an operation ID replayed
+ * with a different action -- replaying the wrong one would turn a recoverable
+ * request into a conflict.
+ */
+export interface PendingAudienceOperation {
+  readonly version:1;readonly scope:string;readonly operationId:string;readonly kind:'audience';
+  readonly action:'publish'|'private';readonly agentSessionId:string;
+}
+export type PendingOwnerGrantOperation=PendingCreateOperation|PendingRevokeOperation|PendingAudienceOperation;
+export type OwnerGrantOperationIntent=Omit<PendingCreateOperation,'version'|'scope'>|Omit<PendingRevokeOperation,'version'|'scope'>|Omit<PendingAudienceOperation,'version'|'scope'>;
 
 const MAXIMUM_BYTES=2048;
 const RECORD_NAME=/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$/u;
 const CREATE_KEYS='agentSessionId,expectedMembershipRevision,expiresAtMs,kind,operationId,scope,subjectPrincipalId,version';
 const REVOKE_KEYS='agentSessionId,expectedRevision,grantId,kind,operationId,scope,subjectPrincipalId,version';
+const AUDIENCE_KEYS='action,agentSessionId,kind,operationId,scope,version';
 
 function scopeDigest(scope:OwnerGrantOperationScope):string{
  const url=new URL(scope.baseUrl);
@@ -51,6 +66,10 @@ function record(scope:OwnerGrantOperationScope,intent:OwnerGrantOperationIntent)
  const digest=scopeDigest(scope);
  assertCanonicalUuid(intent.operationId,'Operation ID');
  assertCanonicalUuid(intent.agentSessionId,'AgentSession ID');
+ if(intent.kind==='audience'){
+  if(intent.action!=='publish'&&intent.action!=='private')throw new Error('Invalid sharing action.');
+  return Object.freeze({version:1,scope:digest,operationId:intent.operationId,kind:'audience',action:intent.action,agentSessionId:intent.agentSessionId});
+ }
  assertCanonicalUuid(intent.subjectPrincipalId,'Principal ID');
  if(intent.kind==='create'){
   if(!Number.isSafeInteger(intent.expectedMembershipRevision)||intent.expectedMembershipRevision<1)throw new Error('Invalid membership revision.');
@@ -111,7 +130,7 @@ export function ownerGrantOperationStore(platform:PlatformAdapter,scope:OwnerGra
     if(typeof value!=='object'||value===null||Array.isArray(value))throw new Error(`Invalid local owner grant operation record: ${path}`);
     const row=value as Record<string,unknown>;
     const keys=Object.keys(row).sort().join(',');
-    if(row.version!==1||row.scope!==digest||row.operationId!==match[1]||(row.kind==='create'?keys!==CREATE_KEYS:row.kind==='revoke'?keys!==REVOKE_KEYS:true))throw new Error(`Invalid local owner grant operation record: ${path}`);
+    if(row.version!==1||row.scope!==digest||row.operationId!==match[1]||(row.kind==='create'?keys!==CREATE_KEYS:row.kind==='revoke'?keys!==REVOKE_KEYS:row.kind==='audience'?keys!==AUDIENCE_KEYS:true))throw new Error(`Invalid local owner grant operation record: ${path}`);
     items.push(record(scope,row as unknown as OwnerGrantOperationIntent));
    }
    signal?.throwIfAborted();

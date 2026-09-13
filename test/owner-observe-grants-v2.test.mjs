@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
-import {createHash} from 'node:crypto';
-import {ownerObserveGrantsApi,decodeOwnerGrant,decodeProjectObserverPage,describeGrantState,classifyTransportFailure,OwnerGrantError} from '../dist/api/owner-observe-grants-v2.js';
+import {createHash,randomUUID} from 'node:crypto';
+import {ownerObserveGrantsApi,decodeOwnerGrant,decodeProjectObserverPage,describeGrantState,classifyTransportFailure,audienceRefusalCanResend,OwnerGrantError} from '../dist/api/owner-observe-grants-v2.js';
 import {ownerObserveGrantSchemas,ownerObserveGrantOperations} from '../dist/api/owner-observe-grants-v2-schema.js';
 import {runOwnerGrantsScreen} from '../dist/runtime/owner-grants-screen.js';
 import {ownerGrantOperationStore} from '../dist/runtime/owner-grant-operations.js';
@@ -30,7 +30,11 @@ test('owner projection is generated from the vendored contract and its check pas
  const header=readFileSync(new URL('../src/api/owner-observe-grants-v2-schema.ts',import.meta.url),'utf8').split('\n')[1];
  assert.ok(header.includes(`contracts/infra/cuna-api.openapi.json; SHA256 ${createHash('sha256').update(bytes).digest('hex')}`));
  const spec=JSON.parse(bytes);for(const [name,schema] of Object.entries(ownerObserveGrantSchemas))assert.deepEqual(schema,spec.components.schemas[name],name);
- assert.deepEqual(Object.keys(ownerObserveGrantOperations).sort(),['createSessionObserveGrantV2','inspectSessionObserveGrantV2','listProjectObserversV2','revokeSessionObserveGrantV2']);
+ assert.deepEqual(Object.keys(ownerObserveGrantOperations).sort(),['createSessionObserveGrantV2','inspectSessionObserveGrantV2','listProjectObserversV2','prepareSessionAudienceV2','revokeSessionObserveGrantV2']);
+ // Both actions of the canonical enum are projected. Shipping only `publish`
+ // would give an owner a way to start disclosing a terminal and no way to stop.
+ assert.deepEqual(ownerObserveGrantSchemas.PrepareSessionAudienceV2Request.properties.action.enum,['publish','private']);
+ assert.equal(ownerObserveGrantOperations.prepareSessionAudienceV2.path,'/v1/collaboration/2/agent-sessions/{id}/audience');
  execFileSync(process.execPath,['scripts/project-owner-observe-grants-v2.mjs','--check'],{cwd:new URL('..',import.meta.url),stdio:'pipe'});
  // The recipient projection and decoder are untouched by this surface.
  assert.doesNotMatch(readFileSync(new URL('../src/api/observer-v2.ts',import.meta.url),'utf8'),/owner-observe/u);
@@ -286,9 +290,10 @@ test('the screen before the grant discloses the real observation and replay hist
  assert.match(screen,/Nothing from before that: earlier output and scrollback are never sent/u);
  assert.match(screen,/still on the screen when they start watching is visible to them/u);
  assert.match(screen,/requires this session to be shared live/u);
- // Publication exists; it lives in the console. Saying the CLI cannot do it
- // must not imply nobody can.
- assert.match(screen,/That step is in the Cuna web app; this CLI does not do it/u);
+ // Sharing is a separate decision from granting, and the disclosure points at
+ // the key that makes it rather than at another product.
+ assert.match(screen,/That is a separate decision: press s on the session list/u);
+ assert.doesNotMatch(screen,/web app/u);
  assert.match(screen,/never type, resize or send a signal/u);
  // Plain language: no contract or transport internals reach the terminal.
  for(const leak of [/sequence/iu,/generation/iu,/stream/iu,/audience/iu,/redraw/iu,/frame/iu])assert.doesNotMatch(screen,leak,String(leak));
@@ -414,6 +419,350 @@ test('denied member read and --grant direct inspect render their own reasons; no
  direct.key('\x03');await direct.done;assert.equal(direct.restored,1);
  const wrong=await harness(r=>{if(route(r)==='inspect')return{...revoking,grant_id:id(4)};throw Error(r.path);},{initialGrantId:active.grant_id});
  await wrong.wait(/Not done - identity mismatch/u);wrong.key('\x03');await wrong.done;
+});
+
+/**
+ * Publication, the other half of the same decision.
+ *
+ * `resolve_collab_v2_observer_admission` (0183) admits nobody unless the
+ * session's latest audience result is `public`, so these tests are about the
+ * authority that makes a grant mean anything -- and about the fact that it is a
+ * SEPARATE authority, never a side effect of granting one.
+ */
+// One request_id per operation, as `issue_collab_v2_session_audience_request`
+// mints it. Reusing one across distinct operations -- as this helper did until
+// the acceptance review -- is not something the producer can do, and it hid the
+// only identity the client can order its own answers by.
+const audienceReceipt=(action,generation,patch={})=>{
+ const response={type:'session_audience_response_v2',version:'2',request_id:randomUUID(),action,agent_session_id:session,session_incarnation:id(6),process_epoch:id(71),runtime_lease_id:id(72),logical_terminal_id:id(13),process_start_identity:'4242',expected_generation:String(generation),
+  result:action==='publish'
+   ? {status:'observed',state:'public',stream_id:id(73),generation:String(generation+1),first_sequence:'1'}
+   : {status:'observed',state:'private',generation:String(generation)}};
+ return{state:'observed',response:{...response,...patch,...(patch.result?{result:{...response.result,...patch.result}}:{})}};
+};
+const audienceProblem=(code,status=503)=>new CunaError({code:status>=500?'cuna.network.service_unavailable':'cuna.remote.rejected',message:'x',exitCode:status>=500?EXIT_CODES.network:EXIT_CODES.remote,details:{http_status:status,reason:code}});
+
+test('publication sends the canonical body for both actions and binds the receipt to this session, this run and the transition asked for',async()=>{
+ const requests=[];const api=ownerObserveGrantsApi({request:async r=>{requests.push(r);return audienceReceipt(r.body.action,r.body.action==='publish'?4:5);}},owner,project);
+ const started=await api.setAudience({agentSessionId:session,action:'publish',sessionIncarnation:id(6)},id(7),signal);
+ assert.equal(requests[0].path,`/v1/collaboration/2/agent-sessions/${session}/audience`);
+ assert.deepEqual(requests[0].body,{version:'2',operation_id:id(7),action:'publish'});
+ assert.equal(started.state,'public');assert.equal(started.generation,'5');assert.equal(started.firstSequence,'1');assert.equal(started.streamId,id(73));
+ const stopped=await api.setAudience({agentSessionId:session,action:'private'},id(8),signal);
+ assert.equal(stopped.state,'private');assert.equal(stopped.generation,'5');assert.equal(stopped.streamId,undefined);
+ assert.deepEqual(requests[1].body,{version:'2',operation_id:id(8),action:'private'});
+ // Every way the answer can be about something other than what was asked.
+ const cases=[
+  [audienceReceipt('publish',4,{agent_session_id:other}),'identity_mismatch','another session'],
+  [audienceReceipt('publish',4,{session_incarnation:id(14)}),'identity_mismatch','another run of this session'],
+  [audienceReceipt('private',4),'identity_mismatch','the other action'],
+  [audienceReceipt('publish',4,{result:{generation:'4'}}),'identity_mismatch','a generation that did not move'],
+  [audienceReceipt('publish',4,{result:{generation:'6'}}),'identity_mismatch','a generation that moved twice'],
+  [audienceReceipt('publish',4,{result:{first_sequence:'0'}}),'malformed_receipt','a stream that does not start at one'],
+  [audienceReceipt('publish',4,{result:{stream_id:'not-a-uuid'}}),'malformed_receipt','an unusable stream identity'],
+  [{state:'observed',response:{...audienceReceipt('publish',4).response,extra:1}},'malformed_receipt','a field the contract does not have'],
+  [{state:'prepared',response:audienceReceipt('publish',4).response},'malformed_receipt','a state the contract does not have'],
+ ];
+ for(const [answer,kind,what] of cases){
+  const bad=ownerObserveGrantsApi({request:async()=>answer},owner,project);
+  await assert.rejects(bad.setAudience({agentSessionId:session,action:'publish',sessionIncarnation:id(6)},id(7),signal),error=>error instanceof OwnerGrantError&&error.kind===kind,what);
+ }
+ // A publish answered with `private` is a contradiction, not a mismatch.
+ const contradiction=ownerObserveGrantsApi({request:async()=>({state:'observed',response:{...audienceReceipt('private',4).response,action:'publish'}})},owner,project);
+ await assert.rejects(contradiction.setAudience({agentSessionId:session,action:'publish'},id(7),signal),e=>e.kind==='malformed_receipt'&&/opposite state/u.test(e.message));
+});
+
+test('a sharing receipt older than one already confirmed is refused, per run of the session',async()=>{
+ let answer=audienceReceipt('publish',4);
+ const api=ownerObserveGrantsApi({request:async()=>answer},owner,project);
+ assert.equal((await api.setAudience({agentSessionId:session,action:'publish'},id(7),signal)).generation,'5');
+ answer=audienceReceipt('private',2);
+ await assert.rejects(api.setAudience({agentSessionId:session,action:'private'},id(8),signal),e=>e.kind==='stale_revision'&&/older sharing state than one already confirmed/u.test(e.message));
+ // Same generation is not stale: a return to private stays on the one it was issued against.
+ answer=audienceReceipt('private',5);
+ assert.equal((await api.setAudience({agentSessionId:session,action:'private'},id(9),signal)).state,'private');
+ // A different run of the same session counts separately; a restart resets the producer's counter.
+ answer=audienceReceipt('publish',0,{session_incarnation:id(15)});
+ assert.equal((await api.setAudience({agentSessionId:session,action:'publish'},id(10),signal)).generation,'1');
+});
+
+/**
+ * Where `coordinateSessionAudienceV2` gives up decides whether anything could
+ * have changed. `invalid_scope`, `request_unavailable` and `request_expired`
+ * return before `registry.controlSessionAudienceV2` is called; the other three
+ * are raised at or after the moment the session was asked.
+ */
+test('every publication refusal is mapped to whether the session was asked, with a distinguishable reason',async()=>{
+ // The five that are settled because the session was asked NOTHING may say so.
+ const askedNothing=['audience_request_invalid','audience_runtime_unavailable','audience_invalid_scope','audience_request_unavailable','audience_request_expired'];
+ const settled=[...askedNothing,'audience_producer_unavailable'];
+ const uncertain=['audience_transport_unavailable','audience_response_unavailable','audience_receipt_unavailable'];
+ const rendered=new Set();
+ for(const code of settled){
+  const error=classifyTransportFailure(audienceProblem(code,code==='audience_request_invalid'?422:503),true,'audience');
+  assert.equal(error.effectUnknown,false,code);assert.equal(error.kind,'unavailable',code);
+  if(askedNothing.includes(code))assert.match(error.message,/nothing about sharing changed/u,code);
+  rendered.add(error.message);
+ }
+ // `producer_unavailable` is the one settled refusal where the session WAS asked
+ // and Cuna recorded an answer. `consume_collab_v2_session_audience_response`
+ // retires pending observer attachments and closes active observer endpoints for
+ // any recorded result, and the Edge collapses the session's own reason, so
+ // claiming nothing changed is a claim the CLI cannot support.
+ const refused=classifyTransportFailure(audienceProblem('audience_producer_unavailable'),true,'audience');
+ assert.doesNotMatch(refused.message,/nothing about sharing changed/u,'a recorded refusal is not proof that nothing changed');
+ assert.match(refused.message,/the change you asked for was not applied/u);
+ assert.match(refused.message,/disconnects anyone currently watching/u);
+ for(const code of uncertain){
+  const error=classifyTransportFailure(audienceProblem(code),true,'audience');
+  assert.equal(error.effectUnknown,true,code);assert.equal(error.kind,'uncertain',code);
+  assert.doesNotMatch(error.message,/nothing about sharing changed/u,code);
+  rendered.add(error.message);
+ }
+ assert.equal(rendered.size,settled.length+uncertain.length,'different causes must not render identically');
+ // A session this account does not own is a 404 from `get_agent_session`, and it
+ // is not one of the grant route's collaboration codes.
+ const missing=classifyTransportFailure(http(404,'resource_not_found'),true,'audience');
+ assert.equal(missing.kind,'not_found');assert.equal(missing.effectUnknown,false);
+ assert.match(missing.message,/does not know this session/u);
+ assert.doesNotMatch(missing.message,/observer at the membership revision/u,'the grant route\'s meanings may not leak onto this one');
+ // A lost answer is uncertain here exactly as it is for a grant.
+ assert.equal(classifyTransportFailure(new TypeError('fetch failed'),true,'audience').kind,'uncertain');
+});
+
+/**
+ * A refusal of a re-raise describes the re-raise. Every refusal that is settled
+ * on a first dispatch only because the session was asked nothing therefore says
+ * nothing about the attempt being replayed, and settling it would destroy the
+ * only identity that could ever finish that attempt.
+ */
+test('no refusal settles a replay unless it proves the replayed attempt did nothing',async()=>{
+ const codes=['audience_invalid_scope','audience_request_unavailable','audience_producer_unavailable','audience_request_expired'];
+ for(const code of codes){
+  const api=ownerObserveGrantsApi({request:async()=>{throw audienceProblem(code);}},owner,project);
+  const first=await api.setAudience({agentSessionId:session,action:'publish'},id(7),signal).catch(e=>e);
+  assert.equal(first.effectUnknown,false,`${code} must settle a first dispatch`);
+  const replay=await api.setAudience({agentSessionId:session,action:'publish',replay:true},id(7),signal).catch(e=>e);
+  assert.equal(replay.effectUnknown,true,`${code} must NOT settle a replay`);
+  assert.notEqual(replay.message,first.message,`${code} must not read identically on a replay`);
+  assert.match(replay.message,/still unknown|earlier attempt/u,code);
+ }
+ // The two the producer has closed the door on cannot be resent; the other two can.
+ assert.equal(audienceRefusalCanResend('audience_request_expired'),false);
+ assert.equal(audienceRefusalCanResend('audience_producer_unavailable'),false);
+ assert.equal(audienceRefusalCanResend('audience_request_unavailable'),true);
+ assert.equal(audienceRefusalCanResend('audience_invalid_scope'),true);
+ assert.equal(audienceRefusalCanResend(undefined),true,'an unnamed reason closes no door');
+ const expired=await ownerObserveGrantsApi({request:async()=>{throw audienceProblem('audience_request_expired');}},owner,project)
+  .setAudience({agentSessionId:session,action:'publish',replay:true},id(7),signal).catch(e=>e);
+ assert.match(expired.message,/can no longer be sent/u);
+ const recorded=await ownerObserveGrantsApi({request:async()=>{throw audienceProblem('audience_producer_unavailable');}},owner,project)
+  .setAudience({agentSessionId:session,action:'publish',replay:true},id(7),signal).catch(e=>e);
+ assert.match(recorded.message,/cannot settle it, because Cuna has now recorded an answer for it/u);
+});
+
+/**
+ * The case the original delivery had no witness for, and the one the PRD called
+ * decisive: an answer to a request that a later confirmed decision has already
+ * replaced must never read as the session's current state. The generation cannot
+ * order these -- a publish TO G and a private AT G carry the same number -- so
+ * the ordering is this client's own record of which requests it has had answered.
+ */
+test('a stored publish answered again after a confirmed private is labelled history, never current state',async()=>{
+ const published=audienceReceipt('publish',0),madePrivate=audienceReceipt('private',1);
+ let answer=published;
+ const api=ownerObserveGrantsApi({request:async()=>answer},owner,project);
+ const p=await api.setAudience({agentSessionId:session,action:'publish'},id(7),signal);
+ assert.equal(p.state,'public');assert.equal(p.supersededBy,undefined);
+ answer=madePrivate;
+ const q=await api.setAudience({agentSessionId:session,action:'private'},id(8),signal);
+ assert.equal(q.state,'private');assert.equal(q.generation,p.generation,'the two carry the SAME generation: it cannot order them');
+ assert.equal(q.supersededBy,undefined);
+ // The producer replays the stored answer to the publish, unchanged. It is
+ // refused, not returned: an answer that cannot describe the session now must
+ // never reach a screen, and the refusal names what replaced it.
+ answer=published;
+ const replayed=await api.setAudience({agentSessionId:session,action:'publish',replay:true},id(7),signal).catch(e=>e);
+ assert.ok(replayed instanceof OwnerGrantError,'a superseded answer is refused, not returned');
+ assert.equal(replayed.kind,'stale_revision');
+ assert.equal(replayed.state,undefined,'nothing state-bearing comes back');
+ assert.match(replayed.message,/the answer it already gave to an earlier request, which started live sharing/u);
+ assert.match(replayed.message,/you asked Cuna to stop live sharing, and Cuna confirmed it/u);
+ assert.match(replayed.message,/it cannot say how the session is shared now/u);
+ assert.equal(published.response.request_id,p.requestId,'the request identity is what makes this knowable');
+ // The same request answered two different ways is a contradiction, not a decision.
+ answer={state:'observed',response:{...published.response,result:{...published.response.result,stream_id:id(74)}}};
+ await assert.rejects(api.setAudience({agentSessionId:session,action:'publish',replay:true},id(7),signal),
+  e=>e.kind==='malformed_receipt'&&/two different ways/u.test(e.message));
+ // A request never seen before is a new decision, superseded by nothing.
+ answer=audienceReceipt('publish',1);
+ const fresh=await api.setAudience({agentSessionId:session,action:'publish'},id(9),signal);
+ assert.equal(fresh.supersededBy,undefined);assert.equal(fresh.state,'public');
+});
+
+test('sharing is started and stopped explicitly, and granting never starts it',async()=>{
+ const answers={publish:audienceReceipt('publish',0),private:audienceReceipt('private',1)};
+ const h=await harness(r=>{if(route(r)==='observers')return memberPage;if(route(r)==='observe-grants')return active;if(route(r)==='audience')return answers[r.body.action];throw Error(r.path);});
+ await h.wait(/Share a session - read-only observation/u);
+ assert.match(h.last(),/s starts sharing this session live; e stops it/u,'the actions are discoverable where a session is selected');
+ assert.match(h.last(),/two separate decisions/u);
+ // Creating a grant sends nothing to the publication route.
+ await h.press('\r',/Choose the member/u);await h.press('\r',/Press 1, 2 or 3/u);await h.press('1',/Observation grant ba600000 - Active/u);
+ assert.equal(h.requests.filter(r=>route(r)==='audience').length,0,'a grant never publishes');
+ assert.match(h.last(),/Watching also needs this session to be shared live/u);
+ // The confirmation states what publishing discloses, and sends nothing.
+ await h.press('s',/Share this session's screen live\?/u);
+ const confirm=h.last();
+ assert.match(confirm,/box \/ claude-live/u,'the confirmation names the session it will share');
+ assert.match(confirm,/whatever is on the screen now, and everything printed from now on/u);
+ assert.match(confirm,/Nothing from before is replayed to them: no scrollback, no earlier output/u);
+ assert.match(confirm,/a token, a login code, a file it opens/u);
+ assert.match(confirm,/cannot recall what was already sent/u);
+ assert.match(confirm,/never type, resize or send a signal/u);
+ assert.match(confirm,/creates no grant/u);
+ assert.equal(h.requests.filter(r=>route(r)==='audience').length,0,'the disclosure precedes the request');
+ await h.press('n',/Observation grant ba600000 - Active/u);
+ assert.equal(h.requests.filter(r=>route(r)==='audience').length,0,'any key but y cancels and sends nothing');
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Live sharing started - Cuna confirmed it/u);
+ const receipt=h.requests.filter(r=>route(r)==='audience');
+ assert.equal(receipt.length,1);assert.equal(receipt[0].body.action,'publish');
+ // CUNA-COL-016-R4's starting point, named from the receipt rather than promised.
+ assert.match(h.last(),/Share {5}#1 of this run of the session/u);
+ assert.match(h.last(),/the first thing anyone sees is the screen as it is now/u);
+ assert.match(h.last(),/Nothing printed before this moment is sent to them/u);
+ assert.match(h.last(),/grants no keyboard, resize or signal/u);
+ assert.match(h.last(),/if Cuna's own checks also allow it/u,'publication does not override the provider or grant checks');
+ // Stopping is a separate confirmed decision, and its confirmation is bound to
+ // the fencing receipt rather than to the keypress.
+ await h.press('e',/Stop sharing this session live\?/u);
+ assert.match(h.last(),/revokes nothing and expires nothing/u);
+ // Declining returns to the receipt that was being read, not to the list.
+ await h.press('n',/Live sharing started - Cuna confirmed it/u);
+ assert.equal(h.requests.filter(r=>route(r)==='audience').length,1,'declining sends nothing');
+ await h.press('e',/Stop sharing this session live\?/u);
+ await h.press('y',/Live sharing stopped - Cuna confirmed it/u);
+ assert.match(h.last(),/Cuna confirmed with the session itself that its output is fenced/u);
+ assert.match(h.last(),/What was already sent cannot be recalled/u);
+ assert.equal(h.requests.filter(r=>route(r)==='audience').length,2);
+ assert.equal(h.requests.filter(r=>route(r)==='audience').at(-1).body.action,'private');
+ assert.notEqual(h.requests.filter(r=>route(r)==='audience')[0].body.operation_id,h.requests.filter(r=>route(r)==='audience')[1].body.operation_id,'each decision has its own identity');
+ assert.deepEqual(await h.records(),[],'both answers settled their records');
+ h.key('\x03');await h.done;assert.equal(h.restored,1);
+});
+
+/**
+ * The rendering half of the supersession backstop.
+ *
+ * Through the shipped producer this branch is unreachable: a replay only exists
+ * for an UNSETTLED operation, whose first answer was never seen, and the
+ * supervisor re-validates live state before serving its journal. So the fixture
+ * here models a producer ANOMALY -- Cuna answering a new sharing request with an
+ * answer it already gave -- which is exactly what a backstop is for. What the
+ * screen must never do is render it as the session's current state.
+ */
+test('an answer Cuna has already given never reaches the screen as the session being shared now',async()=>{
+ const published=audienceReceipt('publish',0);
+ const answers={publish:published,private:audienceReceipt('private',1)};
+ let repeat=false;
+ const h=await harness(r=>{if(route(r)==='observers')return memberPage;
+  if(route(r)==='audience'){if(r.body.action==='publish'&&repeat)return published;if(r.body.action==='publish')repeat=true;return answers[r.body.action];}
+  throw Error(r.path);});
+ await h.wait(/Share a session/u);
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Live sharing started - Cuna confirmed it/u);
+ await h.press('e',/Stop sharing this session live\?/u);
+ await h.press('y',/Live sharing stopped - Cuna confirmed it/u);
+ // A second, genuinely new publish request, which Cuna answers with the answer
+ // it already gave to the first one.
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Not done - stale revision/u);
+ assert.match(h.last(),/the answer it already gave to an earlier request, which started live sharing/u);
+ assert.match(h.last(),/you asked Cuna to stop live sharing, and Cuna confirmed it/u);
+ assert.match(h.last(),/it cannot say how the session is shared now/u);
+ assert.doesNotMatch(h.last(),/Live sharing started - Cuna confirmed it/u,'a superseded answer must never read as a confirmed publication');
+ assert.doesNotMatch(h.last(),/Watching starts here/u);
+ assert.match(h.last(),/This attempt applied nothing/u,'the re-raise applied nothing, which is what it settles');
+ assert.deepEqual(await h.records(),[],'and the operation it belongs to is settled');
+ h.key('\x03');await h.done;
+});
+
+test('an unconfirmed publication keeps its identity, resends only that identity, and never blocks stopping',async()=>{
+ let lost=true;const bodies=[];
+ const h=await harness(r=>{if(route(r)==='observers')return memberPage;
+  if(route(r)==='audience'){bodies.push(r.body);if(r.body.action==='publish'&&lost){lost=false;throw new TypeError('fetch failed');}return audienceReceipt(r.body.action,r.body.action==='publish'?0:1);}
+  throw Error(r.path);});
+ await h.wait(/Share a session/u);
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Unresolved change - outcome unknown/u);
+ assert.match(h.last(),/> share +operation/u);
+ assert.match(h.last(),/may or may not be shared live now, and Cuna offers no way to ask/u);
+ assert.match(h.last(),/asks the session about the same request instead of starting a second one/u);
+ assert.match(h.last(),/it is the only thing that can settle this/u);
+ assert.match(h.last(),/press e: stopping never depends on this answer/u);
+ assert.match(h.last(),/e stops live sharing now/u);
+ const kept=await h.records();
+ assert.equal(kept.length,1);assert.equal(kept[0].kind,'audience');assert.equal(kept[0].action,'publish');
+ assert.equal(kept[0].operationId,bodies[0].operation_id);
+ assert.deepEqual(Object.keys(kept[0]).sort(),['action','agentSessionId','kind','operationId','scope','version'],'no member, no stream, no secret is persisted');
+ // Stopping is allowed while that stays unresolved: it only removes access.
+ await h.press('e',/Stop sharing this session live\?/u);
+ await h.press('y',/Live sharing stopped - Cuna confirmed it/u);
+ assert.equal(bodies.length,2);assert.equal(bodies[1].action,'private');
+ assert.notEqual(bodies[1].operation_id,bodies[0].operation_id,'stopping is its own operation, not a replay of the other one');
+ const still=await h.records();
+ assert.equal(still.length,1,'the unconfirmed publication is still unresolved');
+ assert.equal(still[0].operationId,bodies[0].operation_id);
+ assert.match(h.last(),/1 earlier change has an unknown outcome/u);
+ // Starting a NEW publication is still refused while it is unresolved.
+ await h.press('p',/Unresolved change - outcome unknown/u);
+ await h.press('b',/Share a session/u);
+ await h.press('s',/Cannot start live sharing while an earlier change has an unknown outcome/u);
+ assert.equal(bodies.length,2,'nothing left the client');
+ // Replaying settles it, under the same identity and the same action.
+ await h.press('r',/Live sharing started - Cuna confirmed it/u);
+ assert.equal(bodies.length,3);
+ assert.equal(bodies[2].operation_id,bodies[0].operation_id,'the replay reuses the exact identity');
+ assert.equal(bodies[2].action,'publish','and the exact action: the producer refuses one identity used for two actions');
+ assert.deepEqual(await h.records(),[]);
+ h.key('\x03');await h.done;
+});
+
+test('an unconfirmed publication survives an exit, and forgetting it names what it cannot undo',async()=>{
+ const first=await harness(r=>{if(route(r)==='audience')throw new TypeError('fetch failed');throw Error(r.path);});
+ await first.wait(/Share a session/u);
+ await first.press('s',/Share this session's screen live\?/u);
+ await first.press('y',/Unresolved change - outcome unknown/u);
+ const stuck=(await first.records())[0].operationId;
+ first.key('\x03');await first.done;
+ // A new process on the same state directory opens on that exact operation.
+ const second=await harness(r=>{if(route(r)==='observers')return memberPage;if(route(r)==='audience')return audienceReceipt(r.body.action,0);throw Error(r.path);},{},first.context);
+ await second.wait(/Unresolved change - outcome unknown/u);
+ assert.match(second.last(),new RegExp(`operation ${stuck}`,'u'));
+ assert.doesNotMatch(second.last(),/Share a session - read-only/u,'recovery precedes the normal entry screen');
+ await second.press('d',/Forget this local record\?/u);
+ assert.match(second.last(),/Start of live sharing operation/u);
+ assert.match(second.last(),/Cuna is not contacted and nothing is revoked/u);
+ assert.match(second.last(),/The outcome stays unknown/u);
+ assert.match(second.last(),/anyone holding a grant on it may be watching/u);
+ assert.match(second.last(),/Stopping the sharing does not need it and is the only way to be sure/u);
+ await second.press('y',/Local record forgotten - nothing was revoked/u);
+ assert.match(second.last(),/Stopping live sharing is still available and does not depend on it/u);
+ assert.deepEqual(await second.records(),[]);
+ second.key('\x03');await second.done;
+});
+
+test('a settled publication refusal renders its reason and its operation identity',async()=>{
+ const h=await harness(r=>{if(route(r)==='observers')return memberPage;if(route(r)==='audience')throw audienceProblem('audience_runtime_unavailable');throw Error(r.path);});
+ await h.wait(/Share a session/u);
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Not done - unavailable/u);
+ assert.match(h.last(),/not connected to Cuna right now/u);
+ assert.match(h.last(),/This attempt applied nothing/u);
+ assert.match(h.last(),/\(start of live sharing\) is settled/u);
+ assert.doesNotMatch(h.last(),/r rereads the members/u,'a sharing refusal is not a membership problem');
+ assert.deepEqual(await h.records(),[],'a refusal the server issued without asking the session drops the record');
+ h.key('\x03');await h.done;
 });
 
 test('share preflight rejects non-TTY, JSON, invalid Project and invalid grant before credentials; help is discoverable',async()=>{

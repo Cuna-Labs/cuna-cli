@@ -126,11 +126,92 @@ results.push(await drive('replay-settled',[
  {key:'r',requests:1,expect:'the settled refusal is rendered',test:s=>s.includes('Not done - grant unavailable')&&s.includes('Cuna refused this grant and created nothing'),
   assert:s=>{assert.ok(!s.includes('Share a session - read-only observation'),'a settled failure must not vanish into the session list');assert.ok(/Operation [0-9a-f-]{36}/u.test(s),'the settled operation identity must survive in the displayed outcome');}},
 ],'settled'));
+// Publication: the authority that makes a grant mean anything. It is a separate
+// decision here, asked for and confirmed on its own, and its receipt is what
+// names the point a watcher starts from.
+results.push(await drive('share',[
+ {expect:'sessions list offers both decisions',test:s=>s.includes('> conpty-owner-box / claude-live')&&s.includes('s starts sharing this session live; e stops it'),
+  assert:s=>assert.ok(s.includes('two separate decisions'),'granting and sharing must be presented as separate')},
+ {key:'s',expect:'the disclosure before anything is sent',test:s=>s.includes("Share this session's screen live?")&&s.includes('a token, a login code, a file it opens'),
+  assert:s=>{assert.ok(s.includes('Nothing from before is replayed to them'),'history scope must be stated');assert.ok(s.includes('cannot recall what was already sent'),'the irrevocable half must be stated');assert.ok(s.includes('creates no grant'));}},
+ {key:'y',requests:1,expect:'publication confirmed with its starting point',test:s=>s.includes('Live sharing started - Cuna confirmed it')&&s.includes('Share #1 of this run of the session'),
+  assert:s=>{assert.ok(s.includes('the first thing anyone sees is the screen as it is now'));assert.ok(s.includes('grants no keyboard, resize or signal'));}},
+ {key:'e',expect:'stopping is confirmed separately',test:s=>s.includes('Stop sharing this session live?')&&s.includes('revokes nothing and expires nothing')},
+ {key:'y',requests:1,expect:'private confirmed by the fencing receipt',test:s=>s.includes('Live sharing stopped - Cuna confirmed it')&&s.includes('its output is fenced'),
+  assert:s=>assert.ok(s.includes('What was already sent cannot be recalled'),'stopping must not claim to recall what was sent')},
+]));
+// A receipt about a different session may not be reported as this session being
+// shared. Refusing it happens AFTER the request left, so the honest outcome is
+// "unknown", not "nothing happened": the refusal is about an answer that was not
+// trusted, which says nothing about what the session did. One input, then observe.
+results.push(await drive('share-wrong-session',[
+ {expect:'sessions list',test:includes('> conpty-owner-box / claude-live')},
+ {key:'s',expect:'the disclosure',test:includes("Share this session's screen live?")},
+ {key:'y',requests:1,expect:'the cross-session receipt is refused and its outcome held unknown',
+  test:s=>s.includes('Unresolved change - outcome unknown')&&s.includes('Cuna answered about a different session. The receipt was refused'),
+  assert:s=>{assert.ok(!s.includes('Live sharing started'),'a receipt about another session must never read as this one being shared');
+   assert.ok(!s.includes('nothing about sharing changed'),'a receipt we refused is not evidence that nothing happened');}},
+]));
+// The answer to a publication is lost AFTER the session transitioned. Only the
+// durable operation identity can reach the producer's stored answer, and a
+// second CLI process must reach it without publishing a second time.
+results.push(await drive('lost-share',[
+ {expect:'sessions list',test:includes('> conpty-owner-box / claude-live')},
+ {key:'s',expect:'the disclosure',test:includes("Share this session's screen live?")},
+ {key:'y',requests:1,expect:'unresolved publication',test:s=>s.includes('Unresolved change - outcome unknown')&&s.includes('may or may not be shared live now'),
+  assert:s=>{assert.ok(!s.includes('Live sharing started'),'an unconfirmed publication must not render as confirmed');assert.ok(s.includes('e stops live sharing now'),'the safe direction must be reachable from here');}},
+],'audience-recovery'));
+results.push(await drive('recover-share',[
+ {expect:'recovery screen before anything else',test:s=>s.includes('Unresolved change - outcome unknown')&&s.includes('operation '),
+  assert:s=>assert.ok(!s.includes('Share a session - read-only observation'),'recovery precedes the normal entry screen')},
+ {key:'r',requests:1,expect:'the producer answers the same identity from its journal',test:includes('Live sharing started - Cuna confirmed it'),
+  assert:s=>assert.ok(s.includes('Share #1 of this run of the session'),'the replay must settle on the SAME share, not a second one')},
+],'audience-recovery'));
+// The ordering root named as decisive, end to end through the screen: an
+// unconfirmed publish, then a SEPARATELY confirmed stop, then a replay of the
+// publish. The producer re-validates live state before serving its journal, so
+// the replay is refused; the screen must hold the original outcome unknown and
+// must never render the stored publication as current.
+results.push(await drive('lost-share',[
+ {expect:'sessions list',test:includes('> conpty-owner-box / claude-live')},
+ {key:'s',expect:'the disclosure',test:includes("Share this session's screen live?")},
+ {key:'y',requests:1,expect:'unresolved publication',test:includes('Unresolved change - outcome unknown')},
+ {key:'e',expect:'stopping is offered from the unresolved screen',test:includes('Stop sharing this session live?')},
+ {key:'y',requests:1,expect:'private confirmed while the publish stays unresolved',
+  test:s=>s.includes('Live sharing stopped - Cuna confirmed it')&&s.includes('1 earlier change has an unknown outcome')},
+ {key:'p',expect:'back to the unresolved publication',test:includes('Unresolved change - outcome unknown')},
+ {key:'r',requests:1,expect:'the replay is refused and the outcome stays unknown',
+  test:s=>s.includes('The session refused this attempt and Cuna recorded that refusal')&&s.includes('what the earlier one did is still unknown'),
+  assert:s=>{assert.ok(!s.includes('Live sharing started'),'a stored publication must never be rendered after a confirmed stop');
+   assert.ok(!s.includes('r resends this exact operation'),'a request Cuna has already answered may not be offered for resend');
+   assert.ok(!s.includes('it is the only thing that can settle this'),'the screen must stop promising a resend it has just withdrawn');
+   assert.ok(s.includes('Cuna will not raise this request with the session again'),'and must say why');}},
+],'audience-ordering'));
+// The acceptance review's F5: reconciliation by replay is bounded to the stored
+// request's ~20 s deadline, and the fixture now models it. Outside the window the
+// replay never reaches the producer's journal, so the screen must say the request
+// can no longer settle anything, must KEEP the record, and must stop offering a
+// resend that cannot work.
+results.push(await drive('lost-share-expired',[
+ {expect:'sessions list',test:includes('> conpty-owner-box / claude-live')},
+ {key:'s',expect:'the disclosure',test:includes("Share this session's screen live?")},
+ {key:'y',requests:1,expect:'unresolved publication',test:includes('Unresolved change - outcome unknown')},
+],'audience-expired'));
+results.push(await drive('lost-share-expired',[
+ {expect:'recovery screen',test:s=>s.includes('Unresolved change - outcome unknown')&&s.includes('r resends this exact operation')},
+ {key:'r',requests:1,expect:'the expired replay settles nothing and keeps the record',
+  test:s=>s.includes('this exact request can no longer be sent')&&s.includes('What the first attempt did is still unknown'),
+  assert:s=>{assert.ok(!s.includes('Live sharing started'),'an expired replay must never render as a confirmed publication');
+   assert.ok(s.includes('Cuna will not raise this request with the session again'),'the screen must say the door is closed');
+   assert.ok(!s.includes('r resends this exact operation'),'and must stop offering the resend');
+   assert.ok(s.includes('e stops live sharing now'),'while keeping the safe direction');}},
+],'audience-expired'));
 // Evidence is written before any cross-case assertion, so a failing assertion
 // leaves the screens and transcripts that explain it rather than nothing.
 for(const r of results){await writeFile(path.join(evidenceDir,`conpty-${r.mode}.transcript.ansi`),r.transcript??'');await writeFile(path.join(evidenceDir,`conpty-${r.mode}.screens.txt`),r.observations.map(o=>`=== ${o.step} @ ${o.at}${o.TIMEOUT?' (TIMEOUT)':''}\n${o.screen??''}\n`).join('\n'));}
 console.log(JSON.stringify({cases:results.map(r=>({mode:r.mode,result:r.result,exitCode:r.exitCode,error:r.error}))},null,2));
 const creates=r=>r.ledger.filter(row=>row.event==='request'&&row.path.endsWith('/observe-grants'));
+const audience=r=>r.ledger.filter(row=>row.event==='request'&&row.path.endsWith('/audience'));
 for(const r of results){
  if(r.result!=='PASS')continue;
  if(r.result!=='PASS')continue;
@@ -138,9 +219,43 @@ for(const r of results){
  if(r.mode==='lost-revoke'){assert.equal(revokes.length,2,'exactly one replay');assert.equal(revokes[0].body.operation_id,revokes[1].body.operation_id,'replay keeps the operation ID');assert.equal(revokes[0].body.expected_revision,revokes[1].body.expected_revision);}
  if(r.mode==='happy'){assert.equal(revokes.length,1);assert.equal(r.ledger.filter(row=>row.event==='request'&&row.path.endsWith('/inspect')).length,2,'two explicit inspects, no polling');}
  // `recover` and `replay-settled` share a ledger with the run that lost the
- // create, so their rows carry both attempts by construction.
- if(!['recover','replay-settled'].includes(r.mode))assert.equal(creates(r).length,1,'exactly one create request per run');
+ // create, so their rows carry both attempts by construction; the sharing cases
+ // never reach the grant route at all, which is asserted below instead.
+ if(!['recover','replay-settled','share','share-wrong-session','lost-share','recover-share','lost-share-expired'].includes(r.mode))assert.equal(creates(r).length,1,'exactly one create request per run');
  assert.ok(!r.transcript.includes('cuna_at_'),'the bearer never reaches the screen');
+ // No sharing decision is ever a side effect of a grant decision, and no grant
+ // is ever a side effect of a sharing decision.
+ const sharing=audience(r);
+ if(['happy','lost-revoke','stale','lost-create','lost-create-settled'].includes(r.mode))assert.equal(sharing.length,0,`${r.mode} must send no publication request`);
+ if(['share','share-wrong-session','lost-share','recover-share','lost-share-expired'].includes(r.mode))assert.equal(creates(r).length,0,`${r.mode} must create no grant`);
+ if(r.mode==='share')assert.deepEqual(sharing.map(row=>row.body.action),['publish','private']);
+}
+// The lost publication and its recovery share a ledger, so its rows carry both
+// attempts: the same identity, the same action, one publication.
+const shareRecovery=results.find(r=>r.mode==='recover-share');
+if(shareRecovery?.result==='PASS'){
+ const attempts=audience(shareRecovery);
+ assert.equal(attempts.length,2,'one lost publication and exactly one replay');
+ assert.equal(attempts[0].body.operation_id,attempts[1].body.operation_id,'the relaunched process replayed the exact recovered operation ID');
+ assert.deepEqual(attempts[0].body,attempts[1].body,'the recovered request is identical in every field, including the action');
+ assert.equal(shareRecovery.ledger.filter(row=>row.event==='audience-replay-answered-from-journal').length,1,'the producer answered the replay from its journal instead of transitioning again');
+ assert.equal(shareRecovery.ledger.filter(row=>row.event==='exit').at(-1).audience,1,'the session was published exactly once across both processes');
+ const lost=results.find(r=>r.mode==='lost-share');
+ assert.equal(lost.durableRecordsAfterExit.length,1,'the unresolved publication survived an ordinary exit');
+ assert.equal(lost.durableRecordsAfterExit[0].kind,'audience');
+ assert.equal(lost.durableRecordsAfterExit[0].action,'publish');
+ assert.deepEqual(Object.keys(lost.durableRecordsAfterExit[0]).sort(),['action','agentSessionId','kind','operationId','scope','version'],'no member, stream or secret is persisted');
+ assert.equal(shareRecovery.durableRecordsAfterExit.length,0,'a settled replay clears the record');
+}
+// Outside the stored window the same replay reaches nothing and settles nothing,
+// so the record must survive rather than be dropped.
+const expiredRuns=results.filter(r=>r.mode==='lost-share-expired'&&r.result==='PASS');
+if(expiredRuns.length===2){
+ const replay=expiredRuns[1];
+ assert.equal(replay.ledger.filter(row=>row.event==='audience-replay-outside-window').length,1,'the producer refused the replay before reaching its journal');
+ assert.equal(replay.ledger.filter(row=>row.event==='audience-replay-answered-from-journal').length,0,'an expired replay must never be served from the journal');
+ assert.equal(replay.durableRecordsAfterExit.length,1,'an unsettled publication keeps its identity across the expired replay');
+ assert.equal(replay.durableRecordsAfterExit[0].kind,'audience');
 }
 // The relaunch shares its ledger with the first run, so its rows include both.
 const recovery=results.find(r=>r.mode==='recover');

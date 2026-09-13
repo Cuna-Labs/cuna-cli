@@ -292,6 +292,165 @@ export const ownerObserveGrantSchemas={
         }
       }
     ]
+  },
+  "PrepareSessionAudienceV2Request": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "version",
+      "operation_id",
+      "action"
+    ],
+    "properties": {
+      "version": {
+        "const": "2"
+      },
+      "operation_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "action": {
+        "enum": [
+          "publish",
+          "private"
+        ]
+      }
+    }
+  },
+  "PrepareSessionAudienceV2Receipt": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "state",
+      "response"
+    ],
+    "properties": {
+      "state": {
+        "const": "observed"
+      },
+      "response": {
+        "$ref": "#/components/schemas/ObservedSessionAudienceResponseV2"
+      }
+    }
+  },
+  "ObservedSessionAudienceResponseV2": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "type",
+      "version",
+      "request_id",
+      "action",
+      "agent_session_id",
+      "session_incarnation",
+      "process_epoch",
+      "runtime_lease_id",
+      "logical_terminal_id",
+      "process_start_identity",
+      "expected_generation",
+      "result"
+    ],
+    "properties": {
+      "type": {
+        "const": "session_audience_response_v2"
+      },
+      "version": {
+        "const": "2"
+      },
+      "request_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "action": {
+        "enum": [
+          "publish",
+          "private"
+        ]
+      },
+      "agent_session_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "session_incarnation": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "process_epoch": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "runtime_lease_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "logical_terminal_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "process_start_identity": {
+        "type": "string",
+        "pattern": "^[1-9][0-9]{0,31}$"
+      },
+      "expected_generation": {
+        "type": "string",
+        "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$"
+      },
+      "result": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "state",
+              "stream_id",
+              "generation",
+              "first_sequence"
+            ],
+            "properties": {
+              "status": {
+                "const": "observed"
+              },
+              "state": {
+                "const": "public"
+              },
+              "stream_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "generation": {
+                "type": "string",
+                "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$"
+              },
+              "first_sequence": {
+                "const": "1"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "state",
+              "generation"
+            ],
+            "properties": {
+              "status": {
+                "const": "observed"
+              },
+              "state": {
+                "const": "private"
+              },
+              "generation": {
+                "type": "string",
+                "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$"
+              }
+            }
+          }
+        ]
+      }
+    }
   }
 } as const;
 export const ownerObserveGrantOperations={
@@ -309,6 +468,10 @@ export const ownerObserveGrantOperations={
   },
   "revokeSessionObserveGrantV2": {
     "path": "/v1/collaboration/2/observe-grants/{id}/revoke",
+    "method": "POST"
+  },
+  "prepareSessionAudienceV2": {
+    "path": "/v1/collaboration/2/agent-sessions/{id}/audience",
     "method": "POST"
   }
 } as const;

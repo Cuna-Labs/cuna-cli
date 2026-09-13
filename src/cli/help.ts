@@ -156,7 +156,7 @@ Available now:
   records list                         List redacted account activity records
   account show                         Show the public account identity
   observe --project PROJECT_ID         Observe an authorized shared session read-only
-  share --project PROJECT_ID           Grant, inspect or revoke a member's read-only view of your session
+  share --project PROJECT_ID           Grant or revoke a member's read-only view, and start or stop live sharing
   workspace show                       Show assignment or waitlist state
   usage show                           Show authoritative workspace estimates
   authorizations list --machine ID     List active credential injection rules
