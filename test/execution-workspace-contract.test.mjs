@@ -42,7 +42,12 @@ test('readiness timeout retains the admitted session identity and read-only reco
   let reads=0;
   const effects=createApiAgentJourneyEffects({client:{async getAgentSession(sessionId){
     assert.equal(sessionId,id(1));reads++;assert.ok(reads<=100,'readiness must stop waiting');
-    return {requestState:'runtime_claimed',processState:'unknown'};
+    // Every decoded AgentSession names itself: `id` and `machineId` are
+    // mandatory on the authoritative read, and readiness refuses an
+    // observation of some other session rather than waiting on it. This
+    // fixture therefore has to be the session it asks about; the case where
+    // it is not is the separate negative control below.
+    return {id:id(1),machineId:id(5),requestState:'runtime_claimed',processState:'unknown'};
   }},requestedAgent:'opencode',async sleep(){}});
   await assert.rejects(effects.ensureAgentSessionReady({agentSessionId:id(1),signal:new AbortController().signal}),error=>{
     assert.equal(error.code,'cuna.journey.agent_session_ready_timeout');
@@ -56,6 +61,17 @@ test('readiness timeout retains the admitted session identity and read-only reco
     return true;
   });
   assert.ok(reads>0);
+});
+test('a readiness observation that names a different AgentSession is refused, never awaited',async()=>{
+  let reads=0;
+  const effects=createApiAgentJourneyEffects({client:{async getAgentSession(){
+    reads++;return {id:id(7),machineId:id(5),requestState:'runtime_claimed',processState:'unknown'};
+  }},requestedAgent:'opencode',async sleep(){throw new Error('must not wait on a foreign session');}});
+  await assert.rejects(effects.ensureAgentSessionReady({agentSessionId:id(1),signal:new AbortController().signal}),error=>{
+    assert.equal(error.code,'cuna.journey.session_identity_mismatch');
+    return true;
+  });
+  assert.equal(reads,1);
 });
 test('materialization failure code is accepted only on a failed request and without unsafe text',()=>{
   const session={id:id(1),machine_id:id(5),name:'session',agent:'codex',cwd:'/workspace',auth_mode:'interactive_login',desired_state:'running',request_state:'failed',process_state:'starting',row_version:1,created_at:'2026-09-04T00:00:00Z',updated_at:'2026-09-04T00:00:00Z',workspace_failure_code:'workspace.remote_edits'};

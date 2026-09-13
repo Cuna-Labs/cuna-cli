@@ -25,6 +25,7 @@ const OPENCODE_AUTH_MISSING_SESSION_ID = "54000000-0000-4000-8000-000000000005";
 const OPENCODE_AUTH_INVALID_SESSION_ID = "55000000-0000-4000-8000-000000000005";
 const OPENCODE_AUTH_CONFIGURED_SESSION_ID = "56000000-0000-4000-8000-000000000005";
 const WORKSPACE_BINDING_ID = "60000000-0000-4000-8000-000000000006";
+const PROJECT_ID = "80000000-0000-4000-8000-000000000008";
 const PROCESS_EPOCH = "70000000-0000-4000-8000-000000000007";
 const LOGIN_CODE = `cuna_login_${"l".repeat(43)}`;
 const LOGIN_CODE_2 = `cuna_login_${"m".repeat(43)}`;
@@ -584,7 +585,13 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
       installedHelpTopics = (await import(pathToFileURL(path.join(installedRoot, "dist", "cli", "command-help.js")).href)).HELP_TOPICS;
       assert.deepEqual([...installedHelpTopics].sort(), [...INSTALLED_HELP_TOPICS].sort(), "a new installed command lacks matrix classification");
       const leafTopics = installedHelpTopics.filter((topic) => !installedHelpTopics.some((candidate) => candidate.startsWith(`${topic} `)));
-      assert.deepEqual([...leafTopics].sort(), [...SUPPORTED_SUCCESS_TOPICS, ...CONDITIONALLY_AVAILABLE_TOPICS, ...DELIBERATE_UNSUPPORTED_TOPICS].sort(), "a leaf command lacks success, conditional, or deliberate-unsupported evidence");
+      assert.deepEqual([...leafTopics].sort(), [...SUPPORTED_SUCCESS_TOPICS, ...CONDITIONALLY_AVAILABLE_TOPICS, ...INTERACTIVE_HUMAN_LOGIN_TOPICS, ...DELIBERATE_UNSUPPORTED_TOPICS].sort(), "a leaf command lacks success, conditional, interactive-refusal, or deliberate-unsupported evidence");
+      for (const topic of INTERACTIVE_HUMAN_LOGIN_TOPICS) {
+        assert.ok(
+          INSTALLED_FAILURE_MATRIX.some((entry) => entry.id === `${topic}/non-interactive`),
+          `${topic} is classified interactive-only but the installed matrix never exercises its refusal`,
+        );
+      }
     });
 
     await runPhase(receipt, "installed-readonly-command-matrix", installedE2ePhaseTimeout("installed-readonly-command-matrix"), async () => {
@@ -603,6 +610,27 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
       assert.equal(help.code, 0, `installed help failed for ${topic}`);
       assert.equal(JSON.parse(help.stdout).type, "result", topic);
     });
+    // Run before the `--json` matrix below, so this evidence is observed on its
+    // own rather than pre-empted by the entry that also names an output mode.
+    //
+    // The matrix entries pass `--json`, so their refusal is attributable to the
+    // requested output mode as much as to the absent terminal. Repeat each
+    // interactive command with valid arguments and no output flag at all: the
+    // only thing left that can refuse it is the redirected terminal, and the
+    // refusal must still happen before the CLI asks the producer anything.
+    //
+    // What this does NOT isolate: `createOutputWriter` selects structured
+    // output whenever stdout is not a TTY, so a redirected invocation always
+    // satisfies both halves of the guard. No piped-stdio harness can separate
+    // them; only a real terminal can.
+    for (const topic of INTERACTIVE_HUMAN_LOGIN_TOPICS) {
+      const before = authority.state.servedRequests;
+      const refused = await invokeInstalled(installedEntrypoint, [topic, "--project", PROJECT_ID], env, sandbox);
+      assert.equal(refused.code, 2, `installed ${topic} must refuse a redirected terminal`);
+      assert.equal(JSON.parse(refused.stderr).error.code, "cuna.usage.invalid", topic);
+      assert.match(JSON.parse(refused.stderr).error.message, /interactive terminal/u, topic);
+      assert.equal(authority.state.servedRequests, before, `installed ${topic} reached the producer before refusing`);
+    }
     await runBoundedConcurrent(INSTALLED_FAILURE_MATRIX, READ_ONLY_MATRIX_CONCURRENCY, async (entry) => {
       const result = await invokeInstalled(installedEntrypoint, entry.argv, env, sandbox);
       assert.equal(result.code, entry.exit, `installed failure mode drifted for ${entry.id}`);
@@ -946,7 +974,7 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
 
 const INSTALLED_HELP_TOPICS = Object.freeze([
   "executions", "executions list", "executions get", "executions cancel",
-  "signup", "login", "logout", "whoami", "access", "capabilities",
+  "signup", "login", "logout", "whoami", "access", "capabilities", "observe", "share",
   "machines", "machines list", "machines create", "machines start", "machines pause",
   "machines resume", "machines stop", "machines update-supervisor", "machines delete", "records", "authorizations",
   "account", "workspace", "usage", "api-keys", "api-keys create", "api-keys list",
@@ -970,6 +998,21 @@ const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
 // against the generic installed matrix: that would manufacture the OpenCode
 // supervisor-upgrade condition or change an existing Machine.
 const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze(["machines update-supervisor"]);
+// Implemented, help-visible, and refused outright by this installed harness:
+// both screens require a real interactive terminal under a human login, and
+// `share` additionally mutates durable observation grants and live sharing of a
+// session. This harness drives the installed binary over pipes, so it cannot
+// present that terminal -- a scope limit of this harness, not a property of the
+// commands. A terminal-driving harness against this same isolated identity and
+// local contract authority could witness them succeeding; none exists yet.
+//
+// So the installed evidence recorded here is the refusal only: the typed
+// refusal named in INSTALLED_FAILURE_MATRIX, which the surface phase requires
+// for every topic listed here so a later interactive command cannot join with
+// none, plus the redirected valid-argument invocation in the read-only phase.
+// A refusal is not a success. Interactive success acceptance for `observe` and
+// `share` stays OPEN and is not claimed by this test.
+const INTERACTIVE_HUMAN_LOGIN_TOPICS = Object.freeze(["observe", "share"]);
 const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "sync", "companion"]);
 
 const INSTALLED_FAILURE_MATRIX = Object.freeze([
@@ -979,6 +1022,14 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "whoami/usage", argv: ["whoami", "extra", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "access/usage", argv: ["access", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "capabilities/usage", argv: ["capabilities", "--scope", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
+  // The read-only view and the owner's grant screen are both refused before any
+  // credential or network authority is consulted: this harness has no terminal.
+  // `share` in particular must not reach the point where it could grant, revoke
+  // or publish anything. These two entries request JSON explicitly, so they
+  // prove the combined refusal; the no-flag invocation in the read-only phase
+  // covers the redirected-terminal case on valid arguments.
+  { id: "observe/non-interactive", argv: ["observe", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
+  { id: "share/non-interactive", argv: ["share", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "machines/usage", argv: ["machines", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "records/usage", argv: ["records", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "authorizations/usage", argv: ["authorizations", "list", "--json"], exit: 2, code: "cuna.usage.invalid" },
@@ -1009,7 +1060,7 @@ function createContractAuthority() {
     exit_code: 0, duration_ms: 8, reason: null, created_at: "2026-09-05T00:00:00Z", observed_at: "2026-09-05T00:00:01Z" });
   const continuations = new Map();
   const accessContexts = new Map();
-  const state = { continuationCounter: 0, continuationPollRequests: 0, legacyContinuationRequests: 0, retiredCodeRenewalRequests: 0, tokenCounter: 0, createdApiKeys: 0, revokedApiKeys: 0, logoutReceipts: 0, idempotencyKeys: [], loginRevoked: false, machineDeleted: false, machineStatus: "running", agentTerminated: false, agentName: "matrix-agent", apiKeyRevoked: false, openCodeSessionRequests: 0, openCodeAgentAuth404Requests: 0, openCodeAgentAuthInvalidEvidenceRequests: 0, openCodeAgentAuthConfiguredRequests: 0 };
+  const state = { servedRequests: 0, continuationCounter: 0, continuationPollRequests: 0, legacyContinuationRequests: 0, retiredCodeRenewalRequests: 0, tokenCounter: 0, createdApiKeys: 0, revokedApiKeys: 0, logoutReceipts: 0, idempotencyKeys: [], loginRevoked: false, machineDeleted: false, machineStatus: "running", agentTerminated: false, agentName: "matrix-agent", apiKeyRevoked: false, openCodeSessionRequests: 0, openCodeAgentAuth404Requests: 0, openCodeAgentAuthInvalidEvidenceRequests: 0, openCodeAgentAuthConfiguredRequests: 0 };
   const machine = (status = state.machineStatus) => ({ id: ID, name: "matrix-machine", status, agent: "codex", memory_mib: 512, vcpus: 1, url: "https://machine.invalid" });
   const agentSession = (terminated = state.agentTerminated) => ({ id: AGENT_SESSION_ID, machine_id: ID, workspace_binding_id: WORKSPACE_BINDING_ID, workspace_generation: 1, name: state.agentName, agent: "codex", cwd: "/workspace", auth_mode: "interactive_login", desired_state: terminated ? "terminated" : "running", request_state: terminated ? "terminal" : "launched", process_state: terminated ? "terminated" : "running", process_epoch: PROCESS_EPOCH, runtime_observed_at: "2026-08-14T00:00:01.000Z", runtime_expires_at: "2030-08-14T00:00:01.000Z", row_version: terminated ? 1 : 0, created_at: "2026-08-14T00:00:00.000Z", updated_at: "2026-08-14T00:00:00.000Z" });
   const foregroundAgentSession = (id) => {
@@ -1098,6 +1149,7 @@ function createContractAuthority() {
     },
     async handle(request, response) {
       try {
+        state.servedRequests += 1;
         const url = new URL(request.url ?? "/", "http://127.0.0.1");
         const body = await readJsonBody(request);
         const send = (status, value) => {

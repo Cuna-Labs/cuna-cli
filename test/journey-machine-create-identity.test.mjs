@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { EXIT_CODES, CunaError } from "../dist/index.js";
@@ -12,6 +15,9 @@ const MACHINE = "55555555-5555-4555-8555-555555555555";
 const SECOND_MACHINE = "66666666-6666-4666-8666-666666666666";
 const BINDING = "33333333-3333-4333-8333-333333333333";
 const SESSION = "44444444-4444-4444-8444-444444444444";
+const EXECUTION_WORKSPACE = "99999999-9999-4999-8999-999999999999";
+const PROFILE = "77777777-7777-4777-8777-777777777777";
+const REMOTE_CWD = `/workspace/workspaces/${EXECUTION_WORKSPACE}`;
 const ROOT = "C:\\work\\project";
 const NOW = Date.parse("2026-08-09T12:00:00.000Z");
 
@@ -122,16 +128,20 @@ function lost(code) {
 function producer() {
   const admitted = new Map();
   const machines = new Map();
+  const sessions = new Map();
   const calls = [];
   let readsFail = false;
   return {
     calls,
     machines,
+    sessions,
     set readsFail(value) { readsFail = value; },
     async discoverCapabilities(scope, resourceId) {
-      return scope === "account"
-        ? capabilitySnapshot("account", undefined, "machines.create")
-        : capabilitySnapshot("machine", resourceId, "agent_sessions.create");
+      if (scope === "account") return capabilitySnapshot("account", undefined, "machines.create");
+      // The launch is complete only once the terminal seat is attestable, so
+      // readiness asks the session's own scope for it.
+      if (scope === "agent_session") return capabilitySnapshot("agent_session", resourceId, "terminal_connections.create");
+      return capabilitySnapshot("machine", resourceId, "agent_sessions.create");
     },
     async listMachines() {
       calls.push(["list-machines"]);
@@ -186,21 +196,27 @@ function producer() {
       return machine;
     },
     async listAgentSessions() { return { items: [] }; },
-    async createAgentSession(machineId, input) {
-      calls.push(["create-agent-session", machineId]);
+    // The retired pre-V2 create. A journey that reaches it has stopped using
+    // the published-Workspace profile path this product now launches through.
+    async createAgentSession() { throw new Error("retired agent-session create must not be dispatched"); },
+    async createProviderSessionV2(machineId, request) {
+      calls.push(["create-provider-session", { machineId, operationId: request.operation_id,
+        executionWorkspaceId: request.execution_workspace_id, generation: request.workspace_generation,
+        profileId: request.profile_id, profileRevision: request.profile_revision }]);
+      sessions.set(SESSION, { machineId });
       return {
-        id: SESSION,
-        machineId,
-        name: "claude-code",
-        agent: input.agent,
-        cwd: input.cwd,
-        authMode: input.authMode,
-        desiredState: "running",
-        requestState: "launch_pending",
-        processState: "ready",
-        rowVersion: 0,
-        workspaceBindingId: input.workspaceBindingId,
-        workspaceGeneration: input.workspaceGeneration,
+        agentSession: {
+          id: SESSION,
+          machineId,
+          name: "claude-code",
+          agent: request.agent,
+          cwd: request.cwd,
+          authMode: "interactive_login",
+          desiredState: "running",
+          requestState: "launch_pending",
+          processState: "ready",
+          rowVersion: 0,
+        },
       };
     },
     async getAgentSession(id) {
@@ -209,7 +225,27 @@ function producer() {
   };
 }
 
-function journey(client, attached) {
+/**
+ * The workspace receipt a launch actually runs on.
+ *
+ * A canonical V2 launch is admitted against a *published execution Workspace*
+ * and a selected provider profile; a receipt without an
+ * `executionWorkspaceId` is refused before dispatch, by design. The fixture
+ * carries the full receipt so the create this test is about is the create the
+ * product performs. `workspaceless` keeps the refusal itself under test.
+ */
+function workspaceReceipt(overrides = {}) {
+  return {
+    bindingId: BINDING,
+    workspaceIdentity: BINDING,
+    executionWorkspaceId: EXECUTION_WORKSPACE,
+    generation: 4,
+    remoteCwd: REMOTE_CWD,
+    ...overrides,
+  };
+}
+
+function journey(client, attached, stateDirectory, workspace = workspaceReceipt()) {
   return orchestrateAgentJourney({
     intent: {
       schemaVersion: "1.0",
@@ -225,15 +261,15 @@ function journey(client, attached) {
     effects: createApiAgentJourneyEffects({
       client,
       requestedAgent: "claude-code",
-      async inspectWorkspace() { return { canonicalLocalRoot: ROOT }; },
-      async synchronizeWorkspace() {
-        return {
-          bindingId: BINDING,
-          workspaceIdentity: BINDING,
-          generation: 4,
-          remoteCwd: "/workspace/projects/project",
-        };
+      // The durable launch identity lives on disk precisely so a re-run
+      // presents the operation identity the interrupted run may have sent.
+      providerLaunchState: { stateDirectory, ownerId: USER, workspaceId: WORKSPACE },
+      async selectProviderPreset() {
+        return { kind: "native_interactive", agent: "claude-code", label: "Selected preset",
+          profile_id: PROFILE, profile_revision: 2 };
       },
+      async inspectWorkspace() { return { canonicalLocalRoot: ROOT }; },
+      async synchronizeWorkspace() { return workspace; },
       async attach({ agentSessionId }) { attached.push(agentSessionId); },
       async authorizeMachineCreate() { return true; },
       now: () => NOW,
@@ -254,23 +290,26 @@ function journey(client, attached) {
  * came into existence, not anything the journey returned. A journey that
  * created a duplicate would also return a perfectly good machine.
  */
-test("an interrupted journey re-run reconciles its own create instead of creating a second machine", async () => {
+test("an interrupted journey re-run reconciles its own create instead of creating a second machine", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cuna-create-identity-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
   const client = producer();
   const attached = [];
 
   client.readsFail = true;
   await assert.rejects(
-    journey(client, attached),
+    journey(client, attached, stateDirectory),
     (error) => error instanceof CunaError && error.code === "cuna.network.failed",
   );
   const firstCreate = client.calls.find((call) => call[0] === "create-machine");
   assert.notEqual(firstCreate, undefined);
   assert.equal(client.machines.size, 1, "run one must have left exactly one machine behind");
   assert.deepEqual(attached, [], "run one must not have reached attach");
+  assert.equal(client.sessions.size, 0, "run one died before any child was requested");
 
   client.calls.length = 0;
   client.readsFail = false;
-  await journey(client, attached);
+  await journey(client, attached, stateDirectory);
 
   assert.equal(
     client.machines.size,
@@ -287,6 +326,54 @@ test("an interrupted journey re-run reconciles its own create instead of creatin
   );
   assert.deepEqual(attached, [SESSION]);
   assert.deepEqual([...client.machines.keys()], [MACHINE]);
+  // One machine and one child. The launch is admitted against the published
+  // execution Workspace and the selected profile the journey actually chose,
+  // under a single durable operation identity.
+  const childCreates = client.calls.filter((call) => call[0] === "create-provider-session");
+  assert.equal(childCreates.length, 1, "the re-run requested more than one child");
+  assert.deepEqual([...client.sessions.keys()], [SESSION]);
+  assert.deepEqual(childCreates[0][1], {
+    machineId: MACHINE,
+    operationId: childCreates[0][1].operationId,
+    executionWorkspaceId: EXECUTION_WORKSPACE,
+    generation: 4,
+    profileId: PROFILE,
+    profileRevision: 2,
+  });
+  assert.match(childCreates[0][1].operationId, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u);
+});
+
+/**
+ * The same re-run, minus the published execution Workspace.
+ *
+ * The recovery path must not become a place where the launch policy relaxes:
+ * a receipt the product would refuse on a first run is refused on a re-run
+ * too, before dispatch, and leaves no second machine and no child behind.
+ */
+test("a recovered journey without a published execution Workspace still refuses before dispatch", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cuna-create-identity-refused-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const client = producer();
+  const attached = [];
+  const workspaceless = workspaceReceipt({ executionWorkspaceId: undefined });
+
+  client.readsFail = true;
+  await assert.rejects(
+    journey(client, attached, stateDirectory, workspaceless),
+    (error) => error instanceof CunaError && error.code === "cuna.network.failed",
+  );
+
+  client.readsFail = false;
+  await assert.rejects(
+    journey(client, attached, stateDirectory, workspaceless),
+    (error) => error instanceof CunaError &&
+      error.code === "cuna.journey.agent_session_create_outcome_unreconcilable" &&
+      error.details.failure_stage === "local_pre_admission" &&
+      error.details.cause_code === "cuna.provider.v2_unavailable",
+  );
+  assert.equal(client.machines.size, 1, "a refused launch must not leave a second machine");
+  assert.equal(client.sessions.size, 0, "a refused launch must not leave a child");
+  assert.deepEqual(attached, []);
 });
 
 /**
