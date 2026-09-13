@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { encodeTerminalFrame, encodeTerminalControl, decodeTerminalFrame, decodeTerminalControl, assertTerminalFrameLegal } from '../dist/terminal/codec.js';
+import { encodeTerminalFrame, decodeTerminalFrame, decodeTerminalControl, assertTerminalFrameLegal } from '../dist/terminal/codec.js';
 
 test('canonical view controls are critical, sequence-zero, closed and geometry-bounded', () => {
   const viewId='11111111-2222-4333-8444-555555555555';

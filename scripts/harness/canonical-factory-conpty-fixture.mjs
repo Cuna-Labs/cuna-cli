@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import {runNodeForegroundSessions} from "../../dist/runtime/node-foreground-session.js";
 import {encodeTerminalControl,encodeTerminalFrame,decodeTerminalFrame,decodeTerminalControl,TERMINAL_PROTOCOL} from "../../dist/terminal/codec.js";
+import {DEPLOYED_WIRE_COMPATIBILITY} from "../../dist/core/deployed-wire-compatibility.js";
 const NOW=Date.now();
 const SESSION_A="11111111-1111-4111-8111-111111111111",SESSION_B="22222222-2222-4222-8222-222222222222";
 function session(id, overrides = {}) {
@@ -123,7 +124,13 @@ function terminalSystem(events, availability = () => "supported", canonical = fa
         terminalSessionId,
         resumeHandle: "66666666-6666-4666-8666-666666666666",
         connectUrl: `wss://api.getcuna.com/v1/terminal-connections/${terminalSessionId}/stream`,
-        connectToken: `runa_tc_${"A".repeat(43)}`,
+        // The grant this fixture mints must be the token the deployed producer
+        // mints: `contracts/infra/cuna-api.openapi.json`
+        // TerminalConnectionGrant.connect_token pins the brand, the `tc` family
+        // and a 43-character opaque secret. Taking the brand from the single
+        // compatibility authority keeps those bytes exact and makes a future
+        // brand change arrive here instead of leaving a stale copy behind.
+        connectToken: `${DEPLOYED_WIRE_COMPATIBILITY.credentialBrand}_tc_${"A".repeat(43)}`,
         protocol: TERMINAL_PROTOCOL,
         capabilities: [
           { name: "acknowledgement", availability: "supported" },
