@@ -81,6 +81,36 @@ function record(scope:OwnerGrantOperationScope,intent:OwnerGrantOperationIntent)
  return Object.freeze({version:1,scope:digest,operationId:intent.operationId,kind:'revoke',grantId:intent.grantId,agentSessionId:intent.agentSessionId,subjectPrincipalId:intent.subjectPrincipalId,expectedRevision:intent.expectedRevision});
 }
 
+/**
+ * The newest audience fact this computer holds about one run of one AgentSession.
+ *
+ * It exists because ordering is otherwise per-process: two `cuna share`
+ * processes on one state directory each kept their knowledge in a closure, so a
+ * reading answered in one could be painted as the present after the other had
+ * already confirmed the opposite. This record is the shared ground both read.
+ *
+ * It is deliberately NOT a clock and NOT a local counter. The order comes from
+ * the producer's own arithmetic: `issue_collab_v2_session_audience_request`
+ * answers a publish at `expected_generation + 1` and a return to private at
+ * `expected_generation`, and refuses to issue while an answer is outstanding.
+ * So generation G can only be created by the publish that answers `public@G`,
+ * and any `private@G` must have been issued when G already existed -- meaning
+ * `public@G` always precedes `private@G`, and nothing can put a second
+ * `public@G` after it. `(generation, state)` is therefore a total order over one
+ * run, computed in `audienceFactRank`, and no local tie-break is invented.
+ *
+ * It is bound to the exact run: a fact about another `sessionIncarnation` or
+ * `processEpoch` says nothing about this one and is never compared to it.
+ * Nothing secret is persisted -- identifiers, a state word and a counter.
+ */
+export interface ConfirmedAudienceFact {
+  readonly version:1;readonly scope:string;readonly agentSessionId:string;
+  readonly sessionIncarnation:string;readonly processEpoch:string;
+  /** `transition` is a decision this account had confirmed here; `reading` is an answer the session gave here. */
+  readonly kind:'transition'|'reading';
+  readonly state:'public'|'private';readonly generation:string;
+}
+export type ConfirmedAudienceFactInput=Omit<ConfirmedAudienceFact,'version'|'scope'>;
 export interface OwnerGrantOperationStore {
   /** Persist one unresolved operation before its request leaves. Refuses to overwrite an existing identity. */
   reserve(intent:OwnerGrantOperationIntent):Promise<PendingOwnerGrantOperation>;
@@ -88,12 +118,59 @@ export interface OwnerGrantOperationStore {
   settle(operationId:string):Promise<void>;
   /** Every operation in this scope whose outcome is still unknown here. */
   list(signal?:AbortSignal):Promise<readonly PendingOwnerGrantOperation[]>;
+  /** The newest audience fact recorded on this computer for this session, or null. Unreadable bytes throw rather than read as absence. */
+  readAudienceFact(agentSessionId:string):Promise<ConfirmedAudienceFact|null>;
+  /** Record one fact. A fact the stored one already supersedes is not written, and the stored winner is returned either way. */
+  recordAudienceFact(input:ConfirmedAudienceFactInput):Promise<ConfirmedAudienceFact>;
+}
+const AUDIENCE_FACT_KEYS='agentSessionId,generation,kind,processEpoch,scope,sessionIncarnation,state,version';
+/**
+ * The producer's own order over one run, as one number.
+ *
+ * `2*generation + (private ? 1 : 0)`: a higher generation always wins, and at an
+ * equal generation `private` is never older than `public`, because the publish
+ * that created G answers `public@G` and every `private@G` is issued after G
+ * exists. Equal ranks agree and need no tie-break.
+ */
+export function audienceFactRank(fact:{state:'public'|'private';generation:string}):bigint{
+ return BigInt(fact.generation)*2n+(fact.state==='private'?1n:0n);
+}
+/** True when `candidate` describes a strictly earlier moment of the same run than `held`. */
+export function audienceFactIsOlder(candidate:{state:'public'|'private';generation:string},held:{state:'public'|'private';generation:string}):boolean{
+ return audienceFactRank(candidate)<audienceFactRank(held);
+}
+/** True when two facts describe the same run and can therefore be ordered against each other. */
+export function audienceFactSameRun(a:{sessionIncarnation:string;processEpoch:string},b:{sessionIncarnation:string;processEpoch:string}):boolean{
+ return a.sessionIncarnation===b.sessionIncarnation&&a.processEpoch===b.processEpoch;
 }
 
+function audienceFact(scope:OwnerGrantOperationScope,input:ConfirmedAudienceFactInput):ConfirmedAudienceFact{
+ const digest=scopeDigest(scope);
+ assertCanonicalUuid(input.agentSessionId,'AgentSession ID');
+ assertCanonicalUuid(input.sessionIncarnation,'Session incarnation');
+ assertCanonicalUuid(input.processEpoch,'Process epoch');
+ if(input.kind!=='transition'&&input.kind!=='reading')throw new Error('Invalid audience fact kind.');
+ if(input.state!=='public'&&input.state!=='private')throw new Error('Invalid audience state.');
+ if(!/^(?:0|[1-9][0-9]{0,19})$/u.test(input.generation)||BigInt(input.generation)>18446744073709551615n)throw new Error('Invalid audience generation.');
+ return Object.freeze({version:1,scope:digest,agentSessionId:input.agentSessionId,sessionIncarnation:input.sessionIncarnation,processEpoch:input.processEpoch,kind:input.kind,state:input.state,generation:input.generation});
+}
 export function ownerGrantOperationStore(platform:PlatformAdapter,scope:OwnerGrantOperationScope):OwnerGrantOperationStore{
  const digest=scopeDigest(scope);
  const directory=join(platform.paths.stateDirectory,'owner-observe-grants-v2',digest);
  const file=(operationId:string)=>join(directory,`${operationId}.json`);
+ // A separate tree, so an audience fact can never be mistaken for an unresolved
+ // operation by `list()` and cannot make that scan fail closed.
+ const factFile=(agentSessionId:string)=>{assertCanonicalUuid(agentSessionId,'AgentSession ID');return join(platform.paths.stateDirectory,'owner-audience-facts-v2',digest,`${agentSessionId}.json`);};
+ const readFact=async(agentSessionId:string):Promise<ConfirmedAudienceFact|null>=>{
+  const path=factFile(agentSessionId);
+  const snapshot=await platform.readSafeConfig(path,MAXIMUM_BYTES);
+  if(!snapshot.exists)return null;
+  let value:unknown;try{value=JSON.parse(snapshot.text??'');}catch{throw new Error(`A local audience state record is unreadable: ${path}`);}
+  if(typeof value!=='object'||value===null||Array.isArray(value))throw new Error(`Invalid local audience state record: ${path}`);
+  const row=value as Record<string,unknown>;
+  if(row.version!==1||row.scope!==digest||row.agentSessionId!==agentSessionId||Object.keys(row).sort().join(',')!==AUDIENCE_FACT_KEYS)throw new Error(`Invalid local audience state record: ${path}`);
+  return audienceFact(scope,row as unknown as ConfirmedAudienceFactInput);
+ };
  const store:OwnerGrantOperationStore={
   async reserve(intent){
    const value=record(scope,intent);const text=JSON.stringify(value)+'\n';
@@ -135,6 +212,40 @@ export function ownerGrantOperationStore(platform:PlatformAdapter,scope:OwnerGra
    }
    signal?.throwIfAborted();
    return Object.freeze(items.sort((a,b)=>a.operationId.localeCompare(b.operationId)));
+  },
+  readAudienceFact:agentSessionId=>readFact(agentSessionId),
+  /**
+   * Record one fact, keeping whichever of the two describes the later moment.
+   *
+   * A fact about a different run replaces the stored one outright: the counter
+   * restarts with the run, so the old one cannot be compared and must not be
+   * allowed to order anything about the new one.
+   *
+   * There is no cross-process lock here, and none can be built from the
+   * primitives this store has. Two processes writing at once can lose one
+   * write, so the read-back below re-merges once against whatever actually
+   * landed; a fact that is still missing after that is reported rather than
+   * assumed. The residual window is stated in the delivery, not papered over.
+   */
+  async recordAudienceFact(input){
+   const next=audienceFact(scope,input),path=factFile(next.agentSessionId);
+   /** True when what is stored already describes this run at or after `next`. */
+   const supersedes=(stored:ConfirmedAudienceFact|null):stored is ConfirmedAudienceFact=>
+    stored!==null&&audienceFactSameRun(stored,next)&&!audienceFactIsOlder(stored,next);
+   const current=await readFact(next.agentSessionId);
+   if(supersedes(current))return current;
+   const text=JSON.stringify(next)+'\n';
+   await platform.writeSafeConfig(path,text,MAXIMUM_BYTES);
+   const saved=await readFact(next.agentSessionId);
+   if(saved===null)throw new Error('The audience state record could not be verified after writing.');
+   if(supersedes(saved))return saved;
+   // An older fact landed between the read and the write. Re-merge once against
+   // what is actually there; either way the store ends holding a fact some
+   // process really observed, never one invented to break a tie.
+   await platform.writeSafeConfig(path,text,MAXIMUM_BYTES);
+   const settled=await readFact(next.agentSessionId);
+   if(settled===null)throw new Error('The audience state record could not be verified after writing.');
+   return settled;
   },
  };
  return Object.freeze(store);

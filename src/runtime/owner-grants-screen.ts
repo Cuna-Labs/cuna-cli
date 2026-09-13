@@ -2,8 +2,8 @@ import {randomUUID} from 'node:crypto';
 import {createNodeForegroundTerminalHost} from '../pty/node-host-terminal.js';
 import type {ForegroundTerminalHost} from '../terminal/foreground.js';
 import {sanitizeHumanTerminalOutput} from '../cli/output.js';
-import {describeGrantState,OwnerGrantError,classifyTransportFailure,audienceRefusalCanResend,type ownerObserveGrantsApi,type OwnerGrant,type ProjectObserver,type SessionAudience,type SessionAudienceAction} from '../api/owner-observe-grants-v2.js';
-import type {OwnerGrantOperationStore,PendingOwnerGrantOperation} from './owner-grant-operations.js';
+import {describeGrantState,OwnerGrantError,classifyTransportFailure,audienceRefusalCanResend,type ownerObserveGrantsApi,type OwnerGrant,type ProjectObserver,type SessionAudience,type SessionAudienceAction,type SessionAudienceHistory,type SessionAudienceState} from '../api/owner-observe-grants-v2.js';
+import {audienceFactIsOlder,audienceFactSameRun,type ConfirmedAudienceFact,type ConfirmedAudienceFactInput,type OwnerGrantOperationStore,type PendingOwnerGrantOperation} from './owner-grant-operations.js';
 
 /** One session the owner may share. `projectId` undefined means the server did not name one. */
 export type ShareableSession={id:string;name:string;agent:string;machineName:string;state:string;projectId?:string};
@@ -18,7 +18,7 @@ export type ShareableSession={id:string;name:string;agent:string;machineName:str
 export type ShareableSessionListing={items:ShareableSession[];omittedMachines:number;machinesWithMoreSessions:number};
 export interface ShareableSessionSource{list(signal:AbortSignal):Promise<ShareableSessionListing>}
 type Api=ReturnType<typeof ownerObserveGrantsApi>;
-type Phase='sessions'|'members'|'duration'|'working'|'grant'|'failure'|'unresolved'|'confirm-forget'|'forgotten'|'confirm-share'|'confirm-stop'|'shared';
+type Phase='sessions'|'members'|'duration'|'working'|'grant'|'failure'|'unresolved'|'confirm-forget'|'forgotten'|'confirm-share'|'confirm-stop'|'shared'|'state';
 type CreateInput={agentSessionId:string;subjectPrincipalId:string;expectedMembershipRevision:number;expiresAtMs:number};
 const DURATIONS=[['1','1 hour',3600000],['2','8 hours',28800000],['3','24 hours',86400000]] as const;
 const CLOSE='Esc / Ctrl+C closes this local view. Observation is read-only: it never grants keyboard control.';
@@ -74,8 +74,9 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
  let stopped=false,busy=false,phase:Phase='sessions',index=0,items:ShareableSession[]=[],listing:ShareableSessionListing|undefined,members:ProjectObserver[]=[],membersAfter:string|null=null,membersNext:string|null=null,session:ShareableSession|undefined,member:ProjectObserver|undefined,grant:OwnerGrant|undefined,failure:OwnerGrantError|undefined,hostWrites=Promise.resolve();
  // Every operation whose outcome is unknown HERE. The record is on disk before
  // the request leaves, so an exit, a crash or a lost answer cannot lose the
- // operation identity a replay needs. While this list is non-empty, no NEW
- // authority change may start: an unresolved operation is never overwritten.
+ // operation identity a replay needs. An unresolved operation blocks every NEW
+ // change of the SAME authority, so it is never overwritten -- and only that
+ // authority, because a grant and a publication are separate things.
  let unresolved:PendingOwnerGrantOperation[]=[],cursor=0,refusal:string|undefined;
  // Operations whose exact request Cuna has already answered, so resending it
  // again cannot settle anything. In memory only: a new process has not seen that
@@ -86,13 +87,23 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
  // tie what the owner is reading to what they asked Cuna to do.
  let settled:{operationId:string;kind:PendingOwnerGrantOperation['kind'];action?:SessionAudienceAction}|undefined;
  // The last sharing decision Cuna confirmed IN THIS PROCESS, and the session a
- // pending sharing decision is about. Neither is a reading of how the session is
- // shared now: the canonical contract has no way to ask that question, only to
- // change the answer. Nothing here is ever rendered as current state.
- let audience:SessionAudience|undefined,audienceTarget:{id:string;label:string;incarnation?:string}|undefined,audienceFrom:'sessions'|'grant'|'shared'='sessions';
+ // pending sharing decision is about. A confirmed decision describes the moment
+ // Cuna confirmed it; it is never rendered as what the session is doing later.
+ let audience:SessionAudience|undefined,audienceTarget:{id:string;label:string;incarnation?:string}|undefined,audienceFrom:'sessions'|'grant'|'shared'|'state'='sessions';
+ // The last answer the SESSION gave to the question "what are you sharing".
+ // It is an observation at the moment it was answered -- the strongest statement
+ // anything here can make -- and it is never merged with the history half beside
+ // it, nor promoted to a claim about a later moment.
+ let audienceState:SessionAudienceState|undefined,audienceAsked:SessionAudienceAction|undefined;
+ // What this computer had already recorded about the run a reading describes.
+ // `stale` means the answer is from earlier in the run than a fact recorded
+ // here, so it must not be shown as this session's state; `otherRun` means the
+ // recorded fact is about a different run and could not order this answer at
+ // all. Both are reported rather than resolved by guessing.
+ let audienceStale:ConfirmedAudienceFact|undefined,audienceOtherRun:ConfirmedAudienceFact|undefined,factNote:string|undefined;
  // Which surface the failure on screen came from, so a recovery offered for a
  // grant refusal is not offered for a sharing refusal that reads alike.
- let failureSubject:'grant'|'audience'='grant';
+ let failureSubject:'grant'|'audience'|'reading'='grant';
  // Set while `grant` holds a receipt Cuna REPLAYED from storage rather than a
  // reading of current authority. Never presented as the grant's state.
  let replayed:{operationId:string;reason?:string}|undefined;
@@ -107,7 +118,25 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
  const noun=(op:{kind:PendingOwnerGrantOperation['kind'];action?:SessionAudienceAction})=>op.kind==='create'?'grant':op.kind==='revoke'?'revocation':op.action==='publish'?'start of live sharing':'stop of live sharing';
  const sessionLine=(s:ShareableSession,i:number)=>`${mark(i)} ${s.machineName} / ${s.name}  ${s.agent}  ${s.state}${s.projectId===undefined?'  (Project not named by server)':''}  ${short(s.id)}`;
  const memberLine=(m:ProjectObserver,i:number)=>`${mark(i)} ${m.recipient_email??'(no email on record)'}  ${short(m.principal_id)}  membership rev ${m.membership_revision}`;
- const banner=()=>unresolved.length?['',`${unresolved.length} earlier change${unresolved.length===1?' has':'s have'} an unknown outcome. Press p to return to ${unresolved.length===1?'it':'them'}.`,'No new grant or revocation can start until it is resolved or its local record is forgotten.']:[];
+ /**
+  * Which authority an unresolved operation belongs to.
+  *
+  * A grant and a publication are separate authorities and neither implies the
+  * other, so an uncertain one must not gate the other. An uncertain publication
+  * has never granted anybody anything; blocking a revocation behind it would
+  * leave an owner unable to take away access they explicitly want to remove,
+  * for as long as a record only they can delete stands.
+  */
+ type Authority='grant'|'audience';
+ const authorityOf=(op:PendingOwnerGrantOperation):Authority=>op.kind==='audience'?'audience':'grant';
+ const pendingIn=(authority:Authority)=>unresolved.filter(op=>authorityOf(op)===authority);
+ const banner=()=>{
+  if(!unresolved.length)return[];
+  const grants=pendingIn('grant').length,shares=pendingIn('audience').length;
+  return['',`${unresolved.length} earlier change${unresolved.length===1?' has':'s have'} an unknown outcome. Press p to return to ${unresolved.length===1?'it':'them'}.`,
+   ...(grants?['No new grant or revocation can start until it is resolved or its local record is forgotten.']:[]),
+   ...(shares?['No new start of live sharing can begin until it is resolved or its local record is forgotten. Stopping, asking what the session is sharing, and granting or revoking observation are all still available.']:[])];
+ };
  /** Say what this listing could not see. Silence here would claim a completeness the reads do not have. */
  const limits=()=>{
   if(!listing)return[];const parts:string[]=[];
@@ -117,7 +146,7 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
  };
  const paintSessions=()=>{phase='sessions';return screen('Share a session - read-only observation',[...(items.length?items.map(sessionLine):['No AgentSessions in this Project were found on your Machines.']),...limits(),
   ...(items.length?['','Granting a member access and sharing the session live are two separate decisions. Cuna needs both before anyone can watch.']:[]),...banner()],
-  items.length?'Enter grants a member access; s starts sharing this session live; e stops it; Up/Down selects; r refreshes.':'r refreshes.');};
+  items.length?'Enter grants a member access; s starts sharing this session live; e stops it; c asks what it is sharing now; Up/Down selects; r refreshes.':'r refreshes.');};
  const paintMembers=()=>{phase='members';return screen(`Choose the member who may observe ${session!.name}`,[...(members.length?members.map(memberLine):['No other members hold observer membership in this Project. Invite one in the web app first; an invitation alone grants no observation.']),'','Membership lets a member be granted observation; it grants nothing by itself.',...banner()],'Up/Down selects; Enter chooses; n next page; r refreshes; b back.');};
  const paintDuration=()=>{phase='duration';return screen(`Grant ${member!.recipient_email??short(member!.principal_id)} read-only observation of ${session!.name}`,[...DURATIONS.map(([key,label])=>`  ${key}  ${label}`),'',...DISCLOSURE,...banner()],'Press 1, 2 or 3 to create the grant; b back.');};
  const paintGrant=()=>{phase='grant';const g=grant!,d=describeGrantState(g,now()),stored=replayed;
@@ -132,7 +161,7 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
     // that is asked. Neither key claims to know how the session is shared now.
     '','Watching also needs this session to be shared live, which is a separate decision from this grant.',
     ...banner()],
-   `${stored?'i reads the current state':d.final?'i inspects again':g.state==='active'?'x revokes; i inspects the current state':'i inspects again (no scheduled polling)'}; s starts sharing this session live; e stops it; b back to sessions.`);};
+   `${stored?'i reads the current state':d.final?'i inspects again':g.state==='active'?'x revokes; i inspects the current state':'i inspects again (no scheduled polling)'}; s starts sharing this session live; e stops it; c asks what it is sharing now; b back to sessions.`);};
  /**
   * The two sharing decisions, each asked before it is made.
   *
@@ -176,12 +205,88 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
         'Cuna confirmed with the session itself that its output is fenced: nothing more is sent to anyone who was watching.',
         'What was already sent cannot be recalled. Observation grants are untouched - stopping the live share revokes nothing.']),
     ...banner()],
-   a.state==='public'?'e stops sharing; b back to sessions.':'s starts sharing again; b back to sessions.');};
+   a.state==='public'?'e stops sharing; c asks what the session is sharing now; b back to sessions.':'s starts sharing again; c asks what the session is sharing now; b back to sessions.');};
+ /**
+  * What one earlier change is RECORDED to have done, said next to -- never
+  * merged into -- what the session is doing now.
+  *
+  * The distinction is the whole repair: a receipt Cuna stored describes the
+  * moment that request was answered, and an owner reading it as the present is
+  * exactly how a session stays shared while its owner believes it is private.
+  */
+ const historyLines=(operation:SessionAudienceHistory,asked:SessionAudienceAction):string[]=>{
+  // `unknown` carries no action of its own -- there is no request to read one
+  // from -- so the noun comes from the durable record the owner is asking about.
+  const named=`the earlier ${asked==='publish'?'start of live sharing':'stop of live sharing'} (operation ${operation.operationId})`;
+  if(operation.status==='unknown')return[`Cuna has no record of ${named} at all. It never reached the session, so it changed nothing.`];
+  const opened=`${named[0]!.toUpperCase()}${named.slice(1)}`;
+  if(operation.status!=='recorded')return operation.status==='pending'
+   ?[`${opened} is still inside the few seconds Cuna allows it, with no answer recorded yet. Ask again in a moment.`]
+   :[`${opened} ran out of time with no answer recorded.`,
+     'Whether it took effect is unknown, and it will stay unknown: Cuna will not raise that exact request with the session again.',
+     'What the session is doing now is the line above, and it is not an answer about that request.'];
+  if(operation.outcome.kind==='refused')return[
+   `Cuna has a recorded answer for ${named}: the session refused it, so that request did not change what it asked to change.`,
+   'That is what that one request did. It is not what the session is doing now.'];
+  return[
+   `Cuna has a recorded answer for ${named}: the session ${operation.outcome.state==='public'?'started sharing at share':'stopped sharing at share'} #${operation.outcome.generation}.`,
+   'That is what that one request did. It is not what the session is doing now.'];
+ };
+ /**
+  * The answer to "what is this session sharing", as the session itself gave it.
+  *
+  * Asking is a query: `consume_collab_v2_session_audience_response` returns
+  * before it retires an attachment or closes an endpoint when the action is
+  * `observe`, so nothing here starts a share, stops one, creates a grant or
+  * disconnects anybody -- and that is stated rather than assumed.
+  */
+ /** The one sentence every reading has to carry. A reading is answered at a
+  *  moment; nothing about that moment binds the next one, and this computer can
+  *  only compare it against changes that were made HERE. */
+ const AS_OF=[
+  'That is what the session answered when Cuna asked, not a promise about now: any window signed in to this account can change it at any moment.',
+  'Cuna is asked again every time you press c. This computer can only compare an answer against sharing changes made on this computer.',
+ ];
+ const factLine=(fact:ConfirmedAudienceFact)=>`${fact.kind==='transition'?'A sharing change confirmed on this computer':'An answer read on this computer'}: ${fact.state==='public'?`sharing live at share #${fact.generation}`:fact.generation==='0'?'never shared live on that run':`not sharing live, last share #${fact.generation}`}.`;
+ const paintAudienceState=()=>{phase='state';const s=audienceState!,target=audienceTarget,current=s.current,stale=audienceStale;
+  const answered=current.state==='public'
+   ? [`Share     #${current.generation} of this run of the session`,'',
+      'Cuna put the question to the session itself, and the session answered that it was sharing live.',
+      'Everyone holding an active observation grant on this session could watch it from that moment, if Cuna\'s own checks also allowed it.']
+   : [...(current.generation==='0'?['','The session answered that this run has never been shared live.']:[`Last share #${current.generation} of this run of the session`,'',
+      'Cuna put the question to the session itself, and the session answered that it was not sharing live.']),
+      'Nothing new was being sent to anyone who had been watching. What was already sent cannot be recalled.'];
+  return screen(stale!==undefined
+    ? 'Cuna answered about an earlier moment than this computer already knows about'
+    : current.state==='public'?'When Cuna asked, this session was sharing live':'When Cuna asked, this session was not sharing live',
+   [`Session   ${target?.label??current.agentSessionId}`,
+    ...(stale!==undefined
+     // Painting this as the session's state is the exact failure this route
+     // exists to end, so it is described and set aside instead.
+     ? ['',`Cuna's answer describes ${current.state==='public'?`sharing live at share #${current.generation}`:`not sharing live at share #${current.generation}`}, which comes earlier in this run than what this computer has already recorded.`,
+        factLine(stale),
+        'So that answer is not shown as this session\'s state. Press c to ask again.']
+     : answered),
+    ...(audienceOtherRun===undefined?[]:['',
+      'This computer also holds a sharing record for a different run of this session, so it could not be used to order this answer.',
+      factLine(audienceOtherRun)]),
+    '',...AS_OF,
+    'Asking changed nothing: it started no share, stopped none, created no grant and disconnected nobody.',
+    ...(factNote===undefined?[]:['',factNote]),
+    ...(s.operation===undefined||audienceAsked===undefined?[]:['',...historyLines(s.operation,audienceAsked),
+     // The record is gone by the time this renders, so this is the last link
+     // between the answer above and the thing the owner asked Cuna to do.
+     ...(settled===undefined?[]:[`Its local record was dropped: Cuna answered operation ${settled.operationId}, so nothing here is left to finish.`])]),
+    ...banner()],
+   `${stale!==undefined?'s starts sharing; e stops sharing':current.state==='public'?'e stops sharing':'s starts sharing'}; c asks again; b back to sessions.`);};
  /** True when rereading the Project members is the actual recovery for this refusal. */
  const rereadsMembers=(f:OwnerGrantError)=>failureSubject==='grant'&&!grant&&session!==undefined&&(f.kind==='stale_revision'||f.kind==='grant_unavailable');
  const paintFailure=()=>{phase='failure';const f=failure!;
-  return screen(`Not done - ${f.kind.replaceAll('_',' ')}`,
+  return screen(`${failureSubject==='reading'?'Not read':'Not done'} - ${f.kind.replaceAll('_',' ')}`,
    [f.message,
+    // A question that failed leaves everything as it was, including every
+    // earlier change it might have been asked about.
+    ...(failureSubject==='reading'?['','Asking changed nothing, and this answer is about the question only: it says nothing about any earlier start or stop.']:[]),
     // `settled` is set only when a MUTATION was refused with its effect known,
     // so this is the one place the no-effect claim is proved by the answer. A
     // read reaching this screen changed nothing by construction and needs no
@@ -230,11 +335,11 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
     // fresh request issued against a sharing state it has already moved past,
     // so this exact identity is the only thing that can ever settle this -- for
     // as long as Cuna will still raise it.
-    : `Cuna never confirmed this. The session may or may not be ${row.action==='publish'?'shared live':'private'} now, and Cuna offers no way to ask - it can only be changed.${resendable?' Resending reuses this exact operation ID, which asks the session about the same request instead of starting a second one, and it is the only thing that can settle this.':' Cuna will not raise this request with the session again, so nothing here can settle it now.'}${row.action==='publish'?' If what you need is for nobody to be watching, press e: stopping never depends on this answer.':''}`);
-  if(!resendable)lines.push('','What that operation did stays unknown, and it will stay unknown. Forgetting the record is the only thing left that changes anything here, and it changes nothing at Cuna.');
+    : `Cuna never confirmed this. Press c to ask the session what it is sharing now and what this exact request is recorded to have done; that is the question this record exists around, and asking changes nothing.${resendable?' Resending instead reuses this exact operation ID, which asks the session about the same request rather than starting a second one.':' Cuna will not raise this request with the session again, so resending cannot settle it now.'}${row.action==='publish'?' If what you need is for nobody to be watching, press e: stopping never depends on this answer.':''}`);
+  if(!resendable)lines.push('','What that operation did stays unknown, and it will stay unknown. Asking what the session is sharing now still answers what the session is doing; forgetting the record is the only other thing left here, and it changes nothing at Cuna.');
   if(failure)lines.push('',`Last reason: ${failure.message}`);
   if(refusal)lines.push('',refusal);
-  return screen(`Unresolved change${unresolved.length===1?'':'s'} - outcome unknown`,lines,`Up/Down selects; ${resendable?'r resends this exact operation; ':''}${row.kind==='revoke'?'i inspects the grant; ':row.kind==='audience'&&row.action==='publish'?'e stops live sharing now; ':''}d forgets the local record only; b back to sessions.`);
+  return screen(`Unresolved change${unresolved.length===1?'':'s'} - outcome unknown`,lines,`Up/Down selects; ${resendable?'r resends this exact operation; ':''}${row.kind==='revoke'?'i inspects the grant; ':row.kind==='audience'?`c asks what the session is sharing now${row.action==='publish'?'; e stops live sharing now':''}; `:''}d forgets the local record only; b back to sessions.`);
  };
  /**
   * Deleting the record is irreversible and revokes nothing, so it is asked
@@ -252,8 +357,8 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
      : op.kind==='revoke'
       ? `The outcome stays unknown. If that request did take effect, the revocation applied. Grant ${op.grantId} stays readable by ID either way, so its state is still reachable; the operation identity is not.`
       : op.action==='publish'
-       ? 'The outcome stays unknown. If that request did take effect, this session is shared live and anyone holding a grant on it may be watching - and after this, nothing in this CLI can replay that operation. Stopping the sharing does not need it and is the only way to be sure nobody is watching.'
-       : 'The outcome stays unknown. If that request did take effect, the session is private. Asking Cuna to stop sharing again is a separate decision that does not need this record.',
+       ? 'The outcome of that request stays unknown, and after this no screen here can name or replay it. Asking what the session is sharing now does not need it and answers what the session is doing; stopping the sharing does not need it either and is the only way to be sure nobody is watching.'
+       : 'The outcome of that request stays unknown, and after this no screen here can name or replay it. Asking what the session is sharing now does not need it. Asking Cuna to stop sharing again is a separate decision that does not need it either.',
     '','This cannot be undone.'],
    'Press y to forget it; any other key keeps it.');};
  const paintForgotten=()=>{phase='forgotten';const op=forgotten!;
@@ -264,7 +369,7 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
      ? 'This CLI can no longer name or replay it. Check the web app if you need to know whether a grant exists.'
      : op.kind==='revoke'
       ? `Grant ${op.grantId} can still be read: cuna share --project ${identity.project} --grant ${op.grantId}`
-      : 'This CLI can no longer replay it. Stopping live sharing is still available and does not depend on it.',
+      : 'This CLI can no longer replay it. Asking what the session is sharing now, and stopping live sharing, are both still available and depend on nothing that was just deleted.',
     ...banner()],
    unresolved.length?'p returns to the remaining unresolved changes; b back to sessions.':'b back to sessions.');};
  /**
@@ -312,7 +417,21 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
   await accept(value);
  };
  const acceptGrant=async(value:OwnerGrant)=>{grant=value;replayed=undefined;refusal=undefined;await paintGrant();};
- const acceptAudience=async(value:SessionAudience)=>{audience=value;refusal=undefined;await paintAudience();};
+ /**
+  * Write down what Cuna confirmed, so a second `cuna share` on this computer
+  * cannot later paint an older answer as this session's state.
+  *
+  * A store that will not record it is reported rather than swallowed: the
+  * consequence is that another window may show something stale, which the owner
+  * has to be able to know.
+  */
+ const rememberAudience=async(fact:ConfirmedAudienceFactInput)=>{
+  try{await store.recordAudienceFact(fact);factNote=undefined;}
+  catch(error){factNote=`Cuna answered, but this computer could not record it where other windows would see it: ${error instanceof Error?error.message:String(error)}. Another window of this account may still show an older answer as current.`;}
+ };
+ const acceptAudience=async(value:SessionAudience)=>{audience=value;refusal=undefined;
+  await rememberAudience({kind:'transition',agentSessionId:value.agentSessionId,sessionIncarnation:value.sessionIncarnation,processEpoch:value.processEpoch,state:value.state,generation:value.generation});
+  await paintAudience();};
  const reserve=async(intent:Parameters<OwnerGrantOperationStore['reserve']>[0])=>{
   let reserved;
   try{reserved=await store.reserve(intent);}
@@ -329,16 +448,18 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
   * the window between this read and the reserve below; there is no cross-process
   * lock, so it narrows the race rather than removing it.
   */
- const cleared=async(action:string)=>{
+ const cleared=async(action:string,authority:Authority)=>{
   unresolved=[...await localState('read its record of unresolved changes',()=>store.list(abort.signal))];
-  if(!unresolved.length)return true;
-  refusal=`Cannot ${action} while an earlier change has an unknown outcome. Resend it, inspect it, or forget its local record first.`;cursor=0;await paintUnresolved();return false;
+  const blocking=pendingIn(authority);
+  if(!blocking.length)return true;
+  cursor=Math.max(0,unresolved.indexOf(blocking[0]!));
+  refusal=`Cannot ${action} while an earlier change has an unknown outcome. Resend it, inspect it, or forget its local record first.`;await paintUnresolved();return false;
  };
  const readSessions=async()=>{listing=await sessions.list(abort.signal);items=listing.items.filter(s=>s.projectId===undefined||s.projectId===identity.project);};
  const loadSessions=()=>run('Finding your AgentSessions',async()=>{failureSubject='grant';await readSessions();index=0;failure=undefined;refusal=undefined;await paintSessions();});
  const loadMembers=(after:string|null)=>run('Reading Project members',async()=>{failureSubject='grant';const page=await api.listMembers(after,abort.signal);members=page.items.filter(m=>m.principal_id!==identity.owner);membersAfter=after;membersNext=page.next_after_principal_id;index=0;await paintMembers();});
- const create=(input:CreateInput)=>run('Creating the observation grant',async()=>{failureSubject='grant';if(!await cleared('create a grant'))return;const op=await reserve({kind:'create',operationId:randomUUID(),...input});await settleWith(op,()=>api.create(input,op.operationId,abort.signal),acceptGrant);});
- const revoke=(g:OwnerGrant)=>run('Requesting revocation',async()=>{failureSubject='grant';if(!await cleared('revoke'))return;const op=await reserve({kind:'revoke',operationId:randomUUID(),grantId:g.grant_id,agentSessionId:g.agent_session_id,subjectPrincipalId:g.subject_principal_id,expectedRevision:g.revision});await settleWith(op,()=>api.revoke(g,op.operationId,abort.signal),acceptGrant);});
+ const create=(input:CreateInput)=>run('Creating the observation grant',async()=>{failureSubject='grant';if(!await cleared('create a grant','grant'))return;const op=await reserve({kind:'create',operationId:randomUUID(),...input});await settleWith(op,()=>api.create(input,op.operationId,abort.signal),acceptGrant);});
+ const revoke=(g:OwnerGrant)=>run('Requesting revocation',async()=>{failureSubject='grant';if(!await cleared('revoke','grant'))return;const op=await reserve({kind:'revoke',operationId:randomUUID(),grantId:g.grant_id,agentSessionId:g.agent_session_id,subjectPrincipalId:g.subject_principal_id,expectedRevision:g.revision});await settleWith(op,()=>api.revoke(g,op.operationId,abort.signal),acceptGrant);});
  /** The session one sharing decision is about, named the way the owner saw it if this process has seen it listed. */
  const audienceTargetFor=(agentSessionId:string,incarnation?:string):{id:string;label:string;incarnation?:string}=>{
   const known=items.find(s=>s.id===agentSessionId);
@@ -356,7 +477,7 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
   */
  const changeAudience=(action:SessionAudienceAction,target:{id:string;label:string;incarnation?:string})=>run(action==='publish'?'Starting live sharing':'Stopping live sharing',async()=>{
   failureSubject='audience';audienceTarget=target;
-  if(action==='publish'){if(!await cleared('start live sharing'))return;}
+  if(action==='publish'){if(!await cleared('start live sharing','audience'))return;}
   else unresolved=[...await localState('read its record of unresolved changes',()=>store.list(abort.signal))];
   const op=await reserve({kind:'audience',operationId:randomUUID(),action,agentSessionId:target.id});
   await settleWith(op,()=>api.setAudience({agentSessionId:target.id,action,...(target.incarnation===undefined?{}:{sessionIncarnation:target.incarnation})},op.operationId,abort.signal),acceptAudience);
@@ -378,6 +499,48 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
   catch(error){grant=stored;replayed={operationId,reason:(error instanceof OwnerGrantError?error:classifyTransportFailure(error,false,'inspect')).message};}
   await paintGrant();
  };
+ /**
+  * Ask the session what it is sharing, optionally about one unfinished change.
+  *
+  * It takes NO durable record and reserves nothing. A reading is a query with no
+  * effect to recover, and its stored request keeps a twenty-second deadline, so
+  * a fresh identity every time is the only thing that can work. It is also never
+  * gated on an unresolved change: an owner who cannot tell whether a session is
+  * shared is exactly the owner who most needs to be able to ask.
+  *
+  * An answer about the named change SETTLES its record when one exists --
+  * `recorded` because the answer is durable, `unknown` because Cuna never issued
+  * the request at all. `expired_unrecorded` settles nothing: the effect stays
+  * unknown, and only the owner removes that record. It does establish that
+  * resending can no longer settle it, which is recorded the same way a refusal
+  * that closed the door is.
+  */
+ const askAudience=(target:{id:string;label:string;incarnation?:string},about?:PendingOwnerGrantOperation&{kind:'audience'})=>run('Asking what this session is sharing now',async()=>{
+  failureSubject='reading';audienceTarget=target;audienceAsked=about?.action;
+  audienceStale=undefined;audienceOtherRun=undefined;factNote=undefined;
+  const answer=await api.readAudience({agentSessionId:target.id,
+   ...(target.incarnation===undefined?{}:{sessionIncarnation:target.incarnation}),
+   ...(about===undefined?{}:{reconcile:{operationId:about.operationId,action:about.action}})},randomUUID(),abort.signal);
+  // The history half is about one named operation and is independent of every
+  // ordering question below, so it settles its record either way.
+  if(about!==undefined&&answer.operation!==undefined){
+   if(answer.operation.status==='recorded'||answer.operation.status==='unknown'){settled={operationId:about.operationId,kind:'audience',action:about.action};await forget(about.operationId);}
+   else if(answer.operation.status==='expired_unrecorded')unresendable.add(about.operationId);
+  }
+  // Order the answer against what this computer recorded, read AFTER the answer
+  // arrived: another process may have confirmed a change while this question was
+  // in flight, and that is exactly the case a floor held in this closure missed.
+  const current=answer.current;
+  let held:ConfirmedAudienceFact|null=null;
+  try{held=await store.readAudienceFact(current.agentSessionId);}
+  catch(error){factNote=`This computer holds a sharing record for this session that could not be read: ${error instanceof Error?error.message:String(error)}. It was not used to order this answer.`;}
+  if(held!==null&&!audienceFactSameRun(held,current))audienceOtherRun=held;
+  else if(held!==null&&audienceFactIsOlder(current,held))audienceStale=held;
+  // An answer this computer already knows to be out of date must never become
+  // the newest thing it knows.
+  if(audienceStale===undefined)await rememberAudience({kind:'reading',agentSessionId:current.agentSessionId,sessionIncarnation:current.sessionIncarnation,processEpoch:current.processEpoch,state:current.state,generation:current.generation});
+  audienceState=answer;failure=undefined;refusal=undefined;await paintAudienceState();
+ });
  /** Replay an operation the durable record already owns. It is never re-reserved and never re-identified. */
  const resend=(op:PendingOwnerGrantOperation)=>run(op.kind==='create'?'Resending the same grant request':op.kind==='revoke'?'Resending the same revocation':op.action==='publish'?'Resending the same request to share':'Resending the same request to stop sharing',async()=>{
   failureSubject=op.kind==='audience'?'audience':'grant';
@@ -406,29 +569,35 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
   if(settling!==undefined)await forget(settling);
   failure=undefined;refusal=undefined;replayed=undefined;await paintGrant();
  });
- /** One unresolved operation blocks every NEW authority change, so it can never be silently replaced. */
- const blocked=(action:string)=>{if(!unresolved.length)return false;refusal=`Cannot ${action} while an earlier change has an unknown outcome. Resend it, inspect it, or forget its local record first.`;cursor=0;void paintUnresolved();return true;};
+ /** One unresolved operation blocks every NEW change of the SAME authority, so it can never be silently replaced. */
+ const blocked=(action:string,authority:Authority)=>{const blocking=pendingIn(authority);if(!blocking.length)return false;
+  refusal=`Cannot ${action} while an earlier change has an unknown outcome. Resend it, inspect it, or forget its local record first.`;
+  cursor=Math.max(0,unresolved.indexOf(blocking[0]!));void paintUnresolved();return true;};
  const toUnresolved=(key:string)=>{if(key!=='p'||!unresolved.length)return false;refusal=undefined;cursor=0;void paintUnresolved();return true;};
  const remove=host.onInput(bytes=>{if(stopped)return;const key=new TextDecoder().decode(bytes);if(key==='\x03'||key==='\x1b'){stop();return;}if(busy)return;
   const up=()=>{index=Math.max(0,index-1);},down=(n:number)=>{index=Math.min(Math.max(0,n-1),index+1);};
   if(phase==='sessions'){if(key==='\x1b[A'){up();void paintSessions();}else if(key==='\x1b[B'){down(items.length);void paintSessions();}else if(key==='\r'&&items[index]){session=items[index];void loadMembers(null);}
    // Publication is asked for on the session the cursor names, and confirmed
    // before anything is sent.
-   else if(key==='s'&&items[index]){if(blocked('start live sharing'))return;audienceFrom='sessions';audienceTarget=audienceTargetFor(items[index]!.id);void paintConfirmShare();}
+   else if(key==='s'&&items[index]){if(blocked('start live sharing','audience'))return;audienceFrom='sessions';audienceTarget=audienceTargetFor(items[index]!.id);void paintConfirmShare();}
    else if(key==='e'&&items[index]){audienceFrom='sessions';audienceTarget=audienceTargetFor(items[index]!.id);void paintConfirmStop();}
+   // Asking is never gated: it changes nothing, and an owner who cannot tell
+   // whether a session is shared is the one who most needs to be able to ask.
+   else if(key==='c'&&items[index]){audienceFrom='sessions';void askAudience(audienceTargetFor(items[index]!.id));}
    else if(key==='r')void loadSessions();else toUnresolved(key);}
   else if(phase==='members'){if(key==='\x1b[A'){up();void paintMembers();}else if(key==='\x1b[B'){down(members.length);void paintMembers();}else if(key==='\r'&&members[index]){member=members[index];void paintDuration();}else if(key==='n'&&membersNext)void loadMembers(membersNext);else if(key==='r')void loadMembers(membersAfter);else if(key==='b')void paintSessions();else toUnresolved(key);}
   else if(phase==='duration'){const choice=DURATIONS.find(([k])=>k===key);
-   if(choice){if(blocked('create a grant'))return;void create({agentSessionId:session!.id,subjectPrincipalId:member!.principal_id,expectedMembershipRevision:member!.membership_revision,expiresAtMs:now()+choice[2]});}
+   if(choice){if(blocked('create a grant','grant'))return;void create({agentSessionId:session!.id,subjectPrincipalId:member!.principal_id,expectedMembershipRevision:member!.membership_revision,expiresAtMs:now()+choice[2]});}
    else if(key==='b')void paintMembers();else toUnresolved(key);}
   else if(phase==='grant'){if(key==='i'&&grant)void inspect(grant);
    // A stored replay is not a reading of current authority, so it may not be
    // the revision a revocation is aimed at. `i` first.
-   else if(key==='x'&&grant&&!replayed&&grant.state==='active'&&!describeGrantState(grant,now()).final){if(blocked('revoke'))return;void revoke(grant);}
+   else if(key==='x'&&grant&&!replayed&&grant.state==='active'&&!describeGrantState(grant,now()).final){if(blocked('revoke','grant'))return;void revoke(grant);}
    // The grant names its session and the exact run of it, so a sharing receipt
    // about a different run can be refused rather than believed.
-   else if(key==='s'&&grant){if(blocked('start live sharing'))return;audienceFrom='grant';audienceTarget=audienceTargetFor(grant.agent_session_id,grant.session_incarnation);void paintConfirmShare();}
+   else if(key==='s'&&grant){if(blocked('start live sharing','audience'))return;audienceFrom='grant';audienceTarget=audienceTargetFor(grant.agent_session_id,grant.session_incarnation);void paintConfirmShare();}
    else if(key==='e'&&grant){audienceFrom='grant';audienceTarget=audienceTargetFor(grant.agent_session_id,grant.session_incarnation);void paintConfirmStop();}
+   else if(key==='c'&&grant){audienceFrom='grant';void askAudience(audienceTargetFor(grant.agent_session_id,grant.session_incarnation));}
    else if(key==='b'){grant=undefined;failure=undefined;replayed=undefined;void loadSessions();}
    else toUnresolved(key);}
   else if(phase==='confirm-share'||phase==='confirm-stop'){const action:SessionAudienceAction=phase==='confirm-share'?'publish':'private',target=audienceTarget!;
@@ -436,11 +605,22 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
    // Cancelling returns to the screen the decision was reached from, so the
    // receipt a person was reading is not lost by declining the next step.
    else if(audienceFrom==='shared'&&audience)void paintAudience();
+   else if(audienceFrom==='state'&&audienceState)void paintAudienceState();
    else{audienceTarget=undefined;void (audienceFrom==='grant'&&grant?paintGrant():items.length?paintSessions():loadSessions());}}
   else if(phase==='shared'){
-   if(key==='s'&&audienceTarget){if(blocked('start live sharing'))return;audienceFrom='shared';void paintConfirmShare();}
+   if(key==='s'&&audienceTarget){if(blocked('start live sharing','audience'))return;audienceFrom='shared';void paintConfirmShare();}
    else if(key==='e'&&audienceTarget){audienceFrom='shared';void paintConfirmStop();}
+   else if(key==='c'&&audienceTarget){audienceFrom='shared';void askAudience(audienceTarget);}
    else if(key==='b'){audience=undefined;audienceTarget=undefined;void (items.length?paintSessions():loadSessions());}
+   else toUnresolved(key);}
+  // What the session itself answered. A fresh decision from here is issued
+  // against the generation this reading recorded, which is what makes starting
+  // or stopping possible again after an acknowledgement was lost.
+  else if(phase==='state'){
+   if(key==='s'&&audienceTarget){if(blocked('start live sharing','audience'))return;audienceFrom='state';void paintConfirmShare();}
+   else if(key==='e'&&audienceTarget){audienceFrom='state';void paintConfirmStop();}
+   else if(key==='c'&&audienceTarget){audienceFrom='state';void askAudience(audienceTarget);}
+   else if(key==='b'){audienceState=undefined;audienceAsked=undefined;audienceTarget=undefined;void (items.length?paintSessions():loadSessions());}
    else toUnresolved(key);}
   else if(phase==='failure'){
    if(key==='r'&&failure&&rereadsMembers(failure))void loadMembers(null);
@@ -455,6 +635,9 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
    // The safe direction out of an unconfirmed publication, reachable without
    // first settling it: it removes access and starts its own operation.
    else if(key==='e'&&row?.kind==='audience'&&row.action==='publish'){refusal=undefined;audienceFrom='sessions';audienceTarget=audienceTargetFor(row.agentSessionId);void paintConfirmStop();}
+   // The question this record exists around, asked about this exact operation.
+   // It is the one action here that can settle the record without a resend.
+   else if(key==='c'&&row?.kind==='audience'){refusal=undefined;audienceFrom='state';void askAudience(audienceTargetFor(row.agentSessionId),row);}
    else if(key==='d'&&row){forgetTarget=row;void paintConfirmForget();}
    else if(key==='b'){refusal=undefined;void (items.length?paintSessions():loadSessions());}}
   else if(phase==='confirm-forget'){const op=forgetTarget!;
@@ -470,8 +653,13 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
    // Recover operation identity from an earlier process before anything else.
    unresolved=[...await localState('read its record of unresolved changes',()=>store.list(abort.signal))];
    await readSessions();
-   if(unresolved.length){cursor=0;await paintUnresolved();}
-   else if(options.initialGrantId){grant=await api.inspect({grant_id:options.initialGrantId},abort.signal);await paintGrant();}
+   // `--grant` names one explicit subject the owner came here for, and reaching
+   // it is how a grant is revoked. An unresolved SHARING change must not hide
+   // it: they are separate authorities, the record outlives every retry, and
+   // revoking only ever removes access. Recovery is not lost either -- the
+   // banner on that screen names it and `p` opens it.
+   if(options.initialGrantId){grant=await api.inspect({grant_id:options.initialGrantId},abort.signal);await paintGrant();}
+   else if(unresolved.length){cursor=0;await paintUnresolved();}
    else await paintSessions();
   });
   await done;

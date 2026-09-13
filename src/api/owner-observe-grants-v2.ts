@@ -2,6 +2,9 @@ import {ownerObserveGrantSchemas,ownerObserveGrantOperations} from './owner-obse
 import type {HttpTransport} from './http.js';
 import {assertCanonicalUuid} from '../core/validation.js';
 import {CunaError,EXIT_CODES} from '../core/errors.js';
+// One implementation of the producer's order over a run, shared with the durable
+// store that carries it between processes. Two copies of this rule would drift.
+import {audienceFactIsOlder} from '../runtime/owner-grant-operations.js';
 
 // Owner side of one session observation grant: create for a distinct Project
 // member, inspect its current authority, revoke it. The recipient decoder in
@@ -13,11 +16,28 @@ import {CunaError,EXIT_CODES} from '../core/errors.js';
 // session's latest audience result is `public`, so a grant alone can never
 // enable observation. Publication and a grant are separate authorities and are
 // separate keypresses; neither implies the other here.
-type Schema={$ref?:string;type?:string|string[];const?:unknown;enum?:unknown[];pattern?:string;format?:string;default?:unknown;minimum?:number;maximum?:number;minLength?:number;maxLength?:number;required?:string[];properties?:Record<string,Schema>;additionalProperties?:boolean;items?:Schema;maxItems?:number;anyOf?:Schema[];allOf?:Schema[];if?:Schema;then?:Schema;else?:Schema};
+//
+// And it owns the question neither of those can answer: what the session is
+// sharing NOW. Migration 0191 added `action='observe'`, which records a reading
+// without retiring an attachment or closing an endpoint, and the Edge serves it
+// at `/v1/collaboration/2/agent-sessions/{id}/audience-state`. Without it a
+// publication whose acknowledgement was lost leaves the runtime a generation
+// ahead of Cuna, every later transition issued at the last recorded generation
+// is refused as stale, and the owner can neither share again nor be told that
+// sharing stopped.
+type Schema={$ref?:string;type?:string|string[];const?:unknown;enum?:unknown[];pattern?:string;format?:string;default?:unknown;minimum?:number;maximum?:number;minLength?:number;maxLength?:number;required?:string[];properties?:Record<string,Schema>;additionalProperties?:boolean;items?:Schema;maxItems?:number;anyOf?:Schema[];oneOf?:Schema[];allOf?:Schema[];if?:Schema;then?:Schema;else?:Schema};
 const schemas=ownerObserveGrantSchemas as unknown as Record<string,Schema>;
 function valid(v:unknown,s:Schema):boolean{
  if(s.$ref)return valid(v,schemas[s.$ref.split('/').at(-1)!]!);
- if(s.allOf&&!s.allOf.every(x=>valid(v,x)))return false;if(s.anyOf&&!s.anyOf.some(x=>valid(v,x)))return false;if(s.if){const branch=valid(v,s.if)?s.then:s.else;if(branch&&!valid(v,branch))return false;}
+ if(s.allOf&&!s.allOf.every(x=>valid(v,x)))return false;if(s.anyOf&&!s.anyOf.some(x=>valid(v,x)))return false;
+ // Exactly one branch, not at least one. The canonical contract uses `oneOf`
+ // where a discriminating field decides the shape -- an operation's `status`
+ // decides whether the five accompanying fields and a non-null `response` are
+ // present -- and a body satisfying two branches is one the producer cannot
+ // emit. Reading it as `anyOf` would have accepted a schema keyword this file
+ // does not implement as no constraint at all.
+ if(s.oneOf&&s.oneOf.filter(x=>valid(v,x)).length!==1)return false;
+ if(s.if){const branch=valid(v,s.if)?s.then:s.else;if(branch&&!valid(v,branch))return false;}
  if(s.const!==undefined&&v!==s.const||s.enum&&!s.enum.includes(v))return false;
  if(Array.isArray(s.type))return s.type.some(type=>valid(v,{...s,type}));
  if(s.type==='null')return v===null;
@@ -40,7 +60,7 @@ export type OwnerGrantFailureKind='malformed_receipt'|'identity_mismatch'|'stale
  * therefore cannot say what happened; the operation the CLI issued is what
  * makes the rendered sentence true instead of merely typed.
  */
-export type OwnerGrantOperation='create'|'revoke'|'inspect'|'members'|'audience';
+export type OwnerGrantOperation='create'|'revoke'|'inspect'|'members'|'audience'|'audience-state';
 export class OwnerGrantError extends CunaError{
  readonly kind:OwnerGrantFailureKind;
  /**
@@ -83,7 +103,7 @@ function check(value:unknown,name:string,what:string){if(!valid(value,schemas[na
  * not at the expected revision. Inspect returns null, which the Edge turns into
  * the same 404, when the actor is neither owner nor subject.
  */
-type GrantRouteOperation=Exclude<OwnerGrantOperation,'audience'>;
+type GrantRouteOperation=Exclude<OwnerGrantOperation,'audience'|'audience-state'>;
 const GRANT_UNAVAILABLE:Readonly<Record<GrantRouteOperation,string>>=Object.freeze({
  create:"Cuna refused this grant and created nothing. The member is no longer an active observer at the membership revision that was read, this account is no longer the Project's active owner, the session is not one it owns, or the requested expiry is outside the window Cuna accepts. Reread the members and decide again.",
  revoke:"Cuna refused this revocation and changed nothing. The grant is no longer active at the revision that was read - it may already be revoked or expired - or this account is no longer the Project's active owner. Inspect the grant to read its current state.",
@@ -108,7 +128,7 @@ const OPERATION_CONFLICT:Readonly<Record<GrantRouteOperation,string>>=Object.fre
  inspect:'Cuna answered this read with a conflict. A read carries no operation identity and applies nothing, so read again.',
  members:'Cuna answered this read with a conflict. A read carries no operation identity and applies nothing, so read again.',
 });
-const pick=(table:Readonly<Record<GrantRouteOperation,string>>,operation:OwnerGrantOperation|undefined,fallback:string)=>operation===undefined||operation==='audience'?fallback:table[operation];
+const pick=(table:Readonly<Record<GrantRouteOperation,string>>,operation:OwnerGrantOperation|undefined,fallback:string)=>operation===undefined||operation==='audience'||operation==='audience-state'?fallback:table[operation];
 /**
  * What the publication route actually answers, per Problem code.
  *
@@ -167,6 +187,36 @@ const AUDIENCE_REFUSAL:Readonly<Record<string,{readonly message:string;readonly 
  audience_response_unavailable:{message:'The session answered something Cuna would not accept, so Cuna recorded nothing. This change may or may not have been made.',effectUnknown:true},
  audience_receipt_unavailable:{message:'The session answered, but Cuna could not record the answer. The session may now be in the state you asked for while Cuna does not know it.',effectUnknown:true},
 });
+/**
+ * What a refusal of the READING route means, per Problem code.
+ *
+ * Every entry settles this attempt and nothing else. A reading issues no
+ * transition: `consume_collab_v2_session_audience_response` returns before it
+ * retires an attachment or closes an endpoint when the action is `observe`, so
+ * even a refusal Cuna recorded leaves the audience, the observers and the
+ * streams exactly as they were. That is why none of these is `effectUnknown`
+ * and why none of them may say anything about an earlier transition: a question
+ * Cuna could not put to the session is not a verdict on a change it asked about
+ * minutes ago.
+ *
+ * `transport_unavailable` is the one that deserves its own sentence. The Edge
+ * registry refuses an `observe` request to a supervisor that does not advertise
+ * `session_audience_state_v2` -- every Machine created before that asset
+ * existed -- and a genuinely lost answer arrives as the same code. Nothing
+ * distinguishes them from here, so both are named instead of one being guessed.
+ */
+const READING_REFUSAL:Readonly<Record<string,string>>=Object.freeze({
+ audience_request_invalid:'Cuna rejected this as not a valid question about sharing, so it asked the session nothing.',
+ audience_runtime_unavailable:'This session is not connected to Cuna right now, so Cuna could not ask it what it is sharing.',
+ audience_invalid_scope:'Cuna would not raise this with the session: what it knows about the session is not current enough to ask.',
+ audience_request_unavailable:'Cuna could not raise this question with the session. Another sharing change on this session may still be in flight; wait a few seconds and ask again.',
+ audience_request_expired:'Cuna ran out of time before it could put this question to the session.',
+ audience_producer_unavailable:'The session refused to answer. Refusing to answer changes nothing about what it is sharing; it only leaves it unread.',
+ audience_transport_unavailable:'Cuna asked the session and no answer came back. A session on a Machine created before this question existed can never answer it, and that is indistinguishable from a lost answer.',
+ audience_response_unavailable:'The session answered something Cuna would not accept, so nothing was read.',
+ audience_receipt_unavailable:'The session answered, but Cuna could not record the answer, so nothing was read.',
+ audience_history_unavailable:'Cuna could not look up what that earlier change is recorded to have done, so it asked the session nothing either.',
+});
 /** True when resending this exact request could still settle it; false where the producer has closed that door. */
 export function audienceRefusalCanResend(reason:unknown):boolean{
  return typeof reason!=='string'||!Object.hasOwn(AUDIENCE_REFUSAL,reason)||AUDIENCE_REFUSAL[reason]!.settledCanResend!==false;
@@ -193,6 +243,14 @@ export function classifyTransportFailure(error:unknown,mutation:boolean,operatio
    const refusal=AUDIENCE_REFUSAL[reason]!;
    return new OwnerGrantError(refusal.effectUnknown?'uncertain':'unavailable',refusal.message,error,reason,refusal.effectUnknown);
   }
+  // A reading changes nothing, so every refusal of it is settled for the reading
+  // and silent about every other request. It is read before the grant mapping
+  // for the same reason the publication route is.
+  if(operation==='audience-state'&&typeof reason==='string'&&Object.hasOwn(READING_REFUSAL,reason))
+   return new OwnerGrantError('unavailable',READING_REFUSAL[reason]!,error,reason);
+  if(operation==='audience-state'&&status===404&&error.code==='cuna.remote.operation_not_served')
+   return new OwnerGrantError('unavailable',`This Cuna deployment does not serve the sharing-state question this build asks, so it could not be asked. ${error.message}`,error,reason);
+  if(operation==='audience-state'&&status===404)return new OwnerGrantError('not_found','Cuna does not know this session for this account, so it read nothing.',error,reason);
   if(operation==='audience'&&status===404&&error.code!=='cuna.remote.operation_not_served')return new OwnerGrantError('not_found','Cuna does not know this session for this account, so it asked nothing and nothing about sharing changed.',error,reason);
   // 403 is the Edge's own principal check -- auth class plus `collaboration:manage`.
   // Project ownership is proved later, inside the transaction, and its failure
@@ -238,6 +296,35 @@ export type SetAudienceInput={agentSessionId:string;action:SessionAudienceAction
  sessionIncarnation?:string;
  /** True when this dispatch reuses an operation identity an earlier attempt already sent. */
  replay?:boolean};
+/**
+ * What the session IS sharing, as the runtime itself answered.
+ *
+ * There is no `firstSequence` because a reading opens no stream, and the
+ * `generation` is the runtime's own counter: after a publication whose
+ * acknowledgement was lost it is AHEAD of every generation Cuna recorded. That
+ * is the case this route exists for, not an error.
+ */
+export type SessionAudienceReading={agentSessionId:string;sessionIncarnation:string;processEpoch:string;logicalTerminalId:string;requestId:string;state:'public'|'private';generation:string;streamId?:string};
+/**
+ * What one earlier operation is RECORDED to have done -- never what the session
+ * is now.
+ *
+ * `recorded` has a durable answer, which may itself be a refusal the session
+ * gave. `pending` is still inside its deadline. `expired_unrecorded` says the
+ * deadline passed with nothing recorded: the effect is unknown, and expiry is
+ * not an acknowledgement that it failed. `unknown` means Cuna never issued the
+ * request for this session at all, so the session was never asked.
+ */
+export type SessionAudienceHistory=
+ |{status:'unknown';operationId:string}
+ |{status:'pending'|'expired_unrecorded';operationId:string;action:SessionAudienceAction|'observe';requestRevision:string}
+ |{status:'recorded';operationId:string;action:SessionAudienceAction|'observe';requestRevision:string;outcome:{kind:'observed';state:'public'|'private';generation:string;streamId?:string}|{kind:'refused'}};
+export type SessionAudienceState={current:SessionAudienceReading;operation?:SessionAudienceHistory};
+export type ReadAudienceInput={agentSessionId:string;
+ /** When known, the exact run the answer must be about. */
+ sessionIncarnation?:string;
+ /** The EARLIER uncertain change to ask about. Never this reading's own identity. */
+ reconcile?:{operationId:string;action:SessionAudienceAction}};
 
 /**
  * The plain-language meaning of one receipt. `revoking`/`effective_pending`
@@ -294,7 +381,10 @@ export function ownerObserveGrantsApi(transport:HttpTransport,owner:string,proje
   * -- never from comparing UUIDs, which carry no order at all.
   */
  const answeredRequest=new Map<string,{readonly order:number;readonly key:string;readonly action:SessionAudienceAction;readonly state:'public'|'private';readonly generation:string;readonly streamId:string|undefined}>();
- const confirmedAudience=new Map<string,{readonly order:number;readonly action:SessionAudienceAction;readonly state:'public'|'private';readonly generation:bigint}>();
+ // A reading belongs here too, and it is why `action` carries `'observe'`: a
+ // fresh reading is the newest thing this client knows about the session, so a
+ // journaled receipt replayed after one cannot describe the session now either.
+ const confirmedAudience=new Map<string,{readonly order:number;readonly action:SessionAudienceAction|'observe';readonly state:'public'|'private';readonly generation:bigint}>();
  let audienceOrder=0;
  const current=async()=>{if(verifyPrincipal&&await verifyPrincipal()!==owner)throw new OwnerGrantError('identity_mismatch','The signed-in account changed while this action was in flight. Nothing from the answer was trusted.');};
  const send=async(path:string,body:unknown,mutation:boolean,signal:AbortSignal,operation:OwnerGrantOperation)=>{
@@ -419,7 +509,10 @@ export function ownerObserveGrantsApi(transport:HttpTransport,owner:string,proje
      // a screen at all, and the refusal names the decision that replaced it so
      // the history is still readable.
      if(confirmed!==undefined&&confirmed.order>prior.order){
-      superseded=`Cuna answered this with the answer it already gave to an earlier request, which ${prior.state==='public'?'started':'stopped'} live sharing. A different decision was confirmed after that one - you asked Cuna to ${confirmed.action==='publish'?'start':'stop'} live sharing, and Cuna confirmed it. This answer describes the earlier request, so it cannot say how the session is shared now, and it was refused.`;
+      const since=confirmed.action==='observe'
+       ?`Cuna has since read this session's current sharing state directly, and it says ${confirmed.state==='public'?'the session is sharing live':'the session is not sharing live'}`
+       :`you asked Cuna to ${confirmed.action==='publish'?'start':'stop'} live sharing, and Cuna confirmed it`;
+      superseded=`Cuna answered this with the answer it already gave to an earlier request, which ${prior.state==='public'?'started':'stopped'} live sharing. Something newer is known since - ${since}. This answer describes the earlier request, so it cannot say how the session is shared now, and it was refused.`;
       return Object.freeze(decision);
      }
      return Object.freeze(decision);
@@ -431,6 +524,90 @@ export function ownerObserveGrantsApi(transport:HttpTransport,owner:string,proje
    });
    if(superseded!==undefined)throw new OwnerGrantError('stale_revision',superseded);
    return decided;
+  },
+  /**
+   * Ask what this session IS sharing, and optionally what one earlier change is
+   * recorded to have done.
+   *
+   * This is the question `setAudience` cannot ask. A publication whose
+   * acknowledgement was lost leaves the runtime one generation ahead of Cuna and
+   * fenced: every later transition is issued at the last RECORDED generation,
+   * the session refuses it as stale, and the owner can neither share again nor
+   * be told that sharing stopped. `issue_collab_v2_session_audience_request`
+   * computes `expected_generation` from the latest OBSERVED result of any
+   * action, so once a reading is recorded the next publish or private is issued
+   * against the live counter -- which is what makes a fresh decision possible
+   * again without restarting the session.
+   *
+   * Every reading mints its OWN identity. A stored request keeps its original
+   * twenty-second deadline, so reusing one can only ever answer
+   * `audience_request_expired`; there is nothing here to make idempotent across
+   * minutes, because the reading is a query. `reconcile` names the EARLIER
+   * uncertain change and may never be this reading's own identity.
+   *
+   * It admits nobody. `consume_collab_v2_session_audience_response` returns
+   * before it retires an attachment or closes an endpoint when the action is
+   * `observe`, so neither a reading nor a refusal of one ends anyone's
+   * observation, and no stream identity is created.
+   *
+   * The two halves are returned side by side and never merged: `current` is the
+   * only statement about now, and `operation` is history even when it is the
+   * history of the very change the owner is trying to finish.
+   */
+  async readAudience(input:ReadAudienceInput,operationId:string,signal:AbortSignal):Promise<SessionAudienceState>{
+   assertCanonicalUuid(input.agentSessionId,'AgentSession ID');assertCanonicalUuid(operationId,'Operation ID');
+   if(input.reconcile!==undefined){
+    assertCanonicalUuid(input.reconcile.operationId,'Operation ID');
+    if(input.reconcile.operationId===operationId)throw new OwnerGrantError('identity_mismatch','A question about an earlier change cannot name itself as that change. Nothing was sent.');
+   }
+   const body={version:'2',operation_id:operationId,...(input.reconcile===undefined?{}:{reconcile_operation_id:input.reconcile.operationId})};
+   check(body,'ReadSessionAudienceStateV2Request','sharing question');
+   const answer=await send(ownerObserveGrantOperations.readSessionAudienceStateV2.path.replace('{id}',input.agentSessionId),body,false,signal,'audience-state');
+   check(answer,'SessionAudienceStateV2Receipt','sharing state');
+   const receipt=answer as {state:'reconciled';
+    current:{request_id:string;agent_session_id:string;session_incarnation:string;process_epoch:string;logical_terminal_id:string;
+     result:{status:'observed';state:'public';stream_id:string;generation:string}|{status:'observed';state:'private';generation:string}};
+    operation?:{operation_id:string;status:'unknown'|'recorded'|'pending'|'expired_unrecorded';agent_session_id?:string;action?:SessionAudienceAction|'observe';request_revision?:string;
+     response?:{result:{status:'observed';state:'public';stream_id:string;generation:string}|{status:'observed';state:'private';generation:string}|{status:'unavailable';reason:string}}|null}};
+   const c=receipt.current;
+   if(c.agent_session_id!==input.agentSessionId)throw mismatch('session');
+   if(input.sessionIncarnation!==undefined&&c.session_incarnation!==input.sessionIncarnation)throw mismatch('run of this session');
+   const key=`${c.agent_session_id}/${c.session_incarnation}/${c.process_epoch}`,confirmed=confirmedAudience.get(key);
+   const generation=BigInt(c.result.generation);
+   // An answer below what this client already had confirmed describes a moment
+   // that has passed. The comparison is on `(generation, state)`, not the
+   // generation alone: `public@G` and `private@G` both exist, and the producer's
+   // arithmetic puts the publish that CREATED G before every `private@G`, so a
+   // reading of `public@G` after a confirmed `private@G` is strictly older. An
+   // answer ABOVE every recorded generation is the repaired case, not an error.
+   if(confirmed!==undefined&&audienceFactIsOlder({state:c.result.state,generation:c.result.generation},{state:confirmed.state,generation:confirmed.generation.toString()}))
+    throw new OwnerGrantError('stale_revision','Cuna answered with a sharing state from earlier in this session run than one already confirmed here. The answer was refused; it describes a moment that has passed.');
+   const raw=receipt.operation;
+   if((raw===undefined)!==(input.reconcile===undefined))
+    throw malformed(input.reconcile===undefined?'sharing state carrying history nobody asked for':'sharing state with no answer about the change that was named');
+   let operation:SessionAudienceHistory|undefined;
+   if(raw!==undefined&&input.reconcile!==undefined){
+    if(raw.operation_id!==input.reconcile.operationId)throw mismatch('change');
+    if(raw.status==='unknown')operation={status:'unknown',operationId:raw.operation_id};
+    else{
+     if(raw.agent_session_id!==input.agentSessionId)throw mismatch('session');
+     // The producer refuses one operation identity replayed with a different
+     // action, so history naming another action is history about something this
+     // CLI never sent under that identity.
+     if(raw.action!==input.reconcile.action)throw mismatch('sharing action');
+     const revision=raw.request_revision!;
+     if(raw.status==='recorded'){
+      const result=raw.response!.result;
+      operation=result.status==='observed'
+       ?{status:'recorded',operationId:raw.operation_id,action:raw.action,requestRevision:revision,outcome:{kind:'observed',state:result.state,generation:result.generation,...(result.state==='public'?{streamId:result.stream_id}:{})}}
+       :{status:'recorded',operationId:raw.operation_id,action:raw.action,requestRevision:revision,outcome:{kind:'refused'}};
+     }else operation={status:raw.status,operationId:raw.operation_id,action:raw.action,requestRevision:revision};
+    }
+   }
+   audienceOrder+=1;
+   confirmedAudience.set(key,{order:audienceOrder,action:'observe',state:c.result.state,generation});
+   const current:SessionAudienceReading={agentSessionId:c.agent_session_id,sessionIncarnation:c.session_incarnation,processEpoch:c.process_epoch,logicalTerminalId:c.logical_terminal_id,requestId:c.request_id,state:c.result.state,generation:c.result.generation,...(c.result.state==='public'?{streamId:c.result.stream_id}:{})};
+   return Object.freeze({current,...(operation===undefined?{}:{operation})});
   }
  };
 }

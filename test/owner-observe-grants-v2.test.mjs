@@ -6,7 +6,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {ownerObserveGrantsApi,decodeOwnerGrant,decodeProjectObserverPage,describeGrantState,classifyTransportFailure,audienceRefusalCanResend,OwnerGrantError} from '../dist/api/owner-observe-grants-v2.js';
 import {ownerObserveGrantSchemas,ownerObserveGrantOperations} from '../dist/api/owner-observe-grants-v2-schema.js';
 import {runOwnerGrantsScreen} from '../dist/runtime/owner-grants-screen.js';
-import {ownerGrantOperationStore} from '../dist/runtime/owner-grant-operations.js';
+import {ownerGrantOperationStore,audienceFactRank,audienceFactIsOlder,audienceFactSameRun} from '../dist/runtime/owner-grant-operations.js';
 import {createPlatformAdapter} from '../dist/platform/adapter.js';
 import {CunaError,EXIT_CODES} from '../dist/core/errors.js';
 import {memoryStreams,runCli} from '../dist/index.js';
@@ -30,7 +30,11 @@ test('owner projection is generated from the vendored contract and its check pas
  const header=readFileSync(new URL('../src/api/owner-observe-grants-v2-schema.ts',import.meta.url),'utf8').split('\n')[1];
  assert.ok(header.includes(`contracts/infra/cuna-api.openapi.json; SHA256 ${createHash('sha256').update(bytes).digest('hex')}`));
  const spec=JSON.parse(bytes);for(const [name,schema] of Object.entries(ownerObserveGrantSchemas))assert.deepEqual(schema,spec.components.schemas[name],name);
- assert.deepEqual(Object.keys(ownerObserveGrantOperations).sort(),['createSessionObserveGrantV2','inspectSessionObserveGrantV2','listProjectObserversV2','prepareSessionAudienceV2','revokeSessionObserveGrantV2']);
+ assert.deepEqual(Object.keys(ownerObserveGrantOperations).sort(),['createSessionObserveGrantV2','inspectSessionObserveGrantV2','listProjectObserversV2','prepareSessionAudienceV2','readSessionAudienceStateV2','revokeSessionObserveGrantV2']);
+ // The reading is projected beside the transition: an owner who can change the
+ // audience and cannot read it has no way out of a lost acknowledgement.
+ assert.equal(ownerObserveGrantOperations.readSessionAudienceStateV2.path,'/v1/collaboration/2/agent-sessions/{id}/audience-state');
+ assert.equal(ownerObserveGrantSchemas.ObservedSessionAudienceStateV2.properties.action.const,'observe');
  // Both actions of the canonical enum are projected. Shipping only `publish`
  // would give an owner a way to start disclosing a terminal and no way to stop.
  assert.deepEqual(ownerObserveGrantSchemas.PrepareSessionAudienceV2Request.properties.action.enum,['publish','private']);
@@ -696,11 +700,11 @@ test('an unconfirmed publication keeps its identity, resends only that identity,
  await h.press('s',/Share this session's screen live\?/u);
  await h.press('y',/Unresolved change - outcome unknown/u);
  assert.match(h.last(),/> share +operation/u);
- assert.match(h.last(),/may or may not be shared live now, and Cuna offers no way to ask/u);
- assert.match(h.last(),/asks the session about the same request instead of starting a second one/u);
- assert.match(h.last(),/it is the only thing that can settle this/u);
+ assert.match(h.last(),/Cuna never confirmed this\. Press c to ask the session what it is sharing now/u);
+ assert.match(h.last(),/asks the session about the same request rather than starting a second one/u);
+ assert.match(h.last(),/Press c to ask the session what it is sharing now and what this exact request is recorded to have done/u);
  assert.match(h.last(),/press e: stopping never depends on this answer/u);
- assert.match(h.last(),/e stops live sharing now/u);
+ assert.match(h.last(),/c asks what the session is sharing now; e stops live sharing now/u);
  const kept=await h.records();
  assert.equal(kept.length,1);assert.equal(kept[0].kind,'audience');assert.equal(kept[0].action,'publish');
  assert.equal(kept[0].operationId,bodies[0].operation_id);
@@ -743,11 +747,11 @@ test('an unconfirmed publication survives an exit, and forgetting it names what 
  await second.press('d',/Forget this local record\?/u);
  assert.match(second.last(),/Start of live sharing operation/u);
  assert.match(second.last(),/Cuna is not contacted and nothing is revoked/u);
- assert.match(second.last(),/The outcome stays unknown/u);
- assert.match(second.last(),/anyone holding a grant on it may be watching/u);
- assert.match(second.last(),/Stopping the sharing does not need it and is the only way to be sure/u);
+ assert.match(second.last(),/The outcome of that request stays unknown/u);
+ assert.match(second.last(),/Asking what the session is sharing now does not need it and answers what the session is doing/u);
+ assert.match(second.last(),/stopping the sharing does not need it either and is the only way to be sure/u);
  await second.press('y',/Local record forgotten - nothing was revoked/u);
- assert.match(second.last(),/Stopping live sharing is still available and does not depend on it/u);
+ assert.match(second.last(),/Asking what the session is sharing now, and stopping live sharing, are both still available/u);
  assert.deepEqual(await second.records(),[]);
  second.key('\x03');await second.done;
 });
@@ -770,4 +774,379 @@ test('share preflight rejects non-TTY, JSON, invalid Project and invalid grant b
  for(const argv of [['share','--project',project],['share','--project',project,'--json'],['share','--project','invalid'],['share','--project',project,'--grant','nope'],['share','extra','--project',project]]){const s=memoryStreams();assert.notEqual(await runCli(argv,{streams:s.streams,platform}),0,argv.join(' '));}
  assert.equal(reads,0);const s=memoryStreams();assert.equal(await runCli(['share','--help'],{streams:s.streams,platform}),0);assert.match(s.stdout(),/share --project PROJECT_ID \[--grant GRANT_ID\]/u);assert.match(s.stdout(),/read-only/u);assert.match(s.stdout(),/keyboard control/u);
  const all=memoryStreams();assert.equal(await runCli(['help','--all'],{streams:all.streams,platform}),0);assert.match(all.stdout(),/\[routed\] share :: cuna share --project PROJECT_ID/u);
+});
+
+/* ---- Asking what the session is sharing now: CUNA-COL-024-R3 recovery ---- */
+const reading=(result={status:'observed',state:'private',generation:'4'},patch={})=>({state:'reconciled',
+ current:{type:'session_audience_response_v2',version:'2',request_id:id(21),action:'observe',agent_session_id:session,session_incarnation:id(6),process_epoch:id(71),runtime_lease_id:id(72),logical_terminal_id:id(13),process_start_identity:'123',expected_generation:'4',result,...patch}});
+const recordedPublish={type:'session_audience_response_v2',version:'2',request_id:id(22),action:'publish',agent_session_id:session,session_incarnation:id(6),process_epoch:id(71),runtime_lease_id:id(72),logical_terminal_id:id(13),process_start_identity:'123',expected_generation:'4',result:{status:'observed',state:'public',stream_id:id(23),generation:'5',first_sequence:'1'}};
+const recordedRefusal={...recordedPublish,result:{status:'unavailable',reason:'audience_stale'}};
+const historyRow=(status,patch={})=>({version:'2',kind:'session_audience_operation',operation_id:id(30),status,
+ ...(status==='unknown'?{}:{agent_session_id:session,action:'publish',request_revision:'7',issued_at_ms:1757700000000,deadline_ms:1757700020000,response:null}),...patch});
+const withHistory=(row,result)=>({...reading(result),operation:row});
+
+test('a reading is a query: its own fresh identity, no stream, and a generation Cuna never recorded',async()=>{
+ const requests=[];const api=ownerObserveGrantsApi({request:async r=>{requests.push(r);return reading();}},owner,project);
+ const answer=await api.readAudience({agentSessionId:session,sessionIncarnation:id(6)},id(20),signal);
+ assert.equal(requests[0].path,`/v1/collaboration/2/agent-sessions/${session}/audience-state`);
+ assert.deepEqual(requests[0].body,{version:'2',operation_id:id(20)});
+ assert.deepEqual(answer,{current:{agentSessionId:session,sessionIncarnation:id(6),processEpoch:id(71),logicalTerminalId:id(13),requestId:id(21),state:'private',generation:'4'}});
+ assert.equal(answer.operation,undefined,'no earlier change was named, so no history comes back');
+ assert.equal(Object.hasOwn(answer.current,'firstSequence'),false,'a reading opens no stream');
+ // The repaired case: the runtime is ahead of every generation Cuna recorded.
+ const ahead=ownerObserveGrantsApi({request:async()=>reading({status:'observed',state:'public',stream_id:id(23),generation:'9'})},owner,project);
+ const shared=await ahead.readAudience({agentSessionId:session},id(20),signal);
+ assert.equal(shared.current.state,'public');assert.equal(shared.current.generation,'9');assert.equal(shared.current.streamId,id(23));
+ await assert.rejects(api.readAudience({agentSessionId:session,reconcile:{operationId:id(20),action:'publish'}},id(20),signal),e=>e.kind==='identity_mismatch','a reading cannot name itself as the earlier change');
+ assert.equal(requests.length,1,'a refused local precondition sends nothing');
+});
+
+test('a reading receipt must be about this session, this run and this question',async()=>{
+ const cases=[
+  [reading({status:'observed',state:'public',stream_id:id(23),generation:'9',first_sequence:'1'}),'malformed_receipt'],
+  [reading({status:'observed',state:'public',stream_id:id(23),generation:'0'}),'malformed_receipt'],
+  [reading(undefined,{action:'publish'}),'malformed_receipt'],
+  [reading(undefined,{agent_session_id:other}),'identity_mismatch'],
+  [{state:'observed',current:reading().current},'malformed_receipt'],
+ ];
+ for(const [answer,kind] of cases){
+  const api=ownerObserveGrantsApi({request:async()=>answer},owner,project);
+  await assert.rejects(api.readAudience({agentSessionId:session},id(20),signal),e=>e instanceof OwnerGrantError&&e.kind===kind,JSON.stringify(answer).slice(0,120));
+ }
+ const run=ownerObserveGrantsApi({request:async()=>reading(undefined,{session_incarnation:id(96)})},owner,project);
+ await assert.rejects(run.readAudience({agentSessionId:session,sessionIncarnation:id(6)},id(20),signal),e=>e.kind==='identity_mismatch');
+ // With no run known, whatever the server names is the run.
+ assert.equal((await run.readAudience({agentSessionId:session},id(20),signal)).current.sessionIncarnation,id(96));
+});
+
+test('history is decoded as itself and never merged with the reading beside it',async()=>{
+ const ask=answer=>ownerObserveGrantsApi({request:async()=>answer},owner,project)
+  .readAudience({agentSessionId:session,reconcile:{operationId:id(30),action:'publish'}},id(20),signal);
+ assert.deepEqual((await ask(withHistory(historyRow('unknown')))).operation,{status:'unknown',operationId:id(30)});
+ assert.deepEqual((await ask(withHistory(historyRow('pending')))).operation,{status:'pending',operationId:id(30),action:'publish',requestRevision:'7'});
+ assert.deepEqual((await ask(withHistory(historyRow('expired_unrecorded')))).operation,{status:'expired_unrecorded',operationId:id(30),action:'publish',requestRevision:'7'});
+ // A recorded publish beside a private reading is the case this route exists
+ // for. Neither answer is adjusted to agree with the other.
+ const recorded=await ask(withHistory(historyRow('recorded',{response:recordedPublish})));
+ assert.deepEqual(recorded.operation.outcome,{kind:'observed',state:'public',generation:'5',streamId:id(23)});
+ assert.equal(recorded.current.state,'private');assert.equal(recorded.current.generation,'4');
+ // A recorded REFUSAL is a durable answer that names no audience state at all.
+ const refused=await ask(withHistory(historyRow('recorded',{response:recordedRefusal})));
+ assert.deepEqual(refused.operation.outcome,{kind:'refused'});
+ assert.equal(refused.current.state,'private');
+});
+
+test('a history half that answers a different question is refused',async()=>{
+ const ask=(answer,reconcile={operationId:id(30),action:'publish'})=>ownerObserveGrantsApi({request:async()=>answer},owner,project)
+  .readAudience({agentSessionId:session,...(reconcile===null?{}:{reconcile})},id(20),signal);
+ for(const [answer,kind] of [
+  [withHistory(historyRow('recorded')),'malformed_receipt'],
+  [withHistory(historyRow('pending',{response:recordedPublish})),'malformed_receipt'],
+  [withHistory(historyRow('unknown',{agent_session_id:session,action:'publish',request_revision:'7',issued_at_ms:1,deadline_ms:2,response:null})),'malformed_receipt'],
+  [withHistory(historyRow('recorded',{response:recordedPublish,operation_id:id(31)})),'identity_mismatch'],
+  [withHistory(historyRow('recorded',{response:recordedPublish,agent_session_id:other})),'identity_mismatch'],
+  [withHistory(historyRow('recorded',{response:recordedPublish,action:'private'})),'identity_mismatch'],
+  [reading(),'malformed_receipt'],
+ ])await assert.rejects(ask(answer),e=>e instanceof OwnerGrantError&&e.kind===kind,JSON.stringify(answer).slice(0,140));
+ await assert.rejects(ask(withHistory(historyRow('unknown')),null),e=>e.kind==='malformed_receipt','history nobody asked for is refused too');
+});
+
+test('a reading older than what this client already confirmed is refused, and it supersedes a journaled replay',async()=>{
+ // One stored receipt, returned unchanged on the replay: that is what the
+ // producer does, and a fresh request_id would hide the repeat this asserts.
+ const journaled=audienceReceipt('publish',4);let answer=journaled;
+ const api=ownerObserveGrantsApi({request:async r=>r.path.endsWith('audience-state')?answer:journaled},owner,project);
+ const confirmed=await api.setAudience({agentSessionId:session,action:'publish'},id(7),signal);
+ assert.equal(confirmed.generation,'5');
+ answer=reading({status:'observed',state:'private',generation:'4'});
+ await assert.rejects(api.readAudience({agentSessionId:session},id(20),signal),e=>e.kind==='stale_revision');
+ answer=reading({status:'observed',state:'private',generation:'5'});
+ assert.equal((await api.readAudience({agentSessionId:session},id(21),signal)).current.generation,'5');
+ // The reading is now the newest thing this client knows, so Cuna answering the
+ // publish request again from its journal cannot describe the session now.
+ await assert.rejects(api.setAudience({agentSessionId:session,action:'publish',replay:true},id(7),signal),
+  e=>e.kind==='stale_revision'&&/Cuna has since read this session's current sharing state directly/u.test(e.message)&&/it says the session is not sharing live/u.test(e.message));
+});
+
+test('every refusal of a reading is settled for the reading and silent about every earlier change',async()=>{
+ for(const reason of ['audience_request_invalid','audience_runtime_unavailable','audience_invalid_scope','audience_request_unavailable','audience_request_expired','audience_producer_unavailable','audience_transport_unavailable','audience_response_unavailable','audience_receipt_unavailable','audience_history_unavailable']){
+  const error=classifyTransportFailure(http(503,reason),false,'audience-state');
+  assert.equal(error.kind,'unavailable',reason);
+  assert.equal(error.effectUnknown,false,reason);
+  assert.doesNotMatch(error.message,/audience_/u,reason);
+ }
+ assert.match(classifyTransportFailure(http(503,'audience_transport_unavailable'),false,'audience-state').message,/Machine created before this question existed/u);
+ // A lost answer to a query leaves nothing uncertain, unlike a lost mutation.
+ const lost=classifyTransportFailure(new TypeError('fetch failed'),false,'audience-state');
+ assert.equal(lost.kind,'unavailable');assert.equal(lost.effectUnknown,false);
+ assert.equal(classifyTransportFailure(http(404,'resource_not_found'),false,'audience-state').kind,'not_found');
+ const missing=new CunaError({code:'cuna.remote.operation_not_served',message:'x',exitCode:EXIT_CODES.remote,details:{http_status:404}});
+ assert.match(classifyTransportFailure(missing,false,'audience-state').message,/does not serve the sharing-state question this build asks/u);
+ // The publication route's own table is untouched by the reading's.
+ assert.equal(classifyTransportFailure(http(503,'audience_transport_unavailable'),true,'audience').effectUnknown,true);
+});
+
+const readRoute=r=>r.path.endsWith('/audience-state');
+test('the owner asks what a session is sharing, and the answer changes nothing',async()=>{
+ const h=await harness(r=>{if(route(r)==='observers')return memberPage;if(readRoute(r))return reading({status:'observed',state:'public',stream_id:id(23),generation:'9'});throw Error(r.path);});
+ await h.wait(/Share a session/u);
+ await h.press('c',/When Cuna asked, this session was sharing live/u);
+ assert.match(h.last(),/Share     #9 of this run of the session/u);
+ assert.match(h.last(),/Cuna put the question to the session itself/u);
+ assert.match(h.last(),/Asking changed nothing: it started no share, stopped none, created no grant and disconnected nobody/u);
+ assert.equal(h.requests.length,1);
+ assert.deepEqual(Object.keys(h.requests[0].body).sort(),['operation_id','version'],'nothing was named to reconcile');
+ assert.deepEqual(await h.records(),[],'a query has no effect to recover, so it reserves nothing');
+ h.key('\x03');await h.done;
+});
+
+test('a recorded answer settles the unconfirmed publication and a fresh decision is offered again',async()=>{
+ const bodies=[];let lost=true;
+ const h=await harness(r=>{
+  if(route(r)==='observers')return memberPage;
+  if(readRoute(r))return withHistory(historyRow('recorded',{operation_id:bodies[0].operation_id,response:recordedPublish}),{status:'observed',state:'private',generation:'5'});
+  if(route(r)==='audience'){bodies.push(r.body);if(lost){lost=false;throw new TypeError('fetch failed');}return audienceReceipt(r.body.action,5);}
+  throw Error(r.path);});
+ await h.wait(/Share a session/u);
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Unresolved change - outcome unknown/u);
+ assert.equal((await h.records()).length,1);
+ await h.press('c',/When Cuna asked, this session was not sharing live/u);
+ const ask=h.requests.at(-1);
+ assert.equal(ask.body.reconcile_operation_id,bodies[0].operation_id,'the question names the change that was left open');
+ assert.notEqual(ask.body.operation_id,bodies[0].operation_id,'and never reuses that identity for itself');
+ assert.match(h.last(),/the session started sharing at share #5/u);
+ assert.match(h.last(),/That is what that one request did\. It is not what the session is doing now\./u);
+ assert.match(h.last(),/Last share #5 of this run of the session/u);
+ assert.match(h.last(),/Its local record was dropped/u);
+ assert.deepEqual(await h.records(),[],'an answered request has nothing left to finish');
+ assert.doesNotMatch(h.last(),/earlier change has an unknown outcome/u);
+ // And a fresh decision is issued normally, with no restart and no block.
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Live sharing started - Cuna confirmed it/u);
+ assert.equal(bodies.length,2);
+ assert.notEqual(bodies[1].operation_id,bodies[0].operation_id,'a fresh decision is a fresh identity');
+ h.key('\x03');await h.done;
+});
+
+test('an expired unrecorded change stays unknown, stops being resendable and survives an exit',async()=>{
+ const first=await harness(r=>{if(route(r)==='audience')throw new TypeError('fetch failed');throw Error(r.path);});
+ await first.wait(/Share a session/u);
+ await first.press('s',/Share this session's screen live\?/u);
+ await first.press('y',/Unresolved change - outcome unknown/u);
+ const stuck=(await first.records())[0].operationId;
+ first.key('\x03');await first.done;
+ // A new process on the same state directory recovers that exact operation and
+ // can ask about it by name.
+ const second=await harness(r=>{if(route(r)==='observers')return memberPage;
+  if(readRoute(r))return withHistory(historyRow('expired_unrecorded',{operation_id:r.body.reconcile_operation_id}),{status:'observed',state:'public',stream_id:id(23),generation:'7'});
+  throw Error(r.path);},{},first.context);
+ await second.wait(/Unresolved change - outcome unknown/u);
+ assert.match(second.last(),/Press c to ask the session what it is sharing now/u);
+ await second.press('c',/When Cuna asked, this session was sharing live/u);
+ assert.equal(second.requests.at(-1).body.reconcile_operation_id,stuck);
+ assert.match(second.last(),/ran out of time with no answer recorded/u);
+ assert.match(second.last(),/Whether it took effect is unknown, and it will stay unknown/u);
+ assert.match(second.last(),/Share     #7 of this run of the session/u);
+ assert.doesNotMatch(second.last(),/Its local record was dropped/u);
+ const kept=await second.records();
+ assert.equal(kept.length,1);assert.equal(kept[0].operationId,stuck,'only the owner removes a record no answer settled');
+ // Resending it can no longer settle anything, and is no longer offered.
+ await second.press('p',/Unresolved change - outcome unknown/u);
+ assert.doesNotMatch(second.last(),/r resends this exact operation/u);
+ assert.match(second.last(),/Cuna will not raise this request with the session again/u);
+ assert.match(second.last(),/Asking what the session is sharing now still answers what the session is doing/u);
+ second.key('\x03');await second.done;
+});
+
+test('a reading that does not answer leaves the unfinished change exactly as it was',async()=>{
+ const h=await harness(r=>{if(route(r)==='observers')return memberPage;
+  if(readRoute(r))throw audienceProblem('audience_transport_unavailable');
+  if(route(r)==='audience')throw new TypeError('fetch failed');throw Error(r.path);});
+ await h.wait(/Share a session/u);
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Unresolved change - outcome unknown/u);
+ const stuck=(await h.records())[0].operationId;
+ await h.press('c',/Last reason/u);
+ assert.match(h.last(),/Machine created before this question existed/u);
+ assert.doesNotMatch(h.last(),/audience_transport_unavailable/u);
+ assert.doesNotMatch(h.last(),/When Cuna asked, this session was (not )?sharing live/u,'a question that failed states no current state');
+ assert.match(h.last(),/r resends this exact operation/u,'the only identity that can finish it is still offered');
+ const kept=await h.records();
+ assert.equal(kept.length,1);assert.equal(kept[0].operationId,stuck);
+ h.key('\x03');await h.done;
+});
+
+test('an unknown operation is an answer: Cuna never issued it, so it changed nothing',async()=>{
+ const h=await harness(r=>{if(route(r)==='observers')return memberPage;
+  if(readRoute(r))return withHistory(historyRow('unknown',{operation_id:r.body.reconcile_operation_id}));
+  if(route(r)==='audience')throw new TypeError('fetch failed');throw Error(r.path);});
+ await h.wait(/Share a session/u);
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Unresolved change - outcome unknown/u);
+ await h.press('c',/When Cuna asked, this session was not sharing live/u);
+ assert.match(h.last(),/Cuna has no record of the earlier start of live sharing/u);
+ assert.match(h.last(),/It never reached the session, so it changed nothing/u);
+ assert.deepEqual(await h.records(),[]);
+ h.key('\x03');await h.done;
+});
+
+/* ---- F1: two processes on one state directory, from the acceptance review ---- */
+/* A second `cuna share` on the same state directory is a genuinely separate
+   store object over the same files, which is what two processes are. The
+   reviewer's counterexamples are reproduced through the real screen, the real
+   store and the real decoder; only the transport and the host are local. */
+const siblingStore=context=>ownerGrantOperationStore(context.platform,{baseUrl:'https://api.getcuna.com',profile:'default',ownerPrincipalId:owner,projectId:project});
+async function twoProcesses({answer,confirm}){
+ let release;const held=new Promise(resolve=>{release=resolve;});
+ const asker=await harness(async r=>{
+  if(route(r)==='observers')return memberPage;
+  if(readRoute(r)){await held;return answer;}
+  throw Error(r.path);});
+ await asker.wait(/Share a session/u);
+ // The question leaves, and its answer is still in flight.
+ asker.key('c');await tick();
+ const other=confirm===null?null:await harness(r=>{
+  if(route(r)==='observers')return memberPage;
+  if(route(r)==='audience')return confirm;
+  throw Error(r.path);},{},{...asker.context,store:siblingStore(asker.context)});
+ if(other!==null){
+  await other.wait(/Share a session/u);
+  await other.press(confirm.response.action==='publish'?'s':'e',/Share this session's screen live\?|Stop sharing this session live\?/u);
+  await other.press('y',/Live sharing (started|stopped) - Cuna confirmed it/u);
+ }
+ release();
+ return {asker,other};
+}
+
+test('F1 counterexample 1: a held answer of public@1 is not painted after another process confirmed private@1',async()=>{
+ const {asker,other}=await twoProcesses({answer:reading({status:'observed',state:'public',stream_id:id(23),generation:'1'}),confirm:audienceReceipt('private',1)});
+ await asker.wait(/Cuna answered about an earlier moment than this computer already knows about/u);
+ // The exact sentence the review saw is gone, in the direction that matters.
+ assert.doesNotMatch(asker.last(),/When Cuna asked, this session was sharing live/u,'a shared terminal must never be reported as this session\'s state from a stale answer');
+ assert.doesNotMatch(asker.last(),/Share     #1 of this run/u);
+ assert.match(asker.last(),/A sharing change confirmed on this computer: not sharing live, last share #1\./u);
+ assert.match(asker.last(),/is not shown as this session's state/u);
+ assert.match(asker.last(),/Press c to ask again|c asks again/u);
+ asker.key('\x03');await asker.done;other.key('\x03');await other.done;
+});
+
+test('F1 counterexample 2: a held answer of private@1 is not painted after another process confirmed public@2',async()=>{
+ const {asker,other}=await twoProcesses({answer:reading({status:'observed',state:'private',generation:'1'}),confirm:audienceReceipt('publish',1)});
+ await asker.wait(/Cuna answered about an earlier moment than this computer already knows about/u);
+ // This is the direction that tells an owner a shared terminal is private.
+ assert.doesNotMatch(asker.last(),/When Cuna asked, this session was not sharing live/u);
+ assert.match(asker.last(),/A sharing change confirmed on this computer: sharing live at share #2\./u);
+ asker.key('\x03');await asker.done;other.key('\x03');await other.done;
+});
+
+test('F1 control: the same answer, with no other process, IS painted',async()=>{
+ // Same instrument, same held answer, one variable flipped: nothing else
+ // confirmed anything. If this did not paint, the two tests above would prove
+ // nothing about ordering.
+ const first=await twoProcesses({answer:reading({status:'observed',state:'public',stream_id:id(23),generation:'1'}),confirm:null});
+ await first.asker.wait(/When Cuna asked, this session was sharing live/u);
+ assert.match(first.asker.last(),/Share     #1 of this run of the session/u);
+ assert.doesNotMatch(first.asker.last(),/earlier moment than this computer already knows/u);
+ first.asker.key('\x03');await first.asker.done;
+ const second=await twoProcesses({answer:reading({status:'observed',state:'private',generation:'1'}),confirm:null});
+ await second.asker.wait(/When Cuna asked, this session was not sharing live/u);
+ second.asker.key('\x03');await second.asker.done;
+});
+
+test('F1: a reading says what was true when it was answered, never what is true now',async()=>{
+ const h=await harness(r=>{if(route(r)==='observers')return memberPage;if(readRoute(r))return reading();throw Error(r.path);});
+ await h.wait(/Share a session/u);
+ await h.press('c',/When Cuna asked, this session was not sharing live/u);
+ assert.match(h.last(),/not a promise about now: any window signed in to this account can change it at any moment/u);
+ assert.match(h.last(),/This computer can only compare an answer against sharing changes made on this computer/u);
+ assert.doesNotMatch(h.last(),/right now/u,'no screen may promise the present tense for an observation');
+ h.key('\x03');await h.done;
+});
+
+test('F1: an answer this computer already knows is out of date never becomes the newest thing it knows',async()=>{
+ const store=(await newStore());
+ const fact={kind:'transition',agentSessionId:session,sessionIncarnation:id(6),processEpoch:id(71),state:'private',generation:'4'};
+ const recorded=await store.store.recordAudienceFact(fact);
+ assert.equal(recorded.generation,'4');assert.equal(recorded.state,'private');
+ // An older moment of the same run is not written over the newer one.
+ const older=await store.store.recordAudienceFact({...fact,kind:'reading',state:'public',generation:'4'});
+ assert.equal(older.state,'private','public@4 came before private@4, so it cannot replace it');
+ assert.equal((await store.store.readAudienceFact(session)).state,'private');
+ // A later moment is.
+ const newer=await store.store.recordAudienceFact({...fact,kind:'reading',state:'public',generation:'5'});
+ assert.equal(newer.generation,'5');assert.equal(newer.state,'public');
+ // A different run cannot be ordered against this one, so it replaces outright.
+ const nextRun=await store.store.recordAudienceFact({...fact,sessionIncarnation:id(77),state:'private',generation:'0'});
+ assert.equal(nextRun.sessionIncarnation,id(77));assert.equal(nextRun.generation,'0');
+ // Nothing but identifiers, a state word and a counter is persisted.
+ assert.deepEqual(Object.keys(nextRun).sort(),['agentSessionId','generation','kind','processEpoch','scope','sessionIncarnation','state','version']);
+ assert.equal(await store.store.readAudienceFact(id(88)),null,'a session with no record reads as absent, not as private');
+});
+
+test('F1: the order is the producer arithmetic, not a clock and not a counter',()=>{
+ // `public@G` is created by the publish that answers G; every `private@G` is
+ // issued once G exists. So at one generation private is never older.
+ assert.equal(audienceFactRank({state:'private',generation:'5'})-audienceFactRank({state:'public',generation:'5'}),1n);
+ assert.ok(audienceFactIsOlder({state:'public',generation:'5'},{state:'private',generation:'5'}));
+ assert.ok(!audienceFactIsOlder({state:'private',generation:'5'},{state:'public',generation:'5'}));
+ assert.ok(audienceFactIsOlder({state:'private',generation:'5'},{state:'public',generation:'6'}));
+ assert.ok(!audienceFactIsOlder({state:'private',generation:'5'},{state:'private',generation:'5'}),'an equal answer agrees, it is not stale');
+ assert.ok(audienceFactSameRun({sessionIncarnation:id(6),processEpoch:id(71)},{sessionIncarnation:id(6),processEpoch:id(71)}));
+ assert.ok(!audienceFactSameRun({sessionIncarnation:id(6),processEpoch:id(71)},{sessionIncarnation:id(6),processEpoch:id(72)}));
+});
+
+/* ---- F3: an uncertain publication never hides an explicit grant revocation ---- */
+test('F3: --grant reaches the grant and revokes it while an expired publication stands',async()=>{
+ const first=await harness(r=>{if(route(r)==='audience')throw new TypeError('fetch failed');throw Error(r.path);});
+ await first.wait(/Share a session/u);
+ await first.press('s',/Share this session's screen live\?/u);
+ await first.press('y',/Unresolved change - outcome unknown/u);
+ const stuck=(await first.records())[0].operationId;
+ first.key('\x03');await first.done;
+ // A new process opened on that grant: the sharing record must not hide it.
+ let state=active;const revokes=[];
+ const second=await harness(r=>{
+  if(route(r)==='observers')return memberPage;
+  if(route(r)==='inspect')return state;
+  if(route(r)==='revoke'){revokes.push(r.body);state=revoking;return revoking;}
+  throw Error(r.path);},{initialGrantId:active.grant_id},first.context);
+ await second.wait(/Observation grant ba600000 - Active/u);
+ assert.match(second.last(),/1 earlier change has an unknown outcome\. Press p/u,'recovery is named, not lost');
+ assert.match(second.last(),/No new start of live sharing can begin/u);
+ assert.match(second.last(),/granting or revoking observation are all still available/u);
+ assert.doesNotMatch(second.last(),/No new grant or revocation can start/u,'a sharing record is not a grant record');
+ // And the revocation actually goes through.
+ await second.press('x',/Revocation requested, not yet effective/u);
+ assert.equal(revokes.length,1);assert.deepEqual(revokes[0],{version:'2',operation_id:revokes[0].operation_id,expected_revision:1});
+ // The uncertain publication is preserved untouched, and never resent.
+ const kept=await second.records();
+ assert.equal(kept.filter(op=>op.kind==='audience').length,1);
+ assert.equal(kept.find(op=>op.kind==='audience').operationId,stuck);
+ assert.equal(second.requests.filter(r=>route(r)==='audience').length,0,'nothing about sharing left the client');
+ // Recovery is still one keypress away from here.
+ await second.press('p',/Unresolved change - outcome unknown/u);
+ assert.match(second.last(),new RegExp(`operation ${stuck}`,'u'));
+ second.key('\x03');await second.done;
+});
+
+test('F3: an uncertain grant change still blocks a grant change, and an uncertain publication still blocks a publication',async()=>{
+ // The separation is per authority, not a removal of the guard.
+ const h=await harness(r=>{if(route(r)==='observers')return memberPage;if(route(r)==='observe-grants')return active;if(route(r)==='audience')throw new TypeError('fetch failed');throw Error(r.path);});
+ await h.wait(/Share a session/u);
+ await h.press('s',/Share this session's screen live\?/u);
+ await h.press('y',/Unresolved change - outcome unknown/u);
+ await h.press('b',/Share a session/u);
+ // Same authority: still refused.
+ await h.press('s',/Cannot start live sharing while an earlier change has an unknown outcome/u);
+ // Different authority: the grant path is reachable and sends its own request.
+ await h.press('b',/Share a session/u);
+ await h.press('\r',/Choose the member/u);
+ await h.press('\r',/Press 1, 2 or 3/u);
+ await h.press('1',/Observation grant ba600000 - Active/u);
+ assert.equal(h.requests.filter(r=>route(r)==='observe-grants').length,1,'the grant was created despite the uncertain publication');
+ assert.equal(h.requests.filter(r=>route(r)==='audience').length,1,'and nothing about sharing was re-sent');
+ const records=await h.records();
+ assert.equal(records.length,1);assert.equal(records[0].kind,'audience','the uncertain publication is preserved exactly');
+ h.key('\x03');await h.done;
 });
