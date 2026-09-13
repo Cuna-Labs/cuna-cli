@@ -68,6 +68,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "Print the account context as one tab-separated line: identity, admission, then\nworkspace state. `cuna whoami` runs the same read and prints the same line; only\nthe --json record name differs (access.status against whoami). The status action\nis required. No command options.",
   ),
   observe: topic("Usage:\n  cuna observe --project PROJECT_ID", "Discover sessions shared with your signed-in account and select one read-only view. Requires an interactive terminal and human login. Escape or Ctrl+C closes only this local view. Reconnect requests fresh admission; no keyboard, resize or signal is sent to the agent."),
+  share: topic("Usage:\n  cuna share --project PROJECT_ID [--grant GRANT_ID]", "As the Project owner, pick one of your AgentSessions, pick a distinct member who\nalready holds observer membership, and grant read-only observation for 1, 8 or 24\nhours. The grant screen shows the exact state Cuna reports (active, revocation\nrequested but not yet effective, revoked and effective, expired); i inspects\nagain on demand and x revokes against the revision you read. --grant opens one\nexisting grant directly. Requires an interactive terminal and human login.\nAn invitation or membership alone grants no observation; observation grants no\nkeyboard control. A change whose answer never arrives is shown as unknown and\ncan be resent only under the same operation identity."),
   capabilities: topic(
     "Usage:\n  cuna capabilities [--scope SCOPE] [--resource-id ID]",
     [

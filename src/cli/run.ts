@@ -1,5 +1,8 @@
 import {observerApi} from "../api/observer-v2.js";
 import {runObserverScreen} from "../runtime/observer-screen.js";
+import {ownerObserveGrantsApi} from "../api/owner-observe-grants-v2.js";
+import {runOwnerGrantsScreen,type ShareableSession,type ShareableSessionListing} from "../runtime/owner-grants-screen.js";
+import {ownerGrantOperationStore} from "../runtime/owner-grant-operations.js";
 import { runProviderScreen } from "../machines/provider-screen.js";
 import { Writable } from "node:stream";
 import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
@@ -420,7 +423,7 @@ function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>>
 }
 
 function needsRemoteCredential(command: string | undefined, foreground: ForegroundSelection | undefined): boolean {
-  return command === "observe" || command === "capabilities" || command === "machines" || command === "agent-sessions" ||
+  return command === "observe" || command === "share" || command === "capabilities" || command === "machines" || command === "agent-sessions" ||
     command === "agent" || command === "executions" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
     command === "account" || command === "workspace" || command === "usage" ||
@@ -1072,6 +1075,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // across embedded invocations.
     if (parsed.command !== undefined) preflightInvocation(parsed, (dependencies.now ?? Date.now)());
     if(parsed.command==="observe"&&(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true))throw usageError("observe requires an interactive terminal; JSON and redirected output are unsupported.");
+    if(parsed.command==="share"&&(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true))throw usageError("share requires an interactive terminal; JSON and redirected output are unsupported.");
 
     let journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "opencode"
       ? preflightAgentJourneyInvocation(parsed)
@@ -1452,6 +1456,23 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // another process changing local credentials; established streams rely on server authority.
       const identity=await client.getIdentity(dependencies.signal);
       await runObserverScreen(observerApi(httpTransport,identity.id,stringOption(parsed,"project")!,async()=>(await client.getIdentity(dependencies.signal)).id),config.baseUrl,undefined,dependencies.signal);
+      return EXIT_CODES.success;
+    }
+    if(parsed.command==="share"){
+      if(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true||credentialMode!=="interactive"||!httpTransport)throw usageError("share requires an interactive terminal and human login.");
+      const project=stringOption(parsed,"project")!,identity=await client.getIdentity(dependencies.signal);
+      // Sessions come from the same Machine/AgentSession reads the explorer uses; the
+      // server names each session's Project, and the grant receipt is bound to it again.
+      // Both reads are bounded: at most 20 Machines, one AgentSession page each.
+      // What those bounds cut off is counted and returned, because a screen that
+      // shows a subset of the owner's own sessions without saying so is a false
+      // statement about their account.
+      const sessions={async list(signal:AbortSignal):Promise<ShareableSessionListing>{const all=(await client.listMachines(signal)).items;const machines=all.slice(0,20);const rows:ShareableSession[]=[];let machinesWithMoreSessions=0;for(const machine of machines){const page=await client.listAgentSessions(machine.id,{},signal);if(page.nextCursor!==undefined)machinesWithMoreSessions+=1;for(const s of page.items){if(s.processState==="terminated")continue;rows.push({id:s.id,name:s.name,agent:s.agent,machineName:machine.name,state:s.processState,...(s.projectId===undefined?{}:{projectId:s.projectId})});}}return{items:rows,omittedMachines:all.length-machines.length,machinesWithMoreSessions};}};
+      // The operation store outlives this process: an unanswered grant or
+      // revocation keeps its exact operation ID on disk, so the next `cuna
+      // share` opens on it instead of losing the authority it may have created.
+      const operations=ownerGrantOperationStore(platform,{baseUrl:config.baseUrl,profile:config.profile,ownerPrincipalId:identity.id,projectId:project});
+      await runOwnerGrantsScreen(ownerObserveGrantsApi(httpTransport,identity.id,project,async()=>(await client.getIdentity(dependencies.signal)).id),sessions,operations,{project,owner:identity.id},{...(dependencies.signal===undefined?{}:{signal:dependencies.signal}),...(stringOption(parsed,"grant")===undefined?{}:{initialGrantId:stringOption(parsed,"grant")!})});
       return EXIT_CODES.success;
     }
     if (interactiveRoot) {

@@ -650,6 +650,12 @@ export function preflightInvocation(
       rejectUnknownOptions(parsed,["project"]);
       if(parsed.operands.length!==0)throw usageError("observe accepts no operands.");
       assertCanonicalUuid(stringOption(parsed,"project")??"","Project ID");return;
+    case "share":{
+      rejectUnknownOptions(parsed,["project","grant"]);
+      if(parsed.operands.length!==0)throw usageError("share accepts no operands.");
+      assertCanonicalUuid(stringOption(parsed,"project")??"","Project ID");
+      const grant=stringOption(parsed,"grant");if(grant!==undefined)assertCanonicalUuid(grant,"Grant ID");return;
+    }
     case "capabilities": {
       rejectUnknownOptions(parsed, ["scope", "resource-id"]);
       if (parsed.operands.length !== 0) throw usageError("capabilities accepts no operands.");
