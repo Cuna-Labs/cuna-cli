@@ -261,6 +261,18 @@ invariant(
   leaseAttestAt >= 0 && (reviewJob.steps[leaseAttestAt].with?.["subject-path"] ?? "").includes("release-approval-lease.json"),
   "The attestation must name the lease itself as its subject",
 );
+// A refused review still establishes who approved it, and that is the one fact
+// this repository has never been able to observe. It must survive a refusal.
+const evidenceUpload = (reviewJob.steps ?? []).find((step) =>
+  typeof step?.uses === "string" && step.uses.startsWith("actions/upload-artifact@") &&
+  typeof step.with?.name === "string" && step.with.name.startsWith("release-review-evidence")
+);
+invariant(evidenceUpload, "Release review must retain its evidence when a check refuses");
+invariant(evidenceUpload.if === "always()", "The evidence upload must run on refusal, which is the case it exists for");
+invariant(
+  evidenceUpload.with?.path === "evidence/",
+  "The refusal-path upload must be scoped to evidence/; widening it to approval/ would let a refused review emit a partial lease",
+);
 
 // The observation cohort is the authorizing counterpart of CI's explicitly
 // non-authorizing observation lane. What makes it authorizing is that its lanes
