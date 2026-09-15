@@ -112,7 +112,7 @@
       "additionalProperties": false,
       "required": ["producerRepository", "sourceCommit", "contractSha256", "approvalAttestationSha256"],
       "properties": {
-        "producerRepository": {"const": "Cuna-Labs/infra"},
+        "producerRepository": {"const": "Cuna-Labs/infra-proxy-mvp"},
         "sourceCommit": {"$ref": "#/$defs/commit"},
         "contractSha256": {"$ref": "#/$defs/sha256"},
         "approvalAttestationSha256": {"$ref": "#/$defs/sha256"}

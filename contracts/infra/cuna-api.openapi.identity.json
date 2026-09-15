@@ -4,7 +4,7 @@
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
   "infra_openapi_raw_sha256": "f4c2d396b94f296b22df276435dc04ecf1da48807efa1e819c4cbff9ea59a83e",
   "infra_openapi_canonical_sha256": "43213c2adac602676437b612b7d4153707e09155bdc4fa3029cca15a0b207ecc",
-  "producer_repository": "Cuna-Labs/infra",
+  "producer_repository": "Cuna-Labs/infra-proxy-mvp",
   "producer_content_state": "committed",
   "producer_revision": "7b1b3e425ed273986a909a68395b5272bd6a01ba",
   "producer_full_tree": {

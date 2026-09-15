@@ -12,7 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const targetArtifact = path.join(root, "contracts", "infra", "cuna-api.openapi.json");
 const targetDigest = path.join(root, "contracts", "infra", "cuna-api.openapi.sha256");
 const targetIdentity = path.join(root, "contracts", "infra", "cuna-api.openapi.identity.json");
-const producerRepository = "Cuna-Labs/infra";
+const producerRepository = "Cuna-Labs/infra-proxy-mvp";
 const expectedSourceName = "runa-api.openapi.json";
 const sha256 = /^[0-9a-f]{64}$/u;
 
