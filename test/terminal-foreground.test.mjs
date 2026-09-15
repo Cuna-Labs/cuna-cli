@@ -1984,3 +1984,22 @@ test("a frame identical to the one the host already shows is not written again",
   await waitUntil(() => host.writes.length > beforeResize, "a resize must repaint");
   await coordinator.stop();
 });
+
+test("automatic recovery keeps trying for a bounded ten attempts before reporting reconnect failure", async () => {
+  // A resize can make the gateway reset the terminal view for several seconds.
+  // Three quick attempts (~0.7 s) used to give up inside that window while a
+  // fresh attach a minute later succeeded; the bound is ten, still explicit.
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectBaseDelayMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw runtimeFailure("terminal_disconnected", "still resetting", { retryable: true });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Reconnect failed"), "recovery eventually reports failure");
+  assert.equal(calls.reconnect.length, 10, "the default budget is ten bounded attempts");
+  assert.equal(coordinator.state, "active", "a failed automatic recovery leaves the person in control, not detached");
+  await coordinator.stop();
+});

@@ -63,6 +63,13 @@ const MAX_DISCONNECT_FRAME_MS = 250;
 const INPUT_WITHHELD_NOTICE = "Reconnecting · input was not sent. Retry after terminal attached.";
 const FLOW_CONTROL_NOTICE = "Terminal output kept active · Ctrl+] s sends Ctrl+S remotely.";
 const RECONNECT_FAILED_NOTICE = "Reconnect failed · Ctrl+] r retries · Ctrl+C disconnects.";
+// Automatic recovery back-off: 100 ms doubling, capped at 5 s per wait, ten
+// attempts, about 26 s in total. Three attempts (~0.7 s) gave up while the
+// gateway was still resetting a terminal view after a host resize, leaving
+// the person on "Reconnect failed" although a fresh attach a minute later
+// succeeded (2026-09-15, session 7d73bf08). The bound stays explicit; a
+// non-retryable refusal still stops the loop on its first occurrence.
+const DEFAULT_RECONNECT_ATTEMPTS = 10;
 const BRACKETED_PASTE_START = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e);
 const BRACKETED_PASTE_END = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e);
 const CLAUDE_LOCAL_ACTION_KINDS = Object.freeze(["browser.open"] as const);
@@ -231,7 +238,7 @@ export class ForegroundTerminalCoordinator {
     if (!Number.isSafeInteger(resizeCoalesceMs) || resizeCoalesceMs < 1 || resizeCoalesceMs > 1_000) {
       throw new RangeError("Foreground resize coalescing must be between 1 and 1000 milliseconds.");
     }
-    const reconnectAttempts = options.reconnectAttempts ?? 3;
+    const reconnectAttempts = options.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS;
     const reconnectBaseDelayMs = options.reconnectBaseDelayMs ?? 100;
     const disconnectFrameMs = options.disconnectFrameMs ?? DISCONNECT_FRAME_MS;
     if (!Number.isSafeInteger(reconnectAttempts) || reconnectAttempts < 1 || reconnectAttempts > 10) {
@@ -738,7 +745,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   async #recoverTab(tabId: string): Promise<void> {
-    const attempts = this.#options.reconnectAttempts ?? 3;
+    const attempts = this.#options.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS;
     const baseDelayMs = this.#options.reconnectBaseDelayMs ?? 100;
     let lastFailure: unknown;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
