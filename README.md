@@ -14,11 +14,6 @@ on Cuna cloud machines. The CLI keeps machine lifecycle, synchronization,
 authorizations, and runtime evidence explicit instead of hiding them behind an
 opaque remote shell.
 
-> [!WARNING]
-> Cuna CLI is under active implementation and is not GA. The npm, Bun, curl,
-> Homebrew, and AUR commands below are the approved distribution interfaces;
-> this repository does not claim that every channel is live yet.
-
 ## Current capabilities
 
 - Versioned human and JSON output with stable error and exit-code categories.
