@@ -31,6 +31,51 @@ export function parseArgs(argv) {
   return result;
 }
 
+const DIGIT_ALPHABET = "0123456789";
+const HEX_ALPHABET = "0123456789abcdef";
+const LOGIN_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";
+
+// Two of these release scripts take a value out of a file or off the network and
+// then use it to build a URL, or write it to disk. Validating with a regular
+// expression establishes the value is well formed but leaves the ORIGINAL
+// string in hand, so a reviewer -- and CodeQL -- still sees remote or
+// repository-controlled bytes reaching an effect.
+//
+// These rebuild the value one character at a time out of a local alphabet, so
+// what reaches the effect is composed entirely of constants chosen by this
+// file, with a length this file bounds. The check and the guarantee become the
+// same thing rather than two claims a reader has to connect.
+function rebuildFromAlphabet(value, alphabet, maximumLength, label) {
+  invariant(typeof value === "string", `${label} must be a string`);
+  invariant(value.length >= 1 && value.length <= maximumLength, `${label} length is out of range`);
+  let rebuilt = "";
+  for (const character of value) {
+    const index = alphabet.indexOf(character);
+    invariant(index >= 0, `${label} contains an unsupported character`);
+    rebuilt += alphabet[index];
+  }
+  return rebuilt;
+}
+
+/** A decimal identifier with no leading zero, rebuilt from local digits. */
+export function strictDecimalId(value, label) {
+  const rebuilt = rebuildFromAlphabet(String(value), DIGIT_ALPHABET, 20, label);
+  invariant(!rebuilt.startsWith("0"), `${label} must not have a leading zero`);
+  return rebuilt;
+}
+
+/** A lowercase hexadecimal string of exactly `length`, rebuilt from local digits. */
+export function strictHex(value, length, label) {
+  const rebuilt = rebuildFromAlphabet(value, HEX_ALPHABET, length, label);
+  invariant(rebuilt.length === length, `${label} must be exactly ${length} hexadecimal characters`);
+  return rebuilt;
+}
+
+/** A GitHub login, rebuilt from the local login alphabet. */
+export function strictLogin(value, label) {
+  return rebuildFromAlphabet(value, LOGIN_ALPHABET, 39, label);
+}
+
 export async function sha256File(file) {
   const bytes = await readFile(file);
   return createHash("sha256").update(bytes).digest("hex");

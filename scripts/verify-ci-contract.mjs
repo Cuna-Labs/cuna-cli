@@ -168,8 +168,8 @@ invariant(
 const reviewJob = releaseReviewWorkflow.jobs?.review;
 invariant(reviewJob?.environment === "release-review-npm-preview", "Release review must preserve its separate protected environment identity");
 invariant(
-  JSON.stringify(reviewJob.permissions) === JSON.stringify({ actions: "read", contents: "read" }),
-  "Blocked release review must retain a strictly read-only token",
+  JSON.stringify(reviewJob.permissions) === JSON.stringify({ actions: "read", contents: "read", "id-token": "write", attestations: "write" }),
+  "Release review must hold exactly the token it needs: evidence reads plus attestation of the lease it mints, and no write to repository contents",
 );
 const reviewRuns = (reviewJob.steps ?? []).map((step) => step?.run).filter((run) => typeof run === "string").join("\n");
 invariant(
@@ -179,41 +179,117 @@ invariant(
   "Release review does not bind protected-main candidate and exact candidate provenance",
 );
 invariant(
-  releaseReviewAuthority.status === "UNCONFIGURED_BLOCKING" &&
+  releaseReviewAuthority.schemaVersion === 2 &&
+    releaseReviewAuthority.status === "CONFIGURED" &&
     releaseReviewAuthority.environment === "release-review-npm-preview" &&
+    releaseReviewAuthority.protectedRef === "main" &&
     releaseReviewAuthority.requiredReviewer?.id === 312749809 &&
     releaseReviewAuthority.requiredReviewer?.login === "cunitacodeitor" &&
-    releaseReviewAuthority.observedAdminBypass === true &&
+    releaseReviewAuthority.requireAdminBypassDisabled === true &&
+    releaseReviewAuthority.requirePreventSelfReview === true &&
     releaseReviewAuthority.requiredApprovalEvidence === "EXACT_APPROVER_ID_LOGIN_EVENT_AND_RUN_BINDING",
-  "Release-review declaration must preserve its exact observed, separately blocked authority",
+  "Release-review declaration must require the exact reviewer, self-review refusal, and a disabled admin bypass",
+);
+invariant(
+  !Object.hasOwn(releaseReviewAuthority, "observedAdminBypass") && !Object.hasOwn(releaseReviewAuthority, "blockers"),
+  "Release-review declaration must state what is required, not freeze an observed broken state as the requirement",
 );
 const reviewInputs = Object.keys(releaseReviewWorkflow.on?.workflow_dispatch?.inputs ?? {}).sort();
-invariant(
-  JSON.stringify(reviewInputs) === JSON.stringify(["candidate_envelope_sha256", "candidate_run_id", "candidate_sha256", "source_commit", "version"]),
-  "Blocked release review may accept only candidate identity inputs",
-);
+// Every permitted input names a run or a digest, never a decision. A dispatcher
+// can choose WHICH candidate and WHICH observation run are reviewed; it cannot
+// supply an approver, a cohort result, or a contract approval. This named check
+// runs before the exact-set check below so that smuggling in authority reports
+// as smuggled authority rather than as a set mismatch.
 for (const forbidden of [
-  "build-release-approval-lease",
-  "release-approval-expectation",
-  "release-approval-lease",
-  "approverIdentityClass",
+  "approver_id",
+  "approver_login",
+  "approval_decision",
   "contract_source_commit",
   "contract_sha256",
   "contract_approval_attestation_sha256",
   "receipt_cohort_sha256",
   "receipt_verification_sha256",
-]) invariant(!releaseReview.includes(forbidden), `Blocked release review contains caller-supplied or apparent minting authority: ${forbidden}`);
-for (const blocker of [
-  "RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED",
-  "ACTUAL_ENVIRONMENT_APPROVAL_EVENT_NOT_OBSERVABLE_BY_WORKFLOW_TOKEN",
-  "CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE",
-  "CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE",
-  "CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED",
-]) invariant(reviewRuns.includes(blocker), `Release review is missing fail-closed blocker: ${blocker}`);
+  "solo_owner_risk_accepted",
+]) invariant(!reviewInputs.includes(forbidden), `Release review accepts caller-supplied authority as an input: ${forbidden}`);
 invariant(
-  reviewRuns.includes("inputs.contractSet?.releaseAuthority !== 'UNRESOLVED_BLOCKING'") &&
-    reviewRuns.trimEnd().endsWith("exit 1"),
-  "Release review must observe the unresolved candidate contract and terminate without minting",
+  JSON.stringify(reviewInputs) === JSON.stringify([
+    "candidate_envelope_sha256",
+    "candidate_run_id",
+    "candidate_sha256",
+    "observation_run_id",
+    "source_commit",
+    "version",
+  ]),
+  "Release review may accept only candidate and evidence-run identity inputs",
+);
+
+// The five names that used to be printed by an unconditional failure step are
+// now produced by checks that read live state. Each must still be reachable,
+// and each must run before anything is minted -- a gate that mints first and
+// checks afterwards is not a gate.
+const reviewStepRunIndex = (needle) =>
+  (reviewJob.steps ?? []).findIndex((step) => typeof step?.run === "string" && step.run.includes(needle));
+const mintStepAt = reviewStepRunIndex("scripts/build-release-approval-lease.mjs");
+invariant(mintStepAt >= 0, "Release review must mint the approval lease from verified evidence");
+for (const [blocker, check] of [
+  ["RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED", "scripts/verify-release-review-authority.mjs"],
+  ["ACTUAL_ENVIRONMENT_APPROVAL_EVENT_NOT_OBSERVABLE_BY_WORKFLOW_TOKEN", "scripts/verify-release-approval-event.mjs"],
+  ["CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE", "scripts/verify-observation-cohort.mjs"],
+  ["CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE", "scripts/verify-contract-authority.mjs"],
+]) {
+  const checkAt = reviewStepRunIndex(check);
+  invariant(checkAt >= 0, `Release review is missing the check for ${blocker}: ${check}`);
+  invariant(checkAt < mintStepAt, `Release review mints the approval lease before checking ${blocker}`);
+  const source = await readFile(path.join(root, check), "utf8");
+  invariant(source.includes(blocker), `${check} must refuse under its own blocker identifier: ${blocker}`);
+}
+invariant(
+  reviewRuns.includes("CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED") &&
+    reviewRuns.includes("inputs.contractSet?.releaseAuthority === 'UNRESOLVED_BLOCKING'") &&
+    reviewStepRunIndex("CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED") < mintStepAt,
+  "Release review must refuse a candidate built without a canonical contract authority before minting",
+);
+const leaseAttestAt = (reviewJob.steps ?? []).findIndex((step) => typeof step?.uses === "string" && step.uses.startsWith("actions/attest@"));
+const leaseUploadAt = (reviewJob.steps ?? []).findIndex((step) =>
+  typeof step?.uses === "string" && step.uses.startsWith("actions/upload-artifact@") && step.with?.name === "release-approval-lease"
+);
+invariant(
+  leaseAttestAt > mintStepAt && leaseUploadAt > leaseAttestAt,
+  "The minted lease must be attested by this workflow before it is published as an artifact, or release.yml's signer-workflow check has nothing to verify",
+);
+invariant(
+  leaseAttestAt >= 0 && (reviewJob.steps[leaseAttestAt].with?.["subject-path"] ?? "").includes("release-approval-lease.json"),
+  "The attestation must name the lease itself as its subject",
+);
+
+// The observation cohort is the authorizing counterpart of CI's explicitly
+// non-authorizing observation lane. What makes it authorizing is that its lanes
+// are allowed to fail the run; if that ever changes it becomes the same
+// evidence CI already declared insufficient.
+const observationWorkflow = parseYaml(
+  await readFile(path.join(root, ".github", "workflows", "distribution-observation.yml"), "utf8"),
+  { prettyErrors: true, uniqueKeys: true },
+);
+const observeJob = observationWorkflow.jobs?.observe;
+const cohortJob = observationWorkflow.jobs?.cohort;
+invariant(observeJob && cohortJob, "Distribution observation must have both an observing matrix and a cohort job");
+invariant(
+  !Object.hasOwn(observeJob, "continue-on-error"),
+  "Cohort observation lanes must be able to fail the cohort; a tolerated lane cannot authorize anything",
+);
+invariant(
+  observeJob.strategy?.matrix === "${{ fromJson(needs.plan.outputs.observation_matrix) }}",
+  "Cohort observation must cover exactly the declared observation-only lanes",
+);
+const cohortRuns = (cohortJob.steps ?? []).map((step) => step?.run).filter((run) => typeof run === "string").join("\n");
+invariant(
+  cohortRuns.includes("node scripts/summarize-observation-receipts.mjs") &&
+    cohortRuns.includes("node scripts/build-observation-cohort.mjs"),
+  "The cohort must be promoted from the same reviewed receipt validator CI uses",
+);
+invariant(
+  Object.keys(observationWorkflow.on?.workflow_dispatch?.inputs ?? {}).sort().join(",") === "candidate_envelope_sha256,candidate_run_id",
+  "Distribution observation may accept only the candidate it is bound to",
 );
 const publishJob = releaseWorkflow.jobs?.["publish-preview"];
 invariant(
