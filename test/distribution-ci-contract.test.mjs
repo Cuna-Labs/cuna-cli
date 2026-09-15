@@ -24,6 +24,18 @@ async function fixture() {
   await cp(path.join(repositoryRoot, "scripts", "lib", "release-approval-consumption.mjs"), path.join(root, "scripts", "lib", "release-approval-consumption.mjs"));
   await cp(path.join(repositoryRoot, "scripts", "lib", "npm-preview-publication.mjs"), path.join(root, "scripts", "lib", "npm-preview-publication.mjs"));
   await cp(path.join(repositoryRoot, "scripts", "publish-npm-preview.mjs"), path.join(root, "scripts", "publish-npm-preview.mjs"));
+  // The release-review gate no longer prints its blocker names from the
+  // workflow; each one is raised by the verifier that can actually observe it.
+  // The contract checks that those verifiers still name their own blocker, so
+  // their sources have to be in the fixture or the check cannot run at all.
+  for (const verifier of [
+    "verify-release-review-authority.mjs",
+    "verify-release-approval-event.mjs",
+    "verify-observation-cohort.mjs",
+    "verify-contract-authority.mjs",
+  ]) {
+    await cp(path.join(repositoryRoot, "scripts", verifier), path.join(root, "scripts", verifier));
+  }
   // The whole of `.github`, not a hand-listed pair of workflows: the required
   // status checks are spread across ci.yml and dependency-review.yml, so a
   // fixture that copies only some workflows cannot tell "this check has no
@@ -275,33 +287,59 @@ test("CI contract rejects caller-supplied contract authority in blocked review",
   await assert.rejects(verify(root), /only candidate identity inputs|caller-supplied/u);
 });
 
-test("CI contract rejects apparent lease minting without exact approval-event authority", async () => {
+// A gate that mints first and checks afterwards is not a gate. Step ORDER is
+// the whole property here, so the mutation adds a mint that is individually
+// well-formed and only wrong because of where it sits.
+test("CI contract rejects lease minting that precedes its authority checks", async () => {
   const root = await fixture();
   const workflow = path.join(root, ".github", "workflows", "release-review.yml");
   const content = (await readFile(workflow, "utf8")).replace(
-    "      - name: Block lease minting until independent authorities exist",
-    "      - run: node scripts/build-release-approval-lease.mjs\n      - name: Block lease minting until independent authorities exist",
+    "      - name: Verify declared review authority against read-only GitHub state",
+    "      - run: node scripts/build-release-approval-lease.mjs\n      - name: Verify declared review authority against read-only GitHub state",
   );
   await writeFile(workflow, content);
-  await assert.rejects(verify(root), /apparent minting authority/u);
+  await assert.rejects(verify(root), /mints the approval lease before checking/u);
 });
 
-test("CI contract rejects omission of unresolved contract and semantic observation blockers", async () => {
+test("CI contract rejects a release review that stops checking the observation cohort", async () => {
   const root = await fixture();
   const workflow = path.join(root, ".github", "workflows", "release-review.yml");
   const content = (await readFile(workflow, "utf8"))
-    .replace("CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE", "observation hashes supplied")
-    .replace("CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED", "contract supplied");
+    .replace("node scripts/verify-observation-cohort.mjs", "node scripts/verify-release-envelope.mjs");
   await writeFile(workflow, content);
-  await assert.rejects(verify(root), /missing fail-closed blocker/u);
+  await assert.rejects(verify(root), /missing the check for CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE/u);
 });
 
-test("CI contract rejects fabricated approver class without an exact approval event", async () => {
+test("CI contract rejects a release review that stops refusing an unresolved candidate contract", async () => {
   const root = await fixture();
   const workflow = path.join(root, ".github", "workflows", "release-review.yml");
-  const content = `${await readFile(workflow, "utf8")}\n# approverIdentityClass: PROTECTED_ENVIRONMENT_REVIEWER\n`;
+  const content = (await readFile(workflow, "utf8"))
+    .replace("inputs.contractSet?.releaseAuthority === 'UNRESOLVED_BLOCKING'", "false");
   await writeFile(workflow, content);
-  await assert.rejects(verify(root), /apparent minting authority/u);
+  await assert.rejects(verify(root), /refuse a candidate built without a canonical contract authority/u);
+});
+
+// The dispatcher may choose which candidate is reviewed. It may never supply
+// the decision: an approver named on the dispatch form is the dispatcher
+// approving itself with extra steps.
+test("CI contract rejects an approver identity offered as a dispatch input", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release-review.yml");
+  const content = (await readFile(workflow, "utf8")).replace(
+    "      observation_run_id:",
+    "      approver_login:\n        description: Reviewer login\n        required: true\n        type: string\n      observation_run_id:",
+  );
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /caller-supplied authority as an input/u);
+});
+
+test("CI contract rejects an unattested approval lease leaving the review", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release-review.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("      - uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v3.2.0\n        with:\n          subject-path: approval/release-approval-lease.json\n", "");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /must be attested by this workflow before it is published/u);
 });
 
 test("CI contract rejects publication without fresh nonce and lease validation in the npm publish step", async () => {

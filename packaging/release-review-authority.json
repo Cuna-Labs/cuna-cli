@@ -1,19 +1,28 @@
 {
-  "schemaVersion": 1,
-  "status": "UNCONFIGURED_BLOCKING",
+  "schemaVersion": 2,
+  "status": "CONFIGURED",
   "repository": "Cuna-Labs/cuna-cli",
   "environment": "release-review-npm-preview",
   "protectedRef": "main",
   "requiredReviewer": {"type": "User", "id": 312749809, "login": "cunitacodeitor"},
   "requirePreventSelfReview": true,
   "requireAdminBypassDisabled": true,
-  "observedAdminBypass": true,
   "requiredApprovalEvidence": "EXACT_APPROVER_ID_LOGIN_EVENT_AND_RUN_BINDING",
-  "blockers": [
-    "RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED",
-    "ACTUAL_ENVIRONMENT_APPROVAL_EVENT_NOT_OBSERVABLE_BY_WORKFLOW_TOKEN",
-    "CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE",
-    "CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE",
-    "CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED"
+  "observedAt": "2026-09-15T06:31:00.000Z",
+  "$comment": [
+    "schemaVersion 1 recorded the environment as UNCONFIGURED_BLOCKING with a frozen list of",
+    "five blockers, and scripts/verify-release-review-authority.mjs asserted that the remote",
+    "environment still had can_admins_bypass=true. That pairing made the broken state the",
+    "requirement: fixing the environment would have failed the verifier.",
+    "",
+    "Measured 2026-09-15T06:31Z against the live environment after disabling admin bypass:",
+    "can_admins_bypass=false, one required reviewer (User 312749809 cunitacodeitor),",
+    "prevent_self_review=true, deployment branch policy custom and restricted to exactly",
+    "'main'. This file now states what must be true, and the verifier fails when it is not.",
+    "",
+    "The remaining release blockers are not properties of this environment and are checked",
+    "where they live: the canonical contract authority by scripts/verify-contract-authority.mjs",
+    "against packaging/contract-authority.json, and the candidate-bound observation cohort by",
+    "scripts/verify-observation-cohort.mjs against the distribution-observation run."
   ]
 }
