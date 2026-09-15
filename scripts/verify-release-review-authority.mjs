@@ -20,15 +20,26 @@ const releaseReviewEnvironment = "release-review-npm-preview";
 const declaration = JSON.parse(await readFile(path.join(root, "packaging", "release-review-authority.json"), "utf8"));
 const token = process.env.GITHUB_TOKEN;
 invariant(typeof token === "string" && token.length >= 20 && !/\s/u.test(token), "A read-only GitHub token is required");
-invariant(
-  declaration.schemaVersion === 2 && declaration.status === "CONFIGURED" &&
-    declaration.repository === repository && declaration.environment === releaseReviewEnvironment &&
-    declaration.protectedRef === "main" && declaration.requiredReviewer?.type === "User" &&
-    declaration.requiredReviewer?.id === 312749809 && declaration.requiredReviewer?.login === "cunitacodeitor" &&
-    declaration.requirePreventSelfReview === true && declaration.requireAdminBypassDisabled === true &&
+// One conjunct per line, each with its own reason. Written as a single boolean
+// this refused every alteration with the same sentence -- a reviewer reading
+// "declaration differs" could not tell a renamed reviewer from a relaxed
+// requirement, and the two are not the same incident.
+for (const [ok, reason] of [
+  [declaration.schemaVersion === 2, "Release-review authority declaration is not schemaVersion 2"],
+  [declaration.status === "CONFIGURED", `Release-review authority declares status ${JSON.stringify(declaration.status)} rather than CONFIGURED`],
+  [declaration.repository === repository, "Release-review authority declares a different repository"],
+  [declaration.environment === releaseReviewEnvironment, "Release-review authority declares a different environment"],
+  [declaration.protectedRef === "main", `Release-review authority declares protected ref ${JSON.stringify(declaration.protectedRef)} rather than main`],
+  [declaration.requiredReviewer?.type === "User", "Release-review required reviewer is not a User"],
+  [declaration.requiredReviewer?.id === 312749809, `Release-review authority declares reviewer id ${JSON.stringify(declaration.requiredReviewer?.id)} rather than 312749809`],
+  [declaration.requiredReviewer?.login === "cunitacodeitor", `Release-review authority declares reviewer login ${JSON.stringify(declaration.requiredReviewer?.login)} rather than cunitacodeitor`],
+  [declaration.requirePreventSelfReview === true, "Release-review authority no longer requires prevent_self_review"],
+  [declaration.requireAdminBypassDisabled === true, "Release-review authority no longer requires the admin bypass to be disabled"],
+  [
     declaration.requiredApprovalEvidence === "EXACT_APPROVER_ID_LOGIN_EVENT_AND_RUN_BINDING",
-  "Release-review authority declaration differs",
-);
+    "Release-review authority no longer requires an exact approver identity bound to the run",
+  ],
+]) invariant(ok, reason);
 
 async function getJson(url, label) {
   const response = await fetch(url, {

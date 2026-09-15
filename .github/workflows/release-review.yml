@@ -180,3 +180,18 @@ jobs:
             evidence/observation-cohort-verification.json
           if-no-files-found: error
           retention-days: 30
+      # A review that refuses still established things worth keeping -- above
+      # all, WHO approved, which is the one fact no later reader can reconstruct
+      # and the one this repository has never been able to observe. The step
+      # above does not run when an earlier check fails, so without this the
+      # receipts for the checks that did pass would exist only in a run log.
+      #
+      # Scoped to `evidence/` deliberately: the lease is written to `approval/`,
+      # so a refused review can never emit a partial lease under any name.
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-review-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
