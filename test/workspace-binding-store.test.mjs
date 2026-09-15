@@ -368,3 +368,38 @@ test("an incompatible durable record is rejected before any mutation", async (t)
   assert.equal(JSON.parse(await readFile(recordPath, "utf8")).schemaVersion, 3);
   assert.equal(dirname(recordPath), join(root, ".cuna"));
 });
+
+// A rebind moves the project onto another Machine under a new binding. It
+// must keep the project identity and refuse to masquerade as a rebind when
+// nothing about the Machine or binding actually changed.
+test("a rebind replaces machine and binding identity but never the project identity", async (t) => {
+  const root = await temporaryDirectory(t);
+  const first = await persistWorkspaceBinding({ root, binding: draft({ generation: 3 }), expected: null });
+  const rebound = await persistWorkspaceBinding({
+    root,
+    binding: draft({ bindingId: "binding_2", machineId: "machine_2", generation: 0, bindingCreatedAt: "2026-09-02T00:00:00.000Z", bindingUpdatedAt: "2026-09-02T00:00:00.000Z" }),
+    expected: workspaceBindingCompareAndSwap(first),
+    rebind: true,
+  });
+  assert.equal(rebound.machineId, "machine_2");
+  assert.equal(rebound.bindingId, "binding_2");
+  assert.equal(rebound.projectId, "project_1");
+  assert.equal(rebound.recordRevision, first.recordRevision + 1);
+  assert.equal(rebound.generation, 0, "a fresh binding starts its generations over");
+
+  // Controls: same Machine is not a rebind; a different project is not this folder.
+  await assert.rejects(
+    persistWorkspaceBinding({ root, binding: draft({ bindingId: "binding_3", machineId: "machine_2" }), expected: workspaceBindingCompareAndSwap(rebound), rebind: true }),
+    (error) => error.code === "cuna.workspace.identity_unproven",
+  );
+  await assert.rejects(
+    persistWorkspaceBinding({ root, binding: draft({ bindingId: "binding_3", machineId: "machine_3", projectId: "project_2", remoteRoot: "/workspace/projects/project_2" }), expected: workspaceBindingCompareAndSwap(rebound), rebind: true },
+    ),
+    (error) => error.code === "cuna.workspace.identity_unproven",
+  );
+  // Without the rebind flag, a changed Machine is still refused as before.
+  await assert.rejects(
+    persistWorkspaceBinding({ root, binding: draft({ bindingId: "binding_3", machineId: "machine_3" }), expected: workspaceBindingCompareAndSwap(rebound) }),
+    (error) => error.code === "cuna.workspace.identity_unproven",
+  );
+});

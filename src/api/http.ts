@@ -1,4 +1,5 @@
 import { EXIT_CODES, CunaError } from "../core/errors.js";
+import { CredentialBoundaryError } from "../credentials/errors.js";
 import {
   INTERNAL_DEFECT_HINT,
   OFF_CONTRACT_RESPONSE_HINT,
@@ -6,11 +7,17 @@ import {
   automationCredentialHint,
 } from "../core/product-web.js";
 import {
+  containsCredentialValue,
+  isAccessToken,
   isProblemType,
   isProblemTypeForCode,
   isTransportCredential,
 } from "../core/namespace.js";
-import { isObject, safeReasonCode } from "../core/validation.js";
+import { isIdempotencyKey, isObject, safeReasonCode } from "../core/validation.js";
+import {
+  isOpenCodeSupervisorUpgradeReason,
+  openCodeSupervisorUpgradeRequired,
+} from "../machines/opencode-supervisor.js";
 import {
   DEFAULT_REQUEST_BUDGET_MS,
   observationBudgetElapsed,
@@ -25,6 +32,17 @@ const OVERSIZED_RESPONSE_HINT =
 const PROBLEM_CODE = /^[a-z][a-z0-9_]{2,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PROBLEM_ACTIONS = new Set(["retry", "sign_in", "open_web", "contact_support", "none"]);
+// Server prose reaches a terminal, so it may not carry control or format
+// characters, and it may never echo a credential back at the user. Same guard
+// `safePublicString` applies in `api/contracts.ts`; it rejects here instead of
+// throwing, because an unusable sentence must degrade to the generic message
+// rather than turn a server refusal into a client crash.
+const FORBIDDEN_PUBLIC_CHARACTER = /[\p{Cc}\p{Cf}]/u;
+function publicProse(value: string): string | undefined {
+  if (FORBIDDEN_PUBLIC_CHARACTER.test(value) || containsCredentialValue(value)) return undefined;
+  return value;
+}
+const AGENT_SESSION_CREATE_PATH = /^\/v1\/sessions\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/agent-sessions$/u;
 const WORKSPACE_SYNC_CAPABILITIES = Object.freeze([
   "atomic_generation_commit",
   "bounded_manifest_pages",
@@ -35,10 +53,71 @@ const WORKSPACE_SYNC_CAPABILITIES = Object.freeze([
 ] as const);
 const NO_WORKSPACE_SYNC_CAPABILITIES = Object.freeze([] as const);
 
+function isOpenCodeAgentSessionCreate(input: Readonly<{
+  readonly method: HttpRequest["method"];
+  readonly path: string;
+  readonly requestBody: unknown;
+}>): boolean {
+  return input.method === "POST" &&
+    AGENT_SESSION_CREATE_PATH.test(input.path) &&
+    isObject(input.requestBody) &&
+    input.requestBody.agent === "opencode";
+}
+
+/**
+ * The subject a request path names, when it names one.
+ *
+ * A 404 was answered two different ways depending on how the command reached
+ * the server: the ones that pass a resource-scoped capability check named the
+ * Machine or AgentSession, and the rest got "The requested Cuna resource or
+ * operation was not found." The vaguer half is the half a reader meets straight
+ * after typing an id, which is the worst place for it. One 404, one sentence.
+ */
+function notFoundSubject(path: string): { readonly subject: string; readonly id: string } | undefined {
+  // A resource-scoped capability query carries its subject in the query string
+  // rather than the path, and it is the one command whose entire job is a
+  // resource-scoped question -- so it is the last place that should answer with
+  // the general sentence.
+  const scoped = /^\/v\d+\/capabilities\?(?=.*\bscope=(machine|agent_session)\b)(?=.*\bresource_id=([^&]+))/u.exec(path);
+  if (scoped !== null && scoped[1] !== undefined && scoped[2] !== undefined) {
+    return {
+      subject: scoped[1] === "machine" ? "Machine" : "AgentSession",
+      id: decodeURIComponent(scoped[2]),
+    };
+  }
+  const match = /^\/v\d+\/(sessions|agent-sessions|api-keys|workspace-bindings)\/([^/?]+)/u.exec(path);
+  const id = match?.[2];
+  if (match === null || id === undefined) return undefined;
+  const subject = match[1] === "sessions"
+    ? "Machine"
+    : match[1] === "agent-sessions"
+      ? "AgentSession"
+      : match[1] === "api-keys"
+        ? "API key"
+        : "workspace binding";
+  return { subject, id: decodeURIComponent(id) };
+}
+
+function machineIdFromAgentSessionCreatePath(path: string): string | undefined {
+  return AGENT_SESSION_CREATE_PATH.exec(path)?.[1];
+}
+
 interface ProblemMetadata {
   readonly code: string;
   readonly requestId: string;
   readonly retryable: boolean;
+  /**
+   * The server's own sentence about this refusal.
+   *
+   * Both fields were already validated here and then dropped, so every refusal
+   * the CLI could not name specifically reached the user as one fixed sentence
+   * with the actionable half discarded. They are optional because the
+   * workspace-sync problem shape does not carry them and because prose that
+   * fails the terminal-safety guard degrades to the generic message rather
+   * than propagating.
+   */
+  readonly title?: string;
+  readonly detail?: string;
   readonly selectedProtocol?: 1 | 2 | null;
   readonly capabilities?: typeof WORKSPACE_SYNC_CAPABILITIES | typeof NO_WORKSPACE_SYNC_CAPABILITIES;
 }
@@ -70,10 +149,39 @@ export interface HttpRequest {
    * that something is unknown, which is a dead end.
    */
   readonly settleWith?: string;
+  /**
+   * Whether the transport may send this request a second time on its own.
+   *
+   * Defaults to `true`, which is the behavior every operation had and keeps:
+   * one immediate re-dispatch when the failure carries a `connect`-phase
+   * witness, because nothing was written and re-sending is free.
+   *
+   * Set to `false` by an operation that has NEITHER a durable server-side
+   * operation identity NOR an idempotency key, where a second POST the caller
+   * never asked for cannot be recognised or reconciled by anyone. For those,
+   * "was it sent?" is decided by `transportFailurePhase` walking an error's
+   * `cause` chain and `AggregateError.errors` depth-first and returning
+   * `connect` for the first witness found ANYWHERE in it — no ordering guard,
+   * no position requirement. A post-write reset whose cause names `connect` is
+   * therefore classified not-sent. That heuristic is fine when a replay is
+   * idempotent; it must not be the thing that decides whether a Machine's
+   * supervisor is replaced twice.
+   *
+   * This suppresses only the AUTOMATIC re-dispatch. The failure still surfaces
+   * as the same `cuna.network.failed` with `retryable: true` and
+   * `remote_outcome: "not_sent"`, so a person may still retry — and their retry
+   * passes the command's own gate, which the transport's does not.
+   */
+  readonly automaticRedispatch?: boolean;
 }
 
 export interface HttpTransport {
   request(input: HttpRequest): Promise<unknown>;
+}
+
+export interface BearerRefreshRequest {
+  readonly reason: "unauthorized";
+  readonly rejectedToken: string;
 }
 
 function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata | undefined {
@@ -100,10 +208,14 @@ function problemMetadata(body: unknown, expectedStatus: number): ProblemMetadata
   ) {
     return undefined;
   }
+  const title = publicProse(body.title);
+  const detail = typeof body.detail === "string" ? publicProse(body.detail) : undefined;
   return Object.freeze({
     code: body.code,
     requestId: body.request_id,
     retryable: body.retryable,
+    ...(title === undefined ? {} : { title }),
+    ...(detail === undefined ? {} : { detail }),
   });
 }
 
@@ -172,12 +284,25 @@ function apiError(input: {
   readonly credentialKind: "api_key" | "interactive" | "anonymous";
   readonly method: HttpRequest["method"];
   readonly path: string;
+  /** The caller's original structured intent, never the decoded response. */
+  readonly requestBody: unknown;
   readonly origin: string;
 }): CunaError {
   const { status, requestId, body, credentialKind } = input;
   const problem = problemMetadata(body, status);
   const reason = problem?.code ??
     (isObject(body) ? safeReasonCode(body.code) ?? safeReasonCode(body.error) : undefined);
+  // Not every route on this API answers with a Problem document. `sessions.start`
+  // is declared `"errorModel": "legacy"` in the contract and answers
+  // `{"error": "<sentence>"}` with no code, title or detail — so `problem` is
+  // undefined and the sentence is not a reason code either, because it has
+  // spaces. Measured: the web console renders exactly this string while the CLI
+  // showed only `http_status: 409`. The sentence is the whole actionable
+  // content, so read it as prose under the same terminal-safety guard.
+  const legacyReason = isObject(body) && typeof body.error === "string" &&
+      body.error.length >= 1 && body.error.length <= 500
+    ? publicProse(body.error)
+    : undefined;
   const effectiveRequestId = problem?.requestId ?? requestId;
   const details = {
     http_status: status,
@@ -199,7 +324,7 @@ function apiError(input: {
       // automation credential" and name no source, which is the same dead end
       // the sign-in path had. It now shares the one sentence that does.
       hint: credentialKind === "interactive"
-        ? "Run `cuna login` to reauthenticate this interactive session."
+        ? "The access token was refused. Retry the command so Cuna can obtain a fresh token from the encrypted local session."
         : credentialKind === "api_key"
           ? `The current automation credential was refused. ${automationCredentialHint()}`
           : `Run \`cuna login\`, or provide an automation credential. ${automationCredentialHint()}`,
@@ -217,26 +342,94 @@ function apiError(input: {
       details,
     });
   }
-  if (status === 409) {
+  // This is not a retryable state conflict: the durable create authority
+  // rejected an AgentSession because its provider is not installed on the
+  // selected Machine. Keep the server's reason in safe details, but turn it
+  // into the same actionable provider-selection result the CLI emits when its
+  // immediately preceding machine observation detects the mismatch.
+  if (status === 409 && reason === "agent_session_provider_unavailable") {
     return new CunaError({
-      code: "cuna.remote.conflict",
-      message: "Cuna could not apply the operation because current state conflicts with it.",
-      exitCode: EXIT_CODES.conflict,
-      hint: "Re-read the resource and decide again from its current state. Repeating this request unchanged repeats this answer.",
+      code: "cuna.agent.provider_not_installed",
+      message: "OpenCode is not installed on the selected Machine.",
+      exitCode: EXIT_CODES.unsupported,
+      hint: "Choose a running Machine configured for OpenCode, or create one with `cuna machines create --agent opencode --name NAME --yes`.",
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
   }
+  // This is an authoritative refusal from the durable AgentSession create
+  // authority, not an attach failure and not an ambiguous network outcome.
+  // Keep the route fence here: `supervisor_upgrade_required` also occurs on
+  // terminal connections, where saying that no AgentSession was created would
+  // be false.
+  if (
+    status === 409 &&
+    problem !== undefined &&
+    isOpenCodeAgentSessionCreate(input) &&
+    isOpenCodeSupervisorUpgradeReason(problem.code)
+  ) {
+    const machineId = machineIdFromAgentSessionCreatePath(input.path);
+    return openCodeSupervisorUpgradeRequired({
+      details,
+      ...(machineId === undefined ? {} : { machineId }),
+      retryable: problem.retryable,
+    });
+  }
+  if (status === 409) {
+    // The server names which state conflicts; this used to answer every 409
+    // with one fixed sentence and throw that away, so the user was told a
+    // conflict exists but never which one. Prefer the server's own words and
+    // keep the generic sentence only as the fallback for a refusal that
+    // carried none.
+    return new CunaError({
+      code: "cuna.remote.conflict",
+      message: problem?.title ?? legacyReason ??
+        "Cuna could not apply the operation because current state conflicts with it.",
+      exitCode: EXIT_CODES.conflict,
+      hint: problem?.detail ??
+        "Re-read the resource and decide again from its current state. Repeating this request unchanged repeats this answer.",
+      ...(problem === undefined ? {} : { retryable: problem.retryable }),
+      details,
+    });
+  }
+  // A 5xx the server marked final. `retryable` is the server's own word, so it
+  // decides, not the status class: exit 5 tells a caller to wait, and a refusal
+  // is not something waiting can clear.
+  //
+  // `hint: problem.detail` is load-bearing. One `code` may be emitted from
+  // several sites and the catalogue fixes `title` per code, so `detail` is the
+  // only field that distinguishes them.
+  if (status >= 500 && problem !== undefined && !problem.retryable) {
+    return new CunaError({
+      code: "cuna.remote.rejected",
+      message: problem.title ?? "Cuna rejected the request.",
+      exitCode: EXIT_CODES.remote,
+      hint: problem.detail ?? OFF_CONTRACT_RESPONSE_HINT,
+      retryable: false,
+      details,
+    });
+  }
   if (status === 429 || status >= 500) {
+    // A 5xx that carries the server's own sentence (a Problem title, or the
+    // legacy `{"error": "<sentence>"}` that `sessions.start` answers) must
+    // show it: nine identical "temporarily unavailable" answers in a row on
+    // 2026-09-02 hid a reason the server had named every time.
+    const serverSentence = status === 429 ? undefined : problem?.title ?? legacyReason;
     return new CunaError({
       code: status === 429 ? "cuna.network.rate_limited" : "cuna.network.service_unavailable",
-      message: status === 429 ? "Cuna is rate limiting this request." : "The Cuna service is temporarily unavailable.",
+      message: status === 429
+        ? "Cuna is rate limiting this request."
+        : serverSentence ?? "The Cuna service is temporarily unavailable.",
       exitCode: EXIT_CODES.network,
       hint: status === 429
         ? "Wait before retrying. No change was applied by this request."
-        : "No authoritative answer was received. Retry a read; do not assume a write was applied.",
+        : problem?.detail ??
+          "No authoritative answer was received. Retry a read; do not assume a write was applied.",
       retryable: problem?.retryable ?? true,
-      details,
+      details: {
+        ...details,
+        ...(legacyReason === undefined || problem !== undefined ? {} : { server_error: legacyReason }),
+      },
     });
   }
   if (status === 404 && !input.apiEncodedBody) {
@@ -260,12 +453,21 @@ function apiError(input: {
       },
     });
   }
+  const subject = status === 404 ? notFoundSubject(input.path) : undefined;
   return new CunaError({
     code: status === 404 ? "cuna.remote.not_found" : "cuna.remote.rejected",
-    message: status === 404 ? "The requested Cuna resource or operation was not found." : "Cuna rejected the request.",
+    message: status !== 404
+      ? "Cuna rejected the request."
+      : subject === undefined
+        ? "The requested Cuna resource or operation was not found."
+        : `${subject.subject} ${subject.id} is not available to this account.`,
     exitCode: EXIT_CODES.remote,
     hint: status === 404
-      ? "The identifier does not name a resource this account can see. Re-list to get a current one."
+      ? subject?.subject === "Machine"
+        ? "Run `cuna machines list` to see the Machines on this account."
+        : subject?.subject === "AgentSession"
+          ? "Run `cuna agent-sessions list --machine <id>` to see the AgentSessions on a Machine."
+          : "The identifier does not name a resource this account can see. Re-list to get a current one."
       : OFF_CONTRACT_RESPONSE_HINT,
     ...(problem === undefined ? {} : { retryable: problem.retryable }),
     details,
@@ -358,23 +560,143 @@ function parseJson(bytes: Uint8Array, request: Pick<HttpRequest, "method" | "pat
   });
 }
 
-function isRetryableAfterUnknownDispatch(request: HttpRequest): boolean {
-  // A transport FAILURE — connection refused, TLS error, DNS — cannot prove
-  // whether a mutating request reached the authority. An idempotency key alone
-  // is not reconciliation evidence, so mutations stay fail-closed until a
-  // producer contract exposes authoritative operation-status reconciliation.
+/**
+ * Which phase of the exchange a transport failure belongs to.
+ *
+ * `connect`: the TCP connection, name resolution or TLS handshake never
+ * completed, so no request bytes were written and the server observed nothing.
+ * `response`: the request may have been written; the connection failed before
+ * an authoritative answer arrived, so the server may have applied it.
+ *
+ * The distinction is what makes a retry safe. Measured 2026-09-02 (PRD-PM-008
+ * §E14-D8): `machines create` and `machines list` each failed once with
+ * `cuna.network.failed` after 17–18 s, with the TCP connect started and never
+ * completed (undici `UND_ERR_CONNECT_TIMEOUT`); the next call succeeded. A
+ * request that was never sent can be re-sent for every method, including POST.
+ */
+type TransportFailurePhase = "connect" | "response";
+
+const CONNECT_PHASE_CODES: ReadonlySet<string> = new Set([
+  // undici gave up waiting for the socket to connect.
+  "UND_ERR_CONNECT_TIMEOUT",
+  // The kernel refused or could not route the connect.
+  "ECONNREFUSED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EADDRNOTAVAIL",
+  // Name resolution failed, permanently or transiently.
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EAI_FAIL",
+  "EAI_NONAME",
+  // The TLS handshake was refused. Node reports certificate faults with the
+  // OpenSSL verify-result names, and handshake protocol faults as `EPROTO`
+  // (only trusted here when the syscall confirms it happened during connect)
+  // or `ERR_TLS_*`.
+  "CERT_HAS_EXPIRED",
+  "CERT_NOT_YET_VALID",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+  "ERR_TLS_HANDSHAKE_TIMEOUT",
+  "ERR_SSL_WRONG_VERSION_NUMBER",
+]);
+// A syscall name is stronger evidence than a code: `ETIMEDOUT` on `connect`
+// never wrote a byte, while `ETIMEDOUT` on `write` may have.
+const CONNECT_PHASE_SYSCALLS: ReadonlySet<string> = new Set(["connect", "getaddrinfo"]);
+
+/**
+ * Walk the error, its `cause` chain and any `AggregateError.errors` (Node's
+ * Happy Eyeballs connect reports one `ECONNREFUSED` per address family that
+ * way) looking for a `connect`-phase witness. Anything else — headers or body
+ * timeouts, a reset after the request was written, a bare `fetch failed` with
+ * no cause — is `response`: the fail-closed answer, because the CLI cannot
+ * prove the request was not sent.
+ */
+function transportFailurePhase(error: unknown): TransportFailurePhase {
+  const seen = new Set<object>();
+  const pending: unknown[] = [error];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current !== "object" || current === null || seen.has(current)) continue;
+    seen.add(current);
+    if (seen.size > 16) break;
+    const record = current as { code?: unknown; syscall?: unknown; cause?: unknown; errors?: unknown };
+    if (typeof record.syscall === "string" && CONNECT_PHASE_SYSCALLS.has(record.syscall)) return "connect";
+    if (typeof record.code === "string" && CONNECT_PHASE_CODES.has(record.code)) return "connect";
+    if (Array.isArray(record.errors)) pending.push(...record.errors);
+    pending.push(record.cause);
+  }
+  return "response";
+}
+
+function transportFailure(input: {
+  readonly request: HttpRequest;
+  readonly phase: TransportFailurePhase;
+  readonly attempts: number;
+  readonly cause: unknown;
+}): CunaError {
+  const { request, phase, attempts } = input;
+  if (phase === "connect") {
+    // Never sent, so nothing was applied, so every method may retry. The
+    // sentence says so: the old one ("failed before an authoritative result
+    // was received") left the user unable to tell a lost answer from a lost
+    // connection, and those call for different next steps.
+    return new CunaError({
+      code: "cuna.network.failed",
+      message: `Cuna could not be reached: the connection was not established after ${attempts} attempts, so the request was never sent.`,
+      exitCode: EXIT_CODES.network,
+      hint: "No change was applied by this request. Check connectivity to the API origin shown by `cuna config get`, then retry.",
+      retryable: true,
+      details: {
+        method: request.method,
+        path: request.path,
+        phase,
+        remote_outcome: "not_sent",
+        attempts,
+      },
+      cause: input.cause,
+    });
+  }
+  // A failure after the request may have been written cannot prove whether a
+  // mutating request reached the authority. An idempotency key alone is not
+  // reconciliation evidence, so mutations stay fail-closed until a producer
+  // contract exposes authoritative operation-status reconciliation.
   //
-  // This no longer governs the timeout arm, and that separation is the fix.
+  // This does not govern the timeout arm, and that separation is deliberate.
   // A budget elapsing is not a transport failure: nothing failed, the CLI
   // stopped waiting. `core/observation-budget.ts` owns that answer and makes it
   // retryable at a single site.
-  return request.method === "GET";
+  return new CunaError({
+    code: "cuna.network.failed",
+    message: "The Cuna request was sent, but the connection failed before an authoritative result was received.",
+    exitCode: EXIT_CODES.network,
+    hint: request.settleWith === undefined
+      ? "Check connectivity to the API origin shown by `cuna config get`. A mutating request may still have been applied; re-read the resource before re-issuing it."
+      : `The operation may still have been applied. Inspect its outcome with \`${request.settleWith}\` before re-issuing it.`,
+    retryable: request.method === "GET",
+    details: {
+      method: request.method,
+      path: request.path,
+      phase,
+      remote_outcome: "unobserved",
+      attempts,
+    },
+    cause: input.cause,
+  });
 }
 
 export function createHttpTransport(input: {
   readonly baseUrl: string;
   readonly apiKey?: string;
   readonly bearerToken?: string;
+  readonly bearerTokenProvider?: (
+    signal?: AbortSignal,
+    refresh?: BearerRefreshRequest,
+  ) => Promise<string>;
   /**
    * The caller's EXPLICIT budget for every request, from `--timeout-ms`.
    *
@@ -386,13 +708,18 @@ export function createHttpTransport(input: {
   readonly timeoutMs?: number;
   readonly fetch?: typeof globalThis.fetch;
 }): HttpTransport {
-  if (input.apiKey !== undefined && input.bearerToken !== undefined) {
+  const credentialAuthorities = [
+    input.apiKey,
+    input.bearerToken,
+    input.bearerTokenProvider,
+  ].filter((value) => value !== undefined).length;
+  if (credentialAuthorities > 1) {
     throw new TypeError("HTTP transport accepts exactly one credential authority.");
   }
   const credential = input.apiKey ?? input.bearerToken;
   const credentialKind = input.apiKey !== undefined
     ? "api_key" as const
-    : input.bearerToken !== undefined
+    : input.bearerToken !== undefined || input.bearerTokenProvider !== undefined
       ? "interactive" as const
       : "anonymous" as const;
   if (credential !== undefined && !isTransportCredential(credential)) {
@@ -447,11 +774,7 @@ export function createHttpTransport(input: {
       for (const [key, value] of Object.entries(request.query ?? {})) {
         if (value !== undefined) target.searchParams.set(key, value);
       }
-      const controller = new AbortController();
       const budgetMs = budgetFor(request);
-      const timeout = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), budgetMs);
-      const onAbort = () => controller.abort(request.signal?.reason);
-      request.signal?.addEventListener("abort", onAbort, { once: true });
       let body: BodyInit | undefined;
       let contentType: HttpRequest["contentType"] | undefined;
       let contentLength: number | undefined;
@@ -503,46 +826,127 @@ export function createHttpTransport(input: {
           hint: INTERNAL_DEFECT_HINT,
         });
       }
+      const controller = new AbortController();
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      // Dispatches actually started, reported in `details.attempts` so a
+      // transport failure says how many connections were tried.
+      let attempts = 0;
+      const onAbort = () => controller.abort(request.signal?.reason);
+      request.signal?.addEventListener("abort", onAbort, { once: true });
       try {
-        const response = await fetcher(target, {
-          method: request.method,
-          headers: {
-            Accept: "application/json, application/problem+json",
-            ...(credential === undefined ? {} : { Authorization: `Bearer ${credential}` }),
-            "User-Agent": `cuna-cli/${CLI_VERSION}`,
-            ...(contentType === undefined ? {} : { "Content-Type": contentType }),
-            ...(contentLength === undefined ? {} : { "Content-Length": String(contentLength) }),
-            ...(request.idempotencyKey === undefined ? {} : { "Idempotency-Key": request.idempotencyKey }),
-            ...(request.machineCreateRequestId === undefined
-              ? {}
-              : { "X-Cuna-Machine-Create-Request-Id": request.machineCreateRequestId }),
-          },
-          ...(body === undefined ? {} : { body }),
-          signal: controller.signal,
-          redirect: "error",
-        });
-        const bytes = await readLimited(response);
-        if (!response.ok) {
-          // The status is read BEFORE the body is required to parse. Parsing
-          // first made every unparseable error body — a proxy's plain-text 404,
-          // an HTML 502, a gateway's 503 page — surface as
-          // `cuna.remote.malformed_response`, discarding the one fact the
-          // client already held authoritatively: the status.
-          const decoded = decodeJson(bytes);
-          throw apiError({
-            status: response.status,
-            requestId: response.headers.get("x-request-id") ?? undefined,
-            body: decoded.decoded ? decoded.value : undefined,
-            apiEncodedBody: decoded.decoded && isObject(decoded.value),
-            credentialKind,
-            method: request.method,
-            path: request.path,
-            origin: input.baseUrl,
+        const requestCredential = input.bearerTokenProvider === undefined
+          ? credential
+          : await input.bearerTokenProvider(controller.signal);
+        if (
+          requestCredential !== undefined &&
+          (input.bearerTokenProvider === undefined
+            ? !isTransportCredential(requestCredential)
+            : !isAccessToken(requestCredential))
+        ) {
+          throw new CunaError({
+            code: "cuna.internal.invalid_transport_credential",
+            message: "Cuna refused an invalid HTTP credential authority.",
+            exitCode: EXIT_CODES.internal,
+            hint: INTERNAL_DEFECT_HINT,
           });
         }
-        return parseJson(bytes, request);
+        // The response-observation budget starts at dispatch. Credential
+        // acquisition is a distinct local security boundary and may wait for
+        // another healthy CLI process to finish a revision-fenced refresh.
+        // The caller's AbortSignal remains live throughout both phases.
+        timeout = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), budgetMs);
+        const dispatch = async (bearer: string | undefined): Promise<unknown> => {
+          const response = await fetcher(target, {
+            method: request.method,
+            headers: {
+              Accept: "application/json, application/problem+json",
+              ...(bearer === undefined ? {} : { Authorization: `Bearer ${bearer}` }),
+              "User-Agent": `cuna-cli/${CLI_VERSION}`,
+              ...(contentType === undefined ? {} : { "Content-Type": contentType }),
+              ...(contentLength === undefined ? {} : { "Content-Length": String(contentLength) }),
+              ...(request.idempotencyKey === undefined ? {} : { "Idempotency-Key": request.idempotencyKey }),
+              ...(request.machineCreateRequestId === undefined
+                ? {}
+                : { "X-Cuna-Machine-Create-Request-Id": request.machineCreateRequestId }),
+            },
+            ...(body === undefined ? {} : { body }),
+            signal: controller.signal,
+            redirect: "error",
+          });
+          const bytes = await readLimited(response);
+          if (!response.ok) {
+            const decoded = decodeJson(bytes);
+            throw apiError({
+              status: response.status,
+              requestId: response.headers.get("x-request-id") ?? undefined,
+              body: decoded.decoded ? decoded.value : undefined,
+              apiEncodedBody: decoded.decoded && isObject(decoded.value),
+              credentialKind,
+              method: request.method,
+              path: request.path,
+              requestBody: request.body,
+              origin: input.baseUrl,
+            });
+          }
+          return parseJson(bytes, request);
+        };
+        // One immediate retry when the connection was never established. The
+        // request was not sent, so this is safe for every method, and the
+        // budget is respected without splitting it: both attempts share
+        // `controller`, so the one `setTimeout` above bounds their sum, and an
+        // attempt that fails after the budget fired is reported as the budget,
+        // never retried. Counted so the final error can say how many times.
+        const dispatchWithConnectRetry = async (bearer: string | undefined): Promise<unknown> => {
+          attempts += 1;
+          try {
+            return await dispatch(bearer);
+          } catch (error) {
+            if (error instanceof CunaError || error instanceof CredentialBoundaryError) throw error;
+            if (controller.signal.aborted) throw error;
+            // Checked BEFORE the phase classification, deliberately. For an
+            // operation that opted out there is no error shape that licenses a
+            // second send, so the walk over `cause`/`errors` never runs and
+            // cannot decide anything.
+            if (request.automaticRedispatch === false) throw error;
+            if (transportFailurePhase(error) !== "connect") throw error;
+            attempts += 1;
+            return await dispatch(bearer);
+          }
+        };
+        try {
+          return await dispatchWithConnectRetry(requestCredential);
+        } catch (error) {
+          const canRetryUnauthorized = error instanceof CunaError &&
+            error.code === "cuna.auth.rejected" &&
+            input.bearerTokenProvider !== undefined &&
+            requestCredential !== undefined &&
+            (request.method === "GET" ||
+              (request.idempotencyKey !== undefined && isIdempotencyKey(request.idempotencyKey)));
+          if (!canRetryUnauthorized) throw error;
+          const refreshedCredential = await input.bearerTokenProvider(controller.signal, {
+            reason: "unauthorized",
+            rejectedToken: requestCredential,
+          });
+          if (!isAccessToken(refreshedCredential)) {
+            throw new CunaError({
+              code: "cuna.internal.invalid_transport_credential",
+              message: "Cuna refused an invalid refreshed HTTP credential authority.",
+              exitCode: EXIT_CODES.internal,
+              hint: INTERNAL_DEFECT_HINT,
+            });
+          }
+          // Deliberately outside a retry loop: a second 401 is authoritative.
+          // The same serialized body and Idempotency-Key are reused verbatim.
+          // The connect retry still applies: the first exchange proved the
+          // origin reachable, and a fresh connection can still stall.
+          return await dispatchWithConnectRetry(refreshedCredential);
+        }
       } catch (error) {
         if (error instanceof CunaError) throw error;
+        // Token acquisition is a local credential boundary, not a network
+        // dispatch. Preserve its typed failure so the CLI can name the exact
+        // authentication repair instead of misreporting connectivity.
+        if (error instanceof CredentialBoundaryError) throw error;
         if (controller.signal.aborted) {
           // TWO DIFFERENT DETECTORS ARRIVE AT THIS ONE BRANCH, and collapsing
           // them is the defect. The caller pressing Ctrl-C is a decision by a
@@ -577,16 +981,14 @@ export function createHttpTransport(input: {
             cause: error,
           });
         }
-        throw new CunaError({
-          code: "cuna.network.failed",
-          message: "The Cuna request failed before an authoritative result was received.",
-          exitCode: EXIT_CODES.network,
-          hint: "Check connectivity to the API origin shown by `cuna config get`. A mutating request may still have been applied.",
-          retryable: isRetryableAfterUnknownDispatch(request),
+        throw transportFailure({
+          request,
+          phase: transportFailurePhase(error),
+          attempts,
           cause: error,
         });
       } finally {
-        clearTimeout(timeout);
+        if (timeout !== undefined) clearTimeout(timeout);
         request.signal?.removeEventListener("abort", onAbort);
       }
     },

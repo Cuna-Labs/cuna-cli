@@ -300,9 +300,14 @@ test("TC-040-07 progress uses measured milestones and cannot claim readiness wit
 test("TC-040-12 manifest omission is explained only by explicit exclusion policy, never relevance heuristics", async (t) => {
   const root = await temporaryDirectory(t);
   await mkdir(join(root, "cache"));
-  await mkdir(join(root, "node_modules"));
+  // Not `node_modules`: that directory now carries its own immutable,
+  // *explicit* exclusion (PRD-PM-002 S9) independent of any user policy, so
+  // it can no longer stand in here for "an ordinary directory omission must
+  // trace to a real rule, not a heuristic." `vendored_libs` keeps that intent
+  // isolated from the immutable-defaults behavior exercised elsewhere.
+  await mkdir(join(root, "vendored_libs"));
   await writeFile(join(root, "cache", "explicitly-ignored.bin"), new Uint8Array([1, 2, 3]));
-  await writeFile(join(root, "node_modules", "must-still-sync.js"), "module.exports = true;\n");
+  await writeFile(join(root, "vendored_libs", "must-still-sync.js"), "module.exports = true;\n");
   await writeFile(join(root, "large-generated-looking.lock"), "x".repeat(64 * 1024));
   await writeFile(join(root, "zero-byte.bin"), new Uint8Array());
   const reads = [];
@@ -315,14 +320,14 @@ test("TC-040-12 manifest omission is explained only by explicit exclusion policy
 
   assert.deepEqual(reads.sort(), [
     "large-generated-looking.lock",
-    "node_modules/must-still-sync.js",
+    "vendored_libs/must-still-sync.js",
     "zero-byte.bin",
   ]);
   assert.deepEqual(manifest.entries.map((entry) => entry.path), [
     "cache",
     "large-generated-looking.lock",
-    "node_modules",
-    "node_modules/must-still-sync.js",
+    "vendored_libs",
+    "vendored_libs/must-still-sync.js",
     "zero-byte.bin",
   ]);
   assert.deepEqual(manifest.excludedCounts, { user_rule: 1 });

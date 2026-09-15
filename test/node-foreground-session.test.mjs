@@ -5,7 +5,9 @@ import {
   runNodeForegroundSessions,
   selectNodeForegroundPresentation,
 } from "../dist/runtime/node-foreground-session.js";
-import { encodeTerminalControl, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
+import { CunaError, EXIT_CODES } from "../dist/core/errors.js";
+import { encodeTerminalControl, encodeTerminalFrame, decodeTerminalFrame, TERMINAL_PROTOCOL } from "../dist/terminal/codec.js";
+import { runtimeFailure } from "../dist/runtime/errors.js";
 
 const NOW = 1_800_000_000_000;
 const SESSION_A = "11111111-1111-4111-8111-111111111111";
@@ -17,6 +19,7 @@ function runSupportedForegroundSessions(input, dependencies) {
   return runNodeForegroundSessions({
     terminalKind: "xterm-256color",
     hostPlatform: "linux",
+    presentationMode: "rich",
     ...input,
   }, dependencies);
 }
@@ -100,13 +103,20 @@ class FakeHost {
     this.events.push("host:acquire");
     return { restore: async () => { this.restored += 1; this.events.push("host:restore"); } };
   }
-  async write(bytes) { this.writes.push(bytes.slice()); }
+  async write(bytes) {
+    this.writes.push(bytes.slice());
+    if (new TextDecoder().decode(bytes).startsWith("Detached ·")) this.events.push("detach-line");
+  }
   onInput(listener) { this.input = listener; return () => { this.input = undefined; }; }
   onResize() { return () => undefined; }
   emitInput(bytes) { this.input?.(bytes); }
 }
 
-test("plain fallback selection is explicit and conservative for nested or non-enriched terminals", () => {
+test("one-session terminals select persistent Cuna chrome when capable and retain explicit fallbacks", () => {
+  assert.equal(selectNodeForegroundPresentation({ platform: "win32", environment: {}, sessionCount: 1 }), "rich");
+  assert.equal(selectNodeForegroundPresentation({ platform: "linux", terminalKind: "xterm-256color", environment: {}, sessionCount: 1 }), "rich");
+  assert.equal(selectNodeForegroundPresentation({ platform: "darwin", terminalKind: "xterm-256color", environment: {}, sessionCount: 1 }), "rich");
+  assert.equal(selectNodeForegroundPresentation({ platform: "win32", environment: { CUNA_TERMINAL_MODE: "rich" }, sessionCount: 1 }), "rich");
   assert.equal(selectNodeForegroundPresentation({ platform: "linux", terminalKind: "xterm-256color", environment: {} }), "rich");
   assert.equal(selectNodeForegroundPresentation({ platform: "linux", terminalKind: "dumb", environment: {} }), "plain");
   assert.equal(selectNodeForegroundPresentation({ platform: "linux", terminalKind: "screen-256color", environment: { TMUX: "/tmp/tmux" } }), "plain");
@@ -120,6 +130,186 @@ test("plain fallback selection is explicit and conservative for nested or non-en
     () => selectNodeForegroundPresentation({ platform: "linux", terminalKind: "xterm", environment: { CUNA_TERMINAL_MODE: "decorated" } }),
     /auto, rich, or plain/u,
   );
+});
+
+test("attach progress hands off before terminal ownership", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    onBeforeTerminalOwnership() { events.push("progress:stop"); },
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => host.input !== undefined, "foreground ownership should start after preflight");
+  host.emitInput(Uint8Array.of(0x03));
+  await operation;
+  assert.ok(events.indexOf(`get:${SESSION_A}`) < events.indexOf("progress:stop"));
+  assert.ok(events.indexOf("progress:stop") < events.indexOf("host:acquire"));
+  assert.equal(system.offers[0], "cuna.terminal-view.v1", "legacy raw READY remains accepted after the optional offer");
+});
+
+// PRD-PM-008 E14-D6. Detaching with Ctrl+] d used to print nothing, so the
+// person could not tell whether the session survived or how to come back. One
+// line, after the terminal is restored, says both.
+test("E14-D6: detaching with Ctrl+] d prints one line after the terminal is restored", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => host.input !== undefined, "foreground ownership should start after preflight");
+  const writesBeforeDetach = host.writes.length;
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+  const afterRestore = host.writes.slice(writesBeforeDetach).map((bytes) => new TextDecoder().decode(bytes));
+  const line = afterRestore.at(-1);
+  assert.equal(line, `Detached · session 1111 keeps running · cuna connect ${SESSION_A}\n`);
+  assert.ok(events.indexOf("host:restore") < events.indexOf("detach-line"), "the line follows the restore, never precedes it");
+});
+
+// Control: a foreground that ends without a local detach prints no such line.
+test("E14-D6 control: a cancelled foreground prints no detach line", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const abort = new AbortController();
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    signal: abort.signal,
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => host.input !== undefined, "foreground ownership should start after preflight");
+  abort.abort();
+  await operation.catch(() => undefined);
+  assert.equal(host.restored, 1);
+  const text = host.writes.map((bytes) => new TextDecoder().decode(bytes)).join("");
+  assert.doesNotMatch(text, /Detached ·/u);
+});
+
+test("one pre-negotiation ticket race is recovered without repeating user input", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  let connections = 0;
+  const terminalConnector = {
+    async connect(input) {
+      connections += 1;
+      if (connections === 1) {
+        throw runtimeFailure(
+          "terminal_disconnected",
+          "The terminal WebSocket failed before negotiation completed.",
+          { retryable: true },
+        );
+      }
+      return await system.terminalConnector.connect(input);
+    },
+  };
+  const operation = runNodeForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    hostPlatform: "win32",
+    presentationMode: "plain",
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => connections === 2 && host.input !== undefined, "the fresh ticket should attach on the bounded retry");
+  host.emitInput(Uint8Array.of(0x03));
+  await operation;
+  assert.equal(connections, 2);
+  assert.equal(host.acquired, 2);
+  assert.equal(host.restored, 2);
+});
+
+test("a failed early-terminal retry preserves the first typed failure alongside fresh capability refusal", async () => {
+  const events = [], host = new FakeHost(events), system = terminalSystem(events);
+  const first = runtimeFailure("terminal_disconnected", "The terminal WebSocket failed before negotiation completed.", { retryable: true });
+  const second = runtimeFailure("capability_unknown", "Current terminal authority is unavailable.", {
+    retryable: false, safeDetails: { capability_id: "terminal_connections.create", reason_code: "supervisor_registry_unavailable" },
+  });
+  const discover = system.controlPlane.discoverCapabilities.bind(system.controlPlane);
+  let connections = 0, retryReads = 0;
+  system.controlPlane.discoverCapabilities = async (...args) => {
+    if (connections > 0) { retryReads++; throw second; }
+    return await discover(...args);
+  };
+  await assert.rejects(runNodeForegroundSessions({
+    client: fakeClient(events), baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A],
+    hostPlatform: "win32", presentationMode: "plain",
+  }, {
+    host, controlPlane: system.controlPlane, clock: () => NOW,
+    terminalConnector: { async connect() { connections++; throw first; } },
+  }), error => {
+    assert.equal(error.code, second.code);
+    assert.equal(error.message, second.message);
+    assert.equal(error.retryable, second.retryable);
+    assert.deepEqual(error.safeDetails, { ...second.safeDetails, prior_attempt_code: first.code });
+    assert.ok(error.cause instanceof AggregateError);
+    assert.deepEqual(error.cause.errors, [first, second], "causal order remains available without flattening error messages into safe metadata");
+    return true;
+  });
+  assert.equal(connections, 1, "retry capability refusal precedes another connection");
+  assert.equal(retryReads, 1, "only one bounded retry is attempted");
+  assert.equal(host.acquired, 1);
+  assert.equal(host.restored, 1, "the first attempt is cleaned before retry capability discovery");
+});
+
+test("one early post-ready passthrough close is recovered without another command", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  let connections = 0;
+  const terminalConnector = {
+    async connect(input) {
+      connections += 1;
+      const connection = await system.terminalConnector.connect(input);
+      if (connections === 1) queueMicrotask(() => system.interruptActiveConnections());
+      return connection;
+    },
+  };
+  const operation = runNodeForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    hostPlatform: "win32",
+    presentationMode: "plain",
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => connections === 2 && host.input !== undefined, "the early remote close should reattach once");
+  host.emitInput(Uint8Array.of(0x03));
+  await operation;
+  assert.equal(connections, 2);
+  assert.equal(host.acquired, 2);
+  assert.equal(host.restored, 2);
 });
 
 class AsyncByteQueue {
@@ -144,12 +334,24 @@ class AsyncByteQueue {
   }
 }
 
-function terminalSystem(events, availability = () => "supported") {
+function terminalSystem(events, availability = () => "supported", canonical = false) {
   let generation = 0;
   let connectFailuresRemaining = 0;
   const grants = new Map();
   const activeQueues = new Set();
+  const offers = [];
+  const sent = [];
+  const issuedRequests = new Map();
+  const cancelledRequests = [];
   const controlPlane = {
+    async cancelTerminalConnection(input) {
+      const { signal, ...request } = input;
+      assert.ok(issuedRequests.has(input.idempotencyKey), "cleanup names an issued request");
+      assert.deepEqual(request, issuedRequests.get(input.idempotencyKey), "cleanup preserves original subject/body/key");
+      assert.equal(signal.aborted, false, "cleanup has independent bounded cancellation");
+      cancelledRequests.push(request);
+      return { cancelled: true };
+    },
     async discoverCapabilities(_scope, id) {
       events.push(`capability:${id}`);
       return capability(id, availability(id));
@@ -159,6 +361,8 @@ function terminalSystem(events, availability = () => "supported") {
       return observation(id);
     },
     async createTerminalConnection(input) {
+      const { signal: _signal, ...request } = input;
+      issuedRequests.set(input.idempotencyKey, request);
       events.push(`grant:${input.agentSessionId}`);
       generation += 1;
       const terminalSessionId = `00000000-0000-4000-8000-${String(generation).padStart(12, "0")}`;
@@ -187,6 +391,7 @@ function terminalSystem(events, availability = () => "supported") {
   const terminalConnector = {
     async connect(input) {
       events.push("wire:connect");
+      offers.push(input.terminalViewProtocol);
       if (connectFailuresRemaining > 0) {
         connectFailuresRemaining -= 1;
         throw new Error("replacement unavailable");
@@ -202,18 +407,24 @@ function terminalSystem(events, availability = () => "supported") {
         processEpoch: grant.processEpoch,
         fencingGeneration: grant.attachmentGeneration,
         resizeCapability: "live",
+        accessMode: "writer",
+        writerEpoch: 1,
+        ...(canonical ? {terminalViewProtocol:{name:"cuna.terminal-view.v1",operation:"new",history:"current_view"}} : {}),
       }));
       events.push("wire:connected");
       return {
         connectionId: terminalSessionId,
         receive: () => queue,
-        async send() {},
+        async send(bytes) { sent.push(decodeTerminalFrame(bytes)); },
         async close() { events.push(`wire:close:${terminalSessionId}`); activeQueues.delete(queue); queue.close(); },
       };
     },
   };
   return {
     controlPlane,
+    offers, sent,
+    push(bytes) { for (const queue of activeQueues) queue.push(bytes); },
+    cancelledRequests,
     terminalConnector,
     failNextConnections(count) { connectFailuresRemaining = count; },
     interruptActiveConnections() {
@@ -330,6 +541,21 @@ test("TC-055-01/02 all explicit sessions preflight before host ownership and one
   assert.equal(events.includes(`capability:${SESSION_B}`), true);
 });
 
+test("an unknown terminal capability stops before session observation, grant, socket, or terminal ownership", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events, () => "unknown");
+  await assert.rejects(runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW }),
+  (error) => error?.code === "capability_unknown");
+
+  assert.deepEqual(events, [`get:${SESSION_A}`, `capability:${SESSION_A}`]);
+  assert.equal(host.acquired, 0);
+});
+
 test("TC-055-01 session authority drift fails before host ownership", async () => {
   const events = [];
   const host = new FakeHost(events);
@@ -434,13 +660,14 @@ test("TC-055-01/13 foreground composition attaches one through four exact sessio
       clock: () => NOW,
       clientInstanceId: () => `client:test:${count}`,
     });
-    await waitUntil(() => host.writes.length > count, `the ${count}-session workbench should become active`);
+    // Identical frames are no longer rewritten, so a raw write count is not a
+    // reliable "is active" proxy; wait for the active workbench content itself.
+    await waitUntil(() => new TextDecoder().decode(host.writes.at(-1) ?? new Uint8Array()).includes("terminal attached"), `the ${count}-session workbench should become active`);
     assert.match(new TextDecoder().decode(host.writes[0]), new RegExp(`ATTACHING ${count} EXACT`, "u"));
     const activeFrame = new TextDecoder().decode(host.writes.at(-1));
-    assert.match(activeFrame, /session running/u);
     assert.match(activeFrame, /terminal attached/u);
-    assert.match(activeFrame, /auth unknown/u);
-    assert.match(activeFrame, /sync unknown/u);
+    assert.match(activeFrame, /Claude auth unknown/u);
+    assert.doesNotMatch(activeFrame, /machine unknown|session (?:running|stale)|sync unknown/u);
     controller.abort();
     await assert.rejects(operation, /cancelled/u);
     assert.equal(host.acquired, 1);
@@ -451,6 +678,29 @@ test("TC-055-01/13 foreground composition attaches one through four exact sessio
     assert.equal(events.slice(0, acquireIndex).filter((event) => event.startsWith("observe:")).length, count);
     assert.equal(events.slice(0, acquireIndex).filter((event) => event.startsWith("grant:")).length, 0);
   }
+});
+
+test("terminal-connections POST remains attach authority when the local runtime observation expiry is old", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  system.controlPlane.observeAgentSession = async (id) => {
+    events.push(`observe:${id}`);
+    return observation(id, {
+      observedAt: new Date(NOW - 60_000).toISOString(),
+      expiresAt: new Date(NOW - 30_000).toISOString(),
+    });
+  };
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW });
+  await waitUntil(() => events.includes(`grant:${SESSION_A}`) && events.includes("wire:connected"), "backend-authorized attach did not reach the terminal wire");
+  host.emitInput(Uint8Array.of(0x03));
+  await operation;
+  assert.equal(events.filter((event) => event === `grant:${SESSION_A}`).length, 1);
+  assert.equal(host.restored, 1);
 });
 
 test("TC-055-13 explicit local detach is a clean success after complete restoration", async () => {
@@ -481,6 +731,7 @@ test("TC-055-06 appbar accepts only fresh auth evidence for the exact AgentSessi
         return {
           observationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
           agentSessionId: id,
+          agent: "claude-code",
           processEpoch: `epoch-${id}`,
           authMode: "interactive_login",
           agentVersion: "2.1.226",
@@ -496,7 +747,7 @@ test("TC-055-06 appbar accepts only fresh auth evidence for the exact AgentSessi
     agentSessionIds: [SESSION_A],
   }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW });
   await waitUntil(
-    () => new TextDecoder().decode(host.writes.at(-1)).includes("auth authenticated"),
+    () => new TextDecoder().decode(host.writes.at(-1)).includes("Claude auth authenticated"),
     "fresh process-scoped provider evidence should reach the appbar",
   );
   assert.equal(events.includes(`auth:${SESSION_A}`), true);
@@ -513,6 +764,7 @@ test("TC-055-06 appbar accepts only fresh auth evidence for the exact AgentSessi
         return {
           observationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
           agentSessionId: id,
+          agent: "claude-code",
           processEpoch: "sibling-epoch",
           authMode: "interactive_login",
           agentVersion: "2.1.226",
@@ -533,7 +785,7 @@ test("TC-055-06 appbar accepts only fresh auth evidence for the exact AgentSessi
     clock: () => NOW,
   });
   await waitUntil(
-    () => new TextDecoder().decode(mismatchedHost.writes.at(-1)).includes("auth unknown"),
+    () => new TextDecoder().decode(mismatchedHost.writes.at(-1)).includes("Claude auth unknown"),
     "sibling process evidence must be omitted",
   );
   mismatchedHost.emitInput(Uint8Array.of(0x1d, 0x64));
@@ -551,6 +803,7 @@ test("TC-055-06 auth evidence expiring exactly now cannot reach the appbar", asy
         return {
           observationId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
           agentSessionId: id,
+          agent: "claude-code",
           processEpoch: `epoch-${id}`,
           authMode: "interactive_login",
           agentVersion: "2.1.226",
@@ -571,149 +824,14 @@ test("TC-055-06 auth evidence expiring exactly now cannot reach the appbar", asy
     clock: () => NOW,
   });
   await waitUntil(
-    () => new TextDecoder().decode(host.writes.at(-1)).includes("auth unknown"),
+    () => new TextDecoder().decode(host.writes.at(-1)).includes("Claude auth unknown"),
     "evidence expiring at the exact observation clock must be omitted",
   );
   host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
 });
 
-test("OpenCode rejects an authenticated claim instead of upgrading provider credential presence", async () => {
-  const events = [];
-  const host = new FakeHost(events);
-  host.columns = 160;
-  const system = terminalSystem(events);
-  await assert.rejects(runSupportedForegroundSessions({
-    client: fakeClient(events, {
-      async getAgentSession(id) { return session(id, { agent: "opencode" }); },
-      async getAgentSessionAuth(id) {
-        return {
-          observationId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-          agentSessionId: id,
-          processEpoch: `epoch-${id}`,
-          authMode: "interactive_login",
-          agentVersion: "1.18.18",
-          adapterVersion: "runa.agent-auth.v1",
-          evidenceClass: "provider_cli_login_status",
-          observedAt: new Date(NOW - 250).toISOString(),
-          validUntil: new Date(NOW + 10_000).toISOString(),
-          state: "authenticated",
-        };
-      },
-    }),
-    baseUrl: "https://api.getcuna.com",
-    agentSessionIds: [SESSION_A],
-  }, {
-    host,
-    controlPlane: system.controlPlane,
-    terminalConnector: system.terminalConnector,
-    clock: () => NOW,
-  }), (error) => error?.code === "remote_state_unproven");
-  assert.equal(host.acquired, 0, "invalid OpenCode evidence must not reach terminal ownership");
-  assert.equal(events.some((event) => event.startsWith("wire:")), false, "invalid OpenCode evidence must not create a terminal wire");
-});
-
-test("OpenCode turns a missing provider credential observation into fail-closed admission before host or terminal child effects", async () => {
-  const events = [];
-  const host = new FakeHost(events);
-  const system = terminalSystem(events);
-  let authReads = 0;
-  await assert.rejects(runSupportedForegroundSessions({
-    client: fakeClient(events, {
-      async getAgentSession(id) { return session(id, { agent: "opencode" }); },
-      async getAgentSessionAuth() {
-        authReads += 1;
-        const error = new Error("agent auth observation not found");
-        error.code = "cuna.remote.not_found";
-        throw error;
-      },
-    }),
-    baseUrl: "https://api.getcuna.com",
-    agentSessionIds: [SESSION_A],
-  }, {
-    host,
-    controlPlane: system.controlPlane,
-    terminalConnector: system.terminalConnector,
-    clock: () => NOW,
-  }), (error) => error?.code === "remote_state_unproven");
-  assert.equal(authReads, 1);
-  assert.equal(host.acquired, 0, "missing OpenCode evidence must not acquire terminal ownership");
-  assert.equal(events.some((event) => event.startsWith("wire:") || event.startsWith("grant:")), false, "missing OpenCode evidence must not create a terminal child or grant");
-});
-
-test("OpenCode permits a fresh login_required provider credential observation so /connect remains available", async () => {
-  const events = [];
-  const host = new FakeHost(events);
-  const system = terminalSystem(events);
-  const operation = runSupportedForegroundSessions({
-    client: fakeClient(events, {
-      async getAgentSession(id) { return session(id, { agent: "opencode" }); },
-      async getAgentSessionAuth(id) {
-        return {
-          observationId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-          agentSessionId: id,
-          processEpoch: `epoch-${id}`,
-          authMode: "interactive_login",
-          agentVersion: "1.18.18",
-          adapterVersion: "runa.agent-auth.v1",
-          evidenceClass: "provider_cli_credential_presence",
-          observedAt: new Date(NOW - 250).toISOString(),
-          validUntil: new Date(NOW + 10_000).toISOString(),
-          state: "login_required",
-        };
-      },
-    }),
-    baseUrl: "https://api.getcuna.com",
-    agentSessionIds: [SESSION_A],
-  }, {
-    host,
-    controlPlane: system.controlPlane,
-    terminalConnector: system.terminalConnector,
-    clock: () => NOW,
-  });
-  await waitUntil(() => events.includes("wire:connected"), "a valid login_required observation must reach the OpenCode terminal");
-  host.emitInput(Uint8Array.of(0x1d, 0x64));
-  await operation;
-  assert.equal(host.restored, 1);
-});
-
-test("OpenCode permits a fresh configured provider credential observation", async () => {
-  const events = [];
-  const host = new FakeHost(events);
-  const system = terminalSystem(events);
-  const operation = runSupportedForegroundSessions({
-    client: fakeClient(events, {
-      async getAgentSession(id) { return session(id, { agent: "opencode" }); },
-      async getAgentSessionAuth(id) {
-        return {
-          observationId: "efefefef-efef-4fef-8fef-efefefefefef",
-          agentSessionId: id,
-          processEpoch: `epoch-${id}`,
-          authMode: "interactive_login",
-          agentVersion: "1.18.18",
-          adapterVersion: "runa.agent-auth.v1",
-          evidenceClass: "provider_cli_credential_presence",
-          observedAt: new Date(NOW - 250).toISOString(),
-          validUntil: new Date(NOW + 10_000).toISOString(),
-          state: "configured",
-        };
-      },
-    }),
-    baseUrl: "https://api.getcuna.com",
-    agentSessionIds: [SESSION_A],
-  }, {
-    host,
-    controlPlane: system.controlPlane,
-    terminalConnector: system.terminalConnector,
-    clock: () => NOW,
-  });
-  await waitUntil(() => events.includes("wire:connected"), "a valid configured observation must reach the OpenCode terminal");
-  host.emitInput(Uint8Array.of(0x1d, 0x64));
-  await operation;
-  assert.equal(host.restored, 1);
-});
-
-test("OpenCode foreground admission rejects a non-interactive AgentSession before auth or terminal effects", async () => {
+test("an unsupported provider direct attach is unavailable before auth, capability, grant, host, or terminal effects", async () => {
   const events = [];
   const host = new FakeHost(events);
   const system = terminalSystem(events);
@@ -722,11 +840,11 @@ test("OpenCode foreground admission rejects a non-interactive AgentSession befor
     runSupportedForegroundSessions({
       client: fakeClient(events, {
         async getAgentSession(id) {
-          return session(id, { agent: "opencode", authMode: "credential_binding" });
+          return session(id, { agent: "openclaw" });
         },
         async getAgentSessionAuth() {
           authReads += 1;
-          throw new Error("must not read provider auth for an invalid OpenCode session");
+          throw new Error("must not read provider auth for an unavailable provider");
         },
       }),
       baseUrl: "https://api.getcuna.com",
@@ -737,9 +855,363 @@ test("OpenCode foreground admission rejects a non-interactive AgentSession befor
       terminalConnector: system.terminalConnector,
       clock: () => NOW,
     }),
-    (error) => error?.code === "remote_state_unproven",
+    (error) => error?.code === "capability_unsupported",
   );
   assert.equal(authReads, 0);
+  assert.equal(host.acquired, 0);
+  assert.equal(events.some((event) => event.startsWith("capability:") || event.startsWith("grant:") || event.startsWith("wire:")), false);
+});
+
+test("OpenCode direct attach reaches the PTY with live terminal and exact provider auth evidence", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) {
+        events.push(`get:${id}`);
+        return session(id, { agent: "opencode" });
+      },
+      async getAgentSessionAuth(id) {
+        events.push(`auth:${id}`);
+        return {
+          observationId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          agentSessionId: id,
+          agent: "opencode",
+          processEpoch: `epoch-${id}`,
+          authMode: "interactive_login",
+          agentVersion: "1.0.0",
+          adapterVersion: "cuna.opencode-auth.v1",
+          evidenceClass: "provider_cli_credential_presence",
+          observedAt: new Date(NOW - 250).toISOString(),
+          validUntil: new Date(NOW + 10_000).toISOString(),
+          state: "login_required",
+        };
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    expectedAgentKinds: ["opencode"],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => events.includes("wire:connected"), "OpenCode should reach the exact terminal wire");
+  assert.equal(events.includes(`auth:${SESSION_A}`), true);
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+});
+
+for (const missingAuthCode of ["cuna.remote.not_found", "cuna.remote.operation_not_served"]) {
+test(`OpenCode ${missingAuthCode} enters a current ready PTY for interactive login`, async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) {
+        events.push(`get:${id}`);
+        return session(id, { agent: "opencode" });
+      },
+      async getAgentSessionAuth(id) {
+        events.push(`auth:${id}`);
+        throw new CunaError({
+          code: missingAuthCode,
+          message: "No provider auth observation exists yet.",
+          exitCode: EXIT_CODES.remote,
+        });
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    expectedAgentKinds: ["opencode"],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+
+  await waitUntil(() => events.includes("wire:connected"), "missing auth evidence should reach the login PTY");
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+});
+}
+
+test("OpenCode auth endpoint errors enter a current ready PTY for interactive login", async () => {
+  for (const [label, error] of [
+    ["missing resource", new CunaError({
+      code: "cuna.remote.not_found",
+      message: "No provider auth observation exists yet.",
+      exitCode: EXIT_CODES.remote,
+    })],
+    ["off-contract observation", new CunaError({
+      code: "cuna.remote.malformed_response",
+      message: "The provider auth observation could not be decoded.",
+      exitCode: EXIT_CODES.remote,
+    })],
+    ["transport fault", new Error("provider auth read interrupted")],
+  ]) {
+    const events = [];
+    const host = new FakeHost(events);
+    host.columns = 160;
+    const system = terminalSystem(events);
+    const operation = runSupportedForegroundSessions({
+      client: fakeClient(events, {
+        async getAgentSession(id) {
+          events.push(`get:${id}`);
+          return session(id, { agent: "opencode" });
+        },
+        async getAgentSessionAuth() {
+          throw error;
+        },
+      }),
+      baseUrl: "https://api.getcuna.com",
+      agentSessionIds: [SESSION_A],
+      expectedAgentKinds: ["opencode"],
+    }, {
+      host,
+      controlPlane: system.controlPlane,
+      terminalConnector: system.terminalConnector,
+      clock: () => NOW,
+    });
+    await waitUntil(() => events.includes("wire:connected"), `${label} should reach the login PTY`);
+    assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+    host.emitInput(Uint8Array.of(0x1d, 0x64));
+    await operation;
+  }
+});
+
+test("a slow OpenCode auth observation is advisory and cannot delay a ready PTY", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) {
+        events.push(`get:${id}`);
+        return session(id, { agent: "opencode" });
+      },
+      async getAgentSessionAuth(id, signal) {
+        events.push(`auth:${id}`);
+        await new Promise((_resolve, reject) => {
+          const rejectOnAbort = () => {
+            events.push(`auth-aborted:${id}`);
+            reject(signal?.reason ?? new Error("auth probe aborted"));
+          };
+          if (signal?.aborted) rejectOnAbort();
+          else signal?.addEventListener("abort", rejectOnAbort, { once: true });
+        });
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    expectedAgentKinds: ["opencode"],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+
+  await waitUntil(() => events.includes(`auth-aborted:${SESSION_A}`), "the advisory auth read should be bounded");
+  await waitUntil(() => events.includes("wire:connected"), "a fresh OpenCode process should reach its PTY after the bounded auth read");
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+});
+
+test("OpenCode missing auth observation still rejects stale or unavailable process readiness", async () => {
+  for (const [label, processState, evidence] of [
+    ["unavailable", "failed", { state: "failed" }],
+    ["stale", "running", {
+      observedAt: new Date(NOW - 60_000).toISOString(),
+      expiresAt: new Date(NOW - 1).toISOString(),
+    }],
+  ]) {
+    const events = [];
+    const host = new FakeHost(events);
+    const system = terminalSystem(events);
+    system.controlPlane.observeAgentSession = async (id) => {
+      events.push(`observe:${id}`);
+      return observation(id, evidence);
+    };
+    await assert.rejects(
+      runSupportedForegroundSessions({
+        client: fakeClient(events, {
+          async getAgentSession(id) {
+            events.push(`get:${id}`);
+            return session(id, { agent: "opencode", processState });
+          },
+          async getAgentSessionAuth() {
+            throw new CunaError({
+              code: "cuna.remote.not_found",
+              message: "No provider auth observation exists yet.",
+              exitCode: EXIT_CODES.remote,
+            });
+          },
+        }),
+        baseUrl: "https://api.getcuna.com",
+        agentSessionIds: [SESSION_A],
+        expectedAgentKinds: ["opencode"],
+      }, {
+        host,
+        controlPlane: system.controlPlane,
+        terminalConnector: system.terminalConnector,
+        clock: () => NOW,
+      }),
+      (error) => error?.code === "remote_state_unproven",
+      `${label} process evidence must fail closed`,
+    );
+    assert.equal(events.some((event) => event.startsWith("grant:")), false);
+    assert.equal(host.acquired, 0);
+  }
+});
+
+test("OpenCode login admission rejects credential binding and an unavailable auth observation", async () => {
+  for (const [label, authMode, authStatus] of [
+    ["credential-binding", "credential_binding", undefined],
+    ["auth-unavailable", "interactive_login", {
+      observationId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      agentSessionId: SESSION_A,
+      agent: "opencode",
+      processEpoch: null,
+      authMode: "interactive_login",
+      agentVersion: "unavailable",
+      adapterVersion: "cuna.opencode-auth.v1",
+      evidenceClass: "insufficient",
+      observedAt: new Date(NOW).toISOString(),
+      validUntil: new Date(NOW).toISOString(),
+      state: "unavailable",
+    }],
+  ]) {
+    const events = [];
+    const host = new FakeHost(events);
+    const system = terminalSystem(events);
+    await assert.rejects(
+      runSupportedForegroundSessions({
+        client: fakeClient(events, {
+          async getAgentSession(id) {
+            events.push(`get:${id}`);
+            return session(id, { agent: "opencode", authMode });
+          },
+          async getAgentSessionAuth() {
+            if (authStatus !== undefined) return authStatus;
+            throw new CunaError({
+              code: "cuna.remote.not_found",
+              message: "No provider auth observation exists yet.",
+              exitCode: EXIT_CODES.remote,
+            });
+          },
+        }),
+        baseUrl: "https://api.getcuna.com",
+        agentSessionIds: [SESSION_A],
+        expectedAgentKinds: ["opencode"],
+      }, {
+        host,
+        controlPlane: system.controlPlane,
+        terminalConnector: system.terminalConnector,
+        clock: () => NOW,
+      }),
+      (error) => error?.code === "remote_state_unproven",
+      `${label} must fail closed`,
+    );
+    assert.equal(events.some((event) => event.startsWith("grant:")), false);
+    assert.equal(host.acquired, 0);
+  }
+});
+
+test("OpenCode matching unavailable auth abstention enters the current PTY as login required", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSession(id) {
+        return session(id, { agent: "opencode" });
+      },
+      async getAgentSessionAuth(id) {
+        return {
+          observationId: "abababab-abab-4bab-8bab-abababababab",
+          agentSessionId: id,
+          agent: "opencode",
+          processEpoch: `epoch-${id}`,
+          authMode: "interactive_login",
+          agentVersion: "unavailable",
+          adapterVersion: "cuna.opencode-auth.v1",
+          evidenceClass: "insufficient",
+          observedAt: new Date(NOW).toISOString(),
+          validUntil: new Date(NOW).toISOString(),
+          state: "unavailable",
+        };
+      },
+    }),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    expectedAgentKinds: ["opencode"],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+
+  await waitUntil(() => events.includes("wire:connected"), "matching auth abstention must not block terminal authority");
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+});
+
+test("OpenCode login admission rejects a provider auth observation for another agent", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  await assert.rejects(
+    runSupportedForegroundSessions({
+      client: fakeClient(events, {
+        async getAgentSession(id) {
+          return session(id, { agent: "opencode" });
+        },
+        async getAgentSessionAuth(id) {
+          return {
+            observationId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            agentSessionId: id,
+            agent: "codex",
+            processEpoch: `epoch-${id}`,
+            authMode: "interactive_login",
+            agentVersion: "1.0.0",
+            adapterVersion: "runa.agent-auth.v1",
+            evidenceClass: "provider_cli_credential_presence",
+            observedAt: new Date(NOW - 250).toISOString(),
+            validUntil: new Date(NOW + 10_000).toISOString(),
+            state: "login_required",
+          };
+        },
+      }),
+      baseUrl: "https://api.getcuna.com",
+      agentSessionIds: [SESSION_A],
+      expectedAgentKinds: ["opencode"],
+    }, {
+      host,
+      controlPlane: system.controlPlane,
+      terminalConnector: system.terminalConnector,
+      clock: () => NOW,
+    }),
+    (error) => error?.code === "remote_state_unproven",
+  );
+  assert.equal(events.some((event) => event.startsWith("grant:")), false);
   assert.equal(host.acquired, 0);
 });
 
@@ -880,6 +1352,31 @@ test("TC-055-11 TERM=dumb selects one-session plain fallback without appbar byte
   await operation;
 });
 
+test("one capable Windows session uses persistent Cuna chrome and Ctrl+C detaches cleanly", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const operation = runNodeForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    hostPlatform: "win32",
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => events.includes("wire:connected"), "rich session should attach before local detach");
+  await waitUntil(() => host.writes.length > 0, "persistent Cuna chrome should render after attach");
+  assert.deepEqual(host.acquireModes, [undefined]);
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), / CUNA/u);
+  host.emitInput(Uint8Array.of(0x03));
+  await operation;
+  assert.equal(host.restored, 1);
+  assert.equal(events.filter((event) => event.startsWith("wire:close:")).length, 1);
+});
+
 test("TC-055-11 inherited non-Windows TERM=dumb selects plain fallback", async () => {
   const events = [];
   const host = new FakeHost(events);
@@ -943,4 +1440,28 @@ test("TC-055-07 no-color foreground rendering emits no color control sequences",
   controller.abort();
   await assert.rejects(operation, /cancelled/u);
   assert.equal(host.writes.every((bytes) => !new TextDecoder().decode(bytes).includes("48;2;")), true);
+});
+
+
+test("default Windows foreground factory offers canonical views and waits for current view", async () => {
+  const events=[];const host=new FakeHost(events);const system=terminalSystem(events,()=>"supported",true);
+  const operation=runNodeForegroundSessions({client:fakeClient(events),baseUrl:"https://api.getcuna.com",agentSessionIds:[SESSION_A],hostPlatform:"win32"}, {host,environment:{},controlPlane:system.controlPlane,terminalConnector:system.terminalConnector,clock:()=>NOW});
+  void operation.catch(()=>undefined);
+  try {
+    await waitUntil(()=>host.writes.some(b=>new TextDecoder().decode(b).includes("Restoring terminal")),"factory must show restoring before current view");
+    assert.equal(system.offers[0],"cuna.terminal-view.v1");
+    host.emitInput(Uint8Array.of(65));
+    await new Promise(resolve=>setTimeout(resolve,20));
+    assert.equal(system.sent.filter(f=>f.type==="input").length,0);
+    const viewId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    system.push(encodeTerminalControl("view_started",0n,{protocol:"cuna.terminal-view.v1",operation:"new",viewId,columns:80,rows:22}));
+    system.push(encodeTerminalFrame({type:"output",critical:false,sequence:1n,payload:new TextEncoder().encode("CURRENT VIEW")}));
+    await waitUntil(()=>host.writes.some(b=>new TextDecoder().decode(b).includes("CURRENT VIEW")),"factory awaited renderer must consume current view");
+    assert.ok(new TextDecoder().decode(host.writes.at(-1)).includes("Restoring terminal"));
+    system.push(encodeTerminalControl("view_ready",0n,{viewId,afterOutputSequence:"1"}));
+    await waitUntil(()=>!new TextDecoder().decode(host.writes.at(-1)).includes("Restoring terminal"),"factory leaves restoring after ready");
+    host.emitInput(Uint8Array.of(66));
+    await waitUntil(()=>system.sent.some(f=>f.type==="input"),"ready view permits user input");
+    assert.deepEqual([...system.sent.find(f=>f.type==="input").payload],[66]);
+  } finally {host.emitInput(Uint8Array.of(3));await operation;}
 });

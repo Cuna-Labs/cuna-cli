@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
+import { ContractViolation, CunaError, EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
 import { CREDENTIAL_BACKEND_PROTOCOL } from "../dist/credentials/contracts.js";
 
 const API_KEY = "cuna_sk_abcdefghijklmnop";
@@ -17,6 +17,12 @@ const FOREGROUND_SESSION_A = "11111111-1111-4111-8111-111111111111";
 const FOREGROUND_SESSION_B = "22222222-2222-4222-8222-222222222222";
 const FOREGROUND_SESSION_C = "33333333-3333-4333-8333-333333333333";
 const FOREGROUND_SESSION_D = "44444444-4444-4444-8444-444444444444";
+const ESCAPE = String.fromCharCode(27);
+const ANSI_PATTERN = new RegExp(`${ESCAPE}\\[[0-?]*[ -/]*[@-~]`, "gu");
+
+function stripAnsi(value) {
+  return value.replaceAll(ANSI_PATTERN, "");
+}
 
 const platform = {
   kind: "linux",
@@ -44,18 +50,20 @@ function fakeClient(overrides = {}) {
         email: "developer@example.test",
         workspaceAssigned: true,
         workspaceId: "22222222-2222-4222-8222-222222222222",
-        workspaceUsage: { estimatedSpendUsd: 1, estimatedRemainingUsd: 49, note: "estimate" },
+        workspaceUsage: { estimatedSpendUsd: 1, estimatedSpendIsLowerBound: true, balanceStatus: "unavailable", balanceUsd: null, balanceUnavailableReason: "no balance endpoint", note: "estimate" },
       };
     },
     async discoverCapabilities() { return capabilitySnapshot([]); },
     async listMachines() { return { items: [] }; },
+    async getMachine(id) { return { id, name: "fixture-machine", state: "running", agent: "claude-code" }; },
     async listRecords() { return []; },
-    async listAuthorizations() { return []; },
+    async listAuthorizations() { return { revision: 1, secret_configuration: [] }; },
     async listApiKeys() { return []; },
     async createApiKey() { throw new Error("unexpected create API key"); },
     async revokeApiKey() { throw new Error("unexpected revoke API key"); },
     async createMachine() { throw new Error("unexpected create"); },
     async transitionMachine() { throw new Error("unexpected transition"); },
+    async replaceMachineSupervisor() { throw new Error("unexpected terminal supervisor replacement"); },
     async deleteMachine() { throw new Error("unexpected delete"); },
     async listAgentSessions() { return { items: [] }; },
     async createAgentSession() { throw new Error("unexpected create agent"); },
@@ -73,6 +81,836 @@ test("parser keeps subcommands separate from options and rejects duplicates", ()
   assert.deepEqual(parsed.operands, ["create"]);
   assert.deepEqual(parsed.options, { name: "dev", yes: true, json: true });
   assert.throws(() => parseArgv(["machines", "--json", "--json"]));
+});
+
+test("bare machines opens the TTY explorer while JSON returns the nested read-only inventory", async () => {
+  let explorerCalls = 0;
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  assert.equal(await runCli(["machines"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    machinesExplorerRunner: async ({ client }) => {
+      explorerCalls += 1;
+      assert.equal(typeof client.listMachines, "function");
+    },
+  }), EXIT_CODES.success);
+  assert.equal(explorerCalls, 1);
+  assert.equal(interactive.stdout(), "");
+
+  const machine = { id: MACHINE_ID, name: "goal0", state: "running", agent: "claude-code" };
+  const session = (id, agent, processState, overrides = {}) => ({
+    id,
+    machineId: MACHINE_ID,
+    name: `${agent}-${processState}`,
+    agent,
+    cwd: "/workspace",
+    authMode: "interactive_login",
+    desiredState: "running",
+    requestState: "launched",
+    processState,
+    processEpoch: `epoch-${id}`,
+    runtimeObservedAt: "2026-08-27T01:00:00.000Z",
+    runtimeExpiresAt: "2026-08-27T01:01:00.000Z",
+    rowVersion: 1,
+    createdAt: "2026-08-27T01:00:00.000Z",
+    updatedAt: "2026-08-27T01:00:00.000Z",
+    ...overrides,
+  });
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "--json"], {
+    streams: json.streams,
+    platform,
+    now: () => Date.parse("2026-08-27T01:00:30.000Z"),
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async listMachines() { return { items: [machine] }; },
+      async listAgentSessions() {
+        return { items: [
+          session(FOREGROUND_SESSION_A, "claude-code", "running"),
+          session(FOREGROUND_SESSION_B, "claude-code", "ready"),
+          session(FOREGROUND_SESSION_C, "codex", "running"),
+          session(FOREGROUND_SESSION_D, "claude-code", "running", { desiredState: "terminated" }),
+          session("55555555-5555-4555-8555-555555555555", "codex", "running", { requestState: "termination_pending" }),
+          session("66666666-6666-4666-8666-666666666666", "opencode", "running"),
+        ] };
+      },
+    }),
+  }), EXIT_CODES.success);
+  const record = JSON.parse(json.stdout());
+  assert.equal(record.command, "machines.overview");
+  assert.deepEqual(record.data.items[0].session_counts.claude, { running: 1, total: 2 });
+  assert.deepEqual(record.data.items[0].session_counts.codex, { running: 0, total: 1 });
+  assert.deepEqual(record.data.items[0].session_counts.opencode, { running: 0, total: 1 });
+  assert.deepEqual(Object.keys(record.data.items[0].session_counts), ["claude", "codex", "opencode"]);
+  assert.equal(record.data.items[0].agent_sessions.length, 4);
+  assert.equal(record.data.items[0].agent_sessions.some((item) => item.desired_state === "terminated"), false);
+  assert.equal(record.data.items[0].agent_sessions.some((item) => item.request_state === "termination_pending"), false);
+  const visibleOpenCode = record.data.items[0].agent_sessions.find((item) => item.agent === "opencode");
+  assert.equal(visibleOpenCode.can_attach, false);
+  assert.equal(visibleOpenCode.base_state, "unsupported");
+  assert.equal(visibleOpenCode.reason_code, "provider_mismatch");
+  assert.deepEqual(record.data.items[0].provider_availability, {
+    declared_id: "claude-code",
+    display_name: "Claude",
+    usability: "declared-installed",
+    actionable: true,
+  });
+  assert.equal(record.data.items[0].agent_sessions.find((item) => item.agent === "codex").base_state, "unsupported");
+});
+
+test("machines overview keeps OpenCode observations visible and actionable on a compatible machine", async () => {
+  const machine = { id: MACHINE_ID, name: "legacy-opencode", state: "running", agent: "opencode", updatedAt: "provider-v4" };
+  const client = fakeClient({
+    async listMachines() { return { items: [machine] }; },
+    async listAgentSessions() { return { items: [agentSession({
+      machineId: MACHINE_ID,
+      agent: "opencode",
+      name: "observed-opencode",
+      requestState: "launched",
+      processState: "running",
+      processEpoch: "open-epoch",
+      runtimeObservedAt: "2026-08-07T23:59:59.000Z",
+      runtimeExpiresAt: "2026-08-08T00:00:30.000Z",
+    })] }; },
+  });
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "--json"], {
+    streams: json.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  const item = JSON.parse(json.stdout()).data.items[0];
+  assert.deepEqual(item.provider_availability, {
+    declared_id: "opencode",
+    display_name: "OpenCode",
+    usability: "declared-installed",
+    actionable: true,
+    observation_version: "provider-v4",
+  });
+  assert.equal(item.agent_sessions[0].agent, "opencode");
+  assert.equal(item.agent_sessions[0].can_attach, true);
+  assert.equal(item.agent_sessions[0].base_state, "attachable");
+
+  const human = memoryStreams({ stdoutIsTTY: true });
+  assert.equal(await runCli(["machines"], {
+    streams: human.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  assert.match(human.stdout(), /OpenCode ready/u);
+  assert.match(human.stdout(), /observed-opencode  attachable/u);
+  assert.ok(human.stdout().indexOf("OpenCode 1/1 running") < human.stdout().indexOf("Claude 0/0 running"));
+});
+
+test("machines overview degrades one AgentSession child-read failure without losing inventory", async () => {
+  const failedId = MACHINE_ID;
+  const healthyId = "44444444-4444-4444-8444-444444444444";
+  const client = fakeClient({
+    async listMachines() {
+      return { items: [
+        { id: failedId, name: "partial", state: "running", agent: "claude-code" },
+        { id: healthyId, name: "healthy", state: "running", agent: "codex" },
+      ] };
+    },
+    async listAgentSessions(machineId) {
+      if (machineId === failedId) throw new Error("private upstream failure");
+      return { items: [agentSession({ id: FOREGROUND_SESSION_B, machineId: healthyId, agent: "codex", name: "healthy-codex" })] };
+    },
+  });
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "--json"], {
+    streams: json.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  const items = JSON.parse(json.stdout()).data.items;
+  assert.equal(items.length, 2);
+  // A cause the CLI has no vocabulary for renders as "unknown", never as the
+  // upstream message. The discriminating cases are in the test below.
+  assert.equal(items.find((item) => item.id === failedId).agent_sessions_error, "unknown");
+  assert.deepEqual(items.find((item) => item.id === failedId).agent_sessions, []);
+  assert.equal(items.find((item) => item.id === healthyId).agent_sessions[0].name, "healthy-codex");
+  assert.doesNotMatch(json.stdout(), /private upstream failure/u);
+
+  const human = memoryStreams({ stdoutIsTTY: true });
+  assert.equal(await runCli(["machines"], {
+    streams: human.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  assert.match(human.stdout(), /partial[\s\S]*AgentSessions unavailable/u);
+  assert.match(human.stdout(), /healthy[\s\S]*healthy-codex/u);
+});
+
+/*
+ * Why a machine's AgentSessions could not be read must be distinguishable.
+ *
+ * The overview reported the single constant "sessions_unavailable" for every
+ * cause. On 2026-09-07 an Edge release added a field this decoder did not know,
+ * every read failed no_unknown_fields, and the overview said only
+ * "unavailable" — naming nothing and pointing nowhere. Diagnosing it took a
+ * different command entirely.
+ *
+ * Each case below carries a DIFFERENT cause and asserts a DIFFERENT rendered
+ * reason, so collapsing them back to one constant turns this red. The last two
+ * assertions are the safety half: the reason is vocabulary the CLI itself
+ * mints, so no upstream message may appear in it.
+ */
+test("the overview names why AgentSessions could not be read, and tells the causes apart", async () => {
+  const drift = "55555555-5555-4555-8555-555555555555";
+  const typed = "66666666-6666-4666-8666-666666666666";
+  const opaque = "77777777-7777-4777-8777-777777777777";
+  const client = fakeClient({
+    async listMachines() {
+      return { items: [
+        { id: drift, name: "contract-drift", state: "running", agent: "opencode" },
+        { id: typed, name: "typed-refusal", state: "running", agent: "codex" },
+        { id: opaque, name: "no-vocabulary", state: "running", agent: "claude-code" },
+      ] };
+    },
+    async listAgentSessions(machineId) {
+      if (machineId === drift) throw new ContractViolation("no_unknown_fields", "items[0]");
+      if (machineId === typed) {
+        throw new CunaError({
+          code: "cuna.remote.unavailable",
+          message: "upstream said something private",
+          exitCode: EXIT_CODES.internal,
+        });
+      }
+      throw new Error("private upstream failure nobody should read");
+    },
+  });
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "--json"], {
+    streams: json.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  const reason = (id) =>
+    JSON.parse(json.stdout()).data.items.find((item) => item.id === id).agent_sessions_error;
+
+  assert.equal(reason(drift), "contract:no_unknown_fields:items[0]");
+  assert.equal(reason(typed), "cuna.remote.unavailable");
+  assert.equal(reason(opaque), "unknown");
+  // Three causes, three reasons: the report actually discriminates.
+  assert.equal(new Set([reason(drift), reason(typed), reason(opaque)]).size, 3);
+
+  // The reason never carries what upstream said.
+  assert.doesNotMatch(json.stdout(), /private upstream failure/u);
+  assert.doesNotMatch(json.stdout(), /something private/u);
+});
+
+test("machines explorer selection attaches through the shared foreground runner", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const attached = [];
+  assert.equal(await runCli(["machines"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    machinesExplorerRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async (input) => { attached.push(input); },
+  }), EXIT_CODES.success);
+  assert.equal(attached.length, 1);
+  assert.deepEqual(attached[0].agentSessionIds, [FOREGROUND_SESSION_A]);
+  assert.deepEqual(attached[0].expectedAgentKinds, ["claude-code"]);
+  assert.match(stripAnsi(interactive.stderr()), /Attaching to Claude Code/u);
+});
+
+test("machine lifecycle recursion preserves --no-color for explorer and progress", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  let explorerCalls = 0;
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      return capabilitySnapshot([{
+        id: "machines.lifecycle",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["machines:write"],
+      }], scope, resourceId);
+    },
+    async transitionMachine(id) { return { id, name: "paused-dev", state: "starting", agent: "claude-code" }; },
+    async getMachine(id) { return { id, name: "paused-dev", state: "running", agent: "claude-code" }; },
+  });
+  assert.equal(await runCli(["machines", "--no-color"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+    machinesExplorerRunner: async (input) => {
+      explorerCalls += 1;
+      assert.equal(input.color, false);
+      return explorerCalls === 1
+        ? { kind: "lifecycle", action: "start", machineId: MACHINE_ID }
+        : undefined;
+    },
+  }), EXIT_CODES.success);
+  assert.equal(explorerCalls, 2, "successful lifecycle should reopen the same no-color explorer");
+  assert.match(interactive.stderr(), /Starting machine/u);
+  assert.equal(interactive.stderr().includes("\u001b[38;"), false);
+  assert.equal(interactive.stderr().includes("\u001b[48;"), false);
+});
+
+test("explorer create selection runs machines create with the chosen provider and name, then reopens the explorer", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  let explorerCalls = 0;
+  const creates = [];
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      return capabilitySnapshot([{
+        id: "machines.create",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "financial",
+        surfaces: ["cli"],
+        requiredPermissions: ["machines:create"],
+      }], scope, resourceId);
+    },
+    async createMachine(body) {
+      creates.push(body);
+      return { id: MACHINE_ID, name: body.name, state: "creating", agent: body.agent };
+    },
+    async getMachine(id) { return { id, name: "cuna-codex-1", state: "creating", agent: "codex" }; },
+  });
+  assert.equal(await runCli(["machines", "--no-color"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+    machinesExplorerRunner: async () => {
+      explorerCalls += 1;
+      return explorerCalls === 1
+        ? { kind: "create", agent: "codex", name: "cuna-codex-1" }
+        : undefined;
+    },
+  }), EXIT_CODES.success);
+  assert.equal(creates.length, 1, "the screen's create selection issues exactly one machines create");
+  assert.equal(creates[0].name, "cuna-codex-1");
+  assert.equal(creates[0].agent, "codex");
+  assert.equal(explorerCalls, 2, "a successful create reopens the explorer");
+  assert.match(interactive.stderr(), /Creating machine/u);
+  assert.equal(interactive.stderr().includes("[38;"), false);
+});
+
+test("no-args remains help off-TTY but a real TTY infers and attaches the selected AgentSession", async () => {
+  const redirected = memoryStreams();
+  assert.equal(await runCli([], { streams: redirected.streams }), EXIT_CODES.success);
+  assert.match(JSON.parse(redirected.stdout()).data.help, /cuna machines/u);
+
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const attached = [];
+  assert.equal(await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async (input) => { attached.push(input); },
+  }), EXIT_CODES.success);
+  assert.equal(attached.length, 1);
+  assert.deepEqual(attached[0].agentSessionIds, [FOREGROUND_SESSION_A]);
+  assert.deepEqual(attached[0].expectedAgentKinds, ["claude-code"]);
+  assert.match(stripAnsi(interactive.stderr()), /Finding a machine or AgentSession/u);
+  assert.equal(interactive.stderr().includes(`${ESCAPE}[38;5;202m`), true, "the root journey should use the Cuna flare accent");
+  const progressOutput = stripAnsi(interactive.stderr());
+  assert.match(progressOutput, /[◐◓◑◒] Finding a machine or AgentSession/u);
+  assert.match(progressOutput, /◐ Attaching to Claude Code  ━╺━━━━/u);
+  assert.doesNotMatch(progressOutput, /Cuna: attaching to Claude/u);
+});
+
+test("both interactive menus create in the selected remote Workspace without local synchronization", async () => {
+  const remoteState=await mkdtemp(join(tmpdir(),"cuna-menu-native-"));let iteration=0;
+  const { Terminal } = (await import("@xterm/headless")).default;
+  for (const argv of [[], ["machines"]]) {
+    for (const { columns, nativeMode } of [
+      ...[60, 80, 100, 160].map(columns => ({ columns, nativeMode: "absent" })),
+      ...(process.platform === "win32" ? ["fresh", "failed", "malformed", "throws"].map(nativeMode => ({ columns: 100, nativeMode })) : []),
+    ]) {
+    const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+    interactive.streams.stderr.columns = columns;
+    let nativeColumns = columns;
+    if (nativeMode !== "absent") interactive.streams.stderr._handle = { getWindowSize(size) {
+      if (nativeMode === "throws") throw new Error("synthetic native observation unavailable");
+      if (nativeMode === "failed") return -1;
+      size.push(nativeMode === "malformed" ? Number.NaN : nativeColumns, 30);
+      return 0;
+    } };
+    const physical = new Terminal({ cols: columns, rows: 30, allowProposedApi: true });
+    let consumed = 0;
+    const observedRows = [];
+    const checkRow = async () => {
+      const text = interactive.stderr();
+      await new Promise((resolve) => physical.write(text.slice(consumed), resolve));
+      consumed = text.length;
+      observedRows.push({ columns: physical.cols, row: physical.buffer.active.cursorY,
+        extraRows: Array.from({ length: 29 }, (_, index) => physical.buffer.active.getLine(index + 1)?.translateToString(true) ?? "").filter(Boolean).length });
+    };
+    const attached = [], created = [];
+    const root = `/workspace/workspaces/${FOREGROUND_SESSION_D}`;
+    const session = { id: FOREGROUND_SESSION_A, machineId: MACHINE_ID, agent: "codex", cwd: root,
+      authMode: "interactive_login", requestState: "launched", processState: "running" };
+    const client = fakeClient({
+      async discoverCapabilities(scope, id) {
+        return capabilitySnapshot([
+          ["machines.default_workspace.read", "read_only"], ["agent_sessions.workspace.create", "native"],
+          ["agent_sessions.workspace.read", "read_only"],
+        ].map(([id, interaction]) => ({ id, interaction, availability: "supported", mutationClass: "none", surfaces: ["cli"], requiredPermissions: [] })), scope, id);
+      },
+      async getMachineDefaultWorkspace(id) {
+        assert.equal(id, MACHINE_ID);
+        return { machineId: id, workspaceId: FOREGROUND_SESSION_B, executionWorkspaceId: FOREGROUND_SESSION_D,
+          remoteRoot: root, workspaceGeneration: 1, publicationStatus: "ready" };
+      },
+      async createProviderSessionV2(id, input) {
+        created.push({ id, input });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await checkRow();
+        return { agentSession: session };
+      },
+      async getAgentSessionWorkspaceContext(id) { return { agentSessionId: id, machineId: MACHINE_ID, executionWorkspaceId: FOREGROUND_SESSION_D, remoteRoot: root, workspaceGeneration: 1 }; },
+      async getAgentSession() { return session; },
+    });
+    const select = async () => ({ kind: "launch", agent: "codex", machineId: MACHINE_ID, machineName: "chosen", newSession: true });
+    const exit = await runCli(argv, { streams: interactive.streams, env: { CUNA_API_KEY: API_KEY },
+      now: () => Date.parse("2026-08-08T00:00:00.000Z"), clientFactory: () => client,
+      rootJourneyRunner: select, machinesExplorerRunner: select,
+      platform:{...platform,paths:{...platform.paths,stateDirectory:join(remoteState,String(iteration++))}},
+      providerScreenRunner: async (_client,mode) => {assert.equal(mode.agent,"codex");return {kind:"native_interactive",agent:"codex",label:"Codex native",profile_id:FOREGROUND_SESSION_C,profile_revision:1};},
+      automaticJourneyEffectsFactory: () => { throw new Error("local synchronization must not run"); },
+      foregroundTerminalRunner: async input => {
+        attached.push(input);
+        input.onProgress("界🙂 e\u0301 ".repeat(50));
+        await checkRow();
+        physical.resize(60, 30);
+        nativeColumns = 60;
+        if (nativeMode !== "fresh") interactive.streams.stderr.columns = 60;
+        input.onProgress("界🙂 e\u0301 ".repeat(51));
+        await checkRow();
+      },
+    });
+    assert.equal(exit, EXIT_CODES.success, interactive.stderr());
+    assert.equal(created.length, 1); assert.equal(created[0].id, MACHINE_ID);
+    assert.equal(created[0].input.workspaceBindingId, undefined);
+    assert.equal(created[0].input.agent,"codex");assert.equal(created[0].input.execution_workspace_id,FOREGROUND_SESSION_D);
+    assert.deepEqual(attached.map(a => a.agentSessionIds), [[FOREGROUND_SESSION_A]]);
+    for (const observation of observedRows) {
+      assert.equal(observation.row, 0, `progress wrapped at ${observation.columns} columns`);
+      assert.equal(observation.extraRows, 0, `progress left old rows at ${observation.columns} columns`);
+    }
+    physical.dispose();
+    }
+  }
+  await rm(remoteState,{recursive:true,force:true});
+});
+
+test("bare cuna paints a neutral loader before a delayed local sign-in check", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  let resolveToken;
+  const token = new Promise((resolve) => { resolveToken = resolve; });
+  const pending = runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: {},
+    humanAuth: {
+      async acquireAccessToken() { return token; },
+      async login() { throw new Error("login is not expected when a stored session resolves"); },
+    },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => undefined,
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const beforeCredential = stripAnsi(interactive.stderr());
+  assert.match(beforeCredential, /Starting Cuna/u);
+  assert.doesNotMatch(beforeCredential, /Finding a machine or AgentSession/u);
+
+  resolveToken(`cuna_at_${"h".repeat(43)}`);
+  assert.equal(await pending, EXIT_CODES.success);
+  const complete = stripAnsi(interactive.stderr());
+  assert.ok(complete.indexOf("Starting Cuna") < complete.indexOf("Finding a machine or AgentSession"));
+});
+
+test("bare cuna explains a replaced terminal link without exposing resume-handle internals", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.remote.conflict",
+        message: "Cuna could not apply the operation because current state conflicts with it.",
+        exitCode: EXIT_CODES.conflict,
+        details: {
+          http_status: 409,
+          request_id: "11111111-1111-4111-8111-111111111111",
+          reason: "terminal_connection_resume_handle_conflict",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.conflict);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  Terminal connection changed/u);
+  assert.match(visible, /previous terminal link was already replaced/u);
+  assert.match(visible, /Cuna did not stop the remote AgentSession/u);
+  assert.match(visible, /Run `cuna` again to reconnect/u);
+  assert.doesNotMatch(visible, /terminal_connection_resume_handle_conflict|request_id|Re-read the resource/u);
+});
+
+test("foreground Cuna explains unavailable terminal control without asserting unobserved effects", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unknown",
+        message: "The server cannot currently prove this capability.",
+        exitCode: EXIT_CODES.policy,
+        details: {
+          capability_id: "terminal_connections.create",
+          reason_code: "supervisor_registry_unavailable",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  Machine terminal supervisor unavailable/u);
+  assert.doesNotMatch(visible, /No terminal connection was created|remote AgentSession was not changed/u);
+  assert.match(visible, /Check this AgentSession's current state before retrying; it may have ended/u);
+  assert.doesNotMatch(visible, /Error \[/u);
+});
+
+test("foreground Cuna translates a terminal-capability abstention without leaking its internal capability name", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unknown",
+        message: "The server cannot currently prove this capability.",
+        exitCode: EXIT_CODES.policy,
+        details: { capability_id: "terminal_connections.create" },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  Terminal connection not ready/u);
+  assert.match(visible, /could not verify this machine's terminal authority yet/u);
+  assert.match(visible, /Cuna could not complete this terminal attachment/u);
+  assert.doesNotMatch(visible, /did not attach a terminal|did not change the remote AgentSession/u);
+  assert.match(visible, /Check this AgentSession's current state before retrying; it may have ended/u);
+  assert.doesNotMatch(visible, /terminal_connections\.create|Error \[/u);
+});
+
+test("bare Cuna keeps the terminal-capability recovery human when Windows exposes visible stderr as non-TTY", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: false });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unknown",
+        message: "The server cannot currently prove this capability.",
+        exitCode: EXIT_CODES.policy,
+        details: { capability_id: "terminal_connections.create" },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = interactive.stderr();
+  assert.match(visible, /CUNA  Terminal connection not ready/u);
+  assert.match(visible, /Cuna could not complete this terminal attachment/u);
+  assert.doesNotMatch(visible, /did not attach a terminal|did not change the remote AgentSession/u);
+  assert.doesNotMatch(visible, /terminal_connections\.create|Error \[/u);
+  // Kept out of the regex above on purpose: a control character inside a
+  // pattern trips no-control-regex, and suppressing the rule would hide the
+  // next one too. A substring check states the same thing more plainly.
+  assert.ok(!visible.includes("\u001b["), "an ANSI escape must not reach non-TTY output");
+  // Kept out of the regex above on purpose: a control character inside a
+  // pattern trips no-control-regex, and suppressing the rule would hide the
+  // next one too. A substring check states the same thing more plainly.
+  assert.ok(!visible.includes("["), "an ANSI escape must not reach non-TTY output");
+});
+
+test("foreground Cuna explains an expired AgentSession runtime lease without pretending the terminal is reconnecting", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unavailable",
+        message: "The terminal runtime lease expired.",
+        exitCode: EXIT_CODES.policy,
+        details: {
+          capability_id: "terminal_connections.create",
+          reason_code: "runtime_lease_expired",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  AgentSession needs a fresh runtime check/u);
+  assert.match(visible, /has not recently confirmed that this selected AgentSession is still running/u);
+  assert.doesNotMatch(visible, /No terminal connection was created|remote AgentSession was not changed/u);
+  assert.match(visible, /Wait for a fresh runtime observation, then open this same AgentSession again/u);
+  assert.doesNotMatch(visible, /reconnecting its terminal control|Error \[/u);
+});
+
+test("foreground Cuna renders an unrecoverable terminal with exact-session recovery, never an invented restart", async () => {
+  // Measured 2026-09-02 after edge v147 settled a session across a Machine
+  // restart: the edge answered `terminal_owner_unrecoverable` and the CLI said
+  // "Terminal connection not ready … Open this same AgentSession again in a
+  // moment", a promise that nothing could keep.
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unavailable",
+        message: "The terminal owner cannot be recovered.",
+        exitCode: EXIT_CODES.policy,
+        details: {
+          capability_id: "terminal_connections.create",
+          reason_code: "terminal_owner_unrecoverable",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  This AgentSession's terminal cannot be recovered/u);
+  assert.match(visible, /cannot be recovered/u);
+  assert.doesNotMatch(visible, /Machine restarted|machine restarted|No terminal connection was created|remote AgentSession was not changed/u);
+  assert.ok(visible.includes(`cuna agent-sessions get ${FOREGROUND_SESSION_A}`), "recovery inspects the exact selected session before suggesting replacement");
+  assert.match(visible, /--new-session/u);
+  assert.doesNotMatch(visible, /again in a moment|Wait for a fresh runtime observation|reconnecting its terminal control|Error \[/u);
+});
+
+test("foreground Cuna recognizes the OpenCode supervisor-upgrade reason without claiming a session changed", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "opencode",
+    }),
+    foregroundTerminalRunner: async () => {
+      throw new CunaError({
+        code: "cuna.runtime.capability_unavailable",
+        message: "The terminal supervisor must be upgraded.",
+        exitCode: EXIT_CODES.policy,
+        details: {
+          capability_id: "terminal_connections.create",
+          reason_code: "opencode_supervisor_upgrade_required",
+        },
+      });
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.policy);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  Machine terminal update needed/u);
+  assert.doesNotMatch(visible, /No terminal connection was created|remote AgentSession was not changed/u);
+  assert.doesNotMatch(visible, /Error \[/u);
+});
+
+test("Ctrl-C while bare cuna is attaching closes visibly and returns success", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const controller = new AbortController();
+  const exit = await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    signal: controller.signal,
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => ({
+      kind: "attach",
+      agentSessionId: FOREGROUND_SESSION_A,
+      agent: "claude-code",
+    }),
+    foregroundTerminalRunner: async () => {
+      controller.abort(new Error("Cuna was interrupted by SIGINT."));
+      throw controller.signal.reason;
+    },
+  });
+
+  assert.equal(exit, EXIT_CODES.success);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /✦ Closing Cuna/u);
+  assert.match(visible, /✓ Closed/u);
+  assert.doesNotMatch(visible, /Error \[/u);
+});
+
+test("Ctrl-C during an OpenCode automatic journey closes visibly instead of printing a journey error", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const controller = new AbortController();
+  const exit = await runCli(["opencode", ".", "--new", "--no-sync"], {
+    streams: interactive.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY, TERM: "xterm-256color" },
+    signal: controller.signal,
+    clientFactory: () => fakeClient(),
+    automaticJourneyEffectsFactory: () => ({
+      onPhase() {},
+      async inspectWorkspace() {
+        controller.abort(new Error("Cuna was interrupted by SIGINT."));
+        return { canonicalLocalRoot: "C:\\work\\project" };
+      },
+      async observeMachines() { throw new Error("unreachable"); },
+      async createMachine() { throw new Error("unreachable"); },
+      async reconcileMachineCreate() { return "unreconcilable"; },
+      async ensureMachineReady() { throw new Error("unreachable"); },
+      async synchronizeWorkspace() { throw new Error("unreachable"); },
+      async observeAgentSessions() { throw new Error("unreachable"); },
+      async createAgentSession() { throw new Error("unreachable"); },
+      async ensureAgentSessionReady() { throw new Error("unreachable"); },
+      async attach() { throw new Error("unreachable"); },
+      async reconcileCancellation() {},
+    }),
+  });
+
+  assert.equal(exit, EXIT_CODES.success);
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /✦ Closing Cuna/u);
+  assert.match(visible, /✓ Closed/u);
+  assert.doesNotMatch(visible, /cuna\.journey\.cancelled|Error \[/u);
+});
+
+test("bare cuna signs in before it claims to search machines", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  let signedIn = false;
+  let loginCalls = 0;
+  let rootCalls = 0;
+  const authResult = {
+    profile: "default",
+    sessionId: "00000000-0000-4000-8000-000000000002",
+    context: {
+      requiredTermsVersion: "2026-08-01",
+      identity: "active",
+      admission: "admitted",
+      workspace: { state: "assigned", id: "00000000-0000-4000-8000-000000000003" },
+    },
+  };
+  const humanAuth = {
+    async acquireAccessToken() {
+      if (!signedIn) {
+        throw new CunaError({
+          code: "cuna.auth.required",
+          message: "No interactive Cuna session is stored.",
+          exitCode: EXIT_CODES.auth,
+        });
+      }
+      return `cuna_at_${"g".repeat(43)}`;
+    },
+    async login() {
+      loginCalls += 1;
+      signedIn = true;
+      return authResult;
+    },
+  };
+
+  assert.equal(await runCli([], {
+    streams: interactive.streams,
+    platform,
+    env: {},
+    humanAuth,
+    clientFactory: () => fakeClient(),
+    rootJourneyRunner: async () => {
+      rootCalls += 1;
+      assert.equal(signedIn, true, "machine discovery must begin only after login succeeds");
+      return undefined;
+    },
+  }), EXIT_CODES.success);
+  assert.equal(loginCalls, 1);
+  assert.equal(rootCalls, 1);
+  const output = interactive.stderr();
+  assert.match(output, /let's sign you in first/u);
+  assert.match(output, /signed in\. Continuing/u);
+  assert.ok(output.indexOf("signed in. Continuing") < output.indexOf("Finding a machine or AgentSession"));
+  assert.doesNotMatch(output, /Error \[cuna\.auth\.required\]/u);
 });
 
 test("non-TTY help and version are versioned JSON records", async () => {
@@ -143,14 +981,10 @@ test("TC-037-03/07 records and authorizations remain capability-gated read-only 
     },
     async listAuthorizations(id) {
       observed.push({ kind: "authorizations", id });
-      return [{
-        id: "rule-1",
-        host: "api.example.com",
-        path: "/v1",
-        credential: "ANTHROPIC_API_KEY",
-        target: { kind: "header", name: "Authorization", format: "Bearer ${credential}" },
-        cacheTtlSeconds: 60,
-      }];
+      return { revision: 1, secret_configuration: [{
+        secret_id: recordId, environment: [], files: [],
+        egress_rules: [{ host_pattern: "api.example.com", path_pattern: "/v1", action: "header", name: "Authorization", value_template: "Bearer ${credential}" }],
+      }] };
     },
   });
   const records = memoryStreams();
@@ -171,7 +1005,7 @@ test("TC-037-03/07 records and authorizations remain capability-gated read-only 
     now: () => Date.parse("2026-08-08T00:00:00Z"),
     clientFactory: () => client,
   }), EXIT_CODES.success);
-  assert.equal(JSON.parse(authorizations.stdout()).data.items[0].credential, "ANTHROPIC_API_KEY");
+  assert.equal(JSON.parse(authorizations.stdout()).data.secret_configuration[0].secret_id, recordId);
   assert.deepEqual(observed, [
     { kind: "capability", scope: "account", resourceId: undefined },
     { kind: "records" },
@@ -187,7 +1021,7 @@ test("TC-037-07 account, workspace, and usage expose only the closed public iden
     email: "developer@example.test",
     workspaceAssigned: true,
     workspaceId: "22222222-2222-4222-8222-222222222222",
-    workspaceUsage: { estimatedSpendUsd: 1.25, estimatedRemainingUsd: 48.75, note: "estimate" },
+    workspaceUsage: { estimatedSpendUsd: 1.25, estimatedSpendIsLowerBound: true, balanceStatus: "unavailable", balanceUsd: null, balanceUnavailableReason: "no balance endpoint", note: "estimate" },
   };
   const client = fakeClient({ async getIdentity() { requests.push("identity"); return identity; } });
   const cases = [
@@ -195,7 +1029,10 @@ test("TC-037-07 account, workspace, and usage expose only the closed public iden
     [["workspace", "show"], "workspace.show", { assigned: true }],
     [["usage", "show"], "usage.show", {
       estimated_spend_usd: 1.25,
-      estimated_remaining_usd: 48.75,
+      estimated_spend_is_lower_bound: true,
+      balance_status: "unavailable",
+      balance_usd: null,
+      balance_unavailable_reason: "no balance endpoint",
       note: "estimate",
     }],
   ];
@@ -268,7 +1105,7 @@ test("TC-037-02 unavailable parity capabilities perform no record or authorizati
       return capabilitySnapshot([], scope, resourceId);
     },
     async listRecords() { effects += 1; return []; },
-    async listAuthorizations() { effects += 1; return []; },
+    async listAuthorizations() { effects += 1; return { revision: 1, secret_configuration: [] }; },
   });
   for (const argv of [
     ["records", "list"],
@@ -549,6 +1386,13 @@ test("login defaults to encrypted local storage and authenticated commands reuse
   assert.deepEqual(loginRequest, {});
   assert.equal(JSON.parse(loginStreams.stdout()).data.storage_mode, "encrypted-local");
 
+  const humanLoginStreams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  assert.equal(
+    await runCli(["login"], { streams: humanLoginStreams.streams, platform, env: {}, humanAuth }),
+    EXIT_CODES.success,
+  );
+  assert.equal(humanLoginStreams.stdout(), "Signed in to Cuna.\n");
+
   let observedAuthorization;
   const commandStreams = memoryStreams();
   assert.equal(
@@ -707,7 +1551,13 @@ test("production login uses the encrypted backend and reuses the canonical durab
       fetch,
     });
     assert.equal(laterExit, EXIT_CODES.success, laterStreams.stderr());
-    assert.equal(observedAuthorization, `Bearer cuna_at_${"b".repeat(43)}`);
+    // The first bearer, not a second one. A stored bearer with real life left
+    // is now reused across processes: every authenticated command used to
+    // re-exchange, against a server budget of ten exchanges per rolling
+    // minute, so the eleventh command in a minute failed. Asserting the
+    // exchange count is the stronger half of this — one sign-in, one exchange.
+    assert.equal(observedAuthorization, `Bearer cuna_at_${"a".repeat(43)}`);
+    assert.equal(exchangeCount, 1, "a second command must not buy another exchange");
     assert.equal(retiredContinuationStatusRequests, 0);
 
     const whoamiStreams = memoryStreams();
@@ -817,11 +1667,18 @@ test("interactive bearer authenticates cloud commands without exposing or persis
 
 test("interactive capabilities use memory bearer without opening login, and auth errors remain secret-free", async () => {
   const accessToken = `runa_at_${"z".repeat(43)}`;
+  const refreshedAccessToken = `runa_at_${"y".repeat(43)}`;
   let acquires = 0;
+  let refreshes = 0;
   let logins = 0;
   const humanAuth = {
     async login() { logins += 1; throw new Error("unexpected browser login"); },
     async acquireAccessToken() { acquires += 1; return accessToken; },
+    async refreshRejectedAccessToken(rejectedToken) {
+      assert.equal(rejectedToken, accessToken);
+      refreshes += 1;
+      return refreshedAccessToken;
+    },
     async whoami() { throw new Error("unexpected"); },
     async logout() { throw new Error("unexpected"); },
   };
@@ -852,8 +1709,11 @@ test("interactive capabilities use memory bearer without opening login, and auth
     fetch: async () => new Response(JSON.stringify({ code: "cli_auth_rejected", detail: accessToken }), { status: 401 }),
   }), EXIT_CODES.auth);
   assert.equal(rejected.stderr().includes(accessToken), false);
-  assert.match(JSON.parse(rejected.stderr()).error.hint, /cuna login/u);
+  assert.equal(rejected.stderr().includes(refreshedAccessToken), false);
+  assert.doesNotMatch(JSON.parse(rejected.stderr()).error.hint, /cuna login|reauthenticate/iu);
+  assert.match(JSON.parse(rejected.stderr()).error.hint, /fresh token from the encrypted local session/iu);
   assert.equal(logins, 0);
+  assert.equal(refreshes, 1);
 });
 
 test("machine list calls the real public legacy Machine projection", async () => {
@@ -994,6 +1854,240 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
   assert.equal(transitions, 1);
   assert.deepEqual(discoveries, [{ scope: "machine", resourceId: MACHINE_ID }]);
   assert.equal(JSON.parse(streams.stdout()).data.state, "paused");
+});
+
+test("terminal supervisor update is an explicit OpenCode-only remediation and preserves lifecycle ownership", async () => {
+  const discoveries = [];
+  let replacements = 0;
+  let lifecycleTransitions = 0;
+  const streams = memoryStreams();
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      discoveries.push({ scope, resourceId });
+      if (discoveries.length === 1) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_supervisor_upgrade_required",
+        }], scope, resourceId);
+      }
+      return capabilitySnapshot([{
+        id: "machines.lifecycle",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["machines:update"],
+      }], scope, resourceId);
+    },
+    async getMachine(id) {
+      return { id, name: "open-dev", state: "stopped", agent: "opencode" };
+    },
+    async transitionMachine() {
+      lifecycleTransitions += 1;
+      throw new Error("the explicit supervisor action must not transition lifecycle");
+    },
+    async replaceMachineSupervisor(id) {
+      replacements += 1;
+      assert.equal(id, MACHINE_ID);
+      return { id, name: "open-dev", state: "running", agent: "opencode" };
+    },
+  });
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(replacements, 1);
+  assert.equal(lifecycleTransitions, 0);
+  assert.deepEqual(discoveries, [
+    { scope: "machine", resourceId: MACHINE_ID },
+    { scope: "machine", resourceId: MACHINE_ID },
+  ]);
+  const record = JSON.parse(streams.stdout());
+  assert.equal(record.command, "machines.update-supervisor");
+  assert.equal(record.data.state, "running");
+});
+
+test("terminal supervisor update admits a stopped OpenCode runtime-unverified preflight", async () => {
+  let discoveries = 0;
+  let replacements = 0;
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        discoveries += 1;
+        if (discoveries === 1) {
+          return capabilitySnapshot([{
+            id: "agent_sessions.create",
+            availability: "temporarily_unavailable",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_runtime_unverified",
+          }], scope, resourceId);
+        }
+        return capabilitySnapshot([{
+          id: "machines.lifecycle",
+          availability: "supported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["machines:update"],
+        }], scope, resourceId);
+      },
+      async getMachine(id) {
+        return { id, name: "stopped-open-dev", state: "stopped", agent: "opencode" };
+      },
+      async replaceMachineSupervisor(id) {
+        replacements += 1;
+        return { id, name: "stopped-open-dev", state: "running", agent: "opencode" };
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(replacements, 1);
+  assert.equal(JSON.parse(streams.stdout()).data.state, "running");
+});
+
+test("terminal supervisor update admits the exact OpenCode protocol-unavailable repair signal", async () => {
+  let discoveries = 0;
+  let replacements = 0;
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        discoveries += 1;
+        if (discoveries === 1) {
+          return capabilitySnapshot([{
+            id: "agent_sessions.create",
+            availability: "temporarily_unavailable",
+            interaction: "native",
+            mutationClass: "reversible",
+            surfaces: ["cli"],
+            requiredPermissions: ["agent_sessions:create"],
+            reasonCode: "opencode_supervisor_protocol_unavailable",
+          }], scope, resourceId);
+        }
+        return capabilitySnapshot([{
+          id: "machines.lifecycle",
+          availability: "supported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["machines:update"],
+        }], scope, resourceId);
+      },
+      async getMachine(id) {
+        return { id, name: "protocol-open-dev", state: "stopped", agent: "opencode" };
+      },
+      async replaceMachineSupervisor(id) {
+        replacements += 1;
+        return { id, name: "protocol-open-dev", state: "running", agent: "opencode" };
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(replacements, 1);
+  assert.equal(JSON.parse(streams.stdout()).data.state, "running");
+});
+
+test("terminal supervisor update never stops a running Machine or terminates sessions", async () => {
+  let replacements = 0;
+  let discoveries = 0;
+  const streams = memoryStreams();
+  const client = fakeClient({
+    async discoverCapabilities(scope, resourceId) {
+      // The second discovery authorizes the same lifecycle/update authority as
+      // start. It is deliberately separate from the unsupported create proof.
+      discoveries += 1;
+      if (discoveries === 1) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_supervisor_upgrade_required",
+        }], scope, resourceId);
+      }
+      return capabilitySnapshot([{
+        id: "machines.lifecycle",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "reversible",
+        surfaces: ["cli"],
+        requiredPermissions: ["machines:update"],
+      }], scope, resourceId);
+    },
+    async getMachine(id) {
+      return { id, name: "protected-open-dev", state: "running", agent: "opencode" };
+    },
+    async replaceMachineSupervisor() {
+      replacements += 1;
+      throw new Error("must not replace a running Machine");
+    },
+  });
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => client,
+  });
+  assert.equal(exit, EXIT_CODES.conflict);
+  assert.equal(replacements, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.machine.supervisor_update_requires_stopped");
+  assert.match(error.hint, /will not stop protected-open-dev or terminate any AgentSessions/u);
+});
+
+test("terminal supervisor update remains hidden unless the exact OpenCode prerequisite is advertised", async () => {
+  let machineReads = 0;
+  let replacements = 0;
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "supervisor_upgrade_required",
+        }], scope, resourceId);
+      },
+      async getMachine() { machineReads += 1; throw new Error("must not inspect a hidden remediation"); },
+      async replaceMachineSupervisor() { replacements += 1; throw new Error("must not replace"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(machineReads, 0);
+  assert.equal(replacements, 0);
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.capability.unsupported");
 });
 
 test("mutations fail closed when independent readback contradicts the write response", async () => {
@@ -1215,15 +2309,105 @@ test("AgentSession termination fails closed only when the terminal observation d
   // read that settles it -- not exit 6 with `retryable: false`.
   assert.equal(exit, EXIT_CODES.network);
   assert.equal(terminations, 1);
-  assert.equal(sleeps, 60);
-  assert.equal(now, 30_000);
-  assert.equal(reads, 61);
+  assert.equal(sleeps, 240);
+  assert.equal(now, 120_000);
+  assert.equal(reads, 241);
   const record = JSON.parse(streams.stderr());
   assert.equal(record.error.code, "cuna.client.convergence_budget_elapsed");
   assert.equal(record.error.retryable, true);
   assert.equal(record.error.details.observed_desired_state, "terminated");
   assert.equal(record.error.details.observed_request_state, "termination_pending");
-  assert.equal(record.error.details.settle_with, `cuna agent-sessions show ${sessionId}`);
+  assert.equal(record.error.details.settle_with, `cuna agent-sessions get ${sessionId}`);
+});
+
+test("agent-sessions get shows all three states when they disagree", async () => {
+  // The timeout above names this exact command as the way to settle a session,
+  // and it reports desired/request/process because one state cannot explain
+  // anything on its own. The human rendering used to print processState alone,
+  // so a session that is terminated/termination_pending/running displayed as a
+  // plain "running" — the disagreement replaced by the word that hides it.
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  const disagreeing = {
+    desiredState: "terminated",
+    requestState: "termination_pending",
+    processState: "running",
+  };
+  const streams = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  const exit = await runCli(["agent-sessions", "get", sessionId], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getAgentSession(id) {
+        assert.equal(id, sessionId);
+        return agentSession({ id, ...disagreeing });
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  const printed = streams.stdout();
+  assert.match(printed, /terminated\/termination_pending\/running/u, printed);
+  // NEGATIVE CONTROL: a settled session must stay a single word, or every
+  // healthy row becomes noise and the triple stops meaning "look here".
+  const settledStreams = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  const settledExit = await runCli(["agent-sessions", "get", sessionId], {
+    streams: settledStreams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getAgentSession(id) {
+        return agentSession({
+          id,
+          desiredState: "terminated",
+          requestState: "terminal",
+          processState: "terminated",
+        });
+      },
+    }),
+  });
+  assert.equal(settledExit, EXIT_CODES.success, settledStreams.stderr());
+  // Check the state FIELD, not the whole line: the cwd is a path and contains
+  // the separator this control looks for.
+  const settledState = settledStreams.stdout().trimEnd().split("\t")[3];
+  assert.equal(settledState, "terminated", settledStreams.stdout());
+});
+
+test("agent-sessions get surfaces the safe terminal reason in JSON", async () => {
+  // Production 2026-09-06 (AgentSession 1b2d0154): the Edge wire carried
+  // terminal_reason but the JSON serializer's explicit field list dropped it,
+  // so a person running `cuna agent-sessions get --json` never saw why a
+  // session ended. The field is a closed enum and only set on terminal states.
+  const sessionId = "44444444-4444-4444-8444-444444444444";
+  const streams = memoryStreams({});
+  const exit = await runCli(["agent-sessions", "get", sessionId, "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getAgentSession(id) {
+        return agentSession({
+          id,
+          desiredState: "running",
+          requestState: "terminal",
+          processState: "exited",
+          terminalReason: "canonical_launch_interrupted",
+        });
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(JSON.parse(streams.stdout()).data.terminal_reason, "canonical_launch_interrupted");
+  // NEGATIVE CONTROL: a session with no reason must not carry the key at all.
+  const bareStreams = memoryStreams({});
+  await runCli(["agent-sessions", "get", sessionId, "--json"], {
+    streams: bareStreams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getAgentSession(id) { return agentSession({ id, processState: "running" }); },
+    }),
+  });
+  assert.equal("terminal_reason" in JSON.parse(bareStreams.stdout()).data, false);
 });
 
 test("AgentSession create keeps auth mode explicit and rename is capability-gated", async () => {
@@ -1233,6 +2417,7 @@ test("AgentSession create keeps auth mode explicit and rename is capability-gate
   const workspaceBindingId = "33333333-3333-4333-8333-333333333333";
   const calls = [];
   const client = fakeClient({
+    async getMachine(id) { return { id, name: "codex-machine", state: "running", agent: "codex" }; },
     async discoverCapabilities(scope, resourceId) {
       const id = scope === "machine" ? "agent_sessions.create" : "agent_sessions.rename";
       return capabilitySnapshot([{
@@ -1312,9 +2497,150 @@ test("AgentSession create keeps auth mode explicit and rename is capability-gate
   assert.equal(JSON.parse(renameStreams.stdout()).data.name, "renamed");
 });
 
-test("OpenCode AgentSession creation remains blocked by a mutable producer witness even when env is exact true", async () => {
+test("AgentSession create rejects a provider not installed on the machine before capability discovery or mutation", async () => {
+  let capabilityReads = 0;
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "44444444-4444-4444-8444-444444444444",
+    "--workspace-generation", "1", "--agent", "codex", "--yes", "--json",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async getMachine(id) { return { id, name: "claude-only", state: "running", agent: "claude-code" }; },
+      async discoverCapabilities() { capabilityReads += 1; return capabilitySnapshot([]); },
+      async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(capabilityReads, 0);
+  assert.equal(creates, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.agent.provider_not_installed");
+  assert.match(error.message, /Codex is unavailable on machine claude-only.*Declared installed provider: Claude/u);
+  assert.match(error.hint, /machines create --agent codex/u);
+});
+
+test("OpenCode create names a supervisor prerequisite before any session dispatch", async () => {
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo",
+    "--yes", "--json",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async getMachine(id) { return { id, name: "open-dev", state: "running", agent: "opencode" }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_supervisor_upgrade_required",
+        }], scope, resourceId);
+      },
+      async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(creates, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.agent.opencode_supervisor_upgrade_required");
+  assert.match(error.hint, /No OpenCode AgentSession was created/u);
+  assert.match(error.hint, /Update terminal supervisor/u);
+  assert.match(error.hint, /will not stop the Machine or terminate sessions/u);
+});
+
+test("OpenCode runtime verification is a retryable no-create result", async () => {
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo",
+    "--yes", "--json",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async getMachine(id) { return { id, name: "open-verifying", state: "running", agent: "opencode" }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "temporarily_unavailable",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_runtime_unverified",
+        }], scope, resourceId);
+      },
+      async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.network);
+  assert.equal(creates, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.agent.opencode_runtime_unverified");
+  assert.equal(error.retryable, true);
+  assert.match(error.hint, /No OpenCode AgentSession was created/u);
+  assert.match(error.hint, /will not create another Machine/u);
+});
+
+test("OpenCode protocol-unavailable evidence names a replacement before any session dispatch", async () => {
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo",
+    "--yes", "--json",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async getMachine(id) { return { id, name: "protocol-open-dev", state: "running", agent: "opencode" }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{
+          id: "agent_sessions.create",
+          availability: "temporarily_unavailable",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["agent_sessions:create"],
+          reasonCode: "opencode_supervisor_protocol_unavailable",
+        }], scope, resourceId);
+      },
+      async createAgentSession() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(creates, 0);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.code, "cuna.agent.opencode_supervisor_upgrade_required");
+  assert.equal(error.details.reason, "opencode_supervisor_protocol_unavailable");
+  assert.match(error.hint, /cannot provide the OpenCode protocol/u);
+});
+
+test("OpenCode AgentSession creation uses live machine and capability evidence, not a local flag", async () => {
   let effects = 0;
   const client = fakeClient({
+    async getMachine(id) { return { id, name: "open-dev", state: "running", agent: "opencode" }; },
     async discoverCapabilities(scope, resourceId) {
       effects += 1;
       return capabilitySnapshot([{
@@ -1355,16 +2681,18 @@ test("OpenCode AgentSession creation remains blocked by a mutable producer witne
       ...platform,
       async readSafeConfig() { effects += 1; return { exists: false }; },
     },
-    env: { CUNA_API_KEY: API_KEY, CUNA_OPENCODE_ENABLED: "true" },
+    env: { CUNA_API_KEY: API_KEY, CUNA_OPENCODE_ENABLED: "false" },
     now: () => Date.parse("2026-08-08T00:00:00Z"),
     clientFactory: () => { effects += 1; return client; },
   });
-  assert.equal(exit, EXIT_CODES.policy);
-  assert.match(streams.stderr(), /immutable_contract_witness_required/u);
-  assert.equal(effects, 0);
+  assert.equal(exit, EXIT_CODES.success);
+  const record = JSON.parse(streams.stdout());
+  assert.equal(record.data.agent, "opencode");
+  assert.equal(record.data.auth_mode, "interactive_login");
+  assert.ok(effects > 0);
 });
 
-test("OpenCode AgentSession creation rejects credential bindings before capability or mutation effects", async () => {
+test("OpenCode AgentSession creation rejects credential-binding auth before effects", async () => {
   let effects = 0;
   const client = fakeClient({
     async discoverCapabilities() { effects += 1; return capabilitySnapshot([]); },
@@ -1393,51 +2721,113 @@ test("OpenCode AgentSession creation rejects credential bindings before capabili
   assert.equal(effects, 0);
 });
 
-test("OpenCode mutable producer identity blocks env true before configuration, credentials, API, host, or terminal effects", async () => {
-  const cases = [
-    ["machines", "create", "--name", "opencode-machine", "--agent", "opencode", "--yes"],
-    [
-      "agent-sessions", "create", "--machine", MACHINE_ID,
-      "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
-      "--workspace-generation", "7", "--agent", "opencode", "--yes",
-    ],
-    ["opencode", ".", "--new-session"],
-    ["opencode", "--agent-session", FOREGROUND_SESSION_A],
-  ];
-  for (const argv of cases) {
-    let effects = 0;
-    const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
-    const exit = await runCli(argv, {
-      streams: streams.streams,
-      platform: {
-        ...platform,
-        async readSafeConfig() { effects += 1; return { exists: false }; },
+test("OpenCode machine creation is stopped by a live backend capability refusal before mutation", async () => {
+  let capabilityReads = 0;
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "machines", "create", "--name", "open-dev", "--agent", "opencode", "--yes",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY, CUNA_OPENCODE_ENABLED: "true" },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        capabilityReads += 1;
+        return capabilitySnapshot([{
+          id: "machines.create",
+          availability: "unsupported",
+          interaction: "native",
+          mutationClass: "reversible",
+          surfaces: ["cli"],
+          requiredPermissions: ["machines:create"],
+          reason: "provider_not_advertised",
+        }], scope, resourceId);
       },
-      // A valid automation credential and a provider-shaped value must not be
-      // selected, copied, or injected when the local gate refuses the command.
-      env: {
-        CUNA_API_KEY: API_KEY,
-        CUNA_OPENCODE_ENABLED: "true",
-        OPENAI_API_KEY: "must-not-be-read",
-      },
-      humanAuth: {
-        async acquireAccessToken() { effects += 1; return "must-not-be-read"; },
-      },
-      clientFactory: () => { effects += 1; return fakeClient(); },
-      automaticJourneyEffectsFactory: () => { effects += 1; throw new Error("unreachable"); },
-      foregroundTerminalRunner: async () => { effects += 1; },
-    });
-    assert.equal(exit, EXIT_CODES.policy, argv.join(" "));
-    assert.match(streams.stderr(), /cuna\.feature\.opencode_disabled/u);
-    assert.match(streams.stderr(), /CUNA_OPENCODE_ENABLED=true/u);
-    assert.match(streams.stderr(), /immutable_contract_witness_required/u);
-    assert.equal(effects, 0, `${argv.join(" ")} must stop before protected effects`);
-  }
+      async createMachine() { creates += 1; throw new Error("unreachable"); },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(capabilityReads, 1);
+  assert.equal(creates, 0);
+  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.capability.unsupported");
 });
 
-test("OpenCode mutable producer identity blocks before a remotely downgraded auth mode can be observed", async () => {
+test("OpenCode AgentSession journey surfaces the server's compatible-Machine remedy", async () => {
+  const requests = [];
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333",
+    "--workspace-generation", "7", "--agent", "opencode", "--cwd", "/workspace/repo", "--yes",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    fetch: async (url, init) => {
+      const request = { url: url.toString(), method: init?.method ?? "GET" };
+      requests.push(request);
+      if (request.method === "GET" && request.url.endsWith(`/v1/sessions/${MACHINE_ID}`)) {
+        return new Response(JSON.stringify({ id: MACHINE_ID, name: "open-dev", status: "running", agent: "opencode" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (request.method === "GET" && request.url.startsWith("https://api.getcuna.com/v1/capabilities?")) {
+        return new Response(JSON.stringify({
+          schema_version: "1.0",
+          subject_scope: "machine",
+          subject_id: MACHINE_ID,
+          observed_at: "2026-08-08T00:00:00.000Z",
+          expires_at: future,
+          etag: "agent-session-create",
+          capabilities: [{
+            id: "agent_sessions.create",
+            availability: "supported",
+            interaction: "native",
+            mutation_class: "reversible",
+            surfaces: ["cli"],
+            required_permissions: ["agent_sessions:create"],
+          }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (request.method === "POST" && request.url === `https://api.getcuna.com/v1/sessions/${MACHINE_ID}/agent-sessions`) {
+        return new Response(JSON.stringify({
+          type: "https://api.getcuna.com/problems/agent_session_provider_unavailable",
+          title: "Agent provider unavailable",
+          status: 409,
+          code: "agent_session_provider_unavailable",
+          request_id: "55555555-5555-4555-8555-555555555555",
+          retryable: false,
+          detail: "The requested provider is not installed on this Machine.",
+          action: "none",
+        }), { status: 409, headers: { "content-type": "application/problem+json" } });
+      }
+      assert.fail(`unexpected request ${request.method} ${request.url}`);
+    },
+  });
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(exit, EXIT_CODES.unsupported, JSON.stringify({ requests, error }));
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[0], {
+    url: `https://api.getcuna.com/v1/sessions/${MACHINE_ID}`,
+    method: "GET",
+  });
+  assert.match(requests[1].url, /^https:\/\/api\.getcuna\.com\/v1\/capabilities\?/u);
+  assert.deepEqual(requests[2], {
+    url: `https://api.getcuna.com/v1/sessions/${MACHINE_ID}/agent-sessions`,
+    method: "POST",
+  });
+  assert.equal(error.code, "cuna.agent.provider_not_installed");
+  assert.match(error.hint, /Machine configured for OpenCode/u);
+});
+
+test("OpenCode create rejects a remotely downgraded auth mode after authoritative readback", async () => {
   let effects = 0;
   const client = fakeClient({
+    async getMachine(id) { return { id, name: "open-dev", state: "running", agent: "opencode" }; },
     async discoverCapabilities(scope, resourceId) {
       effects += 1;
       return capabilitySnapshot([{
@@ -1470,9 +2860,9 @@ test("OpenCode mutable producer identity blocks before a remotely downgraded aut
     now: () => Date.parse("2026-08-08T00:00:00Z"),
     clientFactory: () => { effects += 1; return client; },
   });
-  assert.equal(exit, EXIT_CODES.policy);
-  assert.match(streams.stderr(), /immutable_contract_witness_required/u);
-  assert.equal(effects, 0);
+  assert.equal(exit, EXIT_CODES.conflict);
+  assert.match(streams.stderr(), /postcondition|does not match|authority/iu);
+  assert.ok(effects > 0);
 });
 
 test("agent logout binds confirmation to one exact AgentSession generation", async () => {
@@ -1585,6 +2975,62 @@ test("AgentSession capability subject mismatch blocks mutation before the client
   assert.equal(JSON.parse(streams.stderr()).error.details.reason, "subject_scope_mismatch");
 });
 
+test("menu creation decline returns to Machines while direct and unrelated refusals remain failures", async () => {
+  for (const mode of ["root", "machines", "direct", "other-policy", "aborted"]) {
+    const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+    const controller = new AbortController();
+    const calls = { menu: 0, declined: 0, dispatched: 0, reconcile: 0, sessions: 0, attached: 0 };
+    const configs = [];
+    const configFile = "C:\\fixture\\chosen-config.json";
+    const invocationOptions = mode === "root" ? [] : ["--profile", "review", "--base-url", "https://review.example.test", "--config-file", configFile, "--timeout-ms", "4321", "--no-color"];
+    const select = async (input) => {
+      calls.menu += 1;
+      if (mode !== "root") assert.equal(input.color, false);
+      return calls.menu === 1 ? { kind: "launch", agent: "opencode", newSession: true } : undefined;
+    };
+    const exit = await runCli([...(mode === "direct" ? ["opencode", ".", "--new", "--no-sync"] : mode === "root" ? [] : ["machines"]), ...invocationOptions], {
+      streams: streams.streams, platform: { ...platform, async readSafeConfig(path) {
+        if (mode === "root") return { exists: false };
+        assert.equal(path, configFile);
+        return { exists: true, text: JSON.stringify({ profiles: { default: {}, review: { development: true } } }) };
+      } }, env: { CUNA_API_KEY: API_KEY }, signal: controller.signal,
+      clientFactory: (config, timeoutMs) => {
+        configs.push({ profile: config.profile, baseUrl: config.baseUrl, configFile: config.configFile, timeoutMs });
+        return fakeClient({ async createMachine() { calls.dispatched += 1; throw new Error("unexpected mutation"); } });
+      },
+      rootJourneyRunner: select, machinesExplorerRunner: select,
+
+
+      automaticJourneyEffectsFactory: () => ({
+        async inspectWorkspace() { return { canonicalLocalRoot: "C:\\work\\project" }; },
+        async observeMachines() { return []; },
+        async createMachine() {
+          calls.declined += 1;
+          if (mode === "aborted") controller.abort(new Error("interrupted"));
+          throw new CunaError({ code: mode === "other-policy" ? "cuna.policy.other_refusal" : "cuna.journey.machine_create_not_authorized",
+            message: "Machine creation was not authorized.", exitCode: EXIT_CODES.policy });
+        },
+        async reconcileMachineCreate() { calls.reconcile += 1; return "unreconcilable"; },
+        async ensureMachineReady() { throw new Error("unexpected readiness"); },
+        async synchronizeWorkspace() { throw new Error("unexpected sync"); },
+        async observeAgentSessions() { calls.sessions += 1; return []; },
+        async createAgentSession() { calls.sessions += 1; throw new Error("unexpected session creation"); },
+        async ensureAgentSessionReady() { throw new Error("unexpected session readiness"); },
+        async attach() { calls.attached += 1; },
+        async reconcileCancellation() {},
+      }),
+    });
+    const returnsToMenu = mode === "root" || mode === "machines";
+    assert.equal(calls.menu, returnsToMenu ? 2 : mode === "direct" ? 0 : 1, `${mode}: ${streams.stderr()}`);
+    assert.equal(exit, returnsToMenu || mode === "aborted" ? EXIT_CODES.success : EXIT_CODES.policy, mode);
+    assert.equal(calls.declined, 1, mode);
+    assert.equal(calls.dispatched + calls.reconcile + calls.sessions + calls.attached, 0, mode);
+    assert.equal(configs.length, returnsToMenu ? 3 : mode === "direct" ? 1 : 2, mode);
+    if (mode !== "root") for (const config of configs) assert.deepEqual(config, { profile: "review", baseUrl: "https://review.example.test", configFile, timeoutMs: 4321 });
+    if (returnsToMenu) assert.doesNotMatch(streams.stderr(), /Error \[/u);
+  }
+});
+
 test("valid automatic agent intents execute the effects-fenced journey and exact attach", async () => {
   const cases = [
     [
@@ -1592,7 +3038,6 @@ test("valid automatic agent intents execute the effects-fenced journey and exact
       "--auth-mode", "credential_binding", "--credential-binding", "44444444-4444-4444-8444-444444444444",
     ],
     ["codex", ".", "--new", "--auth-mode", "interactive_login"],
-    ["openclaw", "tools", "--new-session"],
   ];
   for (const argv of cases) {
     const phases = [];
@@ -1634,7 +3079,6 @@ test("TC-004-01 explicit agent shorthand binds one AgentSession and its expected
   const expectations = [
     ["claude", "claude-code"],
     ["codex", "codex"],
-    ["openclaw", "openclaw"],
   ];
   for (const [command, expectedAgent] of expectations) {
     let observed;
@@ -1650,7 +3094,15 @@ test("TC-004-01 explicit agent shorthand binds one AgentSession and its expected
     assert.deepEqual(observed.agentSessionIds, [FOREGROUND_SESSION_A]);
     assert.deepEqual(observed.expectedAgentKinds, [expectedAgent]);
     assert.equal(streams.stdout(), "");
-    assert.equal(streams.stderr(), "");
+    const display = expectedAgent === "claude-code" ? "Claude Code" : expectedAgent === "codex" ? "Codex" : "OpenClaw";
+    const progress = streams.stderr();
+    const visible = stripAnsi(progress).replaceAll("\r", "");
+    assert.match(visible, new RegExp(`Preparing ${display}`, "u"));
+    assert.match(visible, new RegExp(`Connecting to ${display}`, "u"));
+    assert.match(visible, new RegExp(`Attaching to ${display}`, "u"));
+    assert.match(progress, /[◐◓◑◒]/u, "the journey should show an immediate spinner");
+    assert.match(progress, /[━╺╸]{6}/u, "the journey should show animated progress");
+    assert.equal(progress.includes(`${ESCAPE}[38;5;202m`), true, "the spinner should use the Cuna flare accent");
   }
 });
 
@@ -1673,6 +3125,62 @@ test("explicit agent shorthand rejects ambiguous or misleading input before effe
     assert.equal(exit, EXIT_CODES.usage);
     assert.equal(effects, 0);
   }
+});
+
+test("history gap CLI error names read-only exact-session inspection without inferring process exit", async () => {
+  const { terminalHistoryGap } = await import("../dist/runtime/errors.js");
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const exit = await runCli(["codex", "--agent-session", FOREGROUND_SESSION_A], {
+    streams: streams.streams, platform,
+    env: { CUNA_API_KEY: API_KEY, TERM: "xterm-256color" },
+    clientFactory: () => fakeClient(),
+    foregroundTerminalRunner: async () => { throw terminalHistoryGap(FOREGROUND_SESSION_A); },
+  });
+  assert.equal(exit, EXIT_CODES.remote);
+  const text = stripAnsi(streams.stderr());
+  assert.match(text, /cuna.runtime.terminal_history_gap/u);
+  assert.ok(text.includes(`cuna agent-sessions get ${FOREGROUND_SESSION_A}`));
+  assert.match(text, /agent's current state is unknown/u);
+  assert.doesNotMatch(text, /new-session|session stopped|process exited/u);
+});
+
+test("agent shorthand shows truthful preparation feedback before configuration or network work completes", async () => {
+  let releaseConfig;
+  const configGate = new Promise((resolve) => { releaseConfig = resolve; });
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const execution = runCli(["claude", "--agent-session", FOREGROUND_SESSION_A], {
+    streams: streams.streams,
+    platform: { ...platform, async readSafeConfig() { await configGate; return { exists: false }; } },
+    env: { CUNA_API_KEY: API_KEY, TERM: "xterm-256color" },
+    clientFactory: () => fakeClient(),
+    foregroundTerminalRunner: async () => {},
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const immediate = streams.stderr();
+  assert.match(stripAnsi(immediate), /Preparing Claude Code/u);
+  assert.match(immediate, /[◐◓◑◒]/u, "feedback should animate before configuration resolves");
+  releaseConfig();
+  assert.equal(await execution, EXIT_CODES.success);
+});
+
+test("OpenCode shorthand directs provider sign-in to its remote TUI before configuration resolves", async () => {
+  let releaseConfig;
+  const configGate = new Promise((resolve) => { releaseConfig = resolve; });
+  const streams = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
+  const execution = runCli(["opencode", "--agent-session", FOREGROUND_SESSION_A], {
+    streams: streams.streams,
+    platform: { ...platform, async readSafeConfig() { await configGate; return { exists: false }; } },
+    env: { CUNA_API_KEY: API_KEY, TERM: "xterm-256color" },
+    clientFactory: () => fakeClient(),
+    foregroundTerminalRunner: async () => {},
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const immediate = streams.stderr();
+  assert.match(stripAnsi(immediate), /Preparing OpenCode — use \/connect in its terminal/u);
+  assert.match(immediate, /[◐◓◑◒]/u, "feedback should animate before configuration resolves");
+  releaseConfig();
+  assert.equal(await execution, EXIT_CODES.success);
+  assert.match(stripAnsi(streams.stderr()).replaceAll("\r", ""), /Opening OpenCode terminal — use \/connect there/u);
 });
 
 test("invalid automatic agent intents fail before config, auth, API, or terminal effects", async () => {
@@ -1727,7 +3235,10 @@ test("TC-055-01 connect and AgentSession attach dispatch only explicit session I
     });
     assert.equal(exit, EXIT_CODES.success);
     assert.equal(streams.stdout(), "");
-    assert.equal(streams.stderr(), "");
+    const visibleProgress = stripAnsi(streams.stderr()).replaceAll("\r", "");
+    const sessionCount = argv[0] === "agent-sessions" ? argv.length - 2 : argv.length - 1;
+    const expectedLabel = sessionCount === 1 ? "Attaching to AgentSession" : `Attaching to ${sessionCount} AgentSessions`;
+    assert.match(visibleProgress, new RegExp(expectedLabel, "u"));
   }
   assert.deepEqual(calls.map((call) => call.agentSessionIds), [
     [FOREGROUND_SESSION_A, FOREGROUND_SESSION_B],
@@ -1765,7 +3276,7 @@ test("TC-055-11 non-TTY and JSON foreground requests fail before auth, configura
   }
 });
 
-test("TC-055-07/11 terminal admission selects truthful plain fallback and preserves NO_COLOR", async () => {
+test("TC-055-07/11 terminal admission keeps Windows rich while selecting truthful fallbacks and preserving NO_COLOR", async () => {
   for (const kind of ["linux", "macos"]) {
     for (const env of [{}, { TERM: "" }, { TERM: "   " }, { TERM: "dumb" }]) {
       let observed;
@@ -1810,14 +3321,18 @@ test("TC-055-07/11 terminal admission selects truthful plain fallback and preser
   }), EXIT_CODES.success);
   assert.equal(windowsObserved.hostPlatform, "win32");
   assert.equal(windowsObserved.terminalKind, "dumb");
-  assert.equal(windowsObserved.presentationMode, "rich");
+  assert.equal(
+    windowsObserved.presentationMode,
+    "rich",
+    "Windows ConPTY stays capable even when an inherited TERM=dumb value is present",
+  );
 
   let observed;
   const noColor = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true });
   assert.equal(await runCli(["connect", FOREGROUND_SESSION_A], {
     streams: noColor.streams,
     platform,
-    env: { CUNA_API_KEY: API_KEY, NO_COLOR: "1", TERM: "xterm-256color" },
+    env: { CUNA_API_KEY: API_KEY, NO_COLOR: "1", TERM: "xterm-256color", CUNA_TERMINAL_MODE: "rich" },
     clientFactory: () => fakeClient(),
     foregroundTerminalRunner: async (input) => { observed = input; },
   }), EXIT_CODES.success);
@@ -2010,4 +3525,229 @@ test("package and runtime versions remain identical", async () => {
   const streams = memoryStreams();
   await runCli(["--version"], { streams: streams.streams });
   assert.equal(JSON.parse(streams.stdout()).data.version, packageJson.version);
+});
+
+// PRD-OC-011 R2. Every test below fails on the rendering that shipped before
+// it: the field it asserts existed in `data`, was decoded, and was dropped on
+// the one branch a person at a terminal reads.
+
+test("machines list names the provider verdict, so a machine that cannot host a session stops printing like one", async () => {
+  const usable = { id: MACHINE_ID, name: "dev-box", state: "running", agent: "opencode" };
+  const unusable = { id: "44444444-4444-4444-8444-444444444444", name: "old-box", state: "running", agent: "fooagent" };
+  const client = fakeClient({ async listMachines() { return { items: [usable, unusable] }; } });
+  const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["machines", "list"], {
+    streams: human.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => client,
+  }), EXIT_CODES.success, human.stderr());
+  const lines = human.stdout().trim().split("\n");
+  assert.equal(lines[0], `${usable.id}\tdev-box\trunning\tOpenCode ready`);
+  assert.equal(lines[1], `${unusable.id}\told-box\trunning\tUnknown (fooagent) unusable — provider_not_supported_by_cli`);
+
+  // The JSON is the control, and it is unchanged: it carried both fields all
+  // along, and the human branch was the only consumer that lost them.
+  const json = memoryStreams();
+  assert.equal(await runCli(["machines", "list", "--json"], {
+    streams: json.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => client,
+  }), EXIT_CODES.success);
+  const items = JSON.parse(json.stdout()).data.items;
+  assert.equal(items[1].provider_availability.usability, "declared-installed");
+  assert.equal(items[1].provider_availability.actionable, false);
+});
+
+test("the machines overview header prints the verdict, not the declaration that contradicts it", async () => {
+  // `usability: declared-installed` and `actionable: false` coexist by
+  // construction. The header used to print the first alone, so this machine
+  // read as installed and usable while every session on it classifies
+  // unsupported and `agent-sessions create` fails closed.
+  const machine = { id: MACHINE_ID, name: "old-box", state: "running", agent: "fooagent" };
+  const client = fakeClient({ async listMachines() { return { items: [machine] }; } });
+  const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["machines"], {
+    streams: human.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00.000Z"),
+    clientFactory: () => client,
+  }), EXIT_CODES.success, human.stderr());
+  assert.match(human.stdout(), /Unknown \(fooagent\) unusable — provider_not_supported_by_cli/u, human.stdout());
+  assert.doesNotMatch(human.stdout(), /fooagent\) declared-installed/u, human.stdout());
+});
+
+test("api-keys list derives its status word from expiry as well as revocation", async () => {
+  const now = Date.parse("2026-08-08T00:00:00.000Z");
+  const keys = [
+    {
+      id: "11111111-1111-4111-8111-111111111111",
+      name: "expired-never-revoked",
+      prefix: "cuna_sk_abcd",
+      lastFour: "WXYZ",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: "2026-08-01T00:00:00.000Z",
+      lastUsedAt: null,
+      revokedAt: null,
+    },
+    {
+      id: "22222222-2222-4222-8222-222222222222",
+      name: "still-valid",
+      prefix: "cuna_sk_efgh",
+      lastFour: "1234",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: "2026-12-01T00:00:00.000Z",
+      lastUsedAt: null,
+      revokedAt: null,
+    },
+    {
+      id: "33333333-3333-4333-8333-333333333333",
+      name: "no-expiry",
+      prefix: "cuna_sk_ijkl",
+      lastFour: "5678",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: null,
+      lastUsedAt: null,
+      revokedAt: null,
+    },
+    {
+      id: "44444444-4444-4444-8444-444444444444",
+      name: "revoked-key",
+      prefix: "cuna_sk_mnop",
+      lastFour: "9012",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: "2026-12-01T00:00:00.000Z",
+      lastUsedAt: null,
+      revokedAt: "2026-08-02T00:00:00.000Z",
+    },
+  ];
+  const client = fakeClient({
+    async discoverCapabilities(scope) {
+      return capabilitySnapshot([{
+        id: "api_keys.manage",
+        availability: "supported",
+        interaction: "native",
+        mutationClass: "secret_revealing",
+        surfaces: ["cli"],
+        requiredPermissions: ["api_keys:manage", "auth:interactive"],
+      }], scope);
+    },
+    async listApiKeys() { return keys; },
+  });
+  const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["api-keys", "list"], {
+    streams: human.streams,
+    platform,
+    env: {},
+    humanAuth: { async acquireAccessToken() { return `cuna_at_${"b".repeat(43)}`; } },
+    now: () => now,
+    clientFactory: () => client,
+  }), EXIT_CODES.success, human.stderr());
+  const lines = human.stdout().trim().split("\n");
+  // The defect: `revokedAt === null` alone printed this key as `active`.
+  assert.equal(lines[0], `${keys[0].id}\texpired-never-revoked\tcuna_sk_abcd…WXYZ\texpired 2026-08-01T00:00:00.000Z`);
+  assert.equal(lines[1], `${keys[1].id}\tstill-valid\tcuna_sk_efgh…1234\tactive until 2026-12-01T00:00:00.000Z`);
+  assert.equal(lines[2], `${keys[2].id}\tno-expiry\tcuna_sk_ijkl…5678\tactive (no expiry)`);
+  assert.equal(lines[3], `${keys[3].id}\trevoked-key\tcuna_sk_mnop…9012\trevoked 2026-08-02T00:00:00.000Z`);
+});
+
+test("cuna version prints the build digest that separates two installations reporting 0.1.0", async () => {
+  const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["version"], { streams: human.streams, platform, env: {} }), EXIT_CODES.success);
+  const printed = human.stdout().trim();
+  assert.match(printed, /^0\.1\.0\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
+
+  // The digest printed is the exact 12-hex prefix of the one the JSON record
+  // carries, so the two surfaces can never name different builds.
+  const json = memoryStreams();
+  assert.equal(await runCli(["version", "--json"], { streams: json.streams, platform, env: {} }), EXIT_CODES.success);
+  const record = JSON.parse(json.stdout());
+  assert.equal(printed.split("\t")[1], `build ${record.data.buildDigest.slice(0, 12)}…`);
+});
+
+test("doctor and config get answer a terminal in lines, not in a JSON dump", async () => {
+  const doctor = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["doctor"], {
+    streams: doctor.streams,
+    platform,
+    env: {},
+    runtimeFeatures: [
+      { feature: "daemon", implementation: "unsupported", reason: "daemon_runtime_unavailable" },
+      { feature: "terminal_workspace", implementation: "available", reason: "foreground_exact_session_composed_live_producer_required" },
+    ],
+  }), EXIT_CODES.success, doctor.stderr());
+  const doctorLines = doctor.stdout().trim().split("\n");
+  assert.equal(doctorLines[0], `platform\t${process.platform}`);
+  assert.equal(doctorLines[1], `node\t${process.version}`);
+  assert.equal(doctorLines[2], "environment_credential\tabsent");
+  assert.equal(doctorLines[3], "environment_credential_variable\tnull");
+  assert.equal(doctorLines[4], "runtime_features");
+  // The reason code is the field that names the prerequisite, and it is on the
+  // line that reports the feature rather than in a nested JSON object.
+  assert.equal(doctorLines[5], "  daemon\tunsupported\tdaemon_runtime_unavailable");
+  assert.equal(doctorLines[6], "  terminal_workspace\tavailable\tforeground_exact_session_composed_live_producer_required");
+  assert.doesNotMatch(doctor.stdout(), /[{}]/u, doctor.stdout());
+
+  const config = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["config", "get"], { streams: config.streams, platform, env: {} }), EXIT_CODES.success, config.stderr());
+  assert.doesNotMatch(config.stdout(), /[{}]/u, config.stdout());
+  assert.match(config.stdout(), /^profile\tdefault$/mu, config.stdout());
+  assert.match(config.stdout(), /^api_key\tabsent$/mu, config.stdout());
+  assert.match(config.stdout(), /^api_key_variable\tnull$/mu, config.stdout());
+
+  // Both records are unchanged under --json; only the human branch moved.
+  const configJson = memoryStreams();
+  assert.equal(await runCli(["config", "get", "--json"], { streams: configJson.streams, platform, env: {} }), EXIT_CODES.success);
+  assert.equal(JSON.parse(configJson.stdout()).data.profile, "default");
+});
+
+test("a truncated page says so, so a missing record cannot be mistaken for an absent one", async () => {
+  const sessions = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["agent-sessions", "list", "--machine", MACHINE_ID], {
+    streams: sessions.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async listAgentSessions() {
+        return { items: [agentSession({ machineId: MACHINE_ID })], nextCursor: "eyJvIjoxMDB9" };
+      },
+    }),
+  }), EXIT_CODES.success, sessions.stderr());
+  assert.equal(
+    sessions.stdout().trim().split("\n").at(-1),
+    "-- more results; continue with --cursor eyJvIjoxMDB9",
+  );
+
+  // NEGATIVE CONTROL: a complete page must not grow a footer, or the notice
+  // stops meaning anything.
+  const complete = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["agent-sessions", "list", "--machine", MACHINE_ID], {
+    streams: complete.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async listAgentSessions() { return { items: [agentSession({ machineId: MACHINE_ID })] }; },
+    }),
+  }), EXIT_CODES.success, complete.stderr());
+  assert.doesNotMatch(complete.stdout(), /more results/u, complete.stdout());
+
+  // `machines list` takes no `--cursor`, so it must not offer one it cannot accept.
+  const machines = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
+  assert.equal(await runCli(["machines", "list"], {
+    streams: machines.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({
+      async listMachines() {
+        return { items: [{ id: MACHINE_ID, name: "dev-box", state: "running", agent: "opencode" }], nextCursor: "eyJvIjoxMDB9" };
+      },
+    }),
+  }), EXIT_CODES.success, machines.stderr());
+  assert.equal(
+    machines.stdout().trim().split("\n").at(-1),
+    "-- truncated; more machines exist beyond this page",
+  );
+  assert.doesNotMatch(machines.stdout(), /--cursor/u, machines.stdout());
 });

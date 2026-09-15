@@ -13,6 +13,7 @@ import { sha256File, verifyEnvelopeFiles } from "../scripts/lib/release-evidence
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const ID = "10000000-0000-4000-8000-000000000001";
+const EXECUTION_ID = "70000000-0000-4000-8000-000000000007";
 const SESSION_ID = "20000000-0000-4000-8000-000000000002";
 const WORKSPACE_ID = "30000000-0000-4000-8000-000000000003";
 const API_KEY_ID = "40000000-0000-4000-8000-000000000004";
@@ -24,6 +25,7 @@ const OPENCODE_AUTH_MISSING_SESSION_ID = "54000000-0000-4000-8000-000000000005";
 const OPENCODE_AUTH_INVALID_SESSION_ID = "55000000-0000-4000-8000-000000000005";
 const OPENCODE_AUTH_CONFIGURED_SESSION_ID = "56000000-0000-4000-8000-000000000005";
 const WORKSPACE_BINDING_ID = "60000000-0000-4000-8000-000000000006";
+const PROJECT_ID = "80000000-0000-4000-8000-000000000008";
 const PROCESS_EPOCH = "70000000-0000-4000-8000-000000000007";
 const LOGIN_CODE = `cuna_login_${"l".repeat(43)}`;
 const LOGIN_CODE_2 = `cuna_login_${"m".repeat(43)}`;
@@ -66,10 +68,11 @@ const INSTALLED_E2E_PHASE_TIMEOUTS = Object.freeze({
   "installed-admitted-whoami": 45_000,
   "installed-authenticated-readonly-command-matrix": 10 * INSTALLED_COMMAND_TIMEOUT_MS + CLEANUP_TIMEOUT_MS,
   "installed-machine-lifecycle-command-matrix": 5 * INSTALLED_COMMAND_TIMEOUT_MS + CLEANUP_TIMEOUT_MS,
+  "installed-execution-recovery-command-matrix": 4 * INSTALLED_COMMAND_TIMEOUT_MS + CLEANUP_TIMEOUT_MS,
   "installed-agent-session-command-matrix": 5 * INSTALLED_COMMAND_TIMEOUT_MS + CLEANUP_TIMEOUT_MS,
   "installed-stale-supervisor-evidence-negative": 45_000,
   "installed-explicit-foreground-command-matrix": 120_000,
-  "installed-opencode-mutable-witness-gate": 90_000,
+  "installed-opencode-foreground": 90_000,
   "installed-automatic-foreground-command-matrix": 120_000,
   "installed-session-api-key-and-logout": INSTALLED_SESSION_API_KEY_AND_LOGOUT_PHASE_TIMEOUT_MS,
   "contract-server-teardown": CLEANUP_TIMEOUT_MS,
@@ -582,7 +585,13 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
       installedHelpTopics = (await import(pathToFileURL(path.join(installedRoot, "dist", "cli", "command-help.js")).href)).HELP_TOPICS;
       assert.deepEqual([...installedHelpTopics].sort(), [...INSTALLED_HELP_TOPICS].sort(), "a new installed command lacks matrix classification");
       const leafTopics = installedHelpTopics.filter((topic) => !installedHelpTopics.some((candidate) => candidate.startsWith(`${topic} `)));
-      assert.deepEqual([...leafTopics].sort(), [...SUPPORTED_SUCCESS_TOPICS, ...DELIBERATE_UNSUPPORTED_TOPICS].sort(), "a leaf command lacks success or deliberate-unsupported evidence");
+      assert.deepEqual([...leafTopics].sort(), [...SUPPORTED_SUCCESS_TOPICS, ...CONDITIONALLY_AVAILABLE_TOPICS, ...INTERACTIVE_HUMAN_LOGIN_TOPICS, ...DELIBERATE_UNSUPPORTED_TOPICS].sort(), "a leaf command lacks success, conditional, interactive-refusal, or deliberate-unsupported evidence");
+      for (const topic of INTERACTIVE_HUMAN_LOGIN_TOPICS) {
+        assert.ok(
+          INSTALLED_FAILURE_MATRIX.some((entry) => entry.id === `${topic}/non-interactive`),
+          `${topic} is classified interactive-only but the installed matrix never exercises its refusal`,
+        );
+      }
     });
 
     await runPhase(receipt, "installed-readonly-command-matrix", installedE2ePhaseTimeout("installed-readonly-command-matrix"), async () => {
@@ -601,6 +610,27 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
       assert.equal(help.code, 0, `installed help failed for ${topic}`);
       assert.equal(JSON.parse(help.stdout).type, "result", topic);
     });
+    // Run before the `--json` matrix below, so this evidence is observed on its
+    // own rather than pre-empted by the entry that also names an output mode.
+    //
+    // The matrix entries pass `--json`, so their refusal is attributable to the
+    // requested output mode as much as to the absent terminal. Repeat each
+    // interactive command with valid arguments and no output flag at all: the
+    // only thing left that can refuse it is the redirected terminal, and the
+    // refusal must still happen before the CLI asks the producer anything.
+    //
+    // What this does NOT isolate: `createOutputWriter` selects structured
+    // output whenever stdout is not a TTY, so a redirected invocation always
+    // satisfies both halves of the guard. No piped-stdio harness can separate
+    // them; only a real terminal can.
+    for (const topic of INTERACTIVE_HUMAN_LOGIN_TOPICS) {
+      const before = authority.state.servedRequests;
+      const refused = await invokeInstalled(installedEntrypoint, [topic, "--project", PROJECT_ID], env, sandbox);
+      assert.equal(refused.code, 2, `installed ${topic} must refuse a redirected terminal`);
+      assert.equal(JSON.parse(refused.stderr).error.code, "cuna.usage.invalid", topic);
+      assert.match(JSON.parse(refused.stderr).error.message, /interactive terminal/u, topic);
+      assert.equal(authority.state.servedRequests, before, `installed ${topic} reached the producer before refusing`);
+    }
     await runBoundedConcurrent(INSTALLED_FAILURE_MATRIX, READ_ONLY_MATRIX_CONCURRENCY, async (entry) => {
       const result = await invokeInstalled(installedEntrypoint, entry.argv, env, sandbox);
       assert.equal(result.code, entry.exit, `installed failure mode drifted for ${entry.id}`);
@@ -701,6 +731,23 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     }
     });
 
+    await runPhase(receipt, "installed-execution-recovery-command-matrix", installedE2ePhaseTimeout("installed-execution-recovery-command-matrix"), async () => {
+      for (const action of ["list", "get", "cancel", "get"]) {
+        const argv = ["executions", action, ...(action === "list" ? [] : [EXECUTION_ID]), "--machine", ID,
+          ...(action === "cancel" ? ["--yes"] : []), "--json"];
+        const result = await invokeInstalled(installedEntrypoint, argv, env, sandbox);
+        assert.equal(result.code, 0, `installed execution ${action} failed: ${safeErrorCode(result.stderr)}`);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.command, `executions.${action}`);
+        const item = action === "list" ? output.data.items[0] : output.data;
+        assert.equal(item.machine_id, ID); assert.equal(item.operation_id, EXECUTION_ID);
+        assert.equal(item.leader_state, "exited"); assert.equal(item.ownership_state, "descendants_live");
+        if (action === "cancel") assert.equal(item.cancel_requested, true);
+        const pair = await installedSessionPairState(user);
+        assert.equal(pair.valid, true, `execution recovery damaged the profile: ${pair.diagnostic}`);
+      }
+    });
+
     await runPhase(receipt, "installed-machine-lifecycle-command-matrix", installedE2ePhaseTimeout("installed-machine-lifecycle-command-matrix"), async () => {
     const successMatrix = [
       ["machines.create", ["machines", "create", "--name", "matrix-machine", "--yes", "--json"]],
@@ -740,11 +787,14 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
         sandbox,
         { authorityScenario: "stale-supervisor-evidence" },
       );
-      assert.equal(staleEvidence.code, 4, staleEvidence.stderr);
-      assert.match(staleEvidence.stderr, /cuna\.runtime\.remote_state_unproven/u);
-      assert.equal(Object.hasOwn(staleEvidence.receipt, "child_pid"), false, "stale supervisor evidence reached terminal child creation");
-      assert.equal(staleEvidence.receipt.events.includes("host:acquire"), false, "stale supervisor evidence reached terminal ownership");
-      assert.equal(staleEvidence.receipt.events.some((event) => event.startsWith("child:spawn") || event.startsWith("wire:")), false, "stale supervisor evidence opened terminal transport");
+      // A cached observation whose lease has elapsed is not attach authority.
+      // This fixture's POST terminal-connections accepts the session, so the
+      // installed CLI must proceed and let that backend decision win.
+      assert.equal(staleEvidence.code, 0, staleEvidence.stderr);
+      assert.equal(staleEvidence.receipt.child_closed, true);
+      assert.equal(staleEvidence.receipt.events.includes("host:acquire"), true);
+      assert.equal(staleEvidence.receipt.events.includes("child:ready"), true);
+      assert.equal(staleEvidence.receipt.events.includes("wire:close"), true);
     });
 
     await runPhase(receipt, "installed-explicit-foreground-command-matrix", installedE2ePhaseTimeout("installed-explicit-foreground-command-matrix"), async () => {
@@ -753,7 +803,6 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
       ["agent-sessions.attach", ["agent-sessions", "attach", AGENT_SESSION_ID]],
       ["claude", ["claude", "--agent-session", CLAUDE_SESSION_ID]],
       ["codex", ["codex", "--agent-session", AGENT_SESSION_ID]],
-      ["openclaw", ["openclaw", "--agent-session", OPENCLAW_SESSION_ID]],
     ]) {
       const result = await invokeInstalledForeground(argv, env, sandbox);
       assert.equal(result.code, 0, `installed foreground matrix failed for ${id}: ${safeErrorCode(result.stderr)} ${result.stderr.slice(0, 500)}`);
@@ -768,35 +817,52 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     }
     });
 
-    await runPhase(receipt, "installed-opencode-mutable-witness-gate", installedE2ePhaseTimeout("installed-opencode-mutable-witness-gate"), async () => {
+    await runPhase(receipt, "installed-opencode-foreground", installedE2ePhaseTimeout("installed-opencode-foreground"), async () => {
       for (const [id, argv] of [
         ["login-required", ["opencode", "--agent-session", OPENCODE_SESSION_ID]],
-        ["404", ["opencode", "--agent-session", OPENCODE_AUTH_MISSING_SESSION_ID]],
-        ["semantic-invalid", ["opencode", "--agent-session", OPENCODE_AUTH_INVALID_SESSION_ID]],
+        ["login-required-missing-observation", ["opencode", "--agent-session", OPENCODE_AUTH_MISSING_SESSION_ID]],
         ["configured", ["opencode", "--agent-session", OPENCODE_AUTH_CONFIGURED_SESSION_ID]],
         ["automatic", ["opencode", ".", "--new-session"]],
       ]) {
-        const result = await invokeInstalledForeground(
-          argv,
-          { ...env, CUNA_OPENCODE_ENABLED: "true" },
-          sandbox,
-        );
-        assert.equal(result.code, 4, `OpenCode ${id} must fail closed on a mutable producer witness: ${result.stderr}`);
-        assert.match(result.stderr, /cuna\.feature\.opencode_disabled/u);
-        assert.match(result.stderr, /immutable_contract_witness_required/u);
-        assert.deepEqual(result.receipt.automatic, { phases: [] });
-        assert.equal(Object.hasOwn(result.receipt, "child_pid"), false, `OpenCode ${id} reached terminal child creation`);
-        assert.equal(result.receipt.events.includes("host:acquire"), false, `OpenCode ${id} reached terminal ownership`);
-        assert.equal(result.receipt.events.some((event) => event.startsWith("child:spawn") || event.startsWith("wire:")), false, `OpenCode ${id} opened terminal transport`);
+        const result = await invokeInstalledForeground(argv, env, sandbox);
+        assert.equal(result.code, 0, `OpenCode ${id} failed: ${safeErrorCode(result.stderr)} ${result.stderr.slice(0, 500)}`);
+        assert.equal(result.receipt.events.includes("host:acquire"), true, `OpenCode ${id} never acquired the terminal`);
+        assert.equal(result.receipt.events.includes("child:ready"), true, `OpenCode ${id} never reached PTY readiness`);
+        assert.equal(result.receipt.events.includes("wire:close"), true, `OpenCode ${id} leaked its terminal wire`);
+        assert.equal(result.receipt.child_closed, true, `OpenCode ${id} left its transport child open`);
       }
-      assert.equal(authority.state.openCodeSessionRequests, 0, "mutable OpenCode witness reached any AgentSession read");
-      assert.equal(authority.state.openCodeAgentAuth404Requests, 0, "mutable OpenCode witness reached 404 auth evidence");
-      assert.equal(authority.state.openCodeAgentAuthInvalidEvidenceRequests, 0, "mutable OpenCode witness reached invalid auth evidence");
-      assert.equal(authority.state.openCodeAgentAuthConfiguredRequests, 0, "mutable OpenCode witness reached configured auth evidence");
+      // DECIDED, after this case and the unit tests were found to demand
+      // opposite things for the same input. This case had never executed — an
+      // earlier phase aborted the suite before reaching it — so it had never
+      // been reconciled with the behaviour three unit variants already pin in
+      // test/node-foreground-session.test.mjs.
+      //
+      // The resolution is that the auth probe is presentation-only: admission
+      // was already decided by the exact supervisor observation and the one-use
+      // terminal grant, so an undecodable auth observation must not withhold a
+      // terminal the runtime already admitted. What it must never do is CLAIM
+      // anything — an impossible observation cannot present the person as
+      // signed in. So the terminal opens, and the claim stays conservative.
+      for (const [id, sessionId] of [["semantic-invalid", OPENCODE_AUTH_INVALID_SESSION_ID]]) {
+        const result = await invokeInstalledForeground(["opencode", "--agent-session", sessionId], env, sandbox);
+        assert.equal(result.code, 0, `OpenCode ${id} did not open: ${safeErrorCode(result.stderr)} ${result.stderr.slice(0, 500)}`);
+        assert.equal(result.receipt.events.includes("host:acquire"), true, `OpenCode ${id} never acquired the terminal`);
+        assert.equal(result.receipt.events.includes("child:ready"), true, `OpenCode ${id} never reached PTY readiness`);
+        assert.equal(result.receipt.events.includes("wire:close"), true, `OpenCode ${id} leaked its terminal wire`);
+        assert.equal(result.receipt.child_closed, true, `OpenCode ${id} left its transport child open`);
+        // The part that still has to fail safe: an off-contract observation
+        // must never be rendered as a signed-in provider.
+        const shown = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+        assert.doesNotMatch(shown, /authenticated/iu, `OpenCode ${id} presented impossible evidence as signed in`);
+      }
+      assert.ok(authority.state.openCodeSessionRequests >= 5, "OpenCode did not bind exact AgentSession authority");
+      assert.equal(authority.state.openCodeAgentAuth404Requests, 1, "OpenCode did not inspect missing auth evidence exactly once");
+      assert.equal(authority.state.openCodeAgentAuthInvalidEvidenceRequests, 1, "OpenCode did not inspect invalid auth evidence exactly once");
+      assert.equal(authority.state.openCodeAgentAuthConfiguredRequests, 1, "OpenCode did not inspect configured auth evidence exactly once");
     });
 
     await runPhase(receipt, "installed-automatic-foreground-command-matrix", installedE2ePhaseTimeout("installed-automatic-foreground-command-matrix"), async () => {
-    for (const [command, expectedAgent, expectedSessionId] of [["claude", "claude-code", CLAUDE_SESSION_ID], ["codex", "codex", AGENT_SESSION_ID], ["openclaw", "openclaw", OPENCLAW_SESSION_ID]]) {
+    for (const [command, expectedAgent, expectedSessionId] of [["claude", "claude-code", CLAUDE_SESSION_ID], ["codex", "codex", AGENT_SESSION_ID]]) {
       const result = await invokeInstalledForeground(
         [command, ".", "--new-session"],
         env,
@@ -869,10 +935,10 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     assert.equal(authority.state.continuationPollRequests, 0, "installed CLI must never fetch continuation status after paste-code onboarding");
     assert.equal(authority.state.legacyContinuationRequests, 0, "installed CLI must never call a retired continuation cancellation route");
     assert.equal(authority.state.retiredCodeRenewalRequests, 0, "installed CLI must never call the retired code-renewal route");
-    assert.equal(authority.state.openCodeSessionRequests, 0, "mutable OpenCode witness made an AgentSession request");
-    assert.equal(authority.state.openCodeAgentAuth404Requests, 0, "mutable OpenCode witness made a 404 auth request");
-    assert.equal(authority.state.openCodeAgentAuthInvalidEvidenceRequests, 0, "mutable OpenCode witness made an invalid auth request");
-    assert.equal(authority.state.openCodeAgentAuthConfiguredRequests, 0, "mutable OpenCode witness made a configured auth request");
+    assert.ok(authority.state.openCodeSessionRequests >= 4, "OpenCode foreground matrix did not read AgentSession authority");
+    assert.equal(authority.state.openCodeAgentAuth404Requests, 1, "OpenCode missing-auth negative was not exercised exactly once");
+    assert.equal(authority.state.openCodeAgentAuthInvalidEvidenceRequests, 1, "OpenCode invalid-auth negative was not exercised exactly once");
+    assert.equal(authority.state.openCodeAgentAuthConfiguredRequests, 1, "OpenCode configured-auth path was not exercised exactly once");
     assert.equal(authority.state.machineDeleted, true, "machine sandbox cleanup was not verified");
     assert.equal(authority.state.agentTerminated, true, "AgentSession sandbox cleanup was not verified");
     });
@@ -907,25 +973,56 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
 });
 
 const INSTALLED_HELP_TOPICS = Object.freeze([
-  "signup", "login", "logout", "whoami", "access", "capabilities",
+  "executions", "executions list", "executions get", "executions cancel",
+  "signup", "login", "logout", "whoami", "access", "capabilities", "observe", "share",
   "machines", "machines list", "machines create", "machines start", "machines pause",
-  "machines resume", "machines stop", "machines delete", "records", "authorizations",
+  "machines resume", "machines stop", "machines update-supervisor", "machines live-update-supervisor",
+  "machines live-update-status", "machines delete", "records", "authorizations",
   "account", "workspace", "usage", "api-keys", "api-keys create", "api-keys list",
   "api-keys revoke", "agent-sessions", "agent-sessions list", "agent-sessions get",
   "agent-sessions create", "agent-sessions rename", "agent-sessions terminate",
-  "agent-sessions attach", "agent", "connect", "config", "doctor", "self-test",
-  "version", "claude", "codex", "openclaw", "opencode",
+  "agent-sessions attach", "agent", "connect", "config", "config set", "doctor", "self-test",
+  "version", "claude", "codex", "opencode", "shell", "sync", "companion",
 ]);
 
 const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
+  "executions list", "executions get", "executions cancel",
   "signup", "login", "logout", "whoami", "access", "capabilities",
   "machines list", "machines create", "machines start", "machines pause", "machines resume", "machines stop", "machines delete",
   "records", "authorizations", "account", "workspace", "usage",
   "api-keys create", "api-keys list", "api-keys revoke",
   "agent-sessions list", "agent-sessions get", "agent-sessions create", "agent-sessions rename", "agent-sessions terminate", "agent-sessions attach",
-  "agent", "connect", "config", "doctor", "self-test", "version", "claude", "codex", "openclaw", "opencode",
+  "agent", "connect", "doctor", "self-test", "version", "claude", "codex", "opencode",
 ]);
-const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze([]);
+// These commands are implemented and help-visible, but only become actionable
+// when the producer advertises their narrow prerequisite. Do not exercise them
+// against the generic installed matrix: that would manufacture the OpenCode
+// supervisor-upgrade condition or change an existing Machine.
+// The live update needs a real running Machine and session continuity evidence.
+// The generic installed matrix checks only its no-dispatch refusals below.
+const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze([
+  "machines update-supervisor",
+  "machines live-update-supervisor",
+  // Reads the local record of one in-place update and sends nothing; it needs
+  // a Machine this computer actually updated, which the generic matrix never has.
+  "machines live-update-status",
+]);
+// Implemented, help-visible, and refused outright by this installed harness:
+// both screens require a real interactive terminal under a human login, and
+// `share` additionally mutates durable observation grants and live sharing of a
+// session. This harness drives the installed binary over pipes, so it cannot
+// present that terminal -- a scope limit of this harness, not a property of the
+// commands. A terminal-driving harness against this same isolated identity and
+// local contract authority could witness them succeeding; none exists yet.
+//
+// So the installed evidence recorded here is the refusal only: the typed
+// refusal named in INSTALLED_FAILURE_MATRIX, which the surface phase requires
+// for every topic listed here so a later interactive command cannot join with
+// none, plus the redirected valid-argument invocation in the read-only phase.
+// A refusal is not a success. Interactive success acceptance for `observe` and
+// `share` stays OPEN and is not claimed by this test.
+const INTERACTIVE_HUMAN_LOGIN_TOPICS = Object.freeze(["observe", "share"]);
+const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "sync", "companion"]);
 
 const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "signup/usage", argv: ["signup", "extra", "--json"], exit: 2, code: "cuna.usage.invalid" },
@@ -934,7 +1031,19 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "whoami/usage", argv: ["whoami", "extra", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "access/usage", argv: ["access", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "capabilities/usage", argv: ["capabilities", "--scope", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
+  // The read-only view and the owner's grant screen are both refused before any
+  // credential or network authority is consulted: this harness has no terminal.
+  // `share` in particular must not reach the point where it could grant, revoke
+  // or publish anything. These two entries request JSON explicitly, so they
+  // prove the combined refusal; the no-flag invocation in the read-only phase
+  // covers the redirected-terminal case on valid arguments.
+  { id: "observe/non-interactive", argv: ["observe", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
+  { id: "share/non-interactive", argv: ["share", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "machines/usage", argv: ["machines", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
+  // Both live-update refusals are decided before configuration or transport.
+  { id: "machines/live-update-supervisor/confirmation", argv: ["machines", "live-update-supervisor", ID, "--json"], exit: 4, code: "cuna.confirmation.required" },
+  { id: "machines/live-update-status/usage", argv: ["machines", "live-update-status", "--json"], exit: 2, code: "cuna.usage.invalid" },
+  { id: "machines/live-update-supervisor/usage", argv: ["machines", "live-update-supervisor", ID, "--yes", "--forget-unknown", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "records/usage", argv: ["records", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "authorizations/usage", argv: ["authorizations", "list", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "account/usage", argv: ["account", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
@@ -951,19 +1060,21 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "claude/non-tty", argv: ["claude", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "codex/non-tty", argv: ["codex", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "openclaw/non-tty", argv: ["openclaw", "--json"], exit: 2, code: "cuna.usage.invalid" },
-  // A disabled feature is rejected before terminal eligibility, with no
-  // automatic attach, credential, remote, or terminal side effect.
-  { id: "opencode/feature-off-non-tty", argv: ["opencode", "--json"], exit: 4, code: "cuna.feature.opencode_disabled" },
+  { id: "opencode/unavailable", argv: ["opencode", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "sync/reserved", argv: ["sync", "--json"], exit: 8, code: "cuna.capability.unsupported" },
   { id: "shell/reserved", argv: ["shell", "--json"], exit: 8, code: "cuna.capability.unsupported" },
   { id: "companion/reserved", argv: ["companion", "--json"], exit: 8, code: "cuna.capability.unsupported" },
 ]);
 
 function createContractAuthority() {
+  let executionCancelled = false;
+  const execution = () => ({ operation_id: EXECUTION_ID, machine_id: ID, execution_workspace_id: null,
+    leader_state: "exited", ownership_state: "descendants_live", cancel_requested: executionCancelled,
+    exit_code: 0, duration_ms: 8, reason: null, created_at: "2026-09-05T00:00:00Z", observed_at: "2026-09-05T00:00:01Z" });
   const continuations = new Map();
   const accessContexts = new Map();
-  const state = { continuationCounter: 0, continuationPollRequests: 0, legacyContinuationRequests: 0, retiredCodeRenewalRequests: 0, tokenCounter: 0, createdApiKeys: 0, revokedApiKeys: 0, logoutReceipts: 0, idempotencyKeys: [], loginRevoked: false, machineDeleted: false, machineStatus: "running", agentTerminated: false, agentName: "matrix-agent", apiKeyRevoked: false, openCodeSessionRequests: 0, openCodeAgentAuth404Requests: 0, openCodeAgentAuthInvalidEvidenceRequests: 0, openCodeAgentAuthConfiguredRequests: 0 };
-  const machine = (status = state.machineStatus) => ({ id: ID, name: "matrix-machine", status, memory_mib: 512, vcpus: 1, url: "https://machine.invalid" });
+  const state = { servedRequests: 0, continuationCounter: 0, continuationPollRequests: 0, legacyContinuationRequests: 0, retiredCodeRenewalRequests: 0, tokenCounter: 0, createdApiKeys: 0, revokedApiKeys: 0, logoutReceipts: 0, idempotencyKeys: [], loginRevoked: false, machineDeleted: false, machineStatus: "running", agentTerminated: false, agentName: "matrix-agent", apiKeyRevoked: false, openCodeSessionRequests: 0, openCodeAgentAuth404Requests: 0, openCodeAgentAuthInvalidEvidenceRequests: 0, openCodeAgentAuthConfiguredRequests: 0 };
+  const machine = (status = state.machineStatus) => ({ id: ID, name: "matrix-machine", status, agent: "codex", memory_mib: 512, vcpus: 1, url: "https://machine.invalid" });
   const agentSession = (terminated = state.agentTerminated) => ({ id: AGENT_SESSION_ID, machine_id: ID, workspace_binding_id: WORKSPACE_BINDING_ID, workspace_generation: 1, name: state.agentName, agent: "codex", cwd: "/workspace", auth_mode: "interactive_login", desired_state: terminated ? "terminated" : "running", request_state: terminated ? "terminal" : "launched", process_state: terminated ? "terminated" : "running", process_epoch: PROCESS_EPOCH, runtime_observed_at: "2026-08-14T00:00:01.000Z", runtime_expires_at: "2030-08-14T00:00:01.000Z", row_version: terminated ? 1 : 0, created_at: "2026-08-14T00:00:00.000Z", updated_at: "2026-08-14T00:00:00.000Z" });
   const foregroundAgentSession = (id) => {
     const observationTime = Date.now();
@@ -1051,6 +1162,7 @@ function createContractAuthority() {
     },
     async handle(request, response) {
       try {
+        state.servedRequests += 1;
         const url = new URL(request.url ?? "/", "http://127.0.0.1");
         const body = await readJsonBody(request);
         const send = (status, value) => {
@@ -1128,7 +1240,7 @@ function createContractAuthority() {
           return send(200, { schema_version: "1.0", subject_scope: scope, ...(resourceId === null ? {} : { subject_id: resourceId }), observed_at: new Date(now - 100).toISOString(), expires_at: new Date(now + 30_000).toISOString(), etag: "installed-e2e", capabilities: [
             { id: "api_keys.manage", availability: "supported", interaction: "native", mutation_class: "secret_revealing", surfaces: ["cli"], required_permissions: ["api_keys:manage", "auth:interactive"] },
             { id: "records.list", availability: "supported", interaction: "read_only", mutation_class: "none", surfaces: ["cli"], required_permissions: ["records:read"] },
-            { id: "authorizations.list", availability: "supported", interaction: "read_only", mutation_class: "none", surfaces: ["cli"], required_permissions: ["authorizations:read"] },
+            { id: "authorizations.list", availability: "supported", interaction: "read_only", mutation_class: "none", surfaces: ["cli"], required_permissions: ["credentials:manage"] },
             { id: "machines.create", availability: "supported", interaction: "native", mutation_class: "reversible", surfaces: ["cli"], required_permissions: ["machines:write"] },
             { id: "machines.lifecycle", availability: "supported", interaction: "native", mutation_class: "reversible", surfaces: ["cli"], required_permissions: ["machines:write"] },
             { id: "machines.delete", availability: "supported", interaction: "native", mutation_class: "destructive", surfaces: ["cli"], required_permissions: ["machines:write"] },
@@ -1138,7 +1250,7 @@ function createContractAuthority() {
             { id: "agent_sessions.auth_logout", availability: "supported", interaction: "native", mutation_class: "reversible", surfaces: ["cli"], required_permissions: ["agent_sessions:write"] },
           ] });
         }
-        if (request.method === "GET" && url.pathname === "/v1/me") return send(200, { id: ID, email: "installed@example.test", workspace: { assigned: true, id: WORKSPACE_ID, usage: { est_spend_usd: 1, est_remaining_usd: 49, note: "contract fixture" } } });
+        if (request.method === "GET" && url.pathname === "/v1/me") return send(200, { id: ID, email: "installed@example.test", workspace: { assigned: true, id: WORKSPACE_ID, usage: { est_spend_usd: 1, est_spend_is_lower_bound: true, balance_status: "unavailable", balance_usd: null, balance_unavailable_reason: "no balance endpoint", note: "contract fixture" } } });
         if (request.method === "GET" && url.pathname === "/v1/sessions") return send(200, state.machineDeleted ? [] : [machine()]);
         if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}`) return state.machineDeleted ? send(404, { error: "not_found" }) : send(200, machine());
         if (request.method === "POST" && url.pathname === "/v1/sessions") { state.machineDeleted = false; state.machineStatus = "created"; return send(201, machine()); }
@@ -1148,7 +1260,12 @@ function createContractAuthority() {
         if (request.method === "POST" && url.pathname === `/v1/sessions/${ID}/stop`) { state.machineStatus = "stopped"; return send(200, machine()); }
         if (request.method === "DELETE" && url.pathname === `/v1/sessions/${ID}`) { state.machineDeleted = true; return send(202, { acknowledged: true }); }
         if (request.method === "GET" && url.pathname === "/v1/records") return send(200, []);
-        if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/authorizations`) return send(200, []);
+        if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/executions`) return send(200, { machine_id: ID, items: [execution()], next_cursor: null });
+        if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/executions/${EXECUTION_ID}`) return send(200, execution());
+        if (request.method === "POST" && url.pathname === `/v1/sessions/${ID}/executions/${EXECUTION_ID}/cancel`) {
+          executionCancelled = true; return send(200, execution());
+        }
+        if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/authorizations`) return send(200, { revision: 1, secret_configuration: [] });
         if (request.method === "POST" && url.pathname === `/v1/sessions/${ID}/agent-sessions`) { state.agentTerminated = false; state.agentName = body.name ?? "matrix-agent"; return send(201, agentSession()); }
         if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/agent-sessions`) return send(200, { items: state.agentTerminated ? [] : [agentSession()] });
         const foregroundSession = /^\/v1\/agent-sessions\/(5[0123456]000000-0000-4000-8000-000000000005)$/u.exec(url.pathname);
@@ -1161,12 +1278,21 @@ function createContractAuthority() {
         if (request.method === "PATCH" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}`) { state.agentName = body.name; return send(200, { ...agentSession(), row_version: 1 }); }
         if (request.method === "POST" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/terminate`) { state.agentTerminated = true; return send(200, agentSession(true)); }
         if (request.method === "POST" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/agent-auth/logout`) return send(200, { observation_id: "80000000-0000-4000-8000-000000000008", agent_session_id: AGENT_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent: "codex", agent_version: "1.0.0", adapter_version: "runa.agent-auth.v1", observed_at: "2026-08-14T00:00:02.000Z", outcome: "logout_confirmed" });
-        if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/agent-auth`) return send(200, { observation_id: "81000000-0000-4000-8000-000000000008", agent_session_id: AGENT_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent_version: "1.0.0", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_login_status", observed_at: "2026-08-14T00:00:02.000Z", valid_until: "2026-08-14T00:00:32.000Z", state: "login_required" });
+        // Codex abstains, and this fixture used to fabricate a response the real
+        // service cannot produce. `classifyProviderLoginStatus` in the Edge
+        // (edge/src/agent-session-auth.ts) emits `provider_cli_login_status` only
+        // for Claude Code: "Codex only documents that a successful
+        // `codex login status` means credentials are present; credential presence
+        // is not proof that the current account can make an accepted request."
+        // So a Codex session reports insufficient evidence, and the decoder is
+        // right to refuse anything else. An unavailable observation must also
+        // carry `agent_version: "unavailable"` and `valid_until === observed_at`.
+        if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${AGENT_SESSION_ID}/agent-auth`) return send(200, { observation_id: "81000000-0000-4000-8000-000000000008", agent_session_id: AGENT_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "codex", auth_mode: "interactive_login", agent_version: "unavailable", adapter_version: "runa.agent-auth.v1", evidence_class: "insufficient", observed_at: "2026-08-14T00:00:02.000Z", valid_until: "2026-08-14T00:00:02.000Z", state: "unavailable" });
         if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${OPENCODE_SESSION_ID}/agent-auth`) {
           const observationTime = Date.now();
           const observedAt = new Date(observationTime - 100).toISOString();
           const validUntil = new Date(observationTime + 10_000).toISOString();
-          return send(200, { observation_id: "82000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_credential_presence", observed_at: observedAt, valid_until: validUntil, state: "login_required" });
+          return send(200, { observation_id: "82000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "opencode", auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_credential_presence", observed_at: observedAt, valid_until: validUntil, state: "login_required" });
         }
         if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${OPENCODE_AUTH_MISSING_SESSION_ID}/agent-auth`) {
           state.openCodeAgentAuth404Requests += 1;
@@ -1177,14 +1303,14 @@ function createContractAuthority() {
           const observationTime = Date.now();
           const observedAt = new Date(observationTime - 100).toISOString();
           const validUntil = new Date(observationTime + 10_000).toISOString();
-          return send(200, { observation_id: "83000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_AUTH_INVALID_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_login_status", observed_at: observedAt, valid_until: validUntil, state: "authenticated" });
+          return send(200, { observation_id: "83000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_AUTH_INVALID_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "opencode", auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_login_status", observed_at: observedAt, valid_until: validUntil, state: "authenticated" });
         }
         if (request.method === "GET" && url.pathname === `/v1/agent-sessions/${OPENCODE_AUTH_CONFIGURED_SESSION_ID}/agent-auth`) {
           state.openCodeAgentAuthConfiguredRequests += 1;
           const observationTime = Date.now();
           const observedAt = new Date(observationTime - 100).toISOString();
           const validUntil = new Date(observationTime + 10_000).toISOString();
-          return send(200, { observation_id: "84000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_AUTH_CONFIGURED_SESSION_ID, process_epoch: PROCESS_EPOCH, auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_credential_presence", observed_at: observedAt, valid_until: validUntil, state: "configured" });
+          return send(200, { observation_id: "84000000-0000-4000-8000-000000000008", agent_session_id: OPENCODE_AUTH_CONFIGURED_SESSION_ID, process_epoch: PROCESS_EPOCH, agent: "opencode", auth_mode: "interactive_login", agent_version: "1.18.18", adapter_version: "runa.agent-auth.v1", evidence_class: "provider_cli_credential_presence", observed_at: observedAt, valid_until: validUntil, state: "configured" });
         }
         if (request.method === "POST" && url.pathname === "/v1/api-keys") {
           assert.match(request.headers["idempotency-key"] ?? "", /^cuna-api-key-create-[0-9a-f-]{36}$/u);

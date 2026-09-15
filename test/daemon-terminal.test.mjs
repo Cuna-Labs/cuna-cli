@@ -240,6 +240,8 @@ test("ready and acknowledgement control frames preserve PTY truth and non-execut
     processEpoch: "epoch-1",
     fencingGeneration: 3,
     resizeCapability: "initial_resize_only",
+    accessMode: "writer",
+    writerEpoch: 1,
   });
   const ready = decodeTerminalFrame(readyWire);
   assert.equal(decodeTerminalControl(ready).processEpoch, "epoch-1");
@@ -249,6 +251,8 @@ test("ready and acknowledgement control frames preserve PTY truth and non-execut
     processEpoch: "epoch-1",
     fencingGeneration: 0,
     resizeCapability: "live",
+    accessMode: "writer",
+    writerEpoch: 1,
   });
   assert.throws(
     () => decodeTerminalControl(decodeTerminalFrame(unfencedReady)),
@@ -469,6 +473,36 @@ test("Node host terminal restoration returns stdin to its prior flow state", asy
   const flowingLease = await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout }));
   await flowingLease.restore();
   assert.equal(paused, false);
+});
+
+test("host restoration stops a deferred stdin read before returning to line mode", async () => {
+  let nativeReading = false;
+  let normalModeWhileReading = 0;
+  const stdin = {
+    isTTY: true,
+    readableFlowing: false,
+    setRawMode(raw) { if (!raw && nativeReading) normalModeWhileReading++; },
+    resume() { this.readableFlowing = true; nativeReading = true; return this; },
+    pause() {
+      this.readableFlowing = false;
+      // Match Node's process.stdin pause hook: native readStop runs next tick.
+      process.nextTick(() => { if (!this.readableFlowing) nativeReading = false; });
+      return this;
+    },
+  };
+  const stdout = {
+    isTTY: true,
+    once() { return this; },
+    removeListener() { return this; },
+    write(_value, callback) { callback?.(null); return true; },
+  };
+  for (let cycle = 0; cycle < 4; cycle++) {
+    const lease = await HostTerminalLease.acquire(createNodeHostTerminalAdapter({ stdin, stdout }));
+    assert.equal(nativeReading, true);
+    await lease.restore();
+    assert.equal(normalModeWhileReading, 0, "normal mode must not restart the read being relinquished");
+    assert.equal(nativeReading, false);
+  }
 });
 
 test("TC-055-18 host terminal restoration is retryable and does not mark partial cleanup complete", async () => {

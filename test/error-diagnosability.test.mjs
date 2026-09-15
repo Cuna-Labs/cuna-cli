@@ -46,7 +46,7 @@ function productionIdentityBody() {
     email: EMAIL,
     workspace: {
       assigned: true,
-      usage: { est_spend_usd: 1, est_remaining_usd: 49, note: "estimate" },
+      usage: { est_spend_usd: 1, est_spend_is_lower_bound: true, balance_status: "unavailable", balance_usd: null, balance_unavailable_reason: "no balance endpoint", note: "estimate" },
     },
   };
 }
@@ -86,14 +86,20 @@ test("a malformed response names the operation and the field that did not match"
 test("a different field in the same response yields a different field name", async () => {
   // Without this, one hard-coded `field` would satisfy the test above. The
   // authority here is the response body, not the decoder's own list.
+  //
+  // The second fault used to be under `workspace.usage`. It is not one any
+  // more: a usage fault no longer fails the identity decode, deliberately, so
+  // that a spend figure cannot decide whether a terminal opens. That behaviour
+  // has its own file. `workspace.assigned` is the sibling that still decides
+  // whether an identity can be read at all.
   const body = productionIdentityBody();
   body.workspace.id = "22222222-2222-4222-8222-222222222222";
-  body.workspace.usage.est_spend_usd = "1";
+  body.workspace.assigned = "yes";
   await assert.rejects(
     clientReturning(body).getIdentity(),
     (error) => error instanceof CunaError &&
-      error.details?.field === "workspace.usage.est_spend_usd" &&
-      error.details?.predicate === "finite_number",
+      error.details?.field === "workspace.assigned" &&
+      error.details?.predicate === "boolean",
   );
 });
 

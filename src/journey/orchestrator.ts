@@ -1,4 +1,6 @@
+import { ContractViolation } from "../core/validation.js";
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 
 import type { AgentAuthMode, AgentKind } from "../api/contracts.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
@@ -29,6 +31,7 @@ export interface JourneyMachine {
 }
 
 export interface JourneyWorkspaceReceipt {
+  readonly executionWorkspaceId?: string;
   readonly bindingId: string;
   readonly workspaceIdentity: string;
   readonly generation: number;
@@ -90,6 +93,11 @@ export interface AgentJourneyEffects {
     readonly requestedAgent: AgentKind;
     readonly idempotencyKey: string;
     readonly requestId: string;
+    /**
+     * Called immediately before the create request leaves this process, and
+     * never if it does not. Only what may have been sent can be reconciled.
+     */
+    readonly onDispatch: () => void;
     readonly signal: AbortSignal;
   }): Promise<JourneyMachine>;
   /**
@@ -201,11 +209,49 @@ function selectionFailure(
       : `Cuna could not prove a safe ${target} selection.`,
     exitCode: plan.kind === "ambiguous" ? EXIT_CODES.conflict : EXIT_CODES.policy,
     hint: target === "machine"
-      ? "Select an exact machine with --machine NAME."
-      : "Select an exact child with --agent-session ID or request --new-session.",
+      ? plan.reason === "opencode-supervisor-update-required"
+        ? "An existing OpenCode machine needs its terminal supervisor updated before a session can start. Cuna did not create another machine. Open `cuna machines`, stop only the machine and sessions you choose, then select Update terminal supervisor."
+        : plan.reason === "agent-mismatch"
+          ? "Choose or create a machine configured for this provider (`cuna machines create --agent claude-code|codex|opencode ...`)."
+          : plan.reason === "not-found"
+            ? "No machine by that name exists in this account. See your machines with `cuna machines list`, create one with `cuna machines create --name NAME --agent claude-code|codex|opencode --yes`, or omit --machine to let Cuna use or create one."
+            : plan.reason === "state-not-reusable"
+              ? "That machine is not running. Start it with `cuna machines start MACHINE_ID --yes`, or omit --machine to let Cuna use or create a running one."
+              // `state-unknown` names a running machine whose provider runtime
+              // Cuna could not verify. Repeating `--machine NAME` was the old
+              // hint and it named the option the caller had already given.
+              : plan.reason === "state-unknown"
+                ? "That machine is running, but Cuna could not verify its agent runtime. Read it with `cuna capabilities --scope machine --resource-id MACHINE_ID`; if the terminal supervisor is the blocker, update it from `cuna machines`."
+                : "Read the machine with `cuna machines list` and select one that is running."
+      : plan.reason === "attachment-unobservable"
+        // Naming the prerequisite instead of implying a retry. The writer seat
+        // is read from the API; when it reports no attestable PTY (`none`,
+        // `owner_unrecoverable`) or the deployment does not serve the route,
+        // reuse cannot prove the session is free and abstains rather than
+        // racing a terminal that may already have a writer. Waiting changes
+        // nothing, which is exactly why this must not read as staleness.
+        ? "Cuna cannot observe whether the existing session's terminal is free (no attested terminal for its current process, or this API does not publish the seat), so it will not reuse it. Start a fresh one with --new-session, or inspect it with `cuna agent-sessions get ID`."
+        : plan.reason === "already-attached"
+          // The holder is the writer seat's client instance id as the API
+          // recorded it. No CLI flag exposes an observer attach today, and an
+          // explicit --agent-session of a held seat is refused by this same
+          // branch, so the hint names the one route that exists.
+          ? `Another client${plan.kind === "unavailable" && plan.holder !== undefined ? ` (${plan.holder})` : ""} holds the writer seat of the existing session for this workspace. Start a second session with --new-session, or wait until that client detaches.`
+          : "Select an exact child with --agent-session ID or request --new-session.",
     details: {
       target: target === "machine" ? "machine" : "agent_session",
       reason: plan.reason,
+      ...(plan.kind === "unavailable" && plan.holder !== undefined ? { holder: plan.holder } : {}),
+      // Which one. Every `unavailable` plan may carry the id it rejected, and
+      // dropping it made two different branches indistinguishable from the
+      // outside: on 2026-08-30 a refusal reading
+      // `authority-observation-stale` could have come either from one
+      // session's own freshness or from the whole collection's, and the
+      // printed error could not say which -- while both inputs were hardcoded
+      // fresh, so neither branch should have been reachable at all.
+      ...("targetId" in plan && plan.targetId !== undefined
+        ? { target_id: plan.targetId }
+        : {}),
       ...(candidates === undefined ? {} : { candidates }),
     },
   });
@@ -229,15 +275,59 @@ function unreconcilableCreate(cause: unknown): CunaError {
 }
 
 function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
+  // Only fixed vocabulary and opaque UUIDs cross this diagnostic boundary.
+  const codes = new Set(["cuna.network.failed", "cuna.network.service_unavailable", "cuna.network.rate_limited", "cuna.remote.rejected", "cuna.remote.conflict", "cuna.remote.not_found", "cuna.remote.operation_not_served", "cuna.remote.malformed_response", "cuna.provider.v2_unavailable", "cuna.provider.selection_cancelled", "cuna.provider.pending_intent_conflict", "cuna.provider.intent_history_full", "cuna.journey.agent_session_create_authority_mismatch"]);
+  const reasons = new Set(["agent_session_memory_capacity", "agent_session_machine_not_found", "invalid_provider_session_request", "provider_session_v2_invalid_input", "provider_session_v2_credentials_unavailable", "provider_session_v2_scope_unavailable", "provider_session_v2_profile_unavailable", "provider_session_v2_receipt_invalid", "provider_session_v2_authority_unavailable", "provider_session_v2_operation_conflict", "provider_session_v2_profile_mismatch", "provider_session_v2_capacity_exceeded", "provider_session_v2_machine_not_running"]);
+  const predicates = new Set(["provider_v2_create", "provider_v2_create_scope", "provider_v2_schema", "provider_v2_exact_contract", "contract_decode_failed", "matches_requested_resource", "response_within_size_limit"]);
+  const details: Record<string,string|number> = {recovery:"exhausted"};
+  const own=(value:object,key:string):unknown=>{const descriptor=Object.getOwnPropertyDescriptor(value,key);return descriptor&&"value" in descriptor?descriptor.value:undefined;};
+  if(cause instanceof ContractViolation){
+    const predicate=own(cause,"predicate");
+    if(typeof predicate==="string"&&predicates.has(predicate))details.predicate=predicate;
+    // Response decoder violations are wrapped by fetchDecoded. This plain exact-contract
+    // violation in the create boundary comes from providerSessionBody before transport.
+    if(predicate==="provider_v2_exact_contract")details.failure_stage="local_pre_admission";
+  }
+  if(cause instanceof CunaError){
+    const code=own(cause,"code");if(typeof code==="string"&&codes.has(code))details.cause_code=code;
+    const raw=own(cause,"details");if(raw&&typeof raw==="object"){
+      const status=own(raw,"http_status");if(typeof status==="number"&&Number.isInteger(status)&&status>=400&&status<=599)details.http_status=status;
+      const reason=own(raw,"reason");if(typeof reason==="string"&&reasons.has(reason))details.cause_reason=reason;
+      const predicate=own(raw,"predicate");if(typeof predicate==="string"&&predicates.has(predicate))details.predicate=predicate;
+      for(const key of ["operation_id","request_id"]){const value=own(raw,key);if(typeof value==="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value))details[key]=value;}
+    }
+    if(typeof code==="string"&&["cuna.provider.v2_unavailable","cuna.provider.selection_cancelled","cuna.provider.pending_intent_conflict","cuna.provider.intent_history_full"].includes(code))details.failure_stage="local_pre_admission";
+  }
+  if(details.cause_code==="cuna.remote.conflict"&&details.http_status===409&&details.cause_reason==="agent_session_memory_capacity"){
+    return new CunaError({
+      code:"cuna.agent.memory_capacity",
+      message:"The selected Machine does not have enough available memory to start this OpenCode session.",
+      exitCode:EXIT_CODES.conflict,
+      retryable:false,
+      hint:"Inspect the Machine's running sessions. If appropriate, stop an unneeded session to free memory, then repeat this command with the same Workspace and preset to resume the recorded launch. Its pending operation identity is preserved; do not request a different launch to bypass this refusal.",
+      details:{...details,recovery:"pending_identity_preserved"},
+      cause,
+    });
+  }
+  const diagnostic=[details.cause_code,details.cause_reason,details.http_status,details.predicate].filter(value=>value!==undefined).join(" / ");
   return new CunaError({
     code: "cuna.journey.agent_session_create_outcome_unreconcilable",
-    message: "Cuna cannot prove whether the AgentSession create request committed.",
+    message: (details.failure_stage==="local_pre_admission"?"Local launch preparation refused before this attempt dispatched; any earlier launch remains unresolved.":"Cuna cannot prove whether the AgentSession create request committed.")+(diagnostic?" Diagnostic: "+diagnostic+".":""),
     exitCode: EXIT_CODES.remote,
     retryable: false,
     hint: "Do not request another child with a new key. Retry recovery with the original journey identity.",
-    details: { recovery: "exhausted" },
+    details,
     cause,
   });
+}
+
+/**
+ * Only the specifically recognized supervisor preflight refusal is passed
+ * through here. An HTTP status alone does not establish non-commit.
+ */
+function isProvenAgentSessionCreateRejection(cause: unknown): cause is CunaError {
+  return cause instanceof CunaError &&
+    cause.code === "cuna.agent.opencode_supervisor_upgrade_required";
 }
 
 function defaultAuthMode(intent: ReconciledAgentJourneyIntent): AgentAuthMode {
@@ -284,7 +374,7 @@ export async function orchestrateAgentJourney(input: {
     idempotencyKey: input.idempotencyKey ?? `cuna-journey-${randomUUID()}`,
   };
   try {
-    const localPath = input.intent.localPath ?? process.cwd();
+    const localPath = resolve(input.intent.localPath ?? process.cwd());
     const workspaceInspection = await boundary({
       phase: "inspect-workspace", signal, effects: input.effects, ledger,
       action: () => input.effects.inspectWorkspace({
@@ -297,18 +387,27 @@ export async function orchestrateAgentJourney(input: {
       phase: "observe-machines", signal, effects: input.effects, ledger,
       action: () => input.effects.observeMachines({ requestedAgent: input.intent.agent, signal }),
     });
-    const machinePlan = planMachineSelection({
+    const planMachines = (projectMachineId: string | undefined) => planMachineSelection({
       requestedAgent: input.intent.agent,
       forceNew: input.intent.machine.kind === "new",
       ...(input.intent.machine.kind === "exact-name"
         ? { selector: { kind: "name" as const, value: input.intent.machine.name } }
         : {}),
-      ...(workspaceInspection.projectMachineId === undefined || input.intent.machine.kind !== "automatic"
+      ...(projectMachineId === undefined || input.intent.machine.kind !== "automatic"
         ? {}
-        : { projectBinding: { machineId: workspaceInspection.projectMachineId, freshness: "fresh" as const } }),
+        : { projectBinding: { machineId: projectMachineId, freshness: "fresh" as const } }),
       collectionFreshness: "fresh",
       machines,
     });
+    let machinePlan = planMachines(workspaceInspection.projectMachineId);
+    if (machinePlan.kind === "stale-binding" && machinePlan.reason === "machine-missing") {
+      // The folder is the project; a Machine is disposable (PRD-PM-008 §H,
+      // E14-D1). A binding whose Machine is no longer in the collection does
+      // not stop the journey: select or create as an unbound folder would,
+      // and let the synchronize step read the bound Machine itself before it
+      // rebinds — a listing is not proof of absence, the Machine read is.
+      machinePlan = planMachines(undefined);
+    }
 
     let machine: JourneyMachine;
     if (machinePlan.kind === "select" && machinePlan.target === "machine") {
@@ -326,24 +425,31 @@ export async function orchestrateAgentJourney(input: {
         machine: input.intent.machine,
       });
       const requestId = createIdentity.requestId;
+      // Set when the request actually leaves this process. A capability check
+      // or a declined confirmation fails BEFORE that, and reconciling then asks
+      // the server about a request it was never sent: it answers 404, and that
+      // 404 replaces the person's own decision with "the resource was not
+      // found" at exit 7, for what they chose at exit 4.
+      let dispatched = false;
       try {
         machine = await boundary({
           phase: "create-machine", signal, effects: input.effects, ledger,
-          action: () => {
-            // Recorded before dispatch: from here on an interrupted journey has
-            // a request identity to reconcile against.
-            ledger.machineCreateRequestId = requestId;
-            return input.effects.createMachine({
-              requestedAgent: input.intent.agent,
-              idempotencyKey: createIdentity.idempotencyKey,
-              requestId,
-              signal,
-            });
-          },
+          action: () => input.effects.createMachine({
+            requestedAgent: input.intent.agent,
+            idempotencyKey: createIdentity.idempotencyKey,
+            requestId,
+            onDispatch: () => {
+              // From here on an interrupted journey has a request identity to
+              // reconcile against.
+              dispatched = true;
+              ledger.machineCreateRequestId = requestId;
+            },
+            signal,
+          }),
         });
         ledger.createdMachineId = machine.id;
       } catch (createError) {
-        if (signal.aborted) throw createError;
+        if (signal.aborted || !dispatched) throw createError;
         const reconciled = await boundary({
           phase: "reconcile-machine-create", signal, effects: input.effects, ledger,
           action: () => input.effects.reconcileMachineCreate({
@@ -426,7 +532,9 @@ export async function orchestrateAgentJourney(input: {
           }),
         });
       } catch (createError) {
-        if (signal.aborted) throw createError;
+        if (signal.aborted || isProvenAgentSessionCreateRejection(createError)) {
+          throw createError;
+        }
         throw unreconcilableAgentSessionCreate(createError);
       }
       ledger.createdAgentSessionId = agentSession.id;

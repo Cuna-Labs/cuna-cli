@@ -7,6 +7,7 @@ import {
   type AgentSessionAuth,
 } from "../api/contracts.js";
 import type { CunaApiClient } from "../api/client.js";
+import type { BrowserOpener } from "../auth/browser.js";
 import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import {
   ForegroundTerminalCoordinator,
@@ -24,7 +25,7 @@ import {
 import { createApiTerminalControlPlane } from "./api-terminal-control-plane.js";
 import { CunaRuntimeBoundary } from "./boundary.js";
 import { admitCapability } from "./capability-gate.js";
-import { runtimeFailure } from "./errors.js";
+import { RuntimeBoundaryError, runtimeFailure } from "./errors.js";
 import { createNodeWebSocketConnector } from "./node-websocket-connector.js";
 import {
   assertRemoteAgentSessionEvidence,
@@ -33,6 +34,13 @@ import {
 } from "./terminal-transport.js";
 
 const TERMINAL_CAPABILITY_ID = "terminal_connections.create";
+const OPENCODE_AUTH_ADVISORY_TIMEOUT_MS = 250;
+// A first interactive OpenCode session has no credential state yet. Provider
+// auth is an advisory display observation: it may be absent, temporarily
+// unreachable, or unavailable on an older deployment. A fresh supervisor
+// process plus the one-use terminal grant remain the attach authority. This
+// fallback never asserts that the provider is configured; it only permits the
+// provider's own login TUI to ask the person to authenticate.
 
 export interface ForegroundSessionRunnerInput {
   readonly client: CunaApiClient;
@@ -44,6 +52,15 @@ export interface ForegroundSessionRunnerInput {
   readonly terminalKind?: string;
   readonly hostPlatform?: NodeJS.Platform;
   readonly presentationMode?: ForegroundPresentationMode;
+  readonly browser?: BrowserOpener;
+  /**
+   * Foreground startup performs several deliberate authority fences.  Surface
+   * the current local phase while the caller still owns an inline progress UI;
+   * never emit this after raw/alternate-screen terminal ownership begins.
+   */
+  readonly onProgress?: (label: string) => void;
+  /** Clears caller-owned progress UI before raw/alternate-screen terminal ownership. */
+  readonly onBeforeTerminalOwnership?: () => void;
 }
 
 export type ForegroundPresentationMode = "rich" | "plain";
@@ -69,6 +86,43 @@ export async function runNodeForegroundSessions(
   input: ForegroundSessionRunnerInput,
   dependencies: NodeForegroundSessionDependencies = {},
 ): Promise<void> {
+  try {
+    await runNodeForegroundSessionsOnce(input, dependencies);
+  } catch (error) {
+    if (!retryableEarlyTerminalFailure(error) || input.signal?.aborted) throw error;
+    // A newly issued one-use ticket can reach the public gateway just before
+    // the machine supervisor observes it. Retry the complete, already-cleaned
+    // foreground composition exactly once; this mints fresh one-use authority
+    // and never repeats user input or an established terminal interaction.
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    try {
+      await runNodeForegroundSessionsOnce(input, dependencies);
+    } catch (retryError) {
+      if (retryError instanceof RuntimeBoundaryError) {
+        throw new RuntimeBoundaryError({
+          code: retryError.code,
+          message: retryError.message,
+          retryable: retryError.retryable,
+          safeDetails: { ...retryError.safeDetails, prior_attempt_code: error.code },
+          cause: new AggregateError([error, retryError], "Both terminal attachment attempts failed."),
+        });
+      }
+      throw retryError;
+    }
+  }
+}
+
+function retryableEarlyTerminalFailure(error: unknown): error is RuntimeBoundaryError {
+  if (!(error instanceof RuntimeBoundaryError) || error.code !== "terminal_disconnected") return false;
+  return (error.retryable && /before negotiation completed/u.test(error.message)) ||
+    error.message === "The passthrough terminal connection ended." ||
+    error.message === "The terminal tab is not connected.";
+}
+
+async function runNodeForegroundSessionsOnce(
+  input: ForegroundSessionRunnerInput,
+  dependencies: NodeForegroundSessionDependencies,
+): Promise<void> {
   const clock = dependencies.clock ?? Date.now;
   const sessionIds = admitForegroundSessionIds(input.agentSessionIds);
   if (
@@ -88,6 +142,7 @@ export async function runNodeForegroundSessions(
   const presentationMode = input.presentationMode ?? selectNodeForegroundPresentation({
     platform,
     environment,
+    sessionCount: sessionIds.length,
     ...(terminalKind === undefined ? {} : { terminalKind }),
   });
   if (presentationMode === "rich") {
@@ -100,6 +155,7 @@ export async function runNodeForegroundSessions(
   }
   const allowedOrigin = admitApiOrigin(input.baseUrl);
   const host = dependencies.host ?? createNodeForegroundTerminalHost();
+  const clientInstanceId = dependencies.clientInstanceId?.() ?? `cli:${randomUUID()}`;
 
   // TTY authority and dimensions are admitted before any control-plane read or
   // one-use terminal grant. Acquiring raw/alternate-screen ownership remains a
@@ -117,7 +173,14 @@ export async function runNodeForegroundSessions(
     const agentSessionId = sessionIds[index];
     if (agentSessionId === undefined) continue;
     throwIfAborted(input.signal);
+    input.onProgress?.("Checking selected AgentSession");
     const session = await input.client.getAgentSession(agentSessionId, input.signal);
+    if (session.agent !== "claude-code" && session.agent !== "codex" && session.agent !== "opencode") {
+      throw runtimeFailure(
+        "capability_unsupported",
+        `The ${session.agent} provider is unavailable for direct CLI attachment.`,
+      );
+    }
     const expectedAgent = input.expectedAgentKinds?.[index];
     if (expectedAgent !== undefined && session.agent !== expectedAgent) {
       throw runtimeFailure(
@@ -125,6 +188,7 @@ export async function runNodeForegroundSessions(
         "The selected AgentSession does not match the requested agent command.",
       );
     }
+    input.onProgress?.("Verifying terminal authority");
     const capabilitySnapshot = await controlPlane.discoverCapabilities(
       "agent_session",
       agentSessionId,
@@ -138,6 +202,7 @@ export async function runNodeForegroundSessions(
       surface: "cli",
       interaction: "native",
     }, clock());
+    input.onProgress?.("Checking live session status");
     const observation = assertRemoteAgentSessionEvidence({
       evidence: await controlPlane.observeAgentSession(agentSessionId, input.signal),
       expectedAgentSessionId: agentSessionId,
@@ -145,6 +210,7 @@ export async function runNodeForegroundSessions(
     });
     throwIfAborted(input.signal);
     admitSessionIdentity(session, observation, agentSessionId);
+    input.onProgress?.("Checking provider sign-in");
     const providerAuthentication = await observeProviderAuthentication({
       client: input.client,
       session,
@@ -161,6 +227,13 @@ export async function runNodeForegroundSessions(
       agentSessionId,
       label: safeSessionLabel(session),
       agent: session.agent,
+      ...(session.workspaceBindingId === undefined
+        ? {}
+        : {
+            workspaceBindingId: session.workspaceBindingId,
+            workspaceGeneration: session.workspaceGeneration,
+          }),
+      localBrowserActions: session.authMode === "interactive_login",
       attachmentAdmission: Object.freeze({
         observation: Object.freeze({ ...observation }),
         capability: Object.freeze({ ...capability }),
@@ -177,12 +250,16 @@ export async function runNodeForegroundSessions(
   }
   throwIfAborted(input.signal);
 
+  input.onProgress?.("Preparing your cloud terminal");
+  input.onBeforeTerminalOwnership?.();
   const coordinator = presentationMode === "rich"
     ? new ForegroundTerminalCoordinator({
         ...dependencies.coordinatorOptions,
         host,
+        ...(input.browser === undefined ? {} : { browser: input.browser }),
         clock,
         color: input.color ?? true,
+        deviceId: clientInstanceId,
       })
     : new PassthroughTerminalCoordinator({
         host,
@@ -193,11 +270,12 @@ export async function runNodeForegroundSessions(
   const callbacks = coordinator.runtimeCallbacks();
   const runtime = new CunaRuntimeBoundary({
     mode: "foreground",
+    canonicalTerminalViews: presentationMode === "rich",
     controlPlane,
     terminalConnector: dependencies.terminalConnector ?? createNodeWebSocketConnector(),
     allowedCunaOrigins: [allowedOrigin],
     terminalCapabilityId: TERMINAL_CAPABILITY_ID,
-    clientInstanceId: dependencies.clientInstanceId?.() ?? `cli:${randomUUID()}`,
+    clientInstanceId,
     clock,
     ...callbacks,
   });
@@ -218,6 +296,22 @@ export async function runNodeForegroundSessions(
     await coordinator.stop();
   } catch (error) {
     cleanupFailures.push(error);
+  }
+  // PRD-PM-008 E14-D6. Only after the host terminal is restored, and only for
+  // detaches the person asked for and the runtime confirmed: one line that
+  // says the session survived and how to come back. A failed run says nothing
+  // here; its error is the message.
+  if (failure === undefined && cleanupFailures.length === 0) {
+    for (const detached of coordinator.detachedSessions) {
+      try {
+        await host.write(new TextEncoder().encode(
+          `Detached · ${detached.label} keeps running · cuna connect ${detached.agentSessionId}\n`,
+        ));
+      } catch {
+        // The line is a courtesy after a completed detach. A host that cannot
+        // take one more write must not turn a confirmed detach into a failure.
+      }
+    }
   }
   try {
     await runtime.shutdown();
@@ -251,6 +345,7 @@ export function selectNodeForegroundPresentation(input: {
   readonly platform: NodeJS.Platform;
   readonly terminalKind?: string;
   readonly environment: NodeJS.ProcessEnv;
+  readonly sessionCount?: number;
 }): ForegroundPresentationMode {
   const requested = input.environment.CUNA_TERMINAL_MODE?.trim().toLowerCase();
   if (requested !== undefined && requested !== "" && requested !== "auto" && requested !== "rich" && requested !== "plain") {
@@ -267,6 +362,10 @@ export function selectNodeForegroundPresentation(input: {
     });
     return "rich";
   }
+  // A capable host gets the isolated workbench even for one AgentSession. The
+  // remote PTY owns only the rows below Cuna's persistent chrome, so provider
+  // redraws and SIGWINCH cannot erase or scroll the appbar. Explicit `plain`
+  // and genuinely non-enriched/nested terminals retain byte passthrough.
   const terminalKind = input.terminalKind?.trim().toLowerCase();
   if (
     input.environment.TMUX !== undefined ||
@@ -312,6 +411,8 @@ function admitSessionIdentity(
   if (
     session.id !== expectedAgentSessionId ||
     session.machineId !== observation.machineId ||
+    (session.workspaceBindingId ?? null) !== observation.workspaceBindingId ||
+    (session.workspaceGeneration ?? null) !== observation.workspaceBindingGeneration ||
     session.processEpoch === undefined ||
     session.processEpoch !== observation.processEpoch ||
     session.processState !== observation.state
@@ -331,14 +432,45 @@ async function observeProviderAuthentication(input: Readonly<{
   signal?: AbortSignal;
 }>): Promise<ForegroundTabIntent["providerAuthentication"]> {
   let status: AgentSessionAuth;
+  // OpenCode authentication is presentation-only at this point.  The exact
+  // supervisor observation and one-use terminal grant already admitted the
+  // process; holding the person behind a server-side auth probe (which may
+  // wait for an older supervisor) does not add authority. Bound it so a first
+  // `/connect` can reach the real OpenCode TUI promptly.
+  const authProbeSignal = mayEnterOpenCodeLogin(input.session, input.observation, input.now())
+    ? input.signal === undefined
+      ? AbortSignal.timeout(OPENCODE_AUTH_ADVISORY_TIMEOUT_MS)
+      : AbortSignal.any([input.signal, AbortSignal.timeout(OPENCODE_AUTH_ADVISORY_TIMEOUT_MS)])
+    : input.signal;
   try {
-    status = await input.client.getAgentSessionAuth(input.session.id, input.signal);
+    status = await input.client.getAgentSessionAuth(input.session.id, authProbeSignal);
   } catch (error) {
     throwIfAborted(input.signal);
+    // This proceeds for EVERY read failure, including an off-contract payload,
+    // and that is a decided semantic rather than an oversight.
+    //
+    // Two suites demanded opposite things here. Three unit variants in
+    // `test/node-foreground-session.test.mjs` — missing resource, off-contract
+    // observation, transport fault — pin "enter the PTY". The installed E2E
+    // asserted "fail closed" for the off-contract one; that case had never
+    // executed, because an earlier phase aborted the suite before reaching it,
+    // so it had never been reconciled with this behaviour.
+    //
+    // Resolved in favour of entering: the probe is presentation-only, and
+    // admission was already granted by the exact supervisor observation and the
+    // one-use terminal grant. Refusing here would withhold a terminal the
+    // runtime had already admitted, on a signal that never authorized it.
+    //
+    // The obligation that survives is presentational, and it is enforced
+    // below and in the E2E: an observation that cannot be decoded must never
+    // be rendered as a signed-in provider — only as login-pending.
+    if (mayEnterOpenCodeLogin(input.session, input.observation, input.now())) {
+      return openCodeInteractiveLoginPending(input.observation);
+    }
     if (input.session.agent === "opencode") {
       throw runtimeFailure(
         "remote_state_unproven",
-        "OpenCode foreground admission requires a current provider credential observation.",
+        "OpenCode foreground admission requires current process evidence before interactive login.",
         { cause: error },
       );
     }
@@ -352,8 +484,23 @@ async function observeProviderAuthentication(input: Readonly<{
       status.evidenceClass === "provider_cli_credential_presence" &&
       (status.state === "login_required" || status.state === "configured")
     : status.evidenceClass !== "provider_cli_credential_presence";
+  // `unavailable/insufficient` is an explicit server abstention: its zero TTL
+  // makes it unusable as authentication evidence, but it is not proof that the
+  // exact, freshly supervisor-observed OpenCode PTY is unsafe to open.  The
+  // terminal-connection endpoint repeats the exact readiness check before it
+  // mints a one-use grant.  Preserve the distinction by showing only the
+  // conservative interactive-login-pending state, never configured/authenticated.
+  if (isCurrentOpenCodeAuthenticationAbstention(
+    input.session,
+    input.observation,
+    status,
+    now,
+  )) {
+    return openCodeInteractiveLoginPending(input.observation);
+  }
   if (
     status.agentSessionId !== input.session.id ||
+    status.agent !== input.session.agent ||
     status.authMode !== input.session.authMode ||
     status.processEpoch === null ||
     status.processEpoch !== input.session.processEpoch ||
@@ -379,6 +526,48 @@ async function observeProviderAuthentication(input: Readonly<{
     observedAt,
     expiresAt: validUntil,
     correlationId: status.observationId,
+  });
+}
+
+function mayEnterOpenCodeLogin(
+  session: AgentSession,
+  observation: ReturnType<typeof assertRemoteAgentSessionEvidence>,
+  now: number,
+): boolean {
+  const expiresAt = Date.parse(observation.expiresAt);
+  return session.agent === "opencode" &&
+    session.authMode === "interactive_login" &&
+    (observation.state === "ready" || observation.state === "running") &&
+    Number.isFinite(expiresAt) &&
+    expiresAt > now;
+}
+
+function isCurrentOpenCodeAuthenticationAbstention(
+  session: AgentSession,
+  observation: ReturnType<typeof assertRemoteAgentSessionEvidence>,
+  status: AgentSessionAuth,
+  now: number,
+): boolean {
+  return mayEnterOpenCodeLogin(session, observation, now) &&
+    status.agentSessionId === session.id &&
+    status.agent === "opencode" &&
+    status.authMode === "interactive_login" &&
+    status.processEpoch !== null &&
+    status.processEpoch === session.processEpoch &&
+    status.processEpoch === observation.processEpoch &&
+    status.state === "unavailable" &&
+    status.evidenceClass === "insufficient";
+}
+
+function openCodeInteractiveLoginPending(
+  observation: ReturnType<typeof assertRemoteAgentSessionEvidence>,
+): ForegroundTabIntent["providerAuthentication"] {
+  return Object.freeze({
+    value: "login_required",
+    source: `${observation.authority}:interactive_login_pending`,
+    observedAt: Date.parse(observation.observedAt),
+    expiresAt: Date.parse(observation.expiresAt),
+    correlationId: observation.evidenceRevision,
   });
 }
 
