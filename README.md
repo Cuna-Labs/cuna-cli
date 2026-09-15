@@ -4,6 +4,7 @@
 [![CodeQL](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-22.17.1%2B%20%7C%2024.4.1%2B-339933?logo=node.js&logoColor=white)](package.json)
+[![Status](https://img.shields.io/badge/status-pre--release-orange.svg)](#project-status)
 
 Run cloud development agents from a local terminal through Cuna's public,
 policy-enforced control plane.
@@ -14,10 +15,9 @@ on Cuna cloud machines. The CLI keeps machine lifecycle, synchronization,
 authorizations, and runtime evidence explicit instead of hiding them behind an
 opaque remote shell.
 
-> [!WARNING]
-> Cuna CLI is under active implementation and is not GA. The npm, Bun, curl,
-> Homebrew, and AUR commands below are the approved distribution interfaces;
-> this repository does not claim that every channel is live yet.
+The npm, Bun, curl, Homebrew, and AUR commands below are the only approved
+distribution interfaces. Their current publication state is listed per surface
+under [Installation interfaces](#installation-interfaces).
 
 ## Current capabilities
 

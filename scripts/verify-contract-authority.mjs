@@ -50,6 +50,19 @@ invariant(
   `${BLOCKER}: the approved contract digest is not the digest this candidate vendors`,
 );
 
+// The refusal used to say the workflow token could not confirm the approval,
+// whatever the producer answered. That names one cause for several: a token
+// with full read access to the organisation receives the same 404 when the
+// repository simply is not there, and blaming the token sends the reader to
+// fix permissions for a repository that does not exist. GitHub deliberately
+// answers 404 for both absent and invisible, so the reason must carry that
+// ambiguity rather than resolve it.
+function producerRefusalReason(status) {
+  if (status === 404) return `${PRODUCER_PATH} is absent, or exists and is invisible to this token; both answer 404`;
+  if (status === 401 || status === 403) return "this token was refused, so the producer's approval is unobserved rather than absent";
+  return "the producer answered outside the contract, so its approval is unobserved rather than absent";
+}
+
 async function producerRead(url, label) {
   const response = await fetch(url, {
     method: "GET",
@@ -64,7 +77,7 @@ async function producerRead(url, label) {
   });
   invariant(
     response.status === 200,
-    `${BLOCKER}: ${label} returned HTTP ${response.status} for ${PRODUCER_PATH}; the workflow token cannot confirm the producer's approval`,
+    `${BLOCKER}: ${label} returned HTTP ${response.status} for ${PRODUCER_PATH}; ${producerRefusalReason(response.status)}`,
   );
   const text = await response.text();
   invariant(Buffer.byteLength(text) <= 4_194_304, `${label} response is too large`);
