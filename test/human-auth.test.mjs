@@ -9,6 +9,7 @@ import {
 } from "../dist/credentials/index.js";
 import {
   createHumanAuthService,
+  createHttpTransport,
   decodeCliAuthBootstrap,
   decodeCliContinuationIssued,
   decodeCliSignupCapability,
@@ -154,10 +155,40 @@ function fakeClient(overrides = {}) {
   return client;
 }
 
+/**
+ * A stored bearer is reused until it nears expiry, so any test about the
+ * EXCHANGE path has to start past that margin — otherwise the CLI correctly
+ * reuses the bearer, never calls `exchange`, and the test either asserts the
+ * wrong count or waits forever for a call that will not come.
+ *
+ * The backend's platform evidence is time-bound too, so it has to follow the
+ * same clock or the vault refuses before the bearer is ever consulted.
+ */
+function exchangeClock() {
+  const state = { now: NOW };
+  const backend = new MemoryBackend();
+  backend.probe = async () => ({
+    protocol: CREDENTIAL_BACKEND_PROTOCOL,
+    backendId: backend.backendId,
+    platform: backend.platform,
+    status: "verified",
+    observedAt: state.now,
+    expiresAt: state.now + 60_000,
+    source: "live_round_trip",
+  });
+  return {
+    backend,
+    clock: () => state.now,
+    /** Move past the stored bearer's reuse margin so the next call exchanges. */
+    expireStoredBearer() { state.now = Date.parse("2026-08-08T00:09:00.000Z"); },
+    advanceTo(iso) { state.now = Date.parse(iso); },
+  };
+}
+
 function fixture(overrides = {}) {
   const backend = overrides.backend ?? new MemoryBackend();
   const clock = overrides.clock ?? (() => NOW);
-  const vault = new CredentialVault({ backend, clock, platform: "linux" });
+  const vault = overrides.vault ?? new CredentialVault({ backend, clock, platform: "linux" });
   const client = overrides.client ?? fakeClient();
   const opened = [];
   const handoff = [];
@@ -179,7 +210,114 @@ function fixture(overrides = {}) {
   return { backend, vault, client, opened, handoff, service };
 }
 
-test("login persists durable exchange authority but no access token", async () => {
+for (const distinctService of [false, true]) {
+  test(`coalesced rejected refresh admits the real vault snapshot; distinct service=${distinctService}`, async () => {
+    const first = fixture();
+    await first.service.login();
+    const second = distinctService ? fixture({ vault: first.vault, backend: first.backend }) : first;
+    let release;
+    let entered;
+    const gate = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    let exchanges = 0;
+    first.client.exchange = async () => { exchanges++; entered(); await gate; return exchangeResult({ accessToken: AT_2 }); };
+    const one = first.service.refreshRejectedAccessToken(AT);
+    await started;
+    const two = second.service.refreshRejectedAccessToken(AT);
+    const results = Promise.all([one, two]);
+    release();
+    assert.deepEqual(await results, [AT_2, AT_2]);
+    assert.equal(exchanges, 1);
+    assert.equal(first.backend.values.size, 1);
+  });
+}
+
+test("rejected refresh cannot reuse a normal acquisition flight's retained rejected token", async () => {
+  const original = fixture();
+  await original.service.login();
+  const normal = fixture({ vault: original.vault, backend: original.backend });
+  const rejected = fixture({ vault: original.vault, backend: original.backend });
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const read = original.backend.read.bind(original.backend);
+  original.backend.read = async target => { entered(); await gate; return read(target); };
+  let exchanges = 0;
+  rejected.client.exchange = async () => { exchanges++; return exchangeResult({ accessToken: AT_2 }); };
+  const one = normal.service.acquireAccessToken();
+  await started;
+  const two = rejected.service.refreshRejectedAccessToken(AT);
+  const results = Promise.all([one, two]);
+  release();
+  assert.deepEqual(await results, [AT, AT_2]);
+  assert.equal(exchanges, 1, "one bounded rejection-aware exchange follows retained authority");
+});
+
+test("cancelling a rejected refresh waiter cannot cancel a coalesced peer", async () => {
+  const subject = fixture();
+  await subject.service.login();
+  const peer = fixture({ vault: subject.vault, backend: subject.backend });
+  const controller = new AbortController();
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  subject.client.exchange = async input => {
+    entered(); await gate;
+    assert.notEqual(input.signal?.aborted, true);
+    return exchangeResult({ accessToken: AT_2 });
+  };
+  const one = subject.service.refreshRejectedAccessToken(AT, controller.signal);
+  const cancelled = assert.rejects(one, error => error.code === "cuna.auth.cancelled");
+  await started;
+  const two = peer.service.refreshRejectedAccessToken(AT);
+  controller.abort();
+  await cancelled;
+  release();
+  assert.equal(await two, AT_2);
+});
+
+test("repeated unsatisfied joined snapshots stop after one retry with non-mutating recovery guidance", async () => {
+  const subject = fixture();
+  await subject.service.login();
+  const refresh = subject.vault.refresh.bind(subject.vault);
+  let attempts = 0;
+  // Model two consecutive foreign refresh owners retaining the refused bearer,
+  // while keeping real vault snapshot construction, disposal and revision logic.
+  subject.vault.refresh = async binding => {
+    attempts++;
+    return refresh(binding, async () => ({ status: "retained" }));
+  };
+  await assert.rejects(subject.service.refreshRejectedAccessToken(AT), error => {
+    assert.equal(error.code, "cuna.auth.reexchange_unknown");
+    assert.equal(error.hint, "Open `cuna` and choose the existing Machine and session to reconnect.");
+    assert.ok(!JSON.stringify(error).includes(AT));
+    return true;
+  });
+  assert.equal(attempts, 2);
+  assert.equal(subject.backend.values.size, 1);
+});
+
+// POLICY CHANGED, deliberately. This test used to assert that the bearer never
+// reached disk. It does now, inside the SAME AES-GCM envelope that already
+// holds the login code — never beside it, never in a second file.
+//
+// The reason is a measured user-facing defect, not convenience: every
+// authenticated command re-exchanged the login code, the server allows ten
+// exchanges per rolling minute, so the eleventh command in a minute failed.
+// 35 failures in 88 attempts.
+//
+// The capability argument for allowing it: the login code already on disk
+// mints bearers for thirty days; this bearer is terminal, capped at ten
+// minutes by the server, and re-checked against `revoked_at is null` on every
+// use. Storing it adds strictly less capability than the file already carries,
+// and co-locating it means logout's existing revision-fenced delete destroys
+// it with no second invalidation path to keep correct.
+//
+// What must stay true is asserted below and in the tests that follow: the
+// bearer never lands anywhere except that envelope.
+test("login persists durable exchange authority and the bearer, in one envelope", async () => {
   const subject = fixture();
   const result = await subject.service.login();
   assert.equal(result.sessionId, UUID_B);
@@ -190,8 +328,13 @@ test("login persists durable exchange authority but no access token", async () =
   assert.equal(subject.client.calls.filter(([name]) => name === "exchange").length, 1);
   assert.equal(subject.client.calls.some(([name]) => name === "poll" || name === "cancel"), false);
   const protectedBytes = Buffer.concat([...subject.backend.values.values()].map((value) => Buffer.from(value))).toString("utf8");
-  assert.equal(protectedBytes.includes(AT), false);
   assert.equal(protectedBytes.includes("code_verifier"), true);
+  // The bearer is stored, and stored in exactly one place: the same record as
+  // the login code. One envelope means one delete on logout.
+  assert.equal(protectedBytes.includes(AT), true);
+  assert.equal(subject.backend.values.size, 1, "the bearer must not create a second protected record");
+  assert.equal(protectedBytes.includes("access_expires_at"), true);
+  assert.equal(protectedBytes.includes("access_observed_at"), true);
 });
 
 test("login announces the continuation URL it hands to the browser, in that order", async () => {
@@ -265,7 +408,23 @@ test("waitlist-only signup stores a restricted session and permits one pinned ad
       return exchangeResult({ context: waitlisted });
     },
   });
-  const signedUp = fixture({ client: signupClient });
+  // The admission transition below is only observable on a real exchange, and
+  // a stored bearer is now reused until it nears expiry. Keep this test about
+  // the transition — not about bearer reuse, which has its own test — by
+  // letting the clock reach the point where an exchange is due. The backend's
+  // platform evidence is time-bound, so it has to follow the same clock.
+  let now = NOW;
+  const backend = new MemoryBackend();
+  backend.probe = async () => ({
+    protocol: CREDENTIAL_BACKEND_PROTOCOL,
+    backendId: backend.backendId,
+    platform: backend.platform,
+    status: "verified",
+    observedAt: now,
+    expiresAt: now + 60_000,
+    source: "live_round_trip",
+  });
+  const signedUp = fixture({ backend, client: signupClient, clock: () => now });
   const result = await signedUp.service.signup();
   assert.equal(result.context.admission, "waitlisted");
   assert.equal(
@@ -289,7 +448,8 @@ test("waitlist-only signup stores a restricted session and permits one pinned ad
       });
     },
   });
-  const admitted = fixture({ backend: signedUp.backend, client: admittedClient });
+  now = Date.parse("2026-08-08T00:09:00.000Z");
+  const admitted = fixture({ backend, client: admittedClient, clock: () => now });
   assert.equal(await admitted.service.acquireAccessToken(), AT_2);
 
   const substitutedClient = fakeClient({
@@ -304,15 +464,16 @@ test("waitlist-only signup stores a restricted session and permits one pinned ad
       });
     },
   });
-  const substituted = fixture({
-    backend: signedUp.backend,
-    client: substitutedClient,
-  });
+  // Same clock, and far enough past the stored bearer that this reaches a real
+  // exchange — a reused bearer would never see the substituted terms version
+  // that this case exists to refuse.
+  now = Date.parse("2026-08-08T00:19:00.000Z");
+  const substituted = fixture({ backend, client: substitutedClient, clock: () => now });
   await assert.rejects(
     substituted.service.acquireAccessToken(),
     (error) => error.code === "cuna.auth.reauthentication_required",
   );
-  assert.equal(signedUp.backend.values.size, 0);
+  assert.equal(backend.values.size, 0);
 });
 
 test("signup capability is closed and never fabricates providers while disabled", () => {
@@ -544,29 +705,225 @@ test("post-rotation cancellation compare-deletes only the just-written session b
   assert.equal(subject.client.calls.filter(([name]) => name === "exchange").length, 1);
 });
 
-test("re-exchange races coalesce, retain the durable code once, and keep access tokens memory-only", async () => {
-  const original = fixture();
+test("a stored bearer is reused across processes, and only a stale one buys an exchange", async () => {
+  // This is the fix for the defect that made one authenticated command in
+  // three fail: every command re-exchanged the login code, against a server
+  // budget of ten exchanges per rolling minute, so the eleventh command in a
+  // minute was refused. A second process must now spend ZERO exchanges while
+  // the stored bearer still has real life left.
+  // The backend's platform evidence is time-bound, so the clock this test
+  // advances has to carry it along or the vault refuses before the bearer is
+  // ever consulted.
+  let now = NOW;
+  const backend = new MemoryBackend();
+  backend.probe = async () => ({
+    protocol: CREDENTIAL_BACKEND_PROTOCOL,
+    backendId: backend.backendId,
+    platform: backend.platform,
+    status: "verified",
+    observedAt: now,
+    expiresAt: now + 60_000,
+    source: "live_round_trip",
+  });
+  const original = fixture({ backend, clock: () => now });
   await original.service.login();
   const nextClient = fakeClient();
-  const next = fixture({ backend: original.backend, client: nextClient });
+  const next = fixture({ backend, client: nextClient, clock: () => now });
   const tokens = await Promise.all(Array.from({ length: 12 }, () => next.service.acquireAccessToken()));
-  assert.deepEqual(new Set(tokens), new Set([AT_2]));
-  const exchanges = nextClient.calls.filter(([name]) => name === "exchange");
-  assert.equal(exchanges.length, 1);
-  assert.equal(exchanges[0][1].expectedLoginCodeExpiresAt, "2026-09-07T00:00:00.000Z");
-  assert.equal(JSON.stringify(nextClient.calls).includes(LOGIN), true);
-  assert.equal(Buffer.concat([...original.backend.values.values()].map((value) => Buffer.from(value))).toString("utf8").includes(AT_2), false);
+  assert.deepEqual(new Set(tokens), new Set([AT]), "a fresh process did not reuse the stored bearer");
+  assert.equal(
+    nextClient.calls.filter(([name]) => name === "exchange").length,
+    0,
+    "reusing a live bearer must cost no exchange at all",
+  );
 
-  const laterClient = fakeClient({
+  // Past the reuse margin the bearer is no longer safe to hand to a request
+  // that could outlive it, so exactly one exchange happens — and concurrent
+  // acquisitions still coalesce into that one, which is the property the
+  // original version of this test existed to hold.
+  const staleClient = fakeClient({
     async exchange(input) {
       this.calls.push(["exchange", input]);
-      return exchangeResult({ accessToken: AT_3 });
+      return exchangeResult({ accessToken: AT_2 });
     },
   });
-  const later = fixture({ backend: original.backend, client: laterClient });
-  assert.equal(await later.service.acquireAccessToken(), AT_3);
-  assert.equal(laterClient.calls.filter(([name]) => name === "exchange").length, 1);
-  assert.equal(laterClient.calls.find(([name]) => name === "exchange")[1].loginCode, LOGIN);
+  now = Date.parse("2026-08-08T00:09:00.000Z");
+  const stale = fixture({ backend, client: staleClient, clock: () => now });
+  const staleTokens = await Promise.all(Array.from({ length: 12 }, () => stale.service.acquireAccessToken()));
+  assert.deepEqual(new Set(staleTokens), new Set([AT_2]));
+  const exchanges = staleClient.calls.filter(([name]) => name === "exchange");
+  assert.equal(exchanges.length, 1, "concurrent acquisitions must still coalesce into one exchange");
+  assert.equal(exchanges[0][1].expectedLoginCodeExpiresAt, "2026-09-07T00:00:00.000Z");
+  assert.equal(JSON.stringify(staleClient.calls).includes(LOGIN), true);
+});
+
+test("one long-lived HTTP transport reacquires an interactive bearer after the 600 second access TTL", async () => {
+  let now = NOW;
+  let exchanges = 0;
+  const backend = new MemoryBackend();
+  backend.probe = async () => ({
+    protocol: CREDENTIAL_BACKEND_PROTOCOL,
+    backendId: backend.backendId,
+    platform: backend.platform,
+    status: "verified",
+    observedAt: now,
+    expiresAt: now + 60_000,
+    source: "live_round_trip",
+  });
+  const client = fakeClient({
+    async exchange(input) {
+      this.calls.push(["exchange", input]);
+      exchanges += 1;
+      return exchangeResult({
+        accessToken: exchanges === 1 ? AT : AT_2,
+        accessExpiresAt: new Date(now + 600_000).toISOString(),
+      });
+    },
+  });
+  const subject = fixture({ backend, client, clock: () => now });
+  await subject.service.login();
+
+  const authorizations = [];
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    bearerTokenProvider: (signal) => subject.service.acquireAccessToken(signal),
+    fetch: async (_url, init) => {
+      authorizations.push(init.headers.Authorization);
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    },
+  });
+  await transport.request({ method: "GET", path: "/v1/context" });
+  now += 601_000;
+  await transport.request({ method: "GET", path: "/v1/context" });
+
+  assert.deepEqual(authorizations, [`Bearer ${AT}`, `Bearer ${AT_2}`]);
+  assert.equal(exchanges, 2, "login plus one expiry-driven re-exchange");
+  assert.equal(backend.values.size, 1, "refreshing an access bearer retains the durable login code");
+});
+
+test("response timeout begins after interprocess credential acquisition, not while waiting for it", async () => {
+  let fetches = 0;
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    timeoutMs: 20,
+    bearerTokenProvider: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return AT;
+    },
+    fetch: async () => {
+      fetches += 1;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    },
+  });
+  assert.deepEqual(await transport.request({ method: "GET", path: "/v1/context" }), { ok: true });
+  assert.equal(fetches, 1);
+});
+
+test("a protected GET 401 forces one bearer rotation, retries once, and retains the durable login code", async () => {
+  const subject = fixture();
+  await subject.service.login();
+  let fetches = 0;
+  const authorizations = [];
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    bearerTokenProvider: (signal, refresh) => refresh === undefined
+      ? subject.service.acquireAccessToken(signal)
+      : subject.service.refreshRejectedAccessToken(refresh.rejectedToken, signal),
+    fetch: async (_url, init) => {
+      fetches += 1;
+      authorizations.push(init.headers.Authorization);
+      if (fetches === 2) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return new Response(JSON.stringify({
+        type: "https://api.getcuna.com/problems/unauthenticated",
+        title: "Authentication required",
+        status: 401,
+        code: "unauthenticated",
+        request_id: UUID_C,
+        retryable: false,
+        action: "sign_in",
+      }), { status: 401, headers: { "content-type": "application/problem+json" } });
+    },
+  });
+
+  assert.deepEqual(await transport.request({ method: "GET", path: "/v1/context" }), { ok: true });
+  assert.equal(fetches, 2, "401 permits exactly one safe replay");
+  assert.deepEqual(authorizations, [`Bearer ${AT}`, `Bearer ${AT_2}`]);
+  assert.equal(subject.backend.values.size, 1, "an access-token rejection does not revoke durable login");
+});
+
+test("401 retry is bounded to GET or a valid idempotency key and preserves mutation identity", async () => {
+  for (const request of [
+    { method: "POST", path: "/v1/write", body: { value: 1 } },
+    { method: "POST", path: "/v1/write", body: { value: 1 }, idempotencyKey: "bad" },
+  ]) {
+    let fetches = 0;
+    let refreshes = 0;
+    const transport = createHttpTransport({
+      baseUrl: "https://api.getcuna.com",
+      bearerTokenProvider: async (_signal, refresh) => {
+        if (refresh !== undefined) refreshes += 1;
+        return AT;
+      },
+      fetch: async () => {
+        fetches += 1;
+        return new Response(JSON.stringify({ error: "unauthenticated" }), { status: 401 });
+      },
+    });
+    await assert.rejects(transport.request(request), (error) => error.code === "cuna.auth.rejected");
+    assert.equal(fetches, 1);
+    assert.equal(refreshes, 0);
+  }
+
+  const attempts = [];
+  let providerCalls = 0;
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    bearerTokenProvider: async (_signal, refresh) => {
+      providerCalls += 1;
+      if (refresh !== undefined) {
+        assert.equal(refresh.reason, "unauthorized");
+        assert.equal(refresh.rejectedToken, AT);
+        return AT_2;
+      }
+      return AT;
+    },
+    fetch: async (_url, init) => {
+      attempts.push({ authorization: init.headers.Authorization, key: init.headers["Idempotency-Key"], body: init.body });
+      return new Response(JSON.stringify(attempts.length === 1 ? { error: "unauthenticated" } : { ok: true }), {
+        status: attempts.length === 1 ? 401 : 200,
+      });
+    },
+  });
+  assert.deepEqual(await transport.request({
+    method: "POST",
+    path: "/v1/write",
+    body: { value: 1 },
+    idempotencyKey: "stable-operation-1",
+  }), { ok: true });
+  assert.equal(providerCalls, 2);
+  assert.deepEqual(attempts, [
+    { authorization: `Bearer ${AT}`, key: "stable-operation-1", body: JSON.stringify({ value: 1 }) },
+    { authorization: `Bearer ${AT_2}`, key: "stable-operation-1", body: JSON.stringify({ value: 1 }) },
+  ]);
+});
+
+test("a second 401 is authoritative and never starts a retry loop", async () => {
+  let fetches = 0;
+  let providerCalls = 0;
+  const transport = createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    bearerTokenProvider: async (_signal, refresh) => {
+      providerCalls += 1;
+      return refresh === undefined ? AT : AT_2;
+    },
+    fetch: async () => {
+      fetches += 1;
+      return new Response(JSON.stringify({ error: "unauthenticated" }), { status: 401 });
+    },
+  });
+  await assert.rejects(transport.request({ method: "GET", path: "/v1/context" }), (error) => error.code === "cuna.auth.rejected");
+  assert.equal(fetches, 2);
+  assert.equal(providerCalls, 2);
 });
 
 test("fresh whoami reuses identity validated by re-exchange instead of rereading the encrypted session", async () => {
@@ -581,7 +938,10 @@ test("fresh whoami reuses identity validated by re-exchange instead of rereading
 
   assert.equal(result.profile, config.profile);
   assert.equal(result.sessionId, UUID_B);
-  assert.equal(client.calls.filter(([name]) => name === "exchange").length, 1);
+  // Zero, not one: the bearer stored by the previous process is still live, so
+  // a fresh `whoami` costs no exchange at all. Identity is still proved live —
+  // the context read below is what does that, and it is unchanged.
+  assert.equal(client.calls.filter(([name]) => name === "exchange").length, 0);
   assert.equal(client.calls.filter(([name]) => name === "context").length, 1);
   // A fresh service still proves the backend once and reads its encrypted
   // record once. The old path did an initial load, a re-exchange read, and a
@@ -591,8 +951,24 @@ test("fresh whoami reuses identity validated by re-exchange instead of rereading
 });
 
 test("one cancelled re-exchange waiter neither aborts nor poisons the shared credential read", async () => {
-  const original = fixture();
+  // This case is about sharing ONE in-flight exchange, so the stored bearer
+  // has to be past its reuse margin — otherwise the CLI correctly reuses it,
+  // no exchange is ever entered, and the test waits forever on a promise that
+  // nothing will resolve. The backend's platform evidence follows the clock.
+  let now = NOW;
+  const backend = new MemoryBackend();
+  backend.probe = async () => ({
+    protocol: CREDENTIAL_BACKEND_PROTOCOL,
+    backendId: backend.backendId,
+    platform: backend.platform,
+    status: "verified",
+    observedAt: now,
+    expiresAt: now + 60_000,
+    source: "live_round_trip",
+  });
+  const original = fixture({ backend, clock: () => now });
   await original.service.login();
+  now = Date.parse("2026-08-08T00:09:00.000Z");
   let releaseExchange;
   let exchangeEntered;
   const entered = new Promise((resolve) => { exchangeEntered = resolve; });
@@ -604,7 +980,7 @@ test("one cancelled re-exchange waiter neither aborts nor poisons the shared cre
       return exchangeResult({ accessToken: AT_2 });
     },
   });
-  const subject = fixture({ backend: original.backend, client });
+  const subject = fixture({ backend, client, clock: () => now });
   const controller = new AbortController();
   const cancelled = subject.service.acquireAccessToken(controller.signal);
   await entered;
@@ -619,8 +995,10 @@ test("one cancelled re-exchange waiter neither aborts nor poisons the shared cre
 });
 
 test("authoritative re-exchange rejection deletes the family while unknown failure preserves it", async () => {
-  const first = fixture();
+  const gate = exchangeClock();
+  const first = fixture({ backend: gate.backend, clock: gate.clock });
   await first.service.login();
+  gate.expireStoredBearer();
   const rejectedClient = fakeClient({
     async exchange() {
       throw new CunaError({
@@ -629,20 +1007,25 @@ test("authoritative re-exchange rejection deletes the family while unknown failu
       });
     },
   });
-  const rejected = fixture({ backend: first.backend, client: rejectedClient });
+  const rejected = fixture({ backend: gate.backend, client: rejectedClient, clock: gate.clock });
   await assert.rejects(rejected.service.acquireAccessToken(), (error) => error.code === "cuna.auth.reauthentication_required");
   assert.equal(first.backend.values.size, 0);
 
-  const second = fixture();
+  const secondGate = exchangeClock();
+  const second = fixture({ backend: secondGate.backend, clock: secondGate.clock });
   await second.service.login();
-  const unknown = fixture({ backend: second.backend, client: fakeClient({ async exchange() { throw new Error("network secret"); } }) });
+  secondGate.expireStoredBearer();
+  const unknown = fixture({ backend: secondGate.backend, client: fakeClient({ async exchange() { throw new Error("network secret"); } }), clock: secondGate.clock });
   await assert.rejects(unknown.service.acquireAccessToken());
-  assert.equal(second.backend.values.size, 1);
+  assert.equal(secondGate.backend.values.size, 1);
 
-  const third = fixture();
+  const thirdGate = exchangeClock();
+  const third = fixture({ backend: thirdGate.backend, clock: thirdGate.clock });
   await third.service.login();
+  thirdGate.expireStoredBearer();
   const invalidContext = fixture({
-    backend: third.backend,
+    clock: thirdGate.clock,
+    backend: thirdGate.backend,
     client: fakeClient({
       async exchange(input) {
         this.calls.push(["exchange", input]);
@@ -655,7 +1038,7 @@ test("authoritative re-exchange rejection deletes the family while unknown failu
     }),
   });
   await assert.rejects(invalidContext.service.acquireAccessToken(), (error) => error.code === "cuna.auth.reauthentication_required");
-  assert.equal(third.backend.values.size, 0);
+  assert.equal(thirdGate.backend.values.size, 0);
   assert.equal(invalidContext.client.calls.some(([name, token]) => name === "logout" && token === AT_2), true);
 });
 
@@ -734,8 +1117,10 @@ test("a fresh logout preserves encrypted material when re-exchange returns gener
       details: { http_status: 409, reason: "terms_version_mismatch" },
     }),
   ]) {
-    const original = fixture();
+    const gate = exchangeClock();
+    const original = fixture({ backend: gate.backend, clock: gate.clock });
     await original.service.login();
+    gate.expireStoredBearer();
     const retryClient = fakeClient({
       async exchange(input) {
         this.calls.push(["exchange", input]);
@@ -745,15 +1130,53 @@ test("a fresh logout preserves encrypted material when re-exchange returns gener
         throw new Error("an unclassified re-exchange failure must not reach a logout mutation");
       },
     });
-    const fresh = fixture({ backend: original.backend, client: retryClient });
+    const fresh = fixture({ backend: gate.backend, client: retryClient, clock: gate.clock });
     await assert.rejects(
       fresh.service.logout(),
       (error) => error.code === "credential_refresh_failed",
     );
-    assert.equal(original.backend.values.size, 1);
+    assert.equal(gate.backend.values.size, 1);
     assert.equal(retryClient.calls.filter(([name]) => name === "exchange").length, 1);
     assert.equal(retryClient.calls.some(([name]) => name === "logout"), false);
   }
+});
+
+test("a rate-limited re-exchange names its reason and keeps the encrypted login code", async () => {
+  // The server allows ten exchanges per rolling minute and every authenticated
+  // command performs one, so this is the eleventh command in a minute: the most
+  // likely failure a real user meets. Two properties matter. The reason must
+  // survive to the surface, because the caller cannot otherwise tell a wait
+  // from a revoked session. And the durable code must stay, because a 429 is
+  // not proof that this login-code family was rejected.
+  const gate = exchangeClock();
+  const original = fixture({ backend: gate.backend, clock: gate.clock });
+  await original.service.login();
+  gate.expireStoredBearer();
+  const limited = fakeClient({
+    async exchange(input) {
+      this.calls.push(["exchange", input]);
+      throw new CunaError({
+        code: "cuna.network.rate_limited",
+        message: "Cuna is rate limiting this request.",
+        exitCode: 5,
+        retryable: true,
+        details: { http_status: 429 },
+      });
+    },
+    async logout() {
+      throw new Error("a rate limit must never reach a logout mutation");
+    },
+  });
+  const fresh = fixture({ backend: gate.backend, client: limited, clock: gate.clock });
+  await assert.rejects(
+    fresh.service.acquireAccessToken(),
+    (error) =>
+      error.code === "credential_refresh_failed" &&
+      error.retryable === true &&
+      error.safeDetails?.reason === "cuna.network.rate_limited",
+  );
+  assert.equal(gate.backend.values.size, 1, "a rate limit must not remove the durable login code");
+  assert.equal(limited.calls.some(([name]) => name === "logout"), false);
 });
 
 test("a response-lost logout is cleaned up idempotently when a retry receives definitive 401 re-exchange rejection", async () => {
@@ -766,8 +1189,10 @@ test("a response-lost logout is cleaned up idempotently when a retry receives de
       throw new Error("logout response lost after server commit");
     },
   });
-  const first = fixture({ client: firstClient });
+  const gate = exchangeClock();
+  const first = fixture({ backend: gate.backend, client: firstClient, clock: gate.clock });
   await first.service.login();
+  gate.expireStoredBearer();
   await assert.rejects(first.service.logout(), /logout response lost/u);
   assert.equal(first.backend.values.size, 1);
 
@@ -785,7 +1210,7 @@ test("a response-lost logout is cleaned up idempotently when a retry receives de
       throw new Error("a revoked family must not reach a second logout mutation");
     },
   });
-  const retry = fixture({ backend: first.backend, client: retryClient });
+  const retry = fixture({ backend: gate.backend, client: retryClient, clock: gate.clock });
   assert.deepEqual(await retry.service.logout(), { revoked: true });
   assert.equal(first.backend.values.size, 0, "a definitive revoked response must remove the encrypted durable login code");
   assert.equal(retryClient.calls.filter(([name]) => name === "exchange").length, 1);
@@ -919,17 +1344,20 @@ test("human authentication rejects clock rollback and tokens that expire during 
     (error) => error.code === "cuna.auth.clock_untrusted",
   );
 
-  const original = fixture();
+  // The bearer has to be past its reuse margin or no exchange happens at all,
+  // and the backend evidence has to move with the clock this case advances.
+  const slowGate = exchangeClock();
+  const original = fixture({ backend: slowGate.backend, clock: slowGate.clock });
   await original.service.login();
-  let slowNow = NOW;
+  slowGate.expireStoredBearer();
   const slowClient = fakeClient({
     async exchange(input) {
       this.calls.push(["exchange", input]);
-      slowNow = Date.parse("2026-08-08T00:10:00.000Z");
+      slowGate.advanceTo("2026-08-08T00:10:00.000Z");
       return exchangeResult({ accessToken: AT_2 });
     },
   });
-  const slow = fixture({ backend: original.backend, client: slowClient, clock: () => slowNow });
+  const slow = fixture({ backend: slowGate.backend, client: slowClient, clock: slowGate.clock });
   await assert.rejects(
     slow.service.acquireAccessToken(),
     (error) => error.code === "cuna.auth.reauthentication_required",

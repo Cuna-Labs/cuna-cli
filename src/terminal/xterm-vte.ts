@@ -1,9 +1,18 @@
 import xtermHeadless from "@xterm/headless";
 
-import type { Terminal as XtermTerminal } from "@xterm/headless";
+import type { IBufferCell, Terminal as XtermTerminal } from "@xterm/headless";
 
 import { MAX_TERMINAL_FRAME_BYTES } from "./codec.js";
-import { MAX_VIEWPORT_CELLS, ViewportRegistry, type ViewportBinding, type ViewportSnapshot } from "./viewport.js";
+import {
+  MAX_VIEWPORT_CELLS,
+  assertViewportRebind,
+  ViewportRegistry,
+  type ViewportBinding,
+  type ViewportCellColor,
+  type ViewportCellStyle,
+  type ViewportRenderRun,
+  type ViewportSnapshot,
+} from "./viewport.js";
 
 const { Terminal } = xtermHeadless as unknown as { readonly Terminal: typeof XtermTerminal };
 export const DEFAULT_XTERM_SCROLLBACK = 1_000;
@@ -108,17 +117,17 @@ export interface XtermViewportOptions {
 
 export class XtermViewportAdapter {
   readonly #tabId: string;
-  readonly #binding: ViewportBinding;
+  #binding: ViewportBinding;
   readonly #registry: ViewportRegistry;
-  readonly #terminal: XtermTerminal;
+  #terminal: XtermTerminal;
   readonly #encoder = new TextEncoder();
-  readonly #complexityDecoder = new TextDecoder();
+  #complexityDecoder = new TextDecoder();
   readonly #scrollback: number;
   readonly #onTerminalResponse: XtermViewportOptions["onTerminalResponse"];
   readonly #clock: () => number;
   readonly #responseDeliveryTimeoutMs: number;
   readonly #resourceBudget: XtermResourceBudget;
-  readonly #responseAbort = new AbortController();
+  #responseAbort = new AbortController();
   #writeTail: Promise<void> = Promise.resolve();
   #pendingWriteBytes = 0;
   #cellExtenderRun = 0;
@@ -168,6 +177,10 @@ export class XtermViewportAdapter {
       try { this.#registry.close(options.tabId); } catch { /* the registry may not have opened */ }
       throw error;
     }
+    this.#configureTerminal();
+  }
+
+  #configureTerminal(): void {
     for (const identifier of CONTAINED_OSC_IDENTIFIERS) {
       // Cuna renders cells only. Consuming non-cell metadata prevents remote
       // title, hyperlink, and clipboard state from entering trusted host UI or
@@ -182,7 +195,7 @@ export class XtermViewportAdapter {
       if (params.some((value) => value === 25 || (Array.isArray(value) && value.includes(25)))) this.#cursorVisible = false;
       return false;
     });
-    if (options.onTerminalResponse !== undefined) {
+    if (this.#onTerminalResponse !== undefined) {
       this.#terminal.onData((value) => this.#queueTerminalResponse("data", this.#encoder.encode(value)));
       this.#terminal.onBinary((value) => this.#queueTerminalResponse(
         "binary",
@@ -194,6 +207,73 @@ export class XtermViewportAdapter {
   snapshot(): ViewportSnapshot {
     this.#assertOpen();
     return this.#registry.require(this.#tabId);
+  }
+
+  async rebind(binding: ViewportBinding): Promise<ViewportSnapshot> {
+    this.#assertOpen();
+    assertViewportRebind(this.#binding, binding);
+    const nextBinding = Object.freeze({ ...binding });
+    // Revoke queued query replies immediately. Their immutable old binding
+    // never gains the new fence, and their cancellation must not destroy the
+    // surviving model. All old writes settle before the binding is changed.
+    this.#responseAbort.abort(new Error("The terminal query's attachment was retired."));
+    const operation = this.#writeTail.then(() => {
+      this.#assertOpen();
+      const snapshot = this.#registry.rebind(this.#tabId, nextBinding);
+      this.#binding = nextBinding;
+      this.#responseAbort = new AbortController();
+      return snapshot;
+    });
+    this.#writeTail = operation.then(() => undefined, () => undefined);
+    return await operation;
+  }
+
+  async resetForCurrentView(binding: ViewportBinding, columns: number, rows: number): Promise<ViewportSnapshot> {
+    this.#assertOpen();
+    assertViewportRebind(this.#binding, binding);
+    assertBufferBudget(columns, rows, this.#scrollback);
+    const nextBinding = Object.freeze({ ...binding });
+    this.#responseAbort.abort(new Error("The terminal rendering view was retired."));
+    const operation = this.#writeTail.then(() => {
+      this.#assertOpen();
+      // Recheck after queued transitions; never weaken the attachment fence.
+      assertViewportRebind(this.#binding, nextBinding);
+      try {
+        this.#resourceBudget.resize(this.#tabId, bufferCells(columns, rows, this.#scrollback));
+        this.#terminal.dispose();
+        this.#terminal = new Terminal({ cols: columns, rows, allowProposedApi: true,
+          scrollback: this.#scrollback, convertEol: false });
+        this.#complexityDecoder = new TextDecoder();
+        this.#cellExtenderRun = 0;
+        this.#responseBatch = undefined;
+        this.#responseBatchBytes = 0;
+        this.#responseOverflow = false;
+        this.#responseWindowStartedAt = this.#clock();
+        this.#responseWindowEvents = 0;
+        this.#responseWindowBytes = 0;
+        this.#cursorVisible = true;
+        this.#configureTerminal();
+        const snapshot = this.#registry.resetForCurrentView(this.#tabId, nextBinding, columns, rows);
+        this.#binding = nextBinding;
+        this.#responseAbort = new AbortController();
+        return snapshot;
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
+    });
+    this.#writeTail = operation.then(() => undefined, () => undefined);
+    return await operation;
+  }
+
+  snapshotForHost(columns: number, rows: number): ViewportSnapshot {
+    this.#assertOpen();
+    if (!Number.isSafeInteger(columns) || !Number.isSafeInteger(rows) ||
+      columns < 1 || rows < 1 || columns > 4096 || rows > 4096 || columns * rows > MAX_VIEWPORT_CELLS) {
+      throw new RangeError("The host projection dimensions exceed the viewport budget.");
+    }
+    const current = this.snapshot();
+    return this.#capture(current.outputSequence, current.replayCursor, false, { columns, rows });
   }
 
   async write(
@@ -272,6 +352,7 @@ export class XtermViewportAdapter {
     this.#responseOverflow = false;
     let timeout: NodeJS.Timeout | undefined;
     try {
+      this.#armSynchronousParse();
       await Promise.race([
         new Promise<void>((resolve) => this.#terminal.write(bytes, resolve)),
         new Promise<never>((_resolve, reject) => {
@@ -285,11 +366,16 @@ export class XtermViewportAdapter {
       this.#responseBatch = undefined;
       if (this.#onTerminalResponse !== undefined) {
         for (const response of responses) {
-          await withDeadline(
-            Promise.resolve(this.#onTerminalResponse(response)),
-            this.#responseDeliveryTimeoutMs,
-            this.#responseAbort.signal,
-          );
+          if (response.signal.aborted) continue;
+          try {
+            await withDeadline(
+              Promise.resolve(this.#onTerminalResponse(response)),
+              this.#responseDeliveryTimeoutMs,
+              response.signal,
+            );
+          } catch (error) {
+            if (!response.signal.aborted || this.#disposed) throw error;
+          }
         }
       }
       return this.#capture(outputSequence, replayCursor);
@@ -300,6 +386,29 @@ export class XtermViewportAdapter {
       if (timeout !== undefined) clearTimeout(timeout);
       this.#responseBatch = undefined;
       this.#responseBatchBytes = 0;
+    }
+  }
+
+  /**
+   * `@xterm/headless` defers `write` to a `setTimeout` macrotask, which costs a
+   * full host timer tick per remote output frame. `handleUserInput()` is
+   * xterm's own input-latency path: the next write on an empty buffer parses
+   * synchronously instead, with the same callback and the same 12 ms yield
+   * slicing for large payloads. Writes here are serialized behind `#writeTail`,
+   * so the buffer is always empty, and a synchronous parse also surfaces a
+   * parser fault to this adapter's `catch` instead of an unhandled timer
+   * callback.
+   *
+   * This reaches past the public surface, so it stays confined to this adapter
+   * and the exact `@xterm/headless` pin, and is feature-detected: an unknown
+   * build keeps the deferred behaviour rather than failing.
+   */
+  #armSynchronousParse(): void {
+    const writeBuffer = (this.#terminal as unknown as {
+      readonly _core?: { readonly _writeBuffer?: { readonly handleUserInput?: () => void } };
+    })._core?._writeBuffer;
+    if (typeof writeBuffer?.handleUserInput === "function") {
+      writeBuffer.handleUserInput();
     }
   }
 
@@ -349,24 +458,63 @@ export class XtermViewportAdapter {
     }
   }
 
-  #capture(outputSequence: bigint, replayCursor: bigint, localReflow = false): ViewportSnapshot {
+  #capture(outputSequence: bigint, replayCursor: bigint, localReflow = false,
+    host?: { readonly columns: number; readonly rows: number },
+  ): ViewportSnapshot {
     const buffer = this.#terminal.buffer.active;
     const cells: string[] = [];
     const displayWidths: number[] = [];
-    for (let row = 0; row < this.#terminal.rows; row += 1) {
-      const line = buffer.getLine(buffer.viewportY + row);
-      cells.push(line?.translateToString(true) ?? "");
+    const renderRows: ViewportRenderRun[][] = [];
+    const columns = Math.min(this.#terminal.cols, host?.columns ?? this.#terminal.cols);
+    const rows = Math.min(this.#terminal.rows, host?.rows ?? this.#terminal.rows);
+    // A host frame shorter than the writer's screen shows a window onto that
+    // screen, not its first rows. Terminals are bottom-anchored: the live
+    // region -- prompt, status line, newest output -- sits at the cursor.
+    // Anchor the window so the cursor row stays inside it, and keep the top
+    // whenever the writer's screen already fits, which is the only case the
+    // non-projecting capture can reach.
+    const rowOffset = Math.min(Math.max(0, buffer.cursorY - rows + 1), this.#terminal.rows - rows);
+    for (let row = 0; row < rows; row += 1) {
+      const line = buffer.getLine(buffer.viewportY + rowOffset + row);
       let visibleWidth = 0;
       if (line !== undefined) {
-        for (let column = 0; column < this.#terminal.cols; column += 1) {
+        for (let column = 0; column < columns; column += 1) {
           const cell = line.getCell(column);
+          const width = cell?.getWidth() ?? 1;
+          if (width === 0) continue;
+          // Do not expose half a wide glyph at the physical host edge.
+          if (column + width > columns) break;
           const characters = cell?.getChars() ?? "";
-          if (characters !== "" && characters !== " ") {
+          // An explicit space is content and may be the final glyph before a
+          // split UTF-8 sequence. Only untouched empty cells are invisible.
+          if (characters !== "" || cell?.isAttributeDefault() === false) {
             visibleWidth = column + Math.max(1, cell?.getWidth() ?? 1);
           }
         }
       }
+      // Bound the plain-text projection to the same authoritative terminal
+      // columns as the styled runs. `trimRight=true` would discard a real
+      // trailing space while a split UTF-8 sequence is pending, and would also
+      // erase background-only cells that are visually significant.
+      cells.push(line?.translateToString(false, 0, visibleWidth) ?? "");
       displayWidths.push(visibleWidth);
+      const runs: ViewportRenderRun[] = [];
+      if (line !== undefined) {
+        for (let column = 0; column < visibleWidth; column += 1) {
+          const cell = line.getCell(column);
+          const width = cell?.getWidth() ?? 1;
+          if (width === 0) continue;
+          const text = cell?.getChars() || " ";
+          const style = cell === undefined ? DEFAULT_CELL_STYLE : cellStyle(cell);
+          const previous = runs.at(-1);
+          if (previous !== undefined && sameCellStyle(previous.style, style)) {
+            runs[runs.length - 1] = { text: `${previous.text}${text}`, width: previous.width + width, style: previous.style };
+          } else {
+            runs.push({ text, width, style });
+          }
+        }
+      }
+      renderRows.push(runs);
     }
     const frame = {
       tabId: this.#tabId,
@@ -374,6 +522,7 @@ export class XtermViewportAdapter {
       outputSequence,
       replayCursor,
       cells,
+      renderRows,
       displayWidths,
       cursorX: buffer.cursorX,
       cursorY: buffer.cursorY,
@@ -384,6 +533,21 @@ export class XtermViewportAdapter {
         cursorVisible: this.#cursorVisible,
       },
     };
+    if (host !== undefined) {
+      // The cursor travels with the window instead of being relocated into it.
+      // Clamping it reported a position the writer's terminal never held; the
+      // offset maps the real row, and a cursor outside the clipped width is
+      // genuinely off this host frame and stays hidden.
+      const projectedCursorY = frame.cursorY - rowOffset;
+      return Object.freeze({ ...frame, columns: host.columns, rows: host.rows,
+        cells: Object.freeze(cells), displayWidths: Object.freeze(displayWidths),
+        renderRows: Object.freeze(renderRows.map(row => Object.freeze(row.map(run => Object.freeze(run))))),
+        cursorX: Math.min(host.columns - 1, frame.cursorX),
+        cursorY: projectedCursorY < 0 || projectedCursorY >= rows ? 0 : projectedCursorY,
+        modes: Object.freeze({ ...frame.modes, cursorVisible: frame.modes.cursorVisible &&
+          frame.cursorX < columns && projectedCursorY >= 0 && projectedCursorY < rows }),
+      });
+    }
     return localReflow
       ? this.#registry.applyLocalReflow(frame)
       : this.#registry.applyRenderedFrame(frame);
@@ -392,6 +556,68 @@ export class XtermViewportAdapter {
   #assertOpen(): void {
     if (this.#disposed) throw new Error("The xterm viewport adapter is disposed.");
   }
+}
+
+const DEFAULT_CELL_STYLE: ViewportCellStyle = Object.freeze({
+  bold: false,
+  dim: false,
+  italic: false,
+  underline: false,
+  blink: false,
+  inverse: false,
+  invisible: false,
+  strikethrough: false,
+  overline: false,
+  foreground: null,
+  background: null,
+});
+
+function cellStyle(cell: IBufferCell | undefined): ViewportCellStyle {
+  if (cell === undefined || cell.isAttributeDefault()) return DEFAULT_CELL_STYLE;
+  return {
+    bold: cell.isBold() !== 0,
+    dim: cell.isDim() !== 0,
+    italic: cell.isItalic() !== 0,
+    underline: cell.isUnderline() !== 0,
+    blink: cell.isBlink() !== 0,
+    inverse: cell.isInverse() !== 0,
+    invisible: cell.isInvisible() !== 0,
+    strikethrough: cell.isStrikethrough() !== 0,
+    overline: cell.isOverline() !== 0,
+    foreground: cellColor(cell, "foreground"),
+    background: cellColor(cell, "background"),
+  };
+}
+
+function cellColor(
+  cell: IBufferCell,
+  layer: "foreground" | "background",
+): ViewportCellColor | null {
+  const rgb = layer === "foreground" ? cell.isFgRGB() : cell.isBgRGB();
+  const palette = layer === "foreground" ? cell.isFgPalette() : cell.isBgPalette();
+  if (!rgb && !palette) return null;
+  return {
+    mode: rgb ? "rgb" : "palette",
+    value: layer === "foreground" ? cell.getFgColor() : cell.getBgColor(),
+  };
+}
+
+function sameCellStyle(left: ViewportCellStyle, right: ViewportCellStyle): boolean {
+  return left.bold === right.bold &&
+    left.dim === right.dim &&
+    left.italic === right.italic &&
+    left.underline === right.underline &&
+    left.blink === right.blink &&
+    left.inverse === right.inverse &&
+    left.invisible === right.invisible &&
+    left.strikethrough === right.strikethrough &&
+    left.overline === right.overline &&
+    sameCellColor(left.foreground, right.foreground) &&
+    sameCellColor(left.background, right.background);
+}
+
+function sameCellColor(left: ViewportCellColor | null, right: ViewportCellColor | null): boolean {
+  return left === right || (left !== null && right !== null && left.mode === right.mode && left.value === right.value);
 }
 
 function assertBufferBudget(columns: number, rows: number, scrollback: number): void {

@@ -1,4 +1,5 @@
 import { ROOT_HELP } from "./help.js";
+import { CLI_ROUTE_REGISTRY } from "./parser.js";
 
 /**
  * Help for one command, and for one action within a command.
@@ -30,6 +31,22 @@ function topic(usage: string, body: string): string {
 }
 
 const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
+  executions: topic(
+    "Usage:\n  cuna executions <list|get|cancel> --machine MACHINE_ID [options]",
+    "Inspect remote commands by their durable execution IDs. Leader state and\nprocess ownership are separate: exited can still have live descendants.\nThese commands do not launch or repeat a command. Use an action's --help.",
+  ),
+  "executions list": topic(
+    "Usage:\n  cuna executions list --machine MACHINE_ID [--execution-workspace-id ID] [--after ID]",
+    "Read up to 50 executions on the exact Machine. Filter by an execution\nWorkspace ID, or continue with the returned --after cursor. No command content\nor output is returned. Reads remain available when new execution is unavailable.",
+  ),
+  "executions get": topic(
+    "Usage:\n  cuna executions get EXECUTION_ID --machine MACHINE_ID",
+    "Read one execution's authoritative leader and ownership states. An unknown\noutcome must be inspected; do not repeat the original command to discover it.",
+  ),
+  "executions cancel": topic(
+    "Usage:\n  cuna executions cancel EXECUTION_ID --machine MACHINE_ID --yes",
+    "Request cancellation of this execution and its descendants. --yes confirms\nthis mutation. Acceptance does not prove cleanup: inspect the same execution\nuntil ownership is cleared. Other executions and AgentSessions are not targets.",
+  ),
   signup: topic(
     "Usage:\n  cuna signup",
     "Create a waitlist-only Cuna account through the browser, paste the displayed\ncuna_login_ code, and store it in the encrypted profile session. Never assigns\ncompute and never starts billing. Accepts no operands and no command options.",
@@ -48,8 +65,10 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   ),
   access: topic(
     "Usage:\n  cuna access status",
-    "Show identity, admission, and workspace state separately. The status action is\nrequired. No command options.",
+    "Print the account context as one tab-separated line: identity, admission, then\nworkspace state. `cuna whoami` runs the same read and prints the same line; only\nthe --json record name differs (access.status against whoami). The status action\nis required. No command options.",
   ),
+  observe: topic("Usage:\n  cuna observe --project PROJECT_ID", "Discover sessions shared with your signed-in account and select one read-only view. Requires an interactive terminal and human login. Escape or Ctrl+C closes only this local view. Reconnect requests fresh admission; no keyboard, resize or signal is sent to the agent."),
+  share: topic("Usage:\n  cuna share --project PROJECT_ID [--grant GRANT_ID]", "As the Project owner, pick one of your AgentSessions, pick a distinct member who\nalready holds observer membership, and grant read-only observation for 1, 8 or 24\nhours. The grant screen shows the exact state Cuna reports (active, revocation\nrequested but not yet effective, revoked and effective, expired); i inspects\nagain on demand and x revokes against the revision you read. --grant opens one\nexisting grant directly. Requires an interactive terminal and human login.\nThe same screen starts and stops live sharing of a session: s and e, each\nconfirmed, each stating what a watcher can and cannot see. Granting and sharing\nare separate decisions and Cuna needs both before anyone can watch; neither\nhappens as a side effect of the other.\nAn invitation or membership alone grants no observation; observation and live\nsharing grant no keyboard control. A change whose answer never arrives is shown\nas unknown and can be resent only under the same operation identity."),
   capabilities: topic(
     "Usage:\n  cuna capabilities [--scope SCOPE] [--resource-id ID]",
     [
@@ -62,14 +81,22 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     ].join("\n"),
   ),
   machines: topic(
-    "Usage:\n  cuna machines <list|create|start|pause|resume|stop|delete> [options]",
+    "Usage:\n  cuna machines\n  cuna machines <list|create|start|pause|resume|stop|update-supervisor|live-update-supervisor|live-update-status|delete> [options]",
     [
       "Manage owned Cuna machines. Add --help after an action for that action.",
+      "",
+      "Interactive view:",
+      "  machines                    Browse machines and their AgentSessions",
+      "                              (↑/↓ move, Enter open, n new machine, r refresh, q quit)",
       "",
       "Actions:",
       "  list                        List owned machines",
       "  create                      Create a machine when server-advertised",
       "  start|pause|resume|stop ID  Change lifecycle when server-advertised",
+      "  update-supervisor ID         Update a stopped machine's terminal supervisor",
+      "  live-update-supervisor ID    Update a running machine's terminal supervisor",
+      "                              in place and report each AgentSession's custody",
+      "  live-update-status ID        Read what one in-place update did; sends nothing",
       "  delete ID                   Delete when server-advertised",
     ].join("\n"),
   ),
@@ -87,7 +114,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  --yes               Confirm this mutating operation",
       "",
       "Options:",
-      "  --agent KIND        claude-code, codex, openclaw, or opencode",
+      "  --agent KIND        claude-code, codex, or opencode",
       "  --vcpus N           Base-10 integer, 1 through 8",
       "  --memory-mib N      Base-10 integer, 512 through 16384",
       "  --background        Do not wait for the machine to become ready",
@@ -111,6 +138,107 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   "machines stop": topic(
     "Usage:\n  cuna machines stop MACHINE_ID --yes",
     "Stop one machine when server-advertised.\n\nRequired:\n  --yes               Confirm this mutating operation",
+  ),
+  "machines update-supervisor": topic(
+    "Usage:\n  cuna machines update-supervisor MACHINE_ID --yes",
+    [
+      "Update the terminal supervisor on one stopped OpenCode machine when Cuna",
+      "reports that exact prerequisite.",
+      "",
+      "Cuna never stops the machine or terminates AgentSessions for this action.",
+      "End only the sessions you intend to end, stop the Machine yourself, then run it.",
+      "",
+      "Required:",
+      "  --yes               Confirm this mutating operation",
+    ].join("\n"),
+  ),
+  "machines live-update-status": topic(
+    "Usage:\n  cuna machines live-update-status MACHINE_ID\n  cuna machines live-update-status MACHINE_ID --operation OPERATION_ID",
+    [
+      "Read what one in-place supervisor update did. This sends nothing to the",
+      "machine: it dispatches no installer, starts no update and changes no state.",
+      "It is the ONLY thing that can say what an update did, and a machine that",
+      "reads as running is not evidence either way.",
+      "",
+      "Without --operation it reads the operation this computer recorded when it",
+      "sent one. An update started from another computer or from the web console",
+      "has an identity this CLI never held; name it with --operation.",
+      "",
+      "It reports the phase (claimed, control rotated, installed, settled), what",
+      "the installer did or did not do, the AgentSessions the attempt measured,",
+      "the per-session account when one has settled, any recorded refusal, and the",
+      "next action. A withheld per-session account is reported as withheld, never",
+      "expanded into unknown outcomes.",
+      "",
+      "When the next action is repeat_same_operation, resolve it with",
+      "`cuna machines live-update-supervisor MACHINE_ID --resume`, which re-sends",
+      "that same identity. Starting a different update is refused while this one",
+      "is open.",
+      "",
+      "Options:",
+      "  --operation ID      Read this exact operation instead of the recorded one",
+    ].join("\n"),
+  ),
+  "machines live-update-supervisor": topic(
+    "Usage:\n  cuna machines live-update-supervisor MACHINE_ID --yes\n  cuna machines live-update-supervisor MACHINE_ID --resume [--operation OPERATION_ID]\n  cuna machines live-update-supervisor MACHINE_ID --forget-unknown",
+    [
+      "Replace the terminal supervisor on one RUNNING machine without stopping it.",
+      "",
+      "Keeping the live AgentSessions is CONDITIONAL, never promised. Cuna measures",
+      "this machine's boot, unit, installed artifacts and every live session's",
+      "process, PTY and stored master first, the installer re-measures all of them",
+      "under the install lock before it writes, and the operation refuses before",
+      "any change when they do not hold. Nothing here relaxes the stopped-machine",
+      "action: `machines update-supervisor` keeps its own boundary.",
+      "",
+      "The answer is one custody line per AgentSession that existed beforehand:",
+      "preserved, exited, did not survive, or unknown. Anything other than",
+      "preserved is reported as such and is not a completed update.",
+      "",
+      "A successful update installs software. It grants no observation or control",
+      "of any AgentSession and signs no provider in; attach and provider login stay",
+      "exactly where they were.",
+      "",
+      "Cuna chooses an operation identity before it sends, and records it on this",
+      "computer first. That is what makes a lost answer recoverable: re-sending the",
+      "SAME identity never rotates this machine's control a second time -- it",
+      "resumes an attempt that spent nothing and reconciles one that may have spent",
+      "something. A DIFFERENT identity is refused while an update is unsettled.",
+      "",
+      "So when the answer is lost, the recovery is a read and then a repeat, never",
+      "a new update and never a fallback to stopping the machine:",
+      "  cuna machines live-update-status MACHINE_ID        (sends nothing)",
+      "  cuna machines live-update-supervisor MACHINE_ID --resume",
+      "",
+      "The record covers this machine on this API for every profile on this",
+      "computer, so --profile neither clears nor bypasses it.",
+      "",
+      "Exactly one of:",
+      "  --yes               Start a NEW update. Confirms this mutating operation.",
+      "  --resume            Re-send an operation identity instead of starting a new",
+      "                      update. A deliberate repeat, not a transport retry: the",
+      "                      transport never re-sends this request on its own. Cuna",
+      "                      reads the update first and refuses when repeating it",
+      "                      would be that identity's FIRST admission rather than",
+      "                      finishing one, and when it is already settled.",
+      "  --forget-unknown    Clear this computer's record. Reads the operation first",
+      "                      and clears it only when that operation has settled, or",
+      "                      when the account that filed the record is signed in and",
+      "                      Cuna has no such operation at all. An open one holds",
+      "                      this machine and the record holds the only identity that",
+      "                      can resolve it. Sends no mutation.",
+      "",
+      "Option:",
+      "  --operation ID      With --resume only: finish an update this computer never",
+      "                      recorded -- one started from another computer or from the",
+      "                      web console. Knowing an identity is not permission to use",
+      "                      it; Cuna answers an update outside your account exactly as",
+      "                      it answers one that does not exist.",
+      "",
+      "This operation can take minutes. --timeout-ms lowers its budget below what",
+      "the server needs and turns a slow answer into an unknown outcome -- which is",
+      "now recoverable with --resume rather than terminal.",
+    ].join("\n"),
   ),
   "machines delete": topic(
     "Usage:\n  cuna machines delete MACHINE_ID --yes",
@@ -170,7 +298,8 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  create              Create a workspace-bound child when server-advertised",
       "  rename ID --name N  Rename one child process",
       "  terminate ID        Terminate when server-advertised",
-      "  attach ID           Attach one exact cloud session in this terminal",
+      "  attach ID           Attach one exact cloud session in this terminal, once",
+      "                      the server grants terminal_connections.create for it",
     ].join("\n"),
   ),
   "agent-sessions list": topic(
@@ -201,7 +330,7 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  --workspace-generation N  Base-10 integer, 1 or greater. This is a fencing",
       "                            token compared exactly, so an exponent or hex form",
       "                            is rejected rather than quietly coerced.",
-      "  --agent KIND              claude-code, codex, openclaw, or opencode",
+      "  --agent KIND              claude-code, codex, or opencode",
       "  --yes                     Confirm this mutating operation",
       "",
       "Options:",
@@ -210,11 +339,6 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
       "  --auth-mode MODE          interactive_login or credential_binding",
       "  --credential-binding ID   Required exactly when --auth-mode is",
       "                            credential_binding, and rejected otherwise",
-      "  OpenCode                  Always sends interactive_login; credential bindings",
-      "                            are rejected",
-      "                            Execution is locally OFF unless",
-      "                            CUNA_OPENCODE_ENABLED=true exactly and this",
-      "                            installed CLI contains a committed Infra witness.",
       "  --idempotency-key K       Generated per invocation when omitted",
     ].join("\n"),
   ),
@@ -228,19 +352,23 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   ),
   "agent-sessions attach": topic(
     "Usage:\n  cuna agent-sessions attach SESSION_ID",
-    "Attach one exact cloud session in this terminal. Requires an interactive\nterminal; JSON and redirected output fail closed. No command options.",
+    "Attach one exact cloud session in this terminal.\n\nThis command is routed in this build, which is not a promise that it will run.\nIt re-reads an AgentSession-scoped capability snapshot first and refuses,\nchanging nothing, when the server does not grant terminal_connections.create\nfor that session. Check it first with\n`cuna capabilities --scope agent_session --resource-id SESSION_ID`.\n\nRequires an interactive terminal; JSON and redirected output fail closed.\nNo command options.",
   ),
   agent: topic(
     "Usage:\n  cuna agent logout --agent-session SESSION_ID --yes",
-    "Sign Claude Code or Codex out of one exact AgentSession. This command does not\nlog out OpenCode; use OpenCode's own interactive provider flow.\n\nRequired:\n  --agent-session ID  Canonical lowercase Cuna UUID\n  --yes               Confirm this mutating operation",
+    "Sign Claude Code or Codex out of one exact AgentSession.\n\nRequired:\n  --agent-session ID  Canonical lowercase Cuna UUID\n  --yes               Confirm this mutating operation",
   ),
   connect: topic(
     "Usage:\n  cuna connect SESSION_ID [SESSION_ID...]",
-    "Attach one through four exact cloud sessions in this terminal. Session IDs must\nbe distinct canonical lowercase Cuna UUIDs. Requires an interactive terminal;\nJSON and redirected output fail closed. No command options.",
+    "Attach one through four exact cloud sessions in this terminal. Session IDs must\nbe distinct canonical lowercase Cuna UUIDs.\n\nRouted in this build, and still gated per session: each attach re-reads an\nAgentSession-scoped capability snapshot and refuses, changing nothing, when the\nserver does not grant terminal_connections.create for that session.\n\nRequires an interactive terminal; JSON and redirected output fail closed.\nNo command options.",
   ),
   config: topic(
     "Usage:\n  cuna config get",
     "Show effective, redacted configuration. Configuration writes are not implemented\nin this build. No command options.",
+  ),
+  "config set": topic(
+    "Usage:\n  cuna config set",
+    "Compatibility-reserved command. Configuration mutation is not implemented in this build.",
   ),
   doctor: topic(
     "Usage:\n  cuna doctor [--check-browser-login] [--json]",
@@ -248,27 +376,37 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   ),
   "self-test": topic(
     "Usage:\n  cuna self-test --offline",
-    "Verify the installed CLI without network access.\n\nRequired:\n  --offline           The only supported mode in this release",
+    "Verify the installed CLI without network access.\n\nRequired:\n  --offline           The only mode this build implements",
   ),
   version: topic(
     "Usage:\n  cuna version",
     "Show the CLI version, build digest, platform, and protocol range. No operands\nand no command options.",
   ),
+  shell: topic(
+    "Usage:\n  cuna shell",
+    "Compatibility-reserved command. This build has no standalone shell runtime; use a provider terminal through `cuna`, `cuna claude`, `cuna codex`, or `cuna opencode`.",
+  ),
+  sync: topic(
+    "Usage:\n  cuna sync",
+    "Compatibility-reserved command. Workspace synchronization is composed into the provider journeys and is not exposed as a standalone command.",
+  ),
+  companion: topic(
+    "Usage:\n  cuna companion",
+    "Compatibility-reserved command. This build has no local companion process.",
+  ),
 });
 
-function agentHelp(command: "claude" | "codex" | "openclaw" | "opencode"): string {
-  const sync = command === "openclaw" ? "" : "\n  --no-sync                 Bind without synchronizing workspace contents";
-  const syncExclusion = command === "openclaw" ? "" : " --no-sync,";
+function agentHelp(command: "claude" | "codex" | "opencode"): string {
+  const sync = "\n  --no-sync                 Bind without synchronizing workspace contents";
   const authOptions = command === "opencode"
     ? [
-        "  --auth-mode MODE          OpenCode accepts interactive_login only",
-        "  OpenAI subscription: in OpenCode choose /connect, OpenAI, then",
-        "  ChatGPT Pro/Plus (headless) for a remote Cuna machine.",
-        "  OpenCode owns its OAuth tokens; Cuna never copies Codex credentials.",
-        "  Execution, including exact --agent-session attach, is locally OFF by",
-        "  default. Set CUNA_OPENCODE_ENABLED=true only after this installed CLI",
-        "  contains a committed Infra OpenCode-contract witness; this local",
-        "  consumer gate does not enable Edge or inject credentials.",
+        "  --auth-mode MODE          interactive_login only (the default)",
+        "  Provider sign-in          In the remote OpenCode terminal, use /connect",
+        "                            to choose and sign in to a provider, then use",
+        "                            /models to select a model. Cuna does not broker",
+        "                            an OpenCode device-sign-in page. Credentials stay",
+        "                            in that remote AgentSession.",
+        "  Credential bindings       Not accepted for OpenCode.",
       ]
     : [
         "  --auth-mode MODE          interactive_login or credential_binding",
@@ -294,12 +432,10 @@ function agentHelp(command: "claude" | "codex" | "openclaw" | "opencode"): strin
       ...authOptions,
       "  --agent-session ID        Attach one exact child and skip reconciliation.",
       "                            Cannot be combined with PATH, --machine, --new,",
-      `                            --new-session,${syncExclusion} --auth-mode or --credential-binding.`,
-      ...(command === "opencode"
-        ? ["                            Exact --agent-session attachment remains available while the local creation gate is OFF."]
-        : []),
+      "                            --new-session, --no-sync, --auth-mode or --credential-binding.",
       "",
       "Requires an interactive terminal; JSON and redirected output fail closed.",
+      "Ctrl+C detaches locally in one press. Use Ctrl+] c to send Ctrl+C to the agent.",
     ].join("\n"),
   );
 }
@@ -309,14 +445,18 @@ export const HELP_TOPICS: readonly string[] = Object.freeze([
   ...Object.keys(COMMAND_HELP),
   "claude",
   "codex",
-  "openclaw",
   "opencode",
 ]);
+
+/** Semantic leaves represented by complete help, derived from parser discovery. */
+export const HELP_ROUTE_KEYS: readonly string[] = Object.freeze(
+  CLI_ROUTE_REGISTRY.map((route) => route.key),
+);
 
 /** Help for `command` plus its action operands, falling back to the root help. */
 export function commandHelp(command: string | undefined, operands: readonly string[]): string {
   if (command === undefined) return ROOT_HELP;
-  if (command === "claude" || command === "codex" || command === "openclaw" || command === "opencode") return agentHelp(command);
+  if (command === "claude" || command === "codex" || command === "opencode") return agentHelp(command);
   const action = operands[0];
   if (action !== undefined) {
     const specific = COMMAND_HELP[`${command} ${action}`];

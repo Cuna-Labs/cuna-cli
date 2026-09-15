@@ -18,16 +18,19 @@ export {
   decodeApiKeyCreation,
   decodeAuditRecords,
   decodeCapabilitySnapshot,
-  decodeCredentialRules,
+  decodeMachineAuthorizations,
   decodeOk,
   decodeMachineItem,
   decodeMachinePage,
   decodeCunaIdentity,
   decodeTerminalConnectionGrant,
+  decodeAgentSessionTerminalSeat,
   type AgentKind,
   type AgentAuthMode,
   type AgentSession,
   type AgentSessionAuth,
+  type AgentSessionTerminalSeat,
+  type TerminalSeatState,
   type AgentSessionAuthEvidenceClass,
   type AgentSessionAuthState,
   type AgentSessionDesiredState,
@@ -42,8 +45,11 @@ export {
   type CapabilityInteraction,
   type CapabilityScope,
   type CapabilitySnapshot,
-  type CredentialRule,
-  type CredentialRuleTarget,
+  type MachineAuthorizations,
+  type RuntimeSecretConfiguration,
+  type SecretEnvironmentInjection,
+  type SecretEgressInjection,
+  type SecretFileInjection,
   type JsonValue,
   type Machine,
   type MachinePage,
@@ -55,6 +61,50 @@ export {
   type TerminalConnectionCapability,
   type TerminalConnectionGrant,
 } from "./api/contracts.js";
+export {
+  SUPERVISOR_LIVE_UPDATE_WIRE,
+  decodeSupervisorLiveUpdate,
+  decodeSupervisorLiveUpdateOperation,
+  type SupervisorLiveUpdate,
+  type SupervisorLiveUpdateDeclaredSession,
+  type SupervisorLiveUpdateFailure,
+  type SupervisorLiveUpdateInstallationEvidence,
+  type SupervisorLiveUpdateInstallerOutcome,
+  type SupervisorLiveUpdateNextAction,
+  type SupervisorLiveUpdateOperation,
+  type SupervisorLiveUpdateOutcome,
+  type SupervisorLiveUpdatePhase,
+  type SupervisorLiveUpdateSession,
+} from "./api/supervisor-live-update.js";
+export {
+  agentSessionProcessObservation,
+  readAgentSessionRuntime,
+  type AgentSessionRuntimeEvidence,
+  type AgentSessionRuntimeReading,
+} from "./machines/session-visibility.js";
+export {
+  classifyLiveSupervisorUpdateFailure,
+  liveSupervisorInstallationEvidenceLabel,
+  liveSupervisorInstallerOutcomeLabel,
+  liveSupervisorInstallerReachLines,
+  liveSupervisorSessionOutcomeLabel,
+  liveSupervisorUpdateMayResume,
+  liveSupervisorUpdateNotes,
+  liveSupervisorUpdatePhaseLabel,
+  liveSupervisorUpdateRecordSurvives,
+  readLiveSupervisorUpdateOperation,
+  summarizeLiveSupervisorUpdate,
+  type LiveSupervisorUpdateDisposition,
+  type LiveSupervisorUpdateIdentityOrigin,
+  type LiveSupervisorUpdateNote,
+  type LiveSupervisorUpdateNotes,
+  type LiveSupervisorInstallerReach,
+  type LiveSupervisorUpdateOperationReading,
+  type LiveSupervisorUpdateReading,
+  type LiveSupervisorUpdateScope,
+  type LiveSupervisorUpdateSettlement,
+  type LiveSupervisorUpdateSummary,
+} from "./machines/live-supervisor-update.js";
 export { createHttpTransport, type HttpRequest, type HttpTransport } from "./api/http.js";
 export { createPkceAuthorization, type PkceAuthorization } from "./auth/pkce.js";
 export {
@@ -99,6 +149,7 @@ export { parseArgv, type ParsedInvocation } from "./cli/parser.js";
 export {
   DEFAULT_BASE_URL,
   assertApiKeyUsable,
+  ensureProfileRecorded,
   environmentCredentialState,
   publicConfig,
   resolveConfig,
@@ -124,6 +175,8 @@ export {
 export {
   DEFAULT_REQUEST_BUDGET_MS,
   MACHINE_CREATE_REQUEST_BUDGET_MS,
+  MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
+  SUPERVISOR_LIVE_UPDATE_REQUEST_BUDGET_MS,
   OBSERVATION_BUDGET_CODES,
   REMOTE_CONVERGENCE_BUDGET_MS,
   REMOTE_CONVERGENCE_POLL_INTERVAL_MS,
@@ -209,6 +262,46 @@ export {
   type PassthroughTerminalCoordinatorOptions,
 } from "./terminal/passthrough.js";
 export {
+  runNodeMachinesExplorer,
+  type MachinesExplorerDependencies,
+  type MachinesExplorerInput,
+  type MachinesExplorerRunner,
+} from "./machines/explorer.js";
+export {
+  INITIAL_MACHINE_FIRST_STATE,
+  canAutoContinueMachineFirst,
+  reduceMachineFirstNavigation,
+  resolveMachineContextActions,
+  resolveProviderContextActions,
+  shouldShowRemoteWaitProgress,
+  type MachineContextAction,
+  type MachineFirstNavigationEvent,
+  type MachineFirstNavigationState,
+  type MachineFirstScreen,
+  type ProviderContextAction,
+} from "./machines/machine-first.js";
+export {
+  machineProviderAvailability,
+  machineSupportsProvider,
+  providerAuthLabel,
+  providerDisplayName,
+  providerVerdict,
+  type ActionableProvider,
+  type MachineProviderAvailability,
+  type ProviderUsability,
+} from "./machines/provider-availability.js";
+export {
+  classifySessionActionability,
+  displaySessionActionability,
+  mergeSessionActionabilityObservation,
+  type SessionActionability,
+  type SessionActionReasonCode,
+  type SessionActionabilityInput,
+  type SessionBaseState,
+  type SessionRecoveryAction,
+  type SessionRefreshStatus,
+} from "./machines/session-actionability.js";
+export {
   buildAppbarModel,
   projectTruth,
   type AppbarModel,
@@ -220,7 +313,10 @@ export {
   ViewportIsolationError,
   ViewportRegistry,
   type ViewportBinding,
+  type ViewportCellColor,
+  type ViewportCellStyle,
   type ViewportModes,
+  type ViewportRenderRun,
   type ViewportSnapshot,
 } from "./terminal/viewport.js";
 export {
@@ -240,6 +336,7 @@ export {
   type XtermViewportOptions,
 } from "./terminal/xterm-vte.js";
 export { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "./version.js";
+export * from "./local-actions/index.js";
 export {
   planAgentSessionSelection,
   planJourneySelection,

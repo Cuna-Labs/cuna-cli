@@ -6,6 +6,7 @@ import {
   DEFAULT_REQUEST_BUDGET_MS,
   EXIT_CODES,
   MACHINE_CREATE_REQUEST_BUDGET_MS,
+  MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
   OBSERVATION_BUDGET_CODES,
   createCunaApiClient,
   createHttpTransport,
@@ -282,6 +283,42 @@ test("D1: the create budget reaches the transport from a constant, not a call-si
   );
 });
 
+test("D1: a machine start declares the lifecycle budget, not the list default", async () => {
+  // Measured 2026-09-02 against edge v148: `cuna machines start` answered at
+  // 24 s, while the same transition inside `cuna opencode` aborted at the 15 s
+  // list default and told the caller the step the journey had just decided to
+  // take "may have completed".
+  const seen = [];
+  const client = createCunaApiClient({
+    async request(request) {
+      seen.push(request);
+      return {
+        id: MACHINE_ID,
+        name: "dev",
+        state: "running",
+        created_at: "2026-08-08T00:00:00.000Z",
+        updated_at: "2026-08-08T00:00:00.000Z",
+      };
+    },
+  });
+  for (const action of ["start", "resume", "stop", "pause"]) {
+    seen.length = 0;
+    await client.transitionMachine(MACHINE_ID, action);
+    assert.equal(seen[0].budgetMs, MACHINE_LIFECYCLE_REQUEST_BUDGET_MS, action);
+    assert.notEqual(seen[0].budgetMs, DEFAULT_REQUEST_BUDGET_MS, action);
+  }
+  seen.length = 0;
+  await client.replaceMachineSupervisor(MACHINE_ID);
+  assert.equal(seen[0].budgetMs, MACHINE_LIFECYCLE_REQUEST_BUDGET_MS);
+
+  assert.ok(MACHINE_LIFECYCLE_REQUEST_BUDGET_MS >= 24_000 * 1.5, "the margin over the measured start is under 50%");
+  assert.ok(MACHINE_LIFECYCLE_REQUEST_BUDGET_MS <= 120_000, "a default a user cannot widen past is a limit, not a default");
+  assert.ok(
+    MACHINE_LIFECYCLE_REQUEST_BUDGET_MS < MACHINE_CREATE_REQUEST_BUDGET_MS,
+    "starting an existing VM does not provision one, so it must not borrow the create budget",
+  );
+});
+
 test("without --timeout-ms a create is bounded by its own budget, not by the global default", async (t) => {
   // The mutation this exists to catch is restoring the eager `15_000` default in
   // `cli/run.ts`. That revert is invisible to every test that builds a transport
@@ -443,7 +480,7 @@ test("D2: a delete that never converges reports the CLI's budget, retryable, nam
   assert.equal(record_.details.settle_with, "cuna machines list");
   assert.equal(record_.details.observed_state, "running");
   assert.equal(record_.details.remote_outcome, "unobserved");
-  assert.equal(clock.elapsed(), 30_000);
+  assert.equal(clock.elapsed(), 120_000);
   assert.ok(record.reads > 1);
 });
 

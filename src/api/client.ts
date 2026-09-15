@@ -1,5 +1,10 @@
-import { EXIT_CODES, CunaError } from "../core/errors.js";
-import { MACHINE_CREATE_REQUEST_BUDGET_MS } from "../core/observation-budget.js";
+import { providerSessionBody, decodeProviderPresets, decodeProviderObservation, decodeProviderSession, type ProviderPreset, type ProviderObservation, type ProviderSessionInput } from "./provider-v2.js";
+import { EXIT_CODES, CunaError, usageError } from "../core/errors.js";
+import {
+  MACHINE_CREATE_REQUEST_BUDGET_MS,
+  MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
+  SUPERVISOR_LIVE_UPDATE_REQUEST_BUDGET_MS,
+} from "../core/observation-budget.js";
 import { OFF_CONTRACT_RESPONSE_HINT } from "../core/product-web.js";
 import {
   ContractViolation,
@@ -16,29 +21,34 @@ import {
   decodeAgentSessionAuthLogout,
   decodeAgentSessionItem,
   decodeAgentSessionPage,
+  decodeAgentSessionTerminalSeat,
   decodeApiKeyList,
   decodeApiKeyCreation,
   decodeCapabilitySnapshot,
-  decodeCredentialRules,
+  decodeMachineAuthorizations,
   decodeMachineItem,
   decodeMachineCreateRequest,
   decodeMachinePage,
   decodeOk,
   decodeCunaIdentity,
   decodeTerminalConnectionGrant,
+  decodeTerminalConnectionCancellation,
+  decodeTerminalWriterState,
   decodeWorkspaceBindingAuthority,
+  type TerminalWriterState,
   type AgentKind,
   type AgentAuthMode,
   type AgentSession,
   type AgentSessionAuth,
   type AgentSessionAuthLogout,
   type AgentSessionPage,
+  type AgentSessionTerminalSeat,
   type AuditRecord,
   type ApiKeyMetadata,
   type ApiKeyCreation,
   type CapabilityScope,
   type CapabilitySnapshot,
-  type CredentialRule,
+  type MachineAuthorizations,
   type Machine,
   type MachineCreateRequest,
   type MachinePage,
@@ -47,7 +57,18 @@ import {
   type TerminalConnectionGrant,
   type WorkspaceBindingAuthority,
 } from "./contracts.js";
+import {
+  decodeSupervisorLiveUpdate,
+  decodeSupervisorLiveUpdateOperation,
+  type SupervisorLiveUpdate,
+  type SupervisorLiveUpdateOperation,
+} from "./supervisor-live-update.js";
 import type { HttpRequest, HttpTransport } from "./http.js";
+import { decodeExecutionWorkspacePage, type ExecutionWorkspacePage } from "./execution-workspaces.js";
+import { decodeManagedExecution, decodeManagedExecutionPage, type ManagedExecution, type ManagedExecutionPage } from "./managed-executions.js";
+import { decodeManagedCommandResult, type ManagedCommandInput, type ManagedCommandResult } from "./managed-executions.js";
+import { decodeMachineDefaultWorkspace, decodeAgentSessionWorkspaceContext, decodeAgentSessionWorkspaceEnvelope,
+  type MachineDefaultWorkspace, type AgentSessionWorkspaceContext, type AgentSessionWorkspaceEnvelope } from "./remote-workspace.js";
 import { classifyCapabilitySnapshot, isPermanentSnapshotFault } from "./capability-evidence.js";
 
 export interface MachineCreateInput {
@@ -69,11 +90,16 @@ export interface AgentSessionCreateInput {
 }
 
 export interface WorkspaceBindingIdentityInput {
+  readonly executionWorkspaceId?: string;
   readonly workspaceId: string;
   readonly projectId: string;
   readonly localInstanceId: string;
   readonly machineId: string;
   readonly exclusionPolicyDigest: string;
+}
+
+export interface AgentSessionWorkspaceCreateInput extends Omit<AgentSessionCreateInput, "workspaceBindingId"> {
+  readonly executionWorkspaceId: string;
 }
 
 export interface WorkspaceBindingCreateInput extends WorkspaceBindingIdentityInput {
@@ -89,6 +115,15 @@ export interface TerminalConnectionCreateInput {
   readonly protocol: typeof TERMINAL_PROTOCOL;
   readonly clientInstanceId: string;
   readonly resumeHandle?: string;
+  /** Omitted means "writer": the seat that may type. "observer" only reads. */
+  readonly accessMode?: "writer" | "observer";
+  readonly expectedWriterEpoch?: number;
+}
+
+export interface TerminalWriterTransferInput {
+  readonly operationId?: string;
+  readonly clientInstanceId: string;
+  readonly expectedWriterEpoch?: number;
 }
 
 export interface CunaApiClient {
@@ -97,7 +132,7 @@ export interface CunaApiClient {
   listMachines(signal?: AbortSignal): Promise<MachinePage>;
   getMachine(id: string, signal?: AbortSignal): Promise<Machine>;
   listRecords(): Promise<readonly AuditRecord[]>;
-  listAuthorizations(machineId: string): Promise<readonly CredentialRule[]>;
+  listAuthorizations(machineId: string): Promise<MachineAuthorizations>;
   listApiKeys(): Promise<readonly ApiKeyMetadata[]>;
   createApiKey(
     input: { readonly name: string; readonly expiresAt?: string },
@@ -114,7 +149,51 @@ export interface CunaApiClient {
   getMachineCreateRequest(id: string, signal?: AbortSignal): Promise<MachineCreateRequest>;
   reconcileMachineCreateRequest(id: string, signal?: AbortSignal): Promise<MachineCreateRequest>;
   transitionMachine(id: string, action: "start" | "pause" | "resume" | "stop", signal?: AbortSignal): Promise<Machine>;
+  /**
+   * Explicitly replace a stopped Machine's terminal supervisor. The server
+   * owns all child-session and durable-fence checks; callers must never infer
+   * that replacing it is safe from a cached Machine row.
+   */
+  replaceMachineSupervisor(id: string, signal?: AbortSignal): Promise<Machine>;
+  /**
+   * `sessions.updateSupervisorInPlace`: replace a RUNNING Machine's supervisor
+   * without stopping it. A second operation, not a relaxation of the one above:
+   * the stopped-boundary guards on `replaceMachineSupervisor` are untouched.
+   *
+   * The server owns every preflight — it measures the Machine's boot, unit,
+   * artifacts and each live session's process, PTY and stored master before the
+   * installer runs and re-measures them under the install lock. A 200 carries
+   * one custody outcome per AgentSession that existed beforehand; it is not a
+   * promise that all of them survived, and callers must read the outcomes.
+   *
+   * `operationId` is chosen and durably recorded by the CALLER before this is
+   * called. Sending the SAME value again is the supported recovery for a lost
+   * answer and never rotates control twice; sending a different value for an
+   * unsettled Machine is refused by the producer.
+   */
+  updateMachineSupervisorInPlace(
+    id: string,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<SupervisorLiveUpdate>;
+  /**
+   * `sessions.readSupervisorInPlaceUpdate`: what one owned in-place update did.
+   *
+   * A read. It dispatches no installer, sends nothing to the Machine and
+   * changes no state, which is precisely why it — and not a second mutation —
+   * is what a caller reaches for after an interruption.
+   */
+  readMachineSupervisorInPlaceUpdate(
+    id: string,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<SupervisorLiveUpdateOperation>;
   deleteMachine(id: string): Promise<unknown>;
+  executeManagedCommand(machineId: string, operationId: string, input: ManagedCommandInput, signal?: AbortSignal): Promise<ManagedCommandResult>;
+  listManagedExecutions(machineId: string, input?: { readonly executionWorkspaceId?: string; readonly after?: string }, signal?: AbortSignal): Promise<ManagedExecutionPage>;
+  getManagedExecution(machineId: string, operationId: string, signal?: AbortSignal): Promise<ManagedExecution>;
+  cancelManagedExecution(machineId: string, operationId: string, signal?: AbortSignal): Promise<ManagedExecution>;
+  listExecutionWorkspaces(input: { readonly workspaceId: string; readonly projectId: string; readonly machineId: string; readonly after?: string }, signal?: AbortSignal): Promise<ExecutionWorkspacePage>;
   createWorkspaceBinding(
     input: WorkspaceBindingCreateInput,
     idempotencyKey: string,
@@ -126,6 +205,12 @@ export interface CunaApiClient {
     signal?: AbortSignal,
   ): Promise<WorkspaceBindingAuthority>;
   listAgentSessions(machineId: string, options?: PageOptions, signal?: AbortSignal): Promise<AgentSessionPage>;
+  getProviderPresetsV2(signal?: AbortSignal): Promise<readonly ProviderPreset[]>;
+  createProviderSessionV2(machineId: string, input: ProviderSessionInput, signal?: AbortSignal): Promise<AgentSessionWorkspaceEnvelope>;
+  checkProviderV2(sessionId: string, epoch: string, signal?: AbortSignal): Promise<ProviderObservation>;
+  getMachineDefaultWorkspace(machineId: string, signal?: AbortSignal): Promise<MachineDefaultWorkspace>;
+  getAgentSessionWorkspaceContext(id: string, signal?: AbortSignal): Promise<AgentSessionWorkspaceContext>;
+  createAgentSessionInWorkspace(machineId: string, input: AgentSessionWorkspaceCreateInput, idempotencyKey: string, signal?: AbortSignal): Promise<AgentSessionWorkspaceEnvelope>;
   createAgentSession(
     machineId: string,
     input: AgentSessionCreateInput,
@@ -138,6 +223,13 @@ export interface CunaApiClient {
   ): Promise<AgentSession>;
   getAgentSession(id: string, signal?: AbortSignal): Promise<AgentSession>;
   getAgentSessionAuth(id: string, signal?: AbortSignal): Promise<AgentSessionAuth>;
+  /**
+   * `agentSessions.getTerminalSeat`: the durable writer seat of the terminal
+   * for the session's current process epoch. Read-only; it counts no live
+   * attachments, so a deploy that emptied the edge registry cannot make a held
+   * seat look free.
+   */
+  getAgentSessionTerminalSeat(id: string, signal?: AbortSignal): Promise<AgentSessionTerminalSeat>;
   logoutAgentSessionAuth(
     id: string,
     expectedProcessEpoch: string,
@@ -151,6 +243,12 @@ export interface CunaApiClient {
     idempotencyKey: string,
     signal?: AbortSignal,
   ): Promise<TerminalConnectionGrant>;
+  transferTerminalWriter(
+    agentSessionId: string,
+    input: TerminalWriterTransferInput,
+    signal?: AbortSignal,
+  ): Promise<TerminalWriterState>;
+  cancelTerminalConnection(agentSessionId: string, input: TerminalConnectionCreateInput, idempotencyKey: string, signal?: AbortSignal): Promise<{ readonly cancelled: true }>;
 }
 
 /**
@@ -238,14 +336,14 @@ function containsAsciiControl(value: string): boolean {
   return false;
 }
 
-function validatePageOptions(options: PageOptions): Readonly<Record<string, string>> {
+function validatePageOptions(options: PageOptions, resource = "AgentSession"): Readonly<Record<string, string>> {
   if (
     options.limit !== undefined &&
     (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100)
   ) {
     throw new CunaError({
       code: "cuna.usage.invalid",
-      message: "AgentSession page limit must be an integer from 1 through 100.",
+      message: `${resource} page limit must be an integer from 1 through 100.`,
       exitCode: EXIT_CODES.usage,
     });
   }
@@ -255,7 +353,7 @@ function validatePageOptions(options: PageOptions): Readonly<Record<string, stri
   ) {
     throw new CunaError({
       code: "cuna.usage.invalid",
-      message: "AgentSession cursor is malformed.",
+      message: `${resource} cursor is malformed.`,
       exitCode: EXIT_CODES.usage,
     });
   }
@@ -265,8 +363,7 @@ function validatePageOptions(options: PageOptions): Readonly<Record<string, stri
   });
 }
 
-function validateAgentSessionCreate(input: AgentSessionCreateInput): void {
-  assertCanonicalUuid(input.workspaceBindingId, "workspace binding ID");
+function validateAgentSessionCreate(input: Omit<AgentSessionCreateInput, "workspaceBindingId">): void {
   if (!Number.isSafeInteger(input.workspaceGeneration) || input.workspaceGeneration < 1) {
     throw new CunaError({
       code: "cuna.usage.invalid",
@@ -352,6 +449,7 @@ function validateMachineCreate(input: MachineCreateInput, idempotencyKey: string
 }
 
 function validateWorkspaceBindingIdentity(input: WorkspaceBindingIdentityInput): void {
+  if (input.executionWorkspaceId !== undefined) assertCanonicalUuid(input.executionWorkspaceId, "execution workspace ID");
   assertCanonicalUuid(input.workspaceId, "workspace ID");
   assertCanonicalUuid(input.projectId, "project ID");
   assertCanonicalUuid(input.localInstanceId, "local instance ID");
@@ -370,6 +468,7 @@ function workspaceBindingIdentityMatches(
   expected: WorkspaceBindingIdentityInput,
 ): boolean {
   return actual.workspaceId === expected.workspaceId &&
+    (expected.executionWorkspaceId === undefined || actual.executionWorkspaceId === expected.executionWorkspaceId) &&
     actual.projectId === expected.projectId &&
     actual.localInstanceId === expected.localInstanceId &&
     actual.machineId === expected.machineId &&
@@ -409,7 +508,11 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
     },
     async listMachines(signal) {
       return fetchDecoded(
-        { method: "GET", path: "/v1/sessions", ...(signal === undefined ? {} : { signal }) },
+        {
+          method: "GET",
+          path: "/v1/sessions",
+          ...(signal === undefined ? {} : { signal }),
+        },
         decodeMachinePage,
       );
     },
@@ -433,7 +536,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const safeId = encodeMachineId(machineId);
       return fetchDecoded(
         { method: "GET", path: `/v1/sessions/${safeId}/authorizations` },
-        decodeCredentialRules,
+        decodeMachineAuthorizations,
       );
     },
     async listApiKeys() {
@@ -519,6 +622,10 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         method: "POST",
         path: `/v1/sessions/${safeId}/${action}`,
         settleWith: "cuna machines list",
+        // A start boots a VM and waits for its supervisor; the list budget
+        // aborted the journey's own step at 15 s and told the caller the
+        // operation "may have completed".
+        budgetMs: MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
         ...(signal === undefined ? {} : { signal }),
       };
       const machine = await fetchDecoded(request, decodeMachineItem);
@@ -527,6 +634,81 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       }
       return machine;
     },
+    async replaceMachineSupervisor(id, signal) {
+      const safeId = encodeMachineId(id);
+      const request: HttpRequest = {
+        method: "POST",
+        path: `/v1/sessions/${safeId}/supervisor/replace`,
+        settleWith: "cuna machines list",
+        budgetMs: MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const machine = await fetchDecoded(request, decodeMachineItem);
+      if (machine.id !== id) {
+        throw malformed(contractViolation("matches_requested_resource", "id"), operationLabel(request));
+      }
+      return machine;
+    },
+    async updateMachineSupervisorInPlace(id, operationId, signal) {
+      const safeId = encodeMachineId(id);
+      assertCanonicalUuid(operationId, "supervisor update operation ID");
+      const request: HttpRequest = {
+        method: "POST",
+        path: `/v1/sessions/${safeId}/supervisor/live-update`,
+        // Chosen by the caller before this line, recorded durably before this
+        // line, and the reason a lost answer is recoverable at all. The producer
+        // journals it before it issues any enrollment, so the same value never
+        // rotates control twice.
+        body: { operation_id: operationId },
+        // The read that settles this operation's outcome without spending
+        // anything, and the only one that answers what this update did.
+        settleWith: `cuna machines live-update-status ${id} --operation ${operationId}`,
+        budgetMs: SUPERVISOR_LIVE_UPDATE_REQUEST_BUDGET_MS,
+        // Still off, and now for a sharper reason than before. The identity
+        // above makes a repeat SAFE on the producer's side, but it must remain
+        // a DECISION: `machines live-update-supervisor --resume` is that
+        // decision, taken by a person who has read the operation. A transport
+        // re-dispatch happens below the command, below the local record and
+        // below the person, so it would be the one repetition nobody chose.
+        automaticRedispatch: false,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const result = await fetchDecoded(request, decodeSupervisorLiveUpdate);
+      // The path id is the Machine, so the Machine in the body must be the one
+      // that was asked about. Without this, a producer answering about a sibling
+      // would have its control generation and artifact digest reported as this
+      // Machine's. The operation identity is checked for the same reason: an
+      // answer about another operation is not an answer about this one, and the
+      // caller is about to settle a durable record against it.
+      if (result.machine.id !== id) {
+        throw malformed(contractViolation("matches_requested_resource", "machine.id"), operationLabel(request));
+      }
+      if (result.operationId !== operationId) {
+        throw malformed(contractViolation("matches_requested_operation", "operation_id"), operationLabel(request));
+      }
+      return result;
+    },
+    async readMachineSupervisorInPlaceUpdate(id, operationId, signal) {
+      const safeId = encodeMachineId(id);
+      const safeOperationId = encodeCanonicalUuid(operationId, "supervisor update operation ID");
+      const request: HttpRequest = {
+        method: "GET",
+        path: `/v1/sessions/${safeId}/supervisor/live-update/${safeOperationId}`,
+        // A database read scoped to the owner and this Machine. It dispatches no
+        // installer and writes nothing, so the ordinary read budget applies and
+        // an automatic re-dispatch of it costs nothing.
+        settleWith: `cuna machines live-update-status ${id} --operation ${operationId}`,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const operation = await fetchDecoded(request, decodeSupervisorLiveUpdateOperation);
+      if (operation.machineId !== id || operation.operationId !== operationId) {
+        throw malformed(
+          contractViolation("matches_requested_operation", "operation_id"),
+          operationLabel(request),
+        );
+      }
+      return operation;
+    },
     async deleteMachine(id) {
       const safeId = encodeMachineId(id);
       return transport.request({
@@ -534,6 +716,74 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         path: `/v1/sessions/${safeId}`,
         settleWith: "cuna machines list",
       });
+    },
+    async executeManagedCommand(machineId, operationId, input, signal) {
+      const safeId = encodeMachineId(machineId);
+      assertCanonicalUuid(operationId, "execution ID");
+      if (typeof input.command !== "string" || input.command.length === 0 || input.command.includes("\0") ||
+          (input.args !== undefined && (!Array.isArray(input.args) || input.args.some(arg => typeof arg !== "string" || arg.includes("\0")))) ||
+          typeof input.cwd !== "string" ||
+          !/^\/workspace\/workspaces\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\/|$)/u.test(input.cwd) ||
+          input.cwd.includes("\\") || input.cwd.split("/").some(part => part === "." || part === "..") || /[\p{Cc}\p{Cf}]/u.test(input.cwd) ||
+          (input.timeoutSecs !== undefined && (!Number.isSafeInteger(input.timeoutSecs) || input.timeoutSecs < 1 || input.timeoutSecs > 600))) {
+        throw usageError("Invalid managed command request.", "Choose an exact remote Workspace path and a timeout from 1 to 600 seconds.");
+      }
+      const body = { operation_id: operationId, command: input.command,
+        ...(input.args === undefined ? {} : { args: [...input.args] }), cwd: input.cwd,
+        ...(input.timeoutSecs === undefined ? {} : { timeout_secs: input.timeoutSecs }) };
+      if (Buffer.byteLength(JSON.stringify(body)) > 8 * 1024 * 1024) throw usageError("Managed command request exceeds 8 MiB.");
+      const request: HttpRequest = { method: "POST", path: `/v1/sessions/${safeId}/exec`, body,
+        budgetMs: (input.timeoutSecs ?? 120) * 1000 + 5000,
+        settleWith: `cuna executions get ${operationId} --machine ${machineId}`,
+        ...(signal === undefined ? {} : { signal }) };
+      return fetchDecoded(request, decodeManagedCommandResult);
+    },
+    async listManagedExecutions(machineId, input = {}, signal) {
+      const safeId = encodeMachineId(machineId);
+      const query = new URLSearchParams();
+      if (input.executionWorkspaceId !== undefined) query.set("execution_workspace_id", assertCanonicalUuid(input.executionWorkspaceId, "execution Workspace ID"));
+      if (input.after !== undefined) query.set("after", assertCanonicalUuid(input.after, "execution cursor"));
+      const request: HttpRequest = { method: "GET", path: `/v1/sessions/${safeId}/executions${query.size ? `?${query}` : ""}`,
+        ...(signal === undefined ? {} : { signal }) };
+      const page = await fetchDecoded(request, decodeManagedExecutionPage);
+      if (page.machineId !== machineId || page.items.some(item =>
+        (input.executionWorkspaceId !== undefined && item.executionWorkspaceId !== input.executionWorkspaceId) ||
+        (input.after !== undefined && item.operationId <= input.after))) {
+        throw malformed(contractViolation("managed_execution_scope"), operationLabel(request));
+      }
+      return page;
+    },
+    async getManagedExecution(machineId, operationId, signal) {
+      const path = `/v1/sessions/${encodeMachineId(machineId)}/executions/${encodeCanonicalUuid(operationId, "execution ID")}`;
+      const request: HttpRequest = { method: "GET", path, ...(signal === undefined ? {} : { signal }) };
+      const result = await fetchDecoded(request, decodeManagedExecution);
+      if (result.machineId !== machineId || result.operationId !== operationId) throw malformed(contractViolation("managed_execution_scope"), operationLabel(request));
+      return result;
+    },
+    async cancelManagedExecution(machineId, operationId, signal) {
+      const path = `/v1/sessions/${encodeMachineId(machineId)}/executions/${encodeCanonicalUuid(operationId, "execution ID")}/cancel`;
+      const request: HttpRequest = { method: "POST", path, body: {},
+        settleWith: `cuna executions get ${operationId} --machine ${machineId}`, ...(signal === undefined ? {} : { signal }) };
+      const result = await fetchDecoded(request, decodeManagedExecution);
+      if (result.machineId !== machineId || result.operationId !== operationId || !result.cancelRequested) {
+        throw malformed(contractViolation("managed_execution_cancellation"), operationLabel(request));
+      }
+      return result;
+    },
+    async listExecutionWorkspaces(input, signal) {
+      assertCanonicalUuid(input.workspaceId, "workspace ID");
+      assertCanonicalUuid(input.projectId, "project ID");
+      assertCanonicalUuid(input.machineId, "machine ID");
+      if (input.after !== undefined) assertCanonicalUuid(input.after, "execution workspace cursor");
+      const query = new URLSearchParams({ workspace_id: input.workspaceId, project_id: input.projectId, machine_id: input.machineId });
+      if (input.after !== undefined) query.set("after", input.after);
+      const request: HttpRequest = { method: "GET", path: `/v1/execution-workspaces?${query}`, ...(signal === undefined ? {} : { signal }) };
+      const page = await fetchDecoded(request, decodeExecutionWorkspacePage);
+      if (page.items.some(row => row.workspaceId !== input.workspaceId || row.projectId !== input.projectId || row.machineId !== input.machineId ||
+        (input.after !== undefined && row.executionWorkspaceId <= input.after))) {
+        throw malformed(contractViolation("execution_workspace_scope"), operationLabel(request));
+      }
+      return page;
     },
     async createWorkspaceBinding(input, idempotencyKey, signal) {
       validateWorkspaceBindingIdentity(input);
@@ -562,6 +812,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
           project_id: input.projectId,
           local_instance_id: input.localInstanceId,
           machine_id: input.machineId,
+          ...(input.executionWorkspaceId === undefined ? {} : { execution_workspace_id: input.executionWorkspaceId }),
           exclusion_policy_digest: input.exclusionPolicyDigest,
           excluded_prefixes: prefixes,
         },
@@ -617,6 +868,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
     },
     async createAgentSession(machineId, input, idempotencyKey, signal) {
       const safeId = encodeMachineId(machineId);
+      assertCanonicalUuid(input.workspaceBindingId, "workspace binding ID");
       validateAgentSessionCreate(input);
       const request: HttpRequest = {
         method: "POST",
@@ -645,6 +897,48 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         },
         operationLabel(request),
       );
+    },
+    async getProviderPresetsV2(signal) {
+      return fetchDecoded({method:"POST",path:"/v1/collaboration/2/provider-profiles/catalog",body:{version:"2"},...(signal===undefined?{}:{signal})},decodeProviderPresets);
+    },
+    async createProviderSessionV2(machineId,input,signal) {
+      assertCanonicalUuid(input.operation_id,"operation ID");assertCanonicalUuid(input.profile_id,"profile ID");
+      return fetchDecoded({method:"POST",path:`/v1/collaboration/2/sessions/${encodeMachineId(machineId)}/workspace-agent-sessions`,body:providerSessionBody(input),...(signal===undefined?{}:{signal})},value=>decodeProviderSession(value,machineId,input));
+    },
+    async checkProviderV2(sessionId,epoch,signal) {
+      return fetchDecoded({method:"POST",path:`/v1/collaboration/2/agent-sessions/${encodeCanonicalUuid(sessionId,"AgentSession ID")}/provider-observations`,body:{version:"2"},...(signal===undefined?{}:{signal})},value=>decodeProviderObservation(value,sessionId,epoch));
+    },
+    async getMachineDefaultWorkspace(machineId, signal) {
+      const request: HttpRequest = {method:"GET",path:`/v1/sessions/${encodeMachineId(machineId)}/default-workspace`,...(signal === undefined ? {} : {signal})};
+      const workspace=await fetchDecoded(request,decodeMachineDefaultWorkspace);
+      if(workspace.machineId !== machineId) throw malformed(contractViolation("matches_requested_resource","machine_id"),operationLabel(request));
+      return workspace;
+    },
+    async getAgentSessionWorkspaceContext(id, signal) {
+      const request: HttpRequest = {method:"GET",path:`/v1/agent-sessions/${encodeCanonicalUuid(id,"AgentSession ID")}/workspace-context`,...(signal === undefined ? {} : {signal})};
+      const context=await fetchDecoded(request,decodeAgentSessionWorkspaceContext);
+      if(context.agentSessionId !== id) throw malformed(contractViolation("matches_requested_resource","agent_session_id"),operationLabel(request));
+      return context;
+    },
+    async createAgentSessionInWorkspace(machineId, input, idempotencyKey, signal) {
+      const safeId=encodeMachineId(machineId);
+      assertCanonicalUuid(input.executionWorkspaceId,"execution Workspace ID");
+      assertIdempotencyKey(idempotencyKey);
+      validateAgentSessionCreate(input);
+      const root=`/workspace/workspaces/${input.executionWorkspaceId}`;
+      if ((input.cwd !== root && !input.cwd.startsWith(`${root}/`)) || input.cwd.includes("\\") || input.cwd.split("/").includes(".") ||
+          input.agent === "openclaw" || input.authMode !== "interactive_login" || input.credentialBindingId !== undefined) {
+        throw new CunaError({code:"cuna.usage.invalid",message:"Remote Workspace sessions require their exact remote path and interactive agent login.",exitCode:EXIT_CODES.usage});
+      }
+      const request: HttpRequest = {method:"POST",path:`/v1/sessions/${safeId}/workspace-agent-sessions`,idempotencyKey,
+        settleWith:`cuna agent-sessions list --machine ${machineId}`,body:{...(input.name === undefined ? {} : {name:input.name}),agent:input.agent,cwd:input.cwd,
+          execution_workspace_id:input.executionWorkspaceId,workspace_generation:input.workspaceGeneration,auth_mode:input.authMode},...(signal === undefined ? {} : {signal})};
+      const result=await fetchDecoded(request,decodeAgentSessionWorkspaceEnvelope);
+      if(result.agentSession.machineId !== machineId || result.executionWorkspaceId !== input.executionWorkspaceId || result.workspaceGeneration !== input.workspaceGeneration ||
+          result.agentSession.cwd !== input.cwd || result.agentSession.agent !== input.agent || result.agentSession.authMode !== input.authMode) {
+        throw malformed(contractViolation("matches_requested_resource","execution_workspace_id"),operationLabel(request));
+      }
+      return result;
     },
     async inspectAgentSessionCreate(idempotencyKey, signal) {
       assertIdempotencyKey(idempotencyKey);
@@ -687,6 +981,22 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       }
       return status;
     },
+    async getAgentSessionTerminalSeat(id, signal) {
+      const safeId = encodeCanonicalUuid(id, "AgentSession ID");
+      const request: HttpRequest = {
+        method: "GET",
+        path: `/v1/agent-sessions/${safeId}/terminal`,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const seat = await fetchDecoded(request, decodeAgentSessionTerminalSeat);
+      if (seat.agentSessionId !== id) {
+        throw malformed(
+          contractViolation("matches_requested_resource", "agent_session_id"),
+          operationLabel(request),
+        );
+      }
+      return seat;
+    },
     async logoutAgentSessionAuth(id, expectedProcessEpoch, signal) {
       const safeId = encodeCanonicalUuid(id, "AgentSession ID");
       const safeEpoch = assertCanonicalUuid(expectedProcessEpoch, "AgentSession process epoch");
@@ -723,7 +1033,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const request: HttpRequest = {
         method: "PATCH",
         path: `/v1/agent-sessions/${safeId}`,
-        settleWith: `cuna agent-sessions show ${id}`,
+        settleWith: `cuna agent-sessions get ${id}`,
         body: { name },
       };
       return assertAgentSessionBinding(
@@ -737,7 +1047,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       const request: HttpRequest = {
         method: "POST",
         path: `/v1/agent-sessions/${safeId}/terminate`,
-        settleWith: `cuna agent-sessions show ${id}`,
+        settleWith: `cuna agent-sessions get ${id}`,
       };
       return assertAgentSessionBinding(
         await fetchDecoded(request, decodeAgentSessionItem),
@@ -775,12 +1085,69 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
             protocol: input.protocol,
             client_instance_id: input.clientInstanceId,
             ...(input.resumeHandle === undefined ? {} : { resume_handle: input.resumeHandle }),
+            ...(input.accessMode === undefined ? {} : { access_mode: input.accessMode }),
+            ...(input.expectedWriterEpoch === undefined ? {} : { expected_writer_epoch: input.expectedWriterEpoch }),
           },
           idempotencyKey,
           ...(signal === undefined ? {} : { signal }),
         },
         decodeTerminalConnectionGrant,
       );
+    },
+    async cancelTerminalConnection(agentSessionId, input, idempotencyKey, signal) {
+      const safeId = encodeCanonicalUuid(agentSessionId, "AgentSession ID");
+      assertIdempotencyKey(idempotencyKey);
+      if (input.protocol !== TERMINAL_PROTOCOL || !/^[A-Za-z0-9._:-]{1,256}$/u.test(input.clientInstanceId) ||
+          (input.accessMode !== undefined && !["writer", "observer"].includes(input.accessMode)) ||
+          (input.expectedWriterEpoch !== undefined && (!Number.isSafeInteger(input.expectedWriterEpoch) || input.expectedWriterEpoch < 0))) {
+        throw contractViolation("terminal_connection_cancellation_request");
+      }
+      if (input.resumeHandle !== undefined) assertCanonicalUuid(input.resumeHandle, "Terminal resume handle");
+      return fetchDecoded({ method: "POST", path: `/v1/agent-sessions/${safeId}/terminal-connections/cancel`,
+        body: { protocol: input.protocol, client_instance_id: input.clientInstanceId,
+          ...(input.resumeHandle === undefined ? {} : { resume_handle: input.resumeHandle }),
+          ...(input.accessMode === undefined ? {} : { access_mode: input.accessMode }),
+          ...(input.expectedWriterEpoch === undefined ? {} : { expected_writer_epoch: input.expectedWriterEpoch }) },
+        idempotencyKey, ...(signal === undefined ? {} : { signal }) }, decodeTerminalConnectionCancellation);
+    },
+    async transferTerminalWriter(agentSessionId, input, signal) {
+      const safeId = encodeCanonicalUuid(agentSessionId, "AgentSession ID");
+      if (!/^[A-Za-z0-9._:-]{1,256}$/u.test(input.clientInstanceId)) {
+        throw new CunaError({
+          code: "cuna.usage.invalid",
+          message: "Terminal client instance ID is malformed.",
+          exitCode: EXIT_CODES.usage,
+        });
+      }
+      if (
+        input.expectedWriterEpoch !== undefined &&
+        (!Number.isSafeInteger(input.expectedWriterEpoch) || input.expectedWriterEpoch < 0)
+      ) {
+        throw new CunaError({
+          code: "cuna.usage.invalid",
+          message: "The expected terminal writer epoch must be a non-negative integer.",
+          exitCode: EXIT_CODES.usage,
+        });
+      }
+      if (input.operationId !== undefined) assertCanonicalUuid(input.operationId, "writer operation ID");
+      const state = await fetchDecoded(
+        {
+          method: "POST",
+          path: `/v1/agent-sessions/${safeId}/terminal-writer`,
+          body: {
+            client_instance_id: input.clientInstanceId,
+            ...(input.operationId === undefined ? {} : { operation_id: input.operationId }),
+            ...(input.expectedWriterEpoch === undefined ? {} : { expected_writer_epoch: input.expectedWriterEpoch }),
+          },
+          ...(signal === undefined ? {} : { signal }),
+        },
+        decodeTerminalWriterState,
+      );
+      if (state.agentSessionId !== agentSessionId || state.writerClientInstanceId !== input.clientInstanceId ||
+          (input.operationId !== undefined && state.operationId !== input.operationId)) {
+        throw malformed(contractViolation("matches_requested_resource", "operation_id"), `POST /v1/agent-sessions/${safeId}/terminal-writer`);
+      }
+      return state;
     },
   };
   return Object.freeze(client);
@@ -830,7 +1197,8 @@ export async function requireCapability(input: {
   readonly scope: CapabilityScope;
   readonly resourceId?: string;
   readonly capabilityId: string;
-  readonly now?: number;
+  /** Number for a fixed observation, or a clock sampled after discovery returns. */
+  readonly now?: number | (() => number);
   readonly allowedInteractions?: readonly import("./contracts.js").CapabilityInteraction[];
   readonly signal?: AbortSignal;
 }): Promise<void> {
@@ -842,6 +1210,27 @@ export async function requireCapability(input: {
     // route now produces. Before the transport read the status before the body,
     // that case arrived as `cuna.remote.malformed_response` and this branch was
     // unreachable against the one deployment that exists.
+    // A 404 means two different things here. On a resource scope it is the
+    // resource saying it is unavailable to this account; on account scope it is the route
+    // saying discovery is not served, because the account always exists.
+    if (
+      error instanceof CunaError &&
+      error.code === "cuna.remote.not_found" &&
+      input.scope !== "account" &&
+      input.resourceId !== undefined
+    ) {
+      const subject = input.scope === "machine" ? "Machine" : "AgentSession";
+      throw new CunaError({
+        code: "cuna.remote.not_found",
+        message: `${subject} ${input.resourceId} is not available to this account.`,
+        exitCode: EXIT_CODES.remote,
+        hint: input.scope === "machine"
+          ? "Nothing was attempted. Run `cuna machines list` to see the Machines on this account."
+          : "Nothing was attempted. Run `cuna agent-sessions list --machine <id>` to see the AgentSessions on a Machine.",
+        details: { capability_id: input.capabilityId, scope: input.scope, resource_id: input.resourceId },
+        cause: error,
+      });
+    }
     if (
       error instanceof CunaError &&
       (error.code === "cuna.remote.not_found" || error.code === "cuna.remote.operation_not_served")
@@ -873,7 +1262,8 @@ export async function requireCapability(input: {
       },
     });
   }
-  const decision = decideCapability(snapshot, input.capabilityId, input.now, input.allowedInteractions);
+  const receivedAt = typeof input.now === "function" ? input.now() : input.now;
+  const decision = decideCapability(snapshot, input.capabilityId, receivedAt, input.allowedInteractions);
   if (decision.status === "supported") return;
   throw new CunaError({
     code:

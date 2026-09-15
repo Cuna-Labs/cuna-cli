@@ -8,7 +8,7 @@
 Run cloud development agents from a local terminal through Cuna's public,
 policy-enforced control plane.
 
-Cuna CLI is designed to make Claude Code, Codex, OpenClaw, and future agents
+Cuna CLI is designed to make Claude Code, Codex, OpenCode, and future agents
 feel local while their processes, durable sessions, and isolated workspaces run
 on Cuna cloud machines. The CLI keeps machine lifecycle, synchronization,
 authorizations, and runtime evidence explicit instead of hiding them behind an
@@ -41,6 +41,23 @@ implemented against the local public 1.5.0 candidate contract. Its immutable
 contract gitlink and provenance approval remain release-blocked.
 Canonical contract approval and producer deployment remain blocked. Source
 code or a documented interface is not evidence that a capability is deployed.
+
+## Use Cuna from a local package
+
+Install the locally built package, sign in once, then let the guided entrypoint
+choose a machine, provider, and AgentSession. The normal journey requires no
+resource IDs.
+
+```powershell
+npm install --global C:\path\to\cuna_labs-cli-0.1.0.tgz
+cuna login
+cuna
+```
+
+To choose a supported provider directly, use `cuna claude [PATH]`,
+`cuna codex [PATH]`, or `cuna opencode [PATH]`. Use `cuna machines` to browse machines and the sessions
+inside them. Exact resource commands and compatibility aliases are documented
+under `cuna help --all`.
 
 ## Quick start for contributors
 
@@ -98,10 +115,13 @@ cuna whoami
 cuna logout
 cuna machines list
 cuna machines create --name NAME --idempotency-key KEY --yes
+cuna machines create --name NAME --agent opencode --yes
 cuna machines start|pause|resume|stop ID --yes
 cuna machines delete ID --yes
 cuna agent-sessions list --machine ID
 cuna agent-sessions create --machine ID --agent claude-code --idempotency-key KEY --yes
+cuna opencode [PATH]
+cuna opencode --agent-session SESSION_ID
 cuna config get
 cuna self-test --offline --json
 cuna version --json
@@ -116,9 +136,11 @@ successful mutation.
 When the foreground terminal capability becomes available, `Ctrl+]` is Cuna's
 local escape prefix. `Ctrl+] ?` toggles trusted in-terminal help; `Ctrl+] 1`…
 `4` selects a tab, `Ctrl+] n` selects the next tab, `Ctrl+] d` detaches the
-local view, and `Ctrl+] Ctrl+]` sends a literal prefix to the cloud session.
-These keys are ignored as Cuna commands inside bracketed paste. Ordinary
-`Ctrl+C` and `Ctrl+Z` continue to the selected cloud session.
+local view, `Ctrl+] c` sends a remote `Ctrl+C`, and `Ctrl+] Ctrl+]` sends a
+literal prefix to the cloud session. These keys are ignored as Cuna commands
+inside bracketed paste. Ordinary `Ctrl+C` detaches the local Cuna view in one
+press; it does not terminate the remote AgentSession. `Ctrl+Z` continues to the
+selected cloud session.
 
 ## Exit codes
 
@@ -141,7 +163,7 @@ cannot change meaning without a named test failing.
 | `3` | `auth` | No usable credential, a rejected credential, or an auth-mode conflict. | `cuna whoami` while `CUNA_API_KEY` is set mints `cuna.auth.mode_conflict`. A credential the server refuses arrives as `cuna.auth.rejected` from HTTP 401. |
 | `4` | `policy` | Understood and refused by policy, including a required confirmation. | `cuna machines delete ID` without `--yes` mints `cuna.confirmation.required`. A server refusal arrives as `cuna.policy.denied` from HTTP 403. |
 | `5` | `network` | No authoritative answer arrived, including when the CLI stopped waiting for one. | a request exceeding its observation budget mints `cuna.client.response_budget_elapsed`, and a bounded read-back that has not converged mints `cuna.client.convergence_budget_elapsed`; both are retryable and name the read to run. HTTP 429 and 5xx arrive as `cuna.network.rate_limited` and `cuna.network.service_unavailable`. |
-| `6` | `conflict` | Current state contradicts the change; repeating it unchanged repeats this. | HTTP 409 mints `cuna.remote.conflict`. A foreground attach to a session already held mints `cuna.runtime.session_conflict`. |
+| `6` | `conflict` | Current state contradicts the change; repeating it unchanged repeats this. | Most HTTP 409 responses mint `cuna.remote.conflict`. A foreground attach to a session already held mints `cuna.runtime.session_conflict`; provider-installation admission is instead an unsupported action with a concrete Machine-selection remedy. |
 | `7` | `remote` | The server answered, but not in a way the published contract allows. | `cuna account show` against a deployment whose body fails contract decoding mints `cuna.remote.malformed_response`. A 404 that does carry a JSON body is an absent resource and lands here as `cuna.remote.not_found`. |
 | `8` | `unsupported` | This deployment does not serve or does not advertise the capability. | `cuna records list` against a deployment with no route for it mints `cuna.remote.operation_not_served`: HTTP 404 whose body is not JSON, which only a layer in front of the API writes. |
 | `70` | `internal` | The CLI itself failed; no server outcome is implied. | any throw that is not a `CunaError` reaching the top of `runCli` is normalized to `cuna.internal.unexpected`. |
@@ -176,14 +198,14 @@ both names are present, `CUNA_API_KEY` always wins. An empty or malformed
 canonical value fails instead of falling through to the legacy credential.
 Other earlier-brand environment-variable names and local paths are not accepted.
 
-`CUNA_OPENCODE_ENABLED=true` is the only local CLI opt-in for OpenCode creation
-and automatic attachment; it is exact and case-sensitive. The default, unset,
-empty, or any other value is disabled. This is a consumer safety gate, not a
-release authority: it cannot enable Edge, override the release manifest, or
-inject/copy any Cuna, Codex, OpenAI, or OpenCode credential. Existing OpenCode
-rows remain readable and an exact `--agent-session` attachment remains
-available while the local creation gate is off. `cuna config get --json`
-reports the non-secret gate state and source.
+OpenCode creation and attachment are admitted from live server capability
+evidence, the observed compatible machine, and exact AgentSession authority.
+The CLI has no local OpenCode feature switch or release-witness gate, so a
+current server response—not package provenance or an environment
+variable—decides whether an operation may proceed. OpenCode uses
+`interactive_login` only: choose `/connect` inside its remote terminal. Cuna
+never copies Codex, OpenAI, local-keychain, or other provider credentials into
+OpenCode.
 
 `CUNA_API_KEY` and its deprecated `RUNA_API_KEY` alias are explicit automation
 credentials and are never persisted automatically. An automation

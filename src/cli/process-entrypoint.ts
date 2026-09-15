@@ -7,10 +7,17 @@ export interface ProcessSignalHost {
   removeListener(signal: SupportedProcessSignal, listener: () => void): unknown;
 }
 
+export interface ProcessInputHost {
+  pause(): unknown;
+  destroy(): unknown;
+}
+
 export async function runProcessCli(
   argv: readonly string[],
   input: {
     readonly host?: ProcessSignalHost;
+    /** The real process stdin, supplied only by the executable entrypoint. */
+    readonly stdin?: ProcessInputHost;
     readonly run?: typeof runCli;
   } = {},
 ): Promise<number> {
@@ -29,5 +36,10 @@ export async function runProcessCli(
     host.removeListener("SIGINT", interrupt);
     host.removeListener("SIGTERM", terminate);
     host.removeListener("SIGHUP", hangup);
+    // Raw hidden-code input must not own the lifetime of a command that has
+    // already returned. Closing stdin here is safe: this is the process
+    // boundary, after every interactive journey and terminal runner finished.
+    input.stdin?.pause();
+    input.stdin?.destroy();
   }
 }

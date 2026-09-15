@@ -198,6 +198,92 @@ test("duplicate machine IDs, stale bindings, unknown authority and incompatible 
   });
 });
 
+test("a stopped machine whose runtime cannot be verified is started, not refused", () => {
+  // Measured 2026-09-02: `cuna opencode --machine NAME` on a stopped OpenCode
+  // Machine refused with `state-unknown`, because `agent_sessions.create`
+  // reads `temporarily_unavailable / opencode_runtime_unverified` while the
+  // Machine is off — a fact about the Machine being off, not about OpenCode.
+  const stopped = planMachineSelection(machineInput([
+    machine({ state: "stopped", requestedAgentSupport: "unknown", agent: "opencode" }),
+  ], { requestedAgent: "opencode", selector: { kind: "id", value: MACHINE_A } }));
+  assert.equal(stopped.kind, "select", JSON.stringify(stopped));
+  assert.equal(stopped.machineId, MACHINE_A);
+
+  // Negative control: while it runs, the same unverifiable capability is
+  // evidence Cuna does not have, and the refusal stands.
+  const running = planMachineSelection(machineInput([
+    machine({ state: "running", requestedAgentSupport: "unknown", agent: "opencode" }),
+  ], { requestedAgent: "opencode", selector: { kind: "id", value: MACHINE_A } }));
+  assert.equal(running.kind, "unavailable");
+  assert.equal(running.reason, "state-unknown");
+
+  // The provider declaration is checked before the capability and does not
+  // depend on the Machine running: a stopped Claude Machine still refuses an
+  // OpenCode request.
+  const wrongProvider = planMachineSelection(machineInput([
+    machine({ state: "stopped", requestedAgentSupport: "unsupported", agent: "claude-code" }),
+  ], { requestedAgent: "opencode", selector: { kind: "id", value: MACHINE_A } }));
+  assert.equal(wrongProvider.kind, "incompatible");
+  assert.equal(wrongProvider.reason, "agent-mismatch");
+
+  // Same rule without a selector: one stopped OpenCode Machine is the one to
+  // start, not a reason to call the whole collection unobserved (which is
+  // what sent the automatic path to `authority-observation-stale`) and not a
+  // reason to allocate a second paid Machine.
+  const automatic = planMachineSelection(machineInput([
+    machine({ state: "stopped", requestedAgentSupport: "unknown", agent: "opencode" }),
+  ], { requestedAgent: "opencode" }));
+  assert.equal(automatic.kind, "select", JSON.stringify(automatic));
+  assert.equal(automatic.source, "unique-compatible");
+
+  // Negative control for the automatic path: a running Machine whose
+  // capability could not be read is an unobserved authority, and Cuna stops.
+  const automaticRunning = planMachineSelection(machineInput([
+    machine({ state: "running", requestedAgentSupport: "unknown", agent: "opencode" }),
+  ], { requestedAgent: "opencode" }));
+  assert.equal(automaticRunning.kind, "unavailable");
+  assert.equal(automaticRunning.reason, "authority-observation-stale");
+});
+
+test("terminal machines with unavailable provider evidence do not block automatic creation", () => {
+  for (const state of ["error", "deleted"]) {
+    assert.deepEqual(
+      planMachineSelection(machineInput([
+        machine({ state, requestedAgentSupport: "unknown", recency: "unknown" }),
+      ], { requestedAgent: "opencode" })),
+      { kind: "create-required", target: "machine", reason: "no-compatible-candidate" },
+      `${state} must not poison a new OpenCode machine selection`,
+    );
+  }
+
+  const creating = planMachineSelection(machineInput([
+    machine({ state: "creating", requestedAgentSupport: "unknown", recency: "unknown" }),
+  ], { requestedAgent: "opencode" }));
+  assert.equal(creating.kind, "unavailable");
+  assert.equal(creating.reason, "authority-observation-stale");
+});
+
+test("an OpenCode supervisor repair blocks automatic allocation but not explicit --new", () => {
+  const repairing = machine({
+    agent: "opencode",
+    requestedAgentSupport: "unsupported",
+    requestedAgentBlocker: "opencode-supervisor-update-required",
+  });
+  assert.deepEqual(
+    planMachineSelection(machineInput([repairing], { requestedAgent: "opencode" })),
+    {
+      kind: "unavailable",
+      target: "machine",
+      targetId: MACHINE_A,
+      reason: "opencode-supervisor-update-required",
+    },
+  );
+  assert.deepEqual(
+    planMachineSelection(machineInput([repairing], { requestedAgent: "opencode", forceNew: true })),
+    { kind: "create-required", target: "machine", reason: "forced" },
+  );
+});
+
 test("PRD-033 legacy machine agent never blocks a different supported child agent", () => {
   const plan = planMachineSelection(machineInput([
     machine({ agent: "claude-code", requestedAgentSupport: "supported" }),
@@ -298,29 +384,99 @@ test("duplicate AgentSession IDs and stale or unknown child state cannot select 
     ).reason,
     "duplicate-id",
   );
-  for (const observation of [
-    agentSession({ freshness: "stale" }),
-    agentSession({ processState: "unknown" }),
-    agentSession({ processState: "starting" }),
-    agentSession({ attachment: "unknown" }),
+  // Each cause keeps its own name. These four used to answer one reason, and
+  // only three of them were about an observation being old: `attachment` is a
+  // hardcoded `"unknown"` because no per-AgentSession attachment authority is
+  // published, so every exact match was refused as "stale" while its
+  // observation was seconds old. Stale invites a retry; unobservable is a
+  // missing prerequisite that no retry supplies, and a user told the wrong one
+  // waits for something that cannot arrive.
+  for (const [observation, expected] of [
+    [agentSession({ freshness: "stale" }), "authority-observation-stale"],
+    [agentSession({ processState: "unknown" }), "authority-observation-stale"],
+    [agentSession({ processState: "starting" }), "authority-observation-stale"],
+    [agentSession({ attachment: "unknown" }), "attachment-unobservable"],
   ]) {
     const plan = planAgentSessionSelection(agentSessionInput([observation]));
     assert.equal(plan.kind, "unavailable");
-    assert.equal(plan.reason, "authority-observation-stale");
+    assert.equal(plan.reason, expected);
   }
 });
 
-test("nonmatching, attached, and terminal children never substitute for an exact detached child", () => {
+test("nonmatching and terminal children never substitute for an exact detached child", () => {
   const nonmatching = agentSession({ id: SESSION_A, cwd: "services/web" });
-  const attached = agentSession({ id: SESSION_B, attachment: "attached" });
   const terminated = agentSession({ id: SESSION_C, processState: "terminated" });
-  const plan = planAgentSessionSelection(agentSessionInput([nonmatching, attached, terminated]));
+  const plan = planAgentSessionSelection(agentSessionInput([nonmatching, terminated]));
   assert.deepEqual(plan, {
     kind: "create-required",
     target: "agent-session",
     machineId: MACHINE_A,
     reason: "no-compatible-candidate",
   });
+});
+
+test("a live exact session whose writer seat another client holds is refused by name, never shadowed by a sibling create", () => {
+  const holder = "cli:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const held = agentSession({ id: SESSION_B, attachment: "attached", attachmentHolder: holder });
+  const plan = planAgentSessionSelection(agentSessionInput([held]));
+  assert.deepEqual(plan, {
+    kind: "unavailable",
+    target: "agent-session",
+    targetId: SESSION_B,
+    holder,
+    reason: "already-attached",
+  });
+
+  // The holder is display data, not a precondition: a held seat with no
+  // recorded holder is still held.
+  const anonymous = planAgentSessionSelection(agentSessionInput([agentSession({ id: SESSION_B, attachment: "attached" })]));
+  assert.equal(anonymous.reason, "already-attached");
+  assert.equal(Object.hasOwn(anonymous, "holder"), false);
+
+  // A free exact session still wins over a held one; the held one is not an
+  // ambiguity because it was never a candidate.
+  const free = agentSession({ id: SESSION_A, attachment: "detached" });
+  const reused = planAgentSessionSelection(agentSessionInput([held, free]));
+  assert.equal(reused.kind, "select");
+  assert.equal(reused.agentSessionId, SESSION_A);
+
+  // Explicit selection of the held session says the same thing.
+  const explicit = planAgentSessionSelection(agentSessionInput([held], { agentSessionId: SESSION_B }));
+  assert.equal(explicit.reason, "already-attached");
+  assert.equal(explicit.holder, holder);
+
+  // Terminal state is judged before the seat: a terminated session with a
+  // stale holder is not "already attached", it is not reusable.
+  const dead = agentSession({ id: SESSION_C, processState: "terminated", attachment: "attached", attachmentHolder: holder });
+  assert.equal(planAgentSessionSelection(agentSessionInput([dead])).reason, "no-compatible-candidate");
+  assert.equal(planAgentSessionSelection(agentSessionInput([dead], { agentSessionId: SESSION_C })).reason, "state-not-reusable");
+});
+
+test("an unobservable seat is named as such on both the automatic and the explicit path", () => {
+  const unobservable = agentSession({ id: SESSION_B, attachment: "unknown" });
+  const automatic = planAgentSessionSelection(agentSessionInput([unobservable]));
+  assert.deepEqual(automatic, {
+    kind: "unavailable",
+    target: "agent-session",
+    targetId: SESSION_B,
+    reason: "attachment-unobservable",
+  });
+  const explicit = planAgentSessionSelection(agentSessionInput([unobservable], { agentSessionId: SESSION_B }));
+  assert.equal(explicit.reason, "attachment-unobservable");
+  assert.equal(explicit.targetId, SESSION_B);
+});
+
+test("a holder reported beside a seat that is not held is invalid authority data", () => {
+  for (const attachment of ["detached", "unknown"]) {
+    const plan = planAgentSessionSelection(
+      agentSessionInput([agentSession({ attachment, attachmentHolder: "cli:x" })]),
+    );
+    assert.equal(plan.reason, "authority-data-invalid", attachment);
+  }
+  const unsafe = planAgentSessionSelection(
+    agentSessionInput([agentSession({ attachment: "attached", attachmentHolder: "cli\u0007bell" })]),
+  );
+  assert.equal(unsafe.reason, "authority-data-invalid");
 });
 
 test("the central journey planner never evaluates AgentSessions until one machine is selected", () => {
@@ -353,4 +509,50 @@ test("the central journey planner never evaluates AgentSessions until one machin
   assert.equal(sessionPlan.kind, "select");
   assert.equal(sessionPlan.target, "agent-session");
   assert.equal(sessionPlan.machineId, MACHINE_A);
+});
+
+test("one usable Machine among same-named siblings is selected, not refused", () => {
+  // A person typed a name that two rows answer to, but only one of them can
+  // serve the request. Refusing here locked them out of a Machine they were
+  // paying for. Nothing is guessed: the survivor is the only candidate that can
+  // host the requested agent.
+  const usable = planMachineSelection(
+    machineInput(
+      [
+        machine({ id: MACHINE_A, name: "production", state: "error" }),
+        machine({ id: MACHINE_B, name: "production", state: "running" }),
+      ],
+      { selector: { kind: "name", value: "production" } },
+    ),
+  );
+  assert.equal(usable.kind, "select", JSON.stringify(usable));
+  assert.equal(usable.machineId, MACHINE_B);
+  assert.equal(usable.source, "explicit");
+
+  // Two usable candidates are still ambiguous: choosing between them would be
+  // a guess.
+  const ambiguous = planMachineSelection(
+    machineInput(
+      [
+        machine({ id: MACHINE_A, name: "production" }),
+        machine({ id: MACHINE_B, name: "production" }),
+      ],
+      { selector: { kind: "name", value: "production" } },
+    ),
+  );
+  assert.equal(ambiguous.kind, "ambiguous");
+  assert.equal(ambiguous.reason, "duplicate-name");
+
+  // None usable keeps its own reason, which names the state rather than the
+  // duplication.
+  const none = planMachineSelection(
+    machineInput(
+      [
+        machine({ id: MACHINE_A, name: "production", state: "error" }),
+        machine({ id: MACHINE_B, name: "production", state: "error" }),
+      ],
+      { selector: { kind: "name", value: "production" } },
+    ),
+  );
+  assert.equal(none.reason, "state-not-reusable");
 });

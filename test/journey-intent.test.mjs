@@ -22,8 +22,6 @@ test("agent commands normalize to closed agent kinds without performing journey 
   const cases = [
     ["claude", "claude-code"],
     ["codex", "codex"],
-    ["openclaw", "openclaw"],
-    ["opencode", "opencode"],
   ];
   for (const [command, agent] of cases) {
     const argv = [command];
@@ -95,8 +93,6 @@ test("explicit --agent-session semantics remain exact and bypass path, sync, and
   for (const [command, agent] of [
     ["claude", "claude-code"],
     ["codex", "codex"],
-    ["openclaw", "openclaw"],
-    ["opencode", "opencode"],
   ]) {
     const intent = parseAgentJourneyIntent([
       command,
@@ -160,20 +156,23 @@ test("duplicate journey options are rejected before intent admission", () => {
   }
 });
 
-test("mutually exclusive and command-specific options fail closed", () => {
+test("mutually exclusive options and unavailable agent commands fail closed", () => {
   for (const argv of [
     ["claude", "--new", "--machine", "existing"],
     ["codex", "--new", "--new-session"],
   ]) {
     assertUsageError(() => parseAgentJourneyIntent(argv), /mutually exclusive/u);
   }
-  assertUsageError(
-    () => parseAgentJourneyIntent(["openclaw", "--no-sync"]),
-    /not available for openclaw/u,
-  );
   assert.equal(parseAgentJourneyIntent(["claude", "--no-sync"]).syncMode, "disabled");
   assert.equal(parseAgentJourneyIntent(["codex", "--no-sync"]).syncMode, "disabled");
-  assert.equal(parseAgentJourneyIntent(["opencode", "--no-sync"]).syncMode, "disabled");
+  assertUsageError(() => parseAgentJourneyIntent(["openclaw"]), /must be claude, codex, or opencode/u);
+  const opencode = parseAgentJourneyIntent(["opencode"]);
+  assert.equal(opencode.agent, "opencode");
+  assert.equal(opencode.authMode, "interactive_login");
+  assertUsageError(
+    () => parseAgentJourneyIntent(["opencode", "--auth-mode", "credential_binding", "--credential-binding", CREDENTIAL_BINDING_ID]),
+    /interactive_login only/u,
+  );
   assertUsageError(
     () => parseAgentJourneyIntent(["claude", "--auth-mode", "credential_binding"]),
     /--credential-binding is required/u,
@@ -181,14 +180,6 @@ test("mutually exclusive and command-specific options fail closed", () => {
   assertUsageError(
     () => parseAgentJourneyIntent(["claude", "--credential-binding", CREDENTIAL_BINDING_ID]),
     /requires --auth-mode credential_binding/u,
-  );
-  assertUsageError(
-    () => parseAgentJourneyIntent(["opencode", "--auth-mode", "credential_binding", "--credential-binding", CREDENTIAL_BINDING_ID]),
-    /interactive_login only/u,
-  );
-  assertUsageError(
-    () => parseAgentJourneyIntent(["opencode", "--credential-binding", CREDENTIAL_BINDING_ID]),
-    /interactive_login only/u,
   );
   assertUsageError(
     () => parseAgentJourneyIntent([
@@ -212,10 +203,10 @@ test("surplus operands, unknown options, and malformed auth modes never produce 
     /Unknown option --background/u,
   );
   assertUsageError(
-    () => parseAgentJourneyIntent(["openclaw", "--auth-mode", "automatic"]),
+    () => parseAgentJourneyIntent(["claude", "--auth-mode", "automatic"]),
     /interactive_login or credential_binding/u,
   );
-  assertUsageError(() => parseAgentJourneyIntent(["shell"]), /must be claude, codex, openclaw, or opencode/u);
+  assertUsageError(() => parseAgentJourneyIntent(["shell"]), /must be claude, codex, or opencode/u);
 });
 
 test("argv-derived values with unsafe types, controls, empty paths, or oversized selectors are rejected safely", () => {

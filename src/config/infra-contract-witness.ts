@@ -3,16 +3,27 @@ export const INFRA_OPENAPI_CONTRACT_IDENTITY = Object.freeze({
   "schemaVersion": 2,
   "artifact_file": "contracts/infra/cuna-api.openapi.json",
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
-  "infra_openapi_raw_sha256": "b15c78aeffe2a34fd7cc0a94306cd23c56b06d2303b913255a02b595fe80ad34",
-  "infra_openapi_canonical_sha256": "f25a9f66253df538455e1f951f3ecdefc5f13d7d4d34b085a9b5da90df7cd700",
+  "infra_openapi_raw_sha256": "f4c2d396b94f296b22df276435dc04ecf1da48807efa1e819c4cbff9ea59a83e",
+  "infra_openapi_canonical_sha256": "43213c2adac602676437b612b7d4153707e09155bdc4fa3029cca15a0b207ecc",
   "producer_repository": "Cuna-Labs/infra",
-  "producer_content_state": "working_tree_product_delta",
-  "producer_base_revision": "735710bdf3f86255190001184715ae104c120dd5",
-  "producer_full_tree": null,
+  "producer_content_state": "committed",
+  "producer_revision": "7b1b3e425ed273986a909a68395b5272bd6a01ba",
+  "producer_full_tree": {
+    "object_format": "sha1",
+    "commit": "7b1b3e425ed273986a909a68395b5272bd6a01ba",
+    "tree": "719a2bc234e3612bd8c17f1afdefcbc764d08cf1",
+    "contract_blob": "36fda0f07b61366ba1cca3e770974dca36f1deed"
+  },
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
-  "producer_projection_sha256": "e2ddff69aaeef19f333c85c73afd50e2d693bc32acf00412cf7392d337972bd3",
-  "producer_runtime_manifest_sha256": "c2e56e5bd0e20c0e1e3b9608a93b7b7883298135bb6950aa199ee69a02e8a9be",
+  "producer_projection_sha256": "a5302868c17cd3ebf2ef05af751873a5e45f9b545a6c96ec24f31c5b3643345c",
+  "producer_runtime_manifest_sha256": "5036aa108aebdee5fcf9f83f95d57f7a0e9bf93fc5acb78bea98d021d3d95cbc",
   "feature_contracts": {
-    "opencode_interactive_only": null
+    "opencode_interactive_only": {
+      "openapi_raw_sha256": "f4c2d396b94f296b22df276435dc04ecf1da48807efa1e819c4cbff9ea59a83e",
+      "openapi_canonical_sha256": "43213c2adac602676437b612b7d4153707e09155bdc4fa3029cca15a0b207ecc",
+      "producer_commit": "7b1b3e425ed273986a909a68395b5272bd6a01ba",
+      "producer_tree": "719a2bc234e3612bd8c17f1afdefcbc764d08cf1",
+      "producer_contract_blob": "36fda0f07b61366ba1cca3e770974dca36f1deed"
+    }
   }
 } as const);

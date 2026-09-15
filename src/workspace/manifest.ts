@@ -61,7 +61,9 @@ export async function createWorkspaceManifest(input: {
   readonly limits?: Partial<ManifestLimits>;
   readonly allowSafeRelativeSymlinks?: boolean;
   readonly beforeContentRead?: (wirePath: string) => void;
+  readonly signal?: AbortSignal;
 }): Promise<WorkspaceManifest> {
+  input.signal?.throwIfAborted();
   const root = await realpath(input.root);
   const limits = Object.freeze({ ...DEFAULT_LIMITS, ...input.limits });
   validateLimits(limits);
@@ -70,11 +72,16 @@ export async function createWorkspaceManifest(input: {
   let totalBytes = 0;
 
   async function walk(directory: string, parentWirePath: string): Promise<void> {
+    input.signal?.throwIfAborted();
     const handle = await opendir(directory);
     const children = [];
-    for await (const child of handle) children.push(child);
+    for await (const child of handle) {
+      input.signal?.throwIfAborted();
+      children.push(child);
+    }
     children.sort((left, right) => left.name.normalize("NFC").localeCompare(right.name.normalize("NFC"), "en"));
     for (const child of children) {
+      input.signal?.throwIfAborted();
       const wirePath = normalizeWirePath(
         parentWirePath.length === 0 ? child.name : `${parentWirePath}/${child.name}`,
         input.capabilities,
@@ -133,7 +140,7 @@ export async function createWorkspaceManifest(input: {
         totalBytes += targetBytes;
         continue;
       }
-      const hashed = await hashStableFile(physicalPath, wirePath, root, limits, input.beforeContentRead);
+      const hashed = await hashStableFile(physicalPath, wirePath, root, limits, input.beforeContentRead, input.signal);
       totalBytes += hashed.byteLength;
       if (totalBytes > limits.maximumTotalBytes) throw limitFailure("total_bytes_limit");
       entries.push(Object.freeze({
@@ -148,6 +155,7 @@ export async function createWorkspaceManifest(input: {
   }
 
   await walk(root, "");
+  input.signal?.throwIfAborted();
   assertNoPortableCollisions(entries.map((entry) => entry.path), input.capabilities);
   entries.sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
   const manifestRoot = publicProtocolManifestRoot(entries);
@@ -195,6 +203,7 @@ async function hashStableFile(
   root: string,
   limits: ManifestLimits,
   beforeContentRead?: (wirePath: string) => void,
+  signal?: AbortSignal,
 ): Promise<{
   readonly byteLength: number;
   readonly executable: boolean;
@@ -222,12 +231,14 @@ async function hashStableFile(
     const opened = await handle.stat({ bigint: true });
     if (!sameIdentity(before, opened)) throw unstableFailure();
     beforeContentRead?.(wirePath);
+    signal?.throwIfAborted();
     const contentHash = createHash("sha256").update("cuna-content-v1\0");
     const chunks: ContentChunk[] = [];
     let byteLength = 0;
     let overlap = Buffer.alloc(0);
     let secretCategory: string | undefined;
-    for await (const value of handle.createReadStream({ highWaterMark: limits.chunkBytes, autoClose: false })) {
+    for await (const value of handle.createReadStream({ highWaterMark: limits.chunkBytes, autoClose: false, ...(signal === undefined ? {} : { signal }) })) {
+      signal?.throwIfAborted();
       const bytes = Buffer.from(value as Uint8Array);
       byteLength += bytes.byteLength;
       if (byteLength > limits.maximumFileBytes) throw limitFailure("file_bytes_limit");

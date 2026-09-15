@@ -89,5 +89,9 @@ export function packageBuildDigest(): Promise<string> {
   return cachedDigest;
 }
 
+// The release artifact is the npm tarball; every supported install channel
+// (npm, bun, curl, Homebrew, AUR) unpacks that same immutable candidate, so
+// the installed CLI identifies its artifact as npm. The release gate
+// (`verify-installed-candidate.mjs`) refuses any other answer.
 export const ARTIFACT_CHANNEL = "npm" as const;
 export const PROTOCOL_RANGE = Object.freeze({ minimum: "1", maximum: "1" });

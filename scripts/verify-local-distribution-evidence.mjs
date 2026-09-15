@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { PACKAGE_NAME, REPOSITORY, invariant, parseArgs, readJson, sha256File } from "./lib/release-evidence.mjs";
 import { exactKeys, normalizeRelativeFile, validateCycloneDxSbom, validateSupportPolicy } from "./release-distribution-lib.mjs";
+import { ARTIFACT_CHANNEL } from "../dist/build-identity.js";
 
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(args.get("root") ?? "evidence/local-distribution");
@@ -56,7 +57,14 @@ invariant(version?.data?.version === record.package.version, "Recorded local run
 invariant(version?.data?.buildDigest === record.runtimeIdentity?.buildDigest, "Recorded local build identity mismatch");
 invariant(version?.data?.platform === record.environment?.platform, "Recorded local platform mismatch");
 invariant(version?.data?.architecture === record.environment?.architecture, "Recorded local architecture mismatch");
-invariant(version?.data?.artifactChannel === "npm", "Recorded local artifact channel mismatch");
+// Bound to the declared constant, like its producer in
+// release-local-artifact-evidence.mjs. A hardcoded "npm" went stale the
+// moment the build began declaring "local", which is the installation path
+// this evidence is ABOUT; npm publication is a separate, parked lane.
+invariant(
+  version?.data?.artifactChannel === ARTIFACT_CHANNEL,
+  `Recorded local artifact channel ${String(version?.data?.artifactChannel)} does not match the declared ${ARTIFACT_CHANNEL}`,
+);
 invariant(record.observations?.uninstallCleanup === "PASS", "Recorded local uninstall cleanup did not pass");
 invariant(!Number.isNaN(Date.parse(record.generatedAt)), "Local evidence timestamp is invalid");
 

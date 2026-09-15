@@ -1,7 +1,18 @@
-import type { AgentSession, Machine } from "../api/contracts.js";
+import {withProviderLaunchIntent} from "./provider-launch-intent.js";
+import type {ProviderPreset} from "../api/provider-v2.js";
+import {createPublishedProviderSessionV2,requireMatchingPreset} from "./remote-workspace.js";
+import type { AgentSession, AgentSessionTerminalSeat, Machine } from "../api/contracts.js";
+import { sessionFailure } from "./session-failure.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
-import { isObservationBudgetCode } from "../core/observation-budget.js";
+import {
+  isOpenCodeRuntimeUnverifiedCapabilityRejection,
+  isOpenCodeSupervisorUpgradeReason,
+  isOpenCodeSupervisorUpgradeCapabilityRejection,
+  openCodeRuntimeUnverified,
+  openCodeSupervisorUpgradeRequired,
+} from "../machines/opencode-supervisor.js";
+import { machineProviderAvailability } from "../machines/provider-availability.js";
 import type { MachineSelectionState } from "./selection.js";
 import type {
   AgentJourneyEffects,
@@ -14,6 +25,17 @@ const CHILD_POLL_LIMIT = 90;
 
 export interface ApiAgentJourneyEffectsInput {
   readonly client: CunaApiClient;
+  readonly confirmNewProviderLaunch?: (signal:AbortSignal)=>Promise<boolean>;
+  readonly providerLaunchState?: {readonly stateDirectory:string;readonly ownerId:string;readonly workspaceId:string};
+  readonly selectProviderPreset?: (signal:AbortSignal)=>Promise<ProviderPreset>;
+  /** The only provider executable this journey may select a machine for. */
+  readonly requestedAgent: "claude-code" | "codex" | "opencode";
+  /**
+   * This process's terminal client instance id, when the caller has one. A
+   * writer seat held by it is reported `detached` so the reconnect path can
+   * reissue with the resume handle. Absent, every held seat is a stranger's.
+   */
+  readonly clientInstanceId?: string;
   readonly inspectWorkspace: AgentJourneyEffects["inspectWorkspace"];
   readonly synchronizeWorkspace: AgentJourneyEffects["synchronizeWorkspace"];
   readonly attach: AgentJourneyEffects["attach"];
@@ -50,7 +72,52 @@ function relativeCwd(cwd: string): string {
   return cwd.replace(/^\/workspace\/?/u, "") || ".";
 }
 
-function sessionObservation(session: AgentSession) {
+type SeatAttachment =
+  | { readonly attachment: "detached" | "unknown" }
+  | { readonly attachment: "attached"; readonly attachmentHolder: string };
+
+/**
+ * Map the durable writer seat onto the selection's attachment fact.
+ *
+ *   available ∧ writer = null          → detached   (nobody types; reuse)
+ *   available ∧ writer = this client   → detached   (our own seat; the
+ *                                         reconnect path reissues with the
+ *                                         resume handle)
+ *   available ∧ writer = other client  → attached   (name the holder)
+ *   owner_unrecoverable | none         → unknown    (no attestable PTY)
+ *
+ * Without our own client instance id every held seat is another client's:
+ * claiming a seat as ours on no evidence would race a terminal that has a
+ * writer.
+ */
+export function attachmentFromSeat(
+  seat: AgentSessionTerminalSeat,
+  ownClientInstanceId: string | undefined,
+): SeatAttachment {
+  if (seat.state !== "available") return { attachment: "unknown" };
+  if (seat.writerClientInstanceId === null) return { attachment: "detached" };
+  // The row names the last writer forever; only its connection says whether
+  // that client is there now. A writer that has detached leaves the terminal
+  // reusable, which is the whole point of a durable session.
+  if (!seat.writerAttached) return { attachment: "detached" };
+  if (ownClientInstanceId !== undefined && seat.writerClientInstanceId === ownClientInstanceId) {
+    return { attachment: "detached" };
+  }
+  return { attachment: "attached", attachmentHolder: seat.writerClientInstanceId };
+}
+
+/**
+ * An edge that does not serve the seat route answers 404. Both spellings the
+ * transport gives a 404 map to "the fact is not published here": a plain
+ * 404 is `operation_not_served`, a Problem-shaped `resource_not_found` is
+ * `not_found`. Every other error is a real failure and propagates.
+ */
+function isSeatUnserved(error: unknown): boolean {
+  return error instanceof CunaError &&
+    (error.code === "cuna.remote.operation_not_served" || error.code === "cuna.remote.not_found");
+}
+
+function sessionObservation(session: AgentSession, seat: SeatAttachment) {
   return Object.freeze({
     id: session.id,
     machineId: session.machineId,
@@ -61,9 +128,7 @@ function sessionObservation(session: AgentSession) {
     cwd: relativeCwd(session.cwd),
     authMode: session.authMode,
     processState: session.processState,
-    // AgentSession does not own attachment state. Until a child-scoped
-    // connection authority is exposed, automatic child reuse must abstain.
-    attachment: "unknown" as const,
+    ...seat,
     freshness: "fresh" as const,
     createdAt: session.createdAt,
   });
@@ -89,6 +154,25 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       }
       return Promise.all(page.items.map(async (machine) => {
         let support: "supported" | "unsupported" | "unknown" = "unknown";
+        let supportReason: string | undefined;
+        const provider = machineProviderAvailability(machine);
+        if (!provider.actionable || provider.agent !== input.requestedAgent) {
+          return Object.freeze({
+            id: machine.id,
+            name: machine.name,
+            agent: provider.agent ?? "unknown" as const,
+            requestedAgentSupport: "unsupported" as const,
+            state: machineState(machine.state),
+            ownership: "owned" as const,
+            freshness: "fresh" as const,
+            recency: recency(machine, now()),
+            resources: Object.freeze({
+              ...(machine.vcpus === undefined ? {} : { vcpus: machine.vcpus }),
+              ...(machine.memoryMiB === undefined ? {} : { memoryMiB: machine.memoryMiB }),
+            }),
+            costStatus: "unknown" as const,
+          });
+        }
         try {
           const snapshot = await input.client.discoverCapabilities("machine", machine.id, signal);
           if (snapshot.subjectScope !== "machine" || snapshot.subjectId !== machine.id) {
@@ -111,16 +195,21 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
             : decision.status === "unsupported"
               ? "unsupported"
               : "unknown";
+          supportReason = decision.status === "supported" ? undefined : decision.reason;
         } catch {
           support = "unknown";
         }
+        const requestedAgentBlocker = input.requestedAgent === "opencode" &&
+          support === "unsupported" &&
+          isOpenCodeSupervisorUpgradeReason(supportReason)
+          ? "opencode-supervisor-update-required" as const
+          : undefined;
         return Object.freeze({
           id: machine.id,
           name: machine.name,
-          agent: machine.agent === "claude-code" || machine.agent === "codex" || machine.agent === "openclaw" || machine.agent === "opencode"
-            ? machine.agent
-            : "unknown" as const,
+          agent: provider.agent ?? "unknown" as const,
           requestedAgentSupport: support,
+          ...(requestedAgentBlocker === undefined ? {} : { requestedAgentBlocker }),
           state: machineState(machine.state),
           ownership: "owned" as const,
           freshness: "fresh" as const,
@@ -133,8 +222,8 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         });
       }));
     },
-    async createMachine({ requestedAgent, idempotencyKey, requestId, signal }) {
-      await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create", now: now(), signal });
+    async createMachine({ requestedAgent, idempotencyKey, requestId, onDispatch, signal }) {
+      await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create", now, signal });
       if (!await input.authorizeMachineCreate({ requestedAgent, signal })) {
         throw fail(
           "cuna.journey.machine_create_not_authorized",
@@ -142,6 +231,9 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           EXIT_CODES.policy,
         );
       }
+      // Everything above this line fails before anything is sent: the
+      // capability check and the person's own confirmation.
+      onDispatch();
       const machine = await input.client.createMachine({
         name: `cuna-${requestedAgent}-${requestId.slice(0, 8)}`,
         agent: requestedAgent,
@@ -192,90 +284,110 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       if (page.nextCursor !== undefined) {
         throw fail("cuna.journey.agent_session_page_incomplete", "AgentSession selection requires a complete bounded collection.", EXIT_CODES.policy);
       }
-      return Object.freeze(page.items.map(sessionObservation));
-    },
-    async createAgentSession({ machineId, agent, authMode, credentialBindingId, workspace, idempotencyKey, signal }) {
-      await requireCapability({
-        client: input.client,
-        scope: "machine",
-        resourceId: machineId,
-        capabilityId: "agent_sessions.create",
-        now: now(),
-        signal,
-      });
-      const createInput = {
-        agent,
-        cwd: workspace.remoteCwd,
-        workspaceBindingId: workspace.bindingId,
-        workspaceGeneration: workspace.generation,
-        authMode,
-        ...(credentialBindingId === undefined ? {} : { credentialBindingId }),
-      } as const;
-      let session: AgentSession;
-      try {
-        session = await input.client.createAgentSession(
-          machineId,
-          createInput,
-          idempotencyKey,
-          signal,
-        );
-      } catch (error) {
-        // "Uncertain" means no authoritative answer reached us. Read the
-        // authority rather than a literal so a third budget kind cannot leave
-        // this recovery path behind.
-        const uncertain =
-          error instanceof CunaError &&
-          (isObservationBudgetCode(error.code) || error.code === "cuna.network.failed");
-        if (!uncertain || signal.aborted) throw error;
-        try {
-          session = await input.client.inspectAgentSessionCreate(idempotencyKey, signal);
-        } catch (inspectionError) {
-          if (
-            !(inspectionError instanceof CunaError) ||
-            inspectionError.code !== "agent_session_not_found" ||
-            signal.aborted
-          ) {
-            throw inspectionError;
-          }
-          // The first dispatch may have failed before durable admission. A
-          // replay with the exact same key and canonical intent serializes on
-          // the producer's idempotency authority and cannot create a sibling.
-          session = await input.client.createAgentSession(
-            machineId,
-            createInput,
-            idempotencyKey,
-            signal,
-          );
+      return Object.freeze(await Promise.all(page.items.map(async (session) => {
+        // Only a session that could be reused is asked for its seat. A
+        // terminal or starting one is refused on its process state before the
+        // seat would matter, and reading it would only spend a request.
+        if (session.processState !== "ready" && session.processState !== "running") {
+          return sessionObservation(session, { attachment: "unknown" });
         }
+        let seat: AgentSessionTerminalSeat;
+        try {
+          await requireCapability({ client: input.client, scope: "agent_session", resourceId: session.id, capabilityId: "terminal_seats.read", allowedInteractions: ["read_only"], now, signal });
+          seat = await input.client.getAgentSessionTerminalSeat(session.id, signal);
+        } catch (error) {
+          if (isSeatUnserved(error)) return sessionObservation(session, { attachment: "unknown" });
+          throw error;
+        }
+        return sessionObservation(session, attachmentFromSeat(seat, input.clientInstanceId));
+      })));
+    },
+    async createAgentSession({ machineId, agent, authMode, credentialBindingId, workspace, signal }) {
+      try {
+        await requireCapability({
+          client: input.client,
+          scope: "machine",
+          resourceId: machineId,
+          capabilityId: "agent_sessions.create",
+          now,
+          signal,
+        });
+      } catch (error) {
+        if (agent === "opencode" && isOpenCodeSupervisorUpgradeCapabilityRejection(error)) {
+          throw openCodeSupervisorUpgradeRequired({
+            ...(error.details === undefined ? {} : { details: error.details }),
+            machineId,
+            cause: error,
+          });
+        }
+        if (agent === "opencode" && isOpenCodeRuntimeUnverifiedCapabilityRejection(error)) {
+          throw openCodeRuntimeUnverified({
+            ...(error.details === undefined ? {} : { details: error.details }),
+            machineId,
+            cause: error,
+          });
+        }
+        throw error;
       }
-      if (
-        session.machineId !== machineId ||
-        session.agent !== agent ||
-        session.cwd !== workspace.remoteCwd ||
-        session.workspaceBindingId !== workspace.bindingId ||
-        session.workspaceGeneration !== workspace.generation ||
-        session.authMode !== authMode
-      ) {
-        throw fail(
-          "cuna.journey.agent_session_create_authority_mismatch",
-          "Recovered AgentSession authority does not match the requested canonical intent.",
-          EXIT_CODES.conflict,
-        );
+      if(agent==='opencode'||agent==='codex'||agent==='claude-code'){
+        if(authMode!=='interactive_login'||credentialBindingId!==undefined||!workspace.executionWorkspaceId||workspace.generation<1||!input.selectProviderPreset)throw fail('cuna.provider.v2_unavailable','The agent requires a selected V2 profile and a published execution Workspace.');
+        const preset=await input.selectProviderPreset(signal);
+        requireMatchingPreset(agent,preset);
+        if(!input.providerLaunchState)throw fail('cuna.provider.v2_unavailable','Durable provider launch state is unavailable.');
+        const executionWorkspaceId=workspace.executionWorkspaceId;
+        const session=await withProviderLaunchIntent({...input.providerLaunchState,machineId,executionWorkspaceId,confirmNew:async()=>await input.confirmNewProviderLaunch?.(signal)??false,intent:{executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,profileId:preset.profile_id,profileRevision:preset.profile_revision,agent,authMode},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId,agent,preset,operationId,executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,signal})});
+        return Object.freeze({id:session.id,machineId:session.machineId});
       }
-      return Object.freeze({ id: session.id, machineId: session.machineId });
+      throw fail('cuna.provider.v2_unavailable','This agent has no supported canonical V2 launch profile.');
     },
     async ensureAgentSessionReady({ agentSessionId, signal }) {
       for (let attempt = 0; attempt < CHILD_POLL_LIMIT; attempt += 1) {
+        if (signal?.aborted) throw signal.reason;
         const session = await input.client.getAgentSession(agentSessionId, signal);
+        if (session.requestState === "failed") {
+          if (session.workspaceFailureCode !== undefined) {
+            const messages: Record<string, string> = {
+              "workspace.remote_edits": "Remote edits prevent synchronization. Preserve and reconcile those edits before retrying.",
+              "workspace.in_use": "This workspace is still in use or waiting for a previous session to finish. Inspect its sessions before retrying.",
+              "workspace.replacement_requires_fence": "This Workspace cannot replace its files while writer exclusion is unverified. Its existing files were preserved.",
+              "workspace.materialization_manifest_limit": "This Workspace exceeds the runtime file manifest limit. Reduce the synchronized file set before retrying.",
+            };
+            throw fail("cuna.journey.workspace_materialization_failed", messages[session.workspaceFailureCode] ?? "The runtime could not prepare this Workspace. Its failure code identifies the refused operation.", EXIT_CODES.remote, { reason: session.workspaceFailureCode });
+          }
+          throw sessionFailure(session, "The AgentSession request failed before attach.");
+        }
+        if (signal?.aborted) throw signal.reason;
+        if (session.id !== agentSessionId) {
+          throw fail("cuna.journey.session_identity_mismatch", "The readiness observation describes a different AgentSession.");
+        }
         if (session.processState === "ready" || session.processState === "running") {
-          return Object.freeze({ id: session.id, machineId: session.machineId });
+          // A durable process acknowledgement can precede the registry's exact
+          // PTY attachment. Wait for that authority without dispatching again.
+          try {
+            await requireCapability({ client: input.client, scope: "agent_session", resourceId: agentSessionId,
+              capabilityId: "terminal_connections.create", allowedInteractions: ["native"], now, signal });
+            if (signal?.aborted) throw signal.reason;
+            return Object.freeze({ id: session.id, machineId: session.machineId });
+          } catch (error) {
+            if (signal?.aborted) throw signal.reason;
+            if (!(error instanceof CunaError
+              && ["cuna.capability.unknown", "cuna.capability.temporarily_unavailable"].includes(error.code)
+              && error.details?.capability_id === "terminal_connections.create"
+              && ["supervisor_registry_unavailable", "agent_session_not_ready", "runtime_lease_expired"].includes(String(error.details?.reason)))) throw error;
+          }
         }
         if (["exited", "failed", "terminated"].includes(session.processState)) {
-          throw fail("cuna.journey.agent_session_failed", "The AgentSession reached a terminal state before attach.");
+          throw sessionFailure(session, "The AgentSession reached a terminal state before attach.");
         }
         await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
       }
-      throw fail("cuna.journey.agent_session_ready_timeout", "AgentSession readiness remained unproven.", EXIT_CODES.network);
+      throw new CunaError({
+        code: "cuna.journey.agent_session_ready_timeout",
+        message: "Cuna stopped waiting for AgentSession readiness. The remote request may still be pending.",
+        exitCode: EXIT_CODES.network,
+        hint: `Inspect the existing request before starting another session: cuna agent-sessions get ${agentSessionId}`,
+        details: { agent_session_id: agentSessionId },
+      });
     },
     attach: input.attach,
     async reconcileCancellation({ ledger, signal }) {
@@ -285,12 +397,6 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       }
       if (ledger.createdAgentSessionId !== undefined) {
         await input.client.getAgentSession(ledger.createdAgentSessionId, signal).catch(() => undefined);
-      } else {
-        // Read-only recovery proves whether a cancelled in-flight create
-        // durably admitted a child; it never creates a new AgentSession.
-        await input.client
-          .inspectAgentSessionCreate(`${ledger.idempotencyKey}-agent`, signal)
-          .catch(() => undefined);
       }
       // An absent request identity proves no create was dispatched, so there is
       // nothing to reconcile. It used to be present unconditionally, which made
