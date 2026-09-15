@@ -1,5 +1,26 @@
 name: Review npm preview release
 
+# This workflow used to end in an unconditional `exit 1` that printed five
+# blocker names. That was honest about the state of the repository but it was
+# not a gate: it could not distinguish a release that should be refused from one
+# that should be allowed, so nothing about it could ever pass or be tested.
+#
+# Each of those five names is now a check that reads live state and fails closed
+# with the same identifier when the authority is genuinely absent:
+#
+#   RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED
+#     -> scripts/verify-release-review-authority.mjs, against the live environment
+#   ACTUAL_ENVIRONMENT_APPROVAL_EVENT_NOT_OBSERVABLE_BY_WORKFLOW_TOKEN
+#     -> scripts/verify-release-approval-event.mjs, against this run's approvals
+#   CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE
+#     -> scripts/verify-observation-cohort.mjs, against a distribution-observation run
+#   CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE
+#   CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED
+#     -> scripts/verify-contract-authority.mjs, against packaging/contract-authority.json
+#
+# The lease is minted only after all of them pass, and it is attested by this
+# workflow so that release.yml can verify who produced it.
+
 on:
   workflow_dispatch:
     inputs:
@@ -23,6 +44,10 @@ on:
         description: Exact release-envelope SHA-256
         required: true
         type: string
+      observation_run_id:
+        description: Successful distribution-observation run containing observation-cohort
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -41,6 +66,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -54,6 +81,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/verify-release-review-authority.mjs
+      - name: Observe the exact protected-environment approval that released this job
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-release-approval-event.mjs
       - name: Bind dispatch to protected main and successful candidate producer
         env:
           GH_TOKEN: ${{ github.token }}
@@ -90,12 +121,6 @@ jobs:
           TARBALL_FILE="$(node -p "require('./admitted/release-artifacts/release-envelope.json').tarball.file")"
           [[ "$TARBALL_FILE" =~ ^[A-Za-z0-9._-]+\.tgz$ ]]
           test "$(sha256sum "admitted/release-artifacts/$TARBALL_FILE" | cut -d' ' -f1)" = "$CANDIDATE_SHA256"
-          node - <<'NODE'
-          const inputs = require('./admitted/release-artifacts/release-inputs.json');
-          if (inputs.contractSet?.releaseAuthority !== 'UNRESOLVED_BLOCKING') {
-            throw new Error('Unexpected contract authority state requires re-audit before release review.');
-          }
-          NODE
       - name: Verify GitHub provenance of exact candidate bytes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -104,12 +129,54 @@ jobs:
           gh attestation verify admitted/release-artifacts/*.tgz
           --repo "$GITHUB_REPOSITORY"
           --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.yml"
-      - name: Block lease minting until independent authorities exist
+      - name: Bind the observation cohort to this candidate's own producing run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OBSERVATION_RUN_ID: ${{ inputs.observation_run_id }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
         shell: bash
         run: |
-          echo "::error title=Release review authority unavailable::RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED"
-          echo "::error title=Approval event evidence unavailable::ACTUAL_ENVIRONMENT_APPROVAL_EVENT_NOT_OBSERVABLE_BY_WORKFLOW_TOKEN"
-          echo "::error title=Contract authority unavailable::CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE"
-          echo "::error title=Observation authority unavailable::CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE"
-          echo "::error title=Candidate contract unresolved::CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED"
-          exit 1
+          [[ "$OBSERVATION_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          OBSERVATION_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${OBSERVATION_RUN_ID}" --jq '[.status,.conclusion,.head_sha,.event,.head_branch,.path] | join(" ")')"
+          test "$OBSERVATION_STATE" = "completed success ${SOURCE_COMMIT} workflow_dispatch main .github/workflows/distribution-observation.yml"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: observation-cohort
+          run-id: ${{ inputs.observation_run_id }}
+          github-token: ${{ github.token }}
+          path: admitted/observation
+      - name: Require a complete candidate-bound observation cohort
+        run: >-
+          node scripts/verify-observation-cohort.mjs
+          --candidate-run-id "${{ inputs.candidate_run_id }}"
+          --observation-run-id "${{ inputs.observation_run_id }}"
+      - name: Require the producer-approved canonical contract authority
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/verify-contract-authority.mjs
+      - name: Require the candidate itself to carry a resolved contract authority
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const inputs = require('./admitted/release-artifacts/release-inputs.json');
+          if (inputs.contractSet?.releaseAuthority === 'UNRESOLVED_BLOCKING') {
+            throw new Error('CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED: the admitted candidate was built without a canonical contract authority.');
+          }
+          NODE
+      - name: Mint the single-use approval lease from verified evidence only
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/build-release-approval-lease.mjs
+      - uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v3.2.0
+        with:
+          subject-path: approval/release-approval-lease.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-approval-lease
+          path: |
+            approval/release-approval-lease.json
+            approval/release-approval-expectation.json
+            evidence/release-approval-event.json
+            evidence/observation-cohort-verification.json
+          if-no-files-found: error
+          retention-days: 30

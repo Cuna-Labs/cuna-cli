@@ -41,6 +41,7 @@ const CONTRACT_FILES = Object.freeze([
 
 const BUILD_RECIPE_FILES = Object.freeze([
   ".github/workflows/ci.yml",
+  ".github/workflows/distribution-observation.yml",
   ".github/workflows/distribution-projection-proof.yml",
   ".github/workflows/release-review.yml",
   ".github/workflows/release.yml",
@@ -48,17 +49,22 @@ const BUILD_RECIPE_FILES = Object.freeze([
   "package-lock.json",
   "packaging/admission-policy.json",
   "packaging/release-approval-consumption-authority.json",
+  "packaging/release-recovery-plan.md",
   "packaging/release-review-authority.json",
   "packaging/support-policy.json",
   "packaging/templates/aur/PKGBUILD.template",
   "packaging/templates/homebrew/cuna.rb.template",
   "packaging/templates/install.sh.template",
+  "scripts/build-observation-cohort.mjs",
+  "scripts/build-release-approval-lease.mjs",
   "scripts/build-release-envelope.mjs",
   "scripts/build-release-inputs.mjs",
   "scripts/emit-infra-contract-witness.mjs",
   "scripts/lib/release-evidence.mjs",
   "scripts/lib/infra-contract-witness.mjs",
   "scripts/lib/npm-preview-publication.mjs",
+  "scripts/lib/observation-cohort.mjs",
+  "scripts/lib/release-approval-event.mjs",
   "scripts/lib/release-approval-lease.mjs",
   "scripts/lib/release-approval-consumption.mjs",
   "scripts/lib/exclusive-build-lock.mjs",
@@ -71,11 +77,14 @@ const BUILD_RECIPE_FILES = Object.freeze([
   "scripts/summarize-observation-receipts.mjs",
   "scripts/consume-release-approval-nonce.mjs",
   "scripts/verify-ci-contract.mjs",
+  "scripts/verify-contract-authority.mjs",
   "scripts/verify-dependency-policy.mjs",
   "scripts/verify-distribution-receipts.mjs",
   "scripts/verify-installed-candidate.mjs",
+  "scripts/verify-observation-cohort.mjs",
   "scripts/verify-package-contents.mjs",
   "scripts/verify-release-admission.mjs",
+  "scripts/verify-release-approval-event.mjs",
   "scripts/verify-release-approval-lease.mjs",
   "scripts/verify-release-approval-consumption-authority.mjs",
   "scripts/verify-release-approval-nonce.mjs",
@@ -186,7 +195,49 @@ function loadInfraOpenapiIdentity() {
   return Object.freeze(parsed);
 }
 
+export const UNRESOLVED_RELEASE_AUTHORITY = "UNRESOLVED_BLOCKING";
+export const APPROVED_RELEASE_AUTHORITY = "CUNA_CANONICAL_PUBLIC_API_CONTRACT_APPROVED";
+
+/**
+ * Decide, at build time, whether this candidate may claim a canonical contract
+ * release authority.
+ *
+ * Two conditions, both necessary. The vendored producer content must be a
+ * committed revision -- a working-tree delta is by definition not something the
+ * producer approved -- and `packaging/contract-authority.json` must exist and
+ * name the exact contract digest this candidate vendors.
+ *
+ * This is a claim, not a proof. The claim is checked against the producer
+ * repository itself by scripts/verify-contract-authority.mjs during the
+ * protected release review, and release.yml refuses any candidate whose value
+ * is still unresolved. A candidate that lies here does not get published; it
+ * fails at review with the producer's own answer.
+ */
+function loadContractReleaseAuthority(identity) {
+  if (identity.producer_content_state !== "committed") return UNRESOLVED_RELEASE_AUTHORITY;
+  let declaration;
+  try {
+    declaration = JSON.parse(readFileSync(new URL("../../packaging/contract-authority.json", import.meta.url), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return UNRESOLVED_RELEASE_AUTHORITY;
+    throw error;
+  }
+  invariant(
+    declaration?.schemaVersion === 1 && declaration.authority === "CUNA_CANONICAL_PUBLIC_API_CONTRACT" &&
+      declaration.status === "APPROVED" && declaration.producerRepository === identity.producer_repository &&
+      COMMIT.test(declaration.sourceCommit ?? "") && SHA256.test(declaration.contractSha256 ?? "") &&
+      SHA256.test(declaration.approvalAttestationSha256 ?? ""),
+    "packaging/contract-authority.json is present but is not a valid canonical contract authority",
+  );
+  invariant(
+    declaration.contractSha256 === identity.infra_openapi_canonical_sha256,
+    "packaging/contract-authority.json approves a different contract than this candidate vendors",
+  );
+  return APPROVED_RELEASE_AUTHORITY;
+}
+
 export const INFRA_OPENAPI_CONTRACT_IDENTITY = loadInfraOpenapiIdentity();
+const CONTRACT_RELEASE_AUTHORITY = loadContractReleaseAuthority(INFRA_OPENAPI_CONTRACT_IDENTITY);
 const INFRA_OPENAPI_RAW_SHA256 = INFRA_OPENAPI_CONTRACT_IDENTITY.infra_openapi_raw_sha256;
 const INFRA_OPENAPI_CANONICAL_SHA256 = INFRA_OPENAPI_CONTRACT_IDENTITY.infra_openapi_canonical_sha256;
 
@@ -253,7 +304,16 @@ export function validateReleaseInputs(inputs) {
 
   exactKeys(inputs.contractSet, ["algorithm", "authority", "releaseAuthority", "files", "aggregateSha256"], "contractSet");
   invariant(inputs.contractSet.authority === "CUNA_INFRA_OPENAPI_VENDORED_EXACT", "Contract-set authority differs");
-  invariant(inputs.contractSet.releaseAuthority === "UNRESOLVED_BLOCKING", "Working-tree producer delta must not claim canonical release authority");
+  invariant(
+    inputs.contractSet.releaseAuthority === UNRESOLVED_RELEASE_AUTHORITY ||
+      inputs.contractSet.releaseAuthority === APPROVED_RELEASE_AUTHORITY,
+    "Contract-set release authority is not a recognized state",
+  );
+  invariant(
+    inputs.contractSet.releaseAuthority === UNRESOLVED_RELEASE_AUTHORITY ||
+      INFRA_OPENAPI_CONTRACT_IDENTITY.producer_content_state === "committed",
+    "Working-tree producer delta must not claim canonical release authority",
+  );
   exactKeys(inputs.buildRecipe, ["algorithm", "commands", "files", "aggregateSha256"], "buildRecipe");
   invariant(Array.isArray(inputs.buildRecipe.commands) && inputs.buildRecipe.commands.length > 0, "Build-recipe commands are missing");
   for (const command of inputs.buildRecipe.commands) invariant(typeof command === "string" && command.length > 0, "Build-recipe command is invalid");
@@ -362,7 +422,7 @@ export async function buildReleaseInputs({ root, sourceCommit, npmVersion, runne
     contractSet: {
       algorithm: "cuna-cli-public-contract-files-v1",
       authority: "CUNA_INFRA_OPENAPI_VENDORED_EXACT",
-      releaseAuthority: "UNRESOLVED_BLOCKING",
+      releaseAuthority: CONTRACT_RELEASE_AUTHORITY,
       files: contractFiles,
       aggregateSha256: aggregateDigest(contractFiles),
     },

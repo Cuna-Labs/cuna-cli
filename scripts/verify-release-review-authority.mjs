@@ -3,6 +3,16 @@ import path from "node:path";
 
 import { invariant, parseArgs } from "./lib/release-evidence.mjs";
 
+// This runs inside the protected release-review job, so the environment's
+// gating has already happened by the time it executes. What it establishes is
+// that the gate the run passed through is the gate this repository declares --
+// the right reviewer, self-review refused, no admin able to walk past it, and
+// no branch other than main able to enter it.
+//
+// It reads the remote state rather than trusting the declaration, and the
+// declaration exists so that a silent change to the remote environment fails
+// the release instead of quietly relaxing it.
+
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(args.get("root") ?? process.cwd());
 const repository = "Cuna-Labs/cuna-cli";
@@ -11,12 +21,11 @@ const declaration = JSON.parse(await readFile(path.join(root, "packaging", "rele
 const token = process.env.GITHUB_TOKEN;
 invariant(typeof token === "string" && token.length >= 20 && !/\s/u.test(token), "A read-only GitHub token is required");
 invariant(
-  declaration.schemaVersion === 1 && declaration.status === "UNCONFIGURED_BLOCKING" &&
+  declaration.schemaVersion === 2 && declaration.status === "CONFIGURED" &&
     declaration.repository === repository && declaration.environment === releaseReviewEnvironment &&
     declaration.protectedRef === "main" && declaration.requiredReviewer?.type === "User" &&
     declaration.requiredReviewer?.id === 312749809 && declaration.requiredReviewer?.login === "cunitacodeitor" &&
     declaration.requirePreventSelfReview === true && declaration.requireAdminBypassDisabled === true &&
-    declaration.observedAdminBypass === true &&
     declaration.requiredApprovalEvidence === "EXACT_APPROVER_ID_LOGIN_EVENT_AND_RUN_BINDING",
   "Release-review authority declaration differs",
 );
@@ -48,7 +57,10 @@ const environment = await getJson(`https://api.github.com/repos/${repository}/en
 const policies = await getJson(`https://api.github.com/repos/${repository}/environments/${releaseReviewEnvironment}/deployment-branch-policies`, "release-review branch-policy lookup");
 const reviewerRule = environment.protection_rules?.find((rule) => rule?.type === "required_reviewers");
 invariant(environment.name === declaration.environment, "Release-review environment identity differs");
-invariant(environment.can_admins_bypass === true, "Observed release-review admin-bypass state changed; declaration and review decision require re-audit");
+invariant(
+  environment.can_admins_bypass === false,
+  "RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED: a repository administrator can approve this environment's own gate",
+);
 invariant(reviewerRule?.prevent_self_review === true, "Release-review environment does not prevent self-review");
 invariant(
   reviewerRule.reviewers?.length === 1 && reviewerRule.reviewers[0]?.type === declaration.requiredReviewer.type &&
@@ -63,14 +75,11 @@ invariant(
     policies.branch_policies[0]?.type === "branch" && policies.branch_policies[0]?.name === declaration.protectedRef,
   "Release-review environment is not restricted exactly to main",
 );
-invariant(
-  JSON.stringify(declaration.blockers) === JSON.stringify([
-    "RELEASE_REVIEW_ENVIRONMENT_ADMIN_BYPASS_ENABLED",
-    "ACTUAL_ENVIRONMENT_APPROVAL_EVENT_NOT_OBSERVABLE_BY_WORKFLOW_TOKEN",
-    "CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE",
-    "CANDIDATE_BOUND_OBSERVATION_COHORT_NOT_AVAILABLE",
-    "CANDIDATE_RELEASE_CONTRACT_AUTHORITY_UNRESOLVED",
-  ]),
-  "Release-review blocker set differs",
-);
-process.stdout.write(`${JSON.stringify({ status: "UNCONFIGURED_BLOCKING", environment: declaration.environment, reviewerId: declaration.requiredReviewer.id, observedAdminBypass: environment.can_admins_bypass, blockers: declaration.blockers })}\n`);
+process.stdout.write(`${JSON.stringify({
+  status: "RELEASE_REVIEW_AUTHORITY_VERIFIED",
+  environment: declaration.environment,
+  reviewerId: declaration.requiredReviewer.id,
+  reviewerLogin: declaration.requiredReviewer.login,
+  adminBypass: environment.can_admins_bypass,
+  preventSelfReview: reviewerRule.prevent_self_review,
+})}\n`);
