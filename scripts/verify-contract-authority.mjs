@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { validateContractAuthority } from "./lib/release-approval-lease.mjs";
-import { invariant, parseArgs } from "./lib/release-evidence.mjs";
+import { invariant, parseArgs, strictHex } from "./lib/release-evidence.mjs";
 
 // The CLI vendors the Cuna public API contract. Vendored bytes prove only what
 // this repository chose to copy; they do not prove the producer approved that
@@ -35,13 +35,18 @@ try {
   throw error;
 }
 const declaration = validateContractAuthority(JSON.parse(declarationText));
+// The declaration is repository content. `validateContractAuthority` proves the
+// shape; these rebuild the two values that reach the network out of a local
+// alphabet, so the request path cannot carry anything the file chose.
+const sourceCommit = strictHex(declaration.sourceCommit, 40, "Contract source commit");
+const contractSha256 = strictHex(declaration.contractSha256, 64, "Contract digest");
 
 // The approval must describe the contract this candidate actually ships, not
 // some other revision of it.
 const canonicalDeclaration = (await readFile(canonicalDigestFile, "utf8")).trim().split(/\s+/u);
 invariant(canonicalDeclaration.length === 2, "Vendored canonical digest declaration is malformed");
 invariant(
-  declaration.contractSha256 === canonicalDeclaration[0],
+  contractSha256 === canonicalDeclaration[0],
   `${BLOCKER}: the approved contract digest is not the digest this candidate vendors`,
 );
 
@@ -59,29 +64,31 @@ async function producerRead(url, label) {
   });
   invariant(
     response.status === 200,
-    `${BLOCKER}: ${label} returned HTTP ${response.status} for ${declaration.producerRepository}; the workflow token cannot confirm the producer's approval`,
+    `${BLOCKER}: ${label} returned HTTP ${response.status} for ${PRODUCER_PATH}; the workflow token cannot confirm the producer's approval`,
   );
   const text = await response.text();
   invariant(Buffer.byteLength(text) <= 4_194_304, `${label} response is too large`);
   return JSON.parse(text);
 }
 
-const producer = encodeURIComponent(declaration.producerRepository.split("/")[0]);
-const producerRepo = encodeURIComponent(declaration.producerRepository.split("/")[1]);
-invariant(producer.length > 0 && producerRepo.length > 0, "Contract producer repository identity is malformed");
+// `validateContractAuthority` already pins producerRepository to one literal, so
+// the host and the owner/name segments are constants in this file rather than
+// anything the declaration can choose.
+const PRODUCER_PATH = "Cuna-Labs/infra";
+invariant(declaration.producerRepository === PRODUCER_PATH, "Contract producer repository identity is malformed");
 
 const commit = await producerRead(
-  `https://api.github.com/repos/${producer}/${producerRepo}/commits/${declaration.sourceCommit}`,
+  `https://api.github.com/repos/${PRODUCER_PATH}/commits/${sourceCommit}`,
   "producer commit lookup",
 );
-invariant(commit.sha === declaration.sourceCommit, `${BLOCKER}: the producer returned a different commit than the one declared`);
+invariant(commit.sha === sourceCommit, `${BLOCKER}: the producer returned a different commit than the one declared`);
 
 // The approval attestation path is a convention fixed here rather than a field
 // the declaration supplies, so an edited declaration cannot nominate an
 // arbitrary file in the producer repository as its own approval.
-const approvalPath = `contracts/approval/cuna-api.openapi.${declaration.contractSha256}.approval.json`;
+const approvalPath = `contracts/approval/cuna-api.openapi.${contractSha256}.approval.json`;
 const approval = await producerRead(
-  `https://api.github.com/repos/${producer}/${producerRepo}/contents/${approvalPath}?ref=${declaration.sourceCommit}`,
+  `https://api.github.com/repos/${PRODUCER_PATH}/contents/${approvalPath}?ref=${sourceCommit}`,
   "producer approval attestation lookup",
 );
 invariant(approval.type === "file" && approval.encoding === "base64" && typeof approval.content === "string", `${BLOCKER}: the producer approval attestation is not a readable file`);

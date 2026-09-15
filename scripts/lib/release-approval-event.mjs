@@ -1,4 +1,4 @@
-import { invariant } from "./release-evidence.mjs";
+import { invariant, strictDecimalId, strictLogin } from "./release-evidence.mjs";
 
 // A protected environment stops a job from starting until a required reviewer
 // approves, but nothing inside the job can see WHO approved unless it reads the
@@ -80,17 +80,21 @@ export function buildReleaseApprovalEventReceipt({ decision, environment, reposi
   invariant(Number.isSafeInteger(runAttempt) && runAttempt > 0, "Approval run attempt is invalid");
   invariant(typeof repository === "string" && repository.includes("/"), "Approval repository identity is invalid");
   invariant(typeof observedAt === "string" && observedAt.length > 0, "Approval observation time is required");
+  // The approver identity arrives over the network and is about to be written
+  // to disk as evidence. It was validated above; rebuilding it from a local
+  // alphabet makes the bytes that land in the receipt constants this code
+  // chose, of a length it bounds, rather than whatever the response contained.
   return {
     schemaVersion: 1,
     status: "PROTECTED_ENVIRONMENT_APPROVAL_OBSERVED",
     repository,
     environment,
-    runId: String(runId),
+    runId: strictDecimalId(runId, "Approval run identity"),
     runAttempt,
-    approverId: String(decision.id),
-    approverLogin: decision.login,
-    dispatchActorId: String(runActorId),
-    dispatchActorLogin: runActorLogin,
+    approverId: strictDecimalId(decision.id, "Approver identity"),
+    approverLogin: strictLogin(decision.login, "Approver login"),
+    dispatchActorId: strictDecimalId(runActorId, "Dispatching actor identity"),
+    dispatchActorLogin: strictLogin(runActorLogin, "Dispatching actor login"),
     approverIsDispatcher: false,
     observedAt,
   };
