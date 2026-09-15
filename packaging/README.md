@@ -4,16 +4,6 @@ npm is the canonical first-GA publication for Cuna CLI. Every other surface in
 this directory is a projection of the exact candidate npm tarball; no projection
 may rebuild, patch, re-bundle, or independently version the CLI.
 
-## Channel status
-
-| Surface | Intended command | Current repository status |
-| --- | --- | --- |
-| npm | `npm install -g @cuna_labs/cli` | Workflow scaffold only; no live package is asserted. |
-| Bun | `bun add --global @cuna_labs/cli` | Compatibility projection for Linux x64 and Intel macOS x64; Windows x64 is release-blocked. |
-| curl | `curl -fsSL https://getcuna.com/install \| sh` | Release-bound template only; endpoint availability is not asserted. |
-| Homebrew | `brew install Cuna-Labs/tap/cuna` | Formula template only; tap availability is not asserted. |
-| paru/AUR | `paru -S cuna-cli-bin` | PKGBUILD template only; AUR package availability is not asserted. |
-
 ## Release envelope and distribution manifest
 
 `release-envelope.schema.json` defines the immutable handoff. A release envelope
