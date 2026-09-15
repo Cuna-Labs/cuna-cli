@@ -333,6 +333,24 @@ test("CI contract rejects an approver identity offered as a dispatch input", asy
   await assert.rejects(verify(root), /caller-supplied authority as an input/u);
 });
 
+test("CI contract rejects a refusal-path evidence upload widened to the lease directory", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release-review.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("          path: evidence/\n", "          path: .\n");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /would let a refused review emit a partial lease/u);
+});
+
+test("CI contract rejects evidence retention that does not survive a refusal", async () => {
+  const root = await fixture();
+  const workflow = path.join(root, ".github", "workflows", "release-review.yml");
+  const content = (await readFile(workflow, "utf8"))
+    .replace("      - if: always()\n        uses: actions/upload-artifact", "      - uses: actions/upload-artifact");
+  await writeFile(workflow, content);
+  await assert.rejects(verify(root), /must run on refusal/u);
+});
+
 test("CI contract rejects an unattested approval lease leaving the review", async () => {
   const root = await fixture();
   const workflow = path.join(root, ".github", "workflows", "release-review.yml");
