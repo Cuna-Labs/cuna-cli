@@ -179,14 +179,29 @@ test("the documented first-run transcript ends in a foreground provider attach",
 
 test("README first run uses the local package and ends in the guided terminal journey", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
-  const section = readme.slice(
-    readme.indexOf("## Use Cuna from a local package"),
-    readme.indexOf("## Quick start for contributors"),
-  );
-  assert.match(section, /npm install --global .*cuna_labs-cli-0\.1\.0\.tgz/u);
-  assert.match(section, /cuna login\s+cuna\s+```/u);
-  assert.doesNotMatch(section, UUID_HEAVY);
-  assert.match(section, /Exact resource commands .*`cuna help --all`/su);
+
+  /* THE ANCHORS ARE ASSERTED BEFORE THEY ARE USED, and that is the repair this
+     test needed rather than a convenience. It used to slice between two literal
+     headings and assert against the result. When both headings were renamed,
+     `indexOf` returned -1 for each, `slice(-1, -1)` produced the empty string,
+     and every assertion below compared against nothing -- a test that fails for
+     the wrong reason and, with a different edit, could have passed while
+     checking nothing at all. */
+  const quickStart = readme.indexOf("## Quick start");
+  const commands = readme.indexOf("## Commands");
+  assert.ok(quickStart !== -1, "README must carry a Quick start heading");
+  assert.ok(commands > quickStart, "README must carry a Commands heading after Quick start");
+
+  // The packed artifact is still how a contributor takes a user's journey.
+  assert.match(readme, /npm install --global .*cuna_labs-cli-0\.1\.0\.tgz/u);
+  // Sign in, then the bare command, and the block ends there: no resource IDs.
+  assert.match(readme, /cuna login\s+cuna\s+```/u);
+  // The first run a reader meets asks for no identifiers. Bounded to the region
+  // above Commands, because the command reference legitimately names MACHINE_ID
+  // and --idempotency-key.
+  assert.doesNotMatch(readme.slice(quickStart, commands), UUID_HEAVY);
+  // And the exact resource commands are reachable from it.
+  assert.match(readme, /`cuna help --all`/u);
 });
 
 test("complete help and parser discovery have an empty bidirectional difference", () => {
