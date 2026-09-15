@@ -352,6 +352,7 @@ export class XtermViewportAdapter {
     this.#responseOverflow = false;
     let timeout: NodeJS.Timeout | undefined;
     try {
+      this.#armSynchronousParse();
       await Promise.race([
         new Promise<void>((resolve) => this.#terminal.write(bytes, resolve)),
         new Promise<never>((_resolve, reject) => {
@@ -385,6 +386,29 @@ export class XtermViewportAdapter {
       if (timeout !== undefined) clearTimeout(timeout);
       this.#responseBatch = undefined;
       this.#responseBatchBytes = 0;
+    }
+  }
+
+  /**
+   * `@xterm/headless` defers `write` to a `setTimeout` macrotask, which costs a
+   * full host timer tick per remote output frame. `handleUserInput()` is
+   * xterm's own input-latency path: the next write on an empty buffer parses
+   * synchronously instead, with the same callback and the same 12 ms yield
+   * slicing for large payloads. Writes here are serialized behind `#writeTail`,
+   * so the buffer is always empty, and a synchronous parse also surfaces a
+   * parser fault to this adapter's `catch` instead of an unhandled timer
+   * callback.
+   *
+   * This reaches past the public surface, so it stays confined to this adapter
+   * and the exact `@xterm/headless` pin, and is feature-detected: an unknown
+   * build keeps the deferred behaviour rather than failing.
+   */
+  #armSynchronousParse(): void {
+    const writeBuffer = (this.#terminal as unknown as {
+      readonly _core?: { readonly _writeBuffer?: { readonly handleUserInput?: () => void } };
+    })._core?._writeBuffer;
+    if (typeof writeBuffer?.handleUserInput === "function") {
+      writeBuffer.handleUserInput();
     }
   }
 
@@ -443,8 +467,15 @@ export class XtermViewportAdapter {
     const renderRows: ViewportRenderRun[][] = [];
     const columns = Math.min(this.#terminal.cols, host?.columns ?? this.#terminal.cols);
     const rows = Math.min(this.#terminal.rows, host?.rows ?? this.#terminal.rows);
+    // A host frame shorter than the writer's screen shows a window onto that
+    // screen, not its first rows. Terminals are bottom-anchored: the live
+    // region -- prompt, status line, newest output -- sits at the cursor.
+    // Anchor the window so the cursor row stays inside it, and keep the top
+    // whenever the writer's screen already fits, which is the only case the
+    // non-projecting capture can reach.
+    const rowOffset = Math.min(Math.max(0, buffer.cursorY - rows + 1), this.#terminal.rows - rows);
     for (let row = 0; row < rows; row += 1) {
-      const line = buffer.getLine(buffer.viewportY + row);
+      const line = buffer.getLine(buffer.viewportY + rowOffset + row);
       let visibleWidth = 0;
       if (line !== undefined) {
         for (let column = 0; column < columns; column += 1) {
@@ -503,11 +534,18 @@ export class XtermViewportAdapter {
       },
     };
     if (host !== undefined) {
+      // The cursor travels with the window instead of being relocated into it.
+      // Clamping it reported a position the writer's terminal never held; the
+      // offset maps the real row, and a cursor outside the clipped width is
+      // genuinely off this host frame and stays hidden.
+      const projectedCursorY = frame.cursorY - rowOffset;
       return Object.freeze({ ...frame, columns: host.columns, rows: host.rows,
         cells: Object.freeze(cells), displayWidths: Object.freeze(displayWidths),
         renderRows: Object.freeze(renderRows.map(row => Object.freeze(row.map(run => Object.freeze(run))))),
-        cursorX: Math.min(host.columns - 1, frame.cursorX), cursorY: Math.min(host.rows - 1, frame.cursorY),
-        modes: Object.freeze({ ...frame.modes, cursorVisible: frame.modes.cursorVisible && frame.cursorX < host.columns && frame.cursorY < host.rows }),
+        cursorX: Math.min(host.columns - 1, frame.cursorX),
+        cursorY: projectedCursorY < 0 || projectedCursorY >= rows ? 0 : projectedCursorY,
+        modes: Object.freeze({ ...frame.modes, cursorVisible: frame.modes.cursorVisible &&
+          frame.cursorX < columns && projectedCursorY >= 0 && projectedCursorY < rows }),
       });
     }
     return localReflow

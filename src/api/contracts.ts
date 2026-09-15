@@ -502,6 +502,15 @@ export type AgentSessionProcessState =
   | "failed"
   | "terminating"
   | "terminated";
+/**
+ * The provenance of `processState`, which is a different question from the
+ * state itself and from whether the runtime lease has expired.
+ *
+ * Read from producer `Cuna-Labs/infra` commit
+ * `7cb7e37ec8f0821fc6b402be5fcc9bc8e9439d55`, `components.schemas.AgentSession
+ * .process_observation`.
+ */
+export type AgentSessionProcessObservation = "observed" | "unproven" | "unknown";
 export interface AgentSession {
   readonly id: string;
   readonly machineId: string;
@@ -528,6 +537,27 @@ export interface AgentSession {
   readonly desiredState: AgentSessionDesiredState;
   readonly requestState: AgentSessionRequestState;
   readonly processState: AgentSessionProcessState;
+  /**
+   * Whether a supervisor ESTABLISHED `processState` and `runtimeObservedAt` for
+   * the CURRENT process epoch, in the producer's own words:
+   *
+   *   `observed`  it did.
+   *   `unproven`  it settled a runtime-lease renewal without being able to
+   *               observe the child, so `processState` and `runtimeObservedAt`
+   *               are the last values anybody established and the lease moved
+   *               without them.
+   *   `unknown`   no provenance is recorded for this epoch.
+   *
+   * ABSENT is not a fourth value and is not `observed`. A deployment older than
+   * the release that began recording provenance sends nothing here, and that is
+   * the same fact as `unknown`: nobody recorded whether anyone looked.
+   * `agentSessionProcessObservation` in `machines/session-visibility.ts` is
+   * where absence is folded into `unknown`, once, so no renderer has to decide.
+   *
+   * Cuna states no staleness threshold and this CLI must not invent one.
+   * `runtimeExpiresAt` is lease authority, never observation freshness.
+   */
+  readonly processObservation?: AgentSessionProcessObservation;
   readonly processEpoch?: string;
   readonly runtimeObservedAt?: string;
   readonly runtimeExpiresAt?: string;
@@ -578,6 +608,9 @@ const REQUEST_STATES = new Set<AgentSessionRequestState>([
 const PROCESS_STATES = new Set<AgentSessionProcessState>([
   "unknown", "starting", "ready", "running", "exited", "failed", "terminating", "terminated",
 ]);
+const PROCESS_OBSERVATIONS: ReadonlySet<string> = new Set<AgentSessionProcessObservation>([
+  "observed", "unproven", "unknown",
+]);
 const AGENT_AUTH_STATES = new Set<AgentSessionAuthState>([
   "login_required", "authenticated", "configured", "unavailable",
 ]);
@@ -609,6 +642,7 @@ function decodeAgentSession(value: unknown): AgentSession {
     "desired_state",
     "request_state",
     "process_state",
+    "process_observation",
     "process_epoch",
     "runtime_observed_at",
     "runtime_expires_at",
@@ -638,6 +672,14 @@ function decodeAgentSession(value: unknown): AgentSession {
   if (terminalReason !== undefined &&
       (!isTerminalReason(terminalReason) || !["exited", "failed", "terminated"].includes(processState))) {
     throw contractViolation("terminal_state_safe_reason", "terminal_reason");
+  }
+  // Strict where it is present, tolerant of its absence, and never defaulted.
+  // A value this build does not know is refused rather than demoted: an
+  // unrecognised provenance could be a NEW way to say "nobody looked", and
+  // reading it as `observed` is the one error this field exists to prevent.
+  const processObservation = optionalString(value, "process_observation");
+  if (processObservation !== undefined && !PROCESS_OBSERVATIONS.has(processObservation)) {
+    throw contractViolation("known_enum_value", "process_observation");
   }
   const processEpoch = optionalString(value, "process_epoch");
   const runtimeObservedAt = optionalString(value, "runtime_observed_at");
@@ -686,6 +728,9 @@ function decodeAgentSession(value: unknown): AgentSession {
     desiredState,
     requestState,
     processState,
+    ...(processObservation === undefined
+      ? {}
+      : { processObservation: processObservation as AgentSessionProcessObservation }),
     ...(processEpoch === undefined
       ? {}
       : UUID.test(processEpoch)

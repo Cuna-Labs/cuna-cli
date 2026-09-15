@@ -1,6 +1,48 @@
-import type { AgentSession } from "../api/contracts.js";
+import type { AgentSession, AgentSessionProcessObservation } from "../api/contracts.js";
 
 const MAX_FUTURE_SKEW_MS = 5_000;
+
+/**
+ * Whether a supervisor ESTABLISHED this row's process state for its CURRENT
+ * epoch, folding "the field is absent" into the one answer it is.
+ *
+ * Absence is `unknown`, not `observed`. A deployment older than the release that
+ * began recording provenance sends no field at all, and the producer's own
+ * description of `unknown` already covers exactly that case: "every observation
+ * older than the release that began recording it". Defaulting the other way is
+ * the single mistake this field exists to make impossible, so the fold happens
+ * once, here, and no renderer is left to decide it.
+ */
+export function agentSessionProcessObservation(
+  session: AgentSession,
+): AgentSessionProcessObservation {
+  return session.processObservation ?? "unknown";
+}
+
+/**
+ * The words a human surface puts beside a state whose provenance is not
+ * `observed`, defined once so the session list, the Machine tree and the
+ * explorer cannot drift into three vocabularies for one producer field.
+ *
+ * `observed` has no word on purpose. It is what an unqualified "running"
+ * already means, and a qualifier on every healthy row is noise that teaches a
+ * reader to skip the two that matter.
+ *
+ * The other two are kept apart rather than folded into one "unverified",
+ * because the producer distinguishes them and the causes differ: `unproven` is
+ * a supervisor that settled a runtime-lease renewal without being able to
+ * observe the child, and `unknown` is no provenance recorded for this epoch at
+ * all — including every row from a deployment older than the release that
+ * began recording it. Neither says the process is stale, and neither may be
+ * rendered as a termination.
+ */
+export const AGENT_SESSION_OBSERVATION_NOTE: Readonly<
+  Record<AgentSessionProcessObservation, string | undefined>
+> = Object.freeze({
+  observed: undefined,
+  unproven: "not observed",
+  unknown: "observation unknown",
+});
 
 /**
  * A still-running process is not an active session once termination has been
@@ -51,9 +93,21 @@ export type AgentSessionRuntimeEvidence =
   /** Last observed running, and the runtime lease has since lapsed. */
   | "observed_running_lease_expired"
   /**
-   * The strongest thing an AgentSession row can support: it was observed
-   * running at `lastObservedAt`, and the lease covering it is still open. It is
-   * NOT a statement that the process is alive at `now`.
+   * The row reports running, and the producer says nobody established that for
+   * this process epoch: a lease renewal settled without observing the child, or
+   * no provenance is recorded at all.
+   *
+   * It is deliberately its own value rather than a qualifier on the two
+   * `observed_*` ones. The word "observed" is a claim, and the whole reason the
+   * producer publishes `process_observation` is that a moving lease was making
+   * that claim on nobody's behalf. The lease is still reported in
+   * `leaseCurrent`, because it is still true — it is just not this.
+   */
+  | "reported_running_observation_unproven"
+  /**
+   * The strongest thing an AgentSession row can support: a supervisor observed
+   * it running at `lastObservedAt` for this epoch, and the lease covering it is
+   * still open. It is NOT a statement that the process is alive at `now`.
    */
   | "observed_running_lease_current";
 
@@ -66,6 +120,12 @@ export interface AgentSessionRuntimeReading {
   readonly leaseExpiresAt?: string;
   /** The lease window alone. True says nothing about the process. */
   readonly leaseCurrent: boolean;
+  /**
+   * The producer's provenance for `processState`, with absence folded into
+   * `unknown`. Carried on every reading so a caller can never get a lease
+   * without also getting the answer to "did anybody look?".
+   */
+  readonly processObservation: AgentSessionProcessObservation;
 }
 
 /**
@@ -106,31 +166,47 @@ export function readRuntimeWindow(session: AgentSession, now: number): RuntimeWi
 
 function reading(
   evidence: AgentSessionRuntimeEvidence,
-  extra: Omit<AgentSessionRuntimeReading, "evidence"> = { leaseCurrent: false },
+  processObservation: AgentSessionProcessObservation,
+  extra: Omit<AgentSessionRuntimeReading, "evidence" | "processObservation"> = { leaseCurrent: false },
 ): AgentSessionRuntimeReading {
-  return Object.freeze({ evidence, ...extra });
+  return Object.freeze({ evidence, processObservation, ...extra });
 }
 
 export function readAgentSessionRuntime(session: AgentSession, now: number): AgentSessionRuntimeReading {
-  if (!isAgentSessionIntendedActive(session)) return reading("not_intended_active");
-  if (session.processState !== "running") return reading("not_reported_running");
+  const observation = agentSessionProcessObservation(session);
+  if (!isAgentSessionIntendedActive(session)) return reading("not_intended_active", observation);
+  if (session.processState !== "running") return reading("not_reported_running", observation);
   const runtimeWindow = readRuntimeWindow(session, now);
-  if (runtimeWindow.kind === "missing") return reading("evidence_missing");
-  if (runtimeWindow.kind === "invalid") return reading("evidence_invalid");
+  if (runtimeWindow.kind === "missing") return reading("evidence_missing", observation);
+  if (runtimeWindow.kind === "invalid") return reading("evidence_invalid", observation);
   const leaseCurrent = runtimeWindow.kind === "lease_current";
-  return reading(leaseCurrent ? "observed_running_lease_current" : "observed_running_lease_expired", {
+  const window = {
     ...(runtimeWindow.lastObservedAt === undefined ? {} : { lastObservedAt: runtimeWindow.lastObservedAt }),
     ...(runtimeWindow.observationAgeMs === undefined ? {} : { observationAgeMs: runtimeWindow.observationAgeMs }),
     ...(runtimeWindow.leaseExpiresAt === undefined ? {} : { leaseExpiresAt: runtimeWindow.leaseExpiresAt }),
     leaseCurrent,
-  });
+  };
+  // The ordering that answers the requirement: a current lease is checked AFTER
+  // provenance, never instead of it. `unproven` with an open lease is the exact
+  // row this field was published for -- the lease moved and nothing observed the
+  // child -- and it must not render as a fresh observation.
+  if (observation !== "observed") {
+    return reading("reported_running_observation_unproven", observation, window);
+  }
+  return reading(
+    leaseCurrent ? "observed_running_lease_current" : "observed_running_lease_expired",
+    observation,
+    window,
+  );
 }
 
 /**
- * The last thing the producer observed about the process, with no lease in it.
+ * The last thing a supervisor OBSERVED about the process, with no lease in it.
  *
  * Past tense in the name because it is past tense in the data: a caller that
- * wants to say something about `now` needs more than this row.
+ * wants to say something about `now` needs more than this row. It is false when
+ * the producer says nobody established the state for this epoch, because then
+ * there is no observation to be past tense about.
  */
 export function wasAgentSessionObservedRunning(session: AgentSession, now: number): boolean {
   const value = readAgentSessionRuntime(session, now).evidence;

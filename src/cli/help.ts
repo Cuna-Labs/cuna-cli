@@ -154,6 +154,7 @@ Available now:
   machines update-supervisor ID        Update a stopped OpenCode terminal supervisor
   machines live-update-supervisor ID   Update a running terminal supervisor in place;
                                        reports one custody line per AgentSession
+  machines live-update-status ID       Read what one in-place update did; sends nothing
   machines delete ID                   Delete when server-advertised
   records list                         List redacted account activity records
   account show                         Show the public account identity

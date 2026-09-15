@@ -57,7 +57,12 @@ import {
   type TerminalConnectionGrant,
   type WorkspaceBindingAuthority,
 } from "./contracts.js";
-import { decodeSupervisorLiveUpdate, type SupervisorLiveUpdate } from "./supervisor-live-update.js";
+import {
+  decodeSupervisorLiveUpdate,
+  decodeSupervisorLiveUpdateOperation,
+  type SupervisorLiveUpdate,
+  type SupervisorLiveUpdateOperation,
+} from "./supervisor-live-update.js";
 import type { HttpRequest, HttpTransport } from "./http.js";
 import { decodeExecutionWorkspacePage, type ExecutionWorkspacePage } from "./execution-workspaces.js";
 import { decodeManagedExecution, decodeManagedExecutionPage, type ManagedExecution, type ManagedExecutionPage } from "./managed-executions.js";
@@ -160,8 +165,29 @@ export interface CunaApiClient {
    * installer runs and re-measures them under the install lock. A 200 carries
    * one custody outcome per AgentSession that existed beforehand; it is not a
    * promise that all of them survived, and callers must read the outcomes.
+   *
+   * `operationId` is chosen and durably recorded by the CALLER before this is
+   * called. Sending the SAME value again is the supported recovery for a lost
+   * answer and never rotates control twice; sending a different value for an
+   * unsettled Machine is refused by the producer.
    */
-  updateMachineSupervisorInPlace(id: string, signal?: AbortSignal): Promise<SupervisorLiveUpdate>;
+  updateMachineSupervisorInPlace(
+    id: string,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<SupervisorLiveUpdate>;
+  /**
+   * `sessions.readSupervisorInPlaceUpdate`: what one owned in-place update did.
+   *
+   * A read. It dispatches no installer, sends nothing to the Machine and
+   * changes no state, which is precisely why it — and not a second mutation —
+   * is what a caller reaches for after an interruption.
+   */
+  readMachineSupervisorInPlaceUpdate(
+    id: string,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<SupervisorLiveUpdateOperation>;
   deleteMachine(id: string): Promise<unknown>;
   executeManagedCommand(machineId: string, operationId: string, input: ManagedCommandInput, signal?: AbortSignal): Promise<ManagedCommandResult>;
   listManagedExecutions(machineId: string, input?: { readonly executionWorkspaceId?: string; readonly after?: string }, signal?: AbortSignal): Promise<ManagedExecutionPage>;
@@ -623,22 +649,27 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       }
       return machine;
     },
-    async updateMachineSupervisorInPlace(id, signal) {
+    async updateMachineSupervisorInPlace(id, operationId, signal) {
       const safeId = encodeMachineId(id);
+      assertCanonicalUuid(operationId, "supervisor update operation ID");
       const request: HttpRequest = {
         method: "POST",
         path: `/v1/sessions/${safeId}/supervisor/live-update`,
-        // Both reads a caller needs after an unknown outcome, and neither of
-        // them repeats the mutation.
-        settleWith: `cuna agent-sessions list --machine ${id}`,
+        // Chosen by the caller before this line, recorded durably before this
+        // line, and the reason a lost answer is recoverable at all. The producer
+        // journals it before it issues any enrollment, so the same value never
+        // rotates control twice.
+        body: { operation_id: operationId },
+        // The read that settles this operation's outcome without spending
+        // anything, and the only one that answers what this update did.
+        settleWith: `cuna machines live-update-status ${id} --operation ${operationId}`,
         budgetMs: SUPERVISOR_LIVE_UPDATE_REQUEST_BUDGET_MS,
-        // This operation carries no request body and no idempotency key, and
-        // the producer keeps no durable identity for it, so a second POST is
-        // indistinguishable from a first one at every layer. The transport's
-        // automatic connect-phase re-dispatch happens below the command's
-        // duplicate-suppression gate and below the local record, so it would be
-        // the one dispatch this CLI cannot see. It is off for this request and
-        // unchanged for every other.
+        // Still off, and now for a sharper reason than before. The identity
+        // above makes a repeat SAFE on the producer's side, but it must remain
+        // a DECISION: `machines live-update-supervisor --resume` is that
+        // decision, taken by a person who has read the operation. A transport
+        // re-dispatch happens below the command, below the local record and
+        // below the person, so it would be the one repetition nobody chose.
         automaticRedispatch: false,
         ...(signal === undefined ? {} : { signal }),
       };
@@ -646,11 +677,37 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       // The path id is the Machine, so the Machine in the body must be the one
       // that was asked about. Without this, a producer answering about a sibling
       // would have its control generation and artifact digest reported as this
-      // Machine's.
+      // Machine's. The operation identity is checked for the same reason: an
+      // answer about another operation is not an answer about this one, and the
+      // caller is about to settle a durable record against it.
       if (result.machine.id !== id) {
         throw malformed(contractViolation("matches_requested_resource", "machine.id"), operationLabel(request));
       }
+      if (result.operationId !== operationId) {
+        throw malformed(contractViolation("matches_requested_operation", "operation_id"), operationLabel(request));
+      }
       return result;
+    },
+    async readMachineSupervisorInPlaceUpdate(id, operationId, signal) {
+      const safeId = encodeMachineId(id);
+      const safeOperationId = encodeCanonicalUuid(operationId, "supervisor update operation ID");
+      const request: HttpRequest = {
+        method: "GET",
+        path: `/v1/sessions/${safeId}/supervisor/live-update/${safeOperationId}`,
+        // A database read scoped to the owner and this Machine. It dispatches no
+        // installer and writes nothing, so the ordinary read budget applies and
+        // an automatic re-dispatch of it costs nothing.
+        settleWith: `cuna machines live-update-status ${id} --operation ${operationId}`,
+        ...(signal === undefined ? {} : { signal }),
+      };
+      const operation = await fetchDecoded(request, decodeSupervisorLiveUpdateOperation);
+      if (operation.machineId !== id || operation.operationId !== operationId) {
+        throw malformed(
+          contractViolation("matches_requested_operation", "operation_id"),
+          operationLabel(request),
+        );
+      }
+      return operation;
     },
     async deleteMachine(id) {
       const safeId = encodeMachineId(id);

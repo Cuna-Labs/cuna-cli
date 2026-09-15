@@ -6,7 +6,10 @@ import type { ForegroundTerminalHost } from "../terminal/foreground.js";
 import { runtimeFailure } from "../runtime/errors.js";
 
 const ENABLE_LOCAL_BRACKETED_PASTE = "\u001b[?2004h";
-const ENTER_ALTERNATE_SCREEN = `\u001b[?1049h${ENABLE_LOCAL_BRACKETED_PASTE}\u001b[H`;
+// Rich mode renders cells locally: inherited mouse reporting must not steal
+// the host terminal's text selection and clipboard gestures.
+const DISABLE_MOUSE_REPORTING = "\u001b[?1000l\u001b[?1002l\u001b[?1003l\u001b[?1006l";
+const ENTER_ALTERNATE_SCREEN = `\u001b[?1049h${DISABLE_MOUSE_REPORTING}${ENABLE_LOCAL_BRACKETED_PASTE}\u001b[H`;
 const LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
 const RESET_REMOTE_MODES = [
   "\u001b[?1000l\u001b[?1002l\u001b[?1003l\u001b[?1004l\u001b[?1006l",

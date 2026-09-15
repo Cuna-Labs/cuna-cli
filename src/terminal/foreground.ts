@@ -1,3 +1,4 @@
+import { copyLocalText } from "../local-actions/clipboard.js";
 import type {
   RuntimeTerminalResponse,
   RuntimeTerminalSnapshot,
@@ -145,6 +146,7 @@ interface PendingRemoteLocalActionResult {
 export interface ForegroundTerminalCoordinatorOptions {
   readonly host: ForegroundTerminalHost;
   readonly browser?: BrowserOpener;
+  readonly copyText?: (text: string) => Promise<void>;
   readonly appbar?: () => AppbarModel;
   readonly color?: boolean;
   readonly clock?: () => number;
@@ -175,7 +177,11 @@ export class ForegroundTerminalCoordinator {
   #removeResize: (() => void) | undefined;
   #resizeTimer: NodeJS.Timeout | undefined;
   #renderTail: Promise<void> = Promise.resolve();
+  /** The last complete frame the host accepted; undefined whenever the host screen is not known to show it. */
+  #lastHostFrame: Uint8Array | undefined;
   #inputTail: Promise<void> = Promise.resolve();
+  readonly #copyDetectors = new Map<string, ProviderBrowserActionDetector[]>();
+  readonly #copyLinks = new Map<string, LocalBrowserActionRequest>();
   #prefixPending = false;
   #prefixTarget: ForegroundInputTarget | undefined;
   #pasteActive = false;
@@ -442,6 +448,8 @@ export class ForegroundTerminalCoordinator {
     for (const tab of this.#tabs.values()) tab.viewport.dispose();
     this.#tabs.clear();
     this.#browserDetectors.clear();
+    this.#copyDetectors.clear();
+    this.#copyLinks.clear();
     this.#retainedBrowserDetectors.clear();
     this.#retainedBrowserCandidates.clear();
     this.#retainedPendingRequestId = undefined;
@@ -489,6 +497,8 @@ export class ForegroundTerminalCoordinator {
     }
     if (previous !== undefined) this.#forgetSeatNoticeOnSeatChange(previous.snapshot, snapshot);
     const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
+    this.#copyLinks.delete(snapshot.tabId);
+    this.#copyDetectors.set(snapshot.tabId, (["codex", "claude-code"] as const).map(provider => new ProviderBrowserActionDetector({ copyOnly: true, provider, agentSessionId: snapshot.agentSessionId, processEpoch: snapshot.processEpoch, fencingGeneration: snapshot.fencingGeneration, clock: this.#clock })));
     this.#retainedBrowserDetectors.delete(snapshot.tabId);
     this.#retainedBrowserCandidates.delete(snapshot.tabId);
     if (
@@ -649,6 +659,10 @@ export class ForegroundTerminalCoordinator {
     // Retained output remains visible but cannot acquire fresh local-action
     // authority. Do not feed it into the streaming detector: a historical
     // prefix must never combine with a live suffix into a new request.
+    for (const detector of this.#copyDetectors.get(event.tabId) ?? []) {
+      const candidate = detector.push(event.bytes).at(-1);
+      if (candidate !== undefined) this.#copyLinks.set(event.tabId, candidate);
+    }
     const detected = event.provenance === "live"
       ? this.#browserDetectors.get(event.tabId)?.push(event.bytes) ?? [] : [];
     if (event.provenance !== "live") {
@@ -821,7 +835,9 @@ export class ForegroundTerminalCoordinator {
       if (error instanceof RuntimeBoundaryError && error.code === "terminal_observer") {
         // Typing into an observed terminal is refused, not fatal: the seat is
         // someone else's. Say so on the notice line and keep observing.
-        this.#seatNotice = error.message;
+        const snapshot = this.#activeTabId === undefined ? undefined : this.#tabs.get(this.#activeTabId)?.snapshot;
+        this.#seatNotice = snapshot === undefined ? "Read-only · input was not sent."
+          : writerCapabilityRefusal(snapshot) ?? "Input not sent · press Ctrl+] then w to take control";
         this.#helpVisible = false;
         void this.#render().catch(() => undefined);
         return;
@@ -947,6 +963,9 @@ export class ForegroundTerminalCoordinator {
       } else if (byte === TAKE_WRITER) {
         await flush();
         this.#takeWriterActiveTab();
+      } else if (byte === 0x79) {
+        await flush();
+        await this.#copySignInLink(chordTarget);
       } else if (byte === RETAINED_SIGN_IN) {
         await flush();
         await this.#requestRetainedSignIn();
@@ -1070,6 +1089,24 @@ export class ForegroundTerminalCoordinator {
     }
     await this.#render();
     this.#promoteBrowserAction();
+  }
+
+  async #copySignInLink(target: ForegroundInputTarget | undefined): Promise<void> {
+    const tab = target === undefined ? undefined : this.#tabs.get(target.tabId);
+    const link = target === undefined ? undefined : this.#copyLinks.get(target.tabId);
+    if (target === undefined || target.tabId !== this.#activeTabId || tab === undefined || link === undefined ||
+        link.agentSessionId !== tab.snapshot.agentSessionId || link.processEpoch !== tab.snapshot.processEpoch ||
+        link.fencingGeneration !== tab.snapshot.fencingGeneration) {
+      this.#browserNotice = "No hay enlace para copiar. Solicita un enlace de acceso en el agente.";
+    } else {
+      try {
+        await (this.#options.copyText ?? copyLocalText)(link.url);
+        this.#browserNotice = "Enlace copiado al portapapeles local. Si caducó, solicita uno nuevo.";
+      } catch {
+        this.#browserNotice = "No se pudo copiar el enlace al portapapeles local. Inténtalo de nuevo.";
+      }
+    }
+    await this.#render();
   }
 
   async #requestRetainedSignIn(): Promise<void> {
@@ -1508,6 +1545,8 @@ export class ForegroundTerminalCoordinator {
     }
     this.#localDetachTabIds.delete(tabId);
     this.#browserDetectors.delete(tabId);
+    this.#copyDetectors.delete(tabId);
+    this.#copyLinks.delete(tabId);
     this.#retainedBrowserDetectors.delete(tabId);
     this.#retainedBrowserCandidates.delete(tabId);
     if (this.#pendingBrowserActionTabId === tabId) {
@@ -1592,6 +1631,9 @@ export class ForegroundTerminalCoordinator {
   }
 
   async #applyResize(): Promise<void> {
+    // The host reflows or clears its alternate screen on resize; the last
+    // frame no longer describes what it shows.
+    this.#lastHostFrame = undefined;
     const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
     const rows = remoteRows(dimensions.rows);
     for (const [tabId, tab] of this.#tabs) {
@@ -1711,6 +1753,7 @@ export class ForegroundTerminalCoordinator {
         rows: dimensions.rows,
         activeTabId,
         tabs,
+        ...(this.#copyLinks.has(activeTabId) ? { action: "Copiar enlace · Ctrl+] y" } : {}),
         appbar: this.#options.appbar?.() ?? runtimeAppbar(
           this.#clock(),
           this.#tabs.get(activeTabId)?.snapshot,
@@ -1734,7 +1777,7 @@ export class ForegroundTerminalCoordinator {
                     : `${providerName(this.#pendingBrowserAction.provider)} requests browser authentication · Enter/o open · d/Esc deny`,
               }
               : this.#helpVisible
-                ? { notice: "Keys: Ctrl+C detach | Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry" +
+                ? { notice: "Keys: Ctrl+C detach | " + (process.platform === "win32" ? "Select text + Ctrl+Shift+C copy | Ctrl+Shift+V paste | " : "") + "Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry" +
                     (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
                       ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"
@@ -1745,7 +1788,15 @@ export class ForegroundTerminalCoordinator {
                     ? { notice: "Sign-in link in history · Ctrl+] a to inspect · if rejected, request a new link in the provider" }
                     : {}),
       });
+      // Every accepted keystroke and every output frame renders a complete
+      // absolute-addressed frame. Most of them repaint exactly what the host
+      // already shows (measured 2026-09-15: three of four frames per typed
+      // key changed no row). A byte-identical frame is not written again;
+      // anything else that touches the host clears this memory first.
+      if (this.#lastHostFrame !== undefined && sameBytes(this.#lastHostFrame, frame.bytes)) return;
+      this.#lastHostFrame = undefined;
       await this.#options.host.write(frame.bytes);
+      this.#lastHostFrame = frame.bytes;
     });
     this.#renderTail = operation.then(() => undefined, () => undefined);
     await operation;
@@ -1801,6 +1852,7 @@ export class ForegroundTerminalCoordinator {
       dimensions.rows > 1 ? detail : "",
       color ? "\u001b[0m" : "",
     ].join("");
+    this.#lastHostFrame = undefined;
     await this.#options.host.write(new TextEncoder().encode(text));
   }
 
@@ -1874,6 +1926,7 @@ export class ForegroundTerminalCoordinator {
       dimensions.rows > 1 ? detail : "",
       color ? "\u001b[0m" : "",
     ].join("");
+    this.#lastHostFrame = undefined;
     await this.#options.host.write(new TextEncoder().encode(text));
   }
 
@@ -1977,12 +2030,12 @@ export class ForegroundTerminalCoordinator {
     if (snapshot === undefined || snapshot.state !== "active" || snapshot.accessMode !== "observer") return historical;
     const refusal = writerCapabilityRefusal(snapshot);
     if (refusal !== undefined) return withHistory(refusal);
-    if (writerCapabilityNeedsRefresh(snapshot)) return withHistory("Observing (read-only) · Ctrl+] w to recheck control");
+    if (writerCapabilityNeedsRefresh(snapshot)) return withHistory("Observing (read-only) · Press Ctrl+] then w to recheck control");
     return withHistory(snapshot.reason === "writer_transferred"
-      ? "Control moved to another client · Ctrl+] w to take it back"
+      ? "Control moved to another client · Press Ctrl+] then w to take it back"
       : snapshot.geometry == null
-        ? "Observing (read-only) · geometry unknown · Ctrl+] w"
-        : "Observing (read-only) · Ctrl+] w to take control");
+        ? "Observing (read-only) · geometry unknown · Ctrl+] then w: control"
+        : "Observing (read-only) · Press Ctrl+] then w to take control");
   }
 }
 
@@ -2015,6 +2068,14 @@ export function admitForegroundDimensions(input: { readonly columns: number; rea
     throw new RangeError("The foreground host terminal dimensions are outside supported bounds.");
   }
   return Object.freeze({ columns: input.columns, rows: input.rows });
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
 }
 
 function remoteRows(hostRows: number): number {

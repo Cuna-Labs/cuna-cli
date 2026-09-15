@@ -2710,7 +2710,7 @@ test("a remote ERROR frame's bounded code is kept beside the protocol failure; u
   // attached view with `view.lease_expired`, and the CLI could only say
   // `terminal_protocol_error`. The remote code is a rendering aid, never the
   // failure classification, and only an identifier-shaped code survives.
-  for (const [code, expected] of [["view.lease_expired", "view.lease_expired"], ["Not An Identifier; secret=x", undefined]]) {
+  for (const [code, expected] of [["opencode_server_exited", "opencode_server_exited"], ["Not An Identifier; secret=x", undefined]]) {
     const system = new FakeTerminalSystem();
     const { runtime } = createRuntime(system);
     try {
@@ -2759,3 +2759,21 @@ for (const phase of ["initial", "live", "reconnect"]) {
     } finally { await runtime.shutdown(); }
   });
 }
+
+test("expired view retires input and permits fresh admission to the same session", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    system.connections[0].incoming.push(encodeTerminalControl("error", 0n, {
+      code: "view.lease_expired", retryable: false, safeReason: "view.lease_expired",
+    }));
+    await waitUntil(() => runtime.listTerminals()[0].state !== "active", "expired view stops input");
+    assert.equal(runtime.listTerminals()[0].state, "interrupted");
+    await assert.rejects(runtime.sendInput(new Uint8Array([65]), "tab-a"));
+    const recovered = await runtime.reconnect({ tabId: "tab-a" });
+    assert.equal(recovered.agentSessionId, "agent-a");
+    assert.equal(recovered.state, "active");
+    assert.equal(system.createCalls.length, 2);
+  } finally { await runtime.shutdown(); }
+});

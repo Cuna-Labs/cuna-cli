@@ -143,7 +143,9 @@ test("trusted appbar removes bidi controls and truncates by terminal cell width"
   assert.equal(frame.text.includes("\u202E"), false);
   const appbar = frame.text.slice(frame.text.indexOf("\u001b[1;1H") + 6, frame.text.indexOf("\u001b[2;1H"));
   let width = 0;
-  for (const character of appbar.normalize("NFC")) {
+  assert.ok(appbar.startsWith("\u001b[0m\u001b[2K"), "erase stale header cells before repainting");
+  // eslint-disable-next-line no-control-regex -- the escape introducer is the subject under test
+  for (const character of appbar.replace(/\u001b\[[0-9;]*[mK]/gu, "").normalize("NFC")) {
     const point = character.codePointAt(0);
     width += /[\p{M}\p{Cf}]/u.test(character) ? 0
       : /\p{Extended_Pictographic}/u.test(character) || (point >= 0x1100 && point <= 0x3fffd) ? 2

@@ -858,6 +858,11 @@ function batchProgressLabel(parsed: ParsedInvocation): string | undefined {
           // behind it, and the spinner stops when the answer arrives or that
           // budget elapses -- never on its own.
           return "Checking this machine and attempting an in-place supervisor update";
+        case "live-update-status":
+          // A read, and the label says so. It dispatches no installer and
+          // changes nothing, which is the whole reason it is safe to run after
+          // an interruption.
+          return "Reading what this machine's in-place supervisor update did";
         default:
           return "Reading your machines";
       }

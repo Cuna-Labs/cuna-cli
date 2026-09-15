@@ -55,6 +55,13 @@ const VALUE = Object.freeze({
   desired_state: "running",
   request_state: "launched",
   process_state: "running",
+  // Added by the 7cb7e37 synchronization, and stated here because this file
+  // stopped the sync until someone did. `observed` is the value that asserts
+  // the most -- a supervisor established `process_state` for this epoch -- so
+  // it is the one the decoder is made to carry; the other two are exercised
+  // below, because a decoder that accepted only the strong value would refuse
+  // every row on a runtime that cannot make the claim.
+  process_observation: "observed",
   process_epoch: "66666666-6666-4666-8666-666666666666",
   runtime_observed_at: "2026-09-07T22:00:00.000+00:00",
   runtime_expires_at: "2026-09-07T22:00:30.000+00:00",
@@ -125,6 +132,38 @@ test("each conditional field decodes on the row shape that makes it valid", () =
     terminal_reason: "process_exited",
   });
   assert.equal(exited.terminalReason, "process_exited");
+});
+
+test("every process_observation the contract declares decodes, and nothing else does", async () => {
+  const declared = await declaredProperties();
+  const row = Object.fromEntries(
+    declared.filter((key) => !CONDITIONAL.includes(key)).map((key) => [key, VALUE[key]]),
+  );
+  const contract = JSON.parse(await readFile(CONTRACT, "utf8"));
+  const values = contract.components.schemas.AgentSession.properties.process_observation.enum;
+  // Read off the contract, not listed here: a fixture that names its own values
+  // agrees with whoever wrote it, which is the blind spot this file exists for.
+  assert.deepEqual([...values].sort(), ["observed", "unknown", "unproven"]);
+  for (const value of values) {
+    assert.equal(
+      decodeAgentSessionItem({ ...row, process_observation: value }).processObservation,
+      value,
+      value,
+    );
+  }
+  // A value outside the enum is refused rather than demoted: an unrecognised
+  // provenance could be a NEW way to say "nobody looked", and reading it as
+  // `observed` is the one error this field exists to prevent.
+  assert.throws(
+    () => decodeAgentSessionItem({ ...row, process_observation: "probably" }),
+    /known_enum_value/u,
+  );
+  // ABSENT is tolerated and is NOT `observed`. The producer's own `unknown`
+  // covers "every observation older than the release that began recording it",
+  // so a runtime that sends no field at all is the same fact -- and the decoder
+  // must keep reading those rows rather than making a whole page unreadable.
+  const { process_observation: _absent, ...withoutProvenance } = row;
+  assert.equal(decodeAgentSessionItem(withoutProvenance).processObservation, undefined);
 });
 
 test("an undeclared field is still refused, so the acceptance above is not blanket tolerance", async () => {

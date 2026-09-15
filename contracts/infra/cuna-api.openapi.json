@@ -1547,6 +1547,104 @@
         ]
       }
     },
+    "/v1/sessions/{id}/supervisor/live-update": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "post": {
+        "operationId": "sessions.updateSupervisorInPlace",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "description": "Replace a running Machine's supervisor in place, preserving its live AgentSessions through the unit's descriptor store. Distinct from the stopped-boundary replacement: Cuna measures this Machine's boot, unit incarnation, installed artifact digests and every live session's process, PTY and stored master before the installer runs, the installer re-measures all of them under the provider-install lock before it writes, and the operation refuses before any artifact or unit change when they do not hold. A 200 reports the exact new control generation, the installed artifact digest and one custody outcome per AgentSession that existed before the update. The caller chooses operation_id before sending: Cuna records that identity durably before it issues any enrollment, so repeating the SAME operation_id never rotates control a second time. Repeating it is the recovery path for a lost response -- it resumes what was never sent, reconciles what may have been, and returns the recorded answer once there is one. A DIFFERENT operation_id for a Machine whose update has not settled is refused.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/SupervisorLiveUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/SupervisorLiveUpdateResult"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "machines:update"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{id}/supervisor/live-update/{operationId}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        },
+        {
+          "name": "operationId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "sessions.readSupervisorInPlaceUpdate",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "description": "Authoritative phase and known result of one owned in-place supervisor update. A read only: it dispatches no installer, sends nothing to the Machine and changes no state. The phase distinguishes the four outcomes the operation itself distinguishes -- nothing was sent, this Machine's control rotated and the installer's outcome is unknown, the artifact is installed and its acknowledgement or the fate of the AgentSessions is not yet established, and settled. agent_sessions carries the per-AgentSession account only once the operation settled with one; declared_sessions names the AgentSessions the attempt was about. A running Machine is not evidence that an update did or did not apply, and this read is the only thing that is. An operation that is not settled reports next_action repeat_same_operation: reissuing the same operation_id to the POST route is what resolves it.",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/SupervisorLiveUpdateOperation"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "machines:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
     "/v1/sessions/{id}/exec": {
       "parameters": [
         {
@@ -6288,6 +6386,26 @@
             "schema": {}
           }
         }
+      },
+      "SupervisorLiveUpdateResult": {
+        "description": "In-place supervisor update result with per-AgentSession custody",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/SupervisorLiveUpdateResult"
+            }
+          }
+        }
+      },
+      "SupervisorLiveUpdateOperation": {
+        "description": "Authoritative phase and known result of one in-place supervisor update",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/SupervisorLiveUpdateOperation"
+            }
+          }
+        }
       }
     },
     "schemas": {
@@ -7399,6 +7517,7 @@
           ]
         },
         "required": [
+          "process_observation",
           "id",
           "machine_id",
           "name",
@@ -7536,6 +7655,14 @@
               "machine_restarted"
             ],
             "description": "Optional safe reason from an accepted terminal process observation; emitted only for exited, failed or terminated. Absent for legacy or unrecognized reasons. This is not provider output or an exit status."
+          },
+          "process_observation": {
+            "description": "Whether a supervisor ESTABLISHED process_state and runtime_observed_at for the CURRENT process_epoch. observed: it did. unproven: it settled a runtime-lease renewal without being able to observe the child, so process_state and runtime_observed_at are the last values anybody established and the lease moved without them. unknown: no provenance is recorded for this epoch, which includes every observation older than the release that began recording it and every epoch that has since been relaunched. Absence of provenance is never proof of observation, and runtime_expires_at is lease authority, never observation freshness. Cuna states no staleness threshold; a client must not invent one.",
+            "enum": [
+              "observed",
+              "unproven",
+              "unknown"
+            ]
           }
         }
       },
@@ -14209,6 +14336,296 @@
                 ]
               }
             }
+          }
+        }
+      },
+      "SupervisorLiveUpdateSession": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "agent_session_id",
+          "process_epoch",
+          "outcome"
+        ],
+        "properties": {
+          "agent_session_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "process_epoch": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "outcome": {
+            "enum": [
+              "preserved",
+              "exited",
+              "ended",
+              "unknown"
+            ]
+          }
+        }
+      },
+      "SupervisorLiveUpdateResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "machine",
+          "operation_id",
+          "control_generation",
+          "artifact_sha256",
+          "installed_at",
+          "agent_sessions"
+        ],
+        "properties": {
+          "machine": {
+            "$ref": "#/components/schemas/Session"
+          },
+          "operation_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "control_generation": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "artifact_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "installed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "agent_sessions": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/SupervisorLiveUpdateSession"
+            }
+          }
+        }
+      },
+      "SupervisorLiveUpdateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id"
+        ],
+        "properties": {
+          "operation_id": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              }
+            ],
+            "description": "Chosen by the caller before sending, so a lost response still leaves it holding the identity of what it asked for. Cuna records it durably before it issues any supervisor enrollment, so repeating the same value never rotates this Machine's control a second time: it resumes an attempt that spent nothing, reconciles one that may have spent something, and returns the recorded answer once the operation has settled. A different value for a Machine whose update has not settled is refused."
+          }
+        }
+      },
+      "SupervisorLiveUpdateDeclaredSession": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "agent_session_id",
+          "process_epoch"
+        ],
+        "properties": {
+          "agent_session_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "process_epoch": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        }
+      },
+      "SupervisorLiveUpdateFailure": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "The refusal this operation settled with, in the fields the mutation returned. Recorded rather than re-derived, so a later read of a settled operation answers with what happened and not with a fresh opinion about a Machine that has moved on since.",
+        "required": [
+          "status",
+          "code",
+          "title",
+          "detail",
+          "retryable",
+          "action"
+        ],
+        "properties": {
+          "status": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{2,63}$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "action": {
+            "enum": [
+              "retry",
+              "none"
+            ]
+          }
+        }
+      },
+      "SupervisorLiveUpdateOperation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "machine_id",
+          "phase",
+          "control_rotated",
+          "installer_outcome",
+          "control_generation",
+          "artifact_sha256",
+          "installed_at",
+          "installation_evidence",
+          "declared_sessions",
+          "agent_sessions",
+          "failure",
+          "next_action",
+          "claimed_at",
+          "updated_at",
+          "settled_at",
+          "retired_at",
+          "retirement_outcome"
+        ],
+        "properties": {
+          "operation_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "phase": {
+            "description": "claimed: the operation is durably admitted and no enrollment, installer or control change has left Cuna. control_rotated: this Machine's supervisor control HAS rotated for this operation and what the installer did is unknown. installed: the artifact this operation selected is on the Machine; its acknowledgement and the fate of the AgentSessions may still be unestablished. settled: terminal, and the recorded answer is what every repeat of this identity receives.",
+            "enum": [
+              "claimed",
+              "control_rotated",
+              "installed",
+              "settled"
+            ]
+          },
+          "control_rotated": {
+            "type": "boolean",
+            "description": "Whether this operation issued a supervisor enrollment. True is irreversible and stays true in every later phase, including a settled failure: the Machine's previous control was superseded even if nothing was installed."
+          },
+          "installer_outcome": {
+            "description": "not_sent: no installer request left Cuna, which is also the honest answer after a rotation whose request the provider client refused to construct. unknown: a request was sent and nothing observed what it did. refused: the installer answered and refused, which it does before it writes. installed: the selected artifact is on the Machine.",
+            "enum": [
+              "not_sent",
+              "unknown",
+              "refused",
+              "installed"
+            ]
+          },
+          "control_generation": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "artifact_sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "The supervisor artifact this operation is bound to install. Null until the operation has bound a target, which it must do before it may rotate anything."
+          },
+          "installed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When Cuna established the installation, which is the installation time only when installation_evidence is installer_exit."
+          },
+          "installation_evidence": {
+            "description": "installer_exit: the installer's own zero exit, observed in this operation's own request. reconciled: a later read-only observation found the artifact on the Machine. The second establishes that it is installed and never when it was installed.",
+            "enum": [
+              "installer_exit",
+              "reconciled",
+              null
+            ]
+          },
+          "declared_sessions": {
+            "type": "array",
+            "maxItems": 64,
+            "description": "The AgentSessions this attempt measured and is accountable for. Empty until the operation binds its prestate. It is a statement of scope, never of outcome.",
+            "items": {
+              "$ref": "#/components/schemas/SupervisorLiveUpdateDeclaredSession"
+            }
+          },
+          "agent_sessions": {
+            "type": "array",
+            "maxItems": 64,
+            "description": "The per-AgentSession account. Empty unless the operation settled with one; an absent account is never rendered as a set of unknown outcomes.",
+            "items": {
+              "$ref": "#/components/schemas/SupervisorLiveUpdateSession"
+            }
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SupervisorLiveUpdateFailure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_action": {
+            "description": "none: the operation is settled and nothing further will change it. repeat_same_operation: reissuing this same operation_id to the POST route is the supported way to resolve it, and is the only safe repetition -- a new identity would rotate this Machine's control again.",
+            "enum": [
+              "none",
+              "repeat_same_operation"
+            ]
+          },
+          "claimed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "settled_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "retired_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When Cuna advanced this Machine's install fence past this operation's control generation. After it, the installer this operation authorized cannot perform any configuration write, binary replacement or service restart, however long it was delayed. Null until that happens. This is what distinguishes a settled installer_outcome of unknown, which means Cuna never observed that installer and it can no longer act, from an unsettled one, which means an authorized installer may still arrive."
+          },
+          "retirement_outcome": {
+            "description": "What this Machine's install fence had recorded for this operation's control generation when it was retired. retired: no admission existed, so the installer never reached the fence and the fence precedes every write it could perform. partial: it was admitted and did not finish. installed: it was admitted and finished. Null until the retirement happens, and never a substitute for installer_outcome, which reports what Cuna itself observed.",
+            "enum": [
+              "retired",
+              "partial",
+              "installed",
+              null
+            ]
           }
         }
       }

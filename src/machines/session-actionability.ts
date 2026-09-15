@@ -1,6 +1,16 @@
-import type { AgentSession, AgentSessionAuthState, Machine } from "../api/contracts.js";
+import type {
+  AgentSession,
+  AgentSessionAuthState,
+  AgentSessionProcessObservation,
+  Machine,
+} from "../api/contracts.js";
 import { machineProviderAvailability } from "./provider-availability.js";
-import { isAgentSessionIntendedActive, readRuntimeWindow } from "./session-visibility.js";
+import {
+  agentSessionProcessObservation,
+  AGENT_SESSION_OBSERVATION_NOTE,
+  isAgentSessionIntendedActive,
+  readRuntimeWindow,
+} from "./session-visibility.js";
 
 export type SessionBaseState = "attachable" | "starting" | "login-required" | "stale" | "failed" | "terminated" | "unsupported";
 export type SessionRefreshStatus = "idle" | "pending";
@@ -20,6 +30,19 @@ export type SessionRecoveryAction = "attach" | "wait" | "authenticate" | "refres
  */
 export type SessionActionReasonCode =
   | "runtime_lease_current"
+  /**
+   * The lease is open AND the producer says nobody established the process
+   * state for this epoch. Two codes rather than one, because the producer
+   * distinguishes the causes: a lease renewal that settled without observing
+   * the child, and no provenance recorded at all.
+   *
+   * Both keep the base state `attachable`. The lease is still what decides
+   * whether attaching is worth attempting, and narrowing the action here would
+   * withhold the one thing that can actually answer the question — a lease is
+   * not an observation, but neither is a refusal to try.
+   */
+  | "runtime_lease_current_observation_unproven"
+  | "runtime_lease_current_observation_unknown"
   | "launch_pending"
   | "provider_authentication_required"
   | "runtime_evidence_missing"
@@ -38,6 +61,13 @@ export interface SessionActionability {
   readonly reasonCode: SessionActionReasonCode;
   readonly observationRevision: number;
   readonly canAttach: boolean;
+  /**
+   * Who established `processState`, carried on every result with absence folded
+   * into `unknown` by `session-visibility.ts`. It travels beside the base state
+   * rather than inside it: a caller that renders one without the other is how
+   * a moving lease came to print the same word as a real observation.
+   */
+  readonly processObservation: AgentSessionProcessObservation;
   /**
    * When the producer last observed this process, and how old that is at `now`.
    * Present only once the runtime timestamps parse. Reported so a caller can
@@ -74,15 +104,36 @@ export function classifySessionActionability(input: SessionActionabilityInput): 
     recoveryAction: recoveryFor(classified.baseState),
     observationRevision: input.session.rowVersion,
     canAttach: classified.baseState === "attachable",
+    processObservation: agentSessionProcessObservation(input.session),
     ...(runtimeWindow.lastObservedAt === undefined ? {} : { lastObservedAt: runtimeWindow.lastObservedAt }),
     ...(runtimeWindow.observationAgeMs === undefined ? {} : { observationAgeMs: runtimeWindow.observationAgeMs }),
     ...(runtimeWindow.leaseExpiresAt === undefined ? {} : { leaseExpiresAt: runtimeWindow.leaseExpiresAt }),
   });
 }
 
-/** `checking` is presentation only; it can never become or replace a base state. */
+/**
+ * The one line every list, tree and explorer row prints for a session.
+ *
+ * Both qualifiers are suffixes and neither can become or replace a base state:
+ * `checking` is presentation only, and the observation note is a fact about
+ * `processState`'s provenance, not a fourth lifecycle.
+ *
+ * Why the note is here at all. `attachable` was derived from the runtime lease
+ * alone, so a row whose lease kept moving while nothing observed the child
+ * printed the byte-identical line to one a supervisor had just looked at. The
+ * note is attached only to `attachable`, because that is the only base state
+ * whose word a reader takes as "this process is up"; `stale`, `starting`,
+ * `failed`, `terminated` and `unsupported` already say the opposite or say
+ * nothing, and a provenance note on them would blur three different answers.
+ */
 export function displaySessionActionability(value: SessionActionability): string {
-  return value.refreshStatus === "pending" ? `${value.baseState} · checking` : value.baseState;
+  const parts = [value.baseState as string];
+  const note = value.baseState === "attachable"
+    ? AGENT_SESSION_OBSERVATION_NOTE[value.processObservation]
+    : undefined;
+  if (note !== undefined) parts.push(note);
+  if (value.refreshStatus === "pending") parts.push("checking");
+  return parts.join(" · ");
 }
 
 /** Missing, equal, or lower revisions cannot replace the confirmed state. */
@@ -133,9 +184,17 @@ function classifyBase(input: SessionActionabilityInput): ClassifiedBase {
   // the server's capability snapshot and terminal grant remain the authority
   // that admits or refuses the attach, and nothing here is narrowed by the age
   // of the observation carried alongside.
-  return runtimeWindow.kind === "lease_current"
-    ? result("attachable", "runtime_lease_current")
-    : result("stale", "runtime_lease_expired");
+  if (runtimeWindow.kind !== "lease_current") return result("stale", "runtime_lease_expired");
+  // ...and the provenance of the state the lease covers is named rather than
+  // absorbed. `stale` would be wrong here: it means the lease lapsed and asks
+  // for a refresh, which answers nothing about a row whose lease is open and
+  // whose observation nobody established. So the base state, the action and the
+  // attach admission are untouched, and only the reason changes.
+  switch (agentSessionProcessObservation(session)) {
+    case "observed": return result("attachable", "runtime_lease_current");
+    case "unproven": return result("attachable", "runtime_lease_current_observation_unproven");
+    case "unknown": return result("attachable", "runtime_lease_current_observation_unknown");
+  }
 }
 
 function result(baseState: SessionBaseState, reasonCode: SessionActionReasonCode): ClassifiedBase {

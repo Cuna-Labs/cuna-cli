@@ -1252,7 +1252,10 @@ test("terminal state storms coalesce to bounded latest-state rendering", async (
   const baseline = host.writeAttempts;
   let releaseWrite;
   host.writeGate = new Promise((resolve) => { releaseWrite = resolve; });
-  callbacks.onTerminalState(snapshot(intents[0]));
+  // The first triggering state differs from the startup frame, so it renders
+  // and reaches host backpressure. Identical frames are (correctly) not
+  // rewritten, so a repeat of the current state would never reach the gate.
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "reconnecting" });
   await waitUntil(() => host.writeAttempts === baseline + 1, "the single state renderer should reach host backpressure");
   for (let index = 0; index < 1_000; index += 1) {
     callbacks.onTerminalState({ ...snapshot(intents[0]), inputSequence: BigInt(index + 1) });
@@ -1260,6 +1263,7 @@ test("terminal state storms coalesce to bounded latest-state rendering", async (
   assert.equal(host.writeAttempts, baseline + 1, "a blocked host must not accumulate one render per state event");
   releaseWrite();
   await waitUntil(() => host.writeAttempts === baseline + 2, "one coalesced render should publish the latest state");
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /reconnecting/u, "the coalesced frame carries the latest state, not the blocked one");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(host.writeAttempts, baseline + 2);
   await coordinator.stop();
@@ -1382,7 +1386,10 @@ test("input fenced after active receipt is reported as unsent and never retried"
 
 test("a resize whose debounce expires during reconnect is reconciled after the new fence becomes active", async () => {
   const { coordinator, callbacks, calls, host, intents, runtime } = harness({
-    coordinatorOptions: { reconnectAttempts: 1, reconnectBaseDelayMs: 1, resizeCoalesceMs: 5 },
+    // A fixed clock keeps the heartbeat evidence verified, so interrupted and
+    // reconnecting states change the appbar and are actually written; with
+    // stale evidence every state renders the same bytes and is not rewritten.
+    coordinatorOptions: { reconnectAttempts: 1, reconnectBaseDelayMs: 1, resizeCoalesceMs: 5, clock: () => 150 },
   });
   await coordinator.start(intents.slice(0, 1));
   const baselineResizes = calls.resize.length;
@@ -1580,6 +1587,9 @@ test("Node foreground host waits for both write completion and drain before rele
   const host = createNodeForegroundTerminalHost({ stdin, stdout, writeTimeoutMs: 100 });
   const lease = await host.acquire();
   assert.equal(Buffer.concat(stdout.writes).toString().includes("\u001b[?2004h"), true, "foreground acquisition enables local bracketed paste");
+  for (const mode of [1000, 1002, 1003, 1006]) {
+    assert.ok(Buffer.concat(stdout.writes).toString().includes(`\u001b[?${mode}l`), "rich acquisition returns mouse selection to the host");
+  }
   stdout.blockNext = true;
   let settled = false;
   const writing = host.write(encoder.encode("frame")).then(() => { settled = true; });
@@ -1707,12 +1717,12 @@ test("a refused seat request is reported on the notice line and does not stop th
   await coordinator.stop();
 });
 
-const OBSERVER_REFUSAL = "This attachment observes the terminal; press Ctrl+] w to take control.";
+const OBSERVER_REFUSAL = "Input not sent · press Ctrl+] then w to take control";
 
 test("observer input refusal remains visible when escape help was already open", async () => {
   let observing = false;
   const { coordinator, callbacks, calls, host, intents } = harness({
-    sendInputError: () => observing ? runtimeFailure("terminal_observer", OBSERVER_REFUSAL) : undefined,
+    sendInputError: () => observing ? runtimeFailure("terminal_observer", "This attachment observes the terminal; input is disabled.") : undefined,
   });
   try {
     await coordinator.start(intents.slice(0, 1));
@@ -1723,7 +1733,10 @@ test("observer input refusal remains visible when escape help was already open",
     await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+C detach"), "help opens for the observer");
     const beforeHeartbeat = host.writes.length;
     callbacks.onTerminalState({ ...observer, heartbeatObservedAt: 150, heartbeatExpiresAt: 250 });
-    await waitUntil(() => host.writes.length > beforeHeartbeat, "heartbeat is rendered");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // A heartbeat that changes nothing on screen is rendered but not rewritten;
+    // had it cleared the help, the differing frame would have been written.
+    assert.equal(host.writes.length, beforeHeartbeat, "an unchanged heartbeat does not repaint the host");
     assert.match(decoder.decode(host.writes.at(-1)), /Keys: Ctrl\+C detach/u, "help remains visible without a transient refusal");
     assert.equal(calls.input.length, 0, "opening help never sends provider input");
     host.emitInput(Uint8Array.of(0x78));
@@ -1879,7 +1892,9 @@ test("a take-control refusal survives an unchanged seat heartbeat publish", asyn
   );
   const writesBefore = host.writes.length;
   callbacks.onTerminalState({ ...observer(), heartbeatObservedAt: 150, heartbeatExpiresAt: 250 });
-  await waitUntil(() => host.writes.length > writesBefore, "an unchanged-seat publish still repaints");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  // Had the publish cleared the refusal, the frame would differ and be written.
+  assert.equal(host.writes.length, writesBefore, "an unchanged-seat publish repaints nothing");
   assert.equal(
     decoder.decode(host.writes.at(-1)).includes("Could not take control: Terminal writer changed"),
     true,
@@ -1906,4 +1921,66 @@ test("writer operation foreground distinguishes cancelled, pending, mismatch and
       await waitUntil(() => decoder.decode(host.writes.at(-1)).includes(expected), reason);
     } finally { await coordinator.stop(); }
   }
+});
+
+
+test("OpenCode visible copy action copies only the full auth URL without browser or remote input", async () => {
+  const copied = [];
+  const { coordinator, callbacks, calls, host, intents } = harness({ coordinatorOptions: {
+    copyText: async text => { copied.push(text); },
+  } });
+  intents[0].agent = "opencode";
+  await coordinator.start(intents.slice(0, 1));
+  const url = "https://auth.openai.com/oauth/authorize?client_id=test&state=opaque&code_challenge=abc";
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`Background text\r\n${url.slice(0, 65)}`)));
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /Copiar enlace/u);
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(`${url.slice(65)}\r\nMore background`)));
+  assert.match(decoder.decode(host.writes.at(-1)), /Copiar enlace/u);
+  assert.deepEqual(copied, []);
+  host.emitInput(Uint8Array.of(0x1d, 0x79));
+  await waitUntil(() => copied.length === 1, "copies link");
+  assert.deepEqual(copied, [url]);
+  assert.equal(calls.input.length, 0);
+  await coordinator.stop();
+});
+
+
+test("copy failure is visible and a new binding cannot copy the old link", async () => {
+  let attempts = 0;
+  const { coordinator, callbacks, calls, host, intents } = harness({ coordinatorOptions: {
+    copyText: async () => { attempts++; throw new Error("unavailable"); },
+  } });
+  intents[0].agent = "opencode";
+  await coordinator.start(intents.slice(0, 1));
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("https://auth.openai.com/oauth/authorize?state=test\r\n")));
+  host.emitInput(Uint8Array.of(0x1d, 0x79));
+  await waitUntil(() => /No se pudo copiar/u.test(decoder.decode(host.writes.at(-1))), "failure feedback");
+  await callbacks.onTerminalReady(snapshot(intents[0], 2));
+  host.emitInput(Uint8Array.of(0x1d, 0x79));
+  await waitUntil(() => /No hay enlace/u.test(decoder.decode(host.writes.at(-1))), "stale link removed");
+  assert.equal(attempts, 1);
+  assert.equal(calls.input.length, 0);
+  await coordinator.stop();
+});
+
+test("a frame identical to the one the host already shows is not written again", async () => {
+  const { coordinator, callbacks, host, intents } = harness();
+  await coordinator.start(intents.slice(0, 1));
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("prompt> ")));
+  const painted = host.writes.length;
+  assert.match(decoder.decode(host.writes.at(-1)), /prompt> /u);
+  // A keystroke publishes state and renders; nothing on screen changed.
+  callbacks.onTerminalState(snapshot(intents[0]));
+  callbacks.onTerminalState(snapshot(intents[0]));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(host.writes.length, painted, "an unchanged frame must not be rewritten to the host");
+  // Output that changes a cell is painted.
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("x")));
+  assert.equal(host.writes.length, painted + 1);
+  assert.match(decoder.decode(host.writes.at(-1)), /prompt> x/u);
+  // A host resize invalidates the memory even when the rendered bytes would repeat.
+  const beforeResize = host.writes.length;
+  host.emitResize();
+  await waitUntil(() => host.writes.length > beforeResize, "a resize must repaint");
+  await coordinator.stop();
 });

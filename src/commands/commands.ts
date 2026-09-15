@@ -37,12 +37,23 @@ import type { ManagedExecution } from "../api/managed-executions.js";
 import { listAllMachines } from "../machines/pagination.js";
 import {
   classifyLiveSupervisorUpdateFailure,
+  liveSupervisorInstallationEvidenceLabel,
+  liveSupervisorInstallerOutcomeLabel,
+  liveSupervisorInstallerReachLines,
   liveSupervisorSessionOutcomeLabel,
   liveSupervisorUpdateNotes,
+  liveSupervisorUpdatePhaseLabel,
+  liveSupervisorUpdateRecordSurvives,
+  readLiveSupervisorUpdateOperation,
   summarizeLiveSupervisorUpdate,
+  type LiveSupervisorUpdateIdentityOrigin,
   type LiveSupervisorUpdateNotes,
+  type LiveSupervisorUpdateReading,
 } from "../machines/live-supervisor-update.js";
-import type { SupervisorLiveUpdate } from "../api/supervisor-live-update.js";
+import type {
+  SupervisorLiveUpdate,
+  SupervisorLiveUpdateOperation,
+} from "../api/supervisor-live-update.js";
 import type { PlatformAdapter } from "../platform/adapter.js";
 import {
   isOpenCodeRuntimeUnverifiedCapabilityRejection,
@@ -58,7 +69,11 @@ import {
   providerVerdict,
 } from "../machines/provider-availability.js";
 import { classifySessionActionability, displaySessionActionability } from "../machines/session-actionability.js";
-import { isAgentSessionIntendedActive } from "../machines/session-visibility.js";
+import {
+  agentSessionProcessObservation,
+  AGENT_SESSION_OBSERVATION_NOTE,
+  isAgentSessionIntendedActive,
+} from "../machines/session-visibility.js";
 import { loadWorkspaceBindingIntent } from "../workspace/binding-store.js";
 import { INITIAL_RUNTIME_GATES, type RuntimeFeatureGate } from "../runtime/contracts.js";
 import { evaluateRuntimeSupport } from "../platform/support.js";
@@ -212,17 +227,30 @@ function agentSessionTerminationConfirmed(session: AgentSession): boolean {
  * hides it. Settled sessions still show a single word, because a triple on every
  * healthy row is noise; anything unsettled shows all three, in the fixed order
  * desired/request/process.
+ *
+ * The provenance of `processState` is the second thing this line hid. Every
+ * authority above is a CLAIM, and the producer publishes who established the
+ * process one; a row whose runtime lease kept moving while nothing observed the
+ * child printed the byte-identical line to a row a supervisor had just looked
+ * at. So whenever the state asserts a live process, the note from
+ * `session-visibility.ts` is printed beside it — `observed` adds nothing, which
+ * is why it has no note. It qualifies the state and never replaces it: a
+ * confirmed termination returns above this and can never acquire one.
  */
 function agentSessionStateLabel(session: AgentSession): string {
   if (agentSessionTerminationConfirmed(session)) return "terminated";
+  const note = session.processState === "running"
+    ? AGENT_SESSION_OBSERVATION_NOTE[agentSessionProcessObservation(session)]
+    : undefined;
+  const qualifier = note === undefined ? "" : ` (${note})`;
   if (
     session.desiredState === "running" &&
     session.requestState === "launched" &&
     session.processState === "running"
   ) {
-    return "running";
+    return `running${qualifier}`;
   }
-  return `${session.desiredState}/${session.requestState}/${session.processState}`;
+  return `${session.desiredState}/${session.requestState}/${session.processState}${qualifier}`;
 }
 
 function requireCredential(context: CommandContext): void {
@@ -480,6 +508,11 @@ function agentSessionRecord(session: AgentSession, machine?: Machine, now?: numb
     desired_state: session.desiredState,
     request_state: session.requestState,
     process_state: session.processState,
+    // The provenance of the line above, and never omitted. A caller reading
+    // `--json` must not have to infer it from a lease: absence on the wire is
+    // folded to `unknown` once, in `session-visibility.ts`, and emitted here so
+    // that "no supervisor established this" is a value rather than a silence.
+    process_observation: agentSessionProcessObservation(session),
     ...(session.terminalReason === undefined ? {} : { terminal_reason: session.terminalReason }),
     ...(session.processEpoch === undefined ? {} : { process_epoch: session.processEpoch }),
     ...(session.runtimeObservedAt === undefined ? {} : { runtime_observed_at: session.runtimeObservedAt }),
@@ -833,30 +866,78 @@ export function preflightInvocation(
 }
 
 /**
- * `machines live-update-supervisor` admits two disjoint intents, and one shared
- * `--yes` would have made them one.
+ * `machines live-update-supervisor` admits three disjoint intents, and one
+ * shared `--yes` would have made them one.
  *
- * `--yes` confirms a mutation on a running Machine. `--forget-unknown` sends
- * nothing at all: it drops this installation's local note about an outcome it
- * never saw. Accepting them together would let "confirm the update" read as
- * "and clear whatever is outstanding first", which is precisely the silent
- * resolution-by-repetition this command must not perform.
+ * `--yes` starts a NEW operation: it mints an identity, records it, and sends
+ * it. `--resume` re-sends the identity already recorded — the producer's own
+ * recovery for a lost answer, and the only repetition that never rotates this
+ * Machine's control twice. `--forget-unknown` sends no mutation at all: it
+ * clears this installation's record, and only once an authoritative read says
+ * the operation settled.
+ *
+ * They are mutually exclusive because collapsing them would let "confirm the
+ * update" read as "and clear whatever is outstanding first", which is precisely
+ * the silent resolution-by-repetition this command must not perform — and would
+ * let a resume be mistaken for a new decision, which is the one mistake the
+ * producer cannot protect a caller from, because a NEW identity is exactly what
+ * it refuses to treat as a repeat.
  */
-function preflightLiveUpdateSupervisor(parsed: ParsedInvocation): { readonly forgetUnknown: boolean } {
-  rejectUnknownOptions(parsed, ["yes", "forget-unknown"]);
+export type LiveUpdateSupervisorIntent = "start" | "resume" | "forget-unknown";
+
+function preflightLiveUpdateSupervisor(
+  parsed: ParsedInvocation,
+): { readonly intent: LiveUpdateSupervisorIntent } {
+  rejectUnknownOptions(parsed, ["yes", "resume", "forget-unknown", "operation"]);
   if (parsed.operands.length !== 2) {
     throw usageError("machines live-update-supervisor requires exactly one machine ID.");
   }
-  const forgetUnknown = booleanOption(parsed, "forget-unknown");
-  if (forgetUnknown && booleanOption(parsed, "yes")) {
+  const chosen = (["yes", "resume", "forget-unknown"] as const)
+    .filter((option) => booleanOption(parsed, option));
+  if (chosen.length > 1) {
     throw usageError(
-      "machines live-update-supervisor accepts either --yes or --forget-unknown, not both.",
-      "Clearing the local record of an unknown outcome is a separate decision from starting a new update. Run --forget-unknown alone, read the Machine and its AgentSessions, then decide.",
+      "machines live-update-supervisor accepts exactly one of --yes, --resume or --forget-unknown.",
+      "Starting a new update, repeating the one this computer already recorded, and clearing that record are three different decisions. Read `cuna machines live-update-status MACHINE_ID` first; it sends nothing.",
     );
   }
-  if (!forgetUnknown) requireConfirmation(parsed, "machines.live-update-supervisor");
+  const intent: LiveUpdateSupervisorIntent = chosen[0] === "forget-unknown"
+    ? "forget-unknown"
+    : chosen[0] === "resume" ? "resume" : "start";
+  // `--resume` is its own explicit decision and carries the identity it will
+  // re-send in its own name, so it is not additionally gated on `--yes`.
+  if (intent === "start") requireConfirmation(parsed, "machines.live-update-supervisor");
   assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
-  return Object.freeze({ forgetUnknown });
+  const operation = stringOption(parsed, "operation");
+  if (operation !== undefined) {
+    // Only the repeat can take an identity. Naming one alongside "start a new
+    // update" or "clear the record" would be two decisions in one flag.
+    if (intent !== "resume") {
+      throw usageError(
+        "machines live-update-supervisor accepts --operation only with --resume.",
+        `--operation names an update to finish, which is what --resume does. To read one without sending anything, use \`cuna machines live-update-status MACHINE_ID --operation ${operation}\`.`,
+      );
+    }
+    assertCanonicalUuid(operation, "supervisor update operation ID");
+  }
+  return Object.freeze({ intent });
+}
+
+/**
+ * `machines live-update-status` — the read that recovers a lost answer.
+ *
+ * No confirmation, because it confirms nothing: the producer states that this
+ * route dispatches no installer, sends nothing to the Machine and changes no
+ * state. `--operation` is optional; without it the command reads the identity
+ * this computer recorded, which is the whole point of having recorded it.
+ */
+function preflightLiveUpdateStatus(parsed: ParsedInvocation): void {
+  rejectUnknownOptions(parsed, ["operation"]);
+  if (parsed.operands.length !== 2) {
+    throw usageError("machines live-update-status requires exactly one machine ID.");
+  }
+  assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
+  const operation = stringOption(parsed, "operation");
+  if (operation !== undefined) assertCanonicalUuid(operation, "supervisor update operation ID");
 }
 
 function preflightMachines(parsed: ParsedInvocation): void {
@@ -893,6 +974,10 @@ function preflightMachines(parsed: ParsedInvocation): void {
   }
   if (action === "live-update-supervisor") {
     preflightLiveUpdateSupervisor(parsed);
+    return;
+  }
+  if (action === "live-update-status") {
+    preflightLiveUpdateStatus(parsed);
     return;
   }
   if (action === "start" || action === "pause" || action === "resume" || action === "stop" || action === "delete") {
@@ -1592,18 +1677,204 @@ function liveUpdateNotesFor(
   return liveSupervisorUpdateNotes(platform, { baseUrl: context.config.baseUrl });
 }
 
-function outstandingLiveUpdate(machineId: string, dispatchedAt: string): CunaError {
+function outstandingLiveUpdate(
+  machineId: string,
+  operationId: string,
+  dispatchedAt: string,
+): CunaError {
   return new CunaError({
     code: "cuna.machine.live_supervisor_update_outcome_unknown",
     message: `An in-place supervisor update for Machine ${machineId} dispatched at ${dispatchedAt} has no known outcome on this computer.`,
     exitCode: EXIT_CODES.conflict,
-    // Two authoritative reads and one local acknowledgement. Repeating the
-    // update is deliberately absent from this list, and so is switching
-    // profiles: the record covers this Machine on this API for every profile.
-    hint: `Read the Machine with \`cuna machines list\` and its AgentSessions with \`cuna agent-sessions list --machine ${machineId}\`. When you have decided what happened, clear this record with \`cuna machines live-update-supervisor ${machineId} --forget-unknown\`. Cuna will not repeat the update to find out, and another profile on this computer will not either.`,
+    // The authoritative read comes first now, because one exists. It sends
+    // nothing to the Machine and is the only thing that can say what this
+    // operation did. Starting a NEW update is still absent from this list, and
+    // so is switching profiles: the record covers this Machine on this API for
+    // every profile.
+    hint: `Read it with \`cuna machines live-update-status ${machineId}\`, which sends nothing to the Machine. If it reports next_action repeat_same_operation, resolve it with \`cuna machines live-update-supervisor ${machineId} --resume\`, which re-sends this same operation ${operationId} and never rotates control a second time. Cuna will not start a different update to find out, and another profile on this computer will not either.`,
     retryable: false,
-    details: { machine_id: machineId, dispatched_at: dispatchedAt, outcome: "unknown" },
+    details: {
+      machine_id: machineId,
+      operation_id: operationId,
+      dispatched_at: dispatchedAt,
+      outcome: "unknown",
+    },
   });
+}
+
+/**
+ * What the producer's own record says about an operation whose answer was lost.
+ *
+ * Called only from the refusal path, and deliberately best-effort: it is one
+ * bounded read that dispatches no installer, and a read that itself fails must
+ * never replace the refusal the caller is owed with a story about a second
+ * request. `undefined` means "this CLI could not ask", which is not "nothing
+ * happened".
+ */
+async function reconcileLiveUpdateOperation(
+  client: CommandContext["client"],
+  machineId: string,
+  operationId: string,
+): Promise<SupervisorLiveUpdateOperation | undefined> {
+  const answer = await readLiveUpdateOperationAnswer(client, machineId, operationId);
+  return answer.state === "read" ? answer.operation : undefined;
+}
+
+/**
+ * The three answers the recovery read can give, kept apart.
+ *
+ * `absent` used to be folded into "could not read", and that single fact is the
+ * difference between two opposite conclusions: for an identity this process
+ * just minted it PROVES the producer journalled nothing, while for a recorded
+ * one it may only mean the signed-in account cannot see it. A caller that
+ * cannot tell them apart can only ever refuse both, which is what stranded the
+ * record.
+ */
+type LiveUpdateOperationAnswer =
+  | Readonly<{ state: "read"; operation: SupervisorLiveUpdateOperation }>
+  /** The producer has no operation with this identity, for this owner. */
+  | Readonly<{ state: "absent" }>
+  /** This CLI could not ask. Never read as either of the above. */
+  | Readonly<{ state: "unavailable" }>;
+
+async function readLiveUpdateOperationAnswer(
+  client: CommandContext["client"],
+  machineId: string,
+  operationId: string,
+): Promise<LiveUpdateOperationAnswer> {
+  try {
+    return Object.freeze({
+      state: "read" as const,
+      operation: await client.readMachineSupervisorInPlaceUpdate(machineId, operationId),
+    });
+  } catch (error) {
+    const reason = error instanceof CunaError ? error.details?.["reason"] : undefined;
+    if (reason === "resource_not_found") return Object.freeze({ state: "absent" as const });
+    return Object.freeze({ state: "unavailable" as const });
+  }
+}
+
+/** The per-AgentSession rows a record and a human line are both built from. */
+function liveUpdateSessionRecords(
+  sessions: readonly { readonly agentSessionId: string; readonly processEpoch: string; readonly outcome?: string }[],
+): readonly Record<string, unknown>[] {
+  return Object.freeze(sessions.map((session) => Object.freeze({
+    agent_session_id: session.agentSessionId,
+    process_epoch: session.processEpoch,
+    ...(session.outcome === undefined ? {} : { outcome: session.outcome }),
+  })));
+}
+
+/**
+ * One operation, as a record and as prose.
+ *
+ * Two rules it holds and a renderer would otherwise be free to break: a
+ * withheld per-session account is stated as withheld rather than expanded into
+ * `unknown` outcomes, and `installed_at` is described by its evidence, because
+ * `reconciled` says when Cuna LOOKED and not when the artifact arrived.
+ */
+function liveUpdateOperationReport(
+  operation: SupervisorLiveUpdateOperation,
+  machineId: string,
+): { readonly data: Record<string, unknown>; readonly lines: readonly string[] } {
+  const reading = readLiveSupervisorUpdateOperation(operation);
+  const data: Record<string, unknown> = {
+    machine_id: machineId,
+    operation_id: operation.operationId,
+    phase: operation.phase,
+    control_rotated: operation.controlRotated,
+    installer_outcome: operation.installerOutcome,
+    ...(operation.controlGeneration === undefined
+      ? {}
+      : { control_generation: operation.controlGeneration }),
+    ...(operation.artifactSha256 === undefined ? {} : { artifact_sha256: operation.artifactSha256 }),
+    ...(operation.installedAt === undefined ? {} : { installed_at: operation.installedAt }),
+    ...(operation.installationEvidence === undefined
+      ? {}
+      : { installation_evidence: operation.installationEvidence }),
+    declared_sessions: liveUpdateSessionRecords(operation.declaredSessions),
+    agent_sessions: liveUpdateSessionRecords(operation.sessions),
+    session_account_withheld: reading.accountWithheld,
+    ...(operation.failure === undefined
+      ? {}
+      : {
+        failure: Object.freeze({
+          status: operation.failure.status,
+          code: operation.failure.code,
+          title: operation.failure.title,
+          detail: operation.failure.detail,
+          retryable: operation.failure.retryable,
+          action: operation.failure.action,
+        }),
+      }),
+    next_action: operation.nextAction,
+    claimed_at: operation.claimedAt,
+    updated_at: operation.updatedAt,
+    ...(operation.settledAt === undefined ? {} : { settled_at: operation.settledAt }),
+    ...(operation.retiredAt === undefined ? {} : { retired_at: operation.retiredAt }),
+    ...(operation.retirementOutcome === undefined
+      ? {}
+      : { retirement_outcome: operation.retirementOutcome }),
+    // The fence, as a decided value rather than two nullable fields a caller
+    // has to combine. `installer_can_still_act` is the one an automated caller
+    // needs before touching this Machine, and it is false ONLY on the producer's
+    // own evidence -- never inferred from the phase or from a running Machine.
+    installer_reach: reading.installerReach,
+    installer_can_still_act: reading.installerCanStillAct,
+    // Stated in the record because a caller reading only `--json` gets no prose,
+    // and because this is the sentence the producer is most emphatic about.
+    machine_running_implies_installed: false,
+    // The same rule one layer out: the fence's record of an admitted installer
+    // that finished is not Cuna's observation of an installation, and only
+    // `installer_outcome` is that.
+    retirement_outcome_implies_installed: false,
+  };
+  const lines = [
+    `Operation ${operation.operationId} on Machine ${machineId}.`,
+    `Phase ${liveSupervisorUpdatePhaseLabel(operation.phase)}.`,
+    `Installer ${liveSupervisorInstallerOutcomeLabel(operation.installerOutcome, reading.installerReach)}.`,
+    operation.controlRotated
+      ? "This Machine's supervisor control HAS rotated for this update. That is irreversible and stays true even if nothing was installed."
+      : "This Machine's supervisor control has not rotated for this update.",
+    ...(operation.artifactSha256 === undefined
+      ? ["No supervisor artifact is bound to this operation yet."]
+      : [`Target artifact ${operation.artifactSha256}.`]),
+    ...(operation.controlGeneration === undefined
+      ? []
+      : [`Control generation ${operation.controlGeneration}.`]),
+    ...(operation.installedAt === undefined || operation.installationEvidence === undefined
+      ? []
+      : [`Installation established ${operation.installedAt} by ${liveSupervisorInstallationEvidenceLabel(operation.installationEvidence)}.`]),
+    reading.declared === 0
+      ? "This operation has not bound the AgentSessions it is accountable for."
+      : `It measured ${reading.declared} AgentSession${reading.declared === 1 ? "" : "s"}:`,
+    ...operation.declaredSessions.map((session) =>
+      `  ${session.agentSessionId} process epoch ${session.processEpoch}`),
+    ...(reading.accountWithheld
+      ? ["Cuna has settled no per-AgentSession account for this operation. That is an answer it has not given, not a set of unknown outcomes."]
+      : reading.accounted === 0
+        ? []
+        : [
+          `Per-AgentSession account, ${reading.accounted} of ${reading.declared} measured:`,
+          ...operation.sessions.map((session) =>
+            `  ${session.agentSessionId} ${liveSupervisorSessionOutcomeLabel(session.outcome)}`),
+        ]),
+    ...(operation.failure === undefined
+      ? []
+      : [`Recorded refusal ${operation.failure.code} (HTTP ${operation.failure.status}): ${operation.failure.title}. ${operation.failure.detail}`]),
+    "A running Machine is not evidence that this update did or did not apply. This read is.",
+    // The install fence, ordered after the refusal and before the next action:
+    // it is what decides whether "nothing further will change it" also means
+    // "nothing further will change this Machine because of it".
+    ...(operation.retiredAt === undefined
+      ? []
+      : [`Installer retired on the Machine ${operation.retiredAt}.`]),
+    ...liveSupervisorInstallerReachLines(reading, machineId),
+    reading.mayRepeatSameOperation
+      ? `Next action: repeat this same operation. Run \`cuna machines live-update-supervisor ${machineId} --resume\`. Starting a different update is refused while this one is open.`
+      : "Next action: none. This operation is settled and nothing further will change it.",
+  ];
+  return Object.freeze({ data, lines: Object.freeze(lines) });
 }
 
 /**
@@ -1622,54 +1893,23 @@ function outstandingLiveUpdate(machineId: string, dispatchedAt: string): CunaErr
  */
 async function executeLiveUpdateSupervisor(context: CommandContext): Promise<CommandResult> {
   const { parsed, client, now } = context;
-  const { forgetUnknown } = preflightLiveUpdateSupervisor(parsed);
+  const { intent } = preflightLiveUpdateSupervisor(parsed);
   const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
   const notes = liveUpdateNotesFor(context, context.platform);
 
-  if (forgetUnknown) {
-    // `discard`, not `settle`. This is a person saying "I have looked and I am
-    // done with this record", which is the one caller allowed to remove a
-    // record it did not create -- including one whose bytes cannot be read,
-    // which is the state the dispatch path's own hint sends people here for.
-    const reading = await notes.read(id);
-    const removed = await notes.discard(id);
-    const readable = reading.state !== "unreadable";
-    const unchanged = "Nothing was sent, and this establishes nothing about whether that update applied: it is not a cancellation and Cuna did not ask the server anything.";
-    return Object.freeze({
-      command: "machines.live-update-supervisor",
-      data: Object.freeze({
-        machine_id: id,
-        local_record_cleared: removed,
-        record_readable: readable,
-        ...(reading.state === "outstanding" ? { dispatched_at: reading.note.dispatchedAt } : {}),
-        // Present only if the note carried the label. It is shown, never used.
-        ...(reading.state === "outstanding" && reading.note.account !== undefined
-          ? { account: reading.note.account }
-          : {}),
-        ...(reading.state === "unreadable" ? { unreadable_reason: reading.reason } : {}),
-        server_state_changed: false,
-        // The exclusion is keyed by API origin and Machine, so this is what was
-        // cleared -- not "this profile's" record.
-        scope: "api_origin_and_machine",
-      }),
-      human: reading.state === "none"
-        ? `No local record of an unknown in-place supervisor update exists for Machine ${id} on ${context.config.baseUrl}. Nothing was sent and nothing changed.`
-        : reading.state === "unreadable"
-          ? `Cleared an unreadable local record for Machine ${id} (${reading.reason}). Cuna could not tell you when that update was dispatched, only that this computer was holding something for this Machine. ${unchanged}`
-          : `Cleared this computer's record of the in-place supervisor update dispatched for Machine ${id} at ${reading.note.dispatchedAt}. It covered every profile on this computer. ${unchanged}`,
-    });
-  }
+  if (intent === "forget-unknown") return clearLiveUpdateRecord(context, notes, id);
 
   const reading = await notes.read(id);
-  if (reading.state === "outstanding") throw outstandingLiveUpdate(id, reading.note.dispatchedAt);
   if (reading.state === "unreadable") {
-    // Fail closed and name the way out. The record may describe a dispatch that
-    // is still in flight, so this is not a corrupt file to step over.
+    // Fail closed and name the way out, for both sending intents. The record may
+    // describe a dispatch that is still in flight, so this is not a corrupt file
+    // to step over -- and Cuna cannot read an operation identity out of it, so
+    // there is nothing to resume either.
     throw new CunaError({
       code: "cuna.machine.live_supervisor_update_record_unreadable",
       message: `This computer holds a supervisor update record for Machine ${id} that Cuna cannot read.`,
       exitCode: EXIT_CODES.conflict,
-      hint: `Nothing was sent. That record may describe an update whose outcome is still unknown, so Cuna will not act past it. Read \`cuna machines list\` and \`cuna agent-sessions list --machine ${id}\`, then clear it with \`cuna machines live-update-supervisor ${id} --forget-unknown\`, which works on an unreadable record.`,
+      hint: `Nothing was sent. That record may describe an update whose outcome is still unknown, and Cuna cannot read the operation identity out of it to ask. Clear it with \`cuna machines live-update-supervisor ${id} --forget-unknown\`, which works on an unreadable record, and read \`cuna machines list\` and \`cuna agent-sessions list --machine ${id}\` before starting another update.`,
       retryable: false,
       details: {
         machine_id: id,
@@ -1678,6 +1918,146 @@ async function executeLiveUpdateSupervisor(context: CommandContext): Promise<Com
         outcome: "unknown",
       },
     });
+  }
+
+  if (intent === "resume") {
+    // A caller-known identity, for an update this computer never recorded. The
+    // cross-client half of recovery: an owner who started one in the console, or
+    // on another computer, holds its id and nothing else.
+    const named = stringOption(parsed, "operation");
+    if (named === undefined && reading.state === "none") {
+      throw new CunaError({
+        code: "cuna.machine.live_supervisor_update_nothing_to_resume",
+        message: `This computer holds no in-place supervisor update record for Machine ${id}.`,
+        exitCode: EXIT_CODES.conflict,
+        hint: `Nothing was sent. --resume re-sends an operation identity, and there is none recorded for ${id} on ${context.config.baseUrl}. An update started from another computer or from the web console has an identity this CLI never held: name it with \`cuna machines live-update-supervisor ${id} --resume --operation UUID\`, or read it first with \`cuna machines live-update-status ${id} --operation UUID\`. To start a new update, run \`cuna machines live-update-supervisor ${id} --yes\`.`,
+        retryable: false,
+        details: { machine_id: id, outcome: "not_sent" },
+      });
+    }
+    if (named !== undefined && reading.state === "outstanding" && reading.note.operationId !== named) {
+      // A live reservation for a different identity. It is not this command's
+      // to overwrite, and the exclusive create below would refuse anyway.
+      throw new CunaError({
+        code: "cuna.machine.live_supervisor_update_already_reserved",
+        message: `This computer is already holding in-place supervisor update ${reading.note.operationId} for Machine ${id}.`,
+        exitCode: EXIT_CODES.conflict,
+        hint: `Nothing was sent. Resolve the update this computer recorded before taking on another: read it with \`cuna machines live-update-status ${id}\`. Two updates must never rotate one Machine's control at once.`,
+        retryable: false,
+        details: {
+          machine_id: id,
+          operation_id: reading.note.operationId,
+          requested_operation_id: named,
+          outcome: "not_sent",
+        },
+      });
+    }
+    const operationId = named ?? (reading as Extract<LiveSupervisorUpdateReading, { state: "outstanding" }>).note.operationId;
+
+    /* Read the authoritative status BEFORE repeating anything. Two reasons, and
+       the second is the one a reviewer drove out:
+         - the producer's own `next_action` is what says a repeat resolves this,
+           so offering one without asking would be the client deciding;
+         - a repeat of an identity the producer never journalled is that
+           identity's FIRST admission and runs a whole update. Calling that a
+           "repeat" was true of the command and false of the effect. */
+    const status = await readLiveUpdateOperationAnswer(client, id, operationId);
+    if (status.state === "absent") {
+      /* A not-found is two facts, and only the record's own account label tells
+         them apart. The SAME account can see its own operations, so this really
+         is "never admitted". A different account, or a record that names none,
+         and a caller-supplied identity that no record backs, are all cases where
+         the operation may exist and simply be out of view -- and saying it was
+         never admitted there would be the false half of the same coin the
+         reviewer caught on the other side. */
+      const recordAccount = reading.state === "outstanding" ? reading.note.account : undefined;
+      const signedIn = await liveUpdateAccountLabel(client);
+      const neverAdmitted =
+        named === undefined && recordAccount !== undefined && signedIn !== undefined &&
+        recordAccount === signedIn;
+      throw new CunaError({
+        code: neverAdmitted
+          ? "cuna.machine.live_supervisor_update_nothing_to_resume"
+          : "cuna.machine.live_supervisor_update_operation_inaccessible",
+        message: neverAdmitted
+          ? `Cuna has no in-place supervisor update ${operationId} for Machine ${id} under this account, which is the account that recorded it.`
+          : `The signed-in account cannot read in-place supervisor update ${operationId} on Machine ${id}.`,
+        exitCode: EXIT_CODES.conflict,
+        hint: neverAdmitted
+          ? `Nothing was sent. There is nothing to resume: this identity was never admitted, so re-sending it would be a NEW update's first admission rather than finishing one -- and Cuna will not do that under a flag that says "resume". Clear the record with \`cuna machines live-update-supervisor ${id} --forget-unknown\`, then start one with \`--yes\`.`
+          : `Nothing was sent, and this is NOT evidence that the operation never existed: Cuna answers an operation outside this account's view exactly as it answers one that never existed. ${
+            recordAccount === undefined
+              ? "This computer's record does not name the account that filed it."
+              : `This computer's record was filed under account ${recordAccount}.`
+          } Check the signed-in account with \`cuna whoami\`, sign in as the Machine's owner, then read it with \`cuna machines live-update-status ${id}${named === undefined ? "" : ` --operation ${operationId}`}\`.`,
+        retryable: false,
+        details: {
+          machine_id: id,
+          operation_id: operationId,
+          outcome: neverAdmitted ? "not_sent" : "inaccessible",
+          local_record_cleared: false,
+          ...(neverAdmitted ? { operation_admitted: false } : {}),
+          ...(recordAccount === undefined ? {} : { record_account: recordAccount }),
+          ...(signedIn === undefined ? {} : { signed_in_account: signedIn }),
+        },
+      });
+    }
+    if (status.state === "read" && status.operation.nextAction === "none") {
+      const report = liveUpdateOperationReport(status.operation, id);
+      // Settled: repeating returns this same recorded answer, so the honest
+      // action is to show it and release the record rather than re-send.
+      if (reading.state === "outstanding" && reading.note.operationId === operationId) {
+        await notes.settle(id, operationId);
+      }
+      return Object.freeze({
+        command: "machines.live-update-status",
+        data: Object.freeze({
+          ...report.data,
+          operation_id_source: named === undefined ? "local_record" : "named",
+          dispatched_installer: false,
+          server_state_changed: false,
+          resumed: false,
+        }),
+        human: [
+          "Nothing was re-sent: this update is settled, and repeating it would return this same recorded answer.",
+          ...report.lines,
+        ].join("\n"),
+      });
+    }
+
+    /* A caller-known identity needs the same reservation every dispatch takes,
+       so a concurrent invocation cannot send it at the same moment. An identity
+       this computer already records IS the reservation, and re-reserving it
+       would lose to itself. */
+    let recordedAccount = reading.state === "outstanding" ? reading.note.account : undefined;
+    if (reading.state === "none") {
+      const account = await liveUpdateAccountLabel(client);
+      const reserved = await notes.reserve(id, operationId, new Date(now).toISOString(), account);
+      if (reserved === undefined) {
+        throw new CunaError({
+          code: "cuna.machine.live_supervisor_update_already_reserved",
+          message: `Another Cuna process on this computer is already updating the supervisor of Machine ${id}.`,
+          exitCode: EXIT_CODES.conflict,
+          hint: "Nothing was sent. Let that invocation finish and read its answer; two in-place updates of one Machine must not run together.",
+          retryable: false,
+          details: { machine_id: id, operation_id: operationId, outcome: "not_sent" },
+        });
+      }
+      recordedAccount = account;
+    }
+    // No fresh identity: the whole point of this path is that it does not
+    // change. The producer fences concurrent advances of one identity itself,
+    // and refuses outright to issue a second enrollment under it.
+    return dispatchLiveUpdate(context, notes, id, {
+      operationId,
+      dispatchedAt: reading.state === "outstanding" ? reading.note.dispatchedAt : new Date(now).toISOString(),
+      origin: "recorded_identity",
+      ...(recordedAccount === undefined ? {} : { recordedAccount }),
+    });
+  }
+
+  if (reading.state === "outstanding") {
+    throw outstandingLiveUpdate(id, reading.note.operationId, reading.note.dispatchedAt);
   }
 
   // The same `machines:update` authority the stopped-boundary replacement takes.
@@ -1698,15 +2078,25 @@ async function executeLiveUpdateSupervisor(context: CommandContext): Promise<Com
     });
   }
 
+  // Chosen HERE, before anything is sent, because a caller that learns its
+  // operation identity from the response cannot use it when the response is the
+  // thing that was lost.
+  const operationId = randomUUID();
   const dispatchedAt = new Date(now).toISOString();
+  // A label, recorded only because the two reads above already established that
+  // the API is answering, and never consulted to admit anything. It exists for
+  // one sentence: when a later read of this record is refused as not-found, the
+  // owner is told the record was filed under a different account rather than
+  // that the operation never existed.
+  const account = await liveUpdateAccountLabel(client);
   // The reservation is the gate, not the read above. Between that read and this
   // line another process on this computer may have taken the slot, and only an
   // exclusive create can say which of them did. `undefined` means it lost.
-  const reserved = await notes.reserve(id, dispatchedAt);
+  const reserved = await notes.reserve(id, operationId, dispatchedAt, account);
   if (reserved === undefined) {
     const rival = await notes.read(id);
     throw rival.state === "outstanding"
-      ? outstandingLiveUpdate(id, rival.note.dispatchedAt)
+      ? outstandingLiveUpdate(id, rival.note.operationId, rival.note.dispatchedAt)
       : new CunaError({
         code: "cuna.machine.live_supervisor_update_already_reserved",
         message: `Another Cuna process on this computer is already updating the supervisor of Machine ${id}.`,
@@ -1716,51 +2106,171 @@ async function executeLiveUpdateSupervisor(context: CommandContext): Promise<Com
         details: { machine_id: id, outcome: "not_sent" },
       });
   }
+  return dispatchLiveUpdate(context, notes, id, {
+    operationId,
+    dispatchedAt,
+    origin: "new_identity",
+    ...(account === undefined ? {} : { recordedAccount: account }),
+  });
+}
+
+/**
+ * The account this dispatch is filed under, when asking costs nothing.
+ *
+ * Best effort on purpose. A label that cannot be fetched is omitted, never
+ * waited for and never a reason to refuse: the record must stay writable in
+ * exactly the state it exists for, and this runs only after two successful
+ * reads have already established that the API is answering.
+ */
+async function liveUpdateAccountLabel(
+  client: CommandContext["client"],
+): Promise<string | undefined> {
+  try {
+    return (await client.getIdentity()).id;
+  } catch {
+    return undefined;
+  }
+}
+
+type LiveUpdateDispatch = Readonly<{
+  operationId: string;
+  dispatchedAt: string;
+  origin: LiveSupervisorUpdateIdentityOrigin;
+  /** The account the record names, when it names one. Evidence, never authority. */
+  recordedAccount?: string;
+}>;
+
+/**
+ * Send one in-place update under an identity that is already recorded.
+ *
+ * Shared by the two intents that send, because the only difference between them
+ * is where the identity came from -- and that difference is carried explicitly
+ * in `origin` rather than re-derived, because it decides whether a not-found
+ * answer means "nothing was admitted" or "this account cannot see it".
+ */
+async function dispatchLiveUpdate(
+  context: CommandContext,
+  notes: LiveSupervisorUpdateNotes,
+  id: string,
+  dispatch: LiveUpdateDispatch,
+): Promise<CommandResult> {
+  const { client } = context;
+  const { operationId, origin } = dispatch;
+  const repeat = origin === "recorded_identity";
   let result: SupervisorLiveUpdate;
   try {
-    result = await client.updateMachineSupervisorInPlace(id);
+    result = await client.updateMachineSupervisorInPlace(id, operationId);
   } catch (error) {
-    const disposition = classifyLiveSupervisorUpdateFailure(error);
+    let disposition = classifyLiveSupervisorUpdateFailure(error, origin);
     // Dropping the note is bookkeeping; the outcome is the answer. A local
     // filesystem fault must never replace the producer's own refusal with a
     // story about this computer's state directory, and a note that survives
-    // fails in the safe direction: the next attempt refuses and names the reads.
+    // fails in the safe direction.
     //
-    // Bound to THIS dispatch: `settle` removes the record only when the record
-    // is the one this invocation created. A record another process wrote after
-    // an owner cleared ours is not ours to remove, and removing it would admit
-    // a third dispatch while the second is still outstanding.
+    // Bound to THIS identity: `settle` removes the record only when the record
+    // names the operation this invocation sent. A record another process wrote
+    // is not ours to remove.
     const drop = async (): Promise<void> => {
-      try { await notes.settle(id, dispatchedAt); } catch { /* the outcome below is the answer */ }
+      try { await notes.settle(id, operationId); } catch { /* the outcome below is the answer */ }
     };
-    if (disposition === "unchanged") {
-      // The producer refused before it sent an installer, an enrollment or a
-      // control change. There is nothing outstanding to remember, and its own
-      // words are already the best available explanation.
-      await drop();
-      throw error;
+    if (disposition === "not_admitted_machine_busy") {
+      /* The producer's claim ordering says nothing was journalled under this
+         identity, and the producer itself can confirm it. One bounded read that
+         dispatches no installer and changes no state turns a reading of the
+         ordering into an answer before a record is released. Only `absent` is
+         that answer; a row, or a read that could not ask, keeps the record. */
+      const answer = await readLiveUpdateOperationAnswer(client, id, operationId);
+      if (answer.state !== "absent") disposition = "operation_conflict";
     }
-    if (disposition === "applied_with_ended_sessions") {
+    if (!liveSupervisorUpdateRecordSurvives(disposition, origin)) {
       await drop();
+      // Nothing was admitted under an identity this process had just minted, so
+      // the producer's own words are already the best available explanation.
+      if (disposition === "not_admitted") throw error;
+      if (disposition === "not_admitted_machine_busy") {
+        throw new CunaError({
+          code: "cuna.machine.live_supervisor_update_machine_busy",
+          message: `Another in-place supervisor update is already running on Machine ${id}.`,
+          exitCode: EXIT_CODES.conflict,
+          hint: `Nothing was sent to this Machine and Cuna recorded no update for you: it refused before admitting one, and confirmed by reading that it has no operation ${operationId}. Two updates must never rotate one Machine's control at once. Read the one that is running with \`cuna machines live-update-status ${id} --operation UUID\` if you know its identity, and start yours again once it settles.`,
+          retryable: true,
+          details: { machine_id: id, operation_id: operationId, outcome: "not_admitted", local_record_cleared: true },
+          cause: error,
+        });
+      }
       throw new CunaError({
-        code: "cuna.machine.live_supervisor_update_ended_sessions",
-        message: `The in-place supervisor update on Machine ${id} was installed and ended AgentSessions.`,
+        code: disposition === "applied_with_ended_sessions"
+          ? "cuna.machine.live_supervisor_update_ended_sessions"
+          : "cuna.machine.live_supervisor_update_control_rotated",
+        message: disposition === "applied_with_ended_sessions"
+          ? `The in-place supervisor update on Machine ${id} was installed and ended AgentSessions.`
+          : `The in-place supervisor update on Machine ${id} rotated its supervisor control and installed nothing.`,
         exitCode: EXIT_CODES.conflict,
-        hint: `${error instanceof CunaError && error.hint !== undefined ? error.hint : "The update cannot be undone."} Repeating this command is not a recovery path. Read \`cuna agent-sessions list --machine ${id}\`.`,
+        hint: `${error instanceof CunaError && error.hint !== undefined ? error.hint : "The update cannot be undone."} This operation is settled, so repeating this identity returns this same answer. Read \`cuna agent-sessions list --machine ${id}\`.`,
         retryable: false,
-        details: { machine_id: id, outcome: "applied_with_ended_sessions" },
+        details: { machine_id: id, operation_id: operationId, outcome: disposition },
         cause: error,
       });
     }
-    // Unknown. The note stays exactly where `reserve` put it.
-    throw outstandingLiveUpdate(id, dispatchedAt);
+    // The record stays. Before reporting an unknown effect, ask the one thing
+    // that can answer: a read that dispatches no installer and changes no state.
+    // "Reconcile uncertain mutations before retrying" is the rule; this is the
+    // reconciliation, and it is bounded to a single request.
+    const reconciled = await reconcileLiveUpdateOperation(client, id, operationId);
+    if (reconciled !== undefined) {
+      const report = liveUpdateOperationReport(reconciled, id);
+      const settled = reconciled.phase === "settled";
+      if (settled) await drop();
+      throw new CunaError({
+        code: settled
+          ? "cuna.machine.live_supervisor_update_settled_refusal"
+          : "cuna.machine.live_supervisor_update_outcome_unknown",
+        message: settled
+          ? `In-place supervisor update ${operationId} on Machine ${id} is settled, and its recorded answer is a refusal.`
+          : `In-place supervisor update ${operationId} on Machine ${id} has not settled.`,
+        exitCode: EXIT_CODES.conflict,
+        hint: `${report.lines.join(" ")} ${settled
+          ? "This computer's record was cleared because the operation is terminal."
+          : "This computer keeps the record, so the identity survives."}`,
+        retryable: false,
+        details: {
+          operation_outcome: settled ? "settled" : "open",
+          local_record_cleared: settled,
+          ...report.data,
+        },
+        cause: error,
+      });
+    }
+    if (disposition === "operation_inaccessible") {
+      throw new CunaError({
+        code: "cuna.machine.live_supervisor_update_operation_inaccessible",
+        message: `The signed-in account cannot read in-place supervisor update ${operationId} on Machine ${id}.`,
+        exitCode: EXIT_CODES.conflict,
+        hint: `Nothing on this Machine was changed by this attempt, and this is NOT evidence that the operation never existed: Cuna answers an unowned Machine and an operation outside this account's view with the same not-found. ${
+          dispatch.recordedAccount === undefined
+            ? "This computer's record does not name the account that filed it."
+            : `This computer's record was filed under account ${dispatch.recordedAccount}.`
+        } Check the signed-in account with \`cuna whoami\`, sign in as the owner, then read it with \`cuna machines live-update-status ${id}\`. The record is kept, so the identity survives.`,
+        retryable: false,
+        details: {
+          machine_id: id,
+          operation_id: operationId,
+          outcome: "inaccessible",
+          local_record_cleared: false,
+          ...(dispatch.recordedAccount === undefined ? {} : { record_account: dispatch.recordedAccount }),
+        },
+        cause: error,
+      });
+    }
+    // The read did not answer either. The record stays exactly where it is.
+    throw outstandingLiveUpdate(id, operationId, dispatch.dispatchedAt);
   }
 
   const summary = summarizeLiveSupervisorUpdate(result);
   // A 200 the producer only emits with every session decided. If a deployment
   // ever answers 200 with an `unknown` in it, that is still an outcome this
   // computer does not know, so the note survives and the result says so.
-  if (!summary.anyUnknown) await notes.settle(id, dispatchedAt);
+  if (!summary.anyUnknown) await notes.settle(id, operationId);
 
   const sessions = result.sessions.map((session) => Object.freeze({
     agent_session_id: session.agentSessionId,
@@ -1769,15 +2279,23 @@ async function executeLiveUpdateSupervisor(context: CommandContext): Promise<Com
   }));
   const lines = result.sessions.map((session) =>
     `  ${session.agentSessionId} ${liveSupervisorSessionOutcomeLabel(session.outcome)}`);
+  const subject = repeat
+    ? `Cuna resolved the in-place supervisor update it had already sent for ${result.machine.name}`
+    : `Cuna installed a new terminal supervisor on ${result.machine.name} without stopping it`;
   const headline = summary.total === 0
-    ? `Cuna installed a new terminal supervisor on ${result.machine.name} without stopping it. No AgentSession existed on it, so nothing was preserved or lost.`
+    ? `${subject}. No AgentSession existed on it, so nothing was preserved or lost.`
     : summary.allPreserved
-      ? `Cuna installed a new terminal supervisor on ${result.machine.name} without stopping it, and all ${summary.total} AgentSessions were preserved.`
-      : `Cuna installed a new terminal supervisor on ${result.machine.name} without stopping it. ${summary.preserved} of ${summary.total} AgentSessions were preserved; this update is not complete.`;
+      ? `${subject}, and all ${summary.total} AgentSessions were preserved.`
+      : `${subject}. ${summary.preserved} of ${summary.total} AgentSessions were preserved; this update is not complete.`;
   return Object.freeze({
     command: "machines.live-update-supervisor",
     data: Object.freeze({
       machine: machineRecord(result.machine),
+      operation_id: result.operationId,
+      // What this invocation did with the identity, which a caller reading only
+      // `--json` cannot otherwise tell apart -- and which is the difference
+      // between spending a control generation and not spending one.
+      dispatch: repeat ? "repeat_same_operation" : "new_operation",
       control_generation: result.controlGeneration,
       artifact_sha256: result.artifactSha256,
       installed_at: result.installedAt,
@@ -1797,13 +2315,234 @@ async function executeLiveUpdateSupervisor(context: CommandContext): Promise<Com
     }),
     human: [
       headline,
+      ...(repeat
+        ? [`This re-sent operation ${result.operationId}, the one this computer had already recorded. It did not start a second update and did not rotate this Machine's control again.`]
+        : [`Operation ${result.operationId}.`]),
       `Control generation ${result.controlGeneration}, artifact ${result.artifactSha256}, installed ${result.installedAt}.`,
       ...(lines.length === 0 ? [] : ["AgentSession custody:", ...lines]),
       "This installed software only. It grants no observation or control of any AgentSession and signs no provider in.",
       ...(summary.anyUnknown
-        ? [`Cuna could not re-read ${summary.unknown} of ${summary.total} AgentSessions, so this computer's record of this update stays open. Clear it with \`cuna machines live-update-supervisor ${id} --forget-unknown\` once you have read them.`]
+        ? [`Cuna could not re-read ${summary.unknown} of ${summary.total} AgentSessions, so this computer's record of this update stays open. Read it with \`cuna machines live-update-status ${id}\`.`]
         : []),
     ].join("\n"),
+  });
+}
+
+/**
+ * `--forget-unknown`, and why it now asks before it forgets.
+ *
+ * It used to be a person saying "I have looked and I am done with this record",
+ * and that was honest while the record held nothing but a timestamp: there was
+ * no identity to lose and no read that could resolve it.
+ *
+ * The record now holds the operation identity, and that changes what discarding
+ * it costs. An unsettled operation still holds the Machine on the producer's
+ * side -- every DIFFERENT identity is refused until it settles, and the only
+ * thing that settles it is a repeat of the identity in this file. Clearing it
+ * while it is open does not free the Machine; it strands it, with no way to
+ * resume and no way to start afresh. So this path reads the operation first and
+ * clears only what is terminal.
+ *
+ * That read is also what prevents clearing an ACTIVELY EXECUTING reservation,
+ * without inventing an age threshold or a liveness file that could go stale: an
+ * attempt in flight is by construction not settled, and a settled operation has
+ * no attempt whose effect is still open.
+ *
+ * Two things it still clears without asking anyone: bytes that carry no
+ * identity to ask about, and nothing at all.
+ */
+async function clearLiveUpdateRecord(
+  context: CommandContext,
+  notes: LiveSupervisorUpdateNotes,
+  id: string,
+): Promise<CommandResult> {
+  const { client } = context;
+  const reading = await notes.read(id);
+  const unchanged = "Nothing was sent to the Machine by this command, and clearing a record is not a cancellation.";
+  if (reading.state === "none") {
+    return Object.freeze({
+      command: "machines.live-update-supervisor",
+      data: Object.freeze({
+        machine_id: id,
+        local_record_cleared: false,
+        record_readable: true,
+        server_state_changed: false,
+        scope: "api_origin_and_machine",
+      }),
+      human: `No local record of an in-place supervisor update exists for Machine ${id} on ${context.config.baseUrl}. Nothing was sent and nothing changed.`,
+    });
+  }
+  if (reading.state === "unreadable") {
+    const removed = await notes.discard(id);
+    return Object.freeze({
+      command: "machines.live-update-supervisor",
+      data: Object.freeze({
+        machine_id: id,
+        local_record_cleared: removed,
+        record_readable: false,
+        unreadable_reason: reading.reason,
+        server_state_changed: false,
+        scope: "api_origin_and_machine",
+      }),
+      human: `Cleared an unreadable local record for Machine ${id} (${reading.reason}). It carried no operation identity, so there is nothing Cuna could have read about it and nothing an update could still have been resumed with. ${unchanged}`,
+    });
+  }
+
+  const { operationId, dispatchedAt } = reading.note;
+  const answer = await readLiveUpdateOperationAnswer(client, id, operationId);
+  if (answer.state === "absent") {
+    /* The producer has no operation with this identity. That is two different
+       facts depending on WHO asked, and the record's own account label is what
+       tells them apart -- evidence, never authority, exactly as it has always
+       been used here.
+         Same account: this owner can see their own operations, so there is
+       genuinely none under this identity. Nothing was admitted, nothing can be
+       resumed, and refusing to clear it would strand the Machine for no reason.
+         Different or unrecorded account: the producer answers an operation
+       outside the caller's view exactly as it answers one that never existed,
+       so this says nothing about whether the owner's operation exists. The
+       record stays. */
+    const signedIn = await liveUpdateAccountLabel(client);
+    const sameAccount =
+      reading.note.account !== undefined && signedIn !== undefined && reading.note.account === signedIn;
+    if (!sameAccount) {
+      throw new CunaError({
+        code: "cuna.machine.live_supervisor_update_record_unresolved",
+        message: `The signed-in account cannot see in-place supervisor update ${operationId} on Machine ${id}, so Cuna kept this computer's record of it.`,
+        exitCode: EXIT_CODES.conflict,
+        hint: `The record was NOT cleared, and that is the safe direction: a not-found answer here does not mean the operation is gone, because Cuna answers an unowned Machine and an operation outside this account's view the same way. ${
+          reading.note.account === undefined
+            ? "This record does not name the account that filed it, so Cuna cannot tell the two apart."
+            : `This record was filed under account ${reading.note.account}.`
+        } Check the signed-in account with \`cuna whoami\`, sign in as the owner, then read it with \`cuna machines live-update-status ${id}\`.`,
+        retryable: false,
+        details: {
+          machine_id: id,
+          operation_id: operationId,
+          dispatched_at: dispatchedAt,
+          local_record_cleared: false,
+          ...(reading.note.account === undefined ? {} : { record_account: reading.note.account }),
+          ...(signedIn === undefined ? {} : { signed_in_account: signedIn }),
+        },
+      });
+    }
+    const removedAbsent = await notes.settle(id, operationId);
+    return Object.freeze({
+      command: "machines.live-update-supervisor",
+      data: Object.freeze({
+        machine_id: id,
+        operation_id: operationId,
+        local_record_cleared: removedAbsent === "settled",
+        record_readable: true,
+        dispatched_at: dispatchedAt,
+        account: reading.note.account,
+        operation_admitted: false,
+        server_state_changed: false,
+        scope: "api_origin_and_machine",
+      }),
+      human: [
+        `Cuna has no in-place supervisor update ${operationId} for Machine ${id} under this account, which is the account this record was filed by, so the record was cleared.`,
+        "That identity was never admitted: nothing was installed, no supervisor control was issued, and nothing on this Machine was changed by it. Starting a new update is now possible again.",
+        unchanged,
+      ].join("\n"),
+    });
+  }
+  if (answer.state === "unavailable") {
+    throw new CunaError({
+      code: "cuna.machine.live_supervisor_update_record_unresolved",
+      message: `Cuna could not read in-place supervisor update ${operationId} on Machine ${id}, so it kept this computer's record of it.`,
+      exitCode: EXIT_CODES.conflict,
+      hint: `The record was NOT cleared, and that is the safe direction: while that operation is open the producer refuses every different update identity for this Machine, so clearing this would leave nothing able to resume it and nothing able to replace it. Read it again with \`cuna machines live-update-status ${id}\`.`,
+      retryable: true,
+      details: {
+        machine_id: id,
+        operation_id: operationId,
+        dispatched_at: dispatchedAt,
+        local_record_cleared: false,
+        ...(reading.note.account === undefined ? {} : { record_account: reading.note.account }),
+      },
+    });
+  }
+  const operation = answer.operation;
+  const report = liveUpdateOperationReport(operation, id);
+  if (operation.phase !== "settled") {
+    throw new CunaError({
+      code: "cuna.machine.live_supervisor_update_not_settled",
+      message: `In-place supervisor update ${operationId} on Machine ${id} has not settled, so this computer's record of it was kept.`,
+      exitCode: EXIT_CODES.conflict,
+      hint: `${report.lines.join(" ")} The record was NOT cleared: it holds the only identity that can resolve this operation, and the producer refuses every different one until it does.`,
+      retryable: false,
+      details: { local_record_cleared: false, ...report.data },
+    });
+  }
+  const removed = await notes.settle(id, operationId);
+  return Object.freeze({
+    command: "machines.live-update-supervisor",
+    data: Object.freeze({
+      local_record_cleared: removed === "settled",
+      record_readable: true,
+      dispatched_at: dispatchedAt,
+      // Present only if the note carried the label. It is shown, never used.
+      ...(reading.note.account === undefined ? {} : { account: reading.note.account }),
+      server_state_changed: false,
+      // The exclusion is keyed by API origin and Machine, so this is what was
+      // cleared -- not "this profile's" record.
+      scope: "api_origin_and_machine",
+      ...report.data,
+    }),
+    human: [
+      `Cuna read in-place supervisor update ${operationId} on Machine ${id} and it is settled, so this computer's record of it was cleared. That record covered every profile on this computer.`,
+      ...report.lines,
+      unchanged,
+    ].join("\n"),
+  });
+}
+
+/**
+ * `machines live-update-status` -- the authoritative read, and the only thing
+ * that can say what one in-place update did.
+ *
+ * It sends no mutation. The producer states that this route dispatches no
+ * installer, sends nothing to the Machine and writes nothing, which is exactly
+ * why it is safe to reach for after an interruption and why a second POST with
+ * a new identity is not.
+ */
+async function executeLiveUpdateStatus(context: CommandContext): Promise<CommandResult> {
+  const { parsed, client } = context;
+  preflightLiveUpdateStatus(parsed);
+  const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
+  const notes = liveUpdateNotesFor(context, context.platform);
+  const named = stringOption(parsed, "operation");
+  const reading = named === undefined ? await notes.read(id) : undefined;
+  if (reading !== undefined && reading.state !== "outstanding") {
+    throw new CunaError({
+      code: "cuna.machine.live_supervisor_update_operation_unnamed",
+      message: `Cuna does not know which in-place supervisor update to read for Machine ${id}.`,
+      exitCode: EXIT_CODES.usage,
+      hint: reading.state === "unreadable"
+        ? `This computer holds a record for this Machine that Cuna cannot read (${reading.reason}), so it carries no operation identity. Name one with --operation UUID, or clear the record with \`cuna machines live-update-supervisor ${id} --forget-unknown\`.`
+        : `This computer holds no record of an update for this Machine on ${context.config.baseUrl}. Name the operation with --operation UUID: an update started from another computer or from the web console has an identity this CLI never held.`,
+      retryable: false,
+      details: {
+        machine_id: id,
+        ...(reading.state === "unreadable" ? { record_path: reading.path, reason: reading.reason } : {}),
+      },
+    });
+  }
+  const operationId = named ?? (reading as Extract<LiveSupervisorUpdateReading, { state: "outstanding" }>).note.operationId;
+  const operation = await client.readMachineSupervisorInPlaceUpdate(id, operationId);
+  const report = liveUpdateOperationReport(operation, id);
+  return Object.freeze({
+    command: "machines.live-update-status",
+    data: Object.freeze({
+      ...report.data,
+      operation_id_source: named === undefined ? "local_record" : "named",
+      // Said in the record as well as in the prose: this command is a read, and
+      // a caller consuming only `--json` must not have to infer that.
+      dispatched_installer: false,
+      server_state_changed: false,
+    }),
+    human: report.lines.join("\n"),
   });
 }
 
@@ -1990,6 +2729,9 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
   }
   if (action === "live-update-supervisor") {
     return executeLiveUpdateSupervisor(context);
+  }
+  if (action === "live-update-status") {
+    return executeLiveUpdateStatus(context);
   }
   if (action === "start" || action === "pause" || action === "resume" || action === "stop") {
     rejectUnknownOptions(parsed, ["yes"]);

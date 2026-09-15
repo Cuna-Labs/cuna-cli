@@ -52,6 +52,8 @@ export interface BrowserActionDetectorOptions {
   readonly id?: () => string;
   readonly nonce?: () => string;
   readonly ttlMs?: number;
+  /** Copy-only admission does not authorize opening a browser. */
+  readonly copyOnly?: boolean;
 }
 
 const MAX_BUFFER_CHARACTERS = 16_384;
@@ -269,7 +271,7 @@ function pasteGuardResult(
  */
 export class ProviderBrowserActionDetector {
   readonly #options: Required<Pick<BrowserActionDetectorOptions, "provider" | "agentSessionId" | "processEpoch" | "fencingGeneration">> &
-    Pick<BrowserActionDetectorOptions, "clock" | "id" | "nonce" | "ttlMs">;
+    Pick<BrowserActionDetectorOptions, "clock" | "id" | "nonce" | "ttlMs" | "copyOnly">;
   readonly #decoder = new TextDecoder("utf-8", { fatal: false });
   readonly #seen = new Set<string>();
   #buffer = "";
@@ -299,7 +301,14 @@ export class ProviderBrowserActionDetector {
     for (const match of this.#buffer.matchAll(URL_CANDIDATE)) {
       const raw = match[0];
       if (raw.length > MAX_URL_CHARACTERS || this.#seen.has(raw)) continue;
-      const admitted = admitProviderAuthUrl(this.#options.provider, raw);
+      if (this.#options.copyOnly && match.index + raw.length === this.#buffer.length) continue;
+      let admitted = admitProviderAuthUrl(this.#options.provider, raw);
+      if (admitted === undefined && this.#options.copyOnly && this.#options.provider === "codex") {
+        try {
+          const candidate = new URL(raw);
+          if (candidate.origin === "https://auth.openai.com" && candidate.pathname === "/oauth/authorize" && !candidate.username && !candidate.password) admitted = candidate;
+        } catch { /* Not a complete URL. */ }
+      }
       if (admitted === undefined) continue;
       this.#seen.add(raw);
       const detectedAt = (this.#options.clock ?? Date.now)();

@@ -109,6 +109,42 @@ test("observer host projection clips complete styled cells without reflowing the
   } finally { viewport.dispose(); }
 });
 
+test("observer host projection keeps the writer's live region visible when the host frame is shorter", async () => {
+  const { viewport } = adapter({ columns: 40, rows: 30 });
+  const paint = (cursorRow) => {
+    let bytes = "";
+    for (let row = 1; row <= 30; row += 1) {
+      bytes += `\u001b[${row};1H${row === 30 ? "PROMPT" : `ROW-${String(row).padStart(2, "0")}`}`;
+    }
+    return encoder.encode(`${bytes}\u001b[${cursorRow};7H`);
+  };
+  try {
+    await viewport.write(paint(30), 1n, 1n);
+    const clipped = viewport.snapshotForHost(40, 12);
+    assert.equal(clipped.cells.length, 12);
+    assert.equal(clipped.cells.at(-1), "PROMPT", "the writer's live bottom row stays visible");
+    assert.equal(clipped.cells[0], "ROW-19", "the window is anchored on the cursor, not on the first row");
+    assert.equal(clipped.cursorY, 11, "the cursor row is mapped through the window offset");
+    assert.equal(clipped.cursorX, 6);
+    assert.equal(clipped.modes.cursorVisible, true, "a cursor inside the window is never hidden");
+
+    const fitting = viewport.snapshotForHost(40, 30);
+    assert.equal(fitting.cells[0], "ROW-01", "a host frame that fits keeps the top of the writer's screen");
+    assert.equal(fitting.cursorY, 29);
+
+    const taller = viewport.snapshotForHost(40, 48);
+    assert.equal(taller.cells.length, 30, "a taller host frame never invents rows the writer does not own");
+    assert.equal(taller.cells[0], "ROW-01");
+    assert.equal(taller.cursorY, 29, "the cursor keeps the writer's row inside a taller host frame");
+
+    await viewport.write(paint(20), 2n, 2n);
+    const middle = viewport.snapshotForHost(40, 12);
+    assert.equal(middle.cells[0], "ROW-09", "the window follows the cursor rather than the screen bottom");
+    assert.equal(middle.cells.at(-1), "ROW-20");
+    assert.equal(middle.cursorY, 11);
+  } finally { viewport.dispose(); }
+});
+
 test("headless VTE preserves split UTF-8 and resolves remote control sequences into safe cells", async () => {
   const { viewport } = adapter();
   const payload = encoder.encode("hello \u{1F30E}\r\nsecond");
@@ -393,4 +429,20 @@ test("same-process viewport rebind retains cells and sequence while retiring old
       assert.equal(viewport.snapshot().cells[0],'PREFIX-DELTA');
     }
   }finally{release();viewport.dispose();}
+});
+
+test("a remote output frame is parsed in the current turn, not after a host timer tick", async () => {
+  // @xterm/headless defers write() to setTimeout when its buffer is empty, which
+  // on a Windows host costs a full ~15 ms timer tick per frame. The adapter arms
+  // xterm's own input fast path so the parse runs synchronously. Without it the
+  // write settles only after the timer, which fires after setImmediate here.
+  const { viewport } = adapter();
+  try {
+    let settled = false;
+    const write = viewport.write(encoder.encode("echo"), 1n, 1n).then((snapshot) => { settled = true; return snapshot; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, true, "the VTE write must not wait for a macrotask timer");
+    const snapshot = await write;
+    assert.equal(snapshot.cells[0], "echo");
+  } finally { viewport.dispose(); }
 });

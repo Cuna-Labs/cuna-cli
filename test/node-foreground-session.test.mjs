@@ -660,7 +660,9 @@ test("TC-055-01/13 foreground composition attaches one through four exact sessio
       clock: () => NOW,
       clientInstanceId: () => `client:test:${count}`,
     });
-    await waitUntil(() => host.writes.length > count, `the ${count}-session workbench should become active`);
+    // Identical frames are no longer rewritten, so a raw write count is not a
+    // reliable "is active" proxy; wait for the active workbench content itself.
+    await waitUntil(() => new TextDecoder().decode(host.writes.at(-1) ?? new Uint8Array()).includes("terminal attached"), `the ${count}-session workbench should become active`);
     assert.match(new TextDecoder().decode(host.writes[0]), new RegExp(`ATTACHING ${count} EXACT`, "u"));
     const activeFrame = new TextDecoder().decode(host.writes.at(-1));
     assert.match(activeFrame, /terminal attached/u);

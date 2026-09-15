@@ -22,6 +22,7 @@ export interface WorkbenchFrameInput {
   readonly tabs: readonly WorkbenchTab[];
   readonly appbar: AppbarModel;
   readonly notice?: string;
+  readonly action?: string;
   readonly color?: boolean;
 }
 
@@ -92,7 +93,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
   const viewportRows = input.rows - appbarRows;
   const lines = appbarRows === 2
     ? [
-        renderTabs(input.tabs, input.activeTabId, input.columns),
+        input.action === undefined ? renderTabs(input.tabs, input.activeTabId, input.columns) : truncate(`[ ${input.action} ]  ${renderTabs(input.tabs, input.activeTabId, input.columns)}`, input.columns),
         input.notice === undefined ? renderTruth(input.appbar, active.agent, input.columns) : truncate(` ${safeText(input.notice)}`, input.columns),
       ]
     : [input.notice === undefined
@@ -102,7 +103,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
   let text = `${ESC}?25l${ESC}H`;
   for (let index = 0; index < lines.length; index += 1) {
     const background = index === 0 ? CUNA_ORANGE : CUNA_ORANGE_DARK;
-    text += `${ESC}${index + 1};1H${color ? `${ESC}${background}m${ESC}${index === 0 ? WHITE : MUTED}m` : ""}`;
+    text += `${ESC}${index + 1};1H${ESC}0m${ESC}2K${color ? `${ESC}${background}m${ESC}${index === 0 ? WHITE : MUTED}m` : ""}`;
     text += padLine(lines[index] ?? "", input.columns);
     if (color) text += `${ESC}0m`;
   }
@@ -138,7 +139,11 @@ function renderTabs(tabs: readonly WorkbenchTab[], activeTabId: string, columns:
     const label = `${index + 1}:${agentLabel(tab.agent)} ${safeText(tab.label)}`;
     parts.push(active ? `[${label}]` : ` ${label} `);
   }
-  return truncate(parts.join("  "), columns);
+  const tabLabels = parts.join("  ");
+  const clipboard = "Select text: Ctrl+Shift+C copy | Ctrl+Shift+V paste";
+  return truncate(process.platform === "win32" && columns >= 100
+    ? `${truncate(tabLabels, Math.max(20, columns - clipboard.length - 3))}   ${clipboard}`
+    : tabLabels, columns);
 }
 
 function renderTruth(model: AppbarModel, agent: WorkbenchTab["agent"], columns: number): string {

@@ -24,12 +24,24 @@ function session(overrides = {}) {
     desiredState: "running",
     requestState: "launched",
     processState: "running",
+    // A row a supervisor really established for this epoch. Stated explicitly
+    // because it is a precondition of every "observed" assertion below: the
+    // producer publishes this provenance, and a row without it is a different
+    // case with its own test at the end of this file.
+    processObservation: "observed",
     processEpoch: "33333333-3333-4333-8333-333333333333",
     runtimeObservedAt: new Date(NOW - 30_000).toISOString(),
     runtimeExpiresAt: new Date(NOW + 30_000).toISOString(),
     rowVersion: 4,
     createdAt: "2026-09-13T10:00:00.000Z",
     updatedAt: "2026-09-13T11:59:30.000Z",
+    // Missing at 4fa037a, so every `session({...})` in this file returned the
+    // base row and the counterexamples were the subject. `formerIsAgent
+    // SessionRunningNow` then answered `true` for the closed-lease control at
+    // line 72 and this file was red before any of the work around it. Repaired
+    // here rather than worked around: a fixture that ignores its overrides is a
+    // test that cannot fail for the reason it names.
+    ...overrides,
   };
 }
 
@@ -164,4 +176,59 @@ test("actionability names the lease it tests and carries both timestamps", () =>
   assert.equal(lapsed.reasonCode, "runtime_lease_expired");
   // A stale row is exactly where "when was it last seen" is the question.
   assert.equal(lapsed.observationAgeMs, 90_000);
+});
+
+/* --- CS4: a lease is not an observation, and the producer now says which ---
+ * `process_observation` was published at producer commit 7cb7e37 for exactly
+ * the row the file above reproduces: one whose lease keeps moving while nothing
+ * observes the child. Before it, "the lease is open" was the only fact
+ * available and a reader had to supply the caution. Now the producer supplies
+ * the answer, and the reading must not out-claim it.
+ */
+
+test("CS4: a fresh lease alone never renders a fresh process observation", () => {
+  const fresh = {
+    runtimeObservedAt: new Date(NOW - 5_000).toISOString(),
+    runtimeExpiresAt: new Date(NOW + 30_000).toISOString(),
+  };
+  // POSITIVE CONTROL: with the producer saying a supervisor established it, the
+  // very same timestamps do read as an observation. Without this the assertions
+  // below would also hold for a build that never says `observed` at all.
+  const established = readAgentSessionRuntime(session({ ...fresh, processObservation: "observed" }), NOW);
+  assert.equal(established.evidence, "observed_running_lease_current");
+  assert.equal(established.processObservation, "observed");
+  assert.equal(wasAgentSessionObservedRunning(session({ ...fresh, processObservation: "observed" }), NOW), true);
+
+  for (const [label, row] of [
+    // The lease renewal that settled without observing the child.
+    ["unproven", session({ ...fresh, processObservation: "unproven" })],
+    // No provenance recorded for this epoch.
+    ["unknown", session({ ...fresh, processObservation: "unknown" })],
+    // A deployment older than the release that began recording it sends no
+    // field at all. Absence is the same fact as `unknown`, never `observed`.
+    ["absent", session({ ...fresh, processObservation: undefined })],
+  ]) {
+    const reading = readAgentSessionRuntime(row, NOW);
+    assert.equal(reading.evidence, "reported_running_observation_unproven", label);
+    assert.equal(reading.processObservation, label === "unproven" ? "unproven" : "unknown", label);
+    // The lease is still reported, because it is still true. It is just not an
+    // observation, and nothing here may read it as one.
+    assert.equal(reading.leaseCurrent, true, label);
+    assert.equal(hasCurrentAgentSessionRuntimeLease(row, NOW), true, label);
+    assert.equal(wasAgentSessionObservedRunning(row, NOW), false, label);
+    assert.doesNotMatch(reading.evidence, /^observed_/u, label);
+  }
+});
+
+test("CS4: provenance travels on every reading, including the ones that decide nothing", () => {
+  for (const state of ["observed", "unproven", "unknown"]) {
+    assert.equal(
+      readAgentSessionRuntime(session({ processObservation: state, processState: "starting" }), NOW).processObservation,
+      state,
+    );
+    assert.equal(
+      readAgentSessionRuntime(session({ processObservation: state, requestState: "termination_pending" }), NOW).processObservation,
+      state,
+    );
+  }
 });

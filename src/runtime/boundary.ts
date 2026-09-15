@@ -1551,14 +1551,17 @@ export class CunaRuntimeBoundary {
       if (entry.state === "detached" || entry.state === "closed") return;
       this.#clearHeartbeatWatchdog(entry);
       entry.outputAbort.abort(error);
+      const remoteReason = remoteSafeReason(error);
+      // Expiry ends this attachment, not the remote process. Reconnect must
+      // obtain fresh admission; it cannot reuse expired input authority.
+      const expiredView = remoteReason === "view.lease_expired";
       entry.state = (
         error instanceof TerminalProtocolError ||
         (error instanceof RuntimeBoundaryError && error.code === "terminal_protocol_error") || isHistoryGap(error)
-      ) ? "failed" : "interrupted";
+      ) && !expiredView ? "failed" : "interrupted";
       retireInputAcceptance(entry);
       entry.outputContinuity = "unknown";
       entry.reason = safeReason(error);
-      const remoteReason = remoteSafeReason(error);
       if (remoteReason === undefined) delete entry.remoteReason;
       else entry.remoteReason = remoteReason;
       this.#publish(entry);

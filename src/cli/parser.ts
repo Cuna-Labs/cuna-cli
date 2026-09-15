@@ -96,6 +96,7 @@ export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
   routed("machines stop", "machines stop MACHINE_ID --yes", ["machines", "stop", "00000000-0000-4000-8000-000000000001", "--yes"], "Stop a machine"),
   routed("machines update-supervisor", "machines update-supervisor MACHINE_ID --yes", ["machines", "update-supervisor", "00000000-0000-4000-8000-000000000001", "--yes"], "Update a stopped machine's terminal supervisor"),
   routed("machines live-update-supervisor", "machines live-update-supervisor MACHINE_ID --yes", ["machines", "live-update-supervisor", "00000000-0000-4000-8000-000000000001", "--yes"], "Update a running machine's terminal supervisor in place and report each AgentSession's custody"),
+  routed("machines live-update-status", "machines live-update-status MACHINE_ID", ["machines", "live-update-status", "00000000-0000-4000-8000-000000000001"], "Read what one in-place supervisor update did, without sending anything to the machine"),
   routed("machines delete", "machines delete MACHINE_ID --yes", ["machines", "delete", "00000000-0000-4000-8000-000000000001", "--yes"], "Delete a machine"),
   routed("records list", "records list", ["records", "list"], "List redacted account activity"),
   routed("executions list", "executions list --machine MACHINE_ID", ["executions", "list", "--machine", "00000000-0000-4000-8000-000000000001"], "List remote commands and their remaining process ownership"),
@@ -220,11 +221,17 @@ const BOOLEAN_OPTIONS = new Set([
   // value option, swallows the next token, and answers "Option --all requires
   // a value" — a usage error about a flag that takes none.
   "all",
-  // `machines live-update-supervisor --forget-unknown`. Drops this
-  // installation's local note about an update whose outcome it never saw. It
-  // sends nothing and settles nothing on the server; it is the acknowledgement
-  // that makes the next explicit attempt possible.
+  // `machines live-update-supervisor --forget-unknown`. Clears this
+  // installation's local record of an update. It sends no mutation and settles
+  // nothing on the server; it reads the operation first and clears only a
+  // terminal one, because that record now holds the only identity able to
+  // resolve an open update.
   "forget-unknown",
+  // `machines live-update-supervisor --resume`. Re-sends the operation identity
+  // already recorded for this Machine. It is a repeat by design and the
+  // producer's own recovery: the same identity never rotates control twice.
+  // Deliberately NOT spelled `--yes`, which starts a different update.
+  "resume",
 ]);
 
 /**
@@ -260,6 +267,11 @@ const VALUE_OPTIONS = new Set([
   "machine",
   "memory-mib",
   "name",
+  // `machines live-update-status --operation`. Names one in-place supervisor
+  // update when this computer holds no record of it -- an update started from
+  // another computer or from the web console has an identity this CLI never
+  // held and cannot reconstruct.
+  "operation",
   "profile",
   "resource-id",
   "scope",

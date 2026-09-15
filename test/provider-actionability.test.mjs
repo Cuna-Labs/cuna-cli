@@ -28,6 +28,13 @@ function session(overrides = {}) {
     desiredState: "running",
     requestState: "launched",
     processState: "running",
+    // A row a supervisor really established for this epoch. Stated explicitly
+    // because every case below is about a DIFFERENT variable -- lifecycle,
+    // clock, provider, refresh, auth -- and the displayed line now carries the
+    // producer's process provenance too. Without this the whole table would
+    // silently read `unknown` and each case would be testing two things at
+    // once; provenance gets its own case at the end of this file instead.
+    processObservation: "observed",
     processEpoch: "epoch-1",
     runtimeObservedAt: new Date(NOW - 1_000).toISOString(),
     runtimeExpiresAt: new Date(NOW + 30_000).toISOString(),
@@ -130,4 +137,29 @@ test("pending refresh is an overlay and missing/lower/equal revisions retain the
   assert.equal(advanced.baseState, "failed");
   assert.equal(advanced.recoveryAction, "show-failure");
   assert.equal(advanced.observationRevision, 2);
+});
+
+test("the displayed line separates the refresh overlay from the process provenance", () => {
+  // Two independent qualifiers on one line. `checking` is about this CLI and
+  // what it is doing; the observation note is about the producer's row and who
+  // established its state. Either, both or neither may apply, and neither may
+  // become or replace the base state.
+  const observed = classifySessionActionability({ session: session(), machine: machine(), now: NOW });
+  assert.equal(displaySessionActionability(observed), "attachable");
+  assert.equal(observed.processObservation, "observed");
+
+  const unproven = classifySessionActionability({
+    session: session({ processObservation: "unproven" }), machine: machine(), now: NOW,
+  });
+  assert.equal(displaySessionActionability(unproven), "attachable · not observed");
+  assert.equal(
+    displaySessionActionability({ ...unproven, refreshStatus: "pending" }),
+    "attachable · not observed · checking",
+  );
+  // The overlay survives a merge, and so does the provenance it travels with.
+  const merged = mergeSessionActionabilityObservation({
+    confirmed: unproven, candidate: undefined, refreshStatus: "pending",
+  });
+  assert.equal(merged.processObservation, "unproven");
+  assert.equal(Object.values(merged).includes("checking"), false, "checking must not be stored as a base state");
 });
