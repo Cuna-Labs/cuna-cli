@@ -6,9 +6,14 @@ import { runProcessCli } from "../dist/cli/process-entrypoint.js";
 
 test("installed process entrypoint translates SIGINT into one abort and removes listeners", async () => {
   const host = new EventEmitter();
+  const inputEvents = [];
   let observedSignal;
   const exit = await runProcessCli(["login"], {
     host,
+    stdin: {
+      pause() { inputEvents.push("pause"); },
+      destroy() { inputEvents.push("destroy"); },
+    },
     run: async (_argv, dependencies) => {
       observedSignal = dependencies.signal;
       assert.equal(observedSignal.aborted, false);
@@ -21,6 +26,7 @@ test("installed process entrypoint translates SIGINT into one abort and removes 
   assert.equal(observedSignal.aborted, true);
   assert.equal(host.listenerCount("SIGINT"), 0);
   assert.equal(host.listenerCount("SIGTERM"), 0);
+  assert.deepEqual(inputEvents, ["pause", "destroy"]);
 });
 
 test("installed process entrypoint translates SIGTERM and also cleans up after failure", async () => {

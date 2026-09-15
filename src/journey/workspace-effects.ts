@@ -3,11 +3,13 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { CunaApiClient } from "../api/client.js";
+import type { Machine } from "../api/contracts.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import type { ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.js";
 import {
   inspectWorkspaceSyncPolicy,
   startContinuousWorkspaceSync,
+  computeWorkspaceManifestRoot,
   synchronizeLocalWorkspace,
   type AuthenticatedWorkspaceSyncTransport,
 } from "../sync/workspace-sync-product-service.js";
@@ -24,14 +26,82 @@ export interface WorkspaceJourneyEffectsInput {
   readonly workspaceId: string;
   readonly stateDirectory: string;
   readonly filesystemCapabilities: FilesystemCapabilities;
+  /**
+   * One human-readable line about a decision the journey took on the person's
+   * behalf (today: the folder was rebound to another Machine). Absent in
+   * structured or non-interactive runs; the decision is taken either way.
+   */
+  readonly onNotice?: (line: string) => void;
 }
 
 function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.conflict): CunaError {
   return new CunaError({ code, message, exitCode });
 }
 
+/**
+ * Whether the Machine a folder is bound to still exists, read from the Machine
+ * authority itself rather than inferred from a listing.
+ *
+ * Two answers mean "gone": a 404 (`cuna.remote.not_found`, the row is absent)
+ * and a row the server still returns in state `deleted` (the list endpoint
+ * hides those, the read does not). Everything else is not evidence of absence:
+ * a transient failure stays the retryable error it already is, and a 404
+ * without an API body (`operation_not_served`) says this deployment lacks the
+ * route, not that the Machine is gone.
+ */
+async function observeBoundMachine(
+  client: CunaApiClient,
+  machineId: string,
+  signal: AbortSignal,
+): Promise<{ readonly kind: "present"; readonly machine: Machine } | { readonly kind: "absent" }> {
+  let machine: Machine;
+  try {
+    machine = await client.getMachine(machineId, signal);
+  } catch (error) {
+    if (error instanceof CunaError && error.code === "cuna.remote.not_found") return Object.freeze({ kind: "absent" as const });
+    throw error;
+  }
+  if (machine.state === "deleted") return Object.freeze({ kind: "absent" as const });
+  return Object.freeze({ kind: "present" as const, machine });
+}
+
+/** The Machine's name when it can be read, its id otherwise. Never throws: this only decorates a message. */
+async function machineDisplayName(client: CunaApiClient, machineId: string, signal: AbortSignal): Promise<string> {
+  try {
+    const machine = await client.getMachine(machineId, signal);
+    return machine.name.trim().length > 0 ? machine.name : machineId;
+  } catch {
+    return machineId;
+  }
+}
+
 function bindingKey(workspaceId: string, userId: string, canonicalRoot: string): string {
   return createHash("sha256").update(`${workspaceId}\0${userId}\0${canonicalRoot}`, "utf8").digest("hex");
+}
+
+function workspaceBindingCreateKey(request: {
+  readonly workspaceId: string;
+  readonly projectId: string;
+  readonly localInstanceId: string;
+  readonly machineId: string;
+  readonly exclusionPolicyDigest: string;
+  readonly excludedPrefixes: readonly string[];
+}): string {
+  // Version the namespace as well as hashing the complete producer body. Old
+  // builds keyed only the local root, so a later machine selection could reuse
+  // a key already bound to another request and fail forever with
+  // workspace_binding_idempotency_conflict. A v2 key can adopt an existing
+  // canonical binding without colliding with those spent legacy keys.
+  const canonicalIntent = JSON.stringify({
+    workspace_id: request.workspaceId,
+    project_id: request.projectId,
+    local_instance_id: request.localInstanceId,
+    machine_id: request.machineId,
+    exclusion_policy_digest: request.exclusionPolicyDigest,
+    excluded_prefixes: request.excludedPrefixes,
+  });
+  const digest = createHash("sha256").update(canonicalIntent, "utf8").digest("hex");
+  return `cuna-workspace-binding-v2-${digest}`;
 }
 
 /** Local binding facts are only hints until the complete tuple is re-read from the API. */
@@ -76,8 +146,19 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       unsubscribeSupervisor = undefined;
       await current?.stop();
     },
-    async inspectWorkspace({ localPath }) {
+    async inspectWorkspace({ localPath, syncMode, signal }) {
+      signal.throwIfAborted();
       const inspected = await inspect(localPath);
+      if (syncMode !== "disabled") {
+        // Reject local content before provisioning. This result is deliberately
+        // discarded: synchronization must scan again against current files.
+        await computeWorkspaceManifestRoot({
+          localRoot: inspected.policy.canonicalRoot,
+          filesystemCapabilities: input.filesystemCapabilities,
+          signal,
+        });
+      }
+      signal.throwIfAborted();
       // The canonical root leaves this layer because the machine-create request
       // identity is derived from it. Recomputing it in the orchestrator would
       // make two answers to "which project is this", and the create identity
@@ -89,19 +170,88 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
     },
     async synchronizeWorkspace({ machineId, localPath, syncMode, signal }) {
       const inspected = await inspect(localPath);
+      // The local record this run will compare-and-swap against. A rebind
+      // replaces it below, so every later persist must swap against the
+      // rebound record, not the one that named the vanished Machine.
+      let localRecord = inspected.local?.record;
       let authority;
       if (inspected.local !== undefined) {
         const record = inspected.local.record;
-        if (record.machineId !== machineId || record.policyDigest !== inspected.policy.exclusionPolicyDigest) {
-          throw fail("cuna.journey.workspace_binding_conflict", "The local project binding does not authorize the selected machine and exclusion policy.");
+        if (record.policyDigest !== inspected.policy.exclusionPolicyDigest) {
+          throw fail("cuna.journey.workspace_binding_conflict", "The local project binding does not authorize the selected exclusion policy.");
         }
-        authority = await input.client.getWorkspaceBinding(record.bindingId, {
-          workspaceId: input.workspaceId,
-          projectId: record.projectId,
-          localInstanceId: record.localInstanceId,
-          machineId,
-          exclusionPolicyDigest: inspected.policy.exclusionPolicyDigest,
-        }, signal);
+        if (record.machineId !== machineId) {
+          // The folder is the project; a Machine is disposable (PRD-PM-008
+          // §H, E14-D1). Decide from the Machine authority, not the listing:
+          // gone means rebind, present means the typed refusal, anything else
+          // is not evidence and keeps its own error.
+          const bound = await observeBoundMachine(input.client, record.machineId, signal);
+          if (bound.kind === "present") {
+            const boundName = bound.machine.name.trim().length > 0 ? bound.machine.name : record.machineId;
+            const selectedName = await machineDisplayName(input.client, machineId, signal);
+            throw new CunaError({
+              code: "cuna.journey.workspace_binding_conflict",
+              message: `This folder is bound to Machine ${boundName}, not ${selectedName}.`,
+              exitCode: EXIT_CODES.conflict,
+              hint: `Run the same command with \`--machine ${boundName}\` to use the Machine this folder is bound to, or delete \`.cuna/workspace.json\` in this folder to bind it to ${selectedName} on the next run. Neither touches the Workspace on either Machine.`,
+              details: {
+                bound_machine_id: record.machineId,
+                bound_machine_name: boundName,
+                selected_machine_id: machineId,
+                selected_machine_name: selectedName,
+              },
+            });
+          }
+          const createRequest = Object.freeze({
+            workspaceId: input.workspaceId,
+            projectId: record.projectId,
+            localInstanceId: record.localInstanceId,
+            machineId,
+            exclusionPolicyDigest: inspected.policy.exclusionPolicyDigest,
+            excludedPrefixes: Object.freeze([] as string[]),
+          });
+          authority = await input.client.createWorkspaceBinding(
+            createRequest,
+            workspaceBindingCreateKey(createRequest),
+            signal,
+          );
+          // Commit the rebind before any synchronization so the receipt is
+          // truthful even if this run stops here: the next run finds the new
+          // Machine, not a second vanished one.
+          localRecord = await persistWorkspaceBinding({
+            root: inspected.policy.canonicalRoot,
+            binding: {
+              profileId: input.profileId,
+              userId: input.userId,
+              workspaceId: input.workspaceId,
+              bindingId: authority.bindingId,
+              projectId: authority.projectId,
+              ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
+              localInstanceId: authority.localInstanceId,
+              machineId,
+              remoteRoot: authority.remoteRoot,
+              policyDigest: authority.exclusionPolicyDigest,
+              generation: authority.activeGeneration,
+              bindingCreatedAt: authority.createdAt,
+              bindingUpdatedAt: authority.updatedAt,
+            },
+            expected: workspaceBindingCompareAndSwap(record),
+            rebind: true,
+          });
+          input.onNotice?.(`Rebound this folder to ${await machineDisplayName(input.client, machineId, signal)} · the previous Machine no longer exists`);
+        } else {
+          authority = await input.client.getWorkspaceBinding(record.bindingId, {
+            ...(record.executionWorkspaceId === undefined ? {} : { executionWorkspaceId: record.executionWorkspaceId }),
+            workspaceId: input.workspaceId,
+            projectId: record.projectId,
+            localInstanceId: record.localInstanceId,
+            machineId,
+            exclusionPolicyDigest: inspected.policy.exclusionPolicyDigest,
+          }, signal);
+          if ((authority.executionWorkspaceId ?? null) !== (record.executionWorkspaceId ?? null) || authority.remoteRoot !== record.remoteRoot) {
+            throw fail("cuna.journey.workspace_binding_conflict", "The server Workspace identity differs from this folder's recorded binding.");
+          }
+        }
       } else {
         if (syncMode === "disabled") {
           throw fail("cuna.journey.workspace_binding_required", "--no-sync requires an existing remotely committed workspace binding.", EXIT_CODES.policy);
@@ -112,22 +262,73 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         // retries the identical tuple and idempotency key, never a duplicate.
         const projectId = stableUuid("cuna.workspace.project.v1", intentDigest);
         const localInstanceId = stableUuid("cuna.workspace.local-instance.v1", `${intentDigest}\0${input.stateDirectory}`);
-        const createKey = `cuna-workspace-${intentDigest}`;
-        authority = await input.client.createWorkspaceBinding({
+        const createRequest = Object.freeze({
           workspaceId: input.workspaceId,
           projectId,
           localInstanceId,
           machineId,
           exclusionPolicyDigest: inspected.policy.exclusionPolicyDigest,
-          excludedPrefixes: [],
-        }, createKey, signal);
+          excludedPrefixes: Object.freeze([] as string[]),
+        });
+        authority = await input.client.createWorkspaceBinding(
+          createRequest,
+          workspaceBindingCreateKey(createRequest),
+          signal,
+        );
       }
 
       if (syncMode === "disabled") {
         if (authority.activeGeneration < 1) {
           throw fail("cuna.journey.workspace_generation_unavailable", "--no-sync cannot attach until the binding has a committed workspace generation.", EXIT_CODES.policy);
         }
-        return Object.freeze({ bindingId: authority.bindingId, workspaceIdentity: authority.bindingId, generation: authority.activeGeneration, remoteCwd: authority.remoteRoot });
+        return Object.freeze({ ...(authority.executionWorkspaceId==null?{}:{executionWorkspaceId:authority.executionWorkspaceId}), bindingId: authority.bindingId, workspaceIdentity: authority.bindingId, generation: authority.activeGeneration, remoteCwd: authority.remoteRoot });
+      }
+
+      // A generation is a witness to workspace content. If the content has not
+      // changed there is nothing to witness, so do not commit one.
+      //
+      // This is not an optimisation. `workspaceGeneration` is part of the
+      // AgentSession identity key (`journey/selection.ts:596-604`), so a
+      // generation committed for identical content makes the previous session
+      // stop being "exact" and forces a sibling with a new process epoch.
+      // Measured in production 2026-08-30 on binding dab40ec9: generations 1,
+      // 2 and 3 all carry manifest root d4313d11…, entry_count 1,
+      // content_bytes 28 — three generations, one manifest, no file touched.
+      // Two runs against one Machine left two live OpenCode processes where the
+      // owner expected to reconnect to one.
+      //
+      // The manifest is recomputed inside `synchronizeLocalWorkspace` when the
+      // content HAS changed, which is the only case that pays for it. Skipping
+      // returns exactly the shape the proven `--no-sync` branch above returns.
+      const currentManifestRoot = await computeWorkspaceManifestRoot({
+        localRoot: inspected.policy.canonicalRoot,
+        filesystemCapabilities: input.filesystemCapabilities,
+      });
+      if (
+        authority.activeGeneration >= 1 &&
+        authority.activeManifestRoot === currentManifestRoot
+      ) {
+        if (localRecord === undefined || localRecord.generation !== authority.activeGeneration) {
+          await persistWorkspaceBinding({
+            root: inspected.policy.canonicalRoot,
+            binding: {
+              profileId: input.profileId, userId: input.userId, workspaceId: input.workspaceId,
+              bindingId: authority.bindingId, projectId: authority.projectId,
+              ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
+              localInstanceId: authority.localInstanceId, machineId, remoteRoot: authority.remoteRoot,
+              policyDigest: authority.exclusionPolicyDigest, generation: authority.activeGeneration,
+              bindingCreatedAt: authority.createdAt, bindingUpdatedAt: authority.updatedAt,
+            },
+            expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
+          });
+        }
+        return Object.freeze({
+          bindingId: authority.bindingId,
+          ...(authority.executionWorkspaceId==null?{}:{executionWorkspaceId:authority.executionWorkspaceId}),
+          workspaceIdentity: authority.bindingId,
+          generation: authority.activeGeneration,
+          remoteCwd: authority.remoteRoot,
+        });
       }
 
       const checkpointRoot = join(input.stateDirectory, "workspace-sync");
@@ -144,6 +345,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         signal,
       });
       const committedAuthority = await input.client.getWorkspaceBinding(authority.bindingId, {
+        ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
         workspaceId: input.workspaceId,
         projectId: authority.projectId,
         localInstanceId: authority.localInstanceId,
@@ -151,6 +353,8 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         exclusionPolicyDigest: authority.exclusionPolicyDigest,
       }, signal);
       if (
+        (committedAuthority.executionWorkspaceId ?? null) !== (authority.executionWorkspaceId ?? null) ||
+        committedAuthority.remoteRoot !== authority.remoteRoot ||
         committedAuthority.activeGeneration !== receipt.generation ||
         committedAuthority.activeManifestRoot !== receipt.manifest_root
       ) {
@@ -168,6 +372,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           workspaceId: input.workspaceId,
           bindingId: committedAuthority.bindingId,
           projectId: committedAuthority.projectId,
+          ...(committedAuthority.executionWorkspaceId == null ? {} : { executionWorkspaceId: committedAuthority.executionWorkspaceId }),
           localInstanceId: committedAuthority.localInstanceId,
           machineId,
           remoteRoot: committedAuthority.remoteRoot,
@@ -176,7 +381,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           bindingCreatedAt: committedAuthority.createdAt,
           bindingUpdatedAt: committedAuthority.updatedAt,
         },
-        expected: inspected.local === undefined ? null : workspaceBindingCompareAndSwap(inspected.local.record),
+        expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
       });
       supervisor = await startContinuousWorkspaceSync({
         localRoot: inspected.policy.canonicalRoot,
@@ -194,7 +399,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           try { listener(snapshot); } catch { /* Status observers never own synchronization correctness. */ }
         }
       });
-      return Object.freeze({ bindingId: persisted.bindingId, workspaceIdentity: persisted.bindingId, generation: persisted.generation, remoteCwd: persisted.remoteRoot });
+      return Object.freeze({ ...(persisted.executionWorkspaceId===undefined?{}:{executionWorkspaceId:persisted.executionWorkspaceId}), bindingId: persisted.bindingId, workspaceIdentity: persisted.bindingId, generation: persisted.generation, remoteCwd: persisted.remoteRoot });
     },
   };
   return Object.freeze(effects);

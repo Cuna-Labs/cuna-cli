@@ -88,6 +88,50 @@ export const DEFAULT_REQUEST_BUDGET_MS = 15_000;
 export const MACHINE_CREATE_REQUEST_BUDGET_MS = 90_000;
 
 /**
+ * `POST /v1/sessions/{id}/{start|resume}` boots a VM and waits for its
+ * supervisor to accept control before it answers, so it is not bounded by the
+ * same budget as a list either.
+ *
+ * DERIVATION. Measured 2026-09-02 against edge v148 on Machine fceaf633: the
+ * answer came at 24 s from `cuna machines start` (which the caller had widened
+ * by hand with `--timeout-ms`), while the same transition inside `cuna
+ * opencode` aborted at the 15 s default and told the user the operation "may
+ * have completed" — for the step the journey itself had just decided to take.
+ * 60 000 ms is that duration with a 150% margin; it stays well inside the
+ * `--timeout-ms` ceiling of 120 000, and it is deliberately lower than the
+ * create budget because starting an existing VM does not provision one.
+ */
+export const MACHINE_LIFECYCLE_REQUEST_BUDGET_MS = 60_000;
+
+/**
+ * `POST /v1/sessions/{id}/supervisor/live-update` replaces a RUNNING Machine's
+ * supervisor in place, and it does five bounded remote steps before it answers.
+ *
+ * DERIVATION, summed from the producer's own declared timeouts rather than from
+ * a wall-clock sample, because no live run of this operation has been observed
+ * from this CLI yet and a constant invented from nothing cannot be refuted:
+ *
+ *   30 s  pre-install session-custody observation
+ *           (`MACHINE_SUPERVISOR_LIVE_CONTINUITY_TIMEOUT_SECONDS`)
+ *   10 s  exec-readiness probe (`MACHINE_SUPERVISOR_EXEC_READY_TIMEOUT_MS`)
+ *   90 s  the installer itself, on the live-process path
+ *           (`MACHINE_SUPERVISOR_LIVE_EXEC_TIMEOUT_SECONDS`)
+ *   15 s  waiting for the exact new control to acknowledge
+ *           (`MACHINE_SUPERVISOR_ACK_TIMEOUT_MS`)
+ *   30 s  the post-install custody re-read, same bound as the first
+ *   ----
+ *  175 s  before the provider read, the Machine reads and the edge's own work.
+ *
+ * 240 000 ms is that sum with a ~37% margin. It is deliberately ABOVE the
+ * `--timeout-ms` ceiling of 120 000: a caller who passes that flag overrides
+ * this budget downward and will abort a dispatch that is still in flight, which
+ * this command must then report as an unknown outcome rather than a failure.
+ * That is why the budget lives here with its derivation instead of being the
+ * lifecycle constant reused one command too far.
+ */
+export const SUPERVISOR_LIVE_UPDATE_REQUEST_BUDGET_MS = 240_000;
+
+/**
  * How long the CLI reads back before it stops judging a postcondition.
  *
  * DERIVATION. Measured 2026-08-19: a deleted machine was still `present` on an
@@ -96,8 +140,14 @@ export const MACHINE_CREATE_REQUEST_BUDGET_MS = 90_000;
  * 15 000 ms and was the only convergence budget in the tree. 30 000 ms is the
  * larger of the two doubled, and one constant replaces both so the two cannot
  * drift apart again.
+ *
+ * Re-measured 2026-09-02 on production: `agent-sessions terminate` was
+ * accepted and the row read `exited` about 36 s later, so a 30 s read-back
+ * reported a false failure (exit 5) for a termination that completed. The
+ * read-back is a cheap poll; 120 s covers a supervisor that has to fence and
+ * flush a live PTY without turning a completed operation into an error.
  */
-export const REMOTE_CONVERGENCE_BUDGET_MS = 30_000;
+export const REMOTE_CONVERGENCE_BUDGET_MS = 120_000;
 
 /** Interval between read-backs while converging. */
 export const REMOTE_CONVERGENCE_POLL_INTERVAL_MS = 500;

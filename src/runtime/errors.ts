@@ -10,14 +10,18 @@ export type RuntimeErrorCode =
   | "grant_expired"
   | "grant_scope_mismatch"
   | "terminal_protocol_error"
+  | "terminal_history_gap"
   | "terminal_not_ready"
   | "terminal_disconnected"
   | "terminal_timeout"
+  | "terminal_observer"
+  | "terminal_writer_unavailable"
   | "session_conflict"
   | "session_unknown"
   | "session_discontinuous"
   | "stale_fence"
   | "runtime_closed"
+  | "runtime_cleanup_timeout"
   | "process_invalid"
   | "process_failed"
   | "pty_unavailable"
@@ -53,4 +57,11 @@ export function runtimeFailure(
   } = {},
 ): RuntimeBoundaryError {
   return new RuntimeBoundaryError({ code, message, ...options });
+}
+
+export function terminalHistoryGap(agentSessionId: string): RuntimeBoundaryError {
+  return runtimeFailure("terminal_history_gap", "Cuna cannot restore this terminal because earlier output is no longer available. The agent's current state is unknown.", {
+    retryable: false,
+    safeDetails: { reason: "retained_output_gap", process_state: "unknown", agent_session_id: agentSessionId },
+  });
 }

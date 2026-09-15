@@ -19,7 +19,9 @@ export function workspaceError(
     code: `cuna.workspace.${code}`,
     message,
     exitCode: EXIT_BY_CLASS[failureClass],
+    ...(code === "secret_blocked" ? {
+      hint: "Remove sensitive files from the synchronization scope, then retry from the intended project folder.",
+    } : {}),
     details: { reason },
   });
 }
-

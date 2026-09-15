@@ -91,7 +91,7 @@ const controlPlane = {
   },
   async observeAgentSession(id) {
     const freshness = supervisorAuthorityWindow();
-    return { authority: "cuna_agent_session_supervisor", userId: "installed-user", machineId: "10000000-0000-4000-8000-000000000001", agentSessionId: id, processEpoch, state: "running", ...freshness, evidenceRevision: "installed-foreground-revision" };
+    return { authority: "cuna_agent_session_supervisor", userId: "installed-user", machineId: "10000000-0000-4000-8000-000000000001", workspaceBindingId: "60000000-0000-4000-8000-000000000006", workspaceBindingGeneration: 1, agentSessionId: id, processEpoch, state: "running", ...freshness, evidenceRevision: "installed-foreground-revision" };
   },
   async createTerminalConnection(input) {
     const freshness = freshAuthorityWindow(20_000);
@@ -167,7 +167,13 @@ try {
         async ensureAgentSessionReady() { return { id: automaticSessionId, machineId: "10000000-0000-4000-8000-000000000001" }; },
         async attach(input) {
           automatic.attached = { id: input.agentSessionId, agent: input.expectedAgent };
-          await foregroundTerminalRunner({ client, baseUrl: config.baseUrl, agentSessionIds: [input.agentSessionId], expectedAgentKinds: [input.expectedAgent], presentationMode: "plain" });
+          await foregroundTerminalRunner({
+            client,
+            baseUrl: config.baseUrl,
+            agentSessionIds: [input.agentSessionId],
+            expectedAgentKinds: [input.expectedAgent],
+            presentationMode: "plain",
+          });
         },
         async reconcileCancellation() {},
       };

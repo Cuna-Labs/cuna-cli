@@ -1,3 +1,4 @@
+import { isTerminalReason, type TerminalReason } from "./terminal-reason.js";
 import {
   containsCredentialValue,
   isApiKeyDisplayPrefix,
@@ -116,6 +117,7 @@ export function decodeCapabilitySnapshot(value: unknown): CapabilitySnapshot {
 }
 
 export interface Machine {
+  readonly createOperation?: MachineCreateRequest;
   readonly id: string;
   readonly name: string;
   readonly state: string;
@@ -150,6 +152,7 @@ export interface MachineCreateRequest {
 
 export interface WorkspaceBindingAuthority {
   readonly bindingId: string;
+  readonly executionWorkspaceId: string | null;
   readonly workspaceId: string;
   readonly projectId: string;
   readonly localInstanceId: string;
@@ -167,6 +170,12 @@ export interface WorkspaceBindingAuthority {
 
 function decodeMachine(value: unknown): Machine {
   if (!isObject(value)) throw contractViolation("object");
+  const id = canonicalUuid(value, "id");
+  const createOperation = value.create_operation === undefined ? undefined
+    : underField("create_operation", () => decodeMachineCreateRequest(value.create_operation));
+  if (createOperation !== undefined && createOperation.machineId !== id) {
+    throw contractViolation("matches_machine_id", "create_operation.machine_id");
+  }
   const state = optionalDisplayString(value, "state") ?? optionalDisplayString(value, "status") ?? "unknown";
   const memoryMiB = optionalNumber(value, "memory_mib");
   const vcpus = optionalNumber(value, "vcpus");
@@ -174,7 +183,8 @@ function decodeMachine(value: unknown): Machine {
   const createdAt = optionalString(value, "created_at");
   const updatedAt = optionalString(value, "updated_at");
   return Object.freeze({
-    id: canonicalUuid(value, "id"),
+    id,
+    ...(createOperation === undefined ? {} : { createOperation }),
     name: optionalDisplayString(value, "name") ?? optionalDisplayString(value, "slug") ?? requiredString(value, "id"),
     state,
     ...(agent === undefined ? {} : { agent }),
@@ -234,12 +244,13 @@ export function decodeMachineCreateRequest(value: unknown): MachineCreateRequest
 export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindingAuthority {
   if (!isObject(value)) throw contractViolation("object");
   exactKeys(value, [
-    "binding_id", "workspace_id", "project_id", "local_instance_id", "machine_id",
+    "binding_id", "workspace_id", "project_id", "local_instance_id", "machine_id", "execution_workspace_id",
     "remote_root", "exclusion_policy_digest", "active_generation", "active_manifest_root",
     "binding_epoch", "minimum_reader", "minimum_writer", "created_at", "updated_at",
   ]);
   const bindingId = canonicalUuid(value, "binding_id");
   const projectId = canonicalUuid(value, "project_id");
+  const executionWorkspaceId = value.execution_workspace_id === null ? null : canonicalUuid(value, "execution_workspace_id");
   const exclusionPolicyDigest = requiredString(value, "exclusion_policy_digest");
   const activeManifestRoot = requiredString(value, "active_manifest_root");
   const remoteRoot = requiredString(value, "remote_root");
@@ -249,8 +260,8 @@ export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindin
   const bindingEpoch = optionalNumber(value, "binding_epoch");
   const minimumReader = optionalNumber(value, "minimum_reader");
   const minimumWriter = optionalNumber(value, "minimum_writer");
-  if (remoteRoot !== `/workspace/projects/${projectId}`) {
-    throw contractViolation("remote_root_derives_from_project_id", "remote_root");
+  if (remoteRoot !== (executionWorkspaceId === null ? `/workspace/projects/${projectId}` : `/workspace/workspaces/${executionWorkspaceId}`)) {
+    throw contractViolation("remote_root_matches_execution_workspace", "remote_root");
   }
   if (!/^[0-9a-f]{64}$/u.test(exclusionPolicyDigest)) {
     throw contractViolation("sha256_digest", "exclusion_policy_digest");
@@ -274,6 +285,7 @@ export function decodeWorkspaceBindingAuthority(value: unknown): WorkspaceBindin
   if (!Number.isFinite(Date.parse(updatedAt))) throw contractViolation("parsable_timestamp", "updated_at");
   return Object.freeze({
     bindingId,
+    executionWorkspaceId,
     workspaceId: canonicalUuid(value, "workspace_id"),
     projectId,
     localInstanceId: canonicalUuid(value, "local_instance_id"),
@@ -296,11 +308,89 @@ export interface CunaIdentity {
   readonly workspaceAssigned: boolean;
   readonly workspaceId?: string;
   readonly workspaceUsage?: {
+    /**
+     * A floor, not a total: spend accrues only while a Machine is running, so a
+     * stopped Machine contributes zero however the provider bills it.
+     */
     readonly estimatedSpendUsd: number;
-    readonly estimatedRemainingUsd: number;
+    readonly estimatedSpendIsLowerBound: true;
+    readonly balanceStatus: "available" | "unavailable";
+    /** `null` whenever `balanceStatus` is `unavailable` -- never zero. */
+    readonly balanceUsd: number | null;
+    /** Present exactly when `balanceStatus` is `unavailable`. */
+    readonly balanceUnavailableReason?: string;
     readonly note: string;
   };
+  /**
+   * Set instead of `workspaceUsage` when the server's usage payload does not
+   * match this contract. Only `cuna usage show` reads it; every other command
+   * proceeds, because knowing who you are does not depend on a spend figure.
+   */
+  readonly workspaceUsageProblem?: string;
   readonly waitlistPosition?: number;
+}
+
+/**
+ * Validate `workspace.usage` and decode it.
+ *
+ * `balance_unavailable_reason` is the one optional key, present exactly when
+ * `balance_status` is `unavailable`. Everything else is required, and this is
+ * closed: a server that adds a field is refused rather than silently displayed.
+ *
+ * Separate from the identity decode on purpose. Usage is read by one command;
+ * identity is read by every command that needs to know who you are. A usage
+ * field this does not recognise must not decide whether a terminal can open.
+ */
+function decodeWorkspaceUsage(usage: Record<string, unknown>): NonNullable<CunaIdentity["workspaceUsage"]> {
+  if (Object.keys(usage).some((key) => ![
+    "est_spend_usd",
+    "est_spend_is_lower_bound",
+    "balance_status",
+    "balance_usd",
+    "balance_unavailable_reason",
+    "note",
+  ].includes(key))) {
+    throw contractViolation("no_unknown_fields", "workspace.usage");
+  }
+  if (typeof usage.est_spend_usd !== "number" || !Number.isFinite(usage.est_spend_usd)) {
+    throw contractViolation("finite_number", "workspace.usage.est_spend_usd");
+  }
+  // A constant, not a flag: `false` would be a different contract.
+  if (usage.est_spend_is_lower_bound !== true) {
+    throw contractViolation("const_true", "workspace.usage.est_spend_is_lower_bound");
+  }
+  if (usage.balance_status !== "available" && usage.balance_status !== "unavailable") {
+    throw contractViolation("balance_status_vocabulary", "workspace.usage.balance_status");
+  }
+  if (usage.balance_status === "available") {
+    if (typeof usage.balance_usd !== "number" || !Number.isFinite(usage.balance_usd)) {
+      throw contractViolation("finite_number", "workspace.usage.balance_usd");
+    }
+    if (usage.balance_unavailable_reason !== undefined) {
+      throw contractViolation("absent_when_available", "workspace.usage.balance_unavailable_reason");
+    }
+  } else {
+    // `null`, not absent and not zero: a zero balance is a real reading.
+    if (usage.balance_usd !== null) {
+      throw contractViolation("null_when_unavailable", "workspace.usage.balance_usd");
+    }
+    if (typeof usage.balance_unavailable_reason !== "string" || usage.balance_unavailable_reason === "") {
+      throw contractViolation("required_when_balance_unavailable", "workspace.usage.balance_unavailable_reason");
+    }
+  }
+  if (typeof usage.note !== "string") {
+    throw contractViolation("string", "workspace.usage.note");
+  }
+  return Object.freeze({
+    estimatedSpendUsd: Number(usage.est_spend_usd),
+    estimatedSpendIsLowerBound: true as const,
+    balanceStatus: usage.balance_status as "available" | "unavailable",
+    balanceUsd: usage.balance_usd as number | null,
+    ...(usage.balance_unavailable_reason === undefined
+      ? {}
+      : { balanceUnavailableReason: String(usage.balance_unavailable_reason) }),
+    note: String(usage.note),
+  });
 }
 
 /**
@@ -337,26 +427,6 @@ export function decodeCunaIdentity(value: unknown): CunaIdentity {
     if (!isObject(value.workspace.usage)) {
       throw contractViolation("required_when_workspace_assigned", "workspace.usage");
     }
-    if (Object.keys(value.workspace.usage).some(
-      (key) => key !== "est_spend_usd" && key !== "est_remaining_usd" && key !== "note",
-    )) {
-      throw contractViolation("no_unknown_fields", "workspace.usage");
-    }
-    if (
-      typeof value.workspace.usage.est_spend_usd !== "number" ||
-      !Number.isFinite(value.workspace.usage.est_spend_usd)
-    ) {
-      throw contractViolation("finite_number", "workspace.usage.est_spend_usd");
-    }
-    if (
-      typeof value.workspace.usage.est_remaining_usd !== "number" ||
-      !Number.isFinite(value.workspace.usage.est_remaining_usd)
-    ) {
-      throw contractViolation("finite_number", "workspace.usage.est_remaining_usd");
-    }
-    if (typeof value.workspace.usage.note !== "string") {
-      throw contractViolation("string", "workspace.usage.note");
-    }
   } else {
     if (workspaceKeys.some((key) => key !== "assigned" && key !== "waitlist_position")) {
       throw contractViolation("no_unknown_fields", "workspace");
@@ -368,6 +438,25 @@ export function decodeCunaIdentity(value: unknown): CunaIdentity {
       throw contractViolation("safe_non_negative_integer", "workspace.waitlist_position");
     }
   }
+  // A usage fault is recorded, not thrown: it stops `cuna usage show` and
+  // nothing else. Letting it throw here took down every command that reads an
+  // identity, including the one that opens a terminal.
+  let decodedUsage: {
+    workspaceUsage?: NonNullable<CunaIdentity["workspaceUsage"]>;
+    workspaceUsageProblem?: string;
+  } = {};
+  if (assigned) {
+    try {
+      decodedUsage = {
+        workspaceUsage: underField("workspace.usage", () =>
+          decodeWorkspaceUsage((value.workspace as Record<string, unknown>).usage as Record<string, unknown>)),
+      };
+    } catch (error) {
+      decodedUsage = {
+        workspaceUsageProblem: error instanceof Error ? error.message : "workspace usage is off contract",
+      };
+    }
+  }
   return Object.freeze({
     id: canonicalUuid(value, "id"),
     email: requiredString(value, "email"),
@@ -375,11 +464,7 @@ export function decodeCunaIdentity(value: unknown): CunaIdentity {
     ...(assigned
       ? {
           workspaceId: underField("workspace", () => canonicalUuid(value.workspace as Record<string, unknown>, "id")),
-          workspaceUsage: Object.freeze({
-            estimatedSpendUsd: Number((value.workspace.usage as Record<string, unknown>).est_spend_usd),
-            estimatedRemainingUsd: Number((value.workspace.usage as Record<string, unknown>).est_remaining_usd),
-            note: String((value.workspace.usage as Record<string, unknown>).note),
-          }),
+          ...decodedUsage,
         }
       : { waitlistPosition: Number(value.workspace.waitlist_position) }),
   });
@@ -417,6 +502,15 @@ export type AgentSessionProcessState =
   | "failed"
   | "terminating"
   | "terminated";
+/**
+ * The provenance of `processState`, which is a different question from the
+ * state itself and from whether the runtime lease has expired.
+ *
+ * Read from producer `Cuna-Labs/infra` commit
+ * `7cb7e37ec8f0821fc6b402be5fcc9bc8e9439d55`, `components.schemas.AgentSession
+ * .process_observation`.
+ */
+export type AgentSessionProcessObservation = "observed" | "unproven" | "unknown";
 export interface AgentSession {
   readonly id: string;
   readonly machineId: string;
@@ -427,6 +521,15 @@ export interface AgentSession {
    */
   readonly workspaceBindingId?: string;
   readonly workspaceGeneration?: number;
+  /**
+   * Project that owns the Workspace this AgentSession runs in, resolved by the
+   * server from whichever Workspace the session names. Absent means the server
+   * could not name one, which is unknown rather than none. It is the session's
+   * own Project and is NOT in general the Machine default Workspace's Project.
+   */
+  readonly projectId?: string;
+  readonly workspaceFailureCode?: string;
+  readonly terminalReason?: TerminalReason;
   readonly name: string;
   readonly agent: AgentKind;
   readonly cwd: string;
@@ -434,6 +537,27 @@ export interface AgentSession {
   readonly desiredState: AgentSessionDesiredState;
   readonly requestState: AgentSessionRequestState;
   readonly processState: AgentSessionProcessState;
+  /**
+   * Whether a supervisor ESTABLISHED `processState` and `runtimeObservedAt` for
+   * the CURRENT process epoch, in the producer's own words:
+   *
+   *   `observed`  it did.
+   *   `unproven`  it settled a runtime-lease renewal without being able to
+   *               observe the child, so `processState` and `runtimeObservedAt`
+   *               are the last values anybody established and the lease moved
+   *               without them.
+   *   `unknown`   no provenance is recorded for this epoch.
+   *
+   * ABSENT is not a fourth value and is not `observed`. A deployment older than
+   * the release that began recording provenance sends nothing here, and that is
+   * the same fact as `unknown`: nobody recorded whether anyone looked.
+   * `agentSessionProcessObservation` in `machines/session-visibility.ts` is
+   * where absence is folded into `unknown`, once, so no renderer has to decide.
+   *
+   * Cuna states no staleness threshold and this CLI must not invent one.
+   * `runtimeExpiresAt` is lease authority, never observation freshness.
+   */
+  readonly processObservation?: AgentSessionProcessObservation;
   readonly processEpoch?: string;
   readonly runtimeObservedAt?: string;
   readonly runtimeExpiresAt?: string;
@@ -451,6 +575,8 @@ export interface AgentSessionPage {
 export interface AgentSessionAuth {
   readonly observationId: string;
   readonly agentSessionId: string;
+  /** The provider observed by the supervisor for this exact process epoch. */
+  readonly agent: AgentKind;
   readonly processEpoch: string | null;
   readonly authMode: AgentAuthMode;
   readonly agentVersion: string;
@@ -482,6 +608,9 @@ const REQUEST_STATES = new Set<AgentSessionRequestState>([
 const PROCESS_STATES = new Set<AgentSessionProcessState>([
   "unknown", "starting", "ready", "running", "exited", "failed", "terminating", "terminated",
 ]);
+const PROCESS_OBSERVATIONS: ReadonlySet<string> = new Set<AgentSessionProcessObservation>([
+  "observed", "unproven", "unknown",
+]);
 const AGENT_AUTH_STATES = new Set<AgentSessionAuthState>([
   "login_required", "authenticated", "configured", "unavailable",
 ]);
@@ -503,6 +632,9 @@ function decodeAgentSession(value: unknown): AgentSession {
     "machine_id",
     "workspace_binding_id",
     "workspace_generation",
+    "project_id",
+    "workspace_failure_code",
+    "terminal_reason",
     "name",
     "agent",
     "cwd",
@@ -510,6 +642,7 @@ function decodeAgentSession(value: unknown): AgentSession {
     "desired_state",
     "request_state",
     "process_state",
+    "process_observation",
     "process_epoch",
     "runtime_observed_at",
     "runtime_expires_at",
@@ -530,7 +663,24 @@ function decodeAgentSession(value: unknown): AgentSession {
   // unreadable during a consumer-first rollback.
   const desiredState = enumField(value, "desired_state", DESIRED_STATES);
   const requestState = enumField(value, "request_state", REQUEST_STATES);
+  const workspaceFailureCode = optionalString(value, "workspace_failure_code");
+  if (workspaceFailureCode !== undefined && (requestState !== "failed" || !/^[a-z][a-z0-9_.]{0,127}$/u.test(workspaceFailureCode))) {
+    throw contractViolation("failed_request_safe_workspace_reason", "workspace_failure_code");
+  }
   const processState = enumField(value, "process_state", PROCESS_STATES);
+  const terminalReason = optionalString(value, "terminal_reason");
+  if (terminalReason !== undefined &&
+      (!isTerminalReason(terminalReason) || !["exited", "failed", "terminated"].includes(processState))) {
+    throw contractViolation("terminal_state_safe_reason", "terminal_reason");
+  }
+  // Strict where it is present, tolerant of its absence, and never defaulted.
+  // A value this build does not know is refused rather than demoted: an
+  // unrecognised provenance could be a NEW way to say "nobody looked", and
+  // reading it as `observed` is the one error this field exists to prevent.
+  const processObservation = optionalString(value, "process_observation");
+  if (processObservation !== undefined && !PROCESS_OBSERVATIONS.has(processObservation)) {
+    throw contractViolation("known_enum_value", "process_observation");
+  }
   const processEpoch = optionalString(value, "process_epoch");
   const runtimeObservedAt = optionalString(value, "runtime_observed_at");
   const runtimeExpiresAt = optionalString(value, "runtime_expires_at");
@@ -549,6 +699,15 @@ function decodeAgentSession(value: unknown): AgentSession {
   ) {
     throw contractViolation("workspace_binding_identity_shape");
   }
+  // The Project is the server's answer about this exact session, so the CLI
+  // checks its shape and otherwise carries it through untouched. Absent stays
+  // absent: a session whose Workspace the server cannot resolve has an unknown
+  // Project, and inventing one here would let a caller scope work to a Project
+  // the session does not belong to.
+  const projectId = optionalString(value, "project_id");
+  if (projectId !== undefined && !UUID.test(projectId)) {
+    throw contractViolation("project_identity_shape", "project_id");
+  }
   const rowVersion = optionalNumber(value, "row_version");
   if (rowVersion === undefined || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
     throw contractViolation("safe_non_negative_integer", "row_version");
@@ -559,6 +718,9 @@ function decodeAgentSession(value: unknown): AgentSession {
     ...(workspaceBindingId === undefined
       ? {}
       : { workspaceBindingId, workspaceGeneration: workspaceGeneration as number }),
+    ...(projectId === undefined ? {} : { projectId }),
+    ...(workspaceFailureCode === undefined ? {} : { workspaceFailureCode }),
+    ...(terminalReason === undefined ? {} : { terminalReason: terminalReason as TerminalReason }),
     name: requiredDisplayString(value, "name"),
     agent,
     cwd: requiredDisplayString(value, "cwd"),
@@ -566,6 +728,9 @@ function decodeAgentSession(value: unknown): AgentSession {
     desiredState,
     requestState,
     processState,
+    ...(processObservation === undefined
+      ? {}
+      : { processObservation: processObservation as AgentSessionProcessObservation }),
     ...(processEpoch === undefined
       ? {}
       : UUID.test(processEpoch)
@@ -605,6 +770,7 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
   const allowed = new Set([
     "observation_id",
     "agent_session_id",
+    "agent",
     "process_epoch",
     "auth_mode",
     "agent_version",
@@ -643,14 +809,17 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
   const state = enumField(value, "state", AGENT_AUTH_STATES);
   const unavailable = state === "unavailable";
   const providerCredentialPresence =
+    value.agent === "opencode" &&
     authMode === "interactive_login" &&
     evidenceClass === "provider_cli_credential_presence" &&
     (state === "login_required" || state === "configured");
   const providerLoginStatus =
+    value.agent === "claude-code" &&
     authMode === "interactive_login" &&
     evidenceClass === "provider_cli_login_status" &&
     (state === "login_required" || state === "authenticated");
   const credentialBindingAuthority =
+    (value.agent === "claude-code" || value.agent === "codex" || value.agent === "openclaw") &&
     authMode === "credential_binding" &&
     evidenceClass === "credential_binding_authority" &&
     state === "configured";
@@ -668,6 +837,7 @@ export function decodeAgentSessionAuth(value: unknown): AgentSessionAuth {
   return Object.freeze({
     observationId: canonicalUuid(value, "observation_id"),
     agentSessionId: canonicalUuid(value, "agent_session_id"),
+    agent: enumField(value, "agent", AGENTS),
     processEpoch,
     authMode,
     agentVersion,
@@ -769,6 +939,11 @@ function decodeTerminalCapability(value: unknown): TerminalConnectionCapability 
   return Object.freeze({ name, availability });
 }
 
+export function decodeTerminalConnectionCancellation(value: unknown): { readonly cancelled: true } {
+  if (!isObject(value) || value.cancelled !== true || Object.keys(value).some(key => key !== "cancelled")) throw contractViolation("terminal_connection_cancellation");
+  return Object.freeze({ cancelled: true });
+}
+
 export function decodeTerminalConnectionGrant(value: unknown): TerminalConnectionGrant {
   if (!isObject(value)) throw contractViolation("object");
   const allowed = new Set([
@@ -842,19 +1017,28 @@ export interface JsonObject {
   readonly [key: string]: JsonValue;
 }
 
-export interface CredentialRuleTarget {
-  readonly kind: "header" | "query";
+export interface SecretEnvironmentInjection {
   readonly name: string;
-  readonly format: string;
+  readonly value_template: string;
 }
-
-export interface CredentialRule {
-  readonly id: string;
-  readonly host: string;
+export interface SecretEgressInjection extends SecretEnvironmentInjection {
+  readonly host_pattern: string;
+  readonly path_pattern?: string | null;
+  readonly action: "header" | "query";
+}
+export interface SecretFileInjection {
   readonly path: string;
-  readonly credential: string;
-  readonly target: CredentialRuleTarget;
-  readonly cacheTtlSeconds: number;
+  readonly value_template: string;
+}
+export interface RuntimeSecretConfiguration {
+  readonly secret_id: string;
+  readonly environment: readonly SecretEnvironmentInjection[];
+  readonly egress_rules: readonly SecretEgressInjection[];
+  readonly files: readonly SecretFileInjection[];
+}
+export interface MachineAuthorizations {
+  readonly revision: number;
+  readonly secret_configuration: readonly RuntimeSecretConfiguration[];
 }
 
 export interface ApiKeyMetadata {
@@ -948,35 +1132,55 @@ export function decodeAuditRecords(value: unknown): readonly AuditRecord[] {
     underField(`[${index}]`, () => decodeAuditRecord(item))));
 }
 
-function decodeCredentialRule(value: unknown): CredentialRule {
-  if (!isObject(value) || !isObject(value.target)) throw contractViolation("object_with_target_object");
-  exactKeys(value, ["id", "host", "path", "credential", "target", "cache_ttl_secs"]);
-  const targetKeys = Object.keys(value.target);
-  const isHeader = targetKeys.length === 2 && targetKeys.includes("header") && targetKeys.includes("format");
-  const isQuery = targetKeys.length === 2 && targetKeys.includes("param") && targetKeys.includes("format");
-  if (isHeader === isQuery) throw contractViolation("exactly_one_target_kind", "target");
-  const cacheTtlSeconds = value.cache_ttl_secs;
-  if (!Number.isSafeInteger(cacheTtlSeconds) || Number(cacheTtlSeconds) < 0 || Number(cacheTtlSeconds) > 86_400) {
-    throw contractViolation("bounded_cache_ttl_seconds", "cache_ttl_secs");
-  }
-  return Object.freeze({
-    id: safePublicString(value.id, "id", 256),
-    host: safePublicString(value.host, "host", 2048),
-    path: safePublicString(value.path, "path", 2048),
-    credential: safePublicString(value.credential, "credential", 64),
-    target: Object.freeze({
-      kind: isHeader ? "header" : "query",
-      name: safePublicString(isHeader ? value.target.header : value.target.param, "target name", 256),
-      format: safePublicString(value.target.format, "target format", 4096),
-    }),
-    cacheTtlSeconds: Number(cacheTtlSeconds),
-  });
+function injectionName(value: unknown, label: string, maximum: number): string {
+  const text = safePublicString(value, label, maximum);
+  if (text.length === 0) throw contractViolation("nonempty_string", label);
+  return text;
 }
 
-export function decodeCredentialRules(value: unknown): readonly CredentialRule[] {
-  if (!Array.isArray(value) || value.length > 1024) throw contractViolation("bounded_array_length");
-  return Object.freeze(value.map((item, index) =>
-    underField(`[${index}]`, () => decodeCredentialRule(item))));
+function injectionTemplate(value: unknown): string {
+  if (typeof value !== "string" || value.length > 4096) throw contractViolation("bounded_string", "value_template");
+  // Templates are opaque metadata, including multiline file content. Preserve
+  // whitespace without interpreting interpolation; reject terminal controls and
+  // known credential values. Human rendering must quote this string.
+  safePublicString(value.replace(/[\r\n\t]/gu, ""), "value_template", 4096);
+  return value;
+}
+
+function injectionArray<T>(value: unknown, label: string, decode: (item: unknown) => T): readonly T[] {
+  if (!Array.isArray(value) || value.length > 64) throw contractViolation("bounded_array_length", label);
+  return Object.freeze(value.map((item, index) => underField(`${label}[${index}]`, () => decode(item))));
+}
+
+export function decodeMachineAuthorizations(value: unknown): MachineAuthorizations {
+  if (!isObject(value)) throw contractViolation("object");
+  exactKeys(value, ["revision", "secret_configuration"]);
+  if (typeof value.revision !== "number" || !Number.isSafeInteger(value.revision) || value.revision < 1) throw contractViolation("positive_safe_integer", "revision");
+  return Object.freeze({ revision: value.revision, secret_configuration: injectionArray(value.secret_configuration, "secret_configuration", (entry) => {
+    if (!isObject(entry)) throw contractViolation("object");
+    exactKeys(entry, ["secret_id", "environment", "egress_rules", "files"]);
+    return Object.freeze({
+      secret_id: canonicalUuid(entry, "secret_id"),
+      environment: injectionArray(entry.environment, "environment", (item) => {
+        if (!isObject(item)) throw contractViolation("object");
+        exactKeys(item, ["name", "value_template"]);
+        return Object.freeze({ name: injectionName(item.name, "name", 256), value_template: injectionTemplate(item.value_template) });
+      }),
+      egress_rules: injectionArray(entry.egress_rules, "egress_rules", (item): SecretEgressInjection => {
+        if (!isObject(item)) throw contractViolation("object");
+        exactKeys(item, ["host_pattern", "action", "name", "value_template", ...(Object.hasOwn(item, "path_pattern") ? ["path_pattern"] : [])]);
+        if (item.action !== "header" && item.action !== "query") throw contractViolation("known_injection_action", "action");
+        return Object.freeze({ host_pattern: injectionName(item.host_pattern, "host_pattern", 253), action: item.action,
+          name: injectionName(item.name, "name", 256), value_template: injectionTemplate(item.value_template),
+          ...(Object.hasOwn(item, "path_pattern") ? { path_pattern: item.path_pattern === null ? null : safePublicString(item.path_pattern, "path_pattern", 4096) } : {}) });
+      }),
+      files: injectionArray(entry.files, "files", (item) => {
+        if (!isObject(item)) throw contractViolation("object");
+        exactKeys(item, ["path", "value_template"]);
+        return Object.freeze({ path: injectionName(item.path, "path", 4096), value_template: injectionTemplate(item.value_template) });
+      }),
+    });
+  }) });
 }
 
 function optionalTimestamp(value: unknown, label: string): string | null {
@@ -1036,6 +1240,147 @@ export function decodeApiKeyCreation(value: unknown): ApiKeyCreation {
   return idempotencyReplayed
     ? Object.freeze({ ...metadata, idempotencyReplayed: true })
     : Object.freeze({ ...metadata, idempotencyReplayed: false, key: key as string });
+}
+
+/**
+ * The terminal's writer seat after a transfer request: which epoch it is at,
+ * who holds it, and whether the supervisor has confirmed the promotion yet.
+ */
+export interface TerminalWriterState {
+  readonly operationId: string;
+  readonly operationState: "committed";
+  readonly agentSessionId: string;
+  readonly processEpoch: string;
+  readonly writerEpoch: number;
+  readonly writerClientInstanceId: string;
+  readonly transferPending: boolean;
+}
+
+export function decodeTerminalWriterState(value: unknown): TerminalWriterState {
+  if (!isObject(value)) throw contractViolation("object");
+  exactKeys(value, ["agent_session_id", "process_epoch", "writer_epoch", "writer_client_instance_id", "transfer_pending", "operation_id", "operation_state"]);
+  const agentSessionId = canonicalUuid(value, "agent_session_id");
+  const processEpoch = canonicalUuid(value, "process_epoch");
+  const operationId = canonicalUuid(value, "operation_id");
+  if (value.operation_state !== "committed") throw contractViolation("terminal_writer_operation_state");
+  if (
+    !Number.isSafeInteger(value.writer_epoch) || Number(value.writer_epoch) < 1 ||
+    typeof value.writer_client_instance_id !== "string" ||
+    !/^[A-Za-z0-9._:-]{1,256}$/u.test(value.writer_client_instance_id) ||
+    typeof value.transfer_pending !== "boolean"
+  ) throw contractViolation("terminal_writer_state_shape");
+  return Object.freeze({
+    operationId,
+    operationState: "committed",
+    agentSessionId,
+    processEpoch,
+    writerEpoch: Number(value.writer_epoch),
+    writerClientInstanceId: value.writer_client_instance_id,
+    transferPending: value.transfer_pending,
+  });
+}
+
+export type TerminalSeatState = "available" | "owner_unrecoverable" | "none";
+
+/**
+ * The durable writer seat of an AgentSession terminal, read from the
+ * database for the session's *current* process epoch (`GET
+ * /v1/agent-sessions/{id}/terminal`). It carries no attachment count: live
+ * attachments are process-local to the edge and vanish on deploy, so a count
+ * would report an empty terminal while a supervisor still holds a PTY.
+ */
+export interface AgentSessionTerminalSeat {
+  readonly agentSessionId: string;
+  readonly processEpoch: string | null;
+  readonly state: TerminalSeatState;
+  readonly unavailableReason: string | null;
+  readonly writerEpoch: number;
+  readonly writerClientInstanceId: string | null;
+  /**
+   * Whether the named writer is connected right now.
+   *
+   * The seat row remembers the last writer so a reconnecting client can
+   * reclaim its epoch; on 2026-09-02 that made a clean detach read as
+   * "another client holds the terminal" five seconds later. Liveness is a
+   * separate durable fact (the terminal connection row's state) and is the
+   * one this CLI acts on.
+   */
+  readonly writerAttached: boolean;
+  readonly writerAttachedAt: string | null;
+  readonly writerDetachedAt: string | null;
+  readonly observedAt: string;
+}
+
+const TERMINAL_SEAT_STATES: ReadonlySet<TerminalSeatState> = new Set<TerminalSeatState>([
+  "available",
+  "owner_unrecoverable",
+  "none",
+]);
+const CLIENT_INSTANCE_ID = /^[A-Za-z0-9._:-]{1,256}$/u;
+
+export function decodeAgentSessionTerminalSeat(value: unknown): AgentSessionTerminalSeat {
+  if (!isObject(value)) throw contractViolation("object");
+  exactKeys(value, [
+    "agent_session_id",
+    "process_epoch",
+    "state",
+    "unavailable_reason",
+    "writer_epoch",
+    "writer_client_instance_id",
+    "writer_attached",
+    "writer_attached_at",
+    "writer_detached_at",
+    "observed_at",
+  ]);
+  const agentSessionId = canonicalUuid(value, "agent_session_id");
+  if (value.process_epoch !== null && (typeof value.process_epoch !== "string" || !UUID.test(value.process_epoch))) {
+    throw contractViolation("canonical_uuid_or_null", "process_epoch");
+  }
+  const state = enumField(value, "state", TERMINAL_SEAT_STATES);
+  if (
+    value.unavailable_reason !== null &&
+    (typeof value.unavailable_reason !== "string" || value.unavailable_reason.length > 4096)
+  ) {
+    throw contractViolation("string_or_null", "unavailable_reason");
+  }
+  if (!Number.isSafeInteger(value.writer_epoch) || Number(value.writer_epoch) < 0) {
+    throw contractViolation("non_negative_integer", "writer_epoch");
+  }
+  if (
+    value.writer_client_instance_id !== null &&
+    (typeof value.writer_client_instance_id !== "string" || !CLIENT_INSTANCE_ID.test(value.writer_client_instance_id))
+  ) {
+    throw contractViolation("client_instance_id_or_null", "writer_client_instance_id");
+  }
+  if (typeof value.writer_attached !== "boolean") {
+    throw contractViolation("boolean", "writer_attached");
+  }
+  // An unheld seat cannot have an attached writer, and a seat nobody holds
+  // must not carry attachment timestamps: the two facts come from different
+  // rows, so their disagreement is a producer defect, not a state.
+  if (value.writer_client_instance_id === null && value.writer_attached === true) {
+    throw contractViolation("writer_attached_without_writer", "writer_attached");
+  }
+  for (const key of ["writer_attached_at", "writer_detached_at"] as const) {
+    const at = value[key];
+    if (at !== null && (typeof at !== "string" || !Number.isFinite(Date.parse(at)))) {
+      throw contractViolation("timestamp_or_null", key);
+    }
+  }
+  const observedAt = requiredString(value, "observed_at");
+  if (!Number.isFinite(Date.parse(observedAt))) throw contractViolation("timestamp", "observed_at");
+  return Object.freeze({
+    agentSessionId,
+    processEpoch: value.process_epoch as string | null,
+    state,
+    unavailableReason: value.unavailable_reason as string | null,
+    writerEpoch: Number(value.writer_epoch),
+    writerClientInstanceId: value.writer_client_instance_id as string | null,
+    writerAttached: value.writer_attached,
+    writerAttachedAt: value.writer_attached_at as string | null,
+    writerDetachedAt: value.writer_detached_at as string | null,
+    observedAt,
+  });
 }
 
 export function decodeOk(value: unknown): true {

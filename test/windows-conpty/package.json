@@ -1,0 +1,9 @@
+{
+  "name": "cuna-windows-conpty-acceptance",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Windows-only real-ConPTY acceptance dependency island for the Cuna CLI.",
+  "dependencies": {
+    "node-pty": "1.1.0"
+  }
+}

@@ -14,6 +14,8 @@ export type MachineSelectionState =
   | "unknown";
 export type MachineCostStatus = "known" | "unknown" | "unavailable";
 export type AttachmentStatus = "detached" | "attached" | "unknown";
+/** A producer-proven condition that blocks automatic machine creation. */
+export type RequestedAgentBlocker = "opencode-supervisor-update-required";
 
 export interface MachineSelectionObservation {
   readonly id: string;
@@ -22,6 +24,12 @@ export interface MachineSelectionObservation {
   readonly agent: AgentKind | "unknown";
   /** Fresh machine-scoped producer evidence for creating the requested child agent. */
   readonly requestedAgentSupport: "supported" | "unsupported" | "unknown";
+  /**
+   * A narrow, human-actionable blocker preserved from fresh capability
+   * evidence. It is not provider inventory and it must never be guessed from
+   * `machine.agent` or terminal text.
+   */
+  readonly requestedAgentBlocker?: RequestedAgentBlocker;
   readonly state: MachineSelectionState;
   readonly ownership: OwnershipStatus;
   readonly freshness: AuthorityFreshness;
@@ -49,6 +57,12 @@ export interface AgentSessionSelectionObservation {
   readonly authMode: AgentAuthMode;
   readonly processState: AgentSessionProcessState;
   readonly attachment: AttachmentStatus;
+  /**
+   * The client instance holding the writer seat, present exactly when
+   * `attachment` is `attached`. Display-only: it lets a refusal name who is
+   * typing, it never authorizes a takeover.
+   */
+  readonly attachmentHolder?: string;
   readonly freshness: AuthorityFreshness;
   readonly createdAt: string;
 }
@@ -142,14 +156,18 @@ export interface UnavailablePlan {
   readonly kind: "unavailable";
   readonly target: "machine" | "agent-session";
   readonly targetId?: string;
+  /** For `already-attached`: the client instance holding the writer seat. */
+  readonly holder?: string;
   readonly reason:
     | "already-attached"
+    | "attachment-unobservable"
     | "authority-data-invalid"
     | "authority-observation-stale"
     | "contradictory-selection"
     | "duplicate-id"
     | "not-found"
     | "ownership-unverified"
+    | "opencode-supervisor-update-required"
     | "state-not-reusable"
     | "state-unknown";
 }
@@ -242,11 +260,13 @@ function unavailable(
   target: "machine" | "agent-session",
   reason: UnavailablePlan["reason"],
   targetId?: string,
+  holder?: string,
 ): UnavailablePlan {
   return freezePlan({
     kind: "unavailable",
     target,
     ...(targetId === undefined ? {} : { targetId }),
+    ...(holder === undefined ? {} : { holder }),
     reason,
   });
 }
@@ -311,6 +331,8 @@ function validMachine(machine: MachineSelectionObservation): boolean {
     (machine.requestedAgentSupport === "supported" ||
       machine.requestedAgentSupport === "unsupported" ||
       machine.requestedAgentSupport === "unknown") &&
+    (machine.requestedAgentBlocker === undefined ||
+      machine.requestedAgentBlocker === "opencode-supervisor-update-required") &&
     MACHINE_STATES.has(machine.state) &&
     (machine.ownership === "owned" || machine.ownership === "foreign" || machine.ownership === "unknown") &&
     (machine.freshness === "fresh" || machine.freshness === "stale" || machine.freshness === "unknown") &&
@@ -320,8 +342,27 @@ function validMachine(machine: MachineSelectionObservation): boolean {
   );
 }
 
+/**
+ * A per-provider capability is an observation of a running Machine. While one
+ * is stopped, paused or still creating, `agent_sessions.create` is reported
+ * `temporarily_unavailable` because the runtime cannot be probed — a fact
+ * about the Machine being off, not about the provider. The provider
+ * declaration is checked separately and does not depend on the state, so an
+ * unverifiable capability on a Machine that is not running is treated as
+ * "not yet observed" rather than as incompatibility; the create step re-reads
+ * the capability once the Machine runs and fails closed there.
+ */
+function capabilityIsObservable(machine: MachineSelectionObservation): boolean {
+  return machine.state === "running" || machine.state === "unknown";
+}
+
+function machineMayBeSelected(machine: MachineSelectionObservation): boolean {
+  return machine.requestedAgentSupport === "supported" ||
+    (machine.requestedAgentSupport === "unknown" && !capabilityIsObservable(machine));
+}
+
 function safeMachine(machine: MachineSelectionObservation): SafeMachineCandidate {
-  if (machine.requestedAgentSupport !== "supported" || machine.state === "unknown") {
+  if (!machineMayBeSelected(machine) || machine.state === "unknown") {
     throw new TypeError("A machine with unknown compatibility cannot become a selection candidate.");
   }
   const resources = Object.freeze({
@@ -354,7 +395,19 @@ function validateSelectedMachine(
   if (machine.freshness !== "fresh") {
     return unavailable("machine", "authority-observation-stale", machine.id);
   }
-  if (machine.requestedAgentSupport === "unknown") {
+  if (machine.requestedAgentBlocker === "opencode-supervisor-update-required") {
+    return unavailable("machine", "opencode-supervisor-update-required", machine.id);
+  }
+  // A provider's runtime can only be verified while the Machine runs: on a
+  // stopped one `agent_sessions.create` reads `temporarily_unavailable /
+  // opencode_runtime_unverified`, which says nothing about the provider.
+  // Measured 2026-09-02: that abstention refused a Machine the journey was
+  // about to start, and told the user to pass the `--machine` they had just
+  // passed. The provider declaration is checked before this point and is not
+  // state-dependent, and the create step re-reads the capability and fails
+  // closed, so an unverifiable capability on a startable Machine is not a
+  // refusal — on a running one it still is.
+  if (machine.requestedAgentSupport === "unknown" && machine.state === "running") {
     return unavailable("machine", "state-unknown", machine.id);
   }
   if (machine.requestedAgentSupport === "unsupported") {
@@ -442,7 +495,20 @@ export function planMachineSelection(input: MachineSelectionInput): MachineSelec
           machine.state !== "unknown" &&
           REUSABLE_MACHINE_STATES.has(machine.state),
       );
-      if (compatible.length !== matches.length) return unavailable("machine", "state-not-reusable");
+      // Exactly one usable candidate is an answer, not an ambiguity. Refusing
+      // here left a person locked out of a Machine they were paying for
+      // whenever a same-named sibling was in `error` or a non-reusable state,
+      // even though only one of the two could ever have served the request.
+      // Nothing is guessed: the surviving candidate is the only one that can
+      // host the requested agent.
+      if (compatible.length === 1) {
+        const only = compatible[0];
+        if (only !== undefined) {
+          const rejection = validateSelectedMachine(only);
+          return rejection ?? selectedMachine(only, "explicit");
+        }
+      }
+      if (compatible.length === 0) return unavailable("machine", "state-not-reusable");
       return freezePlan({
         kind: "ambiguous",
         target: "machine",
@@ -497,11 +563,15 @@ export function planMachineSelection(input: MachineSelectionInput): MachineSelec
   }
 
   const plausiblyCompatible = input.machines.filter(
-    (machine) => machine.ownership !== "foreign" && machine.requestedAgentSupport === "supported",
+    (machine) => machine.ownership !== "foreign" && machineMayBeSelected(machine),
   );
   if (
     input.machines.some(
-      (machine) => machine.ownership !== "foreign" && machine.requestedAgentSupport === "unknown",
+      (machine) =>
+        machine.ownership !== "foreign" &&
+        machine.requestedAgentSupport === "unknown" &&
+        capabilityIsObservable(machine) &&
+        (machine.state === "unknown" || REUSABLE_MACHINE_STATES.has(machine.state)),
     ) ||
     plausiblyCompatible.some(
       (machine) =>
@@ -532,6 +602,19 @@ export function planMachineSelection(input: MachineSelectionInput): MachineSelec
       candidates: sortMachines(eligible),
     });
   }
+  // A current OpenCode-specific repair condition is a reason to stop and
+  // explain—not a license to allocate another paid machine. `--new` returned
+  // above intentionally remains an explicit user choice.
+  const repairBlocked = input.machines.find(
+    (machine) =>
+      machine.ownership === "owned" &&
+      machine.freshness === "fresh" &&
+      machine.requestedAgentBlocker === "opencode-supervisor-update-required" &&
+      REUSABLE_MACHINE_STATES.has(machine.state),
+  );
+  if (repairBlocked !== undefined) {
+    return unavailable("machine", "opencode-supervisor-update-required", repairBlocked.id);
+  }
   return freezePlan({
     kind: "create-required",
     target: "machine",
@@ -554,6 +637,11 @@ function validAgentSession(session: AgentSessionSelectionObservation): boolean {
     (session.attachment === "detached" ||
       session.attachment === "attached" ||
       session.attachment === "unknown") &&
+    // A holder is only meaningful on a held seat; one reported beside
+    // `detached` or `unknown` is a mapping defect, not a fact to display.
+    (session.attachmentHolder === undefined
+      ? true
+      : session.attachment === "attached" && isSafeDisplay(session.attachmentHolder)) &&
     (session.freshness === "fresh" || session.freshness === "stale" || session.freshness === "unknown") &&
     Number.isFinite(Date.parse(session.createdAt))
   );
@@ -641,8 +729,10 @@ function sessionAvailabilityRejection(
   if (session.processState !== "ready" && session.processState !== "running") {
     return unavailable("agent-session", "state-not-reusable", session.id);
   }
-  if (session.attachment === "unknown") return unavailable("agent-session", "state-unknown", session.id);
-  if (session.attachment === "attached") return unavailable("agent-session", "already-attached", session.id);
+  if (session.attachment === "unknown") return unavailable("agent-session", "attachment-unobservable", session.id);
+  if (session.attachment === "attached") {
+    return unavailable("agent-session", "already-attached", session.id, session.attachmentHolder);
+  }
   return undefined;
 }
 
@@ -696,24 +786,45 @@ export function planAgentSessionSelection(
   }
 
   const exact = input.agentSessions.filter((session) => isExactSessionKey(session, input));
+  /*
+   * Separate "the observation is old" from "this fact is not published".
+   *
+   * Both used to answer `authority-observation-stale`, and only one of them was
+   * ever true. Until 2026-09-02 `attachment` was a hardcoded `"unknown"`
+   * because no per-AgentSession attachment authority existed, so EVERY exact
+   * match reached this branch and was refused. Measured in production
+   * 2026-08-30: three runs against machine 20ea0900 refused with
+   * `authority-observation-stale` while the matched session's observation was
+   * five seconds old with a valid runtime lease and a running process.
+   *
+   * The seat is now read from `GET /v1/agent-sessions/{id}/terminal`, so
+   * `unknown` is no longer the rule: it is a seat whose state is `none` or
+   * `owner_unrecoverable`, or an edge that does not serve the route. Only a
+   * session that is otherwise live (fresh, ready|running) is judged by its
+   * seat; a session that is already unreusable for another reason keeps that
+   * reason.
+   *
+   * The distinction is not cosmetic. Stale is transient and a retry is the
+   * right advice; unobservable is a missing prerequisite, and telling someone
+   * to retry it is telling them to wait for something that cannot arrive.
+   */
+  const live = exact.filter(
+    (session) =>
+      session.freshness === "fresh" &&
+      (session.processState === "ready" || session.processState === "running"),
+  );
   if (
     exact.some(
       (session) =>
         session.freshness !== "fresh" ||
         session.processState === "unknown" ||
         session.processState === "starting" ||
-        session.processState === "terminating" ||
-        session.attachment === "unknown",
+        session.processState === "terminating",
     )
   ) {
     return unavailable("agent-session", "authority-observation-stale");
   }
-  const reusable = exact.filter(
-    (session) =>
-      session.freshness === "fresh" &&
-      (session.processState === "ready" || session.processState === "running") &&
-      session.attachment === "detached",
-  );
+  const reusable = live.filter((session) => session.attachment === "detached");
   if (reusable.length === 1 && reusable[0] !== undefined) {
     return selectedAgentSession(reusable[0], "unique-compatible");
   }
@@ -725,6 +836,18 @@ export function planAgentSessionSelection(
       reason: "multiple-compatible-candidates",
       candidates: sortAgentSessions(reusable),
     });
+  }
+  // No free exact session. A held one is refused by name rather than silently
+  // shadowed by a sibling create: the user asked for THIS workspace's session,
+  // and another client is typing in it. `--new-session` remains the explicit
+  // way to start a second one.
+  const unobservable = live.find((session) => session.attachment === "unknown");
+  if (unobservable !== undefined) {
+    return unavailable("agent-session", "attachment-unobservable", unobservable.id);
+  }
+  const held = live.find((session) => session.attachment === "attached");
+  if (held !== undefined) {
+    return unavailable("agent-session", "already-attached", held.id, held.attachmentHolder);
   }
   return freezePlan({
     kind: "create-required",

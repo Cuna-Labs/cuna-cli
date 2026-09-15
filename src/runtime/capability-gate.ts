@@ -1,7 +1,23 @@
 import type { CapabilityScope, CapabilitySnapshot } from "../api/contracts.js";
 import { classifyCapabilitySnapshot } from "../api/capability-evidence.js";
 
-import { runtimeFailure } from "./errors.js";
+import { RuntimeBoundaryError, runtimeFailure } from "./errors.js";
+
+export interface WriterTransferCapability {
+  readonly supported: boolean;
+  readonly reasonCode: string | null;
+  readonly expiresAt: number;
+}
+
+export function writerTransferCapability(snapshot: CapabilitySnapshot, subjectId: string, now: number): WriterTransferCapability {
+  try {
+    const admission = admitCapability(snapshot, { id: "terminal_writers.transfer", scope: "agent_session", subjectId, interaction: "native" }, now);
+    return Object.freeze({ supported: true, reasonCode: null, expiresAt: admission.expiresAt });
+  } catch (error) {
+    if (!(error instanceof RuntimeBoundaryError)) throw error;
+    return Object.freeze({ supported: false, reasonCode: String(error.safeDetails?.reason_code ?? error.code), expiresAt: now });
+  }
+}
 
 export interface CapabilityRequirement {
   readonly id: string;
@@ -51,18 +67,24 @@ export function admitCapability(
   const capability = matches[0];
   if (capability === undefined || capability.availability === "unknown") {
     throw runtimeFailure("capability_unknown", "The server cannot currently prove this capability.", {
-      safeDetails: { capability_id: requirement.id },
+      safeDetails: {
+        capability_id: requirement.id,
+        ...(capability?.reasonCode === undefined ? {} : { reason_code: capability.reasonCode }),
+      },
     });
   }
   if (capability.availability === "temporarily_unavailable") {
     throw runtimeFailure("capability_unavailable", "The required capability is temporarily unavailable.", {
       retryable: true,
-      safeDetails: { capability_id: requirement.id },
+      safeDetails: {
+        capability_id: requirement.id,
+        ...(capability.reasonCode === undefined ? {} : { reason_code: capability.reasonCode }),
+      },
     });
   }
   if (capability.availability !== "supported") {
     throw runtimeFailure("capability_unsupported", "The required capability is unsupported.", {
-      safeDetails: { capability_id: requirement.id },
+      safeDetails: { capability_id: requirement.id, ...(capability.reasonCode === undefined ? {} : { reason_code: capability.reasonCode }) },
     });
   }
   const surface = requirement.surface ?? "cli";

@@ -1,21 +1,31 @@
+import {observerApi} from "../api/observer-v2.js";
+import {runObserverScreen} from "../runtime/observer-screen.js";
+import {ownerObserveGrantsApi} from "../api/owner-observe-grants-v2.js";
+import {runOwnerGrantsScreen,type ShareableSession,type ShareableSessionListing} from "../runtime/owner-grants-screen.js";
+import {ownerGrantOperationStore} from "../runtime/owner-grant-operations.js";
+import { runProviderScreen } from "../machines/provider-screen.js";
 import { Writable } from "node:stream";
+import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
 import { createInterface } from "node:readline/promises";
+import { mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { launchRemoteWorkspaceSession } from "../journey/remote-workspace.js";
+import { join, resolve } from "node:path";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
-import { createHttpTransport, type HttpRequest } from "../api/http.js";
+import { createHttpTransport, type BearerRefreshRequest, type HttpRequest } from "../api/http.js";
 import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import type { BrowserHandoffReporter } from "../auth/browser-handoff.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
 import { createHumanAuthService, type HumanAuthResult, type HumanAuthService } from "../auth/human-session.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
-import { assertApiKeyUsable, resolveConfig, type EffectiveConfig } from "../config/config.js";
-import { assertOpenCodeExecutionEnabled } from "../config/opencode-feature-gate.js";
+import { assertApiKeyUsable, ensureProfileRecorded, resolveConfig, type EffectiveConfig } from "../config/config.js";
 import {
   executeCommand,
   preflightInvocation,
   type ConvergencePoller,
 } from "../commands/commands.js";
-import { EXIT_CODES, normalizeError, CunaError, usageError, type ExitCode } from "../core/errors.js";
+import { EXIT_CODES, normalizeError, CunaError, unsupportedError, usageError, type ExitCode } from "../core/errors.js";
 import { DEFAULT_REQUEST_BUDGET_MS } from "../core/observation-budget.js";
 import {
   CONSOLE_ORIGIN,
@@ -34,8 +44,14 @@ import {
   orchestrateAgentJourney,
   preflightAgentJourneyInvocation,
   type AgentJourneyEffects,
+  type AgentJourneyPhase,
   type ReconciledAgentJourneyIntent,
 } from "../journey/index.js";
+import {
+  rootJourneyArgv,
+  runNodeRootJourney,
+  type RootJourneyRunner,
+} from "../journey/root-entry.js";
 import { createPlatformAdapter, type PlatformAdapter } from "../platform/adapter.js";
 import { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "../version.js";
 import { runtimeFeatureGates, type RuntimeFeatureGate } from "../runtime/contracts.js";
@@ -46,6 +62,10 @@ import {
   type ForegroundSessionRunner,
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
+import { runNodeMachinesExplorer, type MachinesExplorerRunner } from "../machines/explorer.js";
+import { runWorkspaceSelectionScreen } from "../workspace/selection-screen.js";
+import { runExecutionsScreen } from "../machines/executions-screen.js";
+import { isOpenCodeSupervisorUpgradeReason } from "../machines/opencode-supervisor.js";
 import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
 import { createOutputWriter, sanitizeHumanTerminalOutput, type CliStreams } from "./output.js";
@@ -80,6 +100,13 @@ export interface RunCliDependencies {
   readonly doctorCredentialBackend?: Pick<SecureCredentialBackend, "backendId" | "probe">;
   readonly runtimeFeatures?: readonly RuntimeFeatureGate[];
   readonly foregroundTerminalRunner?: ForegroundSessionRunner;
+  readonly machinesExplorerRunner?: MachinesExplorerRunner;
+  readonly providerScreenRunner?: typeof runProviderScreen;
+  readonly rootJourneyRunner?: RootJourneyRunner;
+  /** Internal root-UI hint; never parsed from or printed to user input. */
+  readonly managedWorkspaceMachineId?: string;
+  /** Test seam for the folder a command resolves its workspace binding from. */
+  readonly workspaceRoot?: string;
   readonly automaticJourneyEffectsFactory?: (input: {
     readonly client: CunaApiClient;
     readonly intent: ReconciledAgentJourneyIntent;
@@ -89,6 +116,8 @@ export interface RunCliDependencies {
     readonly signal?: AbortSignal;
   }) => AgentJourneyEffects;
   readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal) => Promise<boolean>;
+  /** Internal navigation context; direct command refusals retain their exit code. */
+  readonly returnToMachinesOnCreateDeclined?: boolean;
 }
 
 async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal): Promise<boolean> {
@@ -216,6 +245,10 @@ export async function readHiddenLoginCode(
   if (signal?.aborted) throw loginCodeInputError("cancelled", "Cuna sign-in was cancelled.");
 
   const wasRaw = input.isRaw === true;
+  // `resume()` below refs the terminal handle. Remember whether another
+  // consumer was already flowing so a completed login does not leave stdin
+  // keeping the whole CLI process alive after the success message.
+  const wasFlowing = input.readableFlowing === true;
   const bytes: number[] = [];
   const maxBytes = 256;
   let masked = 0;
@@ -240,6 +273,7 @@ export async function readHiddenLoginCode(
       input.off("end", onEnd);
       signal?.removeEventListener("abort", onAbort);
       try { input.setRawMode?.(wasRaw); } catch { /* best-effort terminal restoration */ }
+      if (!wasFlowing) input.pause();
       output.write("\n");
       bytes.fill(0);
     };
@@ -362,6 +396,16 @@ function commandLabel(argv: readonly string[]): string {
   }
 }
 
+function menuInvocationOptions(parsed: ReturnType<typeof parseArgv>): readonly string[] {
+  const args: string[] = [];
+  for (const name of ["profile", "base-url", "config-file", "timeout-ms"]) {
+    const value = stringOption(parsed, name);
+    if (value !== undefined) args.push(`--${name}`, value);
+  }
+  if (booleanOption(parsed, "no-color")) args.push("--no-color");
+  return args;
+}
+
 function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>> {
   return Object.freeze({
     profile: result.profile,
@@ -379,11 +423,11 @@ function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>>
 }
 
 function needsRemoteCredential(command: string | undefined, foreground: ForegroundSelection | undefined): boolean {
-  return command === "capabilities" || command === "machines" || command === "agent-sessions" ||
-    command === "agent" ||
+  return command === "observe" || command === "share" || command === "capabilities" || command === "machines" || command === "agent-sessions" ||
+    command === "agent" || command === "executions" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
     command === "account" || command === "workspace" || command === "usage" ||
-    command === "claude" || command === "codex" || command === "openclaw" || command === "opencode" || foreground !== undefined;
+    command === "claude" || command === "codex" || command === "opencode" || foreground !== undefined;
 }
 
 function managesInteractiveSession(command: string | undefined): boolean {
@@ -421,11 +465,13 @@ function foregroundSelection(parsed: ParsedInvocation): ForegroundSelection | un
   if (parsed.command === "agent-sessions" && parsed.operands[0] === "attach") {
     return Object.freeze({ agentSessionIds: parsed.operands.slice(1) });
   }
-  const expectedAgent: "claude-code" | "codex" | "openclaw" | "opencode" | undefined = parsed.command === "claude"
+  const expectedAgent: "claude-code" | "codex" | "opencode" | undefined = parsed.command === "claude"
     ? "claude-code"
-    : parsed.command === "codex" || parsed.command === "openclaw" || parsed.command === "opencode"
-      ? parsed.command
-      : undefined;
+    : parsed.command === "codex"
+      ? "codex"
+      : parsed.command === "opencode"
+        ? "opencode"
+        : undefined;
   const agentSessionId = stringOption(parsed, "agent-session");
   if (expectedAgent !== undefined && agentSessionId !== undefined) {
     return Object.freeze({
@@ -438,6 +484,41 @@ function foregroundSelection(parsed: ParsedInvocation): ForegroundSelection | un
 
 function nodePlatform(kind: PlatformAdapter["kind"]): NodeJS.Platform {
   return kind === "windows" ? "win32" : kind === "macos" ? "darwin" : "linux";
+}
+
+function platformHomeDirectory(
+  environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): string | undefined {
+  const candidate = platform === "win32" ? environment.USERPROFILE : environment.HOME;
+  return typeof candidate === "string" && candidate.trim() !== "" ? candidate : undefined;
+}
+
+function sameHostPath(left: string, right: string, platform: NodeJS.Platform): boolean {
+  const canonicalLeft = resolve(left);
+  const canonicalRight = resolve(right);
+  return platform === "win32"
+    ? canonicalLeft.toLocaleLowerCase("en-US") === canonicalRight.toLocaleLowerCase("en-US")
+    : canonicalLeft === canonicalRight;
+}
+
+function managedWorkspaceScope(intent: ReconciledAgentJourneyIntent, machineId?: string): string {
+  if (machineId !== undefined) {
+    const digest = createHash("sha256").update(machineId, "utf8").digest("hex").slice(0, 16);
+    return `machine-${digest}`;
+  }
+  if (intent.machine.kind === "exact-name") {
+    const digest = createHash("sha256").update(intent.machine.name, "utf8").digest("hex").slice(0, 16);
+    return `machine-${digest}`;
+  }
+  return `${intent.agent}-${intent.machine.kind}`;
+}
+
+function agentDisplayName(agent: string): string {
+  return agent === "claude-code" ? "Claude Code"
+    : agent === "codex" ? "Codex"
+    : agent === "opencode" ? "OpenCode"
+    : "OpenClaw";
 }
 
 type BrowserLoginRemoteProbe = Readonly<{
@@ -492,16 +573,402 @@ function runtimeError(error: RuntimeBoundaryError): CunaError {
     code: `cuna.runtime.${error.code}`,
     message: error.message,
     exitCode,
+    ...(error.code === "terminal_history_gap" && typeof error.safeDetails?.agent_session_id === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(error.safeDetails.agent_session_id)
+      ? { hint: `Inspect this session with \`cuna agent-sessions get ${error.safeDetails.agent_session_id}\`.` }
+      : {}),
     retryable: error.retryable,
     ...(error.safeDetails === undefined ? {} : { details: error.safeDetails }),
     cause: error,
   });
 }
 
+/**
+ * A credential refresh that failed because the request did — a 429, a 5xx, a
+ * timeout — is not an auth failure. Reporting it as one exits `auth`, which
+ * this CLI documents as "no usable credential", and sends a person to
+ * `cuna login` to fix something that clears on its own. The exit-code contract
+ * already promises that "HTTP 429 and 5xx arrive as `cuna.network.rate_limited`
+ * and `cuna.network.service_unavailable`"; this keeps that promise across the
+ * credential boundary, where the class used to be overwritten.
+ *
+ * Every authenticated command re-exchanges the stored login code, and the
+ * server allows ten exchanges per rolling minute, so the eleventh command in a
+ * minute lands here. Say that, rather than doubting the credential.
+ */
+function credentialError(error: CredentialBoundaryError): CunaError {
+  const reason = error.safeDetails?.["reason"];
+  const transport = typeof reason === "string" &&
+      (reason.startsWith("cuna.network.") || reason.startsWith("cuna.client."))
+    ? reason
+    : undefined;
+  if (transport !== undefined) {
+    return new CunaError({
+      code: transport,
+      message: "Cuna could not renew this session because the request did not complete.",
+      exitCode: EXIT_CODES.network,
+      retryable: true,
+      hint: transport === "cuna.network.rate_limited"
+        ? "This account exchanged its sign-in too many times in the last minute. Wait a minute and run the command again. The stored session is unchanged and `cuna login` is not needed."
+        : "Run the command again. The stored session is unchanged.",
+      details: { reason: transport },
+      cause: error,
+    });
+  }
+  return new CunaError({
+    code: `cuna.auth.${error.code}`,
+    message: error.message,
+    exitCode: EXIT_CODES.auth,
+    retryable: error.retryable,
+    // `RuntimeBoundaryError` already forwards its safe details; this arm
+    // dropped them, so the credential backend's reason died here even
+    // when the vault had populated it.
+    ...(error.safeDetails === undefined ? {} : { details: error.safeDetails }),
+    cause: error,
+  });
+}
+
+interface InlineProgress {
+  update(label: string): void;
+  /** Print one durable line above the spinner, then keep spinning. */
+  note(line: string): void;
+  stop(): void;
+}
+
+const INLINE_CLOSE_FRAME_MS = 90;
+const INLINE_CLOSE_FRAMES = Object.freeze(["✦ Closing Cuna...", "✧ Closing Cuna...", "✓ Closed."]);
+
+function waitForUiFrame(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function animateInlineClose(stream: Writable, color: boolean): Promise<void> {
+  for (const [index, frame] of INLINE_CLOSE_FRAMES.entries()) {
+    const styled = color
+      ? index === INLINE_CLOSE_FRAMES.length - 1
+        ? `\u001b[38;5;42m\u001b[1m${frame}\u001b[0m`
+        : `\u001b[38;5;202m${frame}\u001b[0m`
+      : frame;
+    stream.write(`\r\u001b[2K${styled}`);
+    await waitForUiFrame(INLINE_CLOSE_FRAME_MS);
+  }
+  stream.write("\n");
+}
+
+function isTerminalResumeHandleConflict(error: CunaError): boolean {
+  return error.code === "cuna.remote.conflict" &&
+    error.details?.reason === "terminal_connection_resume_handle_conflict";
+}
+
+type TerminalSupervisorReadiness = "waiting" | "lease_expired" | "upgrade_required" | "unverified" | "ended";
+
+function terminalSupervisorReadiness(error: CunaError): TerminalSupervisorReadiness | undefined {
+  if (
+    error.code !== "cuna.runtime.capability_unknown" &&
+    error.code !== "cuna.runtime.capability_unavailable"
+  ) return undefined;
+  const reason = error.details?.reason_code;
+  // The process this AgentSession named is gone for good (the Machine
+  // restarted, or the owner could not be recovered). Nothing can still
+  // arrive, so this is BLOCKED with a route, never a "try again in a moment".
+  if (reason === "terminal_owner_unrecoverable") return "ended";
+  if (isOpenCodeSupervisorUpgradeReason(reason)) return "upgrade_required";
+  if (reason === "runtime_lease_expired") return "lease_expired";
+  if (reason === "supervisor_registry_unavailable") return "waiting";
+  // A capability-abstention at this exact boundary is not an actionable CLI
+  // error for a person.  The server has declined to prove that it can mint an
+  // attached terminal; Cuna must leave the AgentSession alone and explain the
+  // transient state without leaking the internal capability vocabulary.
+  if (error.details?.capability_id === "terminal_connections.create") return "unverified";
+  return undefined;
+}
+
+function writeTerminalReconnectConflict(stream: Writable, color: boolean): void {
+  const accent = (value: string): string => color ? `\u001b[38;5;202m\u001b[1m${value}\u001b[0m` : value;
+  const success = (value: string): string => color ? `\u001b[38;5;42m${value}\u001b[0m` : value;
+  stream.write(`${accent("◆ CUNA")}  Terminal connection changed\n`);
+  stream.write("The previous terminal link was already replaced.\n");
+  stream.write(`${success("Cuna did not stop the remote AgentSession.")}\n`);
+  stream.write("Run `cuna` again to reconnect.\n");
+}
+
+function writeTerminalSupervisorReadiness(
+  stream: Writable,
+  color: boolean,
+  state: TerminalSupervisorReadiness,
+  sessionIds: readonly string[],
+): void {
+  const accent = (value: string): string => color ? `\u001b[38;5;202m\u001b[1m${value}\u001b[0m` : value;
+  const inspection = (): void => {
+    for (const id of sessionIds.slice(0, 4)) {
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(id)) {
+        stream.write(`Inspect: cuna agent-sessions get ${id}\n`);
+      }
+    }
+  };
+  if (state === "ended") {
+    stream.write(`${accent("◆ CUNA")}  This AgentSession's terminal cannot be recovered\n`);
+    stream.write("The exact process or retained terminal is no longer available.\n");
+    inspection();
+    stream.write("Start a fresh one with `cuna <claude|codex|opencode> --new-session`.\n");
+    return;
+  }
+  if (state === "upgrade_required") {
+    stream.write(`${accent("◆ CUNA")}  Machine terminal update needed\n`);
+    stream.write("This machine needs its terminal supervisor updated before it can attach.\n");
+  } else if (state === "lease_expired") {
+    stream.write(`${accent("◆ CUNA")}  AgentSession needs a fresh runtime check\n`);
+    stream.write("The machine has not recently confirmed that this selected AgentSession is still running.\n");
+  } else if (state === "unverified") {
+    stream.write(`${accent("◆ CUNA")}  Terminal connection not ready\n`);
+    stream.write("Cuna could not verify this machine's terminal authority yet.\n");
+  } else {
+    stream.write(`${accent("◆ CUNA")}  Machine terminal supervisor unavailable\n`);
+    stream.write("Cuna could not verify live terminal control for this AgentSession.\n");
+  }
+  // This error can follow a redeemed connection and an automatic retry. Its
+  // capability reason cannot prove that no earlier connection or effect exists.
+  stream.write("Cuna could not complete this terminal attachment.\n");
+  inspection();
+  if (state === "unverified" || state === "waiting") {
+    stream.write("Check this AgentSession's current state before retrying; it may have ended.\n");
+  } else {
+    stream.write(state === "lease_expired"
+      ? "Wait for a fresh runtime observation, then open this same AgentSession again.\n"
+      : "After the stopped-machine supervisor update, open this same AgentSession again.\n");
+  }
+}
+
+function inlineProgressColumns(stream: Writable): number {
+  const tty = stream as Writable & {
+    columns?: number;
+    _handle?: { getWindowSize?: (size: number[]) => number };
+  };
+  // Node 24 on Windows can retain stale public columns after ConPTY resize.
+  // Read this stream's native TTY observation without changing its prototype
+  // or cached fields. This guarded private API depends on the supported Node
+  // engine; absent/failed/malformed observations retain the ordinary fallback.
+  if (process.platform === "win32" && typeof tty._handle?.getWindowSize === "function") {
+    try {
+      const size: number[] = [];
+      if (tty._handle.getWindowSize(size) === 0 && size.length === 2 &&
+        Number.isSafeInteger(size[0]) && size[0]! >= 2 && size[0]! <= 4096 &&
+        Number.isSafeInteger(size[1]) && size[1]! >= 1 && size[1]! <= 4096) return size[0]!;
+    } catch { /* An unavailable native observation does not break progress. */ }
+  }
+  return Number.isSafeInteger(tty.columns) && tty.columns! >= 2 && tty.columns! <= 4096 ? tty.columns! : 80;
+}
+
+function startInlineProgress(stream: Writable, color: boolean, initialLabel = "Loading machines"): Readonly<InlineProgress> {
+  const frames = ["◐", "◓", "◑", "◒"];
+  const bars = ["━╺━━━━", "━━╺━━━", "━━━╺━━", "━━━━╺━", "━━━━━╺", "━━━━╸━", "━━━╸━━", "━━╸━━━"];
+  const startedAt = Date.now();
+  let frame = 0;
+  let label = initialLabel;
+  let stopped = false;
+  let lastColumns = 0;
+  let lastCells = 0;
+  const paint = (): void => {
+    const columns = inlineProgressColumns(stream);
+    const elapsed = Date.now() - startedAt;
+    // A spinner alone is too easy to mistake for a frozen cursor on slower
+    // Windows terminals. Keep the phase honest, then add a small, actionable
+    // acknowledgement while an authenticated read is still in flight.
+    const slowHint = elapsed >= 12_000
+      ? " · still working — Ctrl-C cancels"
+      : elapsed >= 4_000
+        ? " · still working"
+        : "";
+    const text = `◆ CUNA  ${frames[frame % frames.length]} ${label}${slowHint}  ${bars[frame % bars.length]}`;
+    const fitted = truncateTerminalLine(text, columns - 1);
+    const styled = color && fitted === text
+      ? `\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;202m${frames[frame % frames.length]}\u001b[0m \u001b[38;5;255m\u001b[1m${label}\u001b[0m\u001b[38;5;245m${slowHint}\u001b[0m  \u001b[38;5;208m${bars[frame % bars.length]}\u001b[0m`
+      : color ? `\u001b[38;5;255m${fitted}\u001b[0m` : fitted;
+    if (lastColumns > columns && lastCells >= columns) {
+      // A terminal resize can reflow our previously single row before repaint.
+      for (let row = 0; row < Math.floor(lastCells / columns); row += 1) stream.write("\r\u001b[2K\u001b[1A");
+    }
+    stream.write(`\r\u001b[2K${styled}`);
+    lastColumns = columns;
+    lastCells = terminalCellWidth(fitted);
+    frame += 1;
+  };
+  paint();
+  const timer = setInterval(paint, 90);
+  timer.unref();
+  return Object.freeze({
+    update(nextLabel: string) {
+      if (stopped || nextLabel === label) return;
+      label = nextLabel;
+      paint();
+    },
+    note(line: string) {
+      if (stopped) {
+        stream.write(`${line}\n`);
+        return;
+      }
+      // Clear the spinner row, leave the line behind, resume spinning below it.
+      stream.write(`\r${String.fromCharCode(0x1b)}[2K${line}\n`);
+      // The previous row now belongs to the persistent note, not the spinner.
+      lastColumns = 0;
+      lastCells = 0;
+      paint();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      stream.write("\r\u001b[2K");
+    },
+  });
+}
+
+// Which batch command deserves a progress line, and what it should say. The
+// label names the task, never the transport (PRD-PM-008 D5-R18). Commands that
+// answer from disk are excluded: a spinner that appears for three milliseconds
+// is noise.
+function batchProgressLabel(parsed: ParsedInvocation): string | undefined {
+  const action = parsed.operands[0];
+  switch (parsed.command) {
+    case "machines":
+      switch (action) {
+        case undefined:
+        case "overview":
+        case "list":
+          return "Loading machines";
+        case "create":
+          return "Creating machine";
+        case "start":
+          return "Starting machine";
+        case "stop":
+          return "Stopping machine";
+        case "pause":
+          return "Pausing machine";
+        case "resume":
+          return "Resuming machine";
+        case "delete":
+          return "Deleting machine";
+        case "update-supervisor":
+          return "Updating terminal supervisor";
+        case "live-update-supervisor":
+          // Deliberately an attempt, not an outcome. The earlier label read
+          // "keeping sessions", which promised the one thing the server has not
+          // decided yet: preservation is conditional on a preflight that has not
+          // run when this line is painted. It is bounded by the request budget
+          // behind it, and the spinner stops when the answer arrives or that
+          // budget elapses -- never on its own.
+          return "Checking this machine and attempting an in-place supervisor update";
+        case "live-update-status":
+          // A read, and the label says so. It dispatches no installer and
+          // changes nothing, which is the whole reason it is safe to run after
+          // an interruption.
+          return "Reading what this machine's in-place supervisor update did";
+        default:
+          return "Reading your machines";
+      }
+    case "agent-sessions":
+    case "agent":
+      switch (action) {
+        case "create":
+          return "Creating AgentSession";
+        case "terminate":
+          return "Ending AgentSession";
+        case "rename":
+          return "Renaming AgentSession";
+        case "attach":
+          return "Attaching to the AgentSession terminal";
+        default:
+          return "Reading your AgentSessions";
+      }
+    case "api-keys":
+      return action === "create"
+        ? "Creating API key"
+        : action === "revoke"
+          ? "Revoking API key"
+          : "Reading your API keys";
+    case "capabilities":
+      return "Reading what this account can do";
+    case "records":
+      return "Reading your records";
+    case "authorizations":
+      return "Reading your authorizations";
+    case "account":
+    case "workspace":
+      return "Reading your workspace";
+    case "usage":
+      return "Reading your usage";
+    case "doctor":
+      return "Checking this installation";
+    case "self-test":
+      return "Running the self-test";
+    default:
+      // `config`, `version` and `help` answer from disk. Everything unlisted is
+      // routed elsewhere before reaching this dispatch.
+      return undefined;
+  }
+}
+
+function writeJourneyDiscovery(stream: Writable, color: boolean): void {
+  if (!color) {
+    stream.write("Cuna: finding a machine or AgentSession to open...\n");
+    return;
+  }
+  stream.write(`\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;255mFinding a machine or AgentSession\u001b[0m\n`);
+}
+
+function journeyPhaseLabel(phase: AgentJourneyPhase, agent: "claude-code" | "codex" | "opencode"): string {
+  const display = agentDisplayName(agent);
+  switch (phase) {
+    case "inspect-workspace": return "Inspecting workspace";
+    case "observe-machines": return "Finding a compatible machine";
+    case "create-machine": return "Creating machine";
+    case "reconcile-machine-create": return "Confirming machine creation";
+    case "ready-machine": return "Starting machine";
+    case "synchronize-workspace": return "Syncing workspace";
+    case "observe-agent-sessions": return `Finding ${/^[AEIOU]/u.test(display) ? "an" : "a"} ${display} session`;
+    case "create-agent-session": return `Creating ${display} session`;
+    case "ready-agent-session": return `Starting ${display}`;
+    case "attach": return agent === "opencode"
+      ? "Opening OpenCode terminal — use /connect there"
+      : `Opening ${display}`;
+  }
+}
+
+function journeyPreparationLabel(agent: string): string {
+  return agent === "opencode"
+    ? "Preparing OpenCode — use /connect in its terminal"
+    : `Preparing ${agentDisplayName(agent)}`;
+}
+
+function foregroundAttachLabel(agent: string): string {
+  return agent === "opencode"
+    ? "Opening OpenCode terminal — use /connect there"
+    : `Attaching to ${agentDisplayName(agent)}`;
+}
+
 export async function runCli(argv: readonly string[], dependencies: RunCliDependencies = {}): Promise<ExitCode> {
   const streams = dependencies.streams ?? defaultStreams();
   const writer = createOutputWriter({ streams, json: argv.includes("--json") });
   const label = commandLabel(argv);
+  let inlineMachinesProgress: Readonly<InlineProgress> | undefined;
+  let inlineJourneyProgress: Readonly<InlineProgress> | undefined;
+  let inlineRootProgress: Readonly<InlineProgress> | undefined;
+  let authProgress: Readonly<InlineProgress> | undefined;
+  let stopAuthProgressCancellation: (() => void) | undefined;
+  let batchProgress: Readonly<InlineProgress> | undefined;
+  let interactiveRootUi = false;
+  let interactiveRootColor = false;
+  // Root discovery, an explicit foreground attach, and an automatic provider
+  // journey all own the terminal interactively.  They must share the same
+  // one-Ctrl-C close affordance; restricting it to bare `cuna` leaked a raw
+  // journey cancellation error from `cuna opencode` before it reached the PTY.
+  let interactiveCloseUi = false;
+  let interactiveCloseColor = false;
+  let terminalSessionIds: readonly string[] = [];
+  const runForeground: ForegroundSessionRunner = async (input) => {
+    terminalSessionIds = [...input.agentSessionIds];
+    await (dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions)(input);
+  };
   try {
     const parsed = parseArgv(argv);
     if (!booleanOption(parsed, "help") && (booleanOption(parsed, "version") || parsed.command === "version")) {
@@ -518,10 +985,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         artifactChannel: ARTIFACT_CHANNEL,
         protocolRange: PROTOCOL_RANGE,
       });
+      // Both `cuna version --json` and the help text promise version, build
+      // digest, platform and protocol range; the human branch printed the
+      // version alone. The digest is the one field that separates two
+      // installations reporting the same `0.1.0` — measured 2026-08-25, when
+      // the installed CLI was not the repo build and nothing printed said so.
+      // It is shown as a 12-hex prefix with the same `…` this CLI already uses
+      // for a truncated API-key prefix, so it can never read as the whole hash.
+      const humanIdentity = `${identity.version}\tbuild ${identity.buildDigest.slice(0, 12)}…` +
+        `\t${identity.platform}/${identity.architecture}` +
+        `\tprotocol ${identity.protocolRange.minimum}..${identity.protocolRange.maximum}`;
       if (writer.structured) {
-        writer.success("version", identity, CLI_VERSION);
+        writer.success("version", identity, humanIdentity);
       } else {
-        writer.text(CLI_VERSION);
+        writer.text(humanIdentity);
       }
       return EXIT_CODES.success;
     }
@@ -537,6 +1014,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       const topic = parsed.command === "help" || parsed.command === undefined
         ? undefined
         : parsed.command;
+      if (topic === "openclaw") {
+        throw usageError(`Unknown command ${topic}.`, "Run `cuna --help`.");
+      }
       // `--all` widens the ROOT topic only. On a command topic the per-command
       // help is already the complete surface for that command, so there is
       // nothing to widen and the flag would promise something it cannot do.
@@ -571,7 +1051,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       const invalidRootOption = Object.keys(parsed.options).find((name) => !allowedRootOptions.has(name));
       if (invalidRootOption !== undefined) throw usageError(`Option --${invalidRootOption} requires a command.`);
     }
-    if (parsed.command === undefined) {
+    const interactiveRoot = parsed.command === undefined &&
+      !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY;
+    interactiveRootUi = interactiveRoot;
+    if (parsed.command === undefined && !interactiveRoot) {
       if (writer.structured) {
         writer.success("help", { version: CLI_VERSION, output_schema_version: OUTPUT_SCHEMA_VERSION, help: ROOT_HELP }, ROOT_HELP);
       } else {
@@ -580,17 +1063,58 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       return EXIT_CODES.success;
     }
 
-    // Preflight gates and configuration must read the same invocation
-    // environment. Otherwise an injected test or embedding could report an
-    // OpenCode gate as enabled after preflight had already read a different
-    // process-level value.
+    // A bare interactive invocation must acknowledge input before any local
+    // credential-store, configuration, or network read.  In particular, an
+    // access-token refresh can take several seconds; leaving the terminal
+    // blank during that work makes Cuna look stuck and encourages a duplicate
+    // invocation.  The phase remains deliberately neutral until config and
+    // authentication tell us what is actually happening.
     const effectiveEnvironment: NodeJS.ProcessEnv = { ...(dependencies.env ?? process.env) };
     Object.freeze(effectiveEnvironment);
-    preflightInvocation(parsed, effectiveEnvironment);
+    if (interactiveRoot) {
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      interactiveRootColor = color;
+      interactiveCloseUi = true;
+      interactiveCloseColor = color;
+      if (streams.stderrIsTTY === true) {
+        inlineRootProgress = startInlineProgress(streams.stderr, color, "Starting Cuna");
+      } else {
+        streams.stderr.write("Cuna: starting...\n");
+      }
+    }
 
-    const journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "openclaw" || parsed.command === "opencode"
+    // Preflight gates and configuration must read the same invocation
+    // environment. This keeps credential and profile selection deterministic
+    // across embedded invocations.
+    if (parsed.command !== undefined) preflightInvocation(parsed, (dependencies.now ?? Date.now)());
+    if(parsed.command==="observe"&&(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true))throw usageError("observe requires an interactive terminal; JSON and redirected output are unsupported.");
+    if(parsed.command==="share"&&(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true))throw usageError("share requires an interactive terminal; JSON and redirected output are unsupported.");
+
+    let journeyIntent = parsed.command === "claude" || parsed.command === "codex" || parsed.command === "opencode"
       ? preflightAgentJourneyInvocation(parsed)
       : undefined;
+    const remoteMenuLaunch = journeyIntent?.target === "reconcile" && journeyIntent.newSession &&
+      dependencies.managedWorkspaceMachineId !== undefined && journeyIntent.localPath === undefined;
+    if (journeyIntent?.target === "reconcile" && journeyIntent.localPath === undefined && !remoteMenuLaunch) {
+      const homeDirectory = platformHomeDirectory(effectiveEnvironment, process.platform);
+      if (homeDirectory !== undefined && sameHostPath(process.cwd(), homeDirectory, process.platform)) {
+        // Keep HOME safe without forcing every machine to share one local
+        // binding. Exact machine selections get a stable private root; the
+        // automatic root remains stable so its committed binding can guide
+        // later automatic selection.
+        // Do not nest these roots under the former single-root `~/Cuna`.
+        // Workspace binding discovery intentionally walks ancestors, so a
+        // child below that already-bound root would inherit its record and
+        // then fail the child-root compare-and-swap.
+        const managedWorkspace = join(
+          homeDirectory,
+          "Cuna Workspaces",
+          managedWorkspaceScope(journeyIntent, dependencies.managedWorkspaceMachineId),
+        );
+        await mkdir(managedWorkspace, { recursive: true });
+        journeyIntent = Object.freeze({ ...journeyIntent, localPath: managedWorkspace });
+      }
+    }
 
     const foreground = foregroundSelection(parsed);
     if ((foreground !== undefined || journeyIntent?.target === "reconcile") &&
@@ -600,12 +1124,26 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         "Run this command directly in an interactive terminal without --json or output redirection.",
       );
     }
+    if ((journeyIntent !== undefined || foreground !== undefined) &&
+      !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY && streams.stderrIsTTY) {
+      interactiveCloseUi = true;
+      interactiveCloseColor = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+    }
+    if (journeyIntent !== undefined) {
+      // This is deliberately before config, credential, and network work: it
+      // tells the truth immediately without claiming that attach has begun.
+      const preparation = journeyPreparationLabel(journeyIntent.agent);
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, preparation);
+      else streams.stderr.write(`Cuna: ${preparation.charAt(0).toLowerCase()}${preparation.slice(1)}...\n`);
+    }
     const platform = dependencies.platform ?? createPlatformAdapter({ env: effectiveEnvironment });
     let foregroundPresentation: ForegroundPresentationMode | undefined;
     if (foreground !== undefined) {
       foregroundPresentation = selectNodeForegroundPresentation({
         platform: nodePlatform(platform.kind),
         environment: effectiveEnvironment,
+        sessionCount: foreground.agentSessionIds.length,
         ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
       });
       if (foregroundPresentation === "plain" && foreground.agentSessionIds.length !== 1) {
@@ -628,6 +1166,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     const profile = stringOption(parsed, "profile");
     const baseUrl = stringOption(parsed, "base-url");
     const configFile = stringOption(parsed, "config-file");
+    // `cuna login --profile <name>` is the one invocation allowed to resolve a
+    // profile the configuration file does not list yet, because it is the one
+    // that creates it. The profile is written only after the sign-in succeeds.
+    const creatingProfile = parsed.command === "login" && profile !== undefined;
     const config = await resolveConfig({
       platform,
       env: effectiveEnvironment,
@@ -636,19 +1178,16 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         ...(baseUrl === undefined ? {} : { baseUrl }),
         ...(configFile === undefined ? {} : { configFile }),
       },
+      ...(creatingProfile ? { allowMissingProfile: true } : {}),
     });
-    // Re-admit every executable OpenCode journey from the immutable, resolved
-    // configuration. This prevents a mutable embedding environment from
-    // passing preflight under one value and reaching remote, host, or child
-    // effects after it has changed under another.
-    if (journeyIntent?.agent === "opencode") {
-      assertOpenCodeExecutionEnabled(config.opencodeFeatureGate);
+    if (interactiveRoot) {
+      inlineRootProgress?.update(config.apiKey === undefined ? "Checking your Cuna sign-in" : "Checking Cuna access");
     }
     // Fail closed before any authority is selected, and only for a command that
     // selects one. Empty or malformed still never means absent: an unusable
     // `*_API_KEY` refuses the command rather than silently demoting automation
     // mode to an interactive browser sign-in.
-    if (usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
+    if (interactiveRoot || usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
     const sessionPaths = localEncryptedSessionPaths(platform.paths.configDirectory, config.profile);
     if (config.apiKey !== undefined && (parsed.command === "login" || parsed.command === "signup")) {
       throw new CunaError({
@@ -658,18 +1197,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         hint: "Unset the automation credential before running `cuna login` or another interactive command.",
       });
     }
-    if (
+    const browserAuthUnavailable =
       (parsed.command === "login" || parsed.command === "signup") &&
       (writer.structured || !streams.stdinIsTTY || !streams.stdoutIsTTY || streams.stderrIsTTY !== true) &&
       dependencies.humanAuth === undefined &&
-      dependencies.browser === undefined &&
-      (parsed.command === "login" || parsed.command === "signup")
-    ) {
-      throw usageError(
-        "Browser authentication requires an interactive terminal and does not support JSON or redirected output.",
-        "Run `cuna login` directly in a TTY; the one-time link is printed only to the terminal.",
-      );
-    }
+      dependencies.browser === undefined;
+    const browserAuthUsageError = (): CunaError => usageError(
+      "Browser authentication requires an interactive terminal and does not support JSON or redirected output.",
+      "Run `cuna login` directly in a TTY; the one-time link is printed only to the terminal.",
+    );
+    // `signup` always needs the browser. `login` decides after reading the
+    // vault: a profile that is already signed in has nothing to print, and
+    // "already signed in" is the answer, not a usage error (the one-time link
+    // is still never written to redirected output — see the login branch).
+    if (browserAuthUnavailable && parsed.command === "signup") throw browserAuthUsageError();
     let humanAuth = dependencies.humanAuth;
     const getHumanAuth = async (): Promise<HumanAuthService> => {
       if (humanAuth !== undefined) return humanAuth;
@@ -703,10 +1244,77 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         // where to go" cannot be proven independently of each other.
         browserHandoff: createTerminalBrowserHandoffReporter(streams.stderr),
         readLoginCode: dependencies.readLoginCode ?? promptLoginCode,
+        onLoginCodeAccepted: () => {
+          // Keep the browser link and hidden reader still. Only validated input
+          // starts completion feedback; remote exchange and storage may still fail.
+          if (parsed.command === "login" && streams.stderrIsTTY === true &&
+              !writer.structured && dependencies.signal?.aborted !== true && authProgress === undefined) {
+            authProgress = startInlineProgress(
+              streams.stderr,
+              !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+              "Completing Cuna sign-in",
+            );
+            const signal = dependencies.signal;
+            if (signal !== undefined) {
+              const stopping = () => authProgress?.update("Stopping Cuna sign-in");
+              signal.addEventListener("abort", stopping, { once: true });
+              stopAuthProgressCancellation = () => signal.removeEventListener("abort", stopping);
+              if (signal.aborted) stopping();
+            }
+          }
+        },
         ...(dependencies.now === undefined ? {} : { clock: dependencies.now }),
       });
       return humanAuth;
     };
+
+    // The primary human entry points own authentication as part of their
+    // journey. A person who runs `cuna`, `cuna machines`, `cuna claude`, or
+    // `cuna codex` should never see machine-discovery feedback followed by an
+    // instruction to discover a separate login command. Establish or recover
+    // the interactive session first, then begin the product action.
+    const guidedInteractiveEntry = config.apiKey === undefined && (
+      interactiveRoot ||
+      (parsed.command === "machines" && parsed.operands.length === 0 &&
+        !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY) ||
+      journeyIntent?.target === "reconcile"
+    );
+    if (guidedInteractiveEntry) {
+      const guidedAuth = await getHumanAuth();
+      try {
+        await guidedAuth.acquireAccessToken(dependencies.signal);
+      } catch (error) {
+        if (!(error instanceof CunaError) ||
+          (error.code !== "cuna.auth.required" && error.code !== "cuna.auth.reauthentication_required")) {
+          throw error;
+        }
+        inlineRootProgress?.stop();
+        inlineRootProgress = undefined;
+        streams.stderr.write("Cuna: let's sign you in first...\n");
+        await guidedAuth.login(dependencies.signal === undefined ? {} : { signal: dependencies.signal });
+        streams.stderr.write("Cuna: signed in. Continuing...\n");
+        if (interactiveRoot && streams.stderrIsTTY === true) {
+          inlineRootProgress = startInlineProgress(streams.stderr, interactiveRootColor, "Finding a machine or AgentSession");
+        }
+      }
+    }
+
+    // Progress starts only after authentication is usable. This ordering is
+    // observable UX: it must not claim to search machines while login is the
+    // actual operation in progress.
+    if (journeyIntent !== undefined) {
+      const display = agentDisplayName(journeyIntent.agent);
+      if (inlineJourneyProgress !== undefined) inlineJourneyProgress.update(`Connecting to ${display}`);
+      else streams.stderr.write(`Cuna: connecting to ${display}...\n`);
+    }
+    if (
+      parsed.command === "machines" && parsed.operands.length === 0 &&
+      !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY
+    ) {
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      if (streams.stderrIsTTY === true) inlineMachinesProgress = startInlineProgress(streams.stderr, color);
+      else streams.stderr.write("Cuna: loading machines...\n");
+    }
 
     if (
       parsed.command === "signup" ||
@@ -731,11 +1339,33 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           hint: `Unset ${config.apiKeyVariable ?? "CUNA_API_KEY"} before managing the interactive session.`,
         });
       }
+      // These commands unlock the encrypted local session and then wait on the
+      // network. `login` is excluded: it prints a URL and blocks on the person,
+      // and a spinner over a link they must read is worse than silence.
+      // Progress exists only for a real terminal, never in structured output.
+      if (
+        parsed.command !== "login" &&
+        streams.stderrIsTTY === true &&
+        !writer.structured &&
+        authProgress === undefined
+      ) {
+        authProgress = startInlineProgress(
+          streams.stderr,
+          !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+          parsed.command === "logout"
+            ? "Signing out of Cuna"
+            : parsed.command === "signup"
+              ? "Creating your Cuna account"
+              : "Checking your Cuna sign-in",
+        );
+      }
       if (parsed.command === "signup") {
         const result = await (await getHumanAuth()).signup(
           dependencies.signal === undefined ? {} : { signal: dependencies.signal },
         );
         const data = humanResult(result);
+        authProgress?.stop();
+        authProgress = undefined;
         writer.success(
           "signup",
           data,
@@ -744,21 +1374,58 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
             : `Cuna completed signup for profile ${result.profile}.`,
         );
       } else if (parsed.command === "login") {
-        const result = await (await getHumanAuth()).login(
-          dependencies.signal === undefined ? {} : { signal: dependencies.signal },
-        );
+        const auth = await getHumanAuth();
+        let result;
+        let alreadySignedIn = false;
+        if (browserAuthUnavailable) {
+          // No terminal to print a link to: the only login that can succeed
+          // here is the one that already happened.
+          try {
+            result = await auth.whoami(dependencies.signal);
+          } catch {
+            throw browserAuthUsageError();
+          }
+          alreadySignedIn = true;
+        } else {
+          try {
+            result = await auth.login(
+              dependencies.signal === undefined ? {} : { signal: dependencies.signal },
+            );
+          } catch (error) {
+          // Being signed in already is the outcome the user asked for, not a
+          // failure: report who they are and how to switch, exit 0.
+          if (!(error instanceof CunaError) || error.code !== "cuna.auth.already_signed_in") throw error;
+          result = await auth.whoami(dependencies.signal);
+          alreadySignedIn = true;
+          }
+        }
+        // After the sign-in and before the result line, so the sentence the
+        // person reads is already true on the next invocation.
+        const profileCreated = creatingProfile
+          ? await ensureProfileRecorded({ platform, config })
+          : false;
         const data = Object.freeze({
           ...humanResult(result),
           storage_mode: "encrypted-local" as const,
+          already_signed_in: alreadySignedIn,
+          ...(creatingProfile ? { profile_created: profileCreated } : {}),
         });
+        authProgress?.stop();
+        authProgress = undefined;
+        stopAuthProgressCancellation?.();
+        stopAuthProgressCancellation = undefined;
         writer.success(
           "login",
           data,
-          `Signed in to Cuna profile ${result.profile} using the encrypted local session store.`,
+          alreadySignedIn
+            ? `Already signed in as ${result.context.identity}. Run \`cuna logout\` to switch accounts.`
+            : "Signed in to Cuna.",
         );
       } else if (parsed.command === "whoami" || parsed.command === "access") {
         const result = await (await getHumanAuth()).whoami(dependencies.signal);
         const data = humanResult(result);
+        authProgress?.stop();
+        authProgress = undefined;
         writer.success(
           parsed.command === "access" ? "access.status" : "whoami",
           data,
@@ -766,28 +1433,198 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         );
       } else {
         const result = await (await getHumanAuth()).logout(dependencies.signal);
+        authProgress?.stop();
+        authProgress = undefined;
         writer.success("logout", result, "Signed out of Cuna on this device.");
       }
       return EXIT_CODES.success;
     }
 
-    let bearerToken: string | undefined;
+    let bearerTokenProvider: ((signal?: AbortSignal, refresh?: BearerRefreshRequest) => Promise<string>) | undefined;
     let credentialMode: "automation" | "interactive" | undefined = config.apiKey === undefined ? undefined : "automation";
-    if (config.apiKey === undefined && needsRemoteCredential(parsed.command, foreground)) {
+    if (config.apiKey === undefined && (interactiveRoot || needsRemoteCredential(parsed.command, foreground))) {
       if (dependencies.clientFactory === undefined || dependencies.humanAuth !== undefined) {
-        bearerToken = await (await getHumanAuth()).acquireAccessToken(dependencies.signal);
+        const humanAuth = await getHumanAuth();
+        if (dependencies.clientFactory === undefined) {
+          bearerTokenProvider = (signal, refresh) => refresh === undefined
+            ? humanAuth.acquireAccessToken(signal)
+            : humanAuth.refreshRejectedAccessToken(refresh.rejectedToken, signal);
+        } else {
+          await humanAuth.acquireAccessToken(dependencies.signal);
+        }
         credentialMode = "interactive";
       }
     }
     const httpTransport = dependencies.clientFactory === undefined ? createHttpTransport({
       baseUrl: config.baseUrl,
       ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
-      ...(bearerToken === undefined ? {} : { bearerToken }),
+      ...(bearerTokenProvider === undefined ? {} : { bearerTokenProvider }),
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     }) : undefined;
     const client = dependencies.clientFactory?.(config, effectiveTimeoutMs) ?? createCunaApiClient(httpTransport!);
+    if(parsed.command==="observe"){
+      if(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true||credentialMode!=="interactive"||!httpTransport)throw usageError("observe requires an interactive terminal and human login.");
+      // This process owns its initial principal. Checks around admission do not watch
+      // another process changing local credentials; established streams rely on server authority.
+      const identity=await client.getIdentity(dependencies.signal);
+      await runObserverScreen(observerApi(httpTransport,identity.id,stringOption(parsed,"project")!,async()=>(await client.getIdentity(dependencies.signal)).id),config.baseUrl,undefined,dependencies.signal);
+      return EXIT_CODES.success;
+    }
+    if(parsed.command==="share"){
+      if(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true||credentialMode!=="interactive"||!httpTransport)throw usageError("share requires an interactive terminal and human login.");
+      const project=stringOption(parsed,"project")!,identity=await client.getIdentity(dependencies.signal);
+      // Sessions come from the same Machine/AgentSession reads the explorer uses; the
+      // server names each session's Project, and the grant receipt is bound to it again.
+      // Both reads are bounded: at most 20 Machines, one AgentSession page each.
+      // What those bounds cut off is counted and returned, because a screen that
+      // shows a subset of the owner's own sessions without saying so is a false
+      // statement about their account.
+      const sessions={async list(signal:AbortSignal):Promise<ShareableSessionListing>{const all=(await client.listMachines(signal)).items;const machines=all.slice(0,20);const rows:ShareableSession[]=[];let machinesWithMoreSessions=0;for(const machine of machines){const page=await client.listAgentSessions(machine.id,{},signal);if(page.nextCursor!==undefined)machinesWithMoreSessions+=1;for(const s of page.items){if(s.processState==="terminated")continue;rows.push({id:s.id,name:s.name,agent:s.agent,machineName:machine.name,state:s.processState,...(s.projectId===undefined?{}:{projectId:s.projectId})});}}return{items:rows,omittedMachines:all.length-machines.length,machinesWithMoreSessions};}};
+      // The operation store outlives this process: an unanswered grant or
+      // revocation keeps its exact operation ID on disk, so the next `cuna
+      // share` opens on it instead of losing the authority it may have created.
+      const operations=ownerGrantOperationStore(platform,{baseUrl:config.baseUrl,profile:config.profile,ownerPrincipalId:identity.id,projectId:project});
+      await runOwnerGrantsScreen(ownerObserveGrantsApi(httpTransport,identity.id,project,async()=>(await client.getIdentity(dependencies.signal)).id),sessions,operations,{project,owner:identity.id},{...(dependencies.signal===undefined?{}:{signal:dependencies.signal}),...(stringOption(parsed,"grant")===undefined?{}:{initialGrantId:stringOption(parsed,"grant")!})});
+      return EXIT_CODES.success;
+    }
+    if (interactiveRoot) {
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      interactiveRootColor = color;
+      interactiveCloseUi = true;
+      interactiveCloseColor = color;
+      if (streams.stderrIsTTY === true) {
+        if (inlineRootProgress === undefined) {
+          inlineRootProgress = startInlineProgress(streams.stderr, color, "Finding a machine or AgentSession");
+        } else {
+          inlineRootProgress.update("Finding a machine or AgentSession");
+        }
+      } else {
+        writeJourneyDiscovery(streams.stderr, false);
+      }
+      const rootRunner = dependencies.rootJourneyRunner ?? runNodeRootJourney;
+      let selection: Awaited<ReturnType<RootJourneyRunner>>;
+      try {
+        selection = await rootRunner({
+          client,
+          color,
+          onBeforeTerminalOwnership: () => {
+            inlineRootProgress?.stop();
+            inlineRootProgress = undefined;
+          },
+          ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+        }, dependencies.now === undefined ? {} : { now: dependencies.now });
+      } finally {
+        inlineRootProgress?.stop();
+        inlineRootProgress = undefined;
+      }
+      if (selection === undefined) {
+        if (dependencies.signal?.aborted === true && streams.stderrIsTTY === true) {
+          await animateInlineClose(streams.stderr, color);
+        }
+        return EXIT_CODES.success;
+      }
+      if (selection.kind === "provider-check") {
+        await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"check",sessionId:selection.agentSessionId},undefined,dependencies.signal);
+        return await runCli(["machines"],dependencies);
+      }
+      if (selection.kind === "executions") {
+        const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal,
+          { platform, baseUrl: config.baseUrl, profile: config.profile });
+        if (outcome === "cancelled") return EXIT_CODES.success;
+        return await runCli(["machines"], dependencies);
+      }
+      if (selection.kind === "workspaces") {
+        const identity = await client.getIdentity(dependencies.signal);
+        if (identity.workspaceId === undefined) throw usageError("This account has no assigned workspace.");
+        const outcome = await runWorkspaceSelectionScreen({ client, profileId: config.profile, userId: identity.id, workspaceId: identity.workspaceId, machineId: selection.machineId, stateDirectory: platform.paths.stateDirectory, platform: platform.kind }, dependencies.workspaceRoot ?? process.cwd(), undefined, dependencies.signal);
+        if (outcome === "cancelled") return EXIT_CODES.success;
+        return await runCli(["machines"], dependencies);
+      }
+      if (selection.kind === "attach") {
+        const attachLabel = foregroundAttachLabel(selection.agent);
+        if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, attachLabel);
+        else streams.stderr.write(`Cuna: ${attachLabel.charAt(0).toLowerCase()}${attachLabel.slice(1)}...\n`);
+        const runner = runForeground;
+        try {
+          await runner({
+            client,
+            baseUrl: config.baseUrl,
+            browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
+            agentSessionIds: [selection.agentSessionId],
+            expectedAgentKinds: [selection.agent],
+            color,
+            hostPlatform: nodePlatform(platform.kind),
+            presentationMode: selectNodeForegroundPresentation({
+              platform: nodePlatform(platform.kind),
+              environment: effectiveEnvironment,
+              sessionCount: 1,
+              ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+            }),
+            onProgress: (nextLabel) => inlineRootProgress?.update(nextLabel),
+            onBeforeTerminalOwnership: () => {
+              inlineRootProgress?.stop();
+              inlineRootProgress = undefined;
+            },
+            ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+            ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+          });
+        } finally {
+          inlineRootProgress?.stop();
+          inlineRootProgress = undefined;
+        }
+        return EXIT_CODES.success;
+      }
+      if (selection.kind === "lifecycle") {
+        const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+        const progress = startInlineProgress(streams.stderr, !noColor, selection.action === "start" ? "Starting machine" : "Stopping machine");
+        const exit = await runCli([
+          "machines", selection.action, selection.machineId, "--yes",
+          ...(noColor ? ["--no-color"] : []),
+        ], dependencies);
+        progress.stop();
+        return exit === EXIT_CODES.success
+          ? await runCli(noColor ? ["--no-color"] : [], dependencies)
+          : exit;
+      }
+      if (selection.kind === "supervisor-update") {
+        const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+        const progress = startInlineProgress(streams.stderr, !noColor, "Updating terminal supervisor");
+        const exit = await runCli([
+          "machines", "update-supervisor", selection.machineId, "--yes",
+          ...(noColor ? ["--no-color"] : []),
+        ], dependencies);
+        progress.stop();
+        return exit === EXIT_CODES.success
+          ? await runCli(noColor ? ["--no-color"] : [], dependencies)
+          : exit;
+      }
+      if (selection.kind === "create") {
+        // E13-R1/R6: the screen chose provider and name; the batch command
+        // owns the `machines.create` gate, the idempotency key and the read.
+        const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+        const progress = startInlineProgress(streams.stderr, !noColor, "Creating machine");
+        const exit = await runCli([
+          "machines", "create", "--name", selection.name, "--agent", selection.agent, "--yes",
+          ...(noColor ? ["--no-color"] : []),
+        ], dependencies);
+        progress.stop();
+        return exit === EXIT_CODES.success
+          ? await runCli(noColor ? ["--no-color"] : [], dependencies)
+          : exit;
+      }
+      return await runCli([...rootJourneyArgv(selection), ...menuInvocationOptions(parsed)], {
+        ...dependencies,
+        returnToMachinesOnCreateDeclined: true,
+        ...(selection.machineId === undefined ? {} : { managedWorkspaceMachineId: selection.machineId }),
+        ...(humanAuth === undefined ? {} : { humanAuth }),
+      });
+    }
     if (journeyIntent?.target === "reconcile") {
+      if (journeyIntent.agent === "openclaw") {
+        throw unsupportedError("openclaw", "provider_route_unavailable");
+      }
+      const journeyAgent = journeyIntent.agent;
       if (credentialMode === undefined) {
         throw new CunaError({
           code: "cuna.auth.required",
@@ -812,6 +1649,25 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         });
       }
       const journeyScope = Object.freeze({ userId: identity.id, workspaceId });
+      if (remoteMenuLaunch && dependencies.managedWorkspaceMachineId !== undefined) {
+        inlineJourneyProgress?.stop(); inlineJourneyProgress = undefined;
+        const preset=await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"preset",agent:journeyAgent},undefined,dependencies.signal);
+        if(preset===undefined)return EXIT_CODES.success;
+        const agentSessionId = await launchRemoteWorkspaceSession({
+          preset,
+          providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id},
+          confirmNew:async()=>{const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal:dependencies.signal})).trim());}finally{prompt.close();}},
+          client, machineId: dependencies.managedWorkspaceMachineId, workspaceId, agent: journeyAgent,
+          onProgress: (label) => inlineJourneyProgress?.update(label),
+          ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+          ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+        });
+        return await runCli([
+          journeyAgent,
+          "--agent-session", agentSessionId,
+          ...(booleanOption(parsed, "no-color") ? ["--no-color"] : []),
+        ], { ...dependencies, ...(humanAuth === undefined ? {} : { humanAuth }) });
+      }
       if (dependencies.automaticJourneyEffectsFactory !== undefined) {
         effects = dependencies.automaticJourneyEffectsFactory({
           client,
@@ -842,29 +1698,66 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           workspaceId,
           stateDirectory: platform.paths.stateDirectory,
           filesystemCapabilities: conservativeFilesystemCapabilities(platform.kind),
+          // The journey never runs under structured output (fenced above), so
+          // this line is always a human-facing note on stderr: above the
+          // spinner while it runs, a plain line otherwise.
+          onNotice: (line) => {
+            if (inlineJourneyProgress !== undefined) inlineJourneyProgress.note(line);
+            else streams.stderr.write(`${line}\n`);
+          },
         });
         stopJourneyWorkspace = () => workspace.stopContinuousSync();
-        const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
+        const runner = runForeground;
         effects = createApiAgentJourneyEffects({
           client,
+          requestedAgent: journeyAgent,
+          confirmNewProviderLaunch:async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal})).trim());}finally{prompt.close();}},
+          providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
+          selectProviderPreset: async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const preset=await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"preset",agent:journeyAgent},undefined,signal);if(!preset)throw new CunaError({code:"cuna.provider.selection_cancelled",message:"Provider selection cancelled. The synchronized Workspace is preserved.",exitCode:EXIT_CODES.usage});return preset;},
           inspectWorkspace: workspace.inspectWorkspace,
           synchronizeWorkspace: workspace.synchronizeWorkspace,
-          authorizeMachineCreate: async ({ requestedAgent, signal }) =>
-            (dependencies.authorizeMachineCreate ?? confirmMachineCreate)(requestedAgent, signal),
+          // The spinner and the prompt write to the same row of the same
+          // stream, and the spinner repaints every 90 ms, so a question asked
+          // underneath it is erased before it can be read. What a person sees
+          // is "Creating machine" forever, while the CLI waits for an answer to
+          // a question it never showed. Give the row up, ask, take it back.
+          authorizeMachineCreate: async ({ requestedAgent, signal }) => {
+            const resume = inlineJourneyProgress;
+            inlineJourneyProgress?.stop();
+            inlineJourneyProgress = undefined;
+            try {
+              return await (dependencies.authorizeMachineCreate ?? confirmMachineCreate)(requestedAgent, signal);
+            } finally {
+              if (resume !== undefined && streams.stderrIsTTY === true) {
+                inlineJourneyProgress = startInlineProgress(
+                  streams.stderr,
+                  !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+                  journeyPhaseLabel("create-machine", journeyAgent),
+                );
+              }
+            }
+          },
           attach: async ({ agentSessionId, expectedAgent, signal }) => {
             const presentationMode = selectNodeForegroundPresentation({
               platform: nodePlatform(platform.kind),
               environment: effectiveEnvironment,
+              sessionCount: 1,
               ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
             });
             await runner({
               client,
               baseUrl: config.baseUrl,
+              browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
               agentSessionIds: [agentSessionId],
               expectedAgentKinds: [expectedAgent],
               color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
               hostPlatform: nodePlatform(platform.kind),
               presentationMode,
+              onProgress: (nextLabel) => inlineJourneyProgress?.update(nextLabel),
+              onBeforeTerminalOwnership: () => {
+                inlineJourneyProgress?.stop();
+                inlineJourneyProgress = undefined;
+              },
               ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
               signal,
             });
@@ -872,6 +1765,24 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
       }
+      const baseEffects = effects;
+      effects = Object.freeze({
+        ...baseEffects,
+        onPhase(phase: AgentJourneyPhase) {
+          baseEffects.onPhase?.(phase);
+          inlineJourneyProgress?.update(journeyPhaseLabel(phase, journeyAgent));
+        },
+        async attach(input: Parameters<AgentJourneyEffects["attach"]>[0]) {
+          inlineJourneyProgress?.update(`Attaching to ${agentDisplayName(journeyAgent)}`);
+          try {
+            await baseEffects.attach(input);
+          } finally {
+            inlineJourneyProgress?.stop();
+            inlineJourneyProgress = undefined;
+          }
+        },
+      });
+      let creationDeclined = false;
       try {
         await orchestrateAgentJourney({
           intent: journeyIntent,
@@ -879,26 +1790,62 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           scope: journeyScope,
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
         });
+      } catch (error) {
+        if (dependencies.returnToMachinesOnCreateDeclined === true && streams.stdinIsTTY === true &&
+          dependencies.signal?.aborted !== true && error instanceof CunaError &&
+          error.code === "cuna.journey.machine_create_not_authorized") {
+          creationDeclined = true;
+        } else throw error;
       } finally {
+        inlineJourneyProgress?.stop();
+        inlineJourneyProgress = undefined;
         await stopJourneyWorkspace?.();
+      }
+      if (creationDeclined) {
+        return await runCli(["machines", ...menuInvocationOptions(parsed)], {
+          ...dependencies, returnToMachinesOnCreateDeclined: false,
+        });
       }
       return EXIT_CODES.success;
     }
     if (foreground !== undefined) {
-      const runner = dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions;
-      await runner({
-        client,
-        baseUrl: config.baseUrl,
-        agentSessionIds: foreground.agentSessionIds,
-        ...(foreground.expectedAgentKinds === undefined
-          ? {}
-          : { expectedAgentKinds: foreground.expectedAgentKinds }),
-        color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
-        hostPlatform: nodePlatform(platform.kind),
-        ...(foregroundPresentation === undefined ? {} : { presentationMode: foregroundPresentation }),
-        ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
-        ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
-      });
+      const expectedAgent = foreground.expectedAgentKinds?.length === 1
+        ? foreground.expectedAgentKinds[0]
+        : undefined;
+      const attachLabel = expectedAgent === undefined
+        ? foreground.agentSessionIds.length === 1
+          ? "Attaching to AgentSession"
+          : `Attaching to ${foreground.agentSessionIds.length} AgentSessions`
+        : foregroundAttachLabel(expectedAgent);
+      const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      if (inlineJourneyProgress !== undefined) inlineJourneyProgress.update(attachLabel);
+      else if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, attachLabel);
+      else streams.stderr.write(`Cuna: ${attachLabel.toLowerCase()}...\n`);
+      const runner = runForeground;
+      try {
+        await runner({
+          client,
+          baseUrl: config.baseUrl,
+          browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
+          agentSessionIds: foreground.agentSessionIds,
+          ...(foreground.expectedAgentKinds === undefined
+            ? {}
+            : { expectedAgentKinds: foreground.expectedAgentKinds }),
+          color,
+          hostPlatform: nodePlatform(platform.kind),
+          ...(foregroundPresentation === undefined ? {} : { presentationMode: foregroundPresentation }),
+          onProgress: (nextLabel) => inlineJourneyProgress?.update(nextLabel),
+          onBeforeTerminalOwnership: () => {
+            inlineJourneyProgress?.stop();
+            inlineJourneyProgress = undefined;
+          },
+          ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+          ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+        });
+      } finally {
+        inlineJourneyProgress?.stop();
+        inlineJourneyProgress = undefined;
+      }
       return EXIT_CODES.success;
     }
     let runtimeFeatures = dependencies.runtimeFeatures;
@@ -937,35 +1884,180 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         browserLoginRemoteReason: browserLoginRemote.reason,
       });
     }
+    if (
+      parsed.command === "machines" && parsed.operands.length === 0 &&
+      !writer.structured && streams.stdinIsTTY && streams.stdoutIsTTY
+    ) {
+      inlineMachinesProgress?.stop();
+      inlineMachinesProgress = undefined;
+      const runner = dependencies.machinesExplorerRunner ?? runNodeMachinesExplorer;
+      const selection = await runner({
+        client,
+        color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+        ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+      }, dependencies.now === undefined ? {} : { now: dependencies.now });
+      if (selection !== undefined) {
+        if (selection.kind === "provider-check") {
+        await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"check",sessionId:selection.agentSessionId},undefined,dependencies.signal);
+        return await runCli(["machines"],dependencies);
+      }
+      if (selection.kind === "executions") {
+          const outcome = await runExecutionsScreen(client, selection.machineId, undefined, dependencies.signal,
+            { platform, baseUrl: config.baseUrl, profile: config.profile });
+          if (outcome === "cancelled") return EXIT_CODES.success;
+          return await runCli(["machines"], dependencies);
+        } else if (selection.kind === "workspaces") {
+          const identity = await client.getIdentity(dependencies.signal);
+          if (identity.workspaceId === undefined) throw usageError("This account has no assigned workspace.");
+          const outcome = await runWorkspaceSelectionScreen({ client, profileId: config.profile, userId: identity.id, workspaceId: identity.workspaceId, machineId: selection.machineId, stateDirectory: platform.paths.stateDirectory, platform: platform.kind }, dependencies.workspaceRoot ?? process.cwd(), undefined, dependencies.signal);
+          if (outcome === "cancelled") return EXIT_CODES.success;
+          return await runCli(["machines"], dependencies);
+        } else if (selection.kind === "attach") {
+          const attachLabel = foregroundAttachLabel(selection.agent);
+          const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+          if (streams.stderrIsTTY === true) inlineRootProgress = startInlineProgress(streams.stderr, color, attachLabel);
+          else streams.stderr.write(`Cuna: ${attachLabel.charAt(0).toLowerCase()}${attachLabel.slice(1)}...\n`);
+          const foregroundRunner = runForeground;
+          try {
+            await foregroundRunner({
+              client,
+              baseUrl: config.baseUrl,
+              browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
+              agentSessionIds: [selection.agentSessionId],
+              expectedAgentKinds: [selection.agent],
+              color,
+              hostPlatform: nodePlatform(platform.kind),
+              presentationMode: selectNodeForegroundPresentation({
+                platform: nodePlatform(platform.kind),
+                environment: effectiveEnvironment,
+                sessionCount: 1,
+                ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+              }),
+              onProgress: (nextLabel) => inlineRootProgress?.update(nextLabel),
+              onBeforeTerminalOwnership: () => {
+                inlineRootProgress?.stop();
+                inlineRootProgress = undefined;
+              },
+              ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
+              ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+            });
+          } finally {
+            inlineRootProgress?.stop();
+            inlineRootProgress = undefined;
+          }
+        } else if (selection.kind === "launch") {
+          return await runCli([...rootJourneyArgv(selection), ...menuInvocationOptions(parsed)], {
+            ...dependencies,
+            returnToMachinesOnCreateDeclined: true,
+            ...(selection.machineId === undefined ? {} : { managedWorkspaceMachineId: selection.machineId }),
+          });
+        } else if (selection.kind === "supervisor-update") {
+          const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+          const progress = startInlineProgress(streams.stderr, !noColor, "Updating terminal supervisor");
+          const exit = await runCli([
+            "machines", "update-supervisor", selection.machineId, "--yes",
+            ...(noColor ? ["--no-color"] : []),
+          ], dependencies);
+          progress.stop();
+          return exit === EXIT_CODES.success
+            ? await runCli(["machines", ...(noColor ? ["--no-color"] : [])], dependencies)
+            : exit;
+        } else if (selection.kind === "create") {
+          const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+          const progress = startInlineProgress(streams.stderr, !noColor, "Creating machine");
+          const exit = await runCli([
+            "machines", "create", "--name", selection.name, "--agent", selection.agent, "--yes",
+            ...(noColor ? ["--no-color"] : []),
+          ], dependencies);
+          progress.stop();
+          return exit === EXIT_CODES.success
+            ? await runCli(["machines", ...(noColor ? ["--no-color"] : [])], dependencies)
+            : exit;
+        } else {
+          const noColor = booleanOption(parsed, "no-color") || Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+          const progress = startInlineProgress(streams.stderr, !noColor, selection.action === "start" ? "Starting machine" : "Stopping machine");
+          const exit = await runCli([
+            "machines", selection.action, selection.machineId, "--yes",
+            ...(noColor ? ["--no-color"] : []),
+          ], dependencies);
+          progress.stop();
+          return exit === EXIT_CODES.success
+            ? await runCli(["machines", ...(noColor ? ["--no-color"] : [])], dependencies)
+            : exit;
+        }
+      }
+      return EXIT_CODES.success;
+    }
+    const commandClock = dependencies.now ?? Date.now;
+    const batchLabel = batchProgressLabel(parsed);
+    if (batchLabel !== undefined && streams.stderrIsTTY === true && !writer.structured) {
+      batchProgress = startInlineProgress(
+        streams.stderr,
+        !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+        batchLabel,
+      );
+    }
     const result = await executeCommand({
       parsed,
       config,
       client,
-      now: dependencies.now?.() ?? Date.now(),
+      now: commandClock(),
+      capabilityClock: commandClock,
       ...(dependencies.convergencePoller === undefined
         ? {}
         : { convergencePoller: dependencies.convergencePoller }),
       ...(credentialMode === undefined ? {} : { credentialMode }),
       ...(runtimeFeatures === undefined ? {} : { runtimeFeatures }),
+      // Where `agent-sessions create` looks for `.cuna/workspace.json`. Passed
+      // in rather than read inside the command so a test can point it at a
+      // scratch folder.
+      workspaceRoot: dependencies.workspaceRoot ?? process.cwd(),
+      // The one batch command that keeps a durable local note across
+      // invocations needs the same adapter every other on-disk state uses.
+      platform,
     });
+    batchProgress?.stop();
+    batchProgress = undefined;
     writer.success(result.command, result.data, result.human);
     return EXIT_CODES.success;
   } catch (unknownError) {
+    inlineMachinesProgress?.stop();
+    inlineJourneyProgress?.stop();
+    inlineRootProgress?.stop();
+    authProgress?.stop();
+    stopAuthProgressCancellation?.();
+    batchProgress?.stop();
     const error = unknownError instanceof CredentialBoundaryError
-      ? new CunaError({
-          code: `cuna.auth.${unknownError.code}`,
-          message: unknownError.message,
-          exitCode: EXIT_CODES.auth,
-          retryable: unknownError.retryable,
-          // `RuntimeBoundaryError` already forwards its safe details; this arm
-          // dropped them, so the credential backend's reason died here even
-          // when the vault had populated it.
-          ...(unknownError.safeDetails === undefined ? {} : { details: unknownError.safeDetails }),
-          cause: unknownError,
-        })
+      ? credentialError(unknownError)
       : unknownError instanceof RuntimeBoundaryError
         ? runtimeError(unknownError)
       : normalizeError(unknownError);
+    if (interactiveCloseUi && streams.stderrIsTTY === true &&
+      (dependencies.signal?.aborted === true || error.code === "cuna.journey.cancelled")) {
+      await animateInlineClose(streams.stderr, interactiveCloseColor);
+      return EXIT_CODES.success;
+    }
+    if (interactiveRootUi && streams.stderrIsTTY === true && isTerminalResumeHandleConflict(error)) {
+      writeTerminalReconnectConflict(streams.stderr, interactiveRootColor);
+      return error.exitCode;
+    }
+    const supervisorReadiness = terminalSupervisorReadiness(error);
+    // The initial Cuna journey is interactive whenever stdin/stdout are TTYs.
+    // Some Windows hosts expose stderr as a non-TTY even though it is visible
+    // to the person.  Never leak an internal capability name merely because
+    // that host classification is conservative; render the same plain-language
+    // recovery instead.
+    if (interactiveCloseUi && supervisorReadiness !== undefined) {
+      writeTerminalSupervisorReadiness(
+        streams.stderr,
+        interactiveCloseColor && streams.stderrIsTTY === true,
+        supervisorReadiness,
+        terminalSessionIds,
+      );
+      // A process that is gone is a final refusal, not a network condition:
+      // retrying cannot change it, so the exit code must not say "retry".
+      return supervisorReadiness === "ended" ? EXIT_CODES.policy : error.exitCode;
+    }
     writer.error(label, error);
     return error.exitCode;
   }

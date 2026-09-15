@@ -52,6 +52,13 @@ export interface SecureCredentialBackend {
     target: string,
     expectedSha256: string,
   ): Promise<"deleted" | "absent" | "conflict">;
+  /**
+   * Optional cross-process refresh authority. It is deliberately separate
+   * from the backend's storage lock: the callback reads and CAS-writes through
+   * that storage lock while this outer authority prevents sibling CLI
+   * processes from re-exchanging the same renewable session concurrently.
+   */
+  withRefreshLock?<T>(target: string, operation: () => Promise<T>): Promise<T>;
 }
 
 export interface CredentialSnapshot {

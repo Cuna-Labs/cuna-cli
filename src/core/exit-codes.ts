@@ -85,7 +85,7 @@ const EXIT_CODE_PROSE = Object.freeze({
   }),
   conflict: Object.freeze({
     meaning: "Current state contradicts the change; repeating it unchanged repeats this.",
-    reachablePath: "HTTP 409 mints `cuna.remote.conflict`. A foreground attach to a session already held mints `cuna.runtime.session_conflict`.",
+    reachablePath: "Most HTTP 409 responses mint `cuna.remote.conflict`. A foreground attach to a session already held mints `cuna.runtime.session_conflict`; provider-installation admission is instead an unsupported action with a concrete Machine-selection remedy.",
   }),
   remote: Object.freeze({
     meaning: "The server answered, but not in a way the published contract allows.",

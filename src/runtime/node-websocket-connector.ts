@@ -7,7 +7,9 @@ import type {
 
 const MAX_MESSAGE_BYTES = 1_048_596;
 const MAX_QUEUED_BYTES = 16 * 1024 * 1024;
-const MAX_QUEUED_MESSAGES = 1_024;
+// Storage is bounded by bytes and fixed slabs, independently of WebSocket
+// message fragmentation. A slab also stays below the decoder's batch limits.
+const RECEIVE_SLAB_BYTES = 16 * 1024;
 const MAX_BUFFERED_SEND_BYTES = 8 * 1024 * 1024;
 const MAX_PENDING_CONVERSION_BYTES = 16 * 1024 * 1024;
 const MAX_PENDING_CONVERSION_MESSAGES = 64;
@@ -20,7 +22,7 @@ interface ByteWaiter {
 }
 
 class BoundedByteQueue implements AsyncIterableIterator<Uint8Array> {
-  readonly #values: Uint8Array[] = [];
+  readonly #values: { bytes: Uint8Array; length: number }[] = [];
   readonly #waiters: ByteWaiter[] = [];
   #queuedBytes = 0;
   #closed = false;
@@ -31,19 +33,30 @@ class BoundedByteQueue implements AsyncIterableIterator<Uint8Array> {
     if (value.byteLength < 1 || value.byteLength > MAX_MESSAGE_BYTES) {
       throw runtimeFailure("terminal_protocol_error", "The terminal transport message is outside the bounded frame window.");
     }
-    const waiter = this.#waiters.shift();
-    if (waiter !== undefined) {
-      waiter.resolve({ done: false, value });
-      return;
-    }
+    // Admit the whole message before delivering any prefix. Waiting consumers
+    // also receive bounded chunks, so packetization cannot bypass decoder limits.
     if (this.#queuedBytes + value.byteLength > MAX_QUEUED_BYTES) {
       throw runtimeFailure("terminal_protocol_error", "The terminal receive queue exceeded its bounded memory budget.");
     }
-    if (this.#values.length >= MAX_QUEUED_MESSAGES) {
-      throw runtimeFailure("terminal_protocol_error", "The terminal receive queue exceeded its bounded message budget.");
+    const deliveries = Math.min(this.#waiters.length, Math.ceil(value.byteLength / RECEIVE_SLAB_BYTES));
+    const deliveredBytes = Math.min(value.byteLength, deliveries * RECEIVE_SLAB_BYTES);
+    let offset = deliveredBytes;
+    while (offset < value.byteLength) {
+      let slab = this.#values.at(-1);
+      if (slab === undefined || slab.length === RECEIVE_SLAB_BYTES) {
+        slab = { bytes: new Uint8Array(RECEIVE_SLAB_BYTES), length: 0 };
+        this.#values.push(slab);
+      }
+      const length = Math.min(RECEIVE_SLAB_BYTES - slab.length, value.byteLength - offset);
+      slab.bytes.set(value.subarray(offset, offset + length), slab.length);
+      slab.length += length;
+      offset += length;
     }
-    this.#values.push(value);
-    this.#queuedBytes += value.byteLength;
+    this.#queuedBytes += value.byteLength - deliveredBytes;
+    for (let index = 0; index < deliveries; index += 1) {
+      const start = index * RECEIVE_SLAB_BYTES;
+      this.#waiters.shift()!.resolve({ done: false, value: value.slice(start, Math.min(start + RECEIVE_SLAB_BYTES, value.byteLength)) });
+    }
   }
 
   close(): void {
@@ -68,8 +81,8 @@ class BoundedByteQueue implements AsyncIterableIterator<Uint8Array> {
   next(): Promise<IteratorResult<Uint8Array>> {
     const value = this.#values.shift();
     if (value !== undefined) {
-      this.#queuedBytes -= value.byteLength;
-      return Promise.resolve({ done: false, value });
+      this.#queuedBytes -= value.length;
+      return Promise.resolve({ done: false, value: value.bytes.subarray(0, value.length) });
     }
     if (this.#failure !== undefined) return Promise.reject(this.#failure);
     if (this.#closed) return Promise.resolve({ done: true, value: undefined });
@@ -92,11 +105,17 @@ function terminalSessionId(url: string): string {
   return id;
 }
 
-async function messageBytes(data: unknown): Promise<Uint8Array> {
+function synchronousMessageBytes(data: unknown): Uint8Array | undefined {
   if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
   if (ArrayBuffer.isView(data)) {
     return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
   }
+  return undefined;
+}
+
+async function messageBytes(data: unknown): Promise<Uint8Array> {
+  const synchronous = synchronousMessageBytes(data);
+  if (synchronous !== undefined) return synchronous;
   if (typeof Blob !== "undefined" && data instanceof Blob) {
     return new Uint8Array(await data.arrayBuffer());
   }
@@ -137,7 +156,8 @@ export function createNodeWebSocketConnector(input: {
       const authProtocol = `${DEPLOYED_WIRE_COMPATIBILITY.websocketAuthPrefix}${request.token}`;
       let socket: WebSocket;
       try {
-        socket = new WebSocketAuthority(request.url, [request.protocol, authProtocol]);
+        socket = new WebSocketAuthority(request.url, [request.protocol, authProtocol,
+          ...(request.terminalViewProtocol === undefined ? [] : [request.terminalViewProtocol])]);
       } catch (error) {
         throw runtimeFailure("terminal_disconnected", "Cuna could not start the terminal WebSocket handshake.", {
           retryable: true,
@@ -173,6 +193,19 @@ export function createNodeWebSocketConnector(input: {
         try {
           if (expectedBytes < 1 || expectedBytes > MAX_MESSAGE_BYTES) {
             throw runtimeFailure("terminal_protocol_error", "The terminal transport message is outside the bounded frame window.");
+          }
+          // Binary WebSockets already deliver bytes. Queue them synchronously
+          // unless an earlier asynchronous conversion owns arrival order.
+          if (pendingConversionMessages === 0) {
+            const bytes = synchronousMessageBytes(event.data);
+            if (bytes !== undefined) {
+              try { queue.push(bytes); } catch (error) {
+                discardPendingConversions = true;
+                queue.fail(error);
+                closeSocket(1003, "cuna_binary_required");
+              }
+              return;
+            }
           }
           if (
             pendingConversionBytes + expectedBytes > MAX_PENDING_CONVERSION_BYTES ||
