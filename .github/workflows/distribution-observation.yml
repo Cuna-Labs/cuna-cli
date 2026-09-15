@@ -1,0 +1,149 @@
+name: Observe candidate distributions
+
+# CI already runs the observation-only platforms, but that lane is declared
+# non-authorizing on purpose: `observed-artifact` carries `continue-on-error`,
+# so a platform that never ran leaves exactly the same green CI as one that
+# passed, and `observation-summary.json` hard-codes `releaseEligible: false`.
+#
+# This workflow produces the authorizing form of the same evidence. It is bound
+# to one exact candidate envelope, its lanes are allowed to fail the run, and it
+# emits a cohort only when every declared observation-only identity verified.
+# The release review consumes that cohort; it is the only producer the release
+# approval lease will name.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful main CI run containing release-candidate
+        required: true
+        type: string
+      candidate_envelope_sha256:
+        description: Exact release-envelope SHA-256
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: distribution-observation-${{ inputs.candidate_run_id }}-${{ inputs.candidate_envelope_sha256 }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: candidate-bound-observation-plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      observation_matrix: ${{ steps.matrix.outputs.observation_matrix }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+      - name: Bind the observation request to a successful protected-main candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_ENVELOPE_SHA256: ${{ inputs.candidate_envelope_sha256 }}
+        shell: bash
+        run: |
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_ENVELOPE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          CANDIDATE_STATE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}" --jq '[.status,.conclusion,.event,.head_branch,.path] | join(" ")')"
+          test "$CANDIDATE_STATE" = "completed success push main .github/workflows/ci.yml"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+          path: release-artifacts
+      - name: Require the exact candidate envelope bytes
+        env:
+          CANDIDATE_ENVELOPE_SHA256: ${{ inputs.candidate_envelope_sha256 }}
+        shell: bash
+        run: |
+          node scripts/verify-release-envelope.mjs
+          test "$(sha256sum release-artifacts/release-envelope.json | cut -d' ' -f1)" = "$CANDIDATE_ENVELOPE_SHA256"
+      - name: Export exactly the observation-only support matrix
+        id: matrix
+        shell: bash
+        run: |
+          echo "observation_matrix=$(node -e 'const p=require("./packaging/support-policy.json");process.stdout.write(JSON.stringify({include:p.ciMatrix.filter((entry)=>entry.claim==="observation-only")}))')" >> "$GITHUB_OUTPUT"
+
+  observe:
+    name: cohort-${{ matrix.id }}
+    needs: plan
+    # Deliberately NOT continue-on-error. In CI a failing observation lane is
+    # tolerated; here a lane that fails or never runs must fail the cohort, or
+    # the cohort would assert coverage it does not have.
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.observation_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --global npm@11.4.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+          path: release-artifacts
+      - run: node scripts/verify-release-envelope.mjs
+      - run: node scripts/verify-installed-candidate.mjs --receipt "evidence/observation-receipts/${{ matrix.id }}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cohort-observation-${{ matrix.id }}
+          path: evidence/observation-receipts/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  cohort:
+    name: candidate-bound-observation-cohort
+    needs: [plan, observe]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.17.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+          path: release-artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: cohort-observation-*
+          path: evidence/observation-receipts
+          merge-multiple: true
+      - name: Validate every observation receipt against the exact candidate
+        run: node scripts/summarize-observation-receipts.mjs
+      - name: Promote the summary only when the cohort is complete
+        run: node scripts/build-observation-cohort.mjs --candidate-run-id "${{ inputs.candidate_run_id }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: observation-cohort
+          path: |
+            evidence/observation-cohort.json
+            evidence/observation-summary.json
+          if-no-files-found: error
+          retention-days: 14
