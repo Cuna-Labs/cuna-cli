@@ -1998,7 +1998,13 @@ test("automatic recovery keeps trying for a bounded ten attempts before reportin
     throw runtimeFailure("terminal_disconnected", "still resetting", { retryable: true });
   };
   callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
-  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Reconnect failed"), "recovery eventually reports failure");
+  // Ten waits of 1..512 ms add up to about a second; the shared waitUntil
+  // budget (200 x setTimeout(1)) is ~200 ms on Linux, so wait by deadline.
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !decoder.decode(host.writes.at(-1)).includes("Reconnect failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(decoder.decode(host.writes.at(-1)).includes("Reconnect failed"), "recovery eventually reports failure");
   assert.equal(calls.reconnect.length, 10, "the default budget is ten bounded attempts");
   assert.equal(coordinator.state, "active", "a failed automatic recovery leaves the person in control, not detached");
   await coordinator.stop();
