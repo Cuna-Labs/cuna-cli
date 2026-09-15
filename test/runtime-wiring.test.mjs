@@ -481,10 +481,14 @@ test("TC-055-12 foreground readiness remains distinct from daemon and cannot aut
   assert.equal(runtime.daemon.state, "absent");
 });
 
-async function waitUntil(predicate, message) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function waitUntil(predicate, message, timeoutMs = 3_000) {
+  // Deadline-based, not iteration-based: 100 x setTimeout(1) is ~1.5 s on a
+  // Windows host (15 ms timer tick) but ~120 ms on Linux, below the 250 ms
+  // client heartbeat floor this file waits for.
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
     if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 1));
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.fail(message);
 }
