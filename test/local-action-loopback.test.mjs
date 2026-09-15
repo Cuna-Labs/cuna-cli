@@ -247,7 +247,11 @@ test("abort closes a private listener and every active stream", async () => {
   await forward.closed;
   if (!client.destroyed) await new Promise((resolve) => client.once("close", resolve));
   assert.equal(client.destroyed, true);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(upstreamSockets.size, 0);
+  // The forward destroyed its remote socket; the upstream server observes that
+  // close through the kernel, one round trip later on Linux. Bound the wait
+  // instead of assuming a single turn of the event loop is enough.
+  const deadline = Date.now() + 2_000;
+  while (upstreamSockets.size > 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(upstreamSockets.size, 0, "abort must close the upstream side of every active stream");
   await new Promise((resolve) => upstream.close(resolve));
 });

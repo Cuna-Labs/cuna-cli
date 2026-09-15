@@ -2163,8 +2163,9 @@ async function raceAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise
 async function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return;
   await new Promise<void>((resolve) => {
+    // Awaited by reconnect recovery: the delay must be able to elapse even when
+    // no other handle keeps the event loop alive (Linux exits early otherwise).
     const timer = setTimeout(done, milliseconds);
-    timer.unref();
     const onAbort = (): void => done();
     function done(): void {
       clearTimeout(timer);

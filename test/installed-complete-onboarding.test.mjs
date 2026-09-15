@@ -977,7 +977,7 @@ const INSTALLED_HELP_TOPICS = Object.freeze([
   "signup", "login", "logout", "whoami", "access", "capabilities", "observe", "share",
   "machines", "machines list", "machines create", "machines start", "machines pause",
   "machines resume", "machines stop", "machines update-supervisor", "machines live-update-supervisor",
-  "machines delete", "records", "authorizations",
+  "machines live-update-status", "machines delete", "records", "authorizations",
   "account", "workspace", "usage", "api-keys", "api-keys create", "api-keys list",
   "api-keys revoke", "agent-sessions", "agent-sessions list", "agent-sessions get",
   "agent-sessions create", "agent-sessions rename", "agent-sessions terminate",
@@ -1003,6 +1003,9 @@ const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
 const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze([
   "machines update-supervisor",
   "machines live-update-supervisor",
+  // Reads the local record of one in-place update and sends nothing; it needs
+  // a Machine this computer actually updated, which the generic matrix never has.
+  "machines live-update-status",
 ]);
 // Implemented, help-visible, and refused outright by this installed harness:
 // both screens require a real interactive terminal under a human login, and
@@ -1039,6 +1042,7 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "machines/usage", argv: ["machines", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   // Both live-update refusals are decided before configuration or transport.
   { id: "machines/live-update-supervisor/confirmation", argv: ["machines", "live-update-supervisor", ID, "--json"], exit: 4, code: "cuna.confirmation.required" },
+  { id: "machines/live-update-status/usage", argv: ["machines", "live-update-status", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "machines/live-update-supervisor/usage", argv: ["machines", "live-update-supervisor", ID, "--yes", "--forget-unknown", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "records/usage", argv: ["records", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "authorizations/usage", argv: ["authorizations", "list", "--json"], exit: 2, code: "cuna.usage.invalid" },

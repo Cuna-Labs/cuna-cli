@@ -1,7 +1,7 @@
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { link, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 
 export const CUNA_TRANSFER_ROOT = ".cuna-transfers" as const;
 export const CUNA_TRANSFER_STAGING_ROOT = ".cuna-transfer-staging" as const;
@@ -117,11 +117,15 @@ export class FileTransferActions {
   readonly #options: FileTransferActionsOptions;
   readonly #store: FileTransferStore;
   readonly #randomBytes: (size: number) => Uint8Array;
+  /** Path rules of the platform the action targets, not of the host running the tests. */
+  readonly #isAbsolute: (candidate: string) => boolean;
   readonly #snapshots = new Map<string, { readonly binding: FileTransferBinding; readonly snapshot: SelectedFileSnapshot }>();
 
   constructor(options: FileTransferActionsOptions) {
-    if (!isAbsolute(options.workspaceRoot)) throw new FileTransferError("workspace_root_invalid");
+    const isAbsoluteForPlatform = options.platform === "win32" ? win32.isAbsolute : posix.isAbsolute;
+    if (!isAbsoluteForPlatform(options.workspaceRoot)) throw new FileTransferError("workspace_root_invalid");
     this.#options = options;
+    this.#isAbsolute = isAbsoluteForPlatform;
     this.#randomBytes = options.randomBytes ?? nodeRandomBytes;
     this.#store = options.platform === "win32"
       ? options.windowsNativeStore ?? UNSUPPORTED_STORE
@@ -153,7 +157,7 @@ export class FileTransferActions {
     try {
       for (const sourcePath of selected) {
         throwIfAborted(signal);
-        if (typeof sourcePath !== "string" || !isAbsolute(sourcePath)) throw new FileTransferError("selection_invalid");
+        if (typeof sourcePath !== "string" || !this.#isAbsolute(sourcePath)) throw new FileTransferError("selection_invalid");
         const opaqueId = deriveOpaqueId(binding, this.#randomBytes(16));
         const snapshot = await this.#store.createSnapshot({
           sourcePath,
@@ -229,7 +233,7 @@ export class FileTransferActions {
     throwIfAborted(signal);
     const destination = await this.#options.picker.selectSaveDestination(args.suggestedName, signal);
     if (destination === null) return null;
-    if (!isAbsolute(destination)) throw new FileTransferError("destination_invalid");
+    if (!this.#isAbsolute(destination)) throw new FileTransferError("destination_invalid");
     let overwrite = false;
     if (await this.#store.destinationExists(destination)) {
       overwrite = await this.#options.picker.confirmOverwrite(sanitizeDisplayName(destination), signal);
@@ -401,13 +405,18 @@ async function copyStableRegularFile(
   signal?: AbortSignal,
   beforeRevalidation?: (sourcePath: string) => void | Promise<void>,
 ): Promise<{ readonly byteLength: number; readonly sha256: string }> {
-  const beforePath = await lstat(sourcePath, { bigint: true });
-  if (!beforePath.isFile() || beforePath.isSymbolicLink() || beforePath.nlink !== 1n) throw new FileTransferError("source_unsafe_type");
+  // Open first, then judge the open descriptor: O_NOFOLLOW refuses a symlink at
+  // the final component, and every type/link-count decision below is made on
+  // the file actually opened, not on a path that could change in between.
   const source = await open(sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   let destination;
   try {
     const before = await source.stat({ bigint: true });
-    assertStableRegular(before, beforePath);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) throw new FileTransferError("source_unsafe_type");
+    // The path must still name this exact inode; a swap after the open is a
+    // changed source, not a different file to copy.
+    const beforePath = await lstat(sourcePath, { bigint: true });
+    assertStableRegular(beforePath, before);
     if (before.size > BigInt(maximumBytes)) throw new FileTransferError("byte_budget_exceeded");
     destination = await open(destinationPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW, 0o600);
     const hash = createHash("sha256");

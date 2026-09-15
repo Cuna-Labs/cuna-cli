@@ -148,7 +148,9 @@ export class LocalActionExecutor {
     this.#active.set(current.request.id, active);
     const deadline = Math.min(current.request.expiresAt, this.#now() + this.#maximumExecutionMs);
     active.timeout = setTimeout(() => { void this.#timeout(active, deadline === current.request.expiresAt); }, Math.max(1, deadline - this.#now()));
-    active.timeout.unref();
+    // The deadline is awaited by the operation's own contract (accepted =>
+    // eventually success or typed failure), so the timer must be able to fire
+    // even when nothing else keeps the event loop alive.
     queueMicrotask(() => { void this.#run(active, deadline); });
     return result;
   }

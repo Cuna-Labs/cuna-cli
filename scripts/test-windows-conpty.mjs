@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -148,8 +148,16 @@ async function sourceIdentity() {
     if (!line.startsWith("?? ")) continue;
     const relative = line.slice(3);
     const absolute = path.join(root, relative);
-    const metadata = await stat(absolute);
-    if (metadata.isFile()) dirty.update(relative).update("\0").update(await readFile(absolute));
+    // Read directly instead of stat-then-read: an untracked entry that is not a
+    // regular file (directories never appear under --untracked-files=all; a
+    // FIFO or socket could) is skipped by the read itself, with no window in
+    // which the path could change between the check and the use.
+    let content;
+    try { content = await readFile(absolute); } catch (error) {
+      if (error?.code === "EISDIR" || error?.code === "ENOENT") continue;
+      throw error;
+    }
+    dirty.update(relative).update("\0").update(content);
   }
   return Object.freeze({ commit, dirtyTreeDiffSha256: dirty.digest("hex"), builtArtifactSha256: await digestTree(path.join(root, "dist")) });
 }

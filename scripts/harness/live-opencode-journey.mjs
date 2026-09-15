@@ -33,7 +33,7 @@
  * "failed" costs a second run to learn anything.
  */
 import { spawnSync } from "node:child_process";
-import { writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import { createRequire } from "node:module";
@@ -280,7 +280,8 @@ function terminalRedeemedThisRun(agentSessionId) {
   const sql = `select count(*)::int as redeemed from public.terminal_connections `
     + `where agent_session_id = '${agentSessionId}' and redeemed_at is not null `
     + `and issued_at > '${since}';`;
-  const file = path.join(os.tmpdir(), `cuna-journey-${process.pid}.sql`);
+  const dir = mkdtempSync(path.join(os.tmpdir(), "cuna-journey-"));
+  const file = path.join(dir, "query.sql");
   try {
     writeFileSync(file, `${sql}\n`, "utf8");
     const out = spawnSync(
@@ -303,7 +304,7 @@ function terminalRedeemedThisRun(agentSessionId) {
   } catch {
     return undefined;
   } finally {
-    try { rmSync(file, { force: true }); } catch { /* best effort */ }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 }
 
@@ -321,7 +322,8 @@ function terminalRedeemedThisRun(agentSessionId) {
  */
 function runDurableQuery(sql) {
   const projectRef = process.env.CUNA_HARNESS_PROJECT_REF ?? "gnxoicpqjjrktktuzqws";
-  const file = path.join(os.tmpdir(), `cuna-journey-${process.pid}-${Date.now()}.sql`);
+  const dir = mkdtempSync(path.join(os.tmpdir(), "cuna-journey-"));
+  const file = path.join(dir, "query.sql");
   try {
     writeFileSync(file, `${sql}\n`, "utf8");
     const out = spawnSync(
@@ -334,7 +336,7 @@ function runDurableQuery(sql) {
   } catch {
     return undefined;
   } finally {
-    try { rmSync(file, { force: true }); } catch { /* best effort */ }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 }
 
