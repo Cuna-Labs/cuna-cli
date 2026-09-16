@@ -4,7 +4,7 @@
   "repository": "Cuna-Labs/cuna-cli",
   "environment": "npm",
   "protectedRef": "main",
-  "requiredReviewer": {"type": "User", "id": 67605416, "login": "superjava1"},
+  "requiredReviewer": {"type": "User", "id": 312749809, "login": "cunitacodeitor"},
   "rulesetName": "Protect Cuna release approval consumptions",
   "rulesetId": 20698394,
   "tagRefPrefix": "refs/tags/cuna-release-approval-consumption/",
