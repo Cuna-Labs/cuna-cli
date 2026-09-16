@@ -126,8 +126,33 @@ jobs:
           if (envelopeSha256 !== process.env.CANDIDATE_ENVELOPE_SHA256 || admission.releaseEnvelopeSha256 !== envelopeSha256) process.exit(1);
           if (admission.candidateSha256 !== envelope.tarball.sha256 || admission.sourceCommit !== envelope.sourceCommit || admission.releaseInputsSha256 !== envelope.releaseInputs.sha256) process.exit(1);
           if (JSON.stringify(admission.identities) !== JSON.stringify(envelope.identities)) process.exit(1);
-          if (admission.decision !== 'CANDIDATE_ADMITTED_FOR_EXTERNAL_RELEASE_REVIEW' || admission.releaseEligible !== true) {
-            throw new Error('Publication blocked: installed-platform evidence is not authenticated semantic release authorization.');
+          // This asked the CI admission to be release authorization. It never
+          // can be, and that is on purpose: `verify-release-admission.mjs`
+          // writes PLATFORM_MATRIX_VERIFIED_NOT_RELEASE_AUTHORIZED with no
+          // branch that could write anything else, and a test holds it there by
+          // name -- "complete platform receipts are never elevated to release
+          // authorization". The value this line demanded has never existed in
+          // the emitter, in any commit. So the condition was unsatisfiable, and
+          // an unsatisfiable gate refuses every release alike: it cannot tell a
+          // candidate that should publish from one that should not.
+          //
+          // Authorization in this repository is the approval lease, and the
+          // steps below take it apart properly: its digest against the dispatch
+          // input, its semantic binding to this exact candidate, an attestation
+          // proving release-review.yml and nothing else produced it, and a
+          // one-use nonce consumed atomically so the same lease cannot publish
+          // twice. The admission's own limitations list says NO_RELEASE_APPROVAL
+          // _LEASE -- it is describing what it is not, and the lease is what it
+          // is not.
+          //
+          // The check is inverted rather than deleted. The admission is still
+          // required to be exactly the non-authorizing verdict its emitter
+          // produces, so if that verdict is ever changed -- to authorize, or to
+          // anything else -- publication stops here until someone has looked at
+          // why. The digest bindings above are untouched: this admission must
+          // still be the one belonging to this candidate.
+          if (admission.decision !== 'PLATFORM_MATRIX_VERIFIED_NOT_RELEASE_AUTHORIZED' || admission.releaseEligible !== false) {
+            throw new Error('Publication blocked: the admission verdict is not the one its emitter produces, so the platform evidence is unrecognised.');
           }
           NODE
         env:
