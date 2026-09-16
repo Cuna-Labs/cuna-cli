@@ -41,6 +41,37 @@ export function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+// Git normalizes what it stores in an annotated tag, and the two readback
+// comparisons below were written against what was SENT rather than what comes
+// back.
+//
+// A tag message is a commit-style message, and git terminates it with a
+// newline, so the reservation JSON returns carrying one byte it was never
+// given. A tagger date is a git timestamp, which counts whole seconds, so a
+// millisecond-precision reservedAt returns truncated: the first real
+// reservation recorded 2026-09-16T03:27:20.928Z and read back
+// 2026-09-16T03:27:20Z, 928 milliseconds apart and never equal as strings.
+//
+// Neither is a discrepancy in the evidence. Both are the format the store uses,
+// and the assertions refused a tag that was exactly right. Comparing through
+// the normalization keeps them exact about everything the store preserves: the
+// reservation must still be byte-identical apart from that one terminator, and
+// the tagger must still name the same second, which is all the resolution a tag
+// object has.
+//
+// The unit tests could not have found this. Their fetch double echoes back the
+// message and tagger it was handed, so it models a store that returns what it
+// is given, and this one does not.
+function sameTagMessage(observed, expected) {
+  return typeof observed === "string" && (observed === expected || observed === `${expected}\n`);
+}
+
+function sameTagSecond(observed, expected) {
+  const left = Date.parse(observed ?? "");
+  const right = Date.parse(expected ?? "");
+  return Number.isSafeInteger(left) && Number.isSafeInteger(right) && Math.floor(left / 1000) === Math.floor(right / 1000);
+}
+
 export function validateReleaseContext(context) {
   exactKeys(context, ["repository", "workflow", "ref", "event", "sourceCommit", "runId", "runAttempt", "actorId", "actorLogin", "environment"], "release workflow context");
   invariant(context.repository === "Cuna-Labs/cuna-cli", "Release workflow repository differs");
@@ -256,10 +287,10 @@ export async function reserveReleaseApprovalConsumption({ declaration, consumpti
   invariant(
     observedTag.sha === tagObject.sha && observedTag.tag === consumption.tagName &&
       observedTag.object?.type === "commit" && observedTag.object?.sha === context.sourceCommit &&
-      observedTag.message === consumption.reservationBytes.toString("utf8") &&
+      sameTagMessage(observedTag.message, consumption.reservationBytes.toString("utf8")) &&
       observedTag.tagger?.name === "Cuna Release Authority" &&
       observedTag.tagger?.email === "release-authority@getcuna.com" &&
-      observedTag.tagger?.date === taggerDate,
+      sameTagSecond(observedTag.tagger?.date, taggerDate),
     "Release consumption annotated-tag evidence differs",
   );
   await observeAuthority();
@@ -307,10 +338,10 @@ export async function verifyReservedReleaseApprovalConsumption({
     exact.ref === current.ref && exact.tagName === current.tagName &&
       observedTag.sha === observedRef.object.sha && observedTag.tag === exact.tagName &&
       observedTag.object?.type === "commit" && observedTag.object?.sha === context.sourceCommit &&
-      observedTag.message === exact.reservationBytes.toString("utf8") &&
+      sameTagMessage(observedTag.message, exact.reservationBytes.toString("utf8")) &&
       observedTag.tagger?.name === "Cuna Release Authority" &&
       observedTag.tagger?.email === "release-authority@getcuna.com" &&
-      observedTag.tagger?.date === exact.reservation.reservedAt,
+      sameTagSecond(observedTag.tagger?.date, exact.reservation.reservedAt),
     "Release consumption annotated-tag evidence differs",
   );
   await verifyReleaseApprovalConsumptionAuthority({ declaration, context, token, fetchImpl, apiRoot });

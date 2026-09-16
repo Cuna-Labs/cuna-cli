@@ -185,12 +185,19 @@ function authorityResponses({ replay = false, rulesetBypass = false, weakenBefor
       return response(200, { ref, object: { sha: tagSha } });
     }
     if (url.endsWith(`/git/tags/${tagSha}`) && options.method === "GET") {
+      // This used to hand back the message and tagger it was given, which made
+      // it a store that keeps whatever it is told. Git is not one. It
+      // terminates a tag message with a newline, and it records a tagger date
+      // as a whole-second git timestamp, so a millisecond-precision reservedAt
+      // comes back truncated. A real reservation failed here on both counts
+      // while ten tests against this double passed, so the double now performs
+      // the same two normalizations and the tests can see what the store does.
       return response(200, {
         sha: tagSha,
         tag: tagRequest.tag,
-        message: tagRequest.message,
+        message: `${tagRequest.message}\n`,
         object: { type: tagRequest.type, sha: tagRequest.object },
-        tagger: tagRequest.tagger,
+        tagger: { ...tagRequest.tagger, date: `${new Date(Math.floor(Date.parse(tagRequest.tagger.date) / 1000) * 1000).toISOString().slice(0, 19)}Z` },
       });
     }
     throw new Error(`unexpected request: ${options.method} ${url}`);
