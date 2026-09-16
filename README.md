@@ -1,7 +1,12 @@
 <div align="center">
   <h1>Cuna CLI</h1>
   <p><strong>Run cloud coding agents from your own terminal.</strong></p>
-  <p>[![CI](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/ci.yml) [![CodeQL](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Node.js](https://img.shields.io/badge/node-22.17.1%2B%20%7C%2024.4.1%2B-339933?logo=node.js&logoColor=white)](package.json)</p>
+  <p>
+    <a href="https://github.com/Cuna-Labs/cuna-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Cuna-Labs/cuna-cli/actions/workflows/ci.yml/badge.svg"></a>
+    <a href="https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/Cuna-Labs/cuna-cli/actions/workflows/codeql.yml/badge.svg"></a>
+    <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+    <a href="package.json"><img alt="Node.js" src="https://img.shields.io/badge/node-22.17.1%2B%20%7C%2024.4.1%2B-339933?logo=node.js&logoColor=white"></a>
+  </p>
 </div>
 
 Claude Code, Codex and OpenCode feel like they are running on your laptop. They

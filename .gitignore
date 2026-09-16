@@ -66,9 +66,12 @@ tmp/
 /CLAUDE.md
 /IMPLEMENTATION-OBJECTIVE.md
 /CODE_OF_CONDUCT.md
-/prds/*
-!/prds/local-actions/
-!/prds/local-actions/**
+/prds/
+# NO EXCEPTIONS. This rule used to read `/prds/*` followed by
+# `!/prds/local-actions/` and `!/prds/local-actions/**`, which re-included
+# exactly one PRD set -- and eight internal planning documents were published
+# on a public repository for it. A negation under an ignore rule is a decision
+# to publish; there is no reason to make that decision here.
 /architecture/
 /governance/
 /packaging/DISTRIBUTION-READINESS.md
