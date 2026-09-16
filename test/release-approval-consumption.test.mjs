@@ -128,7 +128,7 @@ function response(status, value) {
   };
 }
 
-function authorityResponses({ replay = false, rulesetBypass = false, weakenBeforeReservation = false, missingUpdate = false } = {}) {
+function authorityResponses({ replay = false, rulesetBypass = false, weakenBeforeReservation = false, missingUpdate = false, bypassActors = undefined, hideBypassActors = false } = {}) {
   let refCreated = false;
   let environmentReads = 0;
   let tagRequest;
@@ -161,7 +161,10 @@ function authorityResponses({ replay = false, rulesetBypass = false, weakenBefor
         enforcement: "active",
         source_type: "Repository",
         source: "Cuna-Labs/cuna-cli",
-        bypass_actors: rulesetBypass ? [{ actor_type: "OrganizationAdmin" }] : [],
+        // GitHub omits bypass_actors entirely for a caller without
+        // administration read, which is every workflow token. `hideBypassActors`
+        // reproduces that response; `bypassActors` supplies a visible list.
+        ...(hideBypassActors ? {} : { bypass_actors: bypassActors ?? (rulesetBypass ? [{ actor_type: "OrganizationAdmin" }] : []) }),
         current_user_can_bypass: rulesetBypass ? "always" : "never",
         conditions: { ref_name: { include: [`${configuredAuthority.tagRefPrefix}*`], exclude: [] } },
         rules: [{ type: "deletion" }, { type: "non_fast_forward" }, ...(!missingUpdate ? [{ type: "update" }] : [])],
@@ -359,6 +362,37 @@ test("stale, substituted, wrong-controller, and bypassable authority states fail
       consumption: consumption(),
       token: "x".repeat(40),
       fetchImpl: authorityResponses({ rulesetBypass: true }),
+      apiRoot: "https://api.github.test",
+    }),
+    /permits bypass/u,
+  );
+});
+
+// A workflow token is never shown the bypass-actor list, so requiring it to be
+// an empty ARRAY refused every release on a ruleset that permits no bypass at
+// all. These two pin what replaced it: an absent list is accepted, because the
+// caller cannot observe it and `current_user_can_bypass` still proves this run
+// cannot bypass; a list that IS visible must still be empty, so nothing is lost
+// wherever it was ever observable.
+test("an undisclosed bypass-actor list does not by itself refuse the reservation", async () => {
+  await assert.doesNotReject(
+    reserveReleaseApprovalConsumption({
+      declaration: configuredAuthority,
+      consumption: consumption(),
+      token: "x".repeat(40),
+      fetchImpl: authorityResponses({ hideBypassActors: true }),
+      apiRoot: "https://api.github.test",
+    }),
+  );
+});
+
+test("a visible bypass-actor list must still be empty, even when this caller cannot bypass", async () => {
+  await assert.rejects(
+    reserveReleaseApprovalConsumption({
+      declaration: configuredAuthority,
+      consumption: consumption(),
+      token: "x".repeat(40),
+      fetchImpl: authorityResponses({ bypassActors: [{ actor_type: "OrganizationAdmin" }] }),
       apiRoot: "https://api.github.test",
     }),
     /permits bypass/u,

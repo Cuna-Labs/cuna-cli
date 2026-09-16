@@ -142,7 +142,33 @@ export function validateConsumptionAuthority({ declaration, environment, branchP
 
   invariant(ruleset.id === declaration.rulesetId && ruleset.name === declaration.rulesetName && ruleset.target === "tag" && ruleset.enforcement === "active", "Release consumption ruleset is not active or has a different identity");
   invariant(ruleset.source_type === "Repository" && ruleset.source === context.repository, "Release consumption ruleset authority differs");
-  invariant(Array.isArray(ruleset.bypass_actors) && ruleset.bypass_actors.length === 0 && ruleset.current_user_can_bypass === "never", "Release consumption ruleset permits bypass");
+  // This required `bypass_actors` to be an empty array, and a workflow token is
+  // never shown that list: GitHub returns `bypass_actors: null` to a caller
+  // without administration read, alongside a real `current_user_can_bypass`.
+  // `null` is not "there are none", it is "not disclosed", and the assertion
+  // read the two as the same thing -- so it refused every release with a
+  // message claiming the ruleset permits bypass, on a ruleset that permits
+  // none. The `permissions:` block of a workflow has no `administration` key,
+  // so no job could have satisfied it with `github.token`, whatever the
+  // ruleset said.
+  //
+  // What a workflow CAN observe is whether IT may bypass, and that is the
+  // actor this chain controls: `current_user_can_bypass === "never"` proves the
+  // run creating the one-use tag can never delete or rewrite it afterwards.
+  // That is still required, and it still fails closed.
+  //
+  // What is given up is the stronger claim that no bypass actor exists at all.
+  // Configuring one takes repository administration, and an administrator can
+  // equally rewrite this workflow, the reviewers and the ruleset itself, so
+  // the claim never defended against that actor. When the list IS visible --
+  // a human running this with an administrative token -- it is still required
+  // to be empty, so nothing is lost where it was ever observable.
+  invariant(
+    ruleset.current_user_can_bypass === "never" &&
+      (ruleset.bypass_actors === null || ruleset.bypass_actors === undefined ||
+        (Array.isArray(ruleset.bypass_actors) && ruleset.bypass_actors.length === 0)),
+    "Release consumption ruleset permits bypass",
+  );
   invariant(JSON.stringify(ruleset.conditions?.ref_name?.exclude ?? []) === "[]", "Release consumption ruleset excludes protected tags");
   invariant(JSON.stringify(ruleset.conditions?.ref_name?.include ?? []) === JSON.stringify([`${TAG_REF_PREFIX}*`]), "Release consumption ruleset scope differs");
   const ruleTypes = (ruleset.rules ?? []).map((rule) => rule?.type).filter(Boolean).sort();
