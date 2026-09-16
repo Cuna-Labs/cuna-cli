@@ -284,10 +284,33 @@ jobs:
           # where the artifact's own prefix puts them once it is extracted here
           # rather than one directory deeper.
           path: admitted
+      # NODE_AUTH_TOKEN exists here for one publication and should not outlive it.
+      #
+      # npm's trusted publishing is configured on a package's own settings page,
+      # and @cuna_labs/cli has no such page because it has never been published.
+      # The registry has no way to record that this workflow may publish a
+      # package that does not exist, so the first publication cannot present an
+      # OIDC identity and must present a credential instead. npm documents this
+      # -- publish once with a token, then configure the trusted publisher --
+      # and npm/cli#8544 tracks closing the gap.
+      #
+      # This changes how the job authenticates to the registry and nothing else.
+      # Every control still runs: the protected-environment approval, the
+      # attested lease, the one-use nonce consumed against a protected tag, the
+      # digest checks on the exact bytes, and --provenance, which derives from
+      # the Actions OIDC identity rather than from this token. The secret is
+      # scoped to the npm environment, so only a job a human has already
+      # approved can read it.
+      #
+      # AFTER 0.1.0 IS PUBLISHED: configure the trusted publisher on the package
+      # (Cuna-Labs/cuna-cli, release.yml, environment npm), then delete both the
+      # NPM_TOKEN secret and these two lines. Publication returns to OIDC, and an
+      # empty NODE_AUTH_TOKEN is exactly what npm needs to attempt it.
       - name: Revalidate fresh approval and publish exact admitted bytes
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           RELEASE_SOURCE_COMMIT: ${{ inputs.source_commit }}
           APPROVAL_LEASE_SHA256: ${{ inputs.approval_lease_sha256 }}
           APPROVAL_EXPECTATION_SHA256: ${{ inputs.approval_expectation_sha256 }}

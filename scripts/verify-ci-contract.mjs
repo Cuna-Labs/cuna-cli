@@ -144,8 +144,13 @@ invariant(
     approvalConsumptionAuthority.rulesetId === 20698394 &&
     approvalConsumptionAuthority.rulesetName === "Protect Cuna release approval consumptions" &&
     approvalConsumptionAuthority.requiredReviewer?.type === "User" &&
-    approvalConsumptionAuthority.requiredReviewer?.id === 67605416 &&
-    approvalConsumptionAuthority.requiredReviewer?.login === "superjava1" &&
+    // The reviewer is pinned here, not merely required to exist, so the
+    // declaration cannot quietly nominate a different approver. It names
+    // cunitacodeitor because superjava1 initiates both release workflows and is
+    // therefore the controller the lease records; the npm environment's approver
+    // has to be somebody else, and with two accounts there is only one else.
+    approvalConsumptionAuthority.requiredReviewer?.id === 312749809 &&
+    approvalConsumptionAuthority.requiredReviewer?.login === "cunitacodeitor" &&
     JSON.stringify(approvalConsumptionAuthority.requiredRules) === JSON.stringify(["deletion", "non_fast_forward", "update"]),
   "Configured release-approval authority must bind the exact externally observed ruleset and reviewer",
 );
