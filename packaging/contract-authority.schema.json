@@ -9,7 +9,7 @@
     "schemaVersion": {"const": 1},
     "authority": {"const": "CUNA_CANONICAL_PUBLIC_API_CONTRACT"},
     "status": {"const": "APPROVED"},
-        "producerRepository": {"const": "Cuna-Labs/infra"},
+        "producerRepository": {"const": "Cuna-Labs/infra-proxy-mvp"},
     "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "contractSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "approvalAttestationSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}

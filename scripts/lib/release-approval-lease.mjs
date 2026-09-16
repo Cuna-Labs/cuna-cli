@@ -36,7 +36,7 @@ export function validateContractAuthority(authority) {
   invariant(authority.schemaVersion === 1, "Unsupported contract-authority schema");
   invariant(authority.authority === "CUNA_CANONICAL_PUBLIC_API_CONTRACT", "Contract authority is not canonical");
   invariant(authority.status === "APPROVED", "Contract authority is not approved");
-  invariant(authority.producerRepository === "Cuna-Labs/infra", "Contract producer repository is invalid");
+  invariant(authority.producerRepository === "Cuna-Labs/infra-proxy-mvp", "Contract producer repository is invalid");
   invariant(COMMIT.test(authority.sourceCommit), "Contract source commit is invalid");
   digest(authority.contractSha256, "Contract digest");
   digest(authority.approvalAttestationSha256, "Contract approval attestation digest");

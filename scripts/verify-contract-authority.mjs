@@ -87,7 +87,7 @@ async function producerRead(url, label) {
 // `validateContractAuthority` already pins producerRepository to one literal, so
 // the host and the owner/name segments are constants in this file rather than
 // anything the declaration can choose.
-const PRODUCER_PATH = "Cuna-Labs/infra";
+const PRODUCER_PATH = "Cuna-Labs/infra-proxy-mvp";
 invariant(declaration.producerRepository === PRODUCER_PATH, "Contract producer repository identity is malformed");
 
 const commit = await producerRead(
