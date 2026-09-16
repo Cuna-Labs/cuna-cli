@@ -92,11 +92,8 @@ the default. Production always talks to `https://api.getcuna.com`.
 shows once. It is stored encrypted, scoped to your OS user, and exchanged for a
 short-lived token on every run. `cuna logout` revokes it before deleting it.
 
-`CUNA_API_KEY` is for automation and is never saved for you.
-
-> [!WARNING]
-> Never put an API key in a command-line argument, a repository file, an issue,
-> a terminal recording, or a diagnostic bundle.
+`CUNA_API_KEY` is for automation and is never saved for you. If it is set but
+unusable, the CLI refuses rather than quietly falling back to your login.
 
 ## Exit codes
 
@@ -155,9 +152,7 @@ stale.
 
 ## Security
 
-Report vulnerabilities privately per [`SECURITY.md`](SECURITY.md). Never open a
-public issue containing an exploit, a credential, a private URL or customer
-data.
+Report vulnerabilities privately per [`SECURITY.md`](SECURITY.md).
 
 Releases build one immutable npm candidate, generate an SBOM and provenance,
 install that exact artifact on every supported platform, and publish through npm
