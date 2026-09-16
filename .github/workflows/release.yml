@@ -192,7 +192,21 @@ jobs:
           name: release-approval-lease
           run-id: ${{ inputs.approval_run_id }}
           github-token: ${{ github.token }}
-          path: admitted/approval
+          # release-review.yml uploads four files under two directories, so the
+          # artifact carries `approval/` and `evidence/` at its own root.
+          # Extracting it into `admitted/approval` therefore produced
+          # `admitted/approval/approval/release-approval-lease.json`, and every
+          # reader below -- these two digest checks, the lease verifier, the
+          # attestation check, the nonce consumer and publish-npm-preview.mjs --
+          # looks for `admitted/approval/release-approval-lease.json`. The first
+          # sha256sum failed with "No such file or directory".
+          #
+          # Extracting into `admitted` lets the artifact's own prefix put the
+          # files exactly where those readers already look, so the paths stop
+          # depending on a directory this workflow invented. The lease's
+          # `evidence/` lands beside the candidate's, which share no filename,
+          # and the admission is read several steps above this download.
+          path: admitted
       - name: Verify approval lease identity and semantic binding
         env:
           APPROVAL_LEASE_SHA256: ${{ inputs.approval_lease_sha256 }}
@@ -265,7 +279,11 @@ jobs:
           name: release-approval-lease
           run-id: ${{ inputs.approval_run_id }}
           github-token: ${{ github.token }}
-          path: admitted/approval
+          # Same correction as the preflight job. publish-npm-preview.mjs builds
+          # its lease and expectation paths from `admitted/approval`, which is
+          # where the artifact's own prefix puts them once it is extracted here
+          # rather than one directory deeper.
+          path: admitted
       - name: Revalidate fresh approval and publish exact admitted bytes
         env:
           GH_TOKEN: ${{ github.token }}
