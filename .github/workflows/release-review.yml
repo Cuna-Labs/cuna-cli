@@ -150,10 +150,33 @@ jobs:
           node scripts/verify-observation-cohort.mjs
           --candidate-run-id "${{ inputs.candidate_run_id }}"
           --observation-run-id "${{ inputs.observation_run_id }}"
+      # Every other step here reads this repository, so `github.token` reaches
+      # everything it needs. This one reads a DIFFERENT repository -- the
+      # producer of the contract, which is private -- and a workflow token is
+      # scoped to the repository it runs in and nowhere else. It therefore
+      # received 404 for a commit that exists, and the refusal said so in the
+      # only honest way available: absent, or present and invisible, because
+      # GitHub answers both alike.
+      #
+      # The token below resolves that ambiguity by being able to see it. It is
+      # fine-grained, holds Contents:Read on Cuna-Labs/infra-proxy-mvp and
+      # nothing else, and lives on this protected environment rather than on the
+      # repository, so it is presentable only by a review job a human has
+      # already approved. Read-only is the whole requirement: this step observes
+      # an approval, it never records one.
       - name: Require the producer-approved canonical contract authority
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: node scripts/verify-contract-authority.mjs
+          GITHUB_TOKEN: ${{ secrets.CONTRACT_PRODUCER_TOKEN }}
+        shell: bash
+        run: |
+          # An unset secret expands to the empty string, which would reach the
+          # script as a malformed token and refuse with a message about token
+          # shape. Name the actual missing thing instead.
+          if [ -z "${GITHUB_TOKEN}" ]; then
+            echo "CANONICAL_CONTRACT_AUTHORITY_ARTIFACT_NOT_AVAILABLE: the release-review-npm-preview environment carries no CONTRACT_PRODUCER_TOKEN, so the producer's approval is unobserved rather than absent." >&2
+            exit 1
+          fi
+          node scripts/verify-contract-authority.mjs
       - name: Require the candidate itself to carry a resolved contract authority
         shell: bash
         run: |
