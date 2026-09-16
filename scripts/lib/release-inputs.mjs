@@ -188,7 +188,7 @@ function loadInfraOpenapiIdentity() {
   invariant(parsed.canonical_digest_file === INFRA_OPENAPI_DIGEST_FILE, "Vendored Infra OpenAPI identity digest artifact differs");
   invariant(SHA256.test(parsed.infra_openapi_raw_sha256), "Vendored Infra OpenAPI identity raw digest is invalid");
   invariant(SHA256.test(parsed.infra_openapi_canonical_sha256), "Vendored Infra OpenAPI identity canonical digest is invalid");
-  invariant(parsed.producer_repository === "Cuna-Labs/infra", "Vendored Infra producer repository differs");
+  invariant(parsed.producer_repository === "Cuna-Labs/infra-proxy-mvp", "Vendored Infra producer repository differs");
   invariant(parsed.producer_contract_verifier === "contracts/tools/verify-contract.mjs", "Vendored Infra verifier identity differs");
   invariant(SHA256.test(parsed.producer_projection_sha256), "Vendored Infra projection digest is invalid");
   invariant(SHA256.test(parsed.producer_runtime_manifest_sha256), "Vendored Infra runtime digest is invalid");

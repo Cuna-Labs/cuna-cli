@@ -58,7 +58,7 @@ function approvedDeclaration(overrides = {}) {
     schemaVersion: 1,
     authority: "CUNA_CANONICAL_PUBLIC_API_CONTRACT",
     status: "APPROVED",
-    producerRepository: "Cuna-Labs/infra",
+    producerRepository: "Cuna-Labs/infra-proxy-mvp",
     sourceCommit: "7b1b3e425ed273986a909a68395b5272bd6a01ba",
     contractSha256: "43213c2adac602676437b612b7d4153707e09155bdc4fa3029cca15a0b207ecc",
     approvalAttestationSha256: "0".repeat(64),
@@ -82,7 +82,11 @@ test("an approval for another revision of the contract cannot approve the bytes 
 });
 
 test("a declaration that renames its own producer cannot redirect the approval lookup", async () => {
-  const stderr = await refusal(await fixture({ declaration: approvedDeclaration({ producerRepository: "Cuna-Labs/infra-proxy-mvp" }) }));
+  /* The wrong name here is the one the canonical literal used to be. It named a
+     repository that does not exist on GitHub, so every approval lookup answered
+     404 and the gate could never open — not "not yet approved", but never. The
+     control is the same shape as before and now also pins the stale name out. */
+  const stderr = await refusal(await fixture({ declaration: approvedDeclaration({ producerRepository: "Cuna-Labs/infra" }) }));
   assert.match(stderr, /Contract producer repository is invalid/);
 });
 

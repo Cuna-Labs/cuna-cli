@@ -34,7 +34,7 @@ function lease() {
       runAttempt: 1,
     },
     contractAuthority: {
-      producerRepository: "Cuna-Labs/infra",
+      producerRepository: "Cuna-Labs/infra-proxy-mvp",
       sourceCommit: "b".repeat(40),
       contractSha256: sha("9"),
       approvalAttestationSha256: sha("c"),
