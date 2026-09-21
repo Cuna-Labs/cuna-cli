@@ -45,6 +45,46 @@ import {
 
 const MAX_RUNTIME_EVIDENCE_TTL_MS = 5 * 60_000;
 
+/**
+ * How long a terminal attach waits for the server to prove the terminal
+ * capability before reporting the refusal it saw last. Two supervisor
+ * heartbeat periods (the slowest measured was 19 s) plus the lease renewal
+ * they carry; long enough for a lapsed lease or a not-yet-attested PTY to
+ * turn into a proof, short enough that a person is not left staring.
+ */
+const TERMINAL_ADMISSION_WAIT_MS = 45_000;
+const TERMINAL_ADMISSION_POLL_MS = 3_000;
+
+/**
+ * Refusals a later capability read can turn into an admission. Everything
+ * else is reported at once: a gone process, a supervisor that needs an
+ * update, a capability this server does not offer, a snapshot for another
+ * resource.
+ */
+const TERMINAL_ADMISSION_TRANSIENT_REASONS: ReadonlySet<string> = new Set([
+  "runtime_lease_expired",
+  "supervisor_registry_unavailable",
+]);
+
+function terminalAdmissionMayResolveByWaiting(error: unknown): boolean {
+  if (!(error instanceof RuntimeBoundaryError)) return false;
+  if (error.code !== "capability_unavailable" && error.code !== "capability_unknown") return false;
+  const reason = error.safeDetails?.reason_code;
+  // `temporarily_unavailable` with no named reason, or `unknown` availability
+  // with no named reason, are the server's own "not yet"; a named reason is
+  // waited on only when it is one that renews itself.
+  return reason === undefined || TERMINAL_ADMISSION_TRANSIENT_REASONS.has(String(reason));
+}
+
+function waitForTerminalAdmission(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted === true) { reject(signal.reason); return; }
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, milliseconds);
+    const onAbort = (): void => { clearTimeout(timer); reject(signal?.reason); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export type RuntimeTerminalState =
   | "attaching"
   | "active"
@@ -1328,14 +1368,41 @@ export class CunaRuntimeBoundary {
     readonly capability: ReturnType<typeof admitCapability>;
     readonly observation: RemoteAgentSessionEvidence;
   }> {
-    const snapshot = await this.#options.controlPlane.discoverCapabilities("agent_session", agentSessionId, signal);
-    const capability = admitCapability(snapshot, {
+    const requirement = {
       id: this.#options.terminalCapabilityId,
-      scope: "agent_session",
+      scope: "agent_session" as const,
       subjectId: agentSessionId,
-      surface: "cli",
-      interaction: "native",
-    }, this.#clock());
+      surface: "cli" as const,
+      interaction: "native" as const,
+    };
+    /*
+     * The terminal capability is a moving fact: the server proves it only
+     * while the AgentSession's runtime lease is fresh and its PTY is attested,
+     * and both are renewed by a supervisor heartbeat every 10-19 s. Read once,
+     * a fresh session is refused at two ordinary moments — the first seconds
+     * after launch, before the attachment is attested, and the last seconds of
+     * a lease window, before the next heartbeat renews it. Measured 2026-09-21
+     * on Machine bd94a624: "could not verify live terminal control" 107 s after
+     * launch, then "needs a fresh runtime check" on a running session whose
+     * lease had 0.7 s left. A person reading either is told to retry something
+     * that resolves itself within a heartbeat, so the CLI waits for it here,
+     * bounded, and only then reports the refusal it saw last. A reason that
+     * cannot change by waiting (a gone process, a supervisor that needs an
+     * update) is reported at once.
+     */
+    const deadline = this.#clock() + TERMINAL_ADMISSION_WAIT_MS;
+    let snapshot: CapabilitySnapshot;
+    let capability: ReturnType<typeof admitCapability>;
+    for (;;) {
+      snapshot = await this.#options.controlPlane.discoverCapabilities("agent_session", agentSessionId, signal);
+      try {
+        capability = admitCapability(snapshot, requirement, this.#clock());
+        break;
+      } catch (error) {
+        if (!terminalAdmissionMayResolveByWaiting(error) || this.#clock() >= deadline || signal?.aborted === true) throw error;
+        await waitForTerminalAdmission(TERMINAL_ADMISSION_POLL_MS, signal);
+      }
+    }
     const observation = assertRemoteAgentSessionEvidence({
       evidence: await this.#options.controlPlane.observeAgentSession(agentSessionId, signal),
       expectedAgentSessionId: agentSessionId,
