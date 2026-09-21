@@ -117,13 +117,42 @@ function isSeatUnserved(error: unknown): boolean {
     (error.code === "cuna.remote.operation_not_served" || error.code === "cuna.remote.not_found");
 }
 
+/**
+ * The execution Workspace a v2 session runs in, read from its cwd.
+ *
+ * A session created through the execution-Workspace path
+ * (`createPublishedProviderSessionV2`) is published WITHOUT
+ * `workspace_binding_id`: the wire names its Workspace only through `cwd`,
+ * which the create call itself pinned to `/workspace/workspaces/<id>` and the
+ * server echoed. Until 2026-09-21 `sessionObservation` mapped that absence to
+ * the identity `"unknown"`, so no v2 session could ever equal the identity the
+ * journey was looking for, and every `cuna claude <path>` on an already-running
+ * session went to "Creating Claude Code session". Measured in production on
+ * Machine bd94a624: session 8d99301b running, detached, fresh, same cwd, and
+ * the second run offered the profile picker for a NEW session.
+ */
+const EXECUTION_WORKSPACE_CWD = /^\/workspace\/workspaces\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/.*)?$/u;
+
+export function executionWorkspaceIdFromCwd(cwd: string): string | undefined {
+  return EXECUTION_WORKSPACE_CWD.exec(cwd)?.[1];
+}
+
 function sessionObservation(session: AgentSession, seat: SeatAttachment) {
+  const executionWorkspaceId = session.workspaceBindingId === undefined
+    ? executionWorkspaceIdFromCwd(session.cwd)
+    : undefined;
   return Object.freeze({
     id: session.id,
     machineId: session.machineId,
     name: session.name,
     agent: session.agent,
-    workspaceIdentity: session.workspaceBindingId ?? "unknown",
+    workspaceIdentity: session.workspaceBindingId ?? executionWorkspaceId ?? "unknown",
+    // A binding session carries the generation it was created against; an
+    // execution-Workspace session is published without one, so the journey
+    // compares generations only for binding sessions (see `workspaceKind`).
+    workspaceKind: session.workspaceBindingId !== undefined
+      ? "binding" as const
+      : executionWorkspaceId !== undefined ? "execution" as const : "unknown" as const,
     workspaceGeneration: session.workspaceGeneration ?? 0,
     cwd: relativeCwd(session.cwd),
     authMode: session.authMode,

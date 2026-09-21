@@ -503,7 +503,10 @@ export async function orchestrateAgentJourney(input: {
     const sessionPlan = planAgentSessionSelection({
       machineId: machine.id,
       requestedAgent: input.intent.agent,
-      workspaceIdentity: workspace.workspaceIdentity,
+      // An execution Workspace is the identity a v2 session is published
+      // under (through its cwd); the binding id is what a legacy binding
+      // session carries. Look for the one this Workspace will produce.
+      workspaceIdentity: workspace.executionWorkspaceId ?? workspace.workspaceIdentity,
       workspaceGeneration: workspace.generation,
       cwd: workspace.remoteCwd.replace(/^\/workspace\/?/u, "") || ".",
       authMode,

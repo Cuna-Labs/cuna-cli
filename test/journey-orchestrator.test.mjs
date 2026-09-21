@@ -286,6 +286,7 @@ function liveSession(overrides = {}) {
     name: "work",
     agent: "claude-code",
     workspaceIdentity: BINDING,
+    workspaceKind: "binding",
     workspaceGeneration: 4,
     cwd: "projects/project",
     authMode: "interactive_login",
