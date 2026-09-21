@@ -1,15 +1,99 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
+import xterm from "@xterm/headless";
 
 import { digestLocalActionArguments, ForegroundTerminalCoordinator, MAX_FOREGROUND_PENDING_INPUT_BYTES } from "../dist/index.js";
 import { createNodeForegroundTerminalHost } from "../dist/pty/node-host-terminal.js";
 import { runtimeFailure } from "../dist/runtime/errors.js";
+import { XtermViewportAdapter } from "../dist/terminal/xterm-vte.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+async function visibleHostText(host) {
+  const terminal = new xterm.Terminal({ cols: host.columns, rows: host.rows, allowProposedApi: true });
+  try {
+    for (const bytes of host.writes) await new Promise(resolve => terminal.write(bytes, resolve));
+    return Array.from({ length: host.rows }, (_, row) => terminal.buffer.active.getLine(row)?.translateToString(true) ?? "").join("\n");
+  } finally { terminal.dispose(); }
+}
 const SESSION_A = "11111111-1111-4111-8111-111111111111";
 const SESSION_B = "22222222-2222-4222-8222-222222222222";
+
+test("slash command Enter is forwarded once and an alternate-screen selector remains visible", async () => {
+  const { coordinator, callbacks, intents, host, calls } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("/model\r"));
+    await waitUntil(() => calls.input.length > 0, "command must reach transport");
+    assert.equal(calls.input.map(item => item.text).join(""), "/model\r");
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n,
+      encoder.encode("\u001b[?1049h\u001b[2J\u001b[HSelect a model\r\n> Current model\r\n  Other model\u001b[?25l")));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(calls.input.map(item => item.text).join(""), "/model\r", "painting cannot send Enter or Escape");
+    assert.match(await visibleHostText(host), /Other model/u);
+    assert.match(await visibleHostText(host), /Select a model/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("slow host painting does not stall ordered remote output and catches up without a frame backlog", async () => {
+  const { coordinator, callbacks, intents, host } = harness();
+  let release;
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const baseline = host.writes.length;
+    host.writeGate = new Promise(resolve => { release = resolve; });
+    const ingest = (async () => {
+      for (let i = 1; i <= 100; i++) {
+        await callbacks.onTerminalOutput(outputEvent(intents[0], BigInt(i), encoder.encode("x")));
+      }
+    })();
+    let timer;
+    try {
+      await Promise.race([ingest, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("remote parsing waited for blocked host paint")), 1000);
+      })]);
+    } finally { clearTimeout(timer); }
+    assert.equal(host.writes.length - baseline, 1, "only the in-flight paint reaches a blocked host");
+    host.writeGate = undefined;
+    release();
+    await waitUntil(() => host.writes.length >= baseline + 2, "latest screen must be painted after release");
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(host.writes.length - baseline, 2, "intermediate screens must not accumulate");
+    const visible = await visibleHostText(host);
+    assert.equal((visible.match(/x/g) ?? []).length, 100, "all received text survives coalescing");
+  } finally {
+    host.writeGate = undefined;
+    release?.();
+    await coordinator.stop();
+  }
+});
+
+test("only the visible observer is projected for host rendering", async () => {
+  const { coordinator, callbacks, intents, host } = harness();
+  const original = XtermViewportAdapter.prototype.snapshotForHost;
+  const projected = [];
+  XtermViewportAdapter.prototype.snapshotForHost = function (...args) {
+    projected.push(this.snapshot().tabId);
+    return original.apply(this, args);
+  };
+  try {
+    await coordinator.start(intents);
+    for (const intent of intents) callbacks.onTerminalState({ ...snapshot(intent), accessMode: "observer" });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    projected.length = 0;
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("visible")));
+    assert.ok(projected.includes(intents[0].tabId));
+    assert.ok(!projected.includes(intents[1].tabId), "hidden observer must not be recaptured");
+    projected.length = 0;
+    host.emitInput(Uint8Array.of(0x1d, 0x32));
+    await waitUntil(() => projected.includes(intents[1].tabId), "switch must project the newly visible observer");
+  } finally {
+    await coordinator.stop();
+    XtermViewportAdapter.prototype.snapshotForHost = original;
+  }
+});
 
 test("canonical foreground resets the parser at higher fence and initial blank view uses real geometry", async () => {
   const {coordinator,callbacks,host,intents}=harness();
@@ -336,7 +420,7 @@ test("historical auth text and cross-boundary fragments cannot create fresh brow
   assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
   await emit(url.slice(0, 10), 4n, "live");
   await emit(`${url.slice(10)}\r\n`, 5n, "live");
-  assert.match(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  assert.match(await visibleHostText(host), /requests browser authentication/u);
   await coordinator.stop();
 });
 
@@ -351,7 +435,7 @@ test("a live auth prefix from an old attachment cannot combine with a replacemen
   await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(suffix), 2));
   assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
   await callbacks.onTerminalOutput(outputEvent(intents[0], 3n, encoder.encode(prefix + suffix), 2));
-  assert.match(decoder.decode(host.writes.at(-1)), /requests browser authentication/u);
+  assert.match(await visibleHostText(host), /requests browser authentication/u);
   await coordinator.stop();
 });
 
@@ -440,7 +524,7 @@ test("Claude OAuth opens once on the local machine only after explicit Cuna appr
   await coordinator.start(intents.slice(0, 1));
   const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
   await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
-  assert.match(decoder.decode(host.writes.at(-1)), /Claude Code requests browser authentication/u);
+  assert.match(await visibleHostText(host), /Claude Code requests browser authentication/u);
   assert.deepEqual(opened, [], "remote output alone must never execute a local action");
 
   host.emitInput(Uint8Array.of(0x0d));
@@ -987,11 +1071,11 @@ test("same-process readiness retains old cells for delta-only resumed output", a
     await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("retained first line\r\n")));
     await callbacks.onTerminalReady(snapshot(intents[0], 2));
     await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("new delta line"), 2));
-    assert.match(decoder.decode(host.writes.at(-1)), /retained first line/u);
+    assert.match(await visibleHostText(host), /retained first line/u);
     assert.match(decoder.decode(host.writes.at(-1)), /new delta line/u);
     await callbacks.onTerminalReady(snapshot(intents[0], 2));
     await callbacks.onTerminalOutput(outputEvent(intents[0], 3n, encoder.encode(" continued"), 2));
-    assert.match(decoder.decode(host.writes.at(-1)), /retained first line/u);
+    assert.match(await visibleHostText(host), /retained first line/u);
     assert.match(decoder.decode(host.writes.at(-1)), /new delta line continued/u);
   } finally { await coordinator.stop(); }
 });
@@ -1005,7 +1089,7 @@ test("foreground rebind refuses foreign process and regressed fence without losi
     await callbacks.onTerminalReady(snapshot(intents[0], 2));
     await assert.rejects(callbacks.onTerminalReady(snapshot(intents[0], 1)));
     await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("still bound"), 2));
-    assert.match(decoder.decode(host.writes.at(-1)), /original model/u);
+    assert.match(await visibleHostText(host), /original model/u);
     assert.match(decoder.decode(host.writes.at(-1)), /still bound/u);
   } finally { await coordinator.stop(); }
 });
@@ -1068,7 +1152,7 @@ test("Ctrl+C keeps the Cuna frame visible through deterministic disconnect feedb
     "Ctrl-C should acknowledge closing before a blocked detach resolves",
   );
   const pendingFrames = host.writes.slice(baselineWrites).map((bytes) => decoder.decode(bytes));
-  assert.equal(pendingFrames.every((frame) => frame.includes("CUNA")), true);
+  assert.match(await visibleHostText(host), /CUNA/u);
   assert.equal(pendingFrames.some((frame) => frame.includes("Disconnected.")), false);
   assert.equal(host.restored, 0);
   releaseDetach();
@@ -1446,6 +1530,9 @@ test("reconnect exhaustion isolates the failed tab without tearing down healthy 
   assert.deepEqual(calls.detach, []);
   assert.match(coordinator.failure?.message ?? "", /replacement unavailable/u);
   assert.match(decoder.decode(host.writes.at(-1)), /Reconnect failed/u);
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(calls.reconnect.length, 2, "duplicate interrupted state must not reset the exhausted retry budget");
   runtime.reconnect = healthyReconnect;
   host.emitInput(Uint8Array.of(0x1d, 0x72));
   await waitUntil(() => calls.reconnect.length === 3, "manual retry should reattach the interrupted active tab");
@@ -1933,9 +2020,9 @@ test("OpenCode visible copy action copies only the full auth URL without browser
   await coordinator.start(intents.slice(0, 1));
   const url = "https://auth.openai.com/oauth/authorize?client_id=test&state=opaque&code_challenge=abc";
   await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`Background text\r\n${url.slice(0, 65)}`)));
-  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /Copiar enlace/u);
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /Copy link/u);
   await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(`${url.slice(65)}\r\nMore background`)));
-  assert.match(decoder.decode(host.writes.at(-1)), /Copiar enlace/u);
+  assert.match(decoder.decode(host.writes.at(-1)), /Copy link/u);
   assert.deepEqual(copied, []);
   host.emitInput(Uint8Array.of(0x1d, 0x79));
   await waitUntil(() => copied.length === 1, "copies link");
@@ -1944,6 +2031,30 @@ test("OpenCode visible copy action copies only the full auth URL without browser
   await coordinator.stop();
 });
 
+
+test("Claude copy keeps a long OAuth URL intact across output chunks and narrow rendering", async () => {
+  const copied = [];
+  const { coordinator, callbacks, calls, host, intents } = harness({ coordinatorOptions: {
+    copyText: async text => { copied.push(text); },
+  } });
+  intents[0].localBrowserActions = true;
+  await coordinator.start(intents.slice(0, 1));
+  try {
+    const url = "https://claude.com/cai/oauth/authorize?code=true&client_id=test&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Aprofile+user%3Ainference&code_challenge=" + "a".repeat(43) + "&code_challenge_method=S256&state=" + "b".repeat(40);
+    let sequence = 0n;
+    for (let offset = 0; offset < url.length; offset += 31) {
+      await callbacks.onTerminalOutput(outputEvent(intents[0], ++sequence, encoder.encode(url.slice(offset, offset + 31))));
+    }
+    await callbacks.onTerminalOutput(outputEvent(intents[0], ++sequence, encoder.encode("\r\nPaste code here > ")));
+    host.emitInput(Uint8Array.of(0x1d, 0x79));
+    await waitUntil(() => copied.length === 1, "full Claude URL copied");
+    assert.equal(copied[0], url);
+    assert.doesNotMatch(copied[0], /\s/u);
+    assert.equal(new URL(copied[0]).searchParams.get("redirect_uri"), "https://platform.claude.com/oauth/code/callback");
+    assert.equal(calls.input.length, 0);
+    await waitUntil(() => /Full link copied/u.test(decoder.decode(host.writes.at(-1))), "English copy feedback");
+  } finally { await coordinator.stop(); }
+});
 
 test("copy failure is visible and a new binding cannot copy the old link", async () => {
   let attempts = 0;
@@ -1954,10 +2065,10 @@ test("copy failure is visible and a new binding cannot copy the old link", async
   await coordinator.start(intents.slice(0, 1));
   await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("https://auth.openai.com/oauth/authorize?state=test\r\n")));
   host.emitInput(Uint8Array.of(0x1d, 0x79));
-  await waitUntil(() => /No se pudo copiar/u.test(decoder.decode(host.writes.at(-1))), "failure feedback");
+  await waitUntil(() => /Could not copy the link/u.test(decoder.decode(host.writes.at(-1))), "failure feedback");
   await callbacks.onTerminalReady(snapshot(intents[0], 2));
   host.emitInput(Uint8Array.of(0x1d, 0x79));
-  await waitUntil(() => /No hay enlace/u.test(decoder.decode(host.writes.at(-1))), "stale link removed");
+  await waitUntil(() => /No sign-in link available/u.test(decoder.decode(host.writes.at(-1))), "stale link removed");
   assert.equal(attempts, 1);
   assert.equal(calls.input.length, 0);
   await coordinator.stop();
@@ -2007,5 +2118,167 @@ test("automatic recovery keeps trying for a bounded ten attempts before reportin
   assert.ok(decoder.decode(host.writes.at(-1)).includes("Reconnect failed"), "recovery eventually reports failure");
   assert.equal(calls.reconnect.length, 10, "the default budget is ten bounded attempts");
   assert.equal(coordinator.state, "active", "a failed automatic recovery leaves the person in control, not detached");
+  await coordinator.stop();
+});
+
+test("a resize while the terminal is interrupted reaches the remote PTY once recovery succeeds", async () => {
+  // The user's symptom: maximize while the attachment is down, the remote keeps
+  // painting at the old height, and the bottom of the window stays black. The
+  // local viewport follows the host immediately; the remote must be told the
+  // CURRENT host size when the attachment comes back, not the size it had
+  // before the interruption.
+  const { coordinator, callbacks, calls, host, intents } = harness({
+    coordinatorOptions: { reconnectAttempts: 2, reconnectBaseDelayMs: 1, resizeCoalesceMs: 5, clock: () => 150 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  const baseline = calls.resize.length;
+  // Interrupt, then grow the host while it is down.
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  host.columns = 200;
+  host.rows = 50;
+  host.emitResize();
+  await waitUntil(() => calls.reconnect.length >= 1, "recovery runs after the interruption");
+  await waitUntil(
+    () => calls.resize.slice(baseline).some((call) => call.columns === 200 && call.rows === 48),
+    "the recovered attachment must carry the CURRENT host geometry to the remote PTY",
+  );
+  const last = calls.resize.at(-1);
+  assert.deepEqual({ columns: last.columns, rows: last.rows }, { columns: 200, rows: 48 });
+  await coordinator.stop();
+});
+
+test("taking the writer seat states this host's geometry to the PTY", async () => {
+  // Measured 2026-09-15 on a live OpenCode session: attach at 200x50 while the
+  // previous writer's PTY was 120x28, take the seat, and the content stayed 28
+  // rows tall in a 50-row window. An observer must not resize the PTY, so the
+  // seat change is the first moment this client may state its own size.
+  const { coordinator, callbacks, calls, host, intents } = harness({ coordinatorOptions: { clock: () => 150 } });
+  host.columns = 200;
+  host.rows = 50;
+  await coordinator.start(intents.slice(0, 1));
+  const observing = { ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 };
+  callbacks.onTerminalState(observing);
+  const baseline = calls.resize.length;
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "writer", writerEpoch: 3 });
+  await waitUntil(
+    () => calls.resize.slice(baseline).some((call) => call.columns === 200 && call.rows === 48),
+    "the new writer must state the full host geometry to the PTY",
+  );
+  await coordinator.stop();
+});
+
+test("only the observer to writer edge resizes; no other seat publish does", async () => {
+  // The negative control for the repair above, and it must reach the branch the
+  // repair changed rather than sit in a steady state: every seat publish that
+  // is NOT observer -> writer must send nothing. Blank rows below a smaller
+  // writer screen are CORRECT for an observer, and the gateway closes an
+  // observer's attachment on its first RESIZE.
+  const { coordinator, callbacks, calls, host, intents } = harness({ coordinatorOptions: { clock: () => 150 } });
+  host.columns = 200;
+  host.rows = 50;
+  await coordinator.start(intents.slice(0, 1));
+  const seat = (accessMode, writerEpoch, extra = {}) => ({ ...snapshot(intents[0]), accessMode, writerEpoch, ...extra });
+  const quiet = async (label, before, next) => {
+    // Let the setup publish settle first: reconciliation is asynchronous, so a
+    // baseline captured in the same turn would count the setup's own RESIZE
+    // against the transition under test.
+    callbacks.onTerminalState(before);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const baseline = calls.resize.length;
+    callbacks.onTerminalState(next);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(calls.resize.length, baseline, label);
+  };
+  // The seat moves to SOMEONE ELSE: still an observer, new writer epoch.
+  await quiet("an observer whose peer takes the seat sends no RESIZE", seat("observer", 2), seat("observer", 3));
+  // This client is demoted from writer to observer.
+  await quiet("a demoted writer sends no RESIZE", seat("writer", 4), seat("observer", 5));
+  // A writer that stays the writer must not re-resize on every heartbeat.
+  await quiet("an unchanged writer seat sends no RESIZE", seat("writer", 6), seat("writer", 6, { heartbeatObservedAt: 151 }));
+  // And a plain host resize while observing is still refused.
+  callbacks.onTerminalState(seat("observer", 7));
+  const baseline = calls.resize.length;
+  host.rows = 56;
+  host.emitResize();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(calls.resize.length, baseline, "an observer sends no RESIZE, at any host size");
+  await coordinator.stop();
+});
+
+test("an exhausted reconnect names the typed reason it gave up on", async () => {
+  // Witnessed on the installed build 2026-09-15: the user is left looking at a
+  // frozen frame under a bare "Reconnect failed", with nothing to say whether
+  // retrying can help. The client holds the typed failure; render its code.
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 2, reconnectBaseDelayMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw runtimeFailure("grant_scope_mismatch", "untrusted remote words that must not be shown", { retryable: true });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !decoder.decode(host.writes.at(-1)).includes("Reconnect failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const frame = decoder.decode(host.writes.at(-1));
+  assert.match(frame, /Reconnect failed: grant scope mismatch/u, "the typed code is named");
+  assert.doesNotMatch(frame, /untrusted remote words/u, "the failure message itself is never rendered");
+  host.emitInput(encoder.encode("hello"));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.match(await visibleHostText(host), /Reconnect failed: grant scope mismatch/u, "typing cannot replace an exhausted retry with a false reconnecting notice");
+  assert.equal(calls.input.length, 0);
+  assert.match(frame, /Ctrl\+\] r retries/u, "the recovery path stays on the line");
+  await coordinator.stop();
+});
+
+test("a capability refusal names which capability could not be proven", async () => {
+  // "capability unknown" alone cannot be acted on. The capability name is this
+  // client's own closed enum, so it is safe to render and it is the one word
+  // that identifies which grant contract the server failed to satisfy.
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 1, reconnectBaseDelayMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw runtimeFailure("capability_unknown", "Cuna cannot prove terminal capability live_resize.", {
+      retryable: false,
+      safeDetails: { capability: "live_resize" },
+    });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !decoder.decode(host.writes.at(-1)).includes("Reconnect failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const frame = decoder.decode(host.writes.at(-1));
+  assert.match(frame, /Reconnect failed: capability unknown \(live resize\)/u, "the capability is named");
+  assert.doesNotMatch(frame, /Cuna cannot prove/u, "the failure message itself is never rendered");
+  await coordinator.stop();
+});
+
+test("a typed capability refusal is not retried: one attempt, not the whole budget", async () => {
+  // A retry budget is the wrong response to a capability the grant cannot
+  // prove -- looping cannot mint it. This pins that the loop breaks on the
+  // first non-retryable refusal even though the budget is ten.
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectBaseDelayMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw runtimeFailure("capability_unknown", "Cuna cannot prove terminal capability live_resize.", {
+      safeDetails: { capability: "live_resize" },
+    });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !decoder.decode(host.writes.at(-1)).includes("Reconnect failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(calls.reconnect.length, 1, "a non-retryable capability refusal is attempted exactly once");
+  assert.match(decoder.decode(host.writes.at(-1)), /capability unknown \(live resize\)/u);
   await coordinator.stop();
 });

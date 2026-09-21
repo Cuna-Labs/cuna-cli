@@ -178,10 +178,10 @@ export function validateTerminalGrant(input: {
   for (const required of input.requiredCapabilities ?? []) {
     const matches = grant.capabilities.filter((capability) => capability.name === required);
     if (matches.length !== 1 || matches[0]?.availability === "unknown") {
-      throw runtimeFailure("capability_unknown", `Cuna cannot prove terminal capability ${required}.`);
+      throw runtimeFailure("capability_unknown", `Cuna cannot prove terminal capability ${required}.`, { safeDetails: { capability: required } });
     }
     if (matches[0]?.availability !== "supported") {
-      throw runtimeFailure("capability_unsupported", `Terminal capability ${required} is unsupported.`);
+      throw runtimeFailure("capability_unsupported", `Terminal capability ${required} is unsupported.`, { safeDetails: { capability: required } });
     }
   }
   let url: URL;

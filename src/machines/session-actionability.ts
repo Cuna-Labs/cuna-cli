@@ -168,6 +168,14 @@ function classifyBase(input: SessionActionabilityInput): ClassifiedBase {
   }
   if (authState === "login_required") return result("login-required", "provider_authentication_required");
   if (authState === "unavailable") return result("unsupported", "provider_unavailable");
+  // A launch receipt is not fresh process evidence. Once an existing runtime
+  // lease expires, unknown/starting must offer recovery instead of waiting forever.
+  if (session.requestState === "launched" &&
+      (session.processState === "unknown" || session.processState === "starting")) {
+    const window = readRuntimeWindow(session, now);
+    if (window.kind === "lease_expired") return result("stale", "runtime_lease_expired");
+    if (window.kind === "invalid") return result("stale", "runtime_evidence_invalid");
+  }
   if (session.requestState === "launch_pending" || session.requestState === "runtime_claimed" ||
       session.processState === "unknown" || session.processState === "starting") {
     return result("starting", "launch_pending");

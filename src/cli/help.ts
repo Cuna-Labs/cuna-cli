@@ -151,7 +151,7 @@ Available now:
   machines list                        List owned Cuna machines
   machines create [options]            Create a machine when server-advertised
   machines start|pause|resume|stop ID  Change lifecycle when server-advertised
-  machines update-supervisor ID        Update a stopped OpenCode terminal supervisor
+  machines update-supervisor ID        Recover a stopped machine's terminal supervisor
   machines live-update-supervisor ID   Update a running terminal supervisor in place;
                                        reports one custody line per AgentSession
   machines live-update-status ID       Read what one in-place update did; sends nothing

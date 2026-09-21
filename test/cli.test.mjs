@@ -487,6 +487,8 @@ test("both interactive menus create in the selected remote Workspace without loc
       },
       async createProviderSessionV2(id, input) {
         created.push({ id, input });
+        assert.match(stripAnsi(interactive.stderr()), /Creating Codex session/u,
+          "progress must resume after the provider picker before remote creation waits");
         await new Promise((resolve) => setTimeout(resolve, 100));
         await checkRow();
         return { agentSession: session };
@@ -934,7 +936,7 @@ test("non-TTY help and version are versioned JSON records", async () => {
   assert.match(allRecord.data.help, /Use --agent-session SESSION_ID to bypass reconciliation/u);
   const version = memoryStreams();
   assert.equal(await runCli(["--version"], { streams: version.streams }), EXIT_CODES.success);
-  assert.equal(JSON.parse(version.stdout()).data.version, "0.1.0");
+  assert.equal(JSON.parse(version.stdout()).data.version, "0.1.1");
 });
 
 test("missing automation auth fails before a remote call and emits no prompt", async () => {
@@ -2057,6 +2059,30 @@ test("terminal supervisor update never stops a running Machine or terminates ses
   const error = JSON.parse(streams.stderr()).error;
   assert.equal(error.code, "cuna.machine.supervisor_update_requires_stopped");
   assert.match(error.hint, /will not stop protected-open-dev or terminate any AgentSessions/u);
+});
+
+test("terminal supervisor update recovers stopped Claude without an OpenCode prerequisite", async () => {
+  const streams = memoryStreams();
+  let replacements = 0;
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams, platform, env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot(["agent_sessions.create", "machines.lifecycle"].map(id => ({
+          id, availability: "supported", interaction: "native", mutationClass: "reversible",
+          surfaces: ["cli"], requiredPermissions: ["machines:update"],
+        })), scope, resourceId);
+      },
+      async getMachine(id) { return { id, name: "example", state: "stopped", agent: "claude-code" }; },
+      async replaceMachineSupervisor(id) {
+        replacements += 1;
+        return { id, name: "example", state: "running", agent: "claude-code" };
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(replacements, 1);
 });
 
 test("terminal supervisor update remains hidden unless the exact OpenCode prerequisite is advertised", async () => {
@@ -3653,11 +3679,11 @@ test("api-keys list derives its status word from expiry as well as revocation", 
   assert.equal(lines[3], `${keys[3].id}\trevoked-key\tcuna_sk_mnop…9012\trevoked 2026-08-02T00:00:00.000Z`);
 });
 
-test("cuna version prints the build digest that separates two installations reporting 0.1.0", async () => {
+test("cuna version prints the build digest that separates two installations reporting the same version", async () => {
   const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
   assert.equal(await runCli(["version"], { streams: human.streams, platform, env: {} }), EXIT_CODES.success);
   const printed = human.stdout().trim();
-  assert.match(printed, /^0\.1\.0\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
+  assert.match(printed, /^0\.1\.1\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
 
   // The digest printed is the exact 12-hex prefix of the one the JSON record
   // carries, so the two surfaces can never name different builds.

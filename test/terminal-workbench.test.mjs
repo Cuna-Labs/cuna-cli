@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import xterm from "@xterm/headless";
+import { workbenchUpdate } from "../dist/terminal/workbench.js";
 
 import {
   buildAppbarModel,
@@ -9,6 +11,45 @@ import {
 } from "../dist/index.js";
 
 const now = Date.parse("2026-08-08T00:00:00.000Z");
+
+test("incremental workbench writes preserve host cells, colors and cursor across edits and clears", async () => {
+  const full = new xterm.Terminal({ cols: 80, rows: 24, allowProposedApi: true });
+  const incremental = new xterm.Terminal({ cols: 80, rows: 24, allowProposedApi: true });
+  const write = (terminal, bytes) => new Promise(resolve => terminal.write(bytes, resolve));
+  const snapshot = terminal => {
+    const buffer = terminal.buffer.active;
+    return { x: buffer.cursorX, y: buffer.cursorY, rows: Array.from({ length: 24 }, (_, row) =>
+      Array.from({ length: 80 }, (_, column) => {
+        const cell = buffer.getLine(row).getCell(column);
+        return [cell.getChars(), cell.getWidth(), cell.getFgColor(), cell.getBgColor(), cell.isBold()];
+      })) };
+  };
+  let previous;
+  let fullBytes = 0;
+  let deltaBytes = 0;
+  try {
+    for (const [index, text] of ["hello world", "hello", "", "你好", "a", "a"].entries()) {
+      const allTabs = tabs();
+      const viewport = allTabs[0].viewport;
+      allTabs[0] = { ...allTabs[0], viewport: { ...viewport, cells: [text], renderRows: undefined,
+        displayWidths: [text === "你好" ? 4 : text.length], cursorX: index, cursorY: index % 2 } };
+      const frame = renderWorkbenchFrame({ columns: 80, rows: 24, tabs: allTabs,
+        activeTabId: allTabs[0].id, appbar: model(), notice: index === 3 ? "Connected" : undefined });
+      const delta = workbenchUpdate(previous, frame);
+      await write(full, frame.bytes);
+      await write(incremental, delta);
+      assert.deepEqual(snapshot(incremental), snapshot(full), `edit ${index}`);
+      fullBytes += frame.bytes.length;
+      deltaBytes += delta.length;
+      assert.equal(workbenchUpdate(frame, frame).length, 0);
+      previous = frame;
+    }
+    assert.ok(deltaBytes < fullBytes / 2, `${deltaBytes} incremental vs ${fullBytes} full bytes`);
+    assert.equal(workbenchUpdate(undefined, previous), previous.bytes);
+    assert.equal(workbenchUpdate({ ...previous, columns: 79 }, previous), previous.bytes);
+    assert.equal(workbenchUpdate({ ...previous, activeTabId: "another" }, previous), previous.bytes);
+  } finally { full.dispose(); incremental.dispose(); }
+});
 const binding = (session, generation = 1) => ({
   userId: "user-1",
   machineId: "machine-1",

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import xterm from "@xterm/headless";
 
 import {
   runNodeForegroundSessions,
@@ -10,10 +11,44 @@ import { encodeTerminalControl, encodeTerminalFrame, decodeTerminalFrame, TERMIN
 import { runtimeFailure } from "../dist/runtime/errors.js";
 
 const NOW = 1_800_000_000_000;
+async function visibleHostText(host) {
+  const terminal = new xterm.Terminal({ cols: host.columns, rows: host.rows, allowProposedApi: true });
+  try {
+    for (const bytes of host.writes) await new Promise(resolve => terminal.write(bytes, resolve));
+    return Array.from({ length: host.rows }, (_, row) => terminal.buffer.active.getLine(row)?.translateToString(true) ?? "").join("\n");
+  } finally { terminal.dispose(); }
+}
 const SESSION_A = "11111111-1111-4111-8111-111111111111";
 const SESSION_B = "22222222-2222-4222-8222-222222222222";
 const SESSION_C = "33333333-3333-4333-8333-333333333333";
 const SESSION_D = "44444444-4444-4444-8444-444444444444";
+
+for (const refreshedAvailability of ["supported", "unsupported"]) {
+  test(`preflight renews expired authority once after slow auth inspection: ${refreshedAvailability}`, async () => {
+    let time = NOW;
+    let reads = 0;
+    const events = [];
+    const host = new FakeHost(events);
+    const system = terminalSystem(events);
+    const reached = new Error("fresh preflight admitted");
+    const controlPlane = { ...system.controlPlane,
+      async discoverCapabilities(_scope, id) {
+        reads++;
+        return { ...capability(id, reads === 1 ? "supported" : refreshedAvailability),
+          observedAt: new Date(time - 100).toISOString(), expiresAt: new Date(time + 30000).toISOString() };
+      },
+      async observeAgentSession(id) { return observation(id, { observedAt: new Date(time - 100).toISOString(), expiresAt: new Date(time + 20000).toISOString() }); },
+    };
+    await assert.rejects(runSupportedForegroundSessions({
+      client: fakeClient(events, { async getAgentSessionAuth() { time += 31000; throw new Error("auth status unavailable"); } }),
+      baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A],
+      onBeforeTerminalOwnership() { throw reached; },
+    }, { host, controlPlane, terminalConnector: system.terminalConnector, clock: () => time }),
+    refreshedAvailability === "supported" ? error => error === reached : /unsupported/u);
+    assert.equal(reads, 2);
+    assert.equal(host.acquired, 0);
+  });
+}
 
 function runSupportedForegroundSessions(input, dependencies) {
   return runNodeForegroundSessions({
@@ -662,9 +697,9 @@ test("TC-055-01/13 foreground composition attaches one through four exact sessio
     });
     // Identical frames are no longer rewritten, so a raw write count is not a
     // reliable "is active" proxy; wait for the active workbench content itself.
-    await waitUntil(() => new TextDecoder().decode(host.writes.at(-1) ?? new Uint8Array()).includes("terminal attached"), `the ${count}-session workbench should become active`);
+    await waitUntil(() => host.writes.some(bytes => new TextDecoder().decode(bytes).includes("terminal attached")), `the ${count}-session workbench should become active`);
     assert.match(new TextDecoder().decode(host.writes[0]), new RegExp(`ATTACHING ${count} EXACT`, "u"));
-    const activeFrame = new TextDecoder().decode(host.writes.at(-1));
+    const activeFrame = await visibleHostText(host);
     assert.match(activeFrame, /terminal attached/u);
     assert.match(activeFrame, /Claude auth unknown/u);
     assert.doesNotMatch(activeFrame, /machine unknown|session (?:running|stale)|sync unknown/u);
@@ -1457,7 +1492,7 @@ test("default Windows foreground factory offers canonical views and waits for cu
     system.push(encodeTerminalControl("view_started",0n,{protocol:"cuna.terminal-view.v1",operation:"new",viewId,columns:80,rows:22}));
     system.push(encodeTerminalFrame({type:"output",critical:false,sequence:1n,payload:new TextEncoder().encode("CURRENT VIEW")}));
     await waitUntil(()=>host.writes.some(b=>new TextDecoder().decode(b).includes("CURRENT VIEW")),"factory awaited renderer must consume current view");
-    assert.ok(new TextDecoder().decode(host.writes.at(-1)).includes("Restoring terminal"));
+    assert.ok((await visibleHostText(host)).includes("Restoring terminal"));
     system.push(encodeTerminalControl("view_ready",0n,{viewId,afterOutputSequence:"1"}));
     await waitUntil(()=>!new TextDecoder().decode(host.writes.at(-1)).includes("Restoring terminal"),"factory leaves restoring after ready");
     host.emitInput(Uint8Array.of(66));

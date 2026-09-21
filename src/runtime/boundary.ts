@@ -1507,10 +1507,10 @@ export class CunaRuntimeBoundary {
   #requireGrantCapability(entry: TerminalEntry, name: TerminalConnectionCapability["name"]): void {
     const matches = entry.capabilities.filter((capability) => capability.name === name);
     if (matches.length !== 1 || matches[0]?.availability === "unknown") {
-      throw runtimeFailure("capability_unknown", `Cuna cannot prove terminal capability ${name}.`);
+      throw runtimeFailure("capability_unknown", `Cuna cannot prove terminal capability ${name}.`, { safeDetails: { capability: name } });
     }
     if (matches[0]?.availability !== "supported") {
-      throw runtimeFailure("capability_unsupported", `Terminal capability ${name} is unsupported.`);
+      throw runtimeFailure("capability_unsupported", `Terminal capability ${name} is unsupported.`, { safeDetails: { capability: name } });
     }
   }
 

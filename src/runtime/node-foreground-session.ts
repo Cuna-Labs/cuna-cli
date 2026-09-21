@@ -195,7 +195,7 @@ async function runNodeForegroundSessionsOnce(
       input.signal,
     );
     throwIfAborted(input.signal);
-    const capability = admitCapability(capabilitySnapshot, {
+    let capability = admitCapability(capabilitySnapshot, {
       id: TERMINAL_CAPABILITY_ID,
       scope: "agent_session",
       subjectId: agentSessionId,
@@ -203,7 +203,7 @@ async function runNodeForegroundSessionsOnce(
       interaction: "native",
     }, clock());
     input.onProgress?.("Checking live session status");
-    const observation = assertRemoteAgentSessionEvidence({
+    let observation = assertRemoteAgentSessionEvidence({
       evidence: await controlPlane.observeAgentSession(agentSessionId, input.signal),
       expectedAgentSessionId: agentSessionId,
       now: clock(),
@@ -220,7 +220,23 @@ async function runNodeForegroundSessionsOnce(
     });
     throwIfAborted(input.signal);
     if (capability.expiresAt <= clock()) {
-      throw runtimeFailure("capability_snapshot_expired", "Terminal capability authority expired during preflight.");
+      // Provider sign-in inspection can outlast the short authorization lease.
+      // Renew read-only evidence once; never reuse an expired grant or retry effects.
+      input.onProgress?.("Refreshing terminal authority");
+      observation = assertRemoteAgentSessionEvidence({
+        evidence: await controlPlane.observeAgentSession(agentSessionId, input.signal),
+        expectedAgentSessionId: agentSessionId,
+        now: clock(),
+      });
+      admitSessionIdentity(session, observation, agentSessionId);
+      capability = admitCapability(await controlPlane.discoverCapabilities("agent_session", agentSessionId, input.signal), {
+        id: TERMINAL_CAPABILITY_ID,
+        scope: "agent_session",
+        subjectId: agentSessionId,
+        surface: "cli",
+        interaction: "native",
+      }, clock());
+      throwIfAborted(input.signal);
     }
     intents.push(Object.freeze({
       tabId: dependencies.tabId?.(index) ?? `tab:${index + 1}`,

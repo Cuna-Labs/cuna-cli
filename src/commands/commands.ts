@@ -2656,9 +2656,8 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     requireConfirmation(parsed, "machines.update-supervisor");
     const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
 
-    // A normal AgentSession create treats this capability refusal as its stop
-    // condition. This is the one explicit remediation action: it is admitted
-    // only when the server itself reported the OpenCode-specific prerequisite.
+    // Preserve OpenCode's explicit repair signals. Other providers can keep
+    // creation supported even when their machine control lease needs repair.
     let updateRequired = false;
     let stoppedRuntimeUnverified: CunaError | undefined;
     try {
@@ -2708,7 +2707,10 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
       if (current.agent !== "opencode") throw stoppedRuntimeUnverified;
       updateRequired = true;
     }
-    if (!updateRequired) {
+    // Claude/Codex creation can remain supported while the machine's control
+    // lease has expired. The stopped replacement endpoint validates that lease
+    // and all child-session blockers; OpenCode discovery is not its authority.
+    if (!updateRequired && current.agent === "opencode") {
       throw new CunaError({
         code: "cuna.machine.supervisor_update_not_required",
         message: "Cuna does not report that this Machine needs an OpenCode terminal-supervisor update.",

@@ -565,7 +565,7 @@ try {
       testId: "T14.3-WIN-BARE-CUNA-LOADING-HANDOFF", args: [machinesToForegroundFixture, configFile, "--bare"], environment: cliEnvironment,
       async drive(context) {
         await context.waitUntil(
-          () => context.screen().includes("claude-ended-a") && context.screen().includes("claude-live"),
+          () => context.screen().includes("claude-live"),
           "bare cuna did not reach its machine-first selector",
         );
         // The promise this guards is stated at src/cli/run.ts:870-875: a bare
@@ -580,9 +580,10 @@ try {
         const acknowledgedAt = context.transcript().indexOf("Starting Cuna");
         assert.ok(acknowledgedAt >= 0, "bare cuna did not acknowledge input before its first read");
         assert.ok(
-          acknowledgedAt < context.transcript().indexOf("claude-ended-a"),
+          acknowledgedAt < context.transcript().indexOf("claude-live"),
           "bare cuna rendered its inventory before acknowledging input",
         );
+        assert.doesNotMatch(context.screen(), /claude-ended-[ab]/u, "ended sessions must not appear in the live selector");
         // The explorer states what Enter will do in its own footer: on a
         // machine row it manages the machine, and only on a session row does
         // it attach (src/machines/explorer.ts:1087,1096). The old drive pressed
@@ -629,12 +630,12 @@ try {
       testId: "T14.3-WIN-MACHINE-EXACT-SESSION-ATTACH", args: [machinesToForegroundFixture, configFile], environment: cliEnvironment,
       async drive(context) {
         await context.waitUntil(
-          () => context.screen().includes("claude-ended-a") && context.screen().includes("claude-live") && context.screen().includes("claude-ended-b"),
-          "machines overview did not render one attachable session among multiple terminated sessions",
+          () => context.screen().includes("claude-live"),
+          "machines overview did not render its live session",
         );
         assert.match(context.screen(), /❯ ▾ conpty-界-🦊/u, "initial selection did not remain on the machine row");
         assert.match(context.screen(), /Claude · claude-live  attachable/u, "the unique live AgentSession was not classified attachable");
-        assert.match(context.screen(), /Claude · claude-ended-[ab]  terminated/u, "terminated sibling AgentSessions were not represented");
+        assert.doesNotMatch(context.screen(), /claude-ended-[ab]/u, "terminated sibling AgentSessions must stay out of the selector");
         // SPECIFICATION CHANGED ON PURPOSE, and the assertion is INVERTED
         // rather than deleted. This case used to demand a shortcut: Enter on a
         // machine holding exactly one openable child attached straight to it,
@@ -683,6 +684,7 @@ try {
           "opening the provider row did not list the machine's sessions",
         );
         await selectRow(/claude-live/u, "the session list never let the cursor reach the one live session");
+        assert.doesNotMatch(context.screen(), /claude-ended-[ab]/u, "ended sessions must stay out of the session list");
         // The row is labelled "attachable", but THIS screen's footer only says
         // "Enter select" — it never states that Enter attaches. The machines
         // overview does state it (src/machines/explorer.ts:1096); the
@@ -774,7 +776,8 @@ try {
           context.child.write("\u001d?");
           await context.waitUntil(() => context.screen().includes("Keys: Ctrl+C detach"), "observer help did not open");
           context.child.write("x");
-          await context.waitUntil(() => context.screen().includes("Fixture observer input is disabled."), "observer input did not render its refusal");
+          await context.waitUntil(() => context.screen().includes("Control unavailable: supervisor_writer_operation_unavailable"), "observer input did not retain its control refusal");
+          assert.doesNotMatch(context.transcript(), /ACCEPTED /u, "observer input reached the provider fixture");
         }
         context.child.write("\u0003");
         await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("writer refresh Ctrl-C did not detach")), 2_000))]);
@@ -785,7 +788,7 @@ try {
         const receipt = /WRITER_REFRESH_RESULT (\{[^\r\n]+\})/u.exec(transcript());
         assert.ok(receipt, "writer refresh fixture result missing");
         assert.deepEqual(JSON.parse(receipt[1]), { mode, discoveries: 1, transfers: mode === "supported" ? 1 : 0,
-          acceptedBytes: mode === "supported" ? 10 : 0, accessMode: mode === "supported" ? "writer" : "observer" });
+          acceptedBytes: mode === "supported" ? 10 : 0, accessMode: mode === "supported" ? "writer" : "observer", observerInputDispatches: mode === "unsupported" ? 1 : 0 });
       },
     }));
   }

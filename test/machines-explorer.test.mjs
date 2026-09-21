@@ -212,7 +212,8 @@ for (const [label, key] of [["Enter", 0x0d], ["Space", 0x20]]) {
         },
       },
     }, { host });
-    await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("  4 sessions")), "one live child among history should render");
+    await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("  1 session")), "only the live child should count");
+    assert.doesNotMatch(stripAnsi(host.writes.at(-1)), /old-[123]/u);
     assert.match(stripAnsi(host.writes.at(-1)), /Enter\/→ manage machine/u);
 
     host.emitInput([key]);
@@ -272,7 +273,7 @@ test("Enter on a machine with multiple openable children opens management withou
   assert.equal(await operation, undefined);
 });
 
-test("terminated visible sessions remain selectable but Right never opens the provider creation menu", async () => {
+test("ended sessions disappear while their machine remains manageable", async () => {
   const host = new FakeHost();
   const now = Date.now();
   const operation = runNodeMachinesExplorer({
@@ -306,20 +307,16 @@ test("terminated visible sessions remain selectable but Right never opens the pr
       },
     },
   }, { host, now: () => now });
-  await waitUntil(() => host.writes.some((write) => stripAnsi(write).includes("terminated")), "terminated session should remain visible with one human state label");
+  await waitUntil(() => host.writes.some((write) => stripAnsi(write).includes("no sessions")), "ended sessions should be excluded");
   const visible = stripAnsi(host.writes.at(-1));
   assert.doesNotMatch(visible, /termination_intended/u);
-  assert.equal(visible.match(/\bterminated\b/gu)?.length, 1);
+  assert.doesNotMatch(visible, /\bterminated\b/u);
   assert.match(visible, /Enter\/→ manage machine/u);
   host.emitInput([0x0d]);
   await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("CUNA  ◆── goal0"), "zero openable children should open machine management");
   host.emitInput([0x1b, 0x5b, 0x44]);
   await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("CUNA  ◆── Machines"), "Left should return to the overview");
-  host.emitInput([0x1b, 0x5b, 0x42]);
-  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("❯   └─ Claude"), "Down should visibly select the terminated child");
-  host.emitInput([0x1b, 0x5b, 0x43]);
-  await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("Session ended."), "Right should explain why the selected historical session cannot open");
-  assert.equal(stripAnsi(host.writes.at(-1)).includes("New Claude session"), false, "opening a historical session must not masquerade as the create-session menu");
+  assert.doesNotMatch(stripAnsi(host.writes.at(-1)), /└─ Claude/u);
   host.emitInput([0x03]);
   await operation;
 });

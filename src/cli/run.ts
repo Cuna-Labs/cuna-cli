@@ -1625,6 +1625,16 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         throw unsupportedError("openclaw", "provider_route_unavailable");
       }
       const journeyAgent = journeyIntent.agent;
+      const resumeJourneyProgress = (): Readonly<InlineProgress> | undefined => {
+        if (streams.stderrIsTTY === true) {
+          return startInlineProgress(
+            streams.stderr,
+            !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+            journeyPhaseLabel("create-agent-session", journeyAgent),
+          );
+        }
+        return undefined;
+      };
       if (credentialMode === undefined) {
         throw new CunaError({
           code: "cuna.auth.required",
@@ -1653,6 +1663,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         inlineJourneyProgress?.stop(); inlineJourneyProgress = undefined;
         const preset=await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"preset",agent:journeyAgent},undefined,dependencies.signal);
         if(preset===undefined)return EXIT_CODES.success;
+        inlineJourneyProgress = resumeJourneyProgress();
         const agentSessionId = await launchRemoteWorkspaceSession({
           preset,
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id},
@@ -1662,6 +1673,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
+        inlineJourneyProgress?.stop();
+        inlineJourneyProgress = undefined;
         return await runCli([
           journeyAgent,
           "--agent-session", agentSessionId,
@@ -1713,7 +1726,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           requestedAgent: journeyAgent,
           confirmNewProviderLaunch:async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal})).trim());}finally{prompt.close();}},
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
-          selectProviderPreset: async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const preset=await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"preset",agent:journeyAgent},undefined,signal);if(!preset)throw new CunaError({code:"cuna.provider.selection_cancelled",message:"Provider selection cancelled. The synchronized Workspace is preserved.",exitCode:EXIT_CODES.usage});return preset;},
+          selectProviderPreset: async (signal) => {
+            inlineJourneyProgress?.stop();
+            inlineJourneyProgress = undefined;
+            const preset = await (dependencies.providerScreenRunner ?? runProviderScreen)(client, { kind: "preset", agent: journeyAgent }, undefined, signal);
+            if (!preset) throw new CunaError({ code: "cuna.provider.selection_cancelled", message: "Provider selection cancelled. The synchronized Workspace is preserved.", exitCode: EXIT_CODES.usage });
+            inlineJourneyProgress = resumeJourneyProgress();
+            return preset;
+          },
           inspectWorkspace: workspace.inspectWorkspace,
           synchronizeWorkspace: workspace.synchronizeWorkspace,
           // The spinner and the prompt write to the same row of the same
