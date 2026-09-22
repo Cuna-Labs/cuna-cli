@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 import { constants as fileConstants } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 import type { HttpTransport } from "../api/http.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { assertCanonicalUuid } from "../core/validation.js";
-import { compileExclusionPolicy, type ExclusionRuleSource } from "../workspace/exclusion.js";
-import { createWorkspaceManifest, type ManifestLimits } from "../workspace/manifest.js";
+import { compileExclusionPolicy, type ExclusionPolicy, type ExclusionRuleSource } from "../workspace/exclusion.js";
+import { createWorkspaceManifest, type ManifestLimits, type WorkspaceManifest } from "../workspace/manifest.js";
 import type { FilesystemCapabilities } from "../workspace/paths.js";
 import { createWorkspaceSyncClient } from "./workspace-sync-client.js";
 import {
@@ -63,6 +63,13 @@ export interface WorkspaceSyncProductReceipt {
 
 export interface StartContinuousWorkspaceSyncInput extends SynchronizeLocalWorkspaceInput {
   readonly initialReceipt: WorkspaceSyncProductReceipt;
+}
+
+export interface ResumeContinuousWorkspaceSyncInput extends Omit<SynchronizeLocalWorkspaceInput, "baseGeneration"> {
+  /** The generation the WorkspaceBinding authority publishes for this binding right now. */
+  readonly activeGeneration: number;
+  /** The manifest root that same authority publishes for `activeGeneration`. */
+  readonly activeManifestRoot: string;
 }
 
 export interface WorkspaceSyncPolicyInspection {
@@ -236,7 +243,6 @@ export async function startContinuousWorkspaceSync(
       exitCode: EXIT_CODES.conflict,
     });
   }
-  const client = createWorkspaceSyncClient(input.transport);
   const initialCheckpoint = await new FileWorkspaceSyncCheckpointStore(join(
     checkpointRoot,
     checkpointIntentDigest(workspaceId, workspaceBindingId, machineId, input.baseGeneration),
@@ -255,6 +261,178 @@ export async function startContinuousWorkspaceSync(
       exitCode: EXIT_CODES.conflict,
     });
   }
+  return startProvenContinuousSupervisor({
+    identity: { workspaceId, workspaceBindingId, machineId },
+    root,
+    checkpointRoot,
+    policy,
+    initialManifest,
+    proven: {
+      syncId: initialCheckpoint.sync_id,
+      generation: input.initialReceipt.generation,
+      manifestRoot: input.initialReceipt.manifest_root,
+    },
+    transfer: input,
+  });
+}
+
+/**
+ * Starts the same live writer for a reconnect that committed no generation,
+ * because the local tree already reproduces the published one.
+ *
+ * `startContinuousWorkspaceSync` cannot serve that case: it demands a receipt
+ * from a commit this run performed, and the byte-identical reconnect
+ * deliberately performs none (`journey/workspace-effects.ts`, gate G1 of
+ * `prds/cuna-workspace-remote-to-local-sync-20260922.md` §1). Skipping the
+ * supervisor there also skips the remote poll, so a generation produced on the
+ * Machine could never reach a reconnecting owner.
+ *
+ * The start state is proven by the authority rather than by a local artifact:
+ * the caller passes the generation and manifest root the WorkspaceBinding
+ * publishes, and this refuses unless the local tree reproduces that exact
+ * manifest root. The durable checkpoint contributes only the sync session id,
+ * which is a read handle and nothing more: `list_workspace_sync_changes` diffs
+ * every committed revision of the session's namespace irrespective of which
+ * session committed it, `get_workspace_sync_chunk` resolves content by
+ * namespace too, neither filters on session state, and a committed session is
+ * never deleted — the pruner only moves `staging` rows to `expired`. Read at
+ * infra `abc07a94`: `supabase/migrations/0060_workspace_sync_public_authority.sql`
+ * lines 1004-1117 and 1219-1243, `0072_workspace_sync_chunk_download_authority.sql`
+ * lines 9-60, `0069_workspace_sync_binding_authority.sql` lines 161-231.
+ */
+export async function resumeContinuousWorkspaceSync(
+  input: ResumeContinuousWorkspaceSyncInput,
+): Promise<ContinuousWorkspaceSyncSupervisor> {
+  validateAuthority(input);
+  const workspaceId = assertCanonicalUuid(input.workspaceId, "workspace ID");
+  const workspaceBindingId = assertCanonicalUuid(input.workspaceBindingId, "workspace binding ID");
+  if (workspaceBindingId === workspaceId) throw invalidInput("workspace_binding_id_domain");
+  const machineId = assertCanonicalUuid(input.machineId, "machine ID");
+  if (!Number.isSafeInteger(input.activeGeneration) || input.activeGeneration < 1) {
+    throw invalidInput("active_generation");
+  }
+  if (!/^[0-9a-f]{64}$/u.test(input.activeManifestRoot)) throw invalidInput("active_manifest_root");
+  const root = await canonicalWorkspaceRoot(input.localRoot);
+  const checkpointRoot = await canonicalCheckpointRoot(input.checkpointRoot, root);
+  const policy = compileExclusionPolicy(
+    await readProjectExclusionPolicy(root),
+    input.filesystemCapabilities,
+  );
+  const initialManifest = await createWorkspaceManifest({
+    root,
+    policy,
+    capabilities: input.filesystemCapabilities,
+    ...(input.manifestLimits === undefined ? {} : { limits: input.manifestLimits }),
+    ...(input.allowSafeRelativeSymlinks === undefined
+      ? {}
+      : { allowSafeRelativeSymlinks: input.allowSafeRelativeSymlinks }),
+  });
+  if (initialManifest.manifestRoot !== input.activeManifestRoot) {
+    throw resumeUnavailable("resume_manifest_unproven");
+  }
+  const session = await findDurableSyncSession({
+    root,
+    checkpointRoot,
+    workspaceId,
+    workspaceBindingId,
+    machineId,
+    policyDigest: policy.digest,
+    activeGeneration: input.activeGeneration,
+  });
+  return startProvenContinuousSupervisor({
+    identity: { workspaceId, workspaceBindingId, machineId },
+    root,
+    checkpointRoot,
+    policy,
+    initialManifest,
+    proven: {
+      syncId: session,
+      generation: input.activeGeneration,
+      manifestRoot: input.activeManifestRoot,
+    },
+    transfer: input,
+  });
+}
+
+/**
+ * The newest committed sync session this installation holds for the binding.
+ *
+ * Directories are read newest base generation first and loaded until one is
+ * admitted, so the common reconnect costs a single checkpoint read however
+ * many generations the folder has committed.
+ */
+async function findDurableSyncSession(input: {
+  readonly root: string;
+  readonly checkpointRoot: string;
+  readonly workspaceId: string;
+  readonly workspaceBindingId: string;
+  readonly machineId: string;
+  readonly policyDigest: string;
+  readonly activeGeneration: number;
+}): Promise<string> {
+  const prefix = `${bindingDigest(input.workspaceId, input.workspaceBindingId, input.machineId)}-generation-`;
+  let names: readonly string[];
+  try {
+    names = await readdir(input.checkpointRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw resumeUnavailable("resume_session_unavailable");
+    throw resumeUnavailable("resume_state_unreadable");
+  }
+  const candidates = names
+    .filter((name) => name.startsWith(prefix) && /^[0-9]{1,15}$/u.test(name.slice(prefix.length)))
+    .map((name) => Object.freeze({ name, base: Number(name.slice(prefix.length)) }))
+    .sort((left, right) => right.base - left.base);
+  for (const candidate of candidates) {
+    const directory = join(input.checkpointRoot, candidate.name);
+    await assertSafeDerivedCheckpoint(directory, input.root);
+    const checkpoint = await new FileWorkspaceSyncCheckpointStore(directory).load();
+    if (
+      checkpoint?.phase !== "committed" ||
+      checkpoint.sync_id === null ||
+      checkpoint.committed_generation === null ||
+      checkpoint.workspace_id !== input.workspaceId ||
+      checkpoint.workspace_binding_id !== input.workspaceBindingId ||
+      checkpoint.machine_id !== input.machineId ||
+      checkpoint.exclusion_policy_digest !== input.policyDigest
+    ) continue;
+    // A durable generation newer than the published one is not a stale handle,
+    // it is a contradiction: either the authority rolled back or this folder is
+    // reading another binding's state. Neither may be resumed silently.
+    if (checkpoint.committed_generation > input.activeGeneration) {
+      throw resumeUnavailable("resume_generation_rollback");
+    }
+    return checkpoint.sync_id;
+  }
+  throw resumeUnavailable("resume_session_unavailable");
+}
+
+/**
+ * The live writer itself, shared by the two admission proofs above. Whoever
+ * proved the initial generation, the supervisor is built identically.
+ */
+async function startProvenContinuousSupervisor(input: {
+  readonly identity: {
+    readonly workspaceId: string;
+    readonly workspaceBindingId: string;
+    readonly machineId: string;
+  };
+  readonly root: string;
+  readonly checkpointRoot: string;
+  readonly policy: ExclusionPolicy;
+  readonly initialManifest: WorkspaceManifest;
+  readonly proven: {
+    readonly syncId: string;
+    readonly generation: number;
+    readonly manifestRoot: string;
+  };
+  readonly transfer: Pick<
+    SynchronizeLocalWorkspaceInput,
+    "transport" | "filesystemCapabilities" | "maximumConcurrentUploads" | "maximumAttempts"
+  >;
+}): Promise<ContinuousWorkspaceSyncSupervisor> {
+  const { workspaceId, workspaceBindingId, machineId } = input.identity;
+  const { root, checkpointRoot, policy } = input;
+  const client = createWorkspaceSyncClient(input.transfer.transport);
   const authority: ContinuousSyncAuthority = {
     async commitLocalSnapshot({ baseGeneration, manifest, signal }) {
       const directory = join(checkpointRoot, checkpointIntentDigest(
@@ -266,10 +444,12 @@ export async function startContinuousWorkspaceSync(
         client,
         checkpointStore,
         chunkSource: await createFilesystemChunkSource(root, manifest),
-        ...(input.maximumConcurrentUploads === undefined
+        ...(input.transfer.maximumConcurrentUploads === undefined
           ? {}
-          : { maximumConcurrentUploads: input.maximumConcurrentUploads }),
-        ...(input.maximumAttempts === undefined ? {} : { maximumAttempts: input.maximumAttempts }),
+          : { maximumConcurrentUploads: input.transfer.maximumConcurrentUploads }),
+        ...(input.transfer.maximumAttempts === undefined
+          ? {}
+          : { maximumAttempts: input.transfer.maximumAttempts }),
       });
       const receipt = await coordinator.synchronize({
         workspaceId,
@@ -336,21 +516,21 @@ export async function startContinuousWorkspaceSync(
   );
   return ContinuousWorkspaceSyncSupervisor.start({
     bindingId: workspaceBindingId,
-    bindingGeneration: input.initialReceipt.generation,
-    syncId: initialCheckpoint.sync_id,
-    initialGeneration: input.initialReceipt.generation,
-    initialManifestRoot: input.initialReceipt.manifest_root,
+    bindingGeneration: input.proven.generation,
+    syncId: input.proven.syncId,
+    initialGeneration: input.proven.generation,
+    initialManifestRoot: input.proven.manifestRoot,
     canonicalRoot: root,
-    stateDirectory: join(bindingStateDirectory, `generation-${input.initialReceipt.generation}`),
+    stateDirectory: join(bindingStateDirectory, `generation-${input.proven.generation}`),
     writerLeaseDirectory: join(bindingStateDirectory, "writer-authority"),
     policy,
-    filesystemCapabilities: input.filesystemCapabilities,
+    filesystemCapabilities: input.transfer.filesystemCapabilities,
     authority,
-    initialManifest,
+    initialManifest: input.initialManifest,
   });
 }
 
-function validateAuthority(input: SynchronizeLocalWorkspaceInput): void {
+function validateAuthority(input: Pick<SynchronizeLocalWorkspaceInput, "transport">): void {
   if (
     input.transport?.authentication !== "authenticated" ||
     (input.transport.credentialAuthority !== "api_key" &&
@@ -480,6 +660,19 @@ function unsafeRoot(reason: string): CunaError {
     code: "cuna.workspace_sync.unsafe_root",
     message: "Workspace synchronization refused an unsafe local storage boundary.",
     exitCode: EXIT_CODES.policy,
+    details: { reason },
+  });
+}
+
+/**
+ * One code, distinguishable reasons. A caller that cannot resume must be able
+ * to render why without enumerating storage layout to the person.
+ */
+function resumeUnavailable(reason: string): CunaError {
+  return new CunaError({
+    code: "cuna.workspace_sync.resume_unavailable",
+    message: "Continuous synchronization could not resume from the published workspace generation.",
+    exitCode: EXIT_CODES.conflict,
     details: { reason },
   });
 }

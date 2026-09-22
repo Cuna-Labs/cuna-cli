@@ -6,6 +6,9 @@ import test from "node:test";
 
 import { CunaError, EXIT_CODES } from "../dist/core/errors.js";
 import { conservativeFilesystemCapabilities, createWorkspaceJourneyEffects } from "../dist/journey/workspace-effects.js";
+import { inspectWorkspaceSyncPolicy } from "../dist/sync/workspace-sync-product-service.js";
+import { manifestEntryForPublicProtocol } from "../dist/sync/workspace-sync-protocol.js";
+import { compileExclusionPolicy, createWorkspaceManifest } from "../dist/workspace/index.js";
 
 const USER = "10000000-0000-4000-8000-000000000001";
 const WORKSPACE = "20000000-0000-4000-8000-000000000001";
@@ -159,7 +162,14 @@ test("E14-D1: a bound Machine that no longer exists rebinds the folder to the se
   assert.equal(record.recordRevision, seeded.record.recordRevision + 1, "the local record is bumped, not replaced");
   assert.equal(record.generation, 1);
 
-  assert.deepEqual(notices, [`Rebound this folder to ${MACHINE} · the previous Machine no longer exists`]);
+  // Two lines, in order: the decision taken on the owner's behalf, then the
+  // consequence of reusing a generation this installation never committed —
+  // there is no durable sync session to poll remote changes with, so the
+  // attach proceeds and says so instead of pretending a poller is running.
+  assert.deepEqual(notices, [
+    `Rebound this folder to ${MACHINE} · the previous Machine no longer exists`,
+    "Remote workspace changes will not arrive this run · resume_session_unavailable",
+  ]);
 });
 
 test("E14-D1: a bound Machine the server still holds as deleted is treated as absent", async (t) => {
@@ -186,7 +196,10 @@ test("E14-D1: a bound Machine the server still holds as deleted is treated as ab
   });
   assert.deepEqual(creates, [MACHINE]);
   assert.equal((await readBoundRecord(project)).machineId, MACHINE);
-  assert.equal(notices.length, 1);
+  assert.deepEqual(notices, [
+    `Rebound this folder to claude-stack-1 · the previous Machine no longer exists`,
+    "Remote workspace changes will not arrive this run · resume_session_unavailable",
+  ]);
 });
 
 // Negative control for the rebind: the bound Machine exists and merely differs
@@ -350,7 +363,9 @@ test("an unchanged workspace reuses its committed generation instead of committi
 
   // The transport throws on any request, so reaching the network at all fails
   // this test rather than silently passing on a slower path.
-  const result = await effects(client, state).synchronizeWorkspace({
+  const notices = [];
+  const reused = effects(client, state, { onNotice: (line) => notices.push(line) });
+  const result = await reused.synchronizeWorkspace({
     machineId: MACHINE,
     localPath: project,
     syncMode: "enabled",
@@ -359,6 +374,279 @@ test("an unchanged workspace reuses its committed generation instead of committi
 
   assert.equal(result.generation, 7, "the committed generation must be reused, not advanced");
   assert.equal(result.bindingId, binding.bindingId);
+  // Generation 7 was committed by nobody this installation can prove, so there
+  // is no sync session to read remote changes with. The attach still succeeds,
+  // and the missing capability is named rather than left as silence.
+  assert.equal(reused.continuousSyncSnapshot(), undefined, "no poller may claim to run without a read handle");
+  assert.deepEqual(notices, ["Remote workspace changes will not arrive this run · resume_session_unavailable"]);
+});
+
+/**
+ * One authenticated workspace-sync transport, answering the public wire
+ * protocol well enough to commit a generation and then to serve one produced
+ * by somebody else. `changePage` and `chunks` stay empty until a test arms
+ * them, so nothing arrives by accident.
+ */
+class WireAuthority {
+  authentication = "authenticated";
+  credentialAuthority = "interactive";
+  requests = [];
+  policyDigest;
+  baseGeneration = 0;
+  committedGeneration = 0;
+  committedRoot;
+  changePage = Object.freeze({ selected_protocol: 2, items: Object.freeze([]), next_cursor: null });
+  chunks = new Map();
+
+  async request(request) {
+    this.requests.push(Object.freeze({ method: request.method, path: request.path }));
+    if (request.path.endsWith("/sync-sessions")) {
+      this.policyDigest = request.body.exclusion_policy_digest;
+      this.baseGeneration = request.body.base_generation;
+      return this.#envelope(this.#session());
+    }
+    if (request.path.endsWith("/manifests")) {
+      return this.#envelope({
+        sync: this.#session(),
+        page_index: request.body.page_index,
+        page_digest: "a".repeat(64),
+        missing_digests: request.body.entries.flatMap((entry) => entry.chunks.map((chunk) => chunk.digest)),
+      });
+    }
+    if (request.method === "PUT") {
+      return this.#envelope({
+        selected_protocol: 2,
+        digest: request.path.split("/").at(-1),
+        byte_length: request.body.byteLength,
+        stored: true,
+      });
+    }
+    if (request.path.endsWith("/commit")) {
+      this.committedGeneration = request.body.expected_generation + 1;
+      this.committedRoot = request.body.manifest_root;
+      return this.#envelope({
+        selected_protocol: 2,
+        state: "committed",
+        generation: this.committedGeneration,
+        manifest_root: this.committedRoot,
+        committed_at: "2026-09-22T12:00:00.000Z",
+        minimum_reader: 1,
+        minimum_writer: 1,
+      });
+    }
+    if (request.path.endsWith("/changes")) return this.#envelope(this.changePage);
+    if (request.method === "GET" && request.path.includes("/chunks/")) {
+      const digest = request.path.split("/").at(-1);
+      const bytes = this.chunks.get(digest);
+      if (bytes === undefined) throw new Error("the change page named a chunk the authority does not hold");
+      return this.#envelope({
+        selected_protocol: 2,
+        digest,
+        byte_length: bytes.byteLength,
+        minimum_reader: 1,
+        content_base64: bytes.toString("base64"),
+      });
+    }
+    if (request.path.endsWith("/reconcile")) {
+      return this.#envelope({
+        selected_protocol: 2,
+        status: "converged",
+        active_generation: request.body.observed_generation,
+        active_manifest_root: request.body.manifest_root,
+        exclusion_policy_digest: request.body.exclusion_policy_digest,
+      });
+    }
+    throw new Error(`unexpected workspace sync operation ${request.method} ${request.path}`);
+  }
+
+  count(suffix) {
+    return this.requests.filter((request) => request.path.endsWith(suffix)).length;
+  }
+
+  #session() {
+    return {
+      id: WIRE_SYNC,
+      workspace_id: WORKSPACE,
+      machine_id: MACHINE,
+      base_generation: this.baseGeneration,
+      exclusion_policy_digest: this.policyDigest,
+      selected_protocol: 2,
+      capabilities: WIRE_CAPABILITIES,
+      state: "staging",
+      manifest_entry_count: 0,
+      manifest_encoded_bytes: 0,
+      content_bytes: 0,
+      expires_at: "2026-09-23T00:00:00.000Z",
+      created_at: "2026-09-22T00:00:00.000Z",
+      updated_at: "2026-09-22T00:00:00.000Z",
+    };
+  }
+
+  #envelope(data) {
+    return Object.freeze({
+      request_id: "44444444-4444-4444-8444-444444444444",
+      selected_protocol: 2,
+      capabilities: WIRE_CAPABILITIES,
+      data,
+    });
+  }
+}
+
+const WIRE_SYNC = "33333333-3333-4333-8333-333333333333";
+const WIRE_CAPABILITIES = Object.freeze([
+  "atomic_generation_commit",
+  "bounded_manifest_pages",
+  "content_digest_verification",
+  "explicit_reconciliation",
+  "ordered_generation_changes",
+  "policy_bound_admission",
+]);
+
+async function waitFor(predicate, message, timeout = 5_000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((settle) => setTimeout(settle, 10));
+  }
+  assert.fail(message);
+}
+
+/** The change page one remote generation would produce, from two manifests of the same tree. */
+function remoteGeneration(generation, before, after, policyDigest) {
+  const prior = new Map(before.entries.map((entry) => [entry.path, entry]));
+  const current = new Map(after.entries.map((entry) => [entry.path, entry]));
+  const shared = {
+    manifest_root: after.manifestRoot,
+    exclusion_policy_digest: policyDigest,
+    committed_at: "2026-09-22T12:05:00.000Z",
+    minimum_reader: 1,
+    minimum_writer: 1,
+  };
+  const items = [{ generation, operation: "revision", path: null, entry: null, ...shared }];
+  for (const path of [...new Set([...prior.keys(), ...current.keys()])].sort()) {
+    const left = prior.get(path);
+    const right = current.get(path);
+    if (JSON.stringify(left) === JSON.stringify(right)) continue;
+    items.push({
+      generation,
+      operation: right === undefined ? "delete" : "upsert",
+      path,
+      entry: right === undefined ? null : manifestEntryForPublicProtocol(right),
+      ...shared,
+    });
+  }
+  return Object.freeze({ selected_protocol: 2, items: Object.freeze(items), next_cursor: null });
+}
+
+// The required gate fix, stated as the journey it unblocks: a returning owner
+// runs the same command on an unchanged folder, so nothing is committed — and a
+// generation produced on the Machine must still land in the folder. Before the
+// fix this test times out waiting for the file, because the reuse path returned
+// without ever starting the supervisor that reads `GET /changes`
+// (PRD workspace remote-to-local sync 2026-09-22, §1 gate G1).
+test("a reconnect that commits nothing still delivers a remote generation into the folder", async (t) => {
+  const { project, state } = await roots(t);
+  const { mkdir: makeDirectory, readFile, writeFile } = await import("node:fs/promises");
+  const capabilities = conservativeFilesystemCapabilities("windows");
+  await writeFile(join(project, "main.js"), "console.log(1);\n");
+
+  const wire = new WireAuthority();
+  const inspected = await inspectWorkspaceSyncPolicy({ localRoot: project, filesystemCapabilities: capabilities });
+  const policy = compileExclusionPolicy(
+    [{ source: "gitignore", text: "" }, { source: "cunaignore", text: "" }],
+    capabilities,
+  );
+  assert.equal(policy.digest, inspected.exclusionPolicyDigest, "the test must compile the policy the journey compiles");
+  const localManifest = await createWorkspaceManifest({ root: project, policy, capabilities });
+
+  const binding = {
+    bindingId: "40000000-0000-4000-8000-000000000020",
+    projectId: "50000000-0000-4000-8000-000000000020",
+    localInstanceId: "60000000-0000-4000-8000-000000000020",
+    remoteRoot: "/workspace/projects/50000000-0000-4000-8000-000000000020",
+    exclusionPolicyDigest: undefined,
+    bindingEpoch: 1,
+    minimumReader: 1,
+    minimumWriter: 2,
+    createdAt: "2026-09-22T09:00:00.000Z",
+    updatedAt: "2026-09-22T09:00:00.000Z",
+  };
+  const published = () => Object.freeze({
+    ...binding,
+    workspaceId: WORKSPACE,
+    machineId: MACHINE,
+    activeGeneration: wire.committedGeneration,
+    activeManifestRoot: wire.committedRoot ?? "0".repeat(64),
+  });
+  const client = {
+    async createWorkspaceBinding(input) {
+      binding.exclusionPolicyDigest = input.exclusionPolicyDigest;
+      return published();
+    },
+    async getWorkspaceBinding() { return published(); },
+    async getMachine(id) { return { id, name: "qa3", state: "running" }; },
+  };
+
+  // The first run is the ordinary upload path: it commits generation 1 and
+  // leaves the durable session this installation will later read with.
+  const first = effects(client, state, { transport: wire });
+  const firstResult = await first.synchronizeWorkspace({
+    machineId: MACHINE, localPath: project, syncMode: "enabled", signal: new AbortController().signal,
+  });
+  assert.equal(firstResult.generation, 1);
+  await first.stopContinuousSync();
+  const commitsAfterFirstRun = wire.count("/commit");
+  assert.equal(commitsAfterFirstRun, 1);
+
+  // Somebody else advances the workspace: generation 2 adds a file this folder
+  // has never seen. Arming it only now keeps the first run's poller innocent.
+  const desired = join(state, "desired");
+  await makeDirectory(desired);
+  await writeFile(join(desired, "main.js"), "console.log(1);\n");
+  await writeFile(join(desired, "from-agent.txt"), "written by the agent\n");
+  const desiredManifest = await createWorkspaceManifest({ root: desired, policy, capabilities });
+  for (const entry of desiredManifest.entries) {
+    if (entry.kind !== "file") continue;
+    const content = await readFile(join(desired, entry.path));
+    let offset = 0;
+    for (const chunk of entry.chunks) {
+      wire.chunks.set(chunk.digest, content.subarray(offset, offset + chunk.byteLength));
+      offset += chunk.byteLength;
+    }
+  }
+  wire.changePage = remoteGeneration(2, localManifest, desiredManifest, policy.digest);
+
+  // The reconnect. Content is byte-identical, so no generation is committed.
+  // The supervisor is stopped in `finally` rather than in an `after` hook: the
+  // temporary-directory hook was registered first, so a still-running poller
+  // would write its durable state into a directory already removed, and the
+  // test would fail on that instead of on what it measures.
+  const second = effects(client, state, { transport: wire });
+  try {
+    const secondResult = await second.synchronizeWorkspace({
+      machineId: MACHINE, localPath: project, syncMode: "enabled", signal: new AbortController().signal,
+    });
+    assert.equal(secondResult.generation, 1, "the reconnect must reuse the committed generation");
+
+    await waitFor(
+      async () => (await readFile(join(project, "from-agent.txt"), "utf8").catch(() => undefined)) !== undefined,
+      "the remote generation never reached the local folder",
+    );
+    assert.equal(await readFile(join(project, "from-agent.txt"), "utf8"), "written by the agent\n");
+    await waitFor(
+      () => second.continuousSyncSnapshot()?.generation === 2,
+      "the supervisor never adopted the remote generation",
+    );
+    assert.notEqual(second.continuousSyncSnapshot(), undefined, "the reconnect must run a supervisor");
+    assert.equal(
+      await readFile(join(project, "main.js"), "utf8"),
+      "console.log(1);\n",
+      "the file that did not change must not be rewritten",
+    );
+    assert.equal(wire.count("/commit"), commitsAfterFirstRun, "an unchanged reconnect must commit nothing");
+  } finally {
+    await second.stopContinuousSync();
+  }
 });
 
 // Negative control: the skip must be keyed on the manifest, not on nothing at

@@ -8,6 +8,7 @@ import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import type { ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.js";
 import {
   inspectWorkspaceSyncPolicy,
+  resumeContinuousWorkspaceSync,
   startContinuousWorkspaceSync,
   computeWorkspaceManifestRoot,
   synchronizeLocalWorkspace,
@@ -115,6 +116,15 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
   let supervisor: Awaited<ReturnType<typeof startContinuousWorkspaceSync>> | undefined;
   const syncListeners = new Set<(snapshot: ContinuousSyncSnapshot) => void>();
   let unsubscribeSupervisor: (() => void) | undefined;
+  /** One wiring for every admission path, so a resumed poller is as observable as a committed one. */
+  const attachContinuousSync = (started: Awaited<ReturnType<typeof startContinuousWorkspaceSync>>): void => {
+    supervisor = started;
+    unsubscribeSupervisor = started.subscribe((snapshot) => {
+      for (const listener of syncListeners) {
+        try { listener(snapshot); } catch { /* Status observers never own synchronization correctness. */ }
+      }
+    });
+  };
   const inspect = async (localPath: string): Promise<{
     readonly policy: Awaited<ReturnType<typeof inspectWorkspaceSyncPolicy>>;
     readonly local?: LoadedWorkspaceBinding;
@@ -304,6 +314,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         localRoot: inspected.policy.canonicalRoot,
         filesystemCapabilities: input.filesystemCapabilities,
       });
+      const checkpointRoot = join(input.stateDirectory, "workspace-sync");
       if (
         authority.activeGeneration >= 1 &&
         authority.activeManifestRoot === currentManifestRoot
@@ -322,6 +333,39 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
           });
         }
+        // Skipping the commit must not also skip remote delivery. The
+        // supervisor is the only reader of `GET …/changes`, so with none
+        // running a generation produced on the Machine can never reach this
+        // folder — and the byte-identical reconnect is exactly the path a
+        // returning owner takes (PRD workspace remote-to-local sync
+        // 2026-09-22, §1 gate G1).
+        //
+        // There is no commit receipt here by construction, so the supervisor is
+        // admitted against the generation the authority publishes instead. Its
+        // one local prerequisite is a sync session id from an earlier commit by
+        // this installation. Without one the attach still proceeds: refusing to
+        // open the terminal because remote edits cannot be delivered would be
+        // the worse trade, and the next local content change commits a
+        // generation, which starts the poller on the proven path. The reason is
+        // said in one line rather than swallowed.
+        try {
+          await mkdir(checkpointRoot, { recursive: true, mode: 0o700 });
+          attachContinuousSync(await resumeContinuousWorkspaceSync({
+            localRoot: inspected.policy.canonicalRoot,
+            workspaceId: input.workspaceId,
+            workspaceBindingId: authority.bindingId,
+            machineId,
+            activeGeneration: authority.activeGeneration,
+            activeManifestRoot: currentManifestRoot,
+            transport: input.transport,
+            checkpointRoot,
+            filesystemCapabilities: input.filesystemCapabilities,
+          }));
+        } catch (error) {
+          if (!(error instanceof CunaError)) throw error;
+          const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
+          input.onNotice?.(`Remote workspace changes will not arrive this run · ${reason}`);
+        }
         return Object.freeze({
           bindingId: authority.bindingId,
           ...(authority.executionWorkspaceId==null?{}:{executionWorkspaceId:authority.executionWorkspaceId}),
@@ -331,7 +375,6 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         });
       }
 
-      const checkpointRoot = join(input.stateDirectory, "workspace-sync");
       await mkdir(checkpointRoot, { recursive: true, mode: 0o700 });
       const receipt = await synchronizeLocalWorkspace({
         localRoot: inspected.policy.canonicalRoot,
@@ -383,7 +426,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         },
         expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
       });
-      supervisor = await startContinuousWorkspaceSync({
+      attachContinuousSync(await startContinuousWorkspaceSync({
         localRoot: inspected.policy.canonicalRoot,
         workspaceId: input.workspaceId,
         workspaceBindingId: persisted.bindingId,
@@ -393,12 +436,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         checkpointRoot,
         filesystemCapabilities: input.filesystemCapabilities,
         initialReceipt: receipt,
-      });
-      unsubscribeSupervisor = supervisor.subscribe((snapshot) => {
-        for (const listener of syncListeners) {
-          try { listener(snapshot); } catch { /* Status observers never own synchronization correctness. */ }
-        }
-      });
+      }));
       return Object.freeze({ ...(persisted.executionWorkspaceId===undefined?{}:{executionWorkspaceId:persisted.executionWorkspaceId}), bindingId: persisted.bindingId, workspaceIdentity: persisted.bindingId, generation: persisted.generation, remoteCwd: persisted.remoteRoot });
     },
   };
