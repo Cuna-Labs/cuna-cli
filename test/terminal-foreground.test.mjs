@@ -1789,6 +1789,58 @@ test("reconnect exhaustion does not hide historical input uncertainty", async ()
   } finally { await coordinator.stop(); }
 });
 
+test("R12: a missed input deadline is named at once, and the tab reconnects under that line", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectBaseDelayMs: 1 },
+  });
+  let releaseReconnect;
+  const reconnectGate = new Promise((resolve) => { releaseReconnect = resolve; });
+  const requested = [];
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    const reconnect = runtime.reconnect;
+    runtime.reconnect = async (input) => { requested.push(input.tabId); await reconnectGate; return await reconnect(input); };
+    callbacks.onTerminalState({
+      ...snapshot(intents[0]), state: "interrupted", reason: "input_ack_timeout",
+      inputContinuity: "uncertain", historicalInputUncertainty: true,
+    });
+    await waitUntil(
+      () => decoder.decode(host.writes.at(-1)).includes("Connection stalled · reconnecting — input not resent"),
+      "the stall is named on the notice line",
+    );
+    await waitUntil(() => requested.length === 1, "recovery starts without waiting for anything else");
+    releaseReconnect();
+    await waitUntil(() => calls.reconnect.length === 1, "the reconnect completes");
+    await waitUntil(
+      () => !decoder.decode(host.writes.at(-1)).includes("Connection stalled"),
+      "the stall line is withdrawn once the tab is attached again",
+    );
+    assert.deepEqual(calls.input, [], "nothing was resent");
+  } finally { releaseReconnect(); await coordinator.stop(); }
+});
+
+test("DISCRIMINATING CONTROL R12: an interruption for another reason does not claim a stall", async () => {
+  const { coordinator, callbacks, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectBaseDelayMs: 1 },
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    // Held open until the coordinator stops, so the line is read mid-recovery.
+    runtime.reconnect = (input) => new Promise((_resolve, reject) => {
+      input.signal?.addEventListener("abort", () => reject(input.signal.reason), { once: true });
+    });
+    callbacks.onTerminalState({
+      ...snapshot(intents[0]), state: "interrupted", reason: "heartbeat_expired",
+      inputContinuity: "uncertain", historicalInputUncertainty: true,
+    });
+    await waitUntil(
+      () => decoder.decode(host.writes.at(-1)).includes("Prior input uncertain · not resent"),
+      "the interruption still renders the input rule",
+    );
+    assert.equal(decoder.decode(host.writes.at(-1)).includes("Connection stalled"), false);
+  } finally { await coordinator.stop(); }
+});
+
 test("a refused seat request is reported on the notice line and does not stop the foreground", async () => {
   const failure = new Error("Terminal writer changed");
   const { coordinator, callbacks, calls, host, intents } = harness({ takeWriterError: failure });

@@ -85,6 +85,22 @@ function waitForTerminalAdmission(milliseconds: number, signal?: AbortSignal): P
   });
 }
 
+/**
+ * How long a sent key may go unacknowledged before the CLI treats the
+ * connection as stalled, says so, and reconnects.
+ *
+ * Measured 2026-09-22 17:44Z on qa5 (R12): keys i7–i9 were sent and never
+ * acknowledged, and the screen said nothing for 19.2 s, until Windows gave up
+ * retransmitting and aborted the socket. The only Cuna bound on that path was
+ * the 45 s heartbeat, so a stalled path owned the terminal for up to 45 s.
+ *
+ * 5 000 ms is 1.75x the slowest acknowledgement seen on a healthy path, 2 847 ms
+ * (r12rep1; the rest 134–532 ms), and a quarter of the 18.9 s Windows needs to
+ * abort. A deadline that fires on a slow but live path costs one reconnect; the
+ * input is never resent either way (`retireInputAcceptance`).
+ */
+const INPUT_ACKNOWLEDGEMENT_DEADLINE_MS = 5_000;
+
 export type RuntimeTerminalState =
   | "attaching"
   | "active"
@@ -187,6 +203,8 @@ export interface RuntimeBoundaryOptions {
   readonly readyTimeoutMs?: number;
   readonly outputDeliveryTimeoutMs?: number;
   readonly heartbeatTimeoutMs?: number;
+  /** How long sent input may wait for its acknowledgement; see `INPUT_ACKNOWLEDGEMENT_DEADLINE_MS`. */
+  readonly inputAcknowledgementTimeoutMs?: number;
   readonly onTerminalReady?: (snapshot: RuntimeTerminalSnapshot) => void | Promise<void>;
   readonly onTerminalGeometry?: (event: { readonly snapshot: RuntimeTerminalSnapshot; readonly signal: AbortSignal }) => void | Promise<void>;
   readonly onTerminalOutput?: (event: {
@@ -239,7 +257,9 @@ interface TerminalEntry {
   inputSequence: bigint;
   acknowledgedInputSequence: bigint;
   inputContinuity: RuntimeTerminalSnapshot["inputContinuity"];
-  pendingInputSequences: Set<bigint>;
+  /** Unacknowledged input sequence -> the clock reading when it was sent. */
+  pendingInputSequences: Map<bigint, number>;
+  inputAcknowledgementTimer?: NodeJS.Timeout;
   /** Accepted receipts from a later writer/attachment cannot resolve this history. */
   historicalInputUncertainty: boolean;
   retiredInputSequence: bigint;
@@ -471,7 +491,7 @@ export class CunaRuntimeBoundary {
         inputSequence: 0n,
         acknowledgedInputSequence: 0n,
         inputContinuity: "none",
-        pendingInputSequences: new Set(),
+        pendingInputSequences: new Map(),
         historicalInputUncertainty: false,
         retiredInputSequence: 0n,
         outputSequence: 0n,
@@ -697,8 +717,9 @@ export class CunaRuntimeBoundary {
       });
       entry.wireSequence = inputSequence;
       entry.inputSequence = inputSequence;
-      entry.pendingInputSequences.add(entry.inputSequence);
+      entry.pendingInputSequences.set(entry.inputSequence, this.#clock());
       entry.inputContinuity = "uncertain";
+      this.#armInputAcknowledgementDeadline(entry, authority.connection, authority.connectionRevision);
       await authority.connection.send(frame);
       this.#publish(entry);
     });
@@ -1829,7 +1850,7 @@ export class CunaRuntimeBoundary {
       ) {
         throw runtimeFailure("terminal_protocol_error", "Terminal input acknowledgement is invalid.");
       }
-      for (const sequence of entry.pendingInputSequences) {
+      for (const sequence of entry.pendingInputSequences.keys()) {
         if (sequence <= acknowledged) entry.pendingInputSequences.delete(sequence);
       }
       entry.acknowledgedInputSequence = acknowledged;
@@ -2029,6 +2050,73 @@ export class CunaRuntimeBoundary {
     void connection.close({ code: 1001, reason: "cuna_heartbeat_expired" }).catch(() => undefined);
   }
 
+  #inputAcknowledgementTimeoutMs(): number {
+    const timeoutMs = this.#options.inputAcknowledgementTimeoutMs ?? INPUT_ACKNOWLEDGEMENT_DEADLINE_MS;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000) {
+      throw runtimeFailure("terminal_protocol_error", "The terminal input acknowledgement deadline is invalid.");
+    }
+    return timeoutMs;
+  }
+
+  /**
+   * One timer per attachment, due when the OLDEST unacknowledged input reaches
+   * the deadline. An acknowledgement does not clear it: when it fires it looks
+   * at whichever input is oldest then, and either interrupts or re-arms for it,
+   * so a later key is measured from its own send time, not from the first one.
+   */
+  #armInputAcknowledgementDeadline(
+    entry: TerminalEntry,
+    connection: TerminalWireConnection,
+    connectionRevision: number,
+  ): void {
+    if (entry.inputAcknowledgementTimer !== undefined) return;
+    const oldestSentAt = entry.pendingInputSequences.values().next().value;
+    if (oldestSentAt === undefined) return;
+    const deadlineMs = this.#inputAcknowledgementTimeoutMs();
+    entry.inputAcknowledgementTimer = setTimeout(() => {
+      delete entry.inputAcknowledgementTimer;
+      if (
+        this.#closed ||
+        entry.connection !== connection ||
+        entry.connectionRevision !== connectionRevision ||
+        entry.state !== "active"
+      ) return;
+      const oldest = entry.pendingInputSequences.values().next().value;
+      if (oldest === undefined) return;
+      if (this.#clock() - oldest < deadlineMs) {
+        this.#armInputAcknowledgementDeadline(entry, connection, connectionRevision);
+        return;
+      }
+      this.#expireInputAcknowledgement(entry, connection, connectionRevision);
+    }, Math.max(1, oldestSentAt + deadlineMs - this.#clock()));
+    entry.inputAcknowledgementTimer.unref();
+  }
+
+  /**
+   * The same interruption as an expired heartbeat, reached sooner and named
+   * for its cause. `retireInputAcceptance` marks the unacknowledged keys as
+   * uncertain history, which is what keeps them from ever being resent.
+   */
+  #expireInputAcknowledgement(
+    entry: TerminalEntry,
+    connection: TerminalWireConnection,
+    connectionRevision: number,
+  ): void {
+    if (
+      entry.connection !== connection ||
+      entry.connectionRevision !== connectionRevision ||
+      entry.state !== "active"
+    ) return;
+    this.#clearHeartbeatWatchdog(entry);
+    entry.outputAbort.abort(runtimeFailure("terminal_disconnected", "Terminal input was not acknowledged before its deadline."));
+    entry.state = "interrupted";
+    retireInputAcceptance(entry);
+    entry.outputContinuity = "unknown";
+    entry.reason = "input_ack_timeout";
+    this.#publish(entry);
+    void connection.close({ code: 1001, reason: "cuna_input_ack_timeout" }).catch(() => undefined);
+  }
+
   #nextActiveTab(excluding: string): string | undefined {
     return [...this.#terminals.values()].find((entry) => entry.tabId !== excluding && entry.state === "active")?.tabId;
   }
@@ -2173,6 +2261,9 @@ function retireInputAcceptance(entry: TerminalEntry): void {
   entry.historicalInputUncertainty ||= entry.pendingInputSequences.size > 0;
   if (entry.inputSequence > entry.retiredInputSequence) entry.retiredInputSequence = entry.inputSequence;
   entry.pendingInputSequences.clear();
+  // Retired input has no deadline left to miss; the next scope arms its own.
+  if (entry.inputAcknowledgementTimer !== undefined) clearTimeout(entry.inputAcknowledgementTimer);
+  delete entry.inputAcknowledgementTimer;
   if (entry.historicalInputUncertainty) entry.inputContinuity = "uncertain";
 }
 

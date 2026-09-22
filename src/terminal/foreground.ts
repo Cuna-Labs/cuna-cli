@@ -61,6 +61,10 @@ const ATTACHING_FRAME_MS = 90;
 // never more than one second under an injected/test cadence.
 const MAX_DISCONNECT_FRAME_MS = 250;
 const INPUT_WITHHELD_NOTICE = "Reconnecting · input was not sent. Retry after terminal attached.";
+// Sent keys went unacknowledged past the runtime's input deadline (R12). Said
+// the moment the runtime gives up on the connection, and it already carries the
+// "not resent" half, so it is never prefixed with HISTORICAL_INPUT_NOTICE.
+const INPUT_STALLED_NOTICE = "Connection stalled · reconnecting — input not resent";
 const FLOW_CONTROL_NOTICE = "Terminal output kept active · Ctrl+] s sends Ctrl+S remotely.";
 const RECONNECT_FAILED_NOTICE = "Reconnect failed · Ctrl+] r retries · Ctrl+C disconnects.";
 // Automatic recovery back-off: 100 ms doubling, capped at 5 s per wait, ten
@@ -704,9 +708,13 @@ export class ForegroundTerminalCoordinator {
       if (becameWriter) this.#reconcileSeatGeometry(snapshot);
       if (
         snapshot.state === "active" &&
-        (this.#browserNotice === INPUT_WITHHELD_NOTICE || isReconnectFailedNotice(this.#browserNotice))
+        (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === INPUT_STALLED_NOTICE ||
+          isReconnectFailedNotice(this.#browserNotice))
       ) {
         this.#browserNotice = undefined;
+      }
+      if (snapshot.state === "interrupted" && snapshot.reason === "input_ack_timeout") {
+        this.#browserNotice = INPUT_STALLED_NOTICE;
       }
       if (
         this.#localDetachTabIds.has(snapshot.tabId) &&
@@ -769,7 +777,8 @@ export class ForegroundTerminalCoordinator {
         const snapshot = await this.#requireRuntime().reconnect({ tabId, signal: this.#lifetimeAbort.signal });
         await this.#reconcileGeometry(snapshot, false);
         this.#recoverableReconnectFailures.delete(tabId);
-        if (this.#browserNotice === INPUT_WITHHELD_NOTICE || isReconnectFailedNotice(this.#browserNotice)) {
+        if (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === INPUT_STALLED_NOTICE ||
+          isReconnectFailedNotice(this.#browserNotice)) {
           this.#browserNotice = undefined;
         }
         return;
