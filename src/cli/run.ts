@@ -645,8 +645,9 @@ interface InlineProgress {
    *
    * The elapsed figure is re-derived on every repaint rather than reprinted
    * from the caller's last notice, because the caller reports once per poll —
-   * up to 2 000 ms apart — and a number that only moves when the poll does
-   * reproduces the dwell it is meant to cure.
+   * up to 1 600 ms apart, the ceiling of `readinessBackoffMs` — and a number
+   * that only moves when the poll does reproduces the dwell it is meant to
+   * cure.
    */
   wait(notice: JourneyWait | undefined): void;
   /** Print one durable line above the spinner, then keep spinning. */
@@ -807,7 +808,7 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
         waiting: {
           waitingFor: waiting.notice.waitingFor,
           // Re-derived per repaint: the reporter speaks once per poll, up to
-          // 2 000 ms apart, and a number that only moves when the poll does
+          // 1 600 ms apart, and a number that only moves when the poll does
           // reproduces the dwell it is meant to cure.
           elapsedMs: waiting.notice.elapsedMs + (now - waiting.observedAt),
           deadlineMs: waiting.notice.deadlineMs,
@@ -823,6 +824,13 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
       : color ? `\u001b[38;5;255m${fitted}\u001b[0m` : fitted;
     if (lastColumns > columns && lastCells >= columns) {
       // A terminal resize can reflow our previously single row before repaint.
+      // HAZARD, unrepaired: this assumes the terminal reflowed. One that
+      // truncated instead still has a single row here, so the walk clears
+      // whatever is above it — on this path, the durable `note()` line naming
+      // the AgentSession. @xterm/headless truncates, which is why
+      // `test/cli.test.mjs` asserts the progress row is never BELOW the durable
+      // rows rather than exactly at row 0. Distinguishing the two needs
+      // terminal feedback the CLI does not have.
       for (let row = 0; row < Math.floor(lastCells / columns); row += 1) stream.write("\r\u001b[2K\u001b[1A");
     }
     stream.write(`\r\u001b[2K${styled}`);

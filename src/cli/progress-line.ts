@@ -17,7 +17,7 @@ import type { JourneyAgentSessionDisposition } from "../journey/orchestrator.js"
  * When the elapsed counter joins the label.
  *
  * DERIVATION. The goal's own silence threshold is 2 000 ms, and the measured
- * dwell floor worth reporting was `Preparing Claude Code` at 2 018–3 700 ms in
+ * dwell floor worth reporting was `Preparing Claude Code` at 2.0–3.7 s in
  * all five runs (§ 3, finding 4). Below this a step is finishing normally and
  * a counter is noise; above it, the number is the only evidence a person has.
  */
@@ -64,10 +64,12 @@ export function composeInlineProgressLine(input: InlineProgressLineInput): Inlin
  *
  * Measured 2026-09-22 (§ 2, finding (ii)): no such line existed. The CLI
  * printed the intent `Creating Claude Code session` and never a completion, so
- * the row `00b6d65a` existed for 11 446 ms with nothing on screen naming it,
- * and the only thing resembling a reuse statement was a QUESTION. The id is
- * shown as an 8-character prefix, the same truncation this CLI already uses
- * for a build digest, so it can never read as a whole identifier.
+ * the row `00b6d65a` was created at t+11 446 ms while the screen still read
+ * `Starting Claude Code`, and nothing named it for the rest of the run; the
+ * only thing resembling a reuse statement was a QUESTION. The id is shown as
+ * an 8-character prefix, the truncation `runtime/owner-grants-screen.ts`
+ * already uses when it puts a resource id on screen, so it can never read as a
+ * whole identifier.
  */
 export function agentSessionDispositionLine(event: JourneyAgentSessionDisposition): string {
   return `AgentSession ${event.agentSessionId.slice(0, 8)} · ${event.disposition}`;

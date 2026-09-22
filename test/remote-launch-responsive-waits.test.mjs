@@ -97,7 +97,8 @@ test("a slow remote session read is re-issued and the launch still attaches", as
 
 test("NEGATIVE CONTROL: the same slow read ends the launch once its deadline has elapsed", async () => {
   // The old behaviour, reproduced by removing the only thing that changed:
-  // launch time left. `cold1` exited 5 here with exactly this refusal.
+  // launch time left. `cold1` exited 5 with exactly this refusal on the
+  // local-path journey, which polls the same idempotent route as this one.
   const f = fixture();
   let reads = 0;
   f.client.getAgentSession = async (id) => {

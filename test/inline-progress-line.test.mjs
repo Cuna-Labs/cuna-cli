@@ -33,9 +33,9 @@ test("a dwelling step carries the seconds it has been dwelling", () => {
     line({ label: "Starting Claude Code", labelElapsedMs: 2_000, totalElapsedMs: 2_000 }),
     "Starting Claude Code · 2s",
   );
-  // The exact dwell the measurement recorded. It used to read
-  // `Starting Claude Code · still working — Ctrl-C cancels` at second 3 and at
-  // second 61 alike.
+  // The exact dwell the measurement recorded. The escalation this replaces
+  // reached `Starting Claude Code · still working — Ctrl-C cancels` at second
+  // 12 and then said it unchanged through second 61.
   assert.equal(
     line({ label: "Starting Claude Code", labelElapsedMs: 61_259, totalElapsedMs: 72_913 }),
     "Starting Claude Code · 61s — Ctrl-C cancels",
@@ -119,8 +119,8 @@ test("the AgentSession line names the row and whether this journey made it", () 
     agentSessionDispositionLine({ agentSessionId: SESSION, machineId: "m", disposition: "reused" }),
     "AgentSession 00b6d65a · reused",
   );
-  // A prefix, never the whole identifier: the same truncation this CLI uses
-  // for a build digest.
+  // A prefix, never the whole identifier: the same 8-character truncation
+  // `src/runtime/owner-grants-screen.ts` uses when it puts an id on screen.
   assert.doesNotMatch(
     agentSessionDispositionLine({ agentSessionId: SESSION, machineId: "m", disposition: "created" }),
     new RegExp(SESSION, "u"),

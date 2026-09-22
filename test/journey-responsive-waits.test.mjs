@@ -142,8 +142,9 @@ test("NEGATIVE CONTROL: the same slow read aborts once the journey is out of tim
 });
 
 test("a non-idempotent step keeps today's behaviour: the create is never re-issued", async () => {
-  // R5's other half. `POST /v1/machines` commits; an unobserved response is an
-  // unknown outcome, and asking again would be a blind retry of an effect.
+  // R5's other half. The machine create commits — `POST /v1/sessions`, per
+  // `api/client.ts` — so an unobserved response is an unknown outcome, and
+  // asking again would be a blind retry of an effect.
   let creates = 0;
   const h = effects({
     async discoverCapabilities() {

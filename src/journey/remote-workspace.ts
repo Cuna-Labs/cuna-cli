@@ -47,8 +47,9 @@ export async function launchRemoteWorkspaceSession(input: {
   readonly onWait?: JourneyWaitReporter;
   /**
    * Called once, as soon as the remote admits a session and before its
-   * readiness is waited on — the moment the row exists and, measured
-   * 2026-09-22, nothing on screen named it for the next 11 446 ms.
+   * readiness is waited on — the moment the row exists. Measured 2026-09-22
+   * (§ 2, finding (ii)): the row was created at t+11 446 ms and no line named
+   * it for the rest of the run, because no such line existed.
    */
   readonly onAgentSession?: (settled: SettledAgentSession) => void;
   readonly now?: () => number;
@@ -73,9 +74,12 @@ export async function launchRemoteWorkspaceSession(input: {
    *
    * It stays `observationBudgetElapsed`, so it keeps saying the one true thing
    * about a wait the CLI ended itself: `remote_outcome: unobserved`, retryable,
-   * and never a claim that the remote failed. What is new is that it carries
-   * the three figures the screen was already showing, so a transcript and an
-   * error record cannot disagree about what was waited for.
+   * and never a claim that the remote failed. What is new is `waiting_for` and
+   * `elapsed_ms`, the two figures the screen was already showing, so a
+   * transcript and an error record cannot disagree about what was waited for —
+   * plus `read_reissues`, which was never on screen and says how often the CLI
+   * chose to ask again. The deadline reaches the record as `budget_ms`, minted
+   * below from the same `REMOTE_CONVERGENCE_BUDGET_MS`.
    */
   const timeout = (operation: string) => (elapsed: JourneyDeadlineElapsed): CunaError => observationBudgetElapsed({
     kind: "response", operation,

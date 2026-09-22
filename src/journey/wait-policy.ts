@@ -100,12 +100,13 @@ export const MACHINE_READY_DEADLINE_MS = 120_000;
  * How long the CLI pauses before re-issuing a read whose response budget
  * elapsed.
  *
- * DERIVATION. The read that just failed already spent `DEFAULT_REQUEST_BUDGET_MS`
- * (15 000 ms), so a long pause on top of it would be waiting twice for the same
- * answer. The measured warm floor for a complete HTTPS exchange on this exact
- * route is 106 ms (`prds/cuna-cli-latency-before-20260922.md` § 1), so 250 ms is
- * roughly two floors — enough that a re-issue is a new attempt rather than a
- * hot loop, and under 2% of what the failed attempt already cost.
+ * DERIVATION. The read that just failed already spent its whole request budget
+ * — `DEFAULT_REQUEST_BUDGET_MS`, 15 000 ms, unless `--timeout-ms` lowered it —
+ * so a long pause on top of that would be waiting twice for the same answer.
+ * The measured warm floor for a complete HTTPS exchange on this exact route is
+ * 106 ms (`prds/cuna-cli-latency-before-20260922.md` § 1), so 250 ms is roughly
+ * two floors — enough that a re-issue is a new attempt rather than a hot loop,
+ * and under 2% of the default budget the failed attempt spent.
  */
 export const REISSUE_PAUSE_MS = 250;
 
@@ -124,9 +125,12 @@ export interface JourneyDeadline {
  * THE BOUND THIS GIVES, STATED EXACTLY. `elapsed()` gates DISPATCH: a read
  * already in flight when the deadline passes is awaited rather than discarded,
  * because throwing away an answer that arrived is strictly worse than being
- * late, and the caller reports the real `elapsed_ms` either way. So the worst
- * case for the phase is `deadlineMs` plus at most one request budget
- * (`DEFAULT_REQUEST_BUDGET_MS`), and never unbounded.
+ * late, and the caller reports the real `elapsed_ms` either way. So a phase
+ * overshoots `deadlineMs` by one request budget (`DEFAULT_REQUEST_BUDGET_MS`)
+ * for every read it dispatches between two checks, and is never unbounded.
+ * That is one read for `ensureMachineReady` and for both loops in
+ * `remote-workspace.ts`, and TWO for `ensureAgentSessionReady`, which reads the
+ * session and then the terminal authority without re-checking in between.
  */
 export function startJourneyDeadline(deadlineMs: number, now: () => number): JourneyDeadline {
   if (!Number.isFinite(deadlineMs) || deadlineMs < 0) {
@@ -217,8 +221,8 @@ export interface IdempotentReadInput<T> {
   /**
    * Declared required, read defensively. The journey effects are reachable
    * without a cancellation authority, and the poll loops around this one
-   * already spell `signal?.aborted` for the same reason: a missing signal must
-   * not become a TypeError on the path that handles a slow network.
+   * already spell `signal?.aborted` for the same reason, so the abort check
+   * below does too rather than being the one place a missing signal throws.
    */
   readonly signal: AbortSignal;
   readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;

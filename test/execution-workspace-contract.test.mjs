@@ -45,7 +45,7 @@ test('readiness timeout retains the admitted session identity and read-only reco
   // attempts, so a fake sleep has to move a fake clock: a sleep that returns
   // without time passing is a loop with no bound, which is what this fixture
   // used to describe. The read guard is derived from that deadline and the
-  // backoff floor, so it stays a live check on termination instead of a number
+  // backoff ceiling, so it stays a live check on termination instead of a number
   // that drifts: the slowest sleep is 1 600 ms, so no more than
   // ceil(deadline / 1600) + 5 reads can fit inside the deadline.
   const READ_CEILING=Math.ceil(AGENT_SESSION_READY_DEADLINE_MS/1_600)+5;
