@@ -374,9 +374,9 @@ test("an unchanged workspace reuses its committed generation instead of committi
 
   assert.equal(result.generation, 7, "the committed generation must be reused, not advanced");
   assert.equal(result.bindingId, binding.bindingId);
-  // Generation 7 was committed by nobody this installation can prove, so there
-  // is no sync session to read remote changes with. The attach still succeeds,
-  // and the missing capability is named rather than left as silence.
+  // This installation never committed generation 7, so it holds no sync session
+  // to read remote changes with. The attach still succeeds, and the missing
+  // capability is named rather than left as silence.
   assert.equal(reused.continuousSyncSnapshot(), undefined, "no poller may claim to run without a read handle");
   assert.deepEqual(notices, ["Remote workspace changes will not arrive this run · resume_session_unavailable"]);
 });
@@ -511,7 +511,7 @@ async function waitFor(predicate, message, timeout = 5_000) {
   assert.fail(message);
 }
 
-/** The change page one remote generation would produce, from two manifests of the same tree. */
+/** The change page one remote generation would produce, from the manifest before it and the manifest after it. */
 function remoteGeneration(generation, before, after, policyDigest) {
   const prior = new Map(before.entries.map((entry) => [entry.path, entry]));
   const current = new Map(after.entries.map((entry) => [entry.path, entry]));
@@ -599,7 +599,8 @@ test("a reconnect that commits nothing still delivers a remote generation into t
   assert.equal(commitsAfterFirstRun, 1);
 
   // Somebody else advances the workspace: generation 2 adds a file this folder
-  // has never seen. Arming it only now keeps the first run's poller innocent.
+  // has never seen. It is armed only now, after the first run's poller has been
+  // stopped, so that poller cannot be what delivered it.
   const desired = join(state, "desired");
   await makeDirectory(desired);
   await writeFile(join(desired, "main.js"), "console.log(1);\n");
@@ -617,10 +618,11 @@ test("a reconnect that commits nothing still delivers a remote generation into t
   wire.changePage = remoteGeneration(2, localManifest, desiredManifest, policy.digest);
 
   // The reconnect. Content is byte-identical, so no generation is committed.
-  // The supervisor is stopped in `finally` rather than in an `after` hook: the
-  // temporary-directory hook was registered first, so a still-running poller
-  // would write its durable state into a directory already removed, and the
-  // test would fail on that instead of on what it measures.
+  // The supervisor is stopped in `finally` rather than in an `after` hook:
+  // `t.after` runs in registration order and the temporary-directory hook was
+  // registered first, so a still-running poller would write its durable state
+  // into a directory already removed, and the test would fail on that instead
+  // of on what it measures.
   const second = effects(client, state, { transport: wire });
   try {
     const secondResult = await second.synchronizeWorkspace({

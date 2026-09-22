@@ -334,20 +334,20 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           });
         }
         // Skipping the commit must not also skip remote delivery. The
-        // supervisor is the only reader of `GET …/changes`, so with none
-        // running a generation produced on the Machine can never reach this
-        // folder — and the byte-identical reconnect is exactly the path a
-        // returning owner takes (PRD workspace remote-to-local sync
+        // supervisor is the only reader of `GET …/changes` the product runs, so
+        // with none running a generation produced on the Machine can never
+        // reach this folder — and the byte-identical reconnect is exactly the
+        // path a returning owner takes (PRD workspace remote-to-local sync
         // 2026-09-22, §1 gate G1).
         //
         // There is no commit receipt here by construction, so the supervisor is
         // admitted against the generation the authority publishes instead. Its
-        // one local prerequisite is a sync session id from an earlier commit by
-        // this installation. Without one the attach still proceeds: refusing to
-        // open the terminal because remote edits cannot be delivered would be
-        // the worse trade, and the next local content change commits a
-        // generation, which starts the poller on the proven path. The reason is
-        // said in one line rather than swallowed.
+        // one local prerequisite is a committed sync session from an earlier run
+        // of this installation under this exclusion policy. Without one the
+        // attach still proceeds: refusing to open the terminal because remote
+        // edits cannot be delivered would be the worse trade, and the next run
+        // whose content differs commits a generation, which starts the poller on
+        // the proven path. The reason is said in one line rather than swallowed.
         try {
           await mkdir(checkpointRoot, { recursive: true, mode: 0o700 });
           attachContinuousSync(await resumeContinuousWorkspaceSync({

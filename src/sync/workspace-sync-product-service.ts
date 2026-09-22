@@ -291,14 +291,19 @@ export async function startContinuousWorkspaceSync(
  * the caller passes the generation and manifest root the WorkspaceBinding
  * publishes, and this refuses unless the local tree reproduces that exact
  * manifest root. The durable checkpoint contributes only the sync session id,
- * which is a read handle and nothing more: `list_workspace_sync_changes` diffs
- * every committed revision of the session's namespace irrespective of which
- * session committed it, `get_workspace_sync_chunk` resolves content by
- * namespace too, neither filters on session state, and a committed session is
- * never deleted — the pruner only moves `staging` rows to `expired`. Read at
- * infra `abc07a94`: `supabase/migrations/0060_workspace_sync_public_authority.sql`
- * lines 1004-1117 and 1219-1243, `0072_workspace_sync_chunk_download_authority.sql`
- * lines 9-60, `0069_workspace_sync_binding_authority.sql` lines 161-231.
+ * which is a read handle and nothing more: the change feed diffs every
+ * committed revision of the session's namespace irrespective of which session
+ * committed it, the chunk read resolves content by namespace too, neither
+ * filters on session state, and a committed session is never deleted — the
+ * pruner only moves `staging` rows to `expired`.
+ *
+ * Read at infra `abc07a94`: `list_workspace_sync_changes_v2`
+ * (`supabase/migrations/0069_workspace_sync_binding_authority.sql`:891-913)
+ * fences and then delegates to the body that same migration renamed at :584,
+ * still written at `0060_workspace_sync_public_authority.sql`:1004-1120. The
+ * pruner is `0060…`:1219-1245, the chunk read
+ * `0072_workspace_sync_chunk_download_authority.sql`:9-67, and the shared
+ * session fence both of them take `0069…`:161-280.
  */
 export async function resumeContinuousWorkspaceSync(
   input: ResumeContinuousWorkspaceSyncInput,
@@ -355,7 +360,10 @@ export async function resumeContinuousWorkspaceSync(
 }
 
 /**
- * The newest committed sync session this installation holds for the binding.
+ * The newest committed sync session this installation holds for the binding
+ * under the exclusion policy in force now. A policy change therefore reads as
+ * no session at all, which is the honest answer: the earlier session's
+ * namespace was admitted under a digest this run no longer computes.
  *
  * Directories are read newest base generation first and loaded until one is
  * admitted, so the common reconnect costs a single checkpoint read however
@@ -395,9 +403,9 @@ async function findDurableSyncSession(input: {
       checkpoint.machine_id !== input.machineId ||
       checkpoint.exclusion_policy_digest !== input.policyDigest
     ) continue;
-    // A durable generation newer than the published one is not a stale handle,
-    // it is a contradiction: either the authority rolled back or this folder is
-    // reading another binding's state. Neither may be resumed silently.
+    // The identity above already matched, so a durable generation newer than
+    // the published one does not lag the authority, it contradicts it. A
+    // contradiction is refused, never resumed on the older published state.
     if (checkpoint.committed_generation > input.activeGeneration) {
       throw resumeUnavailable("resume_generation_rollback");
     }

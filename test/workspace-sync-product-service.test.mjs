@@ -282,9 +282,10 @@ test("a reconnect that commits nothing resumes the poller from the durable commi
     activeGeneration: receipt.generation,
     activeManifestRoot: receipt.manifest_root,
   });
-  // Stopped inside the test body, not in an `after` hook: the temporary
-  // directory hooks were registered first, so a live supervisor would still be
-  // writing its durable state into a directory already removed.
+  // Stopped inside the test body, not in an `after` hook: `t.after` runs in
+  // registration order and the temporary-directory hooks were registered first,
+  // so a live supervisor would still be writing its durable state into a
+  // directory already removed.
   try {
     assert.equal(supervisor.snapshot.generation, receipt.generation);
     assert.equal(supervisor.snapshot.manifestRoot, receipt.manifest_root);
