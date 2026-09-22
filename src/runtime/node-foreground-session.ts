@@ -28,6 +28,13 @@ import { admitCapability } from "./capability-gate.js";
 import { RuntimeBoundaryError, runtimeFailure } from "./errors.js";
 import { createNodeWebSocketConnector } from "./node-websocket-connector.js";
 import {
+  claimTerminalClientIdentity,
+  forgetTerminalClientIdentity,
+  isAgentSessionGone,
+  type TerminalClientIdentity,
+  type TerminalClientScope,
+} from "./terminal-client-identity.js";
+import {
   assertRemoteAgentSessionEvidence,
   type TerminalConnector,
   type TerminalControlPlane,
@@ -61,6 +68,15 @@ export interface ForegroundSessionRunnerInput {
   readonly onProgress?: (label: string) => void;
   /** Clears caller-owned progress UI before raw/alternate-screen terminal ownership. */
   readonly onBeforeTerminalOwnership?: () => void;
+  /**
+   * Where this computer remembers which terminal client it is for one
+   * AgentSession, so a re-attach resumes its own writer seat instead of
+   * taking it over; see `runtime/terminal-client-identity.ts`. Absent, every
+   * run is a new client, as before.
+   */
+  readonly terminalClients?: TerminalClientScope;
+  /** One durable line for the person, delivered before terminal ownership begins. */
+  readonly onNotice?: (line: string) => void;
 }
 
 export type ForegroundPresentationMode = "rich" | "plain";
@@ -85,6 +101,26 @@ export interface NodeForegroundSessionDependencies {
 export async function runNodeForegroundSessions(
   input: ForegroundSessionRunnerInput,
   dependencies: NodeForegroundSessionDependencies = {},
+): Promise<void> {
+  try {
+    await runNodeForegroundSessionsWithRetry(input, dependencies);
+  } catch (error) {
+    // A refusal that says the session's process is gone for good ends the
+    // remembered client with it, whichever step of the run it came from.
+    if (input.terminalClients !== undefined && sessionEndedFailure(error)) {
+      for (const agentSessionId of input.agentSessionIds) {
+        try {
+          await forgetTerminalClientIdentity(input.terminalClients, agentSessionId);
+        } catch { /* the refusal is the message; a leftover record is only garbage */ }
+      }
+    }
+    throw error;
+  }
+}
+
+async function runNodeForegroundSessionsWithRetry(
+  input: ForegroundSessionRunnerInput,
+  dependencies: NodeForegroundSessionDependencies,
 ): Promise<void> {
   try {
     await runNodeForegroundSessionsOnce(input, dependencies);
@@ -155,7 +191,6 @@ async function runNodeForegroundSessionsOnce(
   }
   const allowedOrigin = admitApiOrigin(input.baseUrl);
   const host = dependencies.host ?? createNodeForegroundTerminalHost();
-  const clientInstanceId = dependencies.clientInstanceId?.() ?? `cli:${randomUUID()}`;
 
   // TTY authority and dimensions are admitted before any control-plane read or
   // one-use terminal grant. Acquiring raw/alternate-screen ownership remains a
@@ -169,12 +204,20 @@ async function runNodeForegroundSessionsOnce(
     clock,
   });
   const intents: ForegroundTabIntent[] = [];
+  const sessions: AgentSession[] = [];
   for (let index = 0; index < sessionIds.length; index += 1) {
     const agentSessionId = sessionIds[index];
     if (agentSessionId === undefined) continue;
     throwIfAborted(input.signal);
     input.onProgress?.("Checking selected AgentSession");
     const session = await input.client.getAgentSession(agentSessionId, input.signal);
+    sessions.push(session);
+    // A session in a typed terminal state takes its remembered client with it.
+    if (input.terminalClients !== undefined && isAgentSessionGone(session)) {
+      try {
+        await forgetTerminalClientIdentity(input.terminalClients, agentSessionId);
+      } catch { /* a record left behind is only garbage; the attach decides on its own */ }
+    }
     if (session.agent !== "claude-code" && session.agent !== "codex" && session.agent !== "opencode") {
       throw runtimeFailure(
         "capability_unsupported",
@@ -266,6 +309,72 @@ async function runNodeForegroundSessionsOnce(
   }
   throwIfAborted(input.signal);
 
+  const identity = await claimClientIdentity(input, dependencies, sessions);
+  try {
+    await runClaimedForeground(input, dependencies, {
+      clock,
+      host,
+      presentationMode,
+      controlPlane,
+      allowedOrigin,
+      intents,
+      clientInstanceId: identity?.clientInstanceId ?? dependencies.clientInstanceId?.() ?? `cli:${randomUUID()}`,
+      ...(identity === undefined ? {} : { identity }),
+    });
+  } finally {
+    await identity?.release();
+  }
+}
+
+/**
+ * The client this run attaches as. Only a single-session run with a scope and
+ * no injected id can reuse one: a runtime has one client id, and a remembered
+ * id belongs to exactly one AgentSession. A record this computer cannot use
+ * (an unsafe file, say) leaves the run a new client, exactly as before.
+ */
+async function claimClientIdentity(
+  input: ForegroundSessionRunnerInput,
+  dependencies: NodeForegroundSessionDependencies,
+  sessions: readonly AgentSession[],
+): Promise<TerminalClientIdentity | undefined> {
+  const session = sessions[0];
+  if (input.terminalClients === undefined || dependencies.clientInstanceId !== undefined ||
+    sessions.length !== 1 || session === undefined || isAgentSessionGone(session)) return undefined;
+  let identity: TerminalClientIdentity;
+  try {
+    identity = await claimTerminalClientIdentity(input.terminalClients, session);
+  } catch {
+    return undefined;
+  }
+  if (identity.notice !== undefined) input.onNotice?.(identity.notice);
+  return identity;
+}
+
+/**
+ * The refusal after which the AgentSession cannot be attached again: the owner
+ * of that exact process is gone. (A process exit seen on the wire is the other
+ * typed end; `runClaimedForeground` watches for it.)
+ */
+function sessionEndedFailure(error: unknown): boolean {
+  if (error instanceof AggregateError) return error.errors.some(sessionEndedFailure);
+  return error instanceof RuntimeBoundaryError && error.safeDetails?.reason_code === "terminal_owner_unrecoverable";
+}
+
+async function runClaimedForeground(
+  input: ForegroundSessionRunnerInput,
+  dependencies: NodeForegroundSessionDependencies,
+  context: {
+    readonly clock: () => number;
+    readonly host: ForegroundTerminalHost;
+    readonly presentationMode: ForegroundPresentationMode;
+    readonly controlPlane: TerminalControlPlane;
+    readonly allowedOrigin: string;
+    readonly intents: readonly ForegroundTabIntent[];
+    readonly clientInstanceId: string;
+    readonly identity?: TerminalClientIdentity;
+  },
+): Promise<void> {
+  const { clock, host, presentationMode, controlPlane, allowedOrigin, intents, clientInstanceId } = context;
   input.onProgress?.("Preparing your cloud terminal");
   input.onBeforeTerminalOwnership?.();
   const coordinator = presentationMode === "rich"
@@ -284,6 +393,7 @@ async function runNodeForegroundSessionsOnce(
           : { resizeCoalesceMs: dependencies.coordinatorOptions.resizeCoalesceMs }),
       });
   const callbacks = coordinator.runtimeCallbacks();
+  let processExited = false;
   const runtime = new CunaRuntimeBoundary({
     mode: "foreground",
     canonicalTerminalViews: presentationMode === "rich",
@@ -294,6 +404,10 @@ async function runNodeForegroundSessionsOnce(
     clientInstanceId,
     clock,
     ...callbacks,
+    onTerminalState: (snapshot) => {
+      if (snapshot.state === "closed" && snapshot.reason === "remote_process_exit") processExited = true;
+      callbacks.onTerminalState?.(snapshot);
+    },
   });
   coordinator.bindRuntime(runtime);
   runtime.startForeground();
@@ -333,6 +447,13 @@ async function runNodeForegroundSessionsOnce(
     await runtime.shutdown();
   } catch (error) {
     cleanupFailures.push(error);
+  }
+  if (processExited) {
+    try {
+      await context.identity?.forget();
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
   }
   if (failure !== undefined && cleanupFailures.length > 0) {
     throw new AggregateError([failure, ...cleanupFailures], "Foreground terminal execution and cleanup both failed.");

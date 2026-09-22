@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import xterm from "@xterm/headless";
 
+import { createPlatformAdapter } from "../dist/platform/adapter.js";
+import { TERMINAL_CLIENT_BUSY_NOTICE, claimTerminalClientIdentity } from "../dist/runtime/terminal-client-identity.js";
 import {
   runNodeForegroundSessions,
   selectNodeForegroundPresentation,
@@ -458,6 +463,8 @@ function terminalSystem(events, availability = () => "supported", canonical = fa
   return {
     controlPlane,
     offers, sent,
+    /** The client instance each grant was requested for, in order. */
+    grantClients: () => [...issuedRequests.values()].map((request) => request.clientInstanceId),
     push(bytes) { for (const queue of activeQueues) queue.push(bytes); },
     cancelledRequests,
     terminalConnector,
@@ -1499,4 +1506,78 @@ test("default Windows foreground factory offers canonical views and waits for cu
     await waitUntil(()=>system.sent.some(f=>f.type==="input"),"ready view permits user input");
     assert.deepEqual([...system.sent.find(f=>f.type==="input").payload],[66]);
   } finally {host.emitInput(Uint8Array.of(3));await operation;}
+});
+
+/* -------------------------------------------------------------------------- */
+/* R14: the same computer re-attaches as the same terminal client               */
+/* -------------------------------------------------------------------------- */
+
+async function terminalClientScope(t) {
+  const home = await mkdtemp(join(tmpdir(), "cuna-foreground-client-"));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
+  const env = { APPDATA: join(home, "Roaming"), LOCALAPPDATA: join(home, "Local"), XDG_STATE_HOME: join(home, "state"), XDG_CONFIG_HOME: join(home, "config") };
+  return { platform: createPlatformAdapter({ env, homeDirectory: home }), profile: "default" };
+}
+
+/** Attach once to SESSION_A and detach cleanly with Ctrl+] d; answer the client the grant was asked for. */
+async function attachAndDetach(input) {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const notices = [];
+  const operation = runSupportedForegroundSessions({
+    client: input.client ?? fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    onNotice: (line) => notices.push(line),
+    ...(input.terminalClients === undefined ? {} : { terminalClients: input.terminalClients }),
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW });
+  await waitUntil(() => host.input !== undefined, "foreground ownership should start after preflight");
+  if (input.exit === true) system.push(encodeTerminalControl("exit", 2n, { exitCode: 0, reason: "exited" }));
+  else host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation.catch(() => undefined);
+  const [client] = system.grantClients();
+  assert.ok(client, "the run must have asked for a grant");
+  return { client, notices };
+}
+
+test("R14: a clean detach and re-attach from this computer asks for the seat as the same client", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const first = await attachAndDetach({ terminalClients });
+  const second = await attachAndDetach({ terminalClients });
+  assert.equal(second.client, first.client);
+  assert.deepEqual([...first.notices, ...second.notices], [], "a sole attachment says nothing about its client");
+});
+
+test("NEGATIVE CONTROL R14: without the remembered client every run is a new one", async () => {
+  const first = await attachAndDetach({});
+  const second = await attachAndDetach({});
+  assert.notEqual(second.client, first.client);
+});
+
+test("R14: a session in a typed terminal state takes its remembered client with it", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const first = await attachAndDetach({ terminalClients });
+  const ended = await attachAndDetach({
+    terminalClients,
+    client: { async getAgentSession(id) { return session(id, { desiredState: "terminated" }); } },
+  });
+  const third = await attachAndDetach({ terminalClients });
+  assert.equal(new Set([first.client, ended.client, third.client]).size, 3);
+});
+
+test("R14: a process exit seen on the wire ends the remembered client", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const exited = await attachAndDetach({ terminalClients, exit: true });
+  const next = await attachAndDetach({ terminalClients });
+  assert.notEqual(next.client, exited.client);
+});
+
+test("R14: while another attachment here holds the client, a second one is new and says so in one line", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const holder = await claimTerminalClientIdentity(terminalClients, session(SESSION_A));
+  t.after(() => holder.release());
+  const second = await attachAndDetach({ terminalClients });
+  assert.notEqual(second.client, holder.clientInstanceId, "two processes are never the same client at once");
+  assert.deepEqual(second.notices, [TERMINAL_CLIENT_BUSY_NOTICE]);
 });

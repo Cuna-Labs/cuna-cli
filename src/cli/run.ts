@@ -77,6 +77,7 @@ import { createPlatformAdapter, type PlatformAdapter } from "../platform/adapter
 import { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "../version.js";
 import { runtimeFeatureGates, type RuntimeFeatureGate } from "../runtime/contracts.js";
 import { RuntimeBoundaryError } from "../runtime/errors.js";
+import type { TerminalClientScope } from "../runtime/terminal-client-identity.js";
 import {
   runNodeForegroundSessions,
   selectNodeForegroundPresentation,
@@ -1027,9 +1028,19 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   let interactiveCloseUi = false;
   let interactiveCloseColor = false;
   let terminalSessionIds: readonly string[] = [];
+  // Known once configuration is read; every attach happens after that.
+  let terminalClients: TerminalClientScope | undefined;
   const runForeground: ForegroundSessionRunner = async (input) => {
     terminalSessionIds = [...input.agentSessionIds];
-    await (dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions)(input);
+    await (dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions)({
+      ...(terminalClients === undefined ? {} : { terminalClients }),
+      onNotice: (line) => {
+        const row = inlineJourneyProgress ?? inlineRootProgress;
+        if (row !== undefined) row.note(line);
+        else streams.stderr.write(`${line}\n`);
+      },
+      ...input,
+    });
   };
   try {
     const parsed = parseArgv(argv);
@@ -1246,6 +1257,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       },
       ...(creatingProfile ? { allowMissingProfile: true } : {}),
     });
+    terminalClients = Object.freeze({ platform, profile: config.profile });
     if (interactiveRoot) {
       inlineRootProgress?.update(config.apiKey === undefined ? "Checking your Cuna sign-in" : "Checking Cuna access");
     }
