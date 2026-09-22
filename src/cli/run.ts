@@ -41,12 +41,19 @@ import {
   conservativeFilesystemCapabilities,
   createApiAgentJourneyEffects,
   createWorkspaceJourneyEffects,
+  journeyWaitLine,
   orchestrateAgentJourney,
   preflightAgentJourneyInvocation,
   type AgentJourneyEffects,
   type AgentJourneyPhase,
+  type JourneyAgentSessionDisposition,
+  type JourneyWait,
   type ReconciledAgentJourneyIntent,
 } from "../journey/index.js";
+import {
+  agentSessionDispositionLine,
+  composeInlineProgressLine,
+} from "./progress-line.js";
 import {
   rootJourneyArgv,
   runNodeRootJourney,
@@ -630,6 +637,16 @@ function credentialError(error: CredentialBoundaryError): CunaError {
 
 interface InlineProgress {
   update(label: string): void;
+  /**
+   * Take over the line with a live "Still waiting for X · Ns of Ms" wait, or
+   * give it back to the plain label with `undefined`.
+   *
+   * The elapsed figure is re-derived on every repaint rather than reprinted
+   * from the caller's last notice, because the caller reports once per poll —
+   * up to 2 000 ms apart — and a number that only moves when the poll does
+   * reproduces the dwell it is meant to cure.
+   */
+  wait(notice: JourneyWait | undefined): void;
   /** Print one durable line above the spinner, then keep spinning. */
   note(line: string): void;
   stop(): void;
@@ -765,24 +782,42 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
   const startedAt = Date.now();
   let frame = 0;
   let label = initialLabel;
+  // When THIS label started, not when the spinner did. The measured defect was
+  // label dwell — 61 259 ms on one unchanging sentence
+  // (`prds/cuna-cli-latency-before-20260922.md` § 3) — so the number a person
+  // needs is how long the current step has been running, not the command.
+  let labelStartedAt = startedAt;
+  let waiting: Readonly<{ notice: JourneyWait; observedAt: number }> | undefined;
   let stopped = false;
   let lastColumns = 0;
   let lastCells = 0;
   const paint = (): void => {
     const columns = inlineProgressColumns(stream);
-    const elapsed = Date.now() - startedAt;
+    const now = Date.now();
     // A spinner alone is too easy to mistake for a frozen cursor on slower
-    // Windows terminals. Keep the phase honest, then add a small, actionable
-    // acknowledgement while an authenticated read is still in flight.
-    const slowHint = elapsed >= 12_000
-      ? " · still working — Ctrl-C cancels"
-      : elapsed >= 4_000
-        ? " · still working"
-        : "";
-    const text = `◆ CUNA  ${frames[frame % frames.length]} ${label}${slowHint}  ${bars[frame % bars.length]}`;
+    // Windows terminals, and `· still working` — the whole escalation this
+    // replaces — said nothing a second repaint had not already said. The
+    // sentence and its thresholds live in `progress-line.ts`, where they can
+    // be asserted without a clock or a TTY.
+    const { headline, trailer } = composeInlineProgressLine({
+      label,
+      ...(waiting === undefined ? {} : {
+        waiting: {
+          waitingFor: waiting.notice.waitingFor,
+          // Re-derived per repaint: the reporter speaks once per poll, up to
+          // 2 000 ms apart, and a number that only moves when the poll does
+          // reproduces the dwell it is meant to cure.
+          elapsedMs: waiting.notice.elapsedMs + (now - waiting.observedAt),
+          deadlineMs: waiting.notice.deadlineMs,
+        },
+      }),
+      labelElapsedMs: now - labelStartedAt,
+      totalElapsedMs: now - startedAt,
+    });
+    const text = `◆ CUNA  ${frames[frame % frames.length]} ${headline}${trailer}  ${bars[frame % bars.length]}`;
     const fitted = truncateTerminalLine(text, columns - 1);
     const styled = color && fitted === text
-      ? `\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;202m${frames[frame % frames.length]}\u001b[0m \u001b[38;5;255m\u001b[1m${label}\u001b[0m\u001b[38;5;245m${slowHint}\u001b[0m  \u001b[38;5;208m${bars[frame % bars.length]}\u001b[0m`
+      ? `\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;202m${frames[frame % frames.length]}\u001b[0m \u001b[38;5;255m\u001b[1m${headline}\u001b[0m\u001b[38;5;245m${trailer}\u001b[0m  \u001b[38;5;208m${bars[frame % bars.length]}\u001b[0m`
       : color ? `\u001b[38;5;255m${fitted}\u001b[0m` : fitted;
     if (lastColumns > columns && lastCells >= columns) {
       // A terminal resize can reflow our previously single row before repaint.
@@ -798,8 +833,23 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
   timer.unref();
   return Object.freeze({
     update(nextLabel: string) {
-      if (stopped || nextLabel === label) return;
-      label = nextLabel;
+      if (stopped) return;
+      // A repeat of the same label must not restart the dwell clock, but it
+      // MUST still end a wait: the phase resuming is exactly the state change
+      // the wait line was standing in for, and an early return on the label
+      // alone would leave the stale wait on screen forever.
+      if (nextLabel === label && waiting === undefined) return;
+      waiting = undefined;
+      if (nextLabel !== label) {
+        label = nextLabel;
+        labelStartedAt = Date.now();
+      }
+      paint();
+    },
+    wait(notice: JourneyWait | undefined) {
+      if (stopped) return;
+      waiting = notice === undefined ? undefined : Object.freeze({ notice, observedAt: Date.now() });
+      if (notice === undefined) labelStartedAt = Date.now();
       paint();
     },
     note(line: string) {
@@ -1625,15 +1675,57 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         throw unsupportedError("openclaw", "provider_route_unavailable");
       }
       const journeyAgent = journeyIntent.agent;
+      const journeyColor = (): boolean =>
+        !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
       const resumeJourneyProgress = (): Readonly<InlineProgress> | undefined => {
         if (streams.stderrIsTTY === true) {
           return startInlineProgress(
             streams.stderr,
-            !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+            journeyColor(),
             journeyPhaseLabel("create-agent-session", journeyAgent),
           );
         }
         return undefined;
+      };
+      /**
+       * Ask the one recorded-launch question, and answer the screen at once.
+       *
+       * ONE HELPER BECAUSE THERE WAS ONE QUESTION AND TWO BEHAVIOURS. The
+       * journey copy stopped the spinner to ask and never took the row back;
+       * the remote-menu copy left the spinner running, so its 90 ms repaint
+       * erased the question before it could be read. Measured 2026-09-22
+       * (`prds/cuna-cli-latency-before-20260922.md` § 3, finding 1): the
+       * terminal went BYTE-silent for up to 18 314 ms in 3 of 5 runs, always
+       * immediately after this answer was accepted — the screen froze on the
+       * person's own keystroke. The answer decides which of two things happens
+       * next, so say which, then take the row back.
+       */
+      const askCreateAnotherSession = async (signal: AbortSignal | undefined): Promise<boolean> => {
+        inlineJourneyProgress?.stop();
+        inlineJourneyProgress = undefined;
+        const question = "A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ";
+        const prompt = createInterface({ input: process.stdin, output: streams.stderr });
+        let another: boolean;
+        try {
+          const answer = signal === undefined
+            ? await prompt.question(question)
+            : await prompt.question(question, { signal });
+          another = /^y(?:es)?$/iu.test(answer.trim());
+        } finally {
+          prompt.close();
+        }
+        // Named for the branch that was taken, not for the question: "No"
+        // resumes a launch that already exists, and calling that "Creating"
+        // would be the CLI announcing work it is not about to do.
+        const next = another
+          ? journeyPhaseLabel("create-agent-session", journeyAgent)
+          : "Resuming the recorded launch";
+        if (streams.stderrIsTTY === true) {
+          inlineJourneyProgress = startInlineProgress(streams.stderr, journeyColor(), next);
+        } else {
+          streams.stderr.write(`${next}\n`);
+        }
+        return another;
       };
       if (credentialMode === undefined) {
         throw new CunaError({
@@ -1667,7 +1759,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const agentSessionId = await launchRemoteWorkspaceSession({
           preset,
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id},
-          confirmNew:async()=>{const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal:dependencies.signal})).trim());}finally{prompt.close();}},
+          confirmNew: () => askCreateAnotherSession(dependencies.signal),
           client, machineId: dependencies.managedWorkspaceMachineId, workspaceId, agent: journeyAgent,
           onProgress: (label) => inlineJourneyProgress?.update(label),
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
@@ -1724,7 +1816,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         effects = createApiAgentJourneyEffects({
           client,
           requestedAgent: journeyAgent,
-          confirmNewProviderLaunch:async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal})).trim());}finally{prompt.close();}},
+          confirmNewProviderLaunch: (signal) => askCreateAnotherSession(signal),
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
           selectProviderPreset: async (signal) => {
             inlineJourneyProgress?.stop();
@@ -1782,6 +1874,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
               signal,
             });
           },
+          onWait: (notice) => {
+            if (inlineJourneyProgress !== undefined) inlineJourneyProgress.wait(notice);
+            else streams.stderr.write(`${journeyWaitLine(notice)}\n`);
+          },
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
       }
@@ -1791,6 +1887,12 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         onPhase(phase: AgentJourneyPhase) {
           baseEffects.onPhase?.(phase);
           inlineJourneyProgress?.update(journeyPhaseLabel(phase, journeyAgent));
+        },
+        onAgentSession(event: JourneyAgentSessionDisposition) {
+          baseEffects.onAgentSession?.(event);
+          const line = agentSessionDispositionLine(event);
+          if (inlineJourneyProgress !== undefined) inlineJourneyProgress.note(line);
+          else streams.stderr.write(`${line}\n`);
         },
         async attach(input: Parameters<AgentJourneyEffects["attach"]>[0]) {
           inlineJourneyProgress?.update(`Attaching to ${agentDisplayName(journeyAgent)}`);
