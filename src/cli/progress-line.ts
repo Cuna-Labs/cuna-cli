@@ -1,5 +1,7 @@
+import type { Writable } from "node:stream";
 import { journeyWaitLine, type JourneyWait } from "../journey/wait-policy.js";
 import type { JourneyAgentSessionDisposition } from "../journey/orchestrator.js";
+import { truncateTerminalLine } from "../terminal/cell-width.js";
 
 /**
  * What the one inline progress row SAYS, separated from how it is painted.
@@ -57,6 +59,54 @@ export function composeInlineProgressLine(input: InlineProgressLineInput): Inlin
     : "";
   const cancelHint = input.totalElapsedMs >= INLINE_CANCEL_HINT_MS ? " — Ctrl-C cancels" : "";
   return Object.freeze({ headline, trailer: `${dwellHint}${cancelHint}` });
+}
+
+const INLINE_PROGRESS_SPINNER = Object.freeze(["◐", "◓", "◑", "◒"]);
+const INLINE_PROGRESS_BARS = Object.freeze(["━╺━━━━", "━━╺━━━", "━━━╺━━", "━━━━╺━", "━━━━━╺", "━━━━╸━", "━━━╸━━", "━━╸━━━"]);
+
+/**
+ * One painted frame of the row, as the bytes after `\r\x1b[2K`.
+ *
+ * Here rather than inside the paint loop because two writers must produce the
+ * same frame: `cli/first-line.ts` paints frame 0 before the CLI's modules have
+ * loaded, and the loop in `cli/run.ts` takes the row over from frame 1. Two
+ * spellings of one frame would show as a flicker at the handover.
+ */
+export function renderInlineProgressFrame(input: {
+  readonly headline: string;
+  readonly trailer: string;
+  readonly frame: number;
+  readonly columns: number;
+  readonly color: boolean;
+}): { readonly styled: string; readonly fitted: string } {
+  const spinner = INLINE_PROGRESS_SPINNER[input.frame % INLINE_PROGRESS_SPINNER.length];
+  const bar = INLINE_PROGRESS_BARS[input.frame % INLINE_PROGRESS_BARS.length];
+  const text = `◆ CUNA  ${spinner} ${input.headline}${input.trailer}  ${bar}`;
+  const fitted = truncateTerminalLine(text, input.columns - 1);
+  const styled = input.color && fitted === text
+    ? `\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;202m${spinner}\u001b[0m \u001b[38;5;255m\u001b[1m${input.headline}\u001b[0m\u001b[38;5;245m${input.trailer}\u001b[0m  \u001b[38;5;208m${bar}\u001b[0m`
+    : input.color ? `\u001b[38;5;255m${fitted}\u001b[0m` : fitted;
+  return Object.freeze({ styled, fitted });
+}
+
+export function inlineProgressColumns(stream: Writable): number {
+  const tty = stream as Writable & {
+    columns?: number;
+    _handle?: { getWindowSize?: (size: number[]) => number };
+  };
+  // Node 24 on Windows can retain stale public columns after ConPTY resize.
+  // Read this stream's native TTY observation without changing its prototype
+  // or cached fields. This guarded private API depends on the supported Node
+  // engine; absent/failed/malformed observations retain the ordinary fallback.
+  if (process.platform === "win32" && typeof tty._handle?.getWindowSize === "function") {
+    try {
+      const size: number[] = [];
+      if (tty._handle.getWindowSize(size) === 0 && size.length === 2 &&
+        Number.isSafeInteger(size[0]) && size[0]! >= 2 && size[0]! <= 4096 &&
+        Number.isSafeInteger(size[1]) && size[1]! >= 1 && size[1]! <= 4096) return size[0]!;
+    } catch { /* An unavailable native observation does not break progress. */ }
+  }
+  return Number.isSafeInteger(tty.columns) && tty.columns! >= 2 && tty.columns! <= 4096 ? tty.columns! : 80;
 }
 
 /**

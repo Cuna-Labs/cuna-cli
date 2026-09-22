@@ -5,7 +5,7 @@ import {runOwnerGrantsScreen,type ShareableSession,type ShareableSessionListing}
 import {ownerGrantOperationStore} from "../runtime/owner-grant-operations.js";
 import { runProviderScreen } from "../machines/provider-screen.js";
 import { Writable } from "node:stream";
-import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
+import { terminalCellWidth } from "../terminal/cell-width.js";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { mkdir } from "node:fs/promises";
@@ -55,7 +55,16 @@ import {
 import {
   agentSessionDispositionLine,
   composeInlineProgressLine,
+  inlineProgressColumns,
+  renderInlineProgressFrame,
 } from "./progress-line.js";
+import {
+  agentDisplayName,
+  journeyPreparationLabel,
+  ROOT_FIRST_LINE_LABEL,
+  type FirstLine,
+  type PaintedFirstLine,
+} from "./first-line.js";
 import { askRecordedLaunch } from "./recorded-launch-prompt.js";
 import { settledAgentSessionDisposition } from "../journey/session-disposition.js";
 import {
@@ -131,6 +140,12 @@ export interface RunCliDependencies {
    * for the repair is n=0: none of the nine runs of § 8.2 met the question.
    */
   readonly promptInput?: NodeJS.ReadableStream;
+  /**
+   * The row `bin/cuna.ts` painted before this module loaded, if it painted one.
+   * The paint site that would have drawn the same row claims it instead of
+   * drawing it again; see `cli/first-line.ts`.
+   */
+  readonly firstLine?: FirstLine;
   readonly automaticJourneyEffectsFactory?: (input: {
     readonly client: CunaApiClient;
     readonly intent: ReconciledAgentJourneyIntent;
@@ -538,13 +553,6 @@ function managedWorkspaceScope(intent: ReconciledAgentJourneyIntent, machineId?:
   return `${intent.agent}-${intent.machine.kind}`;
 }
 
-function agentDisplayName(agent: string): string {
-  return agent === "claude-code" ? "Claude Code"
-    : agent === "codex" ? "Codex"
-    : agent === "opencode" ? "OpenCode"
-    : "OpenClaw";
-}
-
 type BrowserLoginRemoteProbe = Readonly<{
   status: "verified" | "unavailable" | "unknown" | "not_checked";
   reason: string;
@@ -774,31 +782,20 @@ function writeTerminalSupervisorReadiness(
   }
 }
 
-function inlineProgressColumns(stream: Writable): number {
-  const tty = stream as Writable & {
-    columns?: number;
-    _handle?: { getWindowSize?: (size: number[]) => number };
-  };
-  // Node 24 on Windows can retain stale public columns after ConPTY resize.
-  // Read this stream's native TTY observation without changing its prototype
-  // or cached fields. This guarded private API depends on the supported Node
-  // engine; absent/failed/malformed observations retain the ordinary fallback.
-  if (process.platform === "win32" && typeof tty._handle?.getWindowSize === "function") {
-    try {
-      const size: number[] = [];
-      if (tty._handle.getWindowSize(size) === 0 && size.length === 2 &&
-        Number.isSafeInteger(size[0]) && size[0]! >= 2 && size[0]! <= 4096 &&
-        Number.isSafeInteger(size[1]) && size[1]! >= 1 && size[1]! <= 4096) return size[0]!;
-    } catch { /* An unavailable native observation does not break progress. */ }
-  }
-  return Number.isSafeInteger(tty.columns) && tty.columns! >= 2 && tty.columns! <= 4096 ? tty.columns! : 80;
-}
-
-function startInlineProgress(stream: Writable, color: boolean, initialLabel = "Loading machines"): Readonly<InlineProgress> {
-  const frames = ["◐", "◓", "◑", "◒"];
-  const bars = ["━╺━━━━", "━━╺━━━", "━━━╺━━", "━━━━╺━", "━━━━━╺", "━━━━╸━", "━━━╸━━", "━━╸━━━"];
-  const startedAt = Date.now();
-  let frame = 0;
+/**
+ * Start the one inline progress row, or continue a row `cli/first-line.ts`
+ * already painted before this module loaded (`adopted`). An adopted row is not
+ * painted again: its frame 0 is on screen, so the loop starts at frame 1 and its
+ * clocks start when that row appeared, not when this code got to run.
+ */
+function startInlineProgress(
+  stream: Writable,
+  color: boolean,
+  initialLabel = "Loading machines",
+  adopted?: PaintedFirstLine,
+): Readonly<InlineProgress> {
+  const startedAt = adopted?.paintedAt ?? Date.now();
+  let frame = adopted === undefined ? 0 : 1;
   let label = initialLabel;
   // When THIS label started, not when the spinner did. The measured defect was
   // label dwell — 61 259 ms on one unchanging sentence
@@ -807,8 +804,8 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
   let labelStartedAt = startedAt;
   let waiting: Readonly<{ notice: JourneyWait; observedAt: number }> | undefined;
   let stopped = false;
-  let lastColumns = 0;
-  let lastCells = 0;
+  let lastColumns = adopted?.columns ?? 0;
+  let lastCells = adopted?.cells ?? 0;
   const paint = (): void => {
     const columns = inlineProgressColumns(stream);
     const now = Date.now();
@@ -832,11 +829,7 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
       labelElapsedMs: now - labelStartedAt,
       totalElapsedMs: now - startedAt,
     });
-    const text = `◆ CUNA  ${frames[frame % frames.length]} ${headline}${trailer}  ${bars[frame % bars.length]}`;
-    const fitted = truncateTerminalLine(text, columns - 1);
-    const styled = color && fitted === text
-      ? `\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;202m${frames[frame % frames.length]}\u001b[0m \u001b[38;5;255m\u001b[1m${headline}\u001b[0m\u001b[38;5;245m${trailer}\u001b[0m  \u001b[38;5;208m${bars[frame % bars.length]}\u001b[0m`
-      : color ? `\u001b[38;5;255m${fitted}\u001b[0m` : fitted;
+    const { styled, fitted } = renderInlineProgressFrame({ headline, trailer, frame, columns, color });
     if (lastColumns > columns && lastCells >= columns) {
       // A terminal resize can reflow our previously single row before repaint.
       // HAZARD, unrepaired: this assumes the terminal reflowed. One that
@@ -853,7 +846,7 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
     lastCells = terminalCellWidth(fitted);
     frame += 1;
   };
-  paint();
+  if (adopted === undefined) paint();
   const timer = setInterval(paint, 90);
   timer.unref();
   return Object.freeze({
@@ -1009,12 +1002,6 @@ function journeyPhaseLabel(phase: AgentJourneyPhase, agent: "claude-code" | "cod
   }
 }
 
-function journeyPreparationLabel(agent: string): string {
-  return agent === "opencode"
-    ? "Preparing OpenCode — use /connect in its terminal"
-    : `Preparing ${agentDisplayName(agent)}`;
-}
-
 function foregroundAttachLabel(agent: string): string {
   return agent === "opencode"
     ? "Opening OpenCode terminal — use /connect there"
@@ -1152,7 +1139,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       interactiveCloseUi = true;
       interactiveCloseColor = color;
       if (streams.stderrIsTTY === true) {
-        inlineRootProgress = startInlineProgress(streams.stderr, color, "Starting Cuna");
+        inlineRootProgress = startInlineProgress(streams.stderr, color, ROOT_FIRST_LINE_LABEL,
+          dependencies.firstLine?.claim({ kind: "root", label: ROOT_FIRST_LINE_LABEL, color, stream: streams.stderr }));
       } else {
         streams.stderr.write("Cuna: starting...\n");
       }
@@ -1209,7 +1197,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // tells the truth immediately without claiming that attach has begun.
       const preparation = journeyPreparationLabel(journeyIntent.agent);
       const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
-      if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, preparation);
+      if (streams.stderrIsTTY === true) {
+        inlineJourneyProgress = startInlineProgress(streams.stderr, color, preparation,
+          dependencies.firstLine?.claim({ kind: "journey", label: preparation, color, stream: streams.stderr }));
+      }
       else streams.stderr.write(`Cuna: ${preparation.charAt(0).toLowerCase()}${preparation.slice(1)}...\n`);
     }
     const platform = dependencies.platform ?? createPlatformAdapter({ env: effectiveEnvironment });
@@ -2224,6 +2215,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     writer.success(result.command, result.data, result.human);
     return EXIT_CODES.success;
   } catch (unknownError) {
+    // A first line painted before this module loaded, and refused before any
+    // progress row took it over, is cleared here, before the error is written
+    // after it on the same row.
+    dependencies.firstLine?.release();
     inlineMachinesProgress?.stop();
     inlineJourneyProgress?.stop();
     inlineRootProgress?.stop();

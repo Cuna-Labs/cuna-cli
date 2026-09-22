@@ -1,4 +1,5 @@
 import { runCli } from "./run.js";
+import type { FirstLine } from "./first-line.js";
 
 type SupportedProcessSignal = "SIGINT" | "SIGTERM" | "SIGHUP";
 
@@ -19,6 +20,8 @@ export async function runProcessCli(
     /** The real process stdin, supplied only by the executable entrypoint. */
     readonly stdin?: ProcessInputHost;
     readonly run?: typeof runCli;
+    /** The row the executable painted before this module loaded; see `cli/first-line.ts`. */
+    readonly firstLine?: FirstLine;
   } = {},
 ): Promise<number> {
   const host = input.host ?? process;
@@ -31,8 +34,10 @@ export async function runProcessCli(
   host.once("SIGTERM", terminate);
   host.once("SIGHUP", hangup);
   try {
-    return await run(argv, { signal: controller.signal });
+    return await run(argv, { signal: controller.signal, ...(input.firstLine === undefined ? {} : { firstLine: input.firstLine }) });
   } finally {
+    // A row nothing took over must not outlive the command on the prompt line.
+    input.firstLine?.release();
     host.removeListener("SIGINT", interrupt);
     host.removeListener("SIGTERM", terminate);
     host.removeListener("SIGHUP", hangup);
