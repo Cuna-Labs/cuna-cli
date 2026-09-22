@@ -7,6 +7,7 @@ import { runProviderScreen } from "../machines/provider-screen.js";
 import { Writable } from "node:stream";
 import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
 import { createInterface } from "node:readline/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { launchRemoteWorkspaceSession } from "../journey/remote-workspace.js";
@@ -44,6 +45,7 @@ import {
   journeyWaitLine,
   orchestrateAgentJourney,
   preflightAgentJourneyInvocation,
+  readAccountIdentityWithin,
   type AgentJourneyEffects,
   type AgentJourneyPhase,
   type JourneyAgentSessionDisposition,
@@ -1784,7 +1786,29 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // Read before the effects branch, not inside it: the principal and the
       // workspace are half of the machine-create request identity, so every
       // journey needs them, including the one built from injected effects.
-      const identity = await client.getIdentity(dependencies.signal);
+      //
+      // Under the journey's own wait policy rather than under the per-request
+      // budget alone. Being first is exactly why this read needed it: it sits
+      // outside `journey/api-effects.ts` and `journey/remote-workspace.ts`, so
+      // the re-issue repair reached neither of the two places it runs, and one
+      // elapsed 15 000 ms budget still ended the whole command — measured
+      // 2026-09-22 (`prds/cuna-cli-latency-before-20260922.md` § 8.3, runs `a5`
+      // and the `--timeout-ms 800` control `slow1`, both exit 5 on `GET /v1/me`).
+      // `journey/account-identity.ts` holds the deadline and its derivation.
+      let accountWaitShown = false;
+      const identity = await readAccountIdentityWithin({
+        read: () => client.getIdentity(dependencies.signal),
+        signal: dependencies.signal ?? new AbortController().signal,
+        sleep: async (milliseconds, signal) => { await delay(milliseconds, undefined, { signal }); },
+        now: dependencies.now ?? Date.now,
+        onWait: (notice) => {
+          accountWaitShown = true;
+          renderJourneyWait(notice);
+        },
+      });
+      // The account answered, so the row stops counting a wait that is over.
+      // Nothing else ends it: the next phase label can be several steps away.
+      if (accountWaitShown) inlineJourneyProgress?.wait(undefined);
       const workspaceId = identity.workspaceId;
       if (workspaceId === undefined) {
         throw new CunaError({

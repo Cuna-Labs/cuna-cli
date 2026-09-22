@@ -1,4 +1,4 @@
-import { OBSERVATION_BUDGET_CODES } from "../core/observation-budget.js";
+import { DEFAULT_REQUEST_BUDGET_MS, OBSERVATION_BUDGET_CODES } from "../core/observation-budget.js";
 import { CunaError } from "../core/errors.js";
 
 /**
@@ -95,6 +95,35 @@ export const AGENT_SESSION_READY_DEADLINE_MS = 180_000;
  * separately in `core/observation-budget.ts`.
  */
 export const MACHINE_READY_DEADLINE_MS = 120_000;
+
+/**
+ * How long the account read at the head of every journey is worth.
+ *
+ * WHY THIS ONE EXISTS SEPARATELY. `GET /v1/me` is the first read the journey
+ * of `cuna claude` makes, and it ran with no phase deadline at all: the
+ * per-request budget WAS the bound, so one elapsed budget ended the command.
+ * Measured 2026-09-22 after the first three deadlines were built
+ * (`prds/cuna-cli-latency-before-20260922.md` § 8.3): run `a5` exited 5 at
+ * 21 454 ms and the deliberate control `slow1` (`--timeout-ms 800`) exited 5 at
+ * 5 147 ms, both `cuna.client.response_budget_elapsed` on `GET /v1/me`, while
+ * the journey behind them had 180 000 ms of its own it never got to spend.
+ *
+ * DERIVATION, from the budget that was killing the command rather than from a
+ * new opinion. The read is bounded by `DEFAULT_REQUEST_BUDGET_MS`, and three of
+ * those is the smallest bound under which the read can burn its whole budget
+ * TWICE and still be dispatched a third time — one refusal absorbed is a
+ * coincidence, two is the shape `a5` and `slow1` produced. It is deliberately
+ * far below the 180 s the AgentSession phase is worth: nothing has started yet
+ * here, so a person waiting on it is waiting on nothing, and the honest thing
+ * at 45 s is to stop and say which read did not answer.
+ *
+ * NOT scaled by `--timeout-ms`. A caller who lowers the per-request budget is
+ * saying how long to believe ONE connection, not how long the account read is
+ * worth — that is the whole separation this module exists for — so a lower
+ * budget buys more re-issues inside the same wall bound, which is what
+ * `slow1` needed and did not have.
+ */
+export const ACCOUNT_IDENTITY_DEADLINE_MS = 3 * DEFAULT_REQUEST_BUDGET_MS;
 
 /**
  * How long the CLI pauses before re-issuing a read whose response budget

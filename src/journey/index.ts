@@ -51,12 +51,18 @@ export {
   type JourneyWorkspaceReceipt,
 } from "./orchestrator.js";
 export {
+  ACCOUNT_IDENTITY_DEADLINE_MS,
   AGENT_SESSION_READY_DEADLINE_MS,
   MACHINE_READY_DEADLINE_MS,
   journeyWaitLine,
   type JourneyWait,
   type JourneyWaitReporter,
 } from "./wait-policy.js";
+export {
+  ACCOUNT_IDENTITY_WAITING_FOR,
+  readAccountIdentityWithin,
+  type AccountIdentityReadInput,
+} from "./account-identity.js";
 export {
   createApiAgentJourneyEffects,
   type ApiAgentJourneyEffectsInput,
