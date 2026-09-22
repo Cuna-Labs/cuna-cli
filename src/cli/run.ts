@@ -54,6 +54,8 @@ import {
   agentSessionDispositionLine,
   composeInlineProgressLine,
 } from "./progress-line.js";
+import { askRecordedLaunch } from "./recorded-launch-prompt.js";
+import { settledAgentSessionDisposition } from "../journey/session-disposition.js";
 import {
   rootJourneyArgv,
   runNodeRootJourney,
@@ -1687,6 +1689,25 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         }
         return undefined;
       };
+      // Both launch paths render these two the same way, so they are written
+      // once: a declared wait takes the spinner row and gives it back, while a
+      // settled AgentSession is a durable note that stays above it. Without the
+      // row, each becomes a plain line on stderr.
+      const renderJourneyWait = (notice: JourneyWait): void => {
+        if (inlineJourneyProgress !== undefined) inlineJourneyProgress.wait(notice);
+        else streams.stderr.write(`${journeyWaitLine(notice)}\n`);
+      };
+      const renderAgentSession = (event: JourneyAgentSessionDisposition): void => {
+        const line = agentSessionDispositionLine(event);
+        if (inlineJourneyProgress !== undefined) inlineJourneyProgress.note(line);
+        else streams.stderr.write(`${line}\n`);
+      };
+      /**
+       * True once the recorded-launch question has been answered No, on either
+       * launch path. It is what separates a new launch from a resumed one; see
+       * `journey/session-disposition.ts` for why nothing else on the path can.
+       */
+      let recordedLaunchResumed = false;
       /**
        * Ask the one recorded-launch question, and answer the screen at once.
        *
@@ -1697,34 +1718,36 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
        * (`prds/cuna-cli-latency-before-20260922.md` § 3, finding 1): the
        * terminal went BYTE-silent for up to 18 314 ms in 3 of 5 runs, always
        * immediately after this answer was accepted — the screen froze on the
-       * person's own keystroke. The answer decides which of two things happens
-       * next, so say which, then take the row back.
+       * person's own keystroke. What is said, and that it is said before this
+       * returns, live in `recorded-launch-prompt.ts`, which can be asserted
+       * without a TTY; this closure owns only the readline and the row.
        */
       const askCreateAnotherSession = async (signal: AbortSignal | undefined): Promise<boolean> => {
         inlineJourneyProgress?.stop();
         inlineJourneyProgress = undefined;
-        const question = "A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ";
-        const prompt = createInterface({ input: process.stdin, output: streams.stderr });
-        let another: boolean;
-        try {
-          const answer = signal === undefined
-            ? await prompt.question(question)
-            : await prompt.question(question, { signal });
-          another = /^y(?:es)?$/iu.test(answer.trim());
-        } finally {
-          prompt.close();
-        }
-        // Named for the branch that was taken, not for the question: "No"
-        // resumes a launch that already exists, and calling that "Creating"
-        // would be the CLI announcing work it is not about to do.
-        const next = another
-          ? journeyPhaseLabel("create-agent-session", journeyAgent)
-          : "Resuming the recorded launch";
-        if (streams.stderrIsTTY === true) {
-          inlineJourneyProgress = startInlineProgress(streams.stderr, journeyColor(), next);
-        } else {
-          streams.stderr.write(`${next}\n`);
-        }
+        const another = await askRecordedLaunch({
+          // The readline is opened and closed inside `ask`, so it has released
+          // the cursor before the acknowledgement is painted onto the same row.
+          ask: async (question) => {
+            const prompt = createInterface({ input: process.stdin, output: streams.stderr });
+            try {
+              return signal === undefined
+                ? await prompt.question(question)
+                : await prompt.question(question, { signal });
+            } finally {
+              prompt.close();
+            }
+          },
+          acknowledge: (line) => {
+            if (streams.stderrIsTTY === true) {
+              inlineJourneyProgress = startInlineProgress(streams.stderr, journeyColor(), line);
+            } else {
+              streams.stderr.write(`${line}\n`);
+            }
+          },
+          createLabel: journeyPhaseLabel("create-agent-session", journeyAgent),
+        });
+        recordedLaunchResumed = recordedLaunchResumed || !another;
         return another;
       };
       if (credentialMode === undefined) {
@@ -1762,6 +1785,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           confirmNew: () => askCreateAnotherSession(dependencies.signal),
           client, machineId: dependencies.managedWorkspaceMachineId, workspaceId, agent: journeyAgent,
           onProgress: (label) => inlineJourneyProgress?.update(label),
+          onWait: renderJourneyWait,
+          onAgentSession: renderAgentSession,
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
@@ -1874,10 +1899,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
               signal,
             });
           },
-          onWait: (notice) => {
-            if (inlineJourneyProgress !== undefined) inlineJourneyProgress.wait(notice);
-            else streams.stderr.write(`${journeyWaitLine(notice)}\n`);
-          },
+          onWait: renderJourneyWait,
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
       }
@@ -1890,9 +1912,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         },
         onAgentSession(event: JourneyAgentSessionDisposition) {
           baseEffects.onAgentSession?.(event);
-          const line = agentSessionDispositionLine(event);
-          if (inlineJourneyProgress !== undefined) inlineJourneyProgress.note(line);
-          else streams.stderr.write(`${line}\n`);
+          // The orchestrator reads its disposition from the selection plan,
+          // which cannot see the answer to the recorded-launch question asked
+          // inside the create. On No, the create carries the recorded operation
+          // id and returns the row that launch already produced, so the plan
+          // still says `create-required` while the screen has just said
+          // `Resuming the recorded launch`. This closure owns that question, so
+          // it is the only place that can reconcile the two.
+          renderAgentSession({
+            ...event,
+            disposition: settledAgentSessionDisposition({
+              planned: event.disposition,
+              resumedRecordedLaunch: recordedLaunchResumed,
+            }),
+          });
         },
         async attach(input: Parameters<AgentJourneyEffects["attach"]>[0]) {
           inlineJourneyProgress?.update(`Attaching to ${agentDisplayName(journeyAgent)}`);

@@ -466,8 +466,15 @@ test("both interactive menus create in the selected remote Workspace without loc
       const text = interactive.stderr();
       await new Promise((resolve) => physical.write(text.slice(consumed), resolve));
       consumed = text.length;
-      observedRows.push({ columns: physical.cols, row: physical.buffer.active.cursorY,
-        extraRows: Array.from({ length: 29 }, (_, index) => physical.buffer.active.getLine(index + 1)?.translateToString(true) ?? "").filter(Boolean).length });
+      // The progress row is the LAST row, not absolutely the first. A durable
+      // note legitimately sits above it — on this path, the one line naming the
+      // AgentSession this launch settled on. Counting those keeps both defects
+      // this was written to catch: a row that wraps leaves the cursor below its
+      // own line, and a stale row after a resize survives underneath it.
+      const durableRows = stripAnsi(text).split("\n").length - 1;
+      const row = physical.buffer.active.cursorY;
+      observedRows.push({ columns: physical.cols, row, durableRows,
+        extraRows: Array.from({ length: 29 - row }, (_, index) => physical.buffer.active.getLine(row + index + 1)?.translateToString(true) ?? "").filter(Boolean).length });
     };
     const attached = [], created = [];
     const root = `/workspace/workspaces/${FOREGROUND_SESSION_D}`;
@@ -520,7 +527,16 @@ test("both interactive menus create in the selected remote Workspace without loc
     assert.equal(created[0].input.agent,"codex");assert.equal(created[0].input.execution_workspace_id,FOREGROUND_SESSION_D);
     assert.deepEqual(attached.map(a => a.agentSessionIds), [[FOREGROUND_SESSION_A]]);
     for (const observation of observedRows) {
-      assert.equal(observation.row, 0, `progress wrapped at ${observation.columns} columns`);
+      // `<=`, not `===`, and the difference is a real property of the repaint
+      // loop rather than slack. `startInlineProgress` compensates for a
+      // narrowing resize by walking up the rows its line would occupy once the
+      // terminal reflows it; @xterm/headless truncates such a line instead of
+      // reflowing it, so on this model the walk reclaims a row ABOVE the
+      // progress line. What must never happen is the opposite — a progress row
+      // sitting BELOW the durable output it follows, which is what a line that
+      // wrapped looks like.
+      assert.ok(observation.row <= observation.durableRows,
+        `progress wrapped at ${observation.columns} columns: row ${observation.row} below ${observation.durableRows} durable rows`);
       assert.equal(observation.extraRows, 0, `progress left old rows at ${observation.columns} columns`);
     }
     physical.dispose();
