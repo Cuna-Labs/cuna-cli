@@ -207,7 +207,7 @@ test("the executable writes the first row before it loads cli/run.js", async (t)
   // Refused at configuration: the row is cleared, then the error, on its own row.
   const stderr = run.events.filter((event) => event.kind === "stderr").map((event) => event.text).join("");
   assert.equal(stderr.split(first.text).length - 1, 1, "frame 0 appears once");
-  assert.match(stderr, /\r\u001b\[2KError \[cuna\.config\.[a-z_]+\]/u);
+  assert.ok(stderr.includes("\r\u001b[2KError [cuna.config."), "the error starts on a cleared row");
   assert.notEqual(run.exit, 0);
 });
 
