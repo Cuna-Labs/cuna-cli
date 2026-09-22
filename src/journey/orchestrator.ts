@@ -44,6 +44,25 @@ export interface JourneyAgentSession {
 }
 
 /**
+ * Which AgentSession this journey settled on, and whether it is new.
+ *
+ * WHY IT EXISTS. Measured 2026-09-22
+ * (`prds/cuna-cli-latency-before-20260922.md` § 2, finding (ii)): the CLI
+ * printed the INTENT — `Creating Claude Code session` — and never printed a
+ * completion. The row `00b6d65a` existed at t+11 446 ms while the screen still
+ * read `Starting Claude Code`, and the nearest thing to a reuse statement was a
+ * QUESTION (`A previous launch is recorded. Create another session?`), not an
+ * acknowledgement. The orchestrator is the only place that knows which of the
+ * two branches ran, so it is the only place that can say so without guessing.
+ */
+export interface JourneyAgentSessionDisposition {
+  readonly agentSessionId: string;
+  readonly machineId: string;
+  /** `created` only when THIS journey dispatched the create that produced it. */
+  readonly disposition: "created" | "reused";
+}
+
+/**
  * The account authority one journey runs under.
  *
  * It is required rather than optional because it enters the machine-create
@@ -147,6 +166,12 @@ export interface AgentJourneyEffects {
     readonly signal: AbortSignal;
   }): Promise<void>;
   onPhase?(phase: AgentJourneyPhase): void;
+  /**
+   * Called exactly once per successful selection or create, before readiness
+   * is waited on — which is the moment the row exists and the 2026-09-22
+   * measurement found nothing on screen for the next 11 seconds.
+   */
+  onAgentSession?(disposition: JourneyAgentSessionDisposition): void;
 }
 
 export interface AgentJourneyResult {
@@ -516,8 +541,13 @@ export async function orchestrateAgentJourney(input: {
     });
 
     let agentSession: JourneyAgentSession;
+    // Read from the branch that ran, never inferred afterwards from the ledger:
+    // `createdAgentSessionId` is also set by recovery paths, and a reused row
+    // announced as created would be a false claim about what this journey did.
+    let disposition: JourneyAgentSessionDisposition["disposition"];
     if (sessionPlan.kind === "select" && sessionPlan.target === "agent-session") {
       agentSession = { id: sessionPlan.agentSessionId, machineId: sessionPlan.machineId };
+      disposition = "reused";
     } else if (sessionPlan.kind === "create-required" && sessionPlan.target === "agent-session") {
       try {
         agentSession = await boundary({
@@ -541,9 +571,15 @@ export async function orchestrateAgentJourney(input: {
         throw unreconcilableAgentSessionCreate(createError);
       }
       ledger.createdAgentSessionId = agentSession.id;
+      disposition = "created";
     } else {
       throw selectionFailure("AgentSession", sessionPlan);
     }
+    input.effects.onAgentSession?.(Object.freeze({
+      agentSessionId: agentSession.id,
+      machineId: agentSession.machineId,
+      disposition,
+    }));
 
     agentSession = await boundary({
       phase: "ready-agent-session", signal, effects: input.effects, ledger,

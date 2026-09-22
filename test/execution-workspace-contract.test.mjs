@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {decodeWorkspaceBindingAuthority,decodeAgentSessionItem} from '../dist/api/contracts.js';
 import {createApiAgentJourneyEffects} from '../dist/journey/api-effects.js';
+import {AGENT_SESSION_READY_DEADLINE_MS} from '../dist/journey/wait-policy.js';
 import {createOutputWriter} from '../dist/cli/output.js';
 import {createWorkspaceJourneyEffects,conservativeFilesystemCapabilities} from '../dist/journey/workspace-effects.js';
 import {inspectWorkspaceSyncPolicy,computeWorkspaceManifestRoot} from '../dist/sync/workspace-sync-product-service.js';
@@ -40,15 +41,24 @@ test('workspace owner refusal explains inspection without retrying or replacing 
 
 test('readiness timeout retains the admitted session identity and read-only recovery hint',async()=>{
   let reads=0;
-  const effects=createApiAgentJourneyEffects({client:{async getAgentSession(sessionId){
-    assert.equal(sessionId,id(1));reads++;assert.ok(reads<=100,'readiness must stop waiting');
+  // Readiness is bounded by a declared deadline rather than a count of
+  // attempts, so a fake sleep has to move a fake clock: a sleep that returns
+  // without time passing is a loop with no bound, which is what this fixture
+  // used to describe. The read guard is derived from that deadline and the
+  // backoff floor, so it stays a live check on termination instead of a number
+  // that drifts: the slowest sleep is 1 600 ms, so no more than
+  // ceil(deadline / 1600) + 5 reads can fit inside the deadline.
+  const READ_CEILING=Math.ceil(AGENT_SESSION_READY_DEADLINE_MS/1_600)+5;
+  let clock=Date.parse('2026-09-22T02:33:22.723Z');
+  const effects=createApiAgentJourneyEffects({now:()=>clock,client:{async getAgentSession(sessionId){
+    assert.equal(sessionId,id(1));reads++;assert.ok(reads<=READ_CEILING,'readiness must stop waiting');
     // Every decoded AgentSession names itself: `id` and `machineId` are
     // mandatory on the authoritative read, and readiness refuses an
     // observation of some other session rather than waiting on it. This
     // fixture therefore has to be the session it asks about; the case where
     // it is not is the separate negative control below.
     return {id:id(1),machineId:id(5),requestState:'runtime_claimed',processState:'unknown'};
-  }},requestedAgent:'opencode',async sleep(){}});
+  }},requestedAgent:'opencode',async sleep(milliseconds){clock+=milliseconds;}});
   await assert.rejects(effects.ensureAgentSessionReady({agentSessionId:id(1),signal:new AbortController().signal}),error=>{
     assert.equal(error.code,'cuna.journey.agent_session_ready_timeout');
     assert.equal(error.exitCode,5);

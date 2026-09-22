@@ -45,10 +45,18 @@ export {
   type AgentJourneyPhase,
   type AgentJourneyResult,
   type JourneyAgentSession,
+  type JourneyAgentSessionDisposition,
   type JourneyMachine,
   type JourneyResourceLedger,
   type JourneyWorkspaceReceipt,
 } from "./orchestrator.js";
+export {
+  AGENT_SESSION_READY_DEADLINE_MS,
+  MACHINE_READY_DEADLINE_MS,
+  journeyWaitLine,
+  type JourneyWait,
+  type JourneyWaitReporter,
+} from "./wait-policy.js";
 export {
   createApiAgentJourneyEffects,
   type ApiAgentJourneyEffectsInput,
