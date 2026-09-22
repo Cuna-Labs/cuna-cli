@@ -57,6 +57,7 @@ import {
 import { askRecordedLaunch } from "./recorded-launch-prompt.js";
 import { settledAgentSessionDisposition } from "../journey/session-disposition.js";
 import {
+  agentJourneyCommand,
   rootJourneyArgv,
   runNodeRootJourney,
   type RootJourneyRunner,
@@ -116,6 +117,18 @@ export interface RunCliDependencies {
   readonly managedWorkspaceMachineId?: string;
   /** Test seam for the folder a command resolves its workspace binding from. */
   readonly workspaceRoot?: string;
+  /**
+   * Test seam for the stream a mid-journey question reads its answer from.
+   * Production always leaves this absent and uses the real `process.stdin`.
+   *
+   * It exists because the recorded-launch question is the one place the CLI
+   * stops and waits for a person mid-journey, and the measured defect there was
+   * entirely about WHEN the next line appears relative to the answer
+   * (`prds/cuna-cli-latency-before-20260922.md` § 3, finding 1). Without a seam
+   * that ordering is only assertable through a real TTY, and the live evidence
+   * for the repair is n=0: none of the nine runs of § 8.2 met the question.
+   */
+  readonly promptInput?: NodeJS.ReadableStream;
   readonly automaticJourneyEffectsFactory?: (input: {
     readonly client: CunaApiClient;
     readonly intent: ReconciledAgentJourneyIntent;
@@ -1737,7 +1750,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           // The readline is opened and closed inside `ask`, so it has released
           // the cursor before the acknowledgement is painted onto the same row.
           ask: async (question) => {
-            const prompt = createInterface({ input: process.stdin, output: streams.stderr });
+            const prompt = createInterface({ input: dependencies.promptInput ?? process.stdin, output: streams.stderr });
             try {
               return signal === undefined
                 ? await prompt.question(question)
@@ -1801,7 +1814,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         inlineJourneyProgress?.stop();
         inlineJourneyProgress = undefined;
         return await runCli([
-          journeyAgent,
+          // The COMMAND, not the agent identifier. `claude-code` is not a
+          // command, and passing it here ended this path at `Unknown command
+          // claude-code` right after the AgentSession was created.
+          agentJourneyCommand(journeyAgent),
           "--agent-session", agentSessionId,
           ...(booleanOption(parsed, "no-color") ? ["--no-color"] : []),
         ], { ...dependencies, ...(humanAuth === undefined ? {} : { humanAuth }) });

@@ -32,17 +32,30 @@ export type RootJourneyRunner = (
   dependencies?: RootJourneyDependencies,
 ) => Promise<RootJourneySelection | undefined>;
 
+/**
+ * The CLI command that launches one agent.
+ *
+ * ONE MAPPING, BECAUSE TWO NAMES FOR ONE THING IS HOW IT BROKE. `codex` and
+ * `opencode` are spelled the same as their command; `claude-code` is not, and
+ * it is the agent identifier everywhere else in the journey. `cli/run.ts`
+ * re-invokes itself after a remote-only launch to attach, and it passed the
+ * agent straight through — so the Claude Code arm of that path ended with
+ * `Unknown command claude-code` (exit 2) immediately after creating the
+ * AgentSession, while the two agents whose names happen to coincide worked.
+ * Found 2026-09-22 by `test/recorded-launch-driver.test.mjs`, which is the
+ * first test to drive that re-invocation; the defect predates the
+ * responsiveness work.
+ */
+export function agentJourneyCommand(agent: ActionableProvider): string {
+  return agent === "claude-code" ? "claude" : agent === "codex" ? "codex" : "opencode";
+}
+
 export function rootJourneyArgv(
   selection: Extract<RootJourneySelection, { readonly kind: "launch" }>,
   options: Readonly<{ readonly noColor?: boolean }> = {},
 ): readonly string[] {
-  const command = selection.agent === "claude-code"
-    ? "claude"
-    : selection.agent === "codex"
-      ? "codex"
-      : "opencode";
   return Object.freeze([
-    command,
+    agentJourneyCommand(selection.agent),
     ...(selection.machineName === undefined ? [] : ["--machine", selection.machineName]),
     ...(selection.newSession === true ? ["--new-session"] : []),
     ...(options.noColor === true ? ["--no-color"] : []),
