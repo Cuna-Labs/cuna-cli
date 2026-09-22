@@ -5,10 +5,12 @@ import { join } from "node:path";
 import type { CunaApiClient } from "../api/client.js";
 import type { Machine } from "../api/contracts.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
-import type { ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.js";
+import type { ContinuousSyncConflict, ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.js";
 import {
   inspectWorkspaceSyncPolicy,
+  readLocalWorkspaceBase,
   resumeContinuousWorkspaceSync,
+  resumeContinuousWorkspaceSyncFromLocalBase,
   startContinuousWorkspaceSync,
   computeWorkspaceManifestRoot,
   synchronizeLocalWorkspace,
@@ -76,6 +78,20 @@ async function machineDisplayName(client: CunaApiClient, machineId: string, sign
   }
 }
 
+/**
+ * One line per retained conflict, naming the path, where each version now is,
+ * and the typed code. Before this the folder's copy of a conflicted path was
+ * replaced with no copy and no word (qa6 witness 2026-09-22, step 4).
+ */
+export function conflictNotice(conflict: ContinuousSyncConflict): string {
+  const where = conflict.resolution === "local_in_place"
+    ? conflict.sibling === null
+      ? "your version stays in place; the Machine deleted it"
+      : `your version stays in place; the Machine's version is in ${conflict.sibling}`
+    : `the Machine's version is now in place; yours is kept as ${conflict.sibling ?? "(no copy)"}`;
+  return `Workspace conflict on ${conflict.path} · changed here and on the Machine · ${where} (${conflict.code})`;
+}
+
 function bindingKey(workspaceId: string, userId: string, canonicalRoot: string): string {
   return createHash("sha256").update(`${workspaceId}\0${userId}\0${canonicalRoot}`, "utf8").digest("hex");
 }
@@ -124,6 +140,9 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         try { listener(snapshot); } catch { /* Status observers never own synchronization correctness. */ }
       }
     });
+  };
+  const renderConflict = (conflict: ContinuousSyncConflict): void => {
+    input.onNotice?.(conflictNotice(conflict));
   };
   const inspect = async (localPath: string): Promise<{
     readonly policy: Awaited<ReturnType<typeof inspectWorkspaceSyncPolicy>>;
@@ -360,6 +379,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             transport: input.transport,
             checkpointRoot,
             filesystemCapabilities: input.filesystemCapabilities,
+            onConflict: renderConflict,
           }));
         } catch (error) {
           if (!(error instanceof CunaError)) throw error;
@@ -376,12 +396,73 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       }
 
       await mkdir(checkpointRoot, { recursive: true, mode: 0o700 });
+      // A commit names the generation its tree came from, and the server's
+      // compare-and-swap can only check that claim against its head. So the
+      // claim must come from this folder's own sync record, never from the
+      // head: a folder the Machine moved ahead of while no CLI ran would
+      // otherwise claim the head and overwrite the Machine's newer bytes with
+      // its older ones (qa6 witness 2026-09-22, step 6: gen 7 claimed base 6
+      // and carried gen 5's tree).
+      //
+      // Without any record (a first bind) the folder is the initial upload and
+      // the head is its base, as before.
+      const localBase = await readLocalWorkspaceBase({
+        localRoot: inspected.policy.canonicalRoot,
+        workspaceId: input.workspaceId,
+        workspaceBindingId: authority.bindingId,
+        machineId,
+        checkpointRoot,
+        filesystemCapabilities: input.filesystemCapabilities,
+      });
+      const baseGeneration = localBase?.generation ?? localRecord?.generation ?? authority.activeGeneration;
+      if (baseGeneration > authority.activeGeneration) {
+        throw fail(
+          "cuna.journey.workspace_generation_rollback",
+          `This folder last synchronized workspace generation ${baseGeneration}, but the server publishes ${authority.activeGeneration}. Nothing was sent.`,
+        );
+      }
+      if (baseGeneration < authority.activeGeneration) {
+        if (localBase?.resumable === undefined) {
+          throw new CunaError({
+            code: "cuna.journey.workspace_base_unproven",
+            message: `The Machine's workspace is at generation ${authority.activeGeneration} and this folder changed since generation ${baseGeneration}, but no local sync state proves which files are yours. Nothing was sent, so nothing on the Machine was overwritten.`,
+            exitCode: EXIT_CODES.conflict,
+            hint: "Copy your changed files somewhere safe, bring the folder back to the Machine's version, then run the same command again.",
+            details: { local_generation: baseGeneration, remote_generation: authority.activeGeneration },
+          });
+        }
+        input.onNotice?.(`The Machine changed this workspace while you were away · bringing generation ${authority.activeGeneration} into this folder before sending local changes`);
+        try {
+          attachContinuousSync(await resumeContinuousWorkspaceSyncFromLocalBase({
+            localRoot: inspected.policy.canonicalRoot,
+            workspaceId: input.workspaceId,
+            workspaceBindingId: authority.bindingId,
+            machineId,
+            base: localBase.resumable,
+            transport: input.transport,
+            checkpointRoot,
+            filesystemCapabilities: input.filesystemCapabilities,
+            onConflict: renderConflict,
+          }));
+        } catch (error) {
+          if (!(error instanceof CunaError)) throw error;
+          const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
+          input.onNotice?.(`Workspace changes will not sync this run · ${reason}`);
+        }
+        return Object.freeze({
+          bindingId: authority.bindingId,
+          ...(authority.executionWorkspaceId==null?{}:{executionWorkspaceId:authority.executionWorkspaceId}),
+          workspaceIdentity: authority.bindingId,
+          generation: authority.activeGeneration,
+          remoteCwd: authority.remoteRoot,
+        });
+      }
       const receipt = await synchronizeLocalWorkspace({
         localRoot: inspected.policy.canonicalRoot,
         workspaceId: input.workspaceId,
         workspaceBindingId: authority.bindingId,
         machineId,
-        baseGeneration: authority.activeGeneration,
+        baseGeneration,
         transport: input.transport,
         checkpointRoot,
         filesystemCapabilities: input.filesystemCapabilities,
@@ -431,11 +512,12 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         workspaceId: input.workspaceId,
         workspaceBindingId: persisted.bindingId,
         machineId,
-        baseGeneration: authority.activeGeneration,
+        baseGeneration,
         transport: input.transport,
         checkpointRoot,
         filesystemCapabilities: input.filesystemCapabilities,
         initialReceipt: receipt,
+        onConflict: renderConflict,
       }));
       return Object.freeze({ ...(persisted.executionWorkspaceId===undefined?{}:{executionWorkspaceId:persisted.executionWorkspaceId}), bindingId: persisted.bindingId, workspaceIdentity: persisted.bindingId, generation: persisted.generation, remoteCwd: persisted.remoteRoot });
     },

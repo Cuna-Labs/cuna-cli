@@ -207,7 +207,7 @@ async function waitFor(predicate, message, timeout = 3_000) {
     if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  assert.fail(message);
+  assert.fail(typeof message === "function" ? message() : message);
 }
 
 function networkFailure() {
@@ -303,23 +303,129 @@ test("a crash-like dependency failure leaves a durable remote apply that resumes
   assert.equal(await readFile(join(fx.root, "durable.txt"), "utf8"), "resume me");
 });
 
-test("same-path divergence retains remote bytes and never overwrites the local edit", async (t) => {
+function sibling(path, generation) {
+  const suffix = createHash("sha256").update(`${BINDING}\0${generation}\0${path}`).digest("hex").slice(0, 12);
+  return `${path}.cuna-conflict-${generation}-${suffix}`;
+}
+
+// The guest's rule (PRD workspace live apply 2026-09-22 §3) from this side: a
+// path changed here and in the incoming generation keeps the local bytes, puts
+// the incoming ones beside it, says so, and keeps synchronizing — the local
+// version is then committed on top of the incoming generation. Before, the
+// supervisor stopped in `conflicted` for good and said nothing.
+test("same-path divergence keeps the local edit, retains remote bytes beside it, and keeps syncing", async (t) => {
   const fx = await fixture(t, { "shared.txt": "base" });
   const desiredFiles = { "shared.txt": "remote" };
   const desired = await desiredManifest(fx, desiredFiles);
   const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
   loadChunks(authority, desired, desiredFiles);
-  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness()));
-  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
-  await waitFor(() => supervisor.snapshot.state === "live_unverified", "initial live state was not established");
+  // Both edits exist before the supervisor runs (a folder edited while no CLI
+  // ran, re-attaching to a Machine that moved on), so the order is fixed.
   await writeFile(join(fx.root, "shared.txt"), "local");
   authority.generation = 2;
   authority.manifestRoot = desired.manifestRoot;
   authority.pages = [remotePage(2, fx.manifest, desired)];
-  await waitFor(() => supervisor.snapshot.state === "conflicted", "divergence was not classified");
+  const conflicts = [];
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness(), {
+    onConflict: (conflict) => conflicts.push(conflict),
+  }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await waitFor(() => supervisor.snapshot.generation === 3, () => `the local version was not committed on top of the incoming generation: ${JSON.stringify(supervisor.snapshot)}`);
   assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "local");
-  const names = (await import("node:fs/promises")).readdir(fx.root);
-  assert.ok((await names).some((name) => name.startsWith("shared.txt.cuna-conflict-2-")));
+  assert.equal(await readFile(join(fx.root, sibling("shared.txt", 2)), "utf8"), "remote");
+  assert.deepEqual(conflicts, [{
+    code: "cuna.workspace_sync.conflict_retained",
+    resolution: "local_in_place",
+    path: "shared.txt",
+    sibling: sibling("shared.txt", 2),
+    generation: 2,
+  }]);
+  assert.deepEqual(
+    authority.commits.at(-1).entries.map((entry) => entry.path).sort(),
+    ["shared.txt", sibling("shared.txt", 2)].sort(),
+    "the commit carries the local version and the retained remote bytes",
+  );
+  assert.notEqual(supervisor.snapshot.state, "conflicted");
+});
+
+// qa6 witness 2026-09-22, step 4. This folder commits README (gen N); the
+// Machine held its own unsaved edit, kept it (the guest rule), and captured it
+// as gen N+1. Taking N+1 is right — it is the Machine's resolution — but it
+// replaced the folder's bytes with no copy and no word. Now they are kept
+// beside the file and the conflict is announced.
+test("a Machine-resolved conflict returning right after this folder's commit keeps the local bytes beside the file", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "base" });
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  const watcher = new WatchHarness();
+  const conflicts = [];
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher, {
+    onConflict: (conflict) => conflicts.push(conflict),
+  }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await writeFile(join(fx.root, "shared.txt"), "local");
+  watcher.change("shared.txt");
+  await waitFor(() => supervisor.snapshot.generation === 2, "the local edit was not committed");
+  const committed = authority.commits.at(-1);
+
+  const machineFiles = { "shared.txt": "machine" };
+  const machine = await desiredManifest(fx, machineFiles);
+  loadChunks(authority, machine, machineFiles);
+  authority.generation = 3;
+  authority.manifestRoot = machine.manifestRoot;
+  authority.pages = [remotePage(3, committed, machine)];
+  await waitFor(() => supervisor.snapshot.generation >= 3, "the Machine generation was not taken in");
+
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "machine", "the Machine's resolution is accepted");
+  assert.equal(await readFile(join(fx.root, sibling("shared.txt", 2)), "utf8"), "local", "the folder's bytes are kept");
+  assert.deepEqual(conflicts, [{
+    code: "cuna.workspace_sync.conflict_retained",
+    resolution: "remote_in_place",
+    path: "shared.txt",
+    sibling: sibling("shared.txt", 2),
+    generation: 3,
+  }]);
+});
+
+// Control: the same incoming replacement, after a commit of this folder that
+// did not carry the path, is an ordinary remote edit. No copy, no notice.
+test("control: a remote edit to a path this folder's last commit did not carry replaces it without a sibling", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "base" });
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  const watcher = new WatchHarness();
+  const conflicts = [];
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher, {
+    onConflict: (conflict) => conflicts.push(conflict),
+  }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await writeFile(join(fx.root, "other.txt"), "local");
+  watcher.change("other.txt");
+  await waitFor(() => supervisor.snapshot.generation === 2, "the local edit was not committed");
+  const committed = authority.commits.at(-1);
+
+  const machineFiles = { "shared.txt": "machine", "other.txt": "local" };
+  const machine = await desiredManifest(fx, machineFiles);
+  loadChunks(authority, machine, machineFiles);
+  authority.generation = 3;
+  authority.manifestRoot = machine.manifestRoot;
+  authority.pages = [remotePage(3, committed, machine)];
+  await waitFor(() => supervisor.snapshot.generation === 3, "the Machine generation was not taken in");
+
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "machine");
+  const names = await (await import("node:fs/promises")).readdir(fx.root);
+  assert.deepEqual(names.filter((name) => name.includes(".cuna-conflict-")), []);
+  assert.deepEqual(conflicts, []);
+  assert.equal(authority.commits.length, 1, "an ordinary remote edit commits nothing back");
+});
+
+test("a start that must resume from durable state refuses to create one", async (t) => {
+  const fx = await fixture(t);
+  t.after(() => fx.cleanup());
+  // A build that ignores the option starts a live supervisor; stop it so the
+  // failure is this assertion rather than a process that never exits.
+  const started = ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, new MemoryAuthority(1, fx.manifest.manifestRoot), new WatchHarness(), {
+    requireDurableState: true,
+  })).then(async (supervisor) => { await supervisor.stop(); return supervisor; });
+  await assert.rejects(started, (error) => error.details?.reason === "durable_state_missing");
 });
 
 test("generation gaps, traversal paths, and symlink swaps fail closed", async (t) => {

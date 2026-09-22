@@ -13,6 +13,8 @@ import { createWorkspaceSyncClient } from "./workspace-sync-client.js";
 import {
   ContinuousWorkspaceSyncSupervisor,
   type ContinuousSyncAuthority,
+  type ContinuousSyncConflict,
+  type ContinuousSyncDurableBase,
 } from "./continuous-sync-supervisor.js";
 import {
   FileWorkspaceSyncCheckpointStore,
@@ -63,6 +65,7 @@ export interface WorkspaceSyncProductReceipt {
 
 export interface StartContinuousWorkspaceSyncInput extends SynchronizeLocalWorkspaceInput {
   readonly initialReceipt: WorkspaceSyncProductReceipt;
+  readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
 }
 
 export interface ResumeContinuousWorkspaceSyncInput extends Omit<SynchronizeLocalWorkspaceInput, "baseGeneration"> {
@@ -70,6 +73,28 @@ export interface ResumeContinuousWorkspaceSyncInput extends Omit<SynchronizeLoca
   readonly activeGeneration: number;
   /** The manifest root that same authority publishes for `activeGeneration`. */
   readonly activeManifestRoot: string;
+  readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
+}
+
+export interface LocalWorkspaceBaseInput {
+  readonly localRoot: string;
+  readonly workspaceId: string;
+  readonly workspaceBindingId: string;
+  readonly machineId: string;
+  readonly checkpointRoot: string;
+  readonly filesystemCapabilities: FilesystemCapabilities;
+}
+
+/**
+ * The newest generation this installation knows its folder to descend from.
+ * `resumable` is present when that fact comes with a durable sync state (the
+ * tree it last synchronized and a read handle), which is what a folder that
+ * fell behind needs in order to take in the newer generations without
+ * mistaking its own edits for unchanged files.
+ */
+export interface LocalWorkspaceBase {
+  readonly generation: number;
+  readonly resumable?: { readonly stateGeneration: number; readonly syncId: string };
 }
 
 export interface WorkspaceSyncPolicyInspection {
@@ -261,6 +286,12 @@ export async function startContinuousWorkspaceSync(
       exitCode: EXIT_CODES.conflict,
     });
   }
+  // The commit this start follows was made on top of the folder's previous
+  // durable state; handing that state over lets the new one know which paths
+  // the commit carried.
+  const prior = (await findDurableBases({
+    root, checkpointRoot, identity: { workspaceId, workspaceBindingId, machineId }, policyDigest: policy.digest,
+  })).find((candidate) => candidate.base.generation === input.initialReceipt.generation - 1);
   return startProvenContinuousSupervisor({
     identity: { workspaceId, workspaceBindingId, machineId },
     root,
@@ -273,7 +304,159 @@ export async function startContinuousWorkspaceSync(
       manifestRoot: input.initialReceipt.manifest_root,
     },
     transfer: input,
+    ...(prior === undefined ? {} : { priorBase: prior.base }),
+    ...(input.onConflict === undefined ? {} : { onConflict: input.onConflict }),
   });
+}
+
+/**
+ * Where this folder's tree came from, as far as this installation can prove.
+ * See `LocalWorkspaceBase`. Undefined when the installation holds no sync
+ * record for the binding at all.
+ */
+export async function readLocalWorkspaceBase(input: LocalWorkspaceBaseInput): Promise<LocalWorkspaceBase | undefined> {
+  const workspaceId = assertCanonicalUuid(input.workspaceId, "workspace ID");
+  const workspaceBindingId = assertCanonicalUuid(input.workspaceBindingId, "workspace binding ID");
+  const machineId = assertCanonicalUuid(input.machineId, "machine ID");
+  const root = await canonicalWorkspaceRoot(input.localRoot);
+  const checkpointRoot = await canonicalCheckpointRoot(input.checkpointRoot, root);
+  const policy = compileExclusionPolicy(await readProjectExclusionPolicy(root), input.filesystemCapabilities);
+  const identity = { workspaceId, workspaceBindingId, machineId };
+  const states = await findDurableBases({ root, checkpointRoot, identity, policyDigest: policy.digest });
+  const committed = await newestCommittedGeneration({ root, checkpointRoot, identity, policyDigest: policy.digest });
+  const newest = states[0];
+  if (newest !== undefined && newest.base.generation >= (committed ?? 0)) {
+    return Object.freeze({
+      generation: newest.base.generation,
+      resumable: Object.freeze({ stateGeneration: newest.stateGeneration, syncId: newest.base.syncId }),
+    });
+  }
+  return committed === undefined ? undefined : Object.freeze({ generation: committed });
+}
+
+/**
+ * Starts the live writer from the tree this folder last synchronized rather
+ * than from the published head, for a folder the Machine moved ahead of while
+ * no CLI was running (qa6 witness 2026-09-22, step 6).
+ *
+ * Committing that folder as it stands would claim the head as its base while
+ * holding an older tree, and the Machine's newer changes would be overwritten
+ * with the old bytes. Resumed from its own durable state, the supervisor
+ * first takes in the newer generations against the tree they are relative to
+ * (a path changed on both sides keeps both versions), and only then commits
+ * what the folder changed, on top of the head.
+ */
+export async function resumeContinuousWorkspaceSyncFromLocalBase(
+  input: Omit<SynchronizeLocalWorkspaceInput, "baseGeneration"> & {
+    readonly base: NonNullable<LocalWorkspaceBase["resumable"]>;
+    readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
+  },
+): Promise<ContinuousWorkspaceSyncSupervisor> {
+  validateAuthority(input);
+  const workspaceId = assertCanonicalUuid(input.workspaceId, "workspace ID");
+  const workspaceBindingId = assertCanonicalUuid(input.workspaceBindingId, "workspace binding ID");
+  if (workspaceBindingId === workspaceId) throw invalidInput("workspace_binding_id_domain");
+  const machineId = assertCanonicalUuid(input.machineId, "machine ID");
+  const root = await canonicalWorkspaceRoot(input.localRoot);
+  const checkpointRoot = await canonicalCheckpointRoot(input.checkpointRoot, root);
+  const policy = compileExclusionPolicy(await readProjectExclusionPolicy(root), input.filesystemCapabilities);
+  const current = await createWorkspaceManifest({
+    root,
+    policy,
+    capabilities: input.filesystemCapabilities,
+    ...(input.manifestLimits === undefined ? {} : { limits: input.manifestLimits }),
+    ...(input.allowSafeRelativeSymlinks === undefined
+      ? {}
+      : { allowSafeRelativeSymlinks: input.allowSafeRelativeSymlinks }),
+  });
+  return startProvenContinuousSupervisor({
+    identity: { workspaceId, workspaceBindingId, machineId },
+    root,
+    checkpointRoot,
+    policy,
+    initialManifest: current,
+    // Only the durable state is used (`requireDurableState`); these values
+    // would seed a fresh state, which this path refuses to create.
+    proven: { syncId: input.base.syncId, generation: input.base.stateGeneration, manifestRoot: current.manifestRoot },
+    transfer: input,
+    requireDurableState: true,
+    ...(input.onConflict === undefined ? {} : { onConflict: input.onConflict }),
+  });
+}
+
+async function findDurableBases(input: {
+  readonly root: string;
+  readonly checkpointRoot: string;
+  readonly identity: { readonly workspaceId: string; readonly workspaceBindingId: string; readonly machineId: string };
+  readonly policyDigest: string;
+}): Promise<readonly { readonly stateGeneration: number; readonly base: ContinuousSyncDurableBase }[]> {
+  const { workspaceId, workspaceBindingId, machineId } = input.identity;
+  const directory = join(input.checkpointRoot, bindingDigest(workspaceId, workspaceBindingId, machineId), "continuous");
+  let names: readonly string[];
+  try {
+    names = await readdir(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return Object.freeze([]);
+    throw resumeUnavailable("resume_state_unreadable");
+  }
+  const found: { readonly stateGeneration: number; readonly base: ContinuousSyncDurableBase }[] = [];
+  for (const name of names) {
+    const match = /^generation-([0-9]{1,15})$/u.exec(name);
+    if (match === null) continue;
+    const stateGeneration = Number(match[1]);
+    const stateDirectory = join(directory, name);
+    await assertSafeDerivedCheckpoint(stateDirectory, input.root);
+    let base: ContinuousSyncDurableBase | undefined;
+    try {
+      base = await ContinuousWorkspaceSyncSupervisor.readDurableBase({
+        stateDirectory, bindingId: workspaceBindingId, bindingGeneration: stateGeneration, policyDigest: input.policyDigest,
+      });
+    } catch (error) {
+      // A state admitted under another policy, or unreadable, proves nothing
+      // about this folder. Skipping it can only make the base older, and an
+      // older base turns more of the folder into local edits, never fewer.
+      if (error instanceof CunaError) continue;
+      throw error;
+    }
+    if (base !== undefined) found.push(Object.freeze({ stateGeneration, base }));
+  }
+  return Object.freeze(found.sort((left, right) =>
+    right.base.generation - left.base.generation || Date.parse(right.base.updatedAt) - Date.parse(left.base.updatedAt)));
+}
+
+/** The newest generation a commit from this installation produced for the binding under this policy. */
+async function newestCommittedGeneration(input: {
+  readonly root: string;
+  readonly checkpointRoot: string;
+  readonly identity: { readonly workspaceId: string; readonly workspaceBindingId: string; readonly machineId: string };
+  readonly policyDigest: string;
+}): Promise<number | undefined> {
+  const { workspaceId, workspaceBindingId, machineId } = input.identity;
+  const prefix = `${bindingDigest(workspaceId, workspaceBindingId, machineId)}-generation-`;
+  let names: readonly string[];
+  try {
+    names = await readdir(input.checkpointRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw resumeUnavailable("resume_state_unreadable");
+  }
+  let newest: number | undefined;
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !/^[0-9]{1,15}$/u.test(name.slice(prefix.length))) continue;
+    const directory = join(input.checkpointRoot, name);
+    await assertSafeDerivedCheckpoint(directory, input.root);
+    const checkpoint = await new FileWorkspaceSyncCheckpointStore(directory).load();
+    if (
+      checkpoint?.phase !== "committed" ||
+      checkpoint.committed_generation === null ||
+      checkpoint.workspace_id !== workspaceId ||
+      checkpoint.workspace_binding_id !== workspaceBindingId ||
+      checkpoint.machine_id !== machineId ||
+      checkpoint.exclusion_policy_digest !== input.policyDigest
+    ) continue;
+    newest = Math.max(newest ?? 0, checkpoint.committed_generation);
+  }
+  return newest;
 }
 
 /**
@@ -356,6 +539,7 @@ export async function resumeContinuousWorkspaceSync(
       manifestRoot: input.activeManifestRoot,
     },
     transfer: input,
+    ...(input.onConflict === undefined ? {} : { onConflict: input.onConflict }),
   });
 }
 
@@ -437,6 +621,9 @@ async function startProvenContinuousSupervisor(input: {
     SynchronizeLocalWorkspaceInput,
     "transport" | "filesystemCapabilities" | "maximumConcurrentUploads" | "maximumAttempts"
   >;
+  readonly requireDurableState?: boolean;
+  readonly priorBase?: ContinuousSyncDurableBase;
+  readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
 }): Promise<ContinuousWorkspaceSyncSupervisor> {
   const { workspaceId, workspaceBindingId, machineId } = input.identity;
   const { root, checkpointRoot, policy } = input;
@@ -535,6 +722,9 @@ async function startProvenContinuousSupervisor(input: {
     filesystemCapabilities: input.transfer.filesystemCapabilities,
     authority,
     initialManifest: input.initialManifest,
+    ...(input.requireDurableState === undefined ? {} : { requireDurableState: input.requireDurableState }),
+    ...(input.priorBase === undefined ? {} : { priorBase: input.priorBase }),
+    ...(input.onConflict === undefined ? {} : { onConflict: input.onConflict }),
   });
 }
 
