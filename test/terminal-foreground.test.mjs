@@ -2499,7 +2499,19 @@ test("R11: a click is not sent to a remote that did not ask for mouse reports", 
   } finally { await coordinator.stop(); }
 });
 
-test("R11: rich host mode reports the mouse in SGR form and restores it on exit", async () => {
+test("R11: only the attached view turns on SGR button reporting, never motion", async () => {
+  const { coordinator, host, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    const written = host.writes.map((bytes) => decoder.decode(bytes)).join("");
+    assert.ok(written.includes("\u001b[?1000h\u001b[?1006h"), "button reporting in SGR form");
+    assert.ok(!written.includes("\u001b[?1002h") && !written.includes("\u001b[?1003h"), "motion is never reported");
+  } finally { await coordinator.stop(); }
+});
+
+// The Machines explorer and provider screens acquire the same rich host and
+// read keys only; a mouse report there would be typed into them.
+test("R11: the rich host lease clears mouse reporting on entry and restores it off on exit", async () => {
   class FakeInput extends EventEmitter {
     isTTY = true;
     readableFlowing = null;
@@ -2519,9 +2531,8 @@ test("R11: rich host mode reports the mouse in SGR form and restores it on exit"
   const host = createNodeForegroundTerminalHost({ stdin: new FakeInput(), stdout, writeTimeoutMs: 100 });
   const lease = await host.acquire("rich");
   const acquired = Buffer.concat(stdout.writes).toString();
-  assert.ok(acquired.indexOf("\u001b[?1000h") > acquired.indexOf("\u001b[?1049h"), "button reporting is enabled inside the alternate screen");
-  assert.ok(acquired.includes("\u001b[?1006h"), "in SGR form");
-  assert.ok(!acquired.includes("\u001b[?1002h") && !acquired.includes("\u001b[?1003h"), "motion is never reported");
+  assert.ok(acquired.includes("\u001b[?1000l") && !acquired.includes("\u001b[?1000h"), "a plain rich lease reports no mouse");
+  await host.write(new TextEncoder().encode("\u001b[?1000h\u001b[?1006h"));
   const mark = stdout.writes.length;
   await lease.restore();
   const restored = Buffer.concat(stdout.writes.slice(mark)).toString();

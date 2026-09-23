@@ -28,7 +28,7 @@ import { buildAppbarModel, type AppbarModel, type StatusEvidence } from "./appba
 import { renderWorkbenchFrame, workbenchUpdate, type WorkbenchFrame, type WorkbenchTab } from "./workbench.js";
 import { ViewportRegistry } from "./viewport.js";
 import { XtermViewportAdapter } from "./xterm-vte.js";
-import { encodeRemoteMouse, HostMouseDecoder, wheelDirection, type HostMouseEvent } from "./host-mouse.js";
+import { encodeRemoteMouse, HOST_MOUSE_REPORTING_ON, HostMouseDecoder, wheelDirection, type HostMouseEvent } from "./host-mouse.js";
 
 /** Lines one wheel notch moves the local view, the common terminal default. */
 const WHEEL_SCROLL_LINES = 3;
@@ -251,6 +251,7 @@ export class ForegroundTerminalCoordinator {
   #removeAbort: (() => void) | undefined;
   #pendingInputBytes = 0;
   readonly #hostMouse = new HostMouseDecoder();
+  #mouseReportingPending = false;
   #helpVisible = false;
   #pendingBrowserAction: LocalBrowserActionRequest | undefined;
   #pendingBrowserActionTabId: string | undefined;
@@ -389,6 +390,11 @@ export class ForegroundTerminalCoordinator {
         throw runtimeFailure("terminal_disconnected", "Foreground terminal startup was cancelled.");
       }
       this.#lease = lease;
+      // Only the attached view reports the mouse. The Machines explorer and the
+      // provider screens take the same rich host and read keys only; the
+      // lease's restore turns reporting off again (RESET_REMOTE_MODES). The
+      // switch rides on this lease's first frame rather than a write of its own.
+      this.#mouseReportingPending = true;
       this.#removeInput = this.#options.host.onInput((bytes) => this.#queueInput(bytes));
       this.#removeResize = this.#options.host.onResize(() => this.#queueResize());
       const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
@@ -835,6 +841,16 @@ export class ForegroundTerminalCoordinator {
       this.#browserNotice = reconnectFailedNotice(this.#recoverableReconnectFailures.get(tabId));
       await this.#render();
     }
+  }
+
+  async #writeHost(bytes: Uint8Array): Promise<void> {
+    if (!this.#mouseReportingPending) return await this.#options.host.write(bytes);
+    const enable = new TextEncoder().encode(HOST_MOUSE_REPORTING_ON);
+    const combined = new Uint8Array(enable.byteLength + bytes.byteLength);
+    combined.set(enable);
+    combined.set(bytes, enable.byteLength);
+    await this.#options.host.write(combined);
+    this.#mouseReportingPending = false;
   }
 
   #queueInput(bytes: Uint8Array): void {
@@ -1941,7 +1957,7 @@ export class ForegroundTerminalCoordinator {
       this.#lastHostFrame = undefined;
       this.#firstFrameRendered = true;
       this.#stopAttachingAnimation();
-      await this.#options.host.write(update);
+      await this.#writeHost(update);
       this.#lastHostFrame = frame.bytes;
       this.#lastWorkbenchFrame = frame;
     });
@@ -2002,7 +2018,7 @@ export class ForegroundTerminalCoordinator {
       color ? "\u001b[0m" : "",
     ].join("");
     this.#lastHostFrame = undefined;
-    await this.#options.host.write(new TextEncoder().encode(text));
+    await this.#writeHost(new TextEncoder().encode(text));
   }
 
   #setAttachingStage(stage: TerminalAttachStage | "first_screen", count: number): void {
@@ -2086,7 +2102,7 @@ export class ForegroundTerminalCoordinator {
       color ? "\u001b[0m" : "",
     ].join("");
     this.#lastHostFrame = undefined;
-    await this.#options.host.write(new TextEncoder().encode(text));
+    await this.#writeHost(new TextEncoder().encode(text));
   }
 
   #recordFailure(error: unknown): void {
