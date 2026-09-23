@@ -46,6 +46,18 @@ follow [Semantic Versioning](https://semver.org/).
   profile and AgentSession while this process holds the local lock; a second
   local process attaches as a new client and says so.
 
+### Known issues
+
+- Re-attaching can fail once with exit 4,
+  `cuna.runtime.capability_snapshot_expired`, when the journey's preparation
+  outlasts the terminal capability it read; running the same command again
+  attached in the observed case.
+- An attach was observed to take the writer seat and then paint nothing for
+  about ten minutes; `Ctrl+] d` detached it at once. Not yet diagnosed.
+- Answering No to the recorded-launch question for a folder whose last session
+  was terminated prints `AgentSession … · reused` and exits 7
+  (`cuna.journey.agent_session_failed`). Answer y, or pass `--new-session`.
+
 ## [0.1.0] - 2026-09-16
 
 ### Changed
