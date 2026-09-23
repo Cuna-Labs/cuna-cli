@@ -482,11 +482,20 @@ function terminalSystem(events, availability = () => "supported", canonical = fa
   };
 }
 
-async function waitUntil(predicate, message) {
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 1));
+async function waitUntil(predicate, message, timeoutMs) {
+  if (timeoutMs === undefined) {
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  } else {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
   }
+  if (predicate()) return;
   assert.fail(message);
 }
 
@@ -1725,7 +1734,7 @@ test("session tabs: a switch does not wait on a slow provider sign-in probe", as
   }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
   await clickTab(host, "2:Claude projB");
   const started = Date.now();
-  await waitUntil(() => system.grantClients().length === 2, "B is granted");
+  await waitUntil(() => system.grantClients().length === 2, "B is granted", 4_000);
   await waitUntil(() => host.input !== undefined && /\[2:Claude projB\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "B is on screen");
   assert.ok(Date.now() - started < 5_000, "bounded by the 2 s advisory timeout");
   assert.match(new TextDecoder().decode(host.writes.at(-1)), /Claude auth unknown/u, "an unanswered probe is shown as unknown");
