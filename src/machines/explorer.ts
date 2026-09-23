@@ -1463,7 +1463,7 @@ function renderContextScreen(input: {
   if (input.refreshError !== undefined) lines.push("", input.refreshError);
   if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
   if (input.lifecycleNotice !== undefined) lines.push("", ` ${input.lifecycleNotice}`);
-  lines.push("", " p Check provider  ·  w Workspaces  ·  e Executions", " ↑↓ move  ·  ←→ navigate  ·  Enter select  ·  Esc/Backspace back  ·  q quit");
+  lines.push("", " w Workspaces  ·  e Executions", " ↑↓ move  ·  ←→ navigate  ·  Enter select  ·  Esc/Backspace back  ·  q quit");
   return Object.freeze({
     lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))),
     ...(selectedLine === undefined ? {} : { selectedLine }),
@@ -1556,7 +1556,8 @@ function overviewFooter(
   now: number,
 ): string {
   // E13-R1: `n new machine` is on every overview footer, whatever is selected.
-  const tail = "p Check provider  ·  n new machine  ·  r refresh  ·  q quit";
+  const tail = "n new machine  ·  r refresh  ·  q quit";
+  const sessionTail = `p Check provider  ·  ${tail}`;
   if (selectedKey?.startsWith("machine:") === true) {
     return ` ↑↓ move  ·  Enter/→ manage machine  ·  ${tail}`;
   }
@@ -1567,18 +1568,18 @@ function overviewFooter(
     if (row !== undefined && session !== undefined && isActionableProvider(session.agent)) {
       const actionability = classifySessionActionability({ session, machine: row.machine, now });
       if (actionability.canAttach || actionability.recoveryAction === "authenticate") {
-        return ` ↑↓ move  ·  Enter/→ attach ${providerDisplayName(session.agent)}  ·  ${tail}`;
+        return ` ↑↓ move  ·  Enter/→ attach ${providerDisplayName(session.agent)}  ·  ${sessionTail}`;
       }
       if (actionability.recoveryAction === "refresh") {
-        return ` ↑↓ move  ·  Enter refresh session  ·  ← back  ·  ${tail}`;
+        return ` ↑↓ move  ·  Enter refresh session  ·  ← back  ·  ${sessionTail}`;
       }
       if (actionability.recoveryAction === "wait") {
         return hasLegacySupervisorBlockedOpenCodeSession(row) && session.agent === "opencode" &&
           isUnobservedLaunchedSession(session)
-          ? ` ↑↓ move  ·  Legacy supervisor blocked  ·  ← back  ·  ${tail}`
-          : ` ↑↓ move  ·  Waiting for process observation  ·  ← back  ·  ${tail}`;
+          ? ` ↑↓ move  ·  Legacy supervisor blocked  ·  ← back  ·  ${sessionTail}`
+          : ` ↑↓ move  ·  Waiting for process observation  ·  ← back  ·  ${sessionTail}`;
       }
-      return ` ↑↓ move  ·  Enter session details  ·  ← back  ·  ${tail}`;
+      return ` ↑↓ move  ·  Enter session details  ·  ← back  ·  ${sessionTail}`;
     }
   }
   if (selectedKey?.startsWith("create:") === true) {
