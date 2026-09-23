@@ -6,6 +6,19 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Typed characters appear at once in an attached cloud terminal.** In the
+  rich terminal, a printable character typed at the input point is painted
+  immediately, dim and underlined, and replaced by the remote's own echo when it
+  arrives. A different echo, a key the screen cannot predict (Enter, Backspace,
+  arrows, a paste, a Ctrl+] chord), or no echo within 1 s repaints the true
+  screen. Guesses are shown only while the measured echo is slower than 60 ms
+  and the remote echoed the last three guesses exactly, never on a line that
+  asks for a password, token or key, and never to an observer. The local copy
+  of the remote screen never contains a guess. `CUNA_PREDICTIVE_ECHO=off`
+  disables it; `on` drops only the 60 ms threshold.
+
 ## [0.1.1] - 2026-09-22
 
 ### Fixed

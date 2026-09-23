@@ -143,6 +143,50 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
   });
 }
 
+/** Unconfirmed typed glyphs to paint over one viewport row; see predictive-echo.ts. */
+export interface WorkbenchPredictionOverlay {
+  readonly row: number;
+  readonly column: number;
+  readonly text: string;
+  readonly cursorColumn: number;
+  readonly cursor: "cursor" | "inverse";
+}
+
+/**
+ * The same frame with predicted glyphs drawn dim and underlined after the
+ * true row content. The overlay is appended to that row's own command, so a
+ * frame without it differs in exactly that row and `workbenchUpdate` repaints
+ * the true row: rollback is an ordinary repaint.
+ */
+export function withPredictionOverlay(frame: WorkbenchFrame, overlay: WorkbenchPredictionOverlay): WorkbenchFrame {
+  const block = overlay.cursor === "inverse" ? 1 : 0;
+  if (
+    !Number.isSafeInteger(overlay.row) || !Number.isSafeInteger(overlay.column) ||
+    overlay.row < 0 || overlay.row >= frame.viewportRows || overlay.column < 0 ||
+    !/^[\x20-\x7e]+$/u.test(overlay.text) ||
+    overlay.cursorColumn !== overlay.column + overlay.text.length ||
+    overlay.cursorColumn + block > frame.columns
+  ) {
+    throw new WorkbenchRenderError("invalid_dimensions", "A predicted glyph lies outside the terminal viewport.");
+  }
+  const hostRow = frame.appbarRows + overlay.row + 1;
+  const index = frame.appbarRows + overlay.row;
+  const rowCommands = [...frame.rowCommands];
+  rowCommands[index] = `${rowCommands[index] ?? ""}${ESC}${hostRow};${overlay.column + 1}H${ESC}0;2;4m${overlay.text}${ESC}0m` +
+    (block === 1 ? `${ESC}7m ${ESC}0m` : "");
+  const cursorCommand = overlay.cursor === "cursor" && overlay.cursorColumn < frame.columns
+    ? `${ESC}0m${ESC}${hostRow};${overlay.cursorColumn + 1}H${ESC}?25h`
+    : frame.cursorCommand;
+  const text = `${ESC}?25l${ESC}H${rowCommands.join("")}${cursorCommand}`;
+  return Object.freeze({
+    ...frame,
+    rowCommands: Object.freeze(rowCommands),
+    cursorCommand,
+    bytes: new TextEncoder().encode(text),
+    text,
+  });
+}
+
 /** Only use a baseline whose host write completed and no other writer invalidated. */
 export function workbenchUpdate(previous: WorkbenchFrame | undefined, next: WorkbenchFrame): Uint8Array {
   if (previous === undefined || previous.columns !== next.columns || previous.rows !== next.rows ||

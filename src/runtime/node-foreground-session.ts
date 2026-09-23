@@ -21,6 +21,7 @@ import {
   PassthroughTerminalCoordinator,
   admitPassthroughDimensions,
 } from "../terminal/passthrough.js";
+import { predictiveEchoModeFromEnvironment, type PredictiveEchoMode } from "../terminal/predictive-echo.js";
 
 import { createApiTerminalControlPlane } from "./api-terminal-control-plane.js";
 import { CunaRuntimeBoundary } from "./boundary.js";
@@ -189,6 +190,8 @@ async function runNodeForegroundSessionsOnce(
   } else if (sessionIds.length !== 1) {
     throw runtimeFailure("capability_unsupported", "Plain passthrough mode binds exactly one AgentSession.");
   }
+  // Plain passthrough forwards bytes untouched and never paints guesses.
+  const predictiveEcho = presentationMode === "rich" ? predictiveEchoModeFromEnvironment(environment) : "off";
   const allowedOrigin = admitApiOrigin(input.baseUrl);
   const host = dependencies.host ?? createNodeForegroundTerminalHost();
 
@@ -315,6 +318,7 @@ async function runNodeForegroundSessionsOnce(
       clock,
       host,
       presentationMode,
+      predictiveEcho,
       controlPlane,
       allowedOrigin,
       intents,
@@ -367,6 +371,7 @@ async function runClaimedForeground(
     readonly clock: () => number;
     readonly host: ForegroundTerminalHost;
     readonly presentationMode: ForegroundPresentationMode;
+    readonly predictiveEcho: PredictiveEchoMode;
     readonly controlPlane: TerminalControlPlane;
     readonly allowedOrigin: string;
     readonly intents: readonly ForegroundTabIntent[];
@@ -374,7 +379,7 @@ async function runClaimedForeground(
     readonly identity?: TerminalClientIdentity;
   },
 ): Promise<void> {
-  const { clock, host, presentationMode, controlPlane, allowedOrigin, intents, clientInstanceId } = context;
+  const { clock, host, presentationMode, predictiveEcho, controlPlane, allowedOrigin, intents, clientInstanceId } = context;
   input.onProgress?.("Preparing your cloud terminal");
   input.onBeforeTerminalOwnership?.();
   const coordinator = presentationMode === "rich"
@@ -385,6 +390,7 @@ async function runClaimedForeground(
         clock,
         color: input.color ?? true,
         deviceId: clientInstanceId,
+        predictiveEcho,
       })
     : new PassthroughTerminalCoordinator({
         host,
