@@ -1449,7 +1449,16 @@ export class CunaRuntimeBoundary {
         `Terminal capability scope changed during ${phase === "preflight" ? "preflight" : "post-grant"} admission.`,
       );
     }
-    if (expected.capability.expiresAt <= now || actual.capability.expiresAt <= now) {
+    // The authority an attach acts on is `actual`, read just now; it must be
+    // live. In the preflight phase `expected` is older evidence that anchors
+    // continuity (same scope, same authority etag, same process) and is never
+    // used to issue anything, so its own age is not a refusal: the provider
+    // sign-in check plus a bounded admission wait routinely outlive a
+    // capability lease capped at 30 s (qa6 re-witness 2026-09-23, j2: preflight
+    // read 00:21:06, refused 00:21:28 with a fresh capability in hand). A
+    // post-grant `expected` is the capability the grant was issued on, and
+    // stays bound by its expiry.
+    if ((phase === "post_grant" && expected.capability.expiresAt <= now) || actual.capability.expiresAt <= now) {
       throw runtimeFailure(
         "capability_snapshot_expired",
         `Terminal capability authority expired during ${phase === "preflight" ? "preflight" : "post-grant"} admission.`,
