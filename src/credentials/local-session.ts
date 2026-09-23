@@ -999,13 +999,9 @@ export function parseWindowsAclFingerprintRecord(text: string): WindowsAclFinger
  * being written. Only the very first write creates the file.
  */
 async function rewriteInPlace(file: string, bytes: Uint8Array): Promise<void> {
-  let handle: Awaited<ReturnType<typeof open>>;
-  try {
-    handle = await open(file, "r+");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    handle = await open(file, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
-  }
+  // One call opens the existing file or creates it; without O_TRUNC an
+  // existing file keeps its directory entry, so nothing is checked first.
+  const handle = await open(file, fsConstants.O_RDWR | fsConstants.O_CREAT, 0o600);
   try {
     await assertOpenedRegularFile(handle, file);
     await handle.write(bytes, 0, bytes.byteLength, 0);
