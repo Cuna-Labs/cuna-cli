@@ -2490,6 +2490,45 @@ test("R11: when the remote program asks for mouse reports, the wheel is forwarde
   } finally { await coordinator.stop(); }
 });
 
+// Lead decision 2026-09-23: the wheel behaves like a normal terminal. A remote
+// on its own alternate screen without mouse reports (less, vim, man) gets
+// three cursor keys per notch, as Windows Terminal's alternate-scroll mode
+// sends; the main screen (the agent's prompt, shells) scrolls locally.
+for (const [mode, enter] of [["1049", "\u001b[?1049h"], ["1047", "\u001b[?1047h"], ["47", "\u001b[?47h"]]) {
+  test(`R11: a remote on its alternate screen (?${mode}) without mouse reports gets three arrow keys per notch`, async () => {
+    const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+    try {
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(`${enter}\u001b[Hpager page`)));
+      host.emitInput(encoder.encode(WHEEL_UP));
+      await waitUntil(() => calls.input.length > 0, "the wheel reaches the pager as cursor keys");
+      host.emitInput(encoder.encode(WHEEL_DOWN));
+      await waitUntil(() => calls.input.map((item) => item.text).join("").length >= 18, "both notches are sent");
+      assert.equal(calls.input.map((item) => item.text).join(""), "\u001b[A".repeat(3) + "\u001b[B".repeat(3));
+      assert.doesNotMatch(await visibleHostText(host), /Scrolled back/u);
+    } finally { await coordinator.stop(); }
+  });
+}
+
+test("R11: the arrow keys follow the remote's application cursor mode", async () => {
+  const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\u001b[?1049h\u001b[?1h\u001b[Hvim")));
+    host.emitInput(encoder.encode(WHEEL_DOWN));
+    await waitUntil(() => calls.input.length > 0, "the wheel reaches vim");
+    assert.equal(calls.input.map((item) => item.text).join(""), "\u001bOB".repeat(3));
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: after the remote leaves its alternate screen the wheel scrolls locally again", async () => {
+  const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\u001b[?1049hpager\u001b[?1049l")));
+    host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => /Scrolled back 3 lines/u.test(decoder.decode(host.writes.at(-1))), "the main screen scrolls locally");
+    assert.deepEqual(calls.input, []);
+  } finally { await coordinator.stop(); }
+});
+
 test("R11: a click is not sent to a remote that did not ask for mouse reports", async () => {
   const { coordinator, host, calls } = await scrolledHarness();
   try {

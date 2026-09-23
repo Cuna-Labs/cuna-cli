@@ -864,10 +864,15 @@ export class ForegroundTerminalCoordinator {
   }
 
   /**
-   * The wheel scrolls Cuna's copy of the remote screen. Only a remote program
-   * that asked for mouse reports receives them, in its own coordinates and
-   * encoding, and only from the writer; nothing else is ever sent for a mouse
-   * event, so a wheel notch can no longer arrive as an arrow key.
+   * The wheel behaves as in a normal terminal, decided by the remote's own
+   * modes (lead decision 2026-09-23):
+   * - it asked for mouse reports: they are forwarded, in its coordinates and
+   *   encoding;
+   * - it is on its alternate screen without them (less, vim, man): three
+   *   cursor keys per notch, as Windows Terminal's alternate-scroll mode sends;
+   * - it is on its main screen (the agent's prompt, a shell): Cuna scrolls its
+   *   own copy and sends nothing, so a notch never moves prompt history.
+   * Only the writer sends; clicks go only to a remote that asked for them.
    */
   #handleHostMouse(event: HostMouseEvent): void {
     if (this.#state !== "active" || this.#closingTabId !== undefined) return;
@@ -882,16 +887,27 @@ export class ForegroundTerminalCoordinator {
       const bytes = encodeRemoteMouse(event, reporting, { column: event.column, row });
       if (bytes === undefined) return;
       tab.viewport.resetScroll();
-      const operation = this.#inputTail.then(async () => {
-        await this.#requireRuntime().sendInput(bytes, target.tabId, target.binding);
-      });
-      this.#inputTail = operation.catch((error) => this.#inputFailure(error));
+      this.#sendRemote(bytes, target);
       return;
     }
     const direction = wheelDirection(event);
     if (direction === 0) return;
+    const screen = tab.viewport.screenModes();
+    if (screen.alternateScreen) {
+      if (tab.snapshot.accessMode === "observer" || target === undefined) return;
+      const key = `\u001b${screen.applicationCursorKeys ? "O" : "["}${direction < 0 ? "A" : "B"}`;
+      this.#sendRemote(new TextEncoder().encode(key.repeat(WHEEL_SCROLL_LINES)), target);
+      return;
+    }
     const before = tab.viewport.scrollOffset;
     if (tab.viewport.scrollBy(-direction * WHEEL_SCROLL_LINES) !== before) void this.#render().catch(() => undefined);
+  }
+
+  #sendRemote(bytes: Uint8Array, target: ForegroundInputTarget): void {
+    const operation = this.#inputTail.then(async () => {
+      await this.#requireRuntime().sendInput(bytes, target.tabId, target.binding);
+    });
+    this.#inputTail = operation.catch((error) => this.#inputFailure(error));
   }
 
   #queueInputBytes(bytes: Uint8Array): void {

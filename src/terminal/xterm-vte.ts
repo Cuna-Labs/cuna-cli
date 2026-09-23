@@ -294,6 +294,18 @@ export class XtermViewportAdapter {
     return Object.freeze({ tracking: this.#terminal.modes.mouseTrackingMode, sgr: this.#mouseSgr });
   }
 
+  /**
+   * The screen the remote program is on, from its own ?1049/?1047/?47
+   * sequences, and whether it asked for application cursor keys (?1).
+   */
+  screenModes(): { readonly alternateScreen: boolean; readonly applicationCursorKeys: boolean } {
+    this.#assertOpen();
+    return Object.freeze({
+      alternateScreen: this.#terminal.buffer.active.type === "alternate",
+      applicationCursorKeys: this.#terminal.modes.applicationCursorKeysMode,
+    });
+  }
+
   get scrollOffset(): number {
     return this.#scrollOffset;
   }
