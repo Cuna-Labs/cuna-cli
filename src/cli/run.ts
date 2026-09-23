@@ -4,6 +4,7 @@ import {ownerObserveGrantsApi} from "../api/owner-observe-grants-v2.js";
 import {runOwnerGrantsScreen,type ShareableSession,type ShareableSessionListing} from "../runtime/owner-grants-screen.js";
 import {ownerGrantOperationStore} from "../runtime/owner-grant-operations.js";
 import { runProviderScreen } from "../machines/provider-screen.js";
+import type { ProviderPreset } from "../api/provider-v2.js";
 import { Writable } from "node:stream";
 import { terminalCellWidth } from "../terminal/cell-width.js";
 import { createInterface } from "node:readline/promises";
@@ -86,6 +87,7 @@ import {
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
 import { runNodeMachinesExplorer, type MachinesExplorerRunner } from "../machines/explorer.js";
+import { machineInventoryCache, type MachineInventoryCache } from "../machines/inventory-cache.js";
 import { runWorkspaceSelectionScreen } from "../workspace/selection-screen.js";
 import { runExecutionsScreen } from "../machines/executions-screen.js";
 import { isOpenCodeSupervisorUpgradeReason } from "../machines/opencode-supervisor.js";
@@ -126,6 +128,12 @@ export interface RunCliDependencies {
   readonly machinesExplorerRunner?: MachinesExplorerRunner;
   readonly providerScreenRunner?: typeof runProviderScreen;
   readonly rootJourneyRunner?: RootJourneyRunner;
+  /**
+   * Test seam for the last-known Machines picture. Production builds one only
+   * for a signed-in person on the real transport, so a test that injects a
+   * client never writes into the host's state directory by accident.
+   */
+  readonly machineInventoryCache?: MachineInventoryCache;
   /** Internal root-UI hint; never parsed from or printed to user input. */
   readonly managedWorkspaceMachineId?: string;
   /** Test seam for the folder a command resolves its workspace binding from. */
@@ -1268,6 +1276,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // mode to an interactive browser sign-in.
     if (interactiveRoot || usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
     const sessionPaths = localEncryptedSessionPaths(platform.paths.configDirectory, config.profile);
+    // The last-known Machines picture belongs to one account. Only the real
+    // sign-in path touches the host's state directory; see the explorer's cache.
+    const accountInventoryCache = (): MachineInventoryCache | undefined => dependencies.machineInventoryCache ??
+      (dependencies.humanAuth === undefined ? machineInventoryCache(platform, { baseUrl: config.baseUrl, profile: config.profile }) : undefined);
     if (config.apiKey !== undefined && (parsed.command === "login" || parsed.command === "signup")) {
       throw new CunaError({
         code: "cuna.auth.mode_conflict",
@@ -1371,6 +1383,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         inlineRootProgress = undefined;
         streams.stderr.write("Cuna: let's sign you in first...\n");
         await guidedAuth.login(dependencies.signal === undefined ? {} : { signal: dependencies.signal });
+        await accountInventoryCache()?.clear();
         streams.stderr.write("Cuna: signed in. Continuing...\n");
         if (interactiveRoot && streams.stderrIsTTY === true) {
           inlineRootProgress = startInlineProgress(streams.stderr, interactiveRootColor, "Finding a machine or AgentSession");
@@ -1483,6 +1496,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const profileCreated = creatingProfile
           ? await ensureProfileRecorded({ platform, config })
           : false;
+        // A new sign-in may be a different account: its Machines are not the
+        // last profile's picture.
+        if (!alreadySignedIn) await accountInventoryCache()?.clear();
         const data = Object.freeze({
           ...humanResult(result),
           storage_mode: "encrypted-local" as const,
@@ -1512,6 +1528,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         );
       } else {
         const result = await (await getHumanAuth()).logout(dependencies.signal);
+        await accountInventoryCache()?.clear();
         authProgress?.stop();
         authProgress = undefined;
         writer.success("logout", result, "Signed out of Cuna on this device.");
@@ -1542,6 +1559,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     }) : undefined;
     const client = dependencies.clientFactory?.(config, effectiveTimeoutMs) ?? createCunaApiClient(httpTransport!);
+    const inventoryCache = dependencies.machineInventoryCache ??
+      (credentialMode === "interactive" && dependencies.clientFactory === undefined
+        ? machineInventoryCache(platform, { baseUrl: config.baseUrl, profile: config.profile })
+        : undefined);
     if(parsed.command==="observe"){
       if(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true||credentialMode!=="interactive"||!httpTransport)throw usageError("observe requires an interactive terminal and human login.");
       // This process owns its initial principal. Checks around admission do not watch
@@ -1587,6 +1608,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         selection = await rootRunner({
           client,
           color,
+          ...(inventoryCache === undefined ? {} : { inventoryCache }),
           onBeforeTerminalOwnership: () => {
             inlineRootProgress?.stop();
             inlineRootProgress = undefined;
@@ -1716,6 +1738,35 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         }
         return undefined;
       };
+      /**
+       * R6/R7. One profile: the spinner keeps its row and one line above it
+       * says what happens next. Several: the picker takes the terminal, and
+       * the spinner is stopped first and restarted after.
+       */
+      const pickProviderPreset = async (signal: AbortSignal | undefined, machineName?: string): Promise<ProviderPreset | undefined> => {
+        let tookTerminal = false;
+        const named = machineName ?? stringOption(parsed, "machine");
+        const preset = await (dependencies.providerScreenRunner ?? runProviderScreen)(client, { kind: "preset", agent: journeyAgent }, undefined, signal, {
+          color: journeyColor(),
+          ...(named === undefined ? {} : { machineName: named }),
+          announce: (line) => {
+            if (inlineJourneyProgress !== undefined) inlineJourneyProgress.note(line);
+            else streams.stderr.write(`${line}\n`);
+          },
+          onBeforeTerminalOwnership: () => {
+            inlineJourneyProgress?.stop();
+            inlineJourneyProgress = undefined;
+            tookTerminal = true;
+          },
+        });
+        // Either way the next thing that happens is the session being created,
+        // and the row says so before that wait begins.
+        if (preset !== undefined) {
+          if (tookTerminal || inlineJourneyProgress === undefined) inlineJourneyProgress = resumeJourneyProgress();
+          else inlineJourneyProgress.update(journeyPhaseLabel("create-agent-session", journeyAgent));
+        }
+        return preset;
+      };
       // Both launch paths render these two the same way, so they are written
       // once: a declared wait takes the spinner row and gives it back, while a
       // settled AgentSession is a durable note that stays above it. Without the
@@ -1826,10 +1877,12 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       }
       const journeyScope = Object.freeze({ userId: identity.id, workspaceId });
       if (remoteMenuLaunch && dependencies.managedWorkspaceMachineId !== undefined) {
-        inlineJourneyProgress?.stop(); inlineJourneyProgress = undefined;
-        const preset=await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"preset",agent:journeyAgent},undefined,dependencies.signal);
-        if(preset===undefined)return EXIT_CODES.success;
-        inlineJourneyProgress = resumeJourneyProgress();
+        const picked = await pickProviderPreset(dependencies.signal);
+        if (picked === undefined) {
+          inlineJourneyProgress?.stop(); inlineJourneyProgress = undefined;
+          return EXIT_CODES.success;
+        }
+        const preset = picked;
         const agentSessionId = await launchRemoteWorkspaceSession({
           preset,
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id},
@@ -1897,12 +1950,13 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           requestedAgent: journeyAgent,
           confirmNewProviderLaunch: recordedLaunchConfirmation(journeyIntent.newSession, askCreateAnotherSession),
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
-          selectProviderPreset: async (signal) => {
-            inlineJourneyProgress?.stop();
-            inlineJourneyProgress = undefined;
-            const preset = await (dependencies.providerScreenRunner ?? runProviderScreen)(client, { kind: "preset", agent: journeyAgent }, undefined, signal);
-            if (!preset) throw new CunaError({ code: "cuna.provider.selection_cancelled", message: "Provider selection cancelled. The synchronized Workspace is preserved.", exitCode: EXIT_CODES.usage });
-            inlineJourneyProgress = resumeJourneyProgress();
+          selectProviderPreset: async (signal, context) => {
+            const preset = await pickProviderPreset(signal, context?.machineName);
+            if (!preset) {
+              inlineJourneyProgress?.stop();
+              inlineJourneyProgress = undefined;
+              throw new CunaError({ code: "cuna.provider.selection_cancelled", message: "Provider selection cancelled. The synchronized Workspace is preserved.", exitCode: EXIT_CODES.usage });
+            }
             return preset;
           },
           inspectWorkspace: workspace.inspectWorkspace,
@@ -2103,6 +2157,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       const selection = await runner({
         client,
         color: !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+        ...(inventoryCache === undefined ? {} : { inventoryCache }),
         ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
       }, dependencies.now === undefined ? {} : { now: dependencies.now });
       if (selection !== undefined) {

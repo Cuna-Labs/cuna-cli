@@ -69,7 +69,8 @@ export interface ApiAgentJourneyEffectsInput {
   readonly client: CunaApiClient;
   readonly confirmNewProviderLaunch?: (signal:AbortSignal, context:RecordedLaunchContext)=>Promise<boolean>;
   readonly providerLaunchState?: {readonly stateDirectory:string;readonly ownerId:string;readonly workspaceId:string};
-  readonly selectProviderPreset?: (signal:AbortSignal)=>Promise<ProviderPreset>;
+  /** `machineName` names the Machine in the one-line notice when nothing is asked. */
+  readonly selectProviderPreset?: (signal:AbortSignal, context?:{readonly machineName?:string})=>Promise<ProviderPreset>;
   /** The only provider executable this journey may select a machine for. */
   readonly requestedAgent: "claude-code" | "codex" | "opencode";
   /**
@@ -251,10 +252,14 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       deadlineMs: deadline.deadlineMs,
     }));
   };
+  // Names this journey has read, for the one line a person sees before a
+  // session starts. Display only: every decision is made by id.
+  const machineNames = new Map<string, string>();
   const effects: AgentJourneyEffects = {
     inspectWorkspace: input.inspectWorkspace,
     async observeMachines({ signal }) {
       const page = await input.client.listMachines(signal);
+      for (const machine of page.items) machineNames.set(machine.id, machine.name);
       if (page.nextCursor !== undefined) {
         throw fail("cuna.journey.machine_page_incomplete", "Machine selection requires a complete bounded collection.", EXIT_CODES.policy);
       }
@@ -345,6 +350,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         agent: requestedAgent,
         background: true,
       }, idempotencyKey, requestId, signal);
+      machineNames.set(machine.id, machine.name);
       return Object.freeze({ id: machine.id, state: machineState(machine.state) });
     },
     async reconcileMachineCreate({ requestId, signal }) {
@@ -355,6 +361,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         }
         if (request.state === "settled" || request.state === "provider_succeeded") {
           const machine = await input.client.getMachine(request.machineId, signal);
+          machineNames.set(machine.id, machine.name);
           return Object.freeze({ id: machine.id, state: machineState(machine.state) });
         }
         if (request.state === "terminal_failed" || request.action === "none") {
@@ -467,7 +474,8 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       }
       if(agent==='opencode'||agent==='codex'||agent==='claude-code'){
         if(authMode!=='interactive_login'||credentialBindingId!==undefined||!workspace.executionWorkspaceId||workspace.generation<1||!input.selectProviderPreset)throw fail('cuna.provider.v2_unavailable','The agent requires a selected V2 profile and a published execution Workspace.');
-        const preset=await input.selectProviderPreset(signal);
+        const machineName=machineNames.get(machineId);
+        const preset=await input.selectProviderPreset(signal,machineName===undefined?undefined:{machineName});
         requireMatchingPreset(agent,preset);
         if(!input.providerLaunchState)throw fail('cuna.provider.v2_unavailable','Durable provider launch state is unavailable.');
         const executionWorkspaceId=workspace.executionWorkspaceId;
