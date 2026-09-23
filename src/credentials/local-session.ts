@@ -1,4 +1,4 @@
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type BigIntStats } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { basename, dirname, resolve } from "node:path";
@@ -554,9 +554,7 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
     if (file === undefined || current[0] === undefined) return undefined;
     let record: WindowsAclFingerprintRecord | undefined;
     try {
-      const metadata = await lstat(file);
-      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < 1 || metadata.size > WINDOWS_ACL_FINGERPRINT_MAX_BYTES) return undefined;
-      record = parseWindowsAclFingerprintRecord(await readFile(file, "utf8"));
+      record = parseWindowsAclFingerprintRecord(await readRegularFileBounded(file, WINDOWS_ACL_FINGERPRINT_MAX_BYTES));
     } catch {
       return undefined;
     }
@@ -1003,19 +1001,44 @@ export function parseWindowsAclFingerprintRecord(text: string): WindowsAclFinger
 async function rewriteInPlace(file: string, bytes: Uint8Array): Promise<void> {
   let handle: Awaited<ReturnType<typeof open>>;
   try {
-    const metadata = await lstat(file);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("ACL fingerprint path is not a regular file");
     handle = await open(file, "r+");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     handle = await open(file, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
   }
   try {
+    await assertOpenedRegularFile(handle, file);
     await handle.write(bytes, 0, bytes.byteLength, 0);
     await handle.truncate(bytes.byteLength);
   } finally {
     await handle.close();
   }
+}
+
+/** Open first, then judge the opened object: nothing is read on the strength of an earlier path check. */
+async function readRegularFileBounded(file: string, maximumBytes: number): Promise<string> {
+  const handle = await open(file, "r");
+  try {
+    const metadata = await assertOpenedRegularFile(handle, file);
+    if (metadata.size < 1n || metadata.size > BigInt(maximumBytes)) throw new Error("ACL fingerprint size is out of bounds");
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * The opened object must be a regular file, and the path must name that same
+ * object without a link: `open` follows reparse points, so a link is caught by
+ * comparing the path's own `lstat` identity with the handle's.
+ */
+async function assertOpenedRegularFile(handle: Awaited<ReturnType<typeof open>>, file: string): Promise<BigIntStats> {
+  const opened = await handle.stat({ bigint: true });
+  const named = await lstat(file, { bigint: true });
+  if (!opened.isFile() || named.isSymbolicLink() || named.dev !== opened.dev || named.ino !== opened.ino) {
+    throw new Error("ACL fingerprint path is not a regular file");
+  }
+  return opened;
 }
 
 function assertWindowsOwnerOnlyInspection(inspection: WindowsAclInspection): void {
