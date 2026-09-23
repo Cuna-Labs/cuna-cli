@@ -65,6 +65,7 @@ export function createApiTerminalControlPlane(input: {
         observedAt: session.runtimeObservedAt,
         expiresAt: session.runtimeExpiresAt,
         evidenceRevision: `agent-session-row:${session.rowVersion}`,
+        createdAt: session.createdAt,
       });
     },
 

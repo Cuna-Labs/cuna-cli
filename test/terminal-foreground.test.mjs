@@ -440,6 +440,29 @@ test("the loader names each attach stage the runtime reports", async () => {
   await coordinator.stop();
 });
 
+// R5: a fresh session whose PTY the Machine has not attested yet is a wait
+// with its own name and a counting clock, not "Checking terminal authority".
+test("the loader names the wait for the Machine to confirm a fresh terminal, with seconds", async () => {
+  let releaseAttach;
+  const attachGate = new Promise((resolve) => { releaseAttach = resolve; });
+  let offset = 0;
+  const { coordinator, host, intents } = harness({ attachGate, attachStages: ["admission", "confirm_wait"],
+    coordinatorOptions: { clock: () => Date.now() + offset } });
+  const starting = coordinator.start(intents.slice(0, 1));
+  await waitUntil(
+    () => host.writes.some((bytes) => decoder.decode(bytes).includes("Waiting for the Machine to confirm the terminal")),
+    "the confirmation wait must be named",
+  );
+  offset = 7_000;
+  await waitUntil(
+    () => host.writes.some((bytes) => /Waiting for the Machine to confirm the terminal · 7s/u.test(decoder.decode(bytes))),
+    "the confirmation wait must count seconds",
+  );
+  releaseAttach();
+  await starting;
+  await coordinator.stop();
+});
+
 test("disconnect feedback cadence is bounded to one second total", () => {
   const host = new FakeHost();
   assert.throws(
@@ -2376,4 +2399,182 @@ test("a typed capability refusal is not retried: one attempt, not the whole budg
   assert.equal(calls.reconnect.length, 1, "a non-retryable capability refusal is attempted exactly once");
   assert.match(decoder.decode(host.writes.at(-1)), /capability unknown \(live resize\)/u);
   await coordinator.stop();
+});
+
+// P5 / R11 (PRD cuna-cli-feel-20260923). Two-finger scroll inside an attached
+// session changed Claude Code's prompt instead of scrolling: the rich view sat
+// in the host's alternate screen with mouse reporting off, so Windows Terminal
+// (alternate-scroll mode on by default) sent each wheel notch as an arrow key
+// and Cuna forwarded it. The host now reports the wheel in SGR form; Cuna
+// scrolls its own copy of the remote screen and sends the remote nothing,
+// unless the remote program asked for mouse reports itself.
+const WHEEL_UP = "\u001b[<64;10;10M";
+const WHEEL_DOWN = "\u001b[<65;10;10M";
+
+async function scrolledHarness() {
+  const context = harness();
+  await context.coordinator.start(context.intents.slice(0, 1));
+  const lines = Array.from({ length: 60 }, (_, index) => `line-${String(index + 1).padStart(2, "0")}`).join("\r\n");
+  await context.callbacks.onTerminalOutput(outputEvent(context.intents[0], 1n, encoder.encode(lines)));
+  await waitUntil(() => decoder.decode(context.host.writes.at(-1) ?? new Uint8Array()).includes("line-60"), "the live screen shows the newest line");
+  return context;
+}
+
+test("R11: the wheel scrolls the local view back and sends nothing to the remote", async () => {
+  const { coordinator, host, calls } = await scrolledHarness();
+  try {
+    assert.doesNotMatch(await visibleHostText(host), /line-30/u, "line 30 has scrolled off the live screen");
+    for (let notch = 0; notch < 5; notch += 1) host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-30"), "five notches bring line 30 back");
+    const visible = await visibleHostText(host);
+    assert.match(visible, /line-30/u);
+    assert.doesNotMatch(visible, /line-60/u, "the live bottom is out of view while scrolled back");
+    assert.match(visible, /Scrolled back 15 lines/u, "the notice says the view is not live");
+    for (let notch = 0; notch < 5; notch += 1) host.emitInput(encoder.encode(WHEEL_DOWN));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-60"), "scrolling down returns to the live screen");
+    assert.doesNotMatch(await visibleHostText(host), /Scrolled back/u);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(calls.input, [], "no wheel notch reached the remote, as an arrow key or otherwise");
+  } finally { await coordinator.stop(); }
+});
+
+test("R11 control: an arrow key is still sent to the remote", async () => {
+  const { coordinator, host, calls } = await scrolledHarness();
+  try {
+    host.emitInput(encoder.encode("\u001b[A"));
+    await waitUntil(() => calls.input.length > 0, "a real arrow key must reach the remote");
+    assert.equal(calls.input.map((item) => item.text).join(""), "\u001b[A");
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: a key typed while scrolled back returns to the live screen and is sent", async () => {
+  const { coordinator, host, calls } = await scrolledHarness();
+  try {
+    for (let notch = 0; notch < 5; notch += 1) host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-30"), "scrolled back");
+    host.emitInput(encoder.encode("x"));
+    await waitUntil(() => calls.input.length > 0, "the key reaches the remote");
+    assert.equal(calls.input.map((item) => item.text).join(""), "x");
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-60"), "the view returns to the live screen");
+    assert.doesNotMatch(await visibleHostText(host), /Scrolled back/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: new output while scrolled back keeps the lines being read in place", async () => {
+  const { coordinator, host, callbacks, intents } = await scrolledHarness();
+  try {
+    for (let notch = 0; notch < 5; notch += 1) host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-30"), "scrolled back");
+    const before = (await visibleHostText(host)).split("\n").find((row) => row.includes("line-"));
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\r\nnew-1\r\nnew-2\r\nnew-3")));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const after = await visibleHostText(host);
+    assert.equal(after.split("\n").find((row) => row.includes("line-")), before, "the first visible history line did not move");
+    assert.doesNotMatch(after, /new-3/u);
+    assert.match(after, /Scrolled back 18 lines/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: when the remote program asks for mouse reports, the wheel is forwarded in its coordinates", async () => {
+  const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\u001b[?1000h\u001b[?1006h")));
+    host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => calls.input.length > 0, "the wheel must reach a remote that tracks the mouse");
+    // Host row 10 is remote row 8: the two app-bar rows sit above the remote screen.
+    assert.equal(calls.input.map((item) => item.text).join(""), "\u001b[<64;10;8M");
+    assert.doesNotMatch(await visibleHostText(host), /Scrolled back/u);
+    host.emitInput(encoder.encode("\u001b[<0;4;1M"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls.input.length, 1, "a click on the app bar is not the remote's");
+  } finally { await coordinator.stop(); }
+});
+
+// Lead decision 2026-09-23: the wheel behaves like a normal terminal. A remote
+// on its own alternate screen without mouse reports (less, vim, man) gets
+// three cursor keys per notch, as Windows Terminal's alternate-scroll mode
+// sends; the main screen (the agent's prompt, shells) scrolls locally.
+for (const [mode, enter] of [["1049", "\u001b[?1049h"], ["1047", "\u001b[?1047h"], ["47", "\u001b[?47h"]]) {
+  test(`R11: a remote on its alternate screen (?${mode}) without mouse reports gets three arrow keys per notch`, async () => {
+    const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+    try {
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(`${enter}\u001b[Hpager page`)));
+      host.emitInput(encoder.encode(WHEEL_UP));
+      await waitUntil(() => calls.input.length > 0, "the wheel reaches the pager as cursor keys");
+      host.emitInput(encoder.encode(WHEEL_DOWN));
+      await waitUntil(() => calls.input.map((item) => item.text).join("").length >= 18, "both notches are sent");
+      assert.equal(calls.input.map((item) => item.text).join(""), "\u001b[A".repeat(3) + "\u001b[B".repeat(3));
+      assert.doesNotMatch(await visibleHostText(host), /Scrolled back/u);
+    } finally { await coordinator.stop(); }
+  });
+}
+
+test("R11: the arrow keys follow the remote's application cursor mode", async () => {
+  const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\u001b[?1049h\u001b[?1h\u001b[Hvim")));
+    host.emitInput(encoder.encode(WHEEL_DOWN));
+    await waitUntil(() => calls.input.length > 0, "the wheel reaches vim");
+    assert.equal(calls.input.map((item) => item.text).join(""), "\u001bOB".repeat(3));
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: after the remote leaves its alternate screen the wheel scrolls locally again", async () => {
+  const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\u001b[?1049hpager\u001b[?1049l")));
+    host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => /Scrolled back 3 lines/u.test(decoder.decode(host.writes.at(-1))), "the main screen scrolls locally");
+    assert.deepEqual(calls.input, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: a click is not sent to a remote that did not ask for mouse reports", async () => {
+  const { coordinator, host, calls } = await scrolledHarness();
+  try {
+    host.emitInput(encoder.encode("\u001b[<0;5;6M\u001b[<0;5;6m"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(calls.input, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: only the attached view turns on SGR button reporting, never motion", async () => {
+  const { coordinator, host, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    const written = host.writes.map((bytes) => decoder.decode(bytes)).join("");
+    assert.ok(written.includes("\u001b[?1000h\u001b[?1006h"), "button reporting in SGR form");
+    assert.ok(!written.includes("\u001b[?1002h") && !written.includes("\u001b[?1003h"), "motion is never reported");
+  } finally { await coordinator.stop(); }
+});
+
+// The Machines explorer and provider screens acquire the same rich host and
+// read keys only; a mouse report there would be typed into them.
+test("R11: the rich host lease clears mouse reporting on entry and restores it off on exit", async () => {
+  class FakeInput extends EventEmitter {
+    isTTY = true;
+    readableFlowing = null;
+    raw = false;
+    setRawMode(value) { this.raw = value; }
+    resume() { this.readableFlowing = true; return this; }
+    pause() { this.readableFlowing = false; return this; }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true;
+    columns = 80;
+    rows = 24;
+    writes = [];
+    write(value, callback) { this.writes.push(Buffer.from(value)); callback?.(null); return true; }
+  }
+  const stdout = new FakeOutput();
+  const host = createNodeForegroundTerminalHost({ stdin: new FakeInput(), stdout, writeTimeoutMs: 100 });
+  const lease = await host.acquire("rich");
+  const acquired = Buffer.concat(stdout.writes).toString();
+  assert.ok(acquired.includes("\u001b[?1000l") && !acquired.includes("\u001b[?1000h"), "a plain rich lease reports no mouse");
+  await host.write(new TextEncoder().encode("\u001b[?1000h\u001b[?1006h"));
+  const mark = stdout.writes.length;
+  await lease.restore();
+  const restored = Buffer.concat(stdout.writes.slice(mark)).toString();
+  assert.ok(restored.includes("\u001b[?1000l") && restored.includes("\u001b[?1006l"), "reporting is off after restore");
+  assert.ok(restored.lastIndexOf("\u001b[?1000l") < restored.lastIndexOf("\u001b[?1049l"), "and off before the alternate screen is left");
 });
