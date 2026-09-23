@@ -196,6 +196,39 @@ test("Enter, Backspace and escape sequences withdraw guesses and pause predictin
   } finally { clock.echo.dispose(); term.viewport.dispose(); }
 });
 
+test("a barrier lapses with time even when the remote answered before it ended", async () => {
+  const term = screen(); const clock = engine("on");
+  try {
+    await term.write("> ");
+    await train(term, clock);
+    clock.echo.predict(Uint8Array.of(0x0d), term.view(), KEY);
+    clock.advance(100);
+    await term.write("\r\n> ");
+    clock.echo.reconcile(term.view(), KEY);
+    // No further output arrives; the next key comes after the barrier ended.
+    clock.advance(300);
+    clock.echo.predict(encoder.encode("n"), term.view(), KEY);
+    assert.deepEqual({ ...clock.echo.overlay(term.view(), KEY) }, { row: 1, column: 2, text: "n", cursorColumn: 3, cursor: "cursor" });
+  } finally { clock.echo.dispose(); term.viewport.dispose(); }
+});
+
+test("local witness: the real coordinator paints guesses at once; off paints only the real echo", async () => {
+  const { runScenario } = await import("../scripts/witness-predictive-echo.mjs");
+  const shape = { delay: 200, isolatedKeys: 4, bursts: 1, burstSize: 5 };
+  for (const renderer of ["shell", "ink"]) {
+    const on = await runScenario({ renderer, mode: "on", ...shape });
+    assert.equal(on.isolated.perceived.missing + on.burst.perceived.missing, 0, renderer);
+    assert.ok(on.isolated.perceived.p95 < 50, `${renderer} isolated perceived p95 ${on.isolated.perceived.p95}`);
+    assert.ok(on.burst.perceived.p95 < 50, `${renderer} burst perceived p95 ${on.burst.perceived.p95}`);
+    assert.ok(on.isolated.real.p50 >= 200, "the real echo still takes the remote delay");
+    assert.equal(on.staleDimUnderlinedCellsOneSecondAfterLastKey, 0);
+  }
+  const off = await runScenario({ renderer: "shell", mode: "off", ...shape });
+  assert.ok(off.isolated.perceived.p50 >= 200, "without prediction the first glyph is the real echo");
+  assert.equal(off.isolated.perceived.p50, off.isolated.real.p50);
+  assert.equal(off.staleDimUnderlinedCellsOneSecondAfterLastKey, 0);
+});
+
 test("an application-drawn inverse cursor is an insertion point; a guess moves the block", async () => {
   const term = screen(); const clock = engine("on");
   try {

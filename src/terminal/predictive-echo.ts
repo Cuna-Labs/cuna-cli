@@ -152,6 +152,9 @@ export class PredictiveEcho {
     const changed = this.#adopt(key);
     const now = this.#clock();
     if (!bytes.every(isPrintableAscii)) return this.barrier() || changed;
+    // The barrier lapses with time too: the remote may have answered before it
+    // ended, leaving no later output frame to clear it in `reconcile`.
+    if (this.#barrierUntil !== undefined && now >= this.#barrierUntil) this.#barrierUntil = undefined;
     if (this.#barrierUntil !== undefined) return changed;
     let anchor: InsertionPoint | undefined;
     const last = this.#pending.at(-1);
