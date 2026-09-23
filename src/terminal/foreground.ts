@@ -25,7 +25,8 @@ import { RuntimeBoundaryError, runtimeFailure, terminalHistoryGap } from "../run
 import type { HostTerminalLease } from "./mode.js";
 import { assertCanonicalUuid } from "../core/validation.js";
 import { buildAppbarModel, type AppbarModel, type StatusEvidence } from "./appbar.js";
-import { renderWorkbenchFrame, workbenchUpdate, type WorkbenchFrame, type WorkbenchTab } from "./workbench.js";
+import { PredictiveEcho, type PredictiveEchoMode } from "./predictive-echo.js";
+import { renderWorkbenchFrame, withPredictionOverlay, workbenchUpdate, type WorkbenchFrame, type WorkbenchTab } from "./workbench.js";
 import { ViewportRegistry } from "./viewport.js";
 import { XtermViewportAdapter } from "./xterm-vte.js";
 import { encodeRemoteMouse, HOST_MOUSE_REPORTING_ON, HostMouseDecoder, wheelDirection, type HostMouseEvent } from "./host-mouse.js";
@@ -193,6 +194,8 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly disconnectFrameMs?: number;
   /** Stable only for this foreground process; never a reusable device credential. */
   readonly deviceId?: string;
+  /** Predictive local echo of typed characters; `off` unless the caller chooses. */
+  readonly predictiveEcho?: PredictiveEchoMode;
 }
 
 interface ForegroundTab {
@@ -273,6 +276,9 @@ export class ForegroundTerminalCoordinator {
    * the timer, is what keeps loader chrome from ever following PTY output.
    */
   #firstFrameRendered = false;
+  readonly #predictiveEcho: PredictiveEcho;
+  /** Received chunks with a non-printable byte that the input tail has not routed yet. */
+  #unroutedBarrierChunks = 0;
 
   constructor(options: ForegroundTerminalCoordinatorOptions) {
     const resizeCoalesceMs = options.resizeCoalesceMs ?? RESIZE_COALESCE_MS;
@@ -293,6 +299,12 @@ export class ForegroundTerminalCoordinator {
     }
     this.#options = Object.freeze({ ...options, resizeCoalesceMs, reconnectAttempts, reconnectBaseDelayMs, disconnectFrameMs });
     this.#clock = options.clock ?? Date.now;
+    this.#predictiveEcho = new PredictiveEcho({
+      mode: options.predictiveEcho ?? "off",
+      clock: this.#clock,
+      // A guess that timed out is repainted away by an ordinary frame.
+      onExpire: () => this.#queueStateRender(),
+    });
     this.#localActionBroker = new LocalActionBroker({
       clock: this.#clock,
       isIdentityLive: (identity) => this.#isLocalActionIdentityLive(identity),
@@ -481,6 +493,7 @@ export class ForegroundTerminalCoordinator {
     if (this.#resizeTimer !== undefined) clearTimeout(this.#resizeTimer);
     for (const timer of this.#oauthPrefixTimers.values()) clearTimeout(timer);
     this.#oauthPrefixTimers.clear();
+    this.#predictiveEcho.dispose();
     this.#resizeTimer = undefined;
     this.#removeInput?.();
     this.#removeResize?.();
@@ -731,6 +744,10 @@ export class ForegroundTerminalCoordinator {
     await raceAbort(tab.viewport.write(event.bytes, event.sequence, event.sequence), event.signal);
     const current = this.#tabs.get(event.tabId);
     if (event.signal.aborted || current !== tab || !sameSnapshotBinding(tab.snapshot, event.binding)) return;
+    if (event.tabId === this.#activeTabId) {
+      const view = tab.viewport.snapshot();
+      this.#predictiveEcho.reconcile(view, predictionKey(tab, view));
+    }
     // Parsing preserves every ordered byte; painting may skip intermediate
     // screens. A slow host must not hold up ingestion of newer remote output.
     this.#queueStateRender();
@@ -973,9 +990,19 @@ export class ForegroundTerminalCoordinator {
       // the local close intent was accepted.
       void this.#render().catch(() => undefined);
     }
+    const barrierChunk = !payload.every(isPrintableAscii);
+    if (barrierChunk) this.#unroutedBarrierChunks += 1;
+    // Receipt time, not input-tail time: the guess is painted before the key
+    // is even queued for the network.
+    if (this.#predictAtReceipt(payload, receiptTarget, barrierChunk)) void this.#render().catch(() => undefined);
     this.#pendingInputBytes += payload.byteLength;
     const operation = this.#inputTail.then(async () => {
-      try { await this.#routeInput(payload, receiptTarget); } finally { this.#pendingInputBytes -= payload.byteLength; }
+      try {
+        await this.#routeInput(payload, receiptTarget);
+      } finally {
+        this.#pendingInputBytes -= payload.byteLength;
+        if (barrierChunk) this.#unroutedBarrierChunks -= 1;
+      }
     });
     this.#inputTail = operation.catch((error) => this.#inputFailure(error));
   }
@@ -1767,6 +1794,36 @@ export class ForegroundTerminalCoordinator {
     });
   }
 
+  /**
+   * Guess the echo of a printable chunk typed into the active writer's input
+   * line. Anything the local router or the remote may treat specially -- a
+   * chord, a paste, a pending browser action, an OAuth code prompt, an
+   * observer seat, uncertain earlier input -- withdraws guesses instead.
+   * Returns whether the painted frame may have changed.
+   */
+  #predictAtReceipt(payload: Uint8Array, target: ForegroundInputTarget | undefined, barrierChunk: boolean): boolean {
+    const echo = this.#predictiveEcho;
+    if (echo.mode === "off") return false;
+    if (barrierChunk) return echo.barrier();
+    const tab = target === undefined ? undefined : this.#tabs.get(target.tabId);
+    if (
+      tab === undefined ||
+      tab.intent.tabId !== this.#activeTabId ||
+      this.#unroutedBarrierChunks > 0 ||
+      this.#prefixPending ||
+      this.#pasteActive ||
+      this.#closingTabId !== undefined ||
+      this.#pendingBrowserAction !== undefined ||
+      this.#oauthPasteGuards.has(tab.intent.tabId) ||
+      tab.snapshot.state !== "active" ||
+      tab.snapshot.accessMode !== "writer" ||
+      tab.snapshot.historicalInputUncertainty === true ||
+      tab.snapshot.terminalView?.ready === false
+    ) return echo.barrier();
+    const view = tab.viewport.snapshot();
+    return echo.predict(payload, view, predictionKey(tab, view));
+  }
+
   #queueResize(): void {
     if (this.#state !== "active") return;
     // Output also requests reconciliation while geometry differs. Preserve the
@@ -1921,7 +1978,7 @@ export class ForegroundTerminalCoordinator {
           ? tab.viewport.snapshotForHost(dimensions.columns, remoteRows(dimensions.rows))
           : tab.viewport.snapshot(),
       }));
-      const frame = renderWorkbenchFrame({
+      const trueFrame = renderWorkbenchFrame({
         columns: dimensions.columns,
         rows: dimensions.rows,
         activeTabId,
@@ -1963,6 +2020,14 @@ export class ForegroundTerminalCoordinator {
                     ? { notice: "Sign-in link in history · Ctrl+] a to inspect · if rejected, request a new link in the provider" }
                     : {}),
       });
+      // Predicted glyphs are painted over the true frame only; the viewport
+      // model that mirrors the remote never contains them.
+      const activeTab = this.#tabs.get(activeTabId);
+      const prediction = activeTab !== undefined && activeTab.snapshot.state === "active" &&
+        activeTab.snapshot.accessMode === "writer"
+        ? this.#predictiveEcho.overlay(activeViewport, predictionKey(activeTab, activeViewport))
+        : undefined;
+      const frame = prediction === undefined ? trueFrame : withPredictionOverlay(trueFrame, prediction);
       // Every accepted keystroke and every output frame renders a complete
       // absolute-addressed frame. Most of them repaint exactly what the host
       // already shows (measured 2026-09-15: three of four frames per typed
@@ -2293,6 +2358,15 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 
 function scrolledBackNotice(lines: number): string {
   return `Scrolled back ${lines} line${lines === 1 ? "" : "s"} · scroll down or type to return`;
+}
+
+/** Guesses belong to one exact writer attachment at one geometry. */
+function predictionKey(tab: ForegroundTab, view: { readonly columns: number; readonly rows: number }): string {
+  return `${tab.intent.tabId}:${tab.snapshot.fencingGeneration}:${tab.snapshot.writerEpoch}:${view.columns}x${view.rows}`;
+}
+
+function isPrintableAscii(byte: number): boolean {
+  return byte >= 0x20 && byte <= 0x7e;
 }
 
 function remoteRows(hostRows: number): number {
