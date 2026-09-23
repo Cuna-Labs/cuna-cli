@@ -41,6 +41,19 @@ export const RECORDED_LAUNCH_QUESTION =
  */
 export const RECORDED_LAUNCH_ACKNOWLEDGEMENT_BUDGET_MS = 500;
 
+/**
+ * What answers the recorded-launch question for a folder journey.
+ * `--new-session` is that answer already given on the command line, so it is
+ * not asked again: asking let a No, or a slow answer, override the flag (qa6
+ * witness 2026-09-22). Without the flag the person is asked.
+ */
+export function recordedLaunchConfirmation<S>(
+  newSessionFlag: boolean,
+  ask: (signal: S) => Promise<boolean>,
+): (signal: S) => Promise<boolean> {
+  return newSessionFlag ? async () => true : ask;
+}
+
 /** Only an explicit yes creates; anything else, including empty, resumes. */
 export function recordedLaunchWantsNewSession(answer: string): boolean {
   return /^y(?:es)?$/iu.test(answer.trim());

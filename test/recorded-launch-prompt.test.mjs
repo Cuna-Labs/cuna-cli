@@ -6,6 +6,7 @@ import {
   RECORDED_LAUNCH_QUESTION,
   askRecordedLaunch,
   recordedLaunchAcknowledgement,
+  recordedLaunchConfirmation,
   recordedLaunchWantsNewSession,
 } from "../dist/cli/recorded-launch-prompt.js";
 
@@ -101,4 +102,16 @@ test("only an explicit yes creates; everything else resumes", () => {
   for (const answer of ["", " ", "n", "no", "N", "yep", "sure", "1"]) {
     assert.equal(recordedLaunchWantsNewSession(answer), false, JSON.stringify(answer));
   }
+});
+
+// qa6 witness 2026-09-22: `cuna claude <folder> --new-session` still asked
+// "Create another session?", and the answer overrode the flag. The flag is
+// the answer; only without it is the person asked.
+test("--new-session answers the recorded-launch question without asking", async () => {
+  let asked = 0;
+  const ask = async () => { asked += 1; return false; };
+  assert.equal(await recordedLaunchConfirmation(true, ask)(undefined), true);
+  assert.equal(asked, 0);
+  assert.equal(await recordedLaunchConfirmation(false, ask)(undefined), false);
+  assert.equal(asked, 1, "without the flag the person is asked");
 });

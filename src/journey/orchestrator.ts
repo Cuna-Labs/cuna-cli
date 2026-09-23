@@ -351,8 +351,14 @@ function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
  * through here. An HTTP status alone does not establish non-commit.
  */
 function isProvenAgentSessionCreateRejection(cause: unknown): cause is CunaError {
-  return cause instanceof CunaError &&
-    cause.code === "cuna.agent.opencode_supervisor_upgrade_required";
+  return cause instanceof CunaError && (
+    cause.code === "cuna.agent.opencode_supervisor_upgrade_required" ||
+    // A No to the recorded-launch question for a launch recorded under
+    // another Workspace version or preset: refused locally, nothing sent, and
+    // its own hint (answer y / --new-session) is the way forward. Wrapped as
+    // an unprovable create it told the person not to request a new session.
+    (cause.code === "cuna.provider.pending_intent_conflict" && cause.details?.reason === "recorded_launch_mismatch")
+  );
 }
 
 function defaultAuthMode(intent: ReconciledAgentJourneyIntent): AgentAuthMode {

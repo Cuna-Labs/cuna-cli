@@ -65,7 +65,7 @@ import {
   type FirstLine,
   type PaintedFirstLine,
 } from "./first-line.js";
-import { askRecordedLaunch } from "./recorded-launch-prompt.js";
+import { askRecordedLaunch, recordedLaunchConfirmation } from "./recorded-launch-prompt.js";
 import { settledAgentSessionDisposition } from "../journey/session-disposition.js";
 import {
   agentJourneyCommand,
@@ -1892,7 +1892,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         effects = createApiAgentJourneyEffects({
           client,
           requestedAgent: journeyAgent,
-          confirmNewProviderLaunch: (signal) => askCreateAnotherSession(signal),
+          confirmNewProviderLaunch: recordedLaunchConfirmation(journeyIntent.newSession, askCreateAnotherSession),
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
           selectProviderPreset: async (signal) => {
             inlineJourneyProgress?.stop();
