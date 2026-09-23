@@ -20,7 +20,7 @@ import {
   type LocalActionSessionIdentity,
   type LocalActionSnapshot,
 } from "../local-actions/index.js";
-import type { TerminalAttachmentAdmission } from "../runtime/terminal-transport.js";
+import type { TerminalAttachStage, TerminalAttachmentAdmission } from "../runtime/terminal-transport.js";
 import { RuntimeBoundaryError, runtimeFailure, terminalHistoryGap } from "../runtime/errors.js";
 import type { HostTerminalLease } from "./mode.js";
 import { assertCanonicalUuid } from "../core/validation.js";
@@ -83,8 +83,7 @@ export const MAX_FOREGROUND_PENDING_INPUT_BYTES = 1_048_576;
 
 export type ForegroundTerminalState = "idle" | "starting" | "active" | "stopping" | "stopped" | "failed";
 
-/** The remote steps of one attach, in order. */
-export type TerminalAttachStage = "admission" | "grant" | "connect" | "ready_wait";
+export type { TerminalAttachStage } from "../runtime/terminal-transport.js";
 
 /**
  * What the loader says while an attach waits. Each line names the step being
@@ -93,6 +92,8 @@ export type TerminalAttachStage = "admission" | "grant" | "connect" | "ready_wai
  */
 const ATTACH_STAGE_LABELS: Readonly<Record<TerminalAttachStage | "first_screen", string>> = Object.freeze({
   admission: "Checking terminal authority",
+  // A fresh session whose PTY the Machine has not attested yet (PRD R5).
+  confirm_wait: "Waiting for the Machine to confirm the terminal",
   grant: "Requesting a terminal connection",
   connect: "Connecting to the Machine's terminal",
   ready_wait: "Waiting for the terminal to answer",

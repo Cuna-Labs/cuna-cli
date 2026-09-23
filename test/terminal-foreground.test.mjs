@@ -440,6 +440,29 @@ test("the loader names each attach stage the runtime reports", async () => {
   await coordinator.stop();
 });
 
+// R5: a fresh session whose PTY the Machine has not attested yet is a wait
+// with its own name and a counting clock, not "Checking terminal authority".
+test("the loader names the wait for the Machine to confirm a fresh terminal, with seconds", async () => {
+  let releaseAttach;
+  const attachGate = new Promise((resolve) => { releaseAttach = resolve; });
+  let offset = 0;
+  const { coordinator, host, intents } = harness({ attachGate, attachStages: ["admission", "confirm_wait"],
+    coordinatorOptions: { clock: () => Date.now() + offset } });
+  const starting = coordinator.start(intents.slice(0, 1));
+  await waitUntil(
+    () => host.writes.some((bytes) => decoder.decode(bytes).includes("Waiting for the Machine to confirm the terminal")),
+    "the confirmation wait must be named",
+  );
+  offset = 7_000;
+  await waitUntil(
+    () => host.writes.some((bytes) => /Waiting for the Machine to confirm the terminal · 7s/u.test(decoder.decode(bytes))),
+    "the confirmation wait must count seconds",
+  );
+  releaseAttach();
+  await starting;
+  await coordinator.stop();
+});
+
 test("disconnect feedback cadence is bounded to one second total", () => {
   const host = new FakeHost();
   assert.throws(
