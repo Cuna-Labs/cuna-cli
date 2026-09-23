@@ -6,6 +6,48 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-22
+
+### Fixed
+
+- **Workspace sync no longer overwrites newer or local bytes.** A folder
+  re-attached after the Machine moved ahead now takes in the newer generations
+  before sending its own edits, instead of committing its stale tree over them.
+  A folder whose base cannot be proven is refused with
+  `cuna.journey.workspace_base_unproven`, and a base ahead of the server with
+  `cuna.journey.workspace_generation_rollback`; nothing is sent in either case.
+- **A path changed on both sides keeps both versions.** The local bytes stay
+  (or, for a conflict the Machine already resolved, the Machine's bytes win)
+  and the other version is kept beside it as `<path>.cuna-conflict-<G>-<sha12>`.
+  One line names each conflict (`cuna.workspace_sync.conflict_retained`), and
+  sync continues instead of stopping silently in `conflicted`.
+- Relaunching a folder after its session ended no longer dead-ends: the
+  recorded-launch question is asked before the journal lease is taken,
+  `--new-session` answers it, and answering No to a launch recorded under
+  another version is a typed refusal with a `--new-session` hint.
+- A remote launch no longer ends in `Unknown command` (exit 2) right after the
+  AgentSession is created; it attaches again.
+- A running execution-Workspace session for the same folder is reused instead
+  of a second one being created.
+- A fresh AgentSession whose terminal capability is not yet attested is waited
+  for, bounded, instead of reported as a failure to retry.
+- A second writer can no longer be admitted through the journal lock fallback.
+
+### Changed
+
+- The first line is painted before the CLI's module graph loads.
+- The progress row names what it waits for and for how long; the account read
+  at the head of every journey waits under a 45 s deadline
+  (`Still waiting for your account · 15s of 45s`).
+- A keystroke unacknowledged for 5 s is named
+  (`Connection stalled · reconnecting — input not resent`) and the connection
+  is reopened; the input is not resent.
+- Re-attaching from the same computer reuses its terminal client id for that
+  profile and AgentSession while this process holds the local lock; a second
+  local process attaches as a new client and says so.
+
+## [0.1.0] - 2026-09-16
+
 ### Changed
 
 - **The CLI no longer reports a failure for an operation that succeeded.** Two
