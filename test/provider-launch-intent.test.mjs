@@ -66,3 +66,51 @@ test('No for a launch recorded under another Workspace version is a typed local 
  assert.equal(calls,0);
  }finally{await rm(directory,{recursive:true,force:true});}
 });
+
+// qa6 re-witness 2026-09-23, run j6: the recorded launch's session had been
+// terminated, No was offered as "resumes the recorded launch", the replay
+// returned the dead session and the screen said "reused" before failing
+// with exit 7. A launch whose session ended is never offered for resume.
+function endedScope(directory) {
+ return {stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{generation:5,profile:'profile',revision:2}};
+}
+test('a recorded launch whose session ended is not offered for resume, and No starts nothing',async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'cuna-provider-intent-'));try{
+ const scope=endedScope(directory);
+ await withProviderLaunchIntent({...scope,create:async()=>({id:'session-1'})});
+ const asked=[];let creates=0;
+ await assert.rejects(withProviderLaunchIntent({...scope,
+  confirmNew:async(context)=>{asked.push(context?.state);return false;},
+  isSessionEnded:async(id)=>id==='session-1',
+  create:async()=>{creates++;return {id:'session-1'};}}),
+  error=>error.code==='cuna.provider.recorded_launch_ended'&&error.details?.reason==='recorded_launch_ended'&&/--new-session/.test(error.hint));
+ assert.deepEqual(asked,['ended'],'the question says the session ended');
+ assert.equal(creates,0,'nothing is re-sent for a session known to have ended');
+ const fresh=await withProviderLaunchIntent({...scope,confirmNew:async()=>true,isSessionEnded:async(id)=>id==='session-1',create:async id=>({id:'session-2',operation:id})});
+ assert.equal(fresh.id,'session-2','yes starts a new session');
+ }finally{await rm(directory,{recursive:true,force:true});}
+});
+test('a resumed launch that turns out to have ended is refused before anyone calls it reused',async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'cuna-provider-intent-'));try{
+ const scope=endedScope(directory);
+ await withProviderLaunchIntent({...scope,create:async()=>({id:'session-1'})});
+ // A record written before session ids were kept: nothing is known until the replay.
+ const {readdir,unlink}=await import('node:fs/promises');
+ const root=join(directory,'provider-launch-v2');
+ for(const name of await readdir(root))for(const file of await readdir(join(root,name)))if(file.startsWith('sessions'))await unlink(join(root,name,file));
+ let resumed=0;
+ await assert.rejects(withProviderLaunchIntent({...scope,confirmNew:async()=>false,onResume:()=>{resumed++;},
+  isSessionEnded:async(id)=>id==='session-1',create:async()=>({id:'session-1'})}),
+  error=>error.code==='cuna.provider.recorded_launch_ended');
+ assert.equal(resumed,0,'a dead session is never announced as resumed');
+ }finally{await rm(directory,{recursive:true,force:true});}
+});
+test('control: a recorded launch whose session is live still resumes',async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'cuna-provider-intent-'));try{
+ const scope=endedScope(directory);
+ const first=await withProviderLaunchIntent({...scope,create:async id=>({id:'session-1',operation:id})});
+ const asked=[];
+ const again=await withProviderLaunchIntent({...scope,confirmNew:async(context)=>{asked.push(context?.state);return false;},isSessionEnded:async()=>false,create:async id=>({id:'session-1',operation:id})});
+ assert.equal(again.operation,first.operation);assert.deepEqual(asked,['resumable']);
+ }finally{await rm(directory,{recursive:true,force:true});}
+});

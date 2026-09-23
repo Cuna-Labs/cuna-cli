@@ -1,5 +1,6 @@
 import type { ProviderPreset } from "../api/provider-v2.js";
-import {withProviderLaunchIntent} from "./provider-launch-intent.js";
+import {withProviderLaunchIntent,type RecordedLaunchContext} from "./provider-launch-intent.js";
+import { isAgentSessionGone } from "../runtime/terminal-client-identity.js";
 import { sessionFailure } from "./session-failure.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { requireCapability, type CunaApiClient } from "../api/client.js";
@@ -55,7 +56,7 @@ export async function launchRemoteWorkspaceSession(input: {
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly providerLaunchState: {stateDirectory:string;ownerId:string};
-  readonly confirmNew?:()=>Promise<boolean>;
+  readonly confirmNew?:(context:RecordedLaunchContext)=>Promise<boolean>;
 }): Promise<string> {
   requireMatchingPreset(input.agent,input.preset);
   const now = input.now ?? Date.now;
@@ -142,7 +143,7 @@ export async function launchRemoteWorkspaceSession(input: {
   }
   const agentName = input.agent === "opencode" ? "OpenCode" : input.agent === "codex" ? "Codex" : "Claude";
   input.onProgress?.(`Starting ${agentName} with the selected profile`);
-  let session = await withProviderLaunchIntent({...input.providerLaunchState,workspaceId:input.workspaceId,machineId:input.machineId,executionWorkspaceId:workspace.executionWorkspaceId,...(input.confirmNew?{confirmNew:input.confirmNew}:{}),onResume:()=>{resumedRecordedLaunch=true;},intent:{executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,profileId:input.preset.profile_id,profileRevision:input.preset.profile_revision,agent:input.agent,authMode:"interactive_login"},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId:input.machineId,agent:input.agent,preset:input.preset,operationId,executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,signal})});
+  let session = await withProviderLaunchIntent({...input.providerLaunchState,workspaceId:input.workspaceId,machineId:input.machineId,executionWorkspaceId:workspace.executionWorkspaceId,...(input.confirmNew?{confirmNew:input.confirmNew}:{}),isSessionEnded:async(id)=>isAgentSessionGone(await input.client.getAgentSession(id,signal)),onResume:()=>{resumedRecordedLaunch=true;},intent:{executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,profileId:input.preset.profile_id,profileRevision:input.preset.profile_revision,agent:input.agent,authMode:"interactive_login"},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId:input.machineId,agent:input.agent,preset:input.preset,operationId,executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,signal})});
   const sessionId = session.id;
   const validate = (value: AgentSession) => {
     if (value.id !== sessionId || value.machineId !== input.machineId || value.agent !== input.agent ||

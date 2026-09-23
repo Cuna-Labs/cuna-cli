@@ -66,6 +66,7 @@ import {
   type PaintedFirstLine,
 } from "./first-line.js";
 import { askRecordedLaunch, recordedLaunchConfirmation } from "./recorded-launch-prompt.js";
+import type { RecordedLaunchContext } from "../journey/provider-launch-intent.js";
 import { settledAgentSessionDisposition } from "../journey/session-disposition.js";
 import {
   agentJourneyCommand,
@@ -1748,7 +1749,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
        * returns, live in `recorded-launch-prompt.ts`, which can be asserted
        * without a TTY; this closure owns only the readline and the row.
        */
-      const askCreateAnotherSession = async (signal: AbortSignal | undefined): Promise<boolean> => {
+      const askCreateAnotherSession = async (signal: AbortSignal | undefined, context?: RecordedLaunchContext): Promise<boolean> => {
         inlineJourneyProgress?.stop();
         inlineJourneyProgress = undefined;
         const another = await askRecordedLaunch({
@@ -1772,8 +1773,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
             }
           },
           createLabel: journeyPhaseLabel("create-agent-session", journeyAgent),
+          ended: context?.state === "ended",
         });
-        recordedLaunchResumed = recordedLaunchResumed || !another;
+        // A No to the ended question resumes nothing; it ends the command.
+        recordedLaunchResumed = recordedLaunchResumed || (!another && context?.state !== "ended");
         return another;
       };
       if (credentialMode === undefined) {
@@ -1830,7 +1833,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const agentSessionId = await launchRemoteWorkspaceSession({
           preset,
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id},
-          confirmNew: () => askCreateAnotherSession(dependencies.signal),
+          confirmNew: (context) => askCreateAnotherSession(dependencies.signal, context),
           client, machineId: dependencies.managedWorkspaceMachineId, workspaceId, agent: journeyAgent,
           onProgress: (label) => inlineJourneyProgress?.update(label),
           onWait: renderJourneyWait,
