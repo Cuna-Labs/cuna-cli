@@ -25,7 +25,15 @@ import { RuntimeBoundaryError, runtimeFailure, terminalHistoryGap } from "../run
 import type { HostTerminalLease } from "./mode.js";
 import { assertCanonicalUuid } from "../core/validation.js";
 import { buildAppbarModel, type AppbarModel, type StatusEvidence } from "./appbar.js";
-import { renderWorkbenchFrame, workbenchUpdate, type WorkbenchFrame, type WorkbenchTab } from "./workbench.js";
+import {
+  renderWorkbenchFrame,
+  workbenchAppbarTargetAt,
+  workbenchUpdate,
+  type WorkbenchFrame,
+  type WorkbenchTab,
+} from "./workbench.js";
+import { ENABLE_HOST_MOUSE_REPORTING, HostMouseParser, type HostMouseEvent } from "./host-mouse.js";
+import type { SessionRoster, SessionRosterEntry } from "./session-roster.js";
 import { ViewportRegistry } from "./viewport.js";
 import { XtermViewportAdapter } from "./xterm-vte.js";
 
@@ -40,6 +48,9 @@ const REMOTE_FLOW_PAUSE = 0x73;
 const REMOTE_REDRAW = Uint8Array.of(0x0c);
 const TAB_FIRST = 0x31;
 const TAB_LAST = 0x34;
+// With a Machine roster, Ctrl+] 1-9 names roster entries rather than attached tabs.
+const ROSTER_LAST = 0x39;
+export const SWITCH_INPUT_NOTICE = "Keys typed while switching are not sent";
 const NEXT_TAB = 0x6e;
 const DETACH = 0x64;
 const HELP = 0x3f;
@@ -188,6 +199,25 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly disconnectFrameMs?: number;
   /** Stable only for this foreground process; never a reusable device credential. */
   readonly deviceId?: string;
+  /**
+   * The Machine's sessions, for a run attached to exactly one AgentSession.
+   * Its tabs replace the attached tab on the bar, and choosing one (click or
+   * Ctrl+] <n>) ends this run with a `switchRequest` for the runner.
+   */
+  readonly sessionRoster?: SessionRoster;
+  /** Ask the host for SGR press/release mouse reports, so the bar is clickable. */
+  readonly mouseReporting?: boolean;
+  /** Replaces the attaching loader's first line (a switch names its target). */
+  readonly attachingTitle?: string;
+  /** One line shown once the terminal is on screen, until the next key. */
+  readonly initialNotice?: string;
+}
+
+/** The session the person chose on the bar; the runner attaches it next. */
+export interface ForegroundSwitchRequest {
+  readonly agentSessionId: string;
+  readonly agent: SessionRosterEntry["agent"];
+  readonly label: string;
 }
 
 interface ForegroundTab {
@@ -266,6 +296,14 @@ export class ForegroundTerminalCoordinator {
    * the timer, is what keeps loader chrome from ever following PTY output.
    */
   #firstFrameRendered = false;
+  readonly #mouse = new HostMouseParser();
+  #removeRoster: (() => void) | undefined;
+  /** Host input chunks are numbered on receipt, so a switch can cut input at one. */
+  #inputReceipt = 0;
+  /** Set when a switch is chosen: input received after this receipt is never sent. */
+  #switchCutoff: number | undefined;
+  #switchRequest: ForegroundSwitchRequest | undefined;
+  #switchNotice: string | undefined;
 
   constructor(options: ForegroundTerminalCoordinatorOptions) {
     const resizeCoalesceMs = options.resizeCoalesceMs ?? RESIZE_COALESCE_MS;
@@ -302,10 +340,20 @@ export class ForegroundTerminalCoordinator {
       resolveStopStarted = resolve;
     });
     this.#resolveStopStarted = resolveStopStarted;
+    if (options.initialNotice !== undefined) this.#browserNotice = options.initialNotice;
   }
 
   get state(): ForegroundTerminalState {
     return this.#state;
+  }
+
+  /**
+   * The session chosen on the bar, once the current one was detached for it.
+   * Undefined when the run ended any other way, including a switch cancelled
+   * by Ctrl+C or a detach the runtime refused.
+   */
+  get switchRequest(): ForegroundSwitchRequest | undefined {
+    return this.#terminalFailure === undefined ? this.#switchRequest : undefined;
   }
 
   get failure(): unknown {
@@ -383,8 +431,16 @@ export class ForegroundTerminalCoordinator {
         throw runtimeFailure("terminal_disconnected", "Foreground terminal startup was cancelled.");
       }
       this.#lease = lease;
+      if (this.#options.mouseReporting === true) {
+        await this.#options.host.write(new TextEncoder().encode(ENABLE_HOST_MOUSE_REPORTING));
+      }
       this.#removeInput = this.#options.host.onInput((bytes) => this.#queueInput(bytes));
       this.#removeResize = this.#options.host.onResize(() => this.#queueResize());
+      if (this.#options.sessionRoster !== undefined && intents.length === 1) {
+        this.#removeRoster = this.#options.sessionRoster.subscribe(() => {
+          if (this.#state === "active") this.#queueStateRender();
+        });
+      }
       const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
       this.#attachingStageSince = this.#clock();
       await this.#renderAttaching(intents.length, dimensions);
@@ -472,8 +528,10 @@ export class ForegroundTerminalCoordinator {
     this.#resizeTimer = undefined;
     this.#removeInput?.();
     this.#removeResize?.();
+    this.#removeRoster?.();
     this.#removeInput = undefined;
     this.#removeResize = undefined;
+    this.#removeRoster = undefined;
     const failures: unknown[] = [];
     const runtime = this.#runtime;
     for (const tab of this.#tabs.values()) {
@@ -833,6 +891,57 @@ export class ForegroundTerminalCoordinator {
 
   #queueInput(bytes: Uint8Array): void {
     if (bytes.byteLength < 1) return;
+    if (this.#options.mouseReporting !== true) {
+      this.#queueKeys(bytes);
+      return;
+    }
+    // Mouse reports are Cuna's: none of them may reach a remote program.
+    for (const segment of this.#mouse.push(bytes)) {
+      if (segment.kind === "bytes") this.#queueKeys(segment.bytes);
+      else this.#queueMouse(segment.event);
+    }
+  }
+
+  /**
+   * A primary press on the bar. It is hit-tested against the frame the host
+   * is showing at receipt time, and ordered after every key received before
+   * it. Other mouse events are dropped: the host asked for them only so the
+   * bar is clickable.
+   */
+  #queueMouse(event: HostMouseEvent): void {
+    if (event.kind !== "press" || event.button !== 0 || this.#state !== "active" ||
+        this.#closingTabId !== undefined || this.#switchCutoff !== undefined) return;
+    const frame = this.#lastWorkbenchFrame;
+    if (frame === undefined || this.#lastHostFrame === undefined || event.row > frame.appbarRows) return;
+    const target = workbenchAppbarTargetAt(frame, event.column, event.row);
+    if (target === undefined) return;
+    const receipt = ++this.#inputReceipt;
+    if (target.startsWith("session:")) {
+      const entry = this.#rosterEntries().find((candidate) => `session:${candidate.agentSessionId}` === target);
+      if (entry === undefined || !this.#acceptSwitch(entry, receipt)) return;
+      this.#enqueueInputOperation(async () => await this.#detachTab(this.#activeTabId));
+    } else if (target.startsWith("tab:")) {
+      const tabId = target.slice("tab:".length);
+      this.#enqueueInputOperation(async () => this.#select(tabId));
+    }
+  }
+
+  #enqueueInputOperation(operation: () => Promise<void>): void {
+    const next = this.#inputTail.then(operation);
+    this.#inputTail = next.catch((error) => {
+      this.#recordFailure(error);
+      void this.stop().catch(() => { this.#state = "failed"; });
+    });
+  }
+
+  #queueKeys(bytes: Uint8Array): void {
+    const receipt = ++this.#inputReceipt;
+    if (this.#switchCutoff !== undefined) {
+      // R13/R16: nothing typed after the choice is sent; Ctrl+C cancels the
+      // switch, so the run ends once the current session is detached.
+      if (bytes.includes(INTERRUPT)) this.#switchRequest = undefined;
+      return;
+    }
     if (this.#state === "starting" && bytes.includes(INTERRUPT)) {
       if (this.#startupDetached) return;
       this.#startupDetached = true;
@@ -890,7 +999,7 @@ export class ForegroundTerminalCoordinator {
     }
     this.#pendingInputBytes += payload.byteLength;
     const operation = this.#inputTail.then(async () => {
-      try { await this.#routeInput(payload, receiptTarget); } finally { this.#pendingInputBytes -= payload.byteLength; }
+      try { await this.#routeInput(payload, receiptTarget, false, receipt); } finally { this.#pendingInputBytes -= payload.byteLength; }
     });
     this.#inputTail = operation.catch((error) => {
       if (error instanceof RuntimeBoundaryError && error.code === "terminal_observer") {
@@ -917,7 +1026,15 @@ export class ForegroundTerminalCoordinator {
     });
   }
 
-  async #routeInput(bytes: Uint8Array, receiptTarget: ForegroundInputTarget | undefined, releasedPrefix = false): Promise<void> {
+  async #routeInput(
+    bytes: Uint8Array,
+    receiptTarget: ForegroundInputTarget | undefined,
+    releasedPrefix = false,
+    receipt = 0,
+  ): Promise<void> {
+    // Received after a switch was chosen (a chord processed ahead of it in
+    // this queue): never sent, to either session.
+    if (this.#switchCutoff !== undefined && receipt > this.#switchCutoff) return;
     const runtime = this.#requireRuntime();
     if (bytes.includes(INTERRUPT)) {
       const active = this.#pendingBrowserAction === undefined
@@ -1002,6 +1119,20 @@ export class ForegroundTerminalCoordinator {
       } else if (byte === REMOTE_FLOW_RESUME) {
         target = chordTarget ?? target;
         remote.push(FLOW_RESUME);
+      } else if (this.#rosterActive() && ((byte >= TAB_FIRST && byte <= ROSTER_LAST) || byte === NEXT_TAB)) {
+        await flush();
+        const entries = this.#rosterEntries();
+        const entry = byte === NEXT_TAB ? this.#nextRosterEntry(entries) : entries[byte - TAB_FIRST];
+        if (entry === undefined) {
+          this.#browserNotice = byte === NEXT_TAB ? "No other session to switch to" : `No session ${byte - TAB_FIRST + 1}`;
+          this.#helpVisible = false;
+          await this.#render();
+          continue;
+        }
+        if (!this.#acceptSwitch(entry, receipt)) continue;
+        // The rest of this chunk came after the choice: it is not sent.
+        await this.#detachTab(this.#activeTabId);
+        return;
       } else if (byte >= TAB_FIRST && byte <= TAB_LAST) {
         await flush();
         this.#selectByIndex(byte - TAB_FIRST);
@@ -1532,6 +1663,59 @@ export class ForegroundTerminalCoordinator {
     return { bytes: joined, blocked: result.blocked };
   }
 
+  /** The roster names the bar only for a one-session run whose session it lists. */
+  #rosterActive(): boolean {
+    const activeSessionId = this.#activeSessionId();
+    return this.#options.sessionRoster !== undefined && this.#tabs.size === 1 && activeSessionId !== undefined &&
+      this.#rosterEntries().some((entry) => entry.agentSessionId === activeSessionId);
+  }
+
+  #rosterEntries(): readonly SessionRosterEntry[] {
+    return this.#options.sessionRoster?.entries() ?? [];
+  }
+
+  #activeSessionId(): string | undefined {
+    return this.#activeTabId === undefined ? undefined : this.#tabs.get(this.#activeTabId)?.intent.agentSessionId;
+  }
+
+  #nextRosterEntry(entries: readonly SessionRosterEntry[]): SessionRosterEntry | undefined {
+    const current = entries.findIndex((entry) => entry.agentSessionId === this.#activeSessionId());
+    for (let step = 1; step < entries.length; step += 1) {
+      const entry = entries[(current + step) % entries.length];
+      if (entry !== undefined && !entry.ended) return entry;
+    }
+    return undefined;
+  }
+
+  /**
+   * Decide a switch at the moment it is chosen. A refusal only says why, and
+   * nothing is detached. An accepted switch fixes the input cutoff here, so the
+   * caller's detach is the next and last thing this run does with the session.
+   */
+  #acceptSwitch(entry: SessionRosterEntry, receipt: number): boolean {
+    const name = `${rosterAgentName(entry.agent)} ${entry.label}`.trim();
+    const refusal = entry.agentSessionId === this.#activeSessionId()
+      ? `Already on ${name}`
+      : entry.ended ? `${name} ended · it cannot be attached` : undefined;
+    if (refusal !== undefined) {
+      this.#browserNotice = refusal;
+      this.#helpVisible = false;
+      void this.#render().catch(() => undefined);
+      return false;
+    }
+    if (this.#state !== "active" || this.#switchCutoff !== undefined || this.#tabs.size !== 1 ||
+        this.#closingTabId !== undefined) return false;
+    this.#switchCutoff = receipt;
+    this.#switchRequest = Object.freeze({ agentSessionId: entry.agentSessionId, agent: entry.agent, label: entry.label });
+    // Nothing of the departing session's input state may follow the person.
+    this.#prefixPending = false;
+    this.#prefixTarget = undefined;
+    this.#helpVisible = false;
+    this.#switchNotice = `Switching to ${name}… · ${SWITCH_INPUT_NOTICE}`;
+    void this.#render().catch(() => undefined);
+    return true;
+  }
+
   #selectByIndex(index: number): void {
     const tabId = [...this.#tabs.keys()][index];
     if (tabId === undefined) return;
@@ -1839,6 +2023,10 @@ export class ForegroundTerminalCoordinator {
         activeTabId,
         tabs,
         ...(this.#copyLinks.has(activeTabId) ? { action: "Copy link · Ctrl+] y" } : {}),
+        ...(this.#rosterActive()
+          ? { sessions: this.#rosterEntries(), activeSessionId: this.#activeSessionId() as string }
+          : {}),
+        ...(this.#options.mouseReporting === true ? { mouseReporting: true } : {}),
         appbar: this.#options.appbar?.() ?? runtimeAppbar(
           this.#clock(),
           this.#tabs.get(activeTabId)?.snapshot,
@@ -1847,6 +2035,8 @@ export class ForegroundTerminalCoordinator {
         color: this.#options.color ?? true,
         ...(this.#disconnectNotice !== undefined
           ? { notice: this.#disconnectNotice }
+          : this.#switchNotice !== undefined
+            ? { notice: this.#switchNotice }
           : this.#tabs.get(activeTabId)?.snapshot.state === "active" && this.#tabs.get(activeTabId)?.snapshot.terminalView?.ready === false
             ? { notice: "Restoring terminal\u2026" }
           : this.#browserNotice !== undefined
@@ -1862,7 +2052,7 @@ export class ForegroundTerminalCoordinator {
                     : `${providerName(this.#pendingBrowserAction.provider)} requests browser authentication · Enter/o open · d/Esc deny`,
               }
               : this.#helpVisible
-                ? { notice: "Keys: Ctrl+C detach | " + (process.platform === "win32" ? "Select text + Ctrl+Shift+C copy | Ctrl+Shift+V paste | " : "") + "Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry" +
+                ? { notice: "Keys: Ctrl+C detach | " + (process.platform === "win32" ? "Select text + Ctrl+Shift+C copy | Ctrl+Shift+V paste | " : "") + "Ctrl+S keep active | Ctrl+] c/s/q remote | " + (this.#rosterActive() ? "1-9 or click switch session" : "1-4 tab") + " | n next | r retry" +
                     (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
                       ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"
@@ -1928,7 +2118,9 @@ export class ForegroundTerminalCoordinator {
     dimensions: { readonly columns: number; readonly rows: number },
   ): Promise<void> {
     const color = this.#options.color ?? true;
-    const top = padTrustedLine(` CUNA  ATTACHING ${count} EXACT AGENTSESSION${count === 1 ? "" : "S"}`, dimensions.columns);
+    const top = padTrustedLine(this.#options.attachingTitle === undefined
+      ? ` CUNA  ATTACHING ${count} EXACT AGENTSESSION${count === 1 ? "" : "S"}`
+      : ` CUNA  ${this.#options.attachingTitle}`, dimensions.columns);
     const waitedMs = this.#clock() - this.#attachingStageSince;
     const waited = waitedMs >= ATTACH_STAGE_ELAPSED_AFTER_MS ? ` · ${Math.floor(waitedMs / 1_000)}s` : "";
     const indicator = `${ATTACHING_FRAMES[this.#attachingFrame % ATTACHING_FRAMES.length]} ${ATTACH_STAGE_LABELS[this.#attachingStage]}${waited}  ${ATTACHING_PROGRESS[this.#attachingFrame % ATTACHING_PROGRESS.length]}`;
@@ -2191,6 +2383,14 @@ function reconnectFailedNotice(failure: unknown): string {
 
 function isReconnectFailedNotice(value: string | undefined): boolean {
   return value !== undefined && value.startsWith("Reconnect failed");
+}
+
+function rosterAgentName(agent: SessionRosterEntry["agent"]): string {
+  switch (agent) {
+    case "claude-code": return "Claude";
+    case "codex": return "Codex";
+    case "opencode": return "OpenCode";
+  }
 }
 
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import xterm from "@xterm/headless";
-import { workbenchUpdate } from "../dist/terminal/workbench.js";
+import { workbenchAppbarTargetAt, workbenchUpdate } from "../dist/terminal/workbench.js";
 
 import {
   buildAppbarModel,
@@ -247,6 +247,76 @@ test("workbench restores the selected remote cursor below the appbar without for
   });
   assert.equal(frame.text.endsWith("\u001b[5;5H\u001b[?25l"), true);
   assert.equal(frame.text.endsWith("\u001b[?25h"), false);
+});
+
+const rosterSessions = [
+  { agentSessionId: "session-claude", number: 1, agent: "claude-code", label: "projA", ended: false },
+  { agentSessionId: "session-b", number: 2, agent: "claude-code", label: "projB", ended: false },
+  { agentSessionId: "session-c", number: 3, agent: "claude-code", label: "old", ended: true },
+];
+
+function rowText(frame, row) {
+  const start = frame.text.indexOf(`\u001b[${row};1H`);
+  const end = frame.text.indexOf(`\u001b[${row + 1};1H`);
+  // eslint-disable-next-line no-control-regex -- stripping the renderer's own SGR/erase sequences
+  return frame.text.slice(start, end).replace(/\u001b\[[0-9;]*[A-Za-z]/gu, "").replace(/^\d+;1H/u, "");
+}
+
+test("the Machine's sessions are the first-row tabs, on the right, the attached one bracketed", () => {
+  const frame = renderWorkbenchFrame({
+    columns: 100, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
+    sessions: rosterSessions, activeSessionId: "session-claude",
+  });
+  const top = rowText(frame, 1);
+  assert.equal(top.length, 100);
+  assert.match(top, /^ CUNA\s+\[1:Claude projA\] {3}2:Claude projB {4}3:Claude old ended  $/u);
+  assert.doesNotMatch(top, /review|primary/u, "the attached-tab labels give way to the roster");
+  const second = frame.appbarTargets.find((target) => target.target === "session:session-b");
+  assert.ok(second);
+  assert.equal(top.slice(second.firstColumn - 1, second.lastColumn), " 2:Claude projB ");
+  assert.equal(workbenchAppbarTargetAt(frame, second.firstColumn, 1), "session:session-b");
+  assert.equal(workbenchAppbarTargetAt(frame, second.lastColumn, 1), "session:session-b");
+  assert.equal(workbenchAppbarTargetAt(frame, second.firstColumn, 2), undefined, "only the tab row is clickable");
+  assert.equal(workbenchAppbarTargetAt(frame, 2, 1), undefined, "the CUNA brand is not a tab");
+});
+
+test("a roster that does not name the attached session is not shown", () => {
+  const frame = renderWorkbenchFrame({
+    columns: 100, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
+    sessions: rosterSessions.slice(1), activeSessionId: "session-claude",
+  });
+  assert.match(rowText(frame, 1), /\[1:Claude primary\]/u);
+  assert.deepEqual(frame.appbarTargets.map((target) => target.target), ["tab:tab-claude", "tab:tab-codex"]);
+});
+
+test("tabs that do not fit give way to a count, never the attached one", () => {
+  const many = Array.from({ length: 9 }, (_, index) => ({
+    agentSessionId: `s${index + 1}`, number: index + 1, agent: "claude-code", label: `project-${index + 1}`, ended: false,
+  }));
+  const frame = renderWorkbenchFrame({
+    columns: 60, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
+    sessions: many, activeSessionId: "s8",
+  });
+  const top = rowText(frame, 1);
+  assert.equal(top.length, 60);
+  assert.match(top, /\[8:Claude project-8\]/u);
+  assert.match(top, /\+\d+ $/u);
+  const shown = frame.appbarTargets.length;
+  assert.equal(Number(top.match(/\+(\d+) $/u)[1]), 9 - shown);
+});
+
+test("the copy/paste hint moves to the second row and says Shift+drag while the mouse is reported", () => {
+  const frame = renderWorkbenchFrame({
+    columns: 140, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
+    sessions: rosterSessions, activeSessionId: "session-claude", mouseReporting: true,
+  });
+  const second = rowText(frame, 2);
+  if (process.platform === "win32") {
+    assert.match(second, /Claude auth authenticated.*Shift\+drag select \| Ctrl\+Shift\+C copy \| Ctrl\+Shift\+V paste $/u);
+  } else {
+    assert.doesNotMatch(second, /Ctrl\+Shift\+C/u);
+  }
+  assert.doesNotMatch(rowText(frame, 1), /Ctrl\+Shift/u);
 });
 
 test("workbench safely re-emits VTE-parsed palette and RGB styles", () => {
