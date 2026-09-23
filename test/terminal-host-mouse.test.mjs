@@ -29,11 +29,48 @@ test("keys around a report keep their order and bytes", () => {
   ]);
 });
 
-test("a lone Escape and cursor keys are never held back", () => {
+test("ambiguous Escape prefixes are released on idle; complete cursor keys pass through", () => {
   const mouse = new HostMouseDecoder();
-  assert.deepEqual(decode(mouse.push(Uint8Array.of(0x1b))), [{ bytes: "\u001b" }]);
-  assert.deepEqual(decode(mouse.push(encoder.encode("\u001b["))), [{ bytes: "\u001b[" }]);
+  assert.deepEqual(decode(mouse.push(Uint8Array.of(0x1b))), []);
+  assert.equal(mouse.hasPending, true);
+  assert.equal(mouse.needsIdleRelease, true);
+  assert.equal(decoder.decode(mouse.flushPending()), "\u001b");
+  assert.deepEqual(decode(mouse.push(encoder.encode("\u001b["))), []);
+  assert.equal(decoder.decode(mouse.flushPending()), "\u001b[");
   assert.deepEqual(decode(mouse.push(encoder.encode("\u001b[B"))), [{ bytes: "\u001b[B" }]);
+  assert.deepEqual(decode(mouse.push(Uint8Array.of(0x1b))), []);
+  assert.deepEqual(decode(mouse.push(encoder.encode("d"))), [{ bytes: "\u001b" }, { bytes: "d" }]);
+});
+
+test("a distinct SGR prefix is never released as an Escape key", () => {
+  const mouse = new HostMouseDecoder();
+  assert.deepEqual(decode(mouse.push(encoder.encode("\u001b[<0;"))), []);
+  assert.equal(mouse.hasPending, true);
+  assert.equal(mouse.needsIdleRelease, false);
+  assert.deepEqual(decode(mouse.push(encoder.encode("13;2M"))), [
+    { mouse: { button: 0, column: 13, row: 2, release: false } },
+  ]);
+});
+
+test("every split of an SGR report stays mouse-only", () => {
+  const report = encoder.encode("\u001b[<0;13;2M");
+  for (let cut = 1; cut < report.length; cut += 1) {
+    const mouse = new HostMouseDecoder();
+    assert.deepEqual(decode(mouse.push(report.subarray(0, cut))), [], `cut ${cut} leaked prefix bytes`);
+    assert.deepEqual(decode(mouse.push(report.subarray(cut))), [
+      { mouse: { button: 0, column: 13, row: 2, release: false } },
+    ], `cut ${cut} failed to recover the click`);
+    assert.equal(mouse.hasPending, false);
+  }
+});
+
+test("a report delayed beyond the Escape window is the known raw-byte ambiguity", () => {
+  const mouse = new HostMouseDecoder();
+  assert.deepEqual(decode(mouse.push(encoder.encode("\u001b"))), []);
+  assert.equal(decoder.decode(mouse.flushPending()), "\u001b", "the idle timer cannot know it was a report prefix");
+  assert.deepEqual(decode(mouse.push(encoder.encode("[<0;13;2M"))), [
+    { bytes: "[<0;13;2M" },
+  ], "the late suffix cannot be recognized as a mouse report");
 });
 
 test("a report split across chunks is joined; a malformed one is passed through as bytes", () => {
@@ -49,6 +86,18 @@ test("a report inside bracketed paste is pasted text", () => {
   const pasted = "\u001b[200~see \u001b[<64;1;1M here\u001b[201~";
   assert.deepEqual(decode(mouse.push(encoder.encode(pasted))), [{ bytes: pasted }]);
   assert.deepEqual(decode(mouse.push(encoder.encode("\u001b[<64;1;1M"))), [{ mouse: { button: 64, column: 1, row: 1, release: false } }]);
+});
+
+test("every split of the paste opener keeps mouse-looking content as bytes", () => {
+  const pasted = "\u001b[200~x\u001b[<0;13;1My\u001b[201~";
+  const input = encoder.encode(pasted);
+  const openerLength = encoder.encode("\u001b[200~").length;
+  for (let cut = 1; cut < openerLength; cut += 1) {
+    const mouse = new HostMouseDecoder();
+    const segments = [...mouse.push(input.subarray(0, cut)), ...mouse.push(input.subarray(cut))];
+    assert.equal(segments.every((segment) => segment.kind === "bytes"), true, `cut ${cut} parsed a pasted click`);
+    assert.equal(decoder.decode(Buffer.concat(segments.map((segment) => segment.bytes))), pasted);
+  }
 });
 
 test("forwarded reports use the remote program's encoding and coordinates", () => {

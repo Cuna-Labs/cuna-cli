@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { constants as fileConstants } from "node:fs";
 import { chmod, lstat, mkdir, open, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { createServer, type Server } from "node:net";
+import { createServer } from "node:net";
 import { isAbsolute, join, parse, resolve } from "node:path";
 
 import { assertReadableSchema, assertWritableSchema, type DurableSchemaEnvelope } from "../workspace/schema.js";
@@ -44,7 +45,7 @@ interface LeaseRecord {
 }
 
 interface WriterAuthority {
-  readonly server: Server;
+  assertHeld(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -62,6 +63,8 @@ export interface JournalInspection {
 const META_FILE = "journal.meta.json";
 const RECORD_FILE = "journal.ndjson";
 const LEASE_FILE = "writer.lease";
+const AUTHORITY_LOCK_FILE = "writer.authority.lock";
+const WRITER_LOCK_HANDSHAKE_MS = 5_000;
 
 export class DurableSyncJournal {
   readonly #directory: string;
@@ -114,6 +117,7 @@ export class DurableSyncJournal {
     let leaseOwned = false;
     let ownerFence = 0;
     try {
+      await authority.assertHeld();
       await assertDirectoryAuthority(directory);
       const metadataPath = join(directory, META_FILE);
       let metadata = await readMetadata(metadataPath, input.bindingId, input.bindingGeneration);
@@ -131,6 +135,7 @@ export class DurableSyncJournal {
       });
       leaseOwned = true;
       ownerFence = fence;
+      await authority.assertHeld();
       metadata = Object.freeze({ ...metadata, lastFence: fence });
       await atomicWriteJson(metadataPath, metadata);
       const inspection = await inspectSyncJournal(directory);
@@ -138,6 +143,7 @@ export class DurableSyncJournal {
         throw journalFailure(inspection.reason ?? "journal_untrusted");
       }
       const readyAt = trustedNow(clock);
+      await authority.assertHeld();
       if (readyAt < observedAt) throw journalFailure("clock_rollback");
       if (readyAt >= expiresAt) throw journalFailure("lease_expired_during_open");
       return new DurableSyncJournal({
@@ -281,6 +287,7 @@ export class DurableSyncJournal {
 
   async #assertLease(): Promise<void> {
     if (this.#closed) throw journalFailure("writer_closed");
+    await this.#authority.assertHeld();
     await assertDirectoryAuthority(this.#directory);
     const lease = await readJson<LeaseRecord>(join(this.#directory, LEASE_FILE), validLeaseRecord);
     if (
@@ -561,54 +568,36 @@ function noFollowFlag(): number {
 }
 
 async function acquireWriterAuthority(directory: string): Promise<WriterAuthority> {
+  if (process.platform !== "win32") return await acquireUnixWriterAuthority(directory);
   const canonicalIdentity = process.platform === "win32" ? directory.toLowerCase() : directory;
   const digest = createHash("sha256")
     .update("cuna-journal-authority-v2\0")
     .update(canonicalIdentity)
     .digest("hex");
-  // Windows reserves dynamic TCP port ranges for system services. Deriving a
-  // lock port from a directory hash can therefore fail with EACCES even when
-  // no peer owns the journal. A named pipe is kernel-owned, directory-scoped,
-  // and released automatically when the process exits.
-  const endpoints = process.platform === "win32"
-    ? [`\\\\.\\pipe\\cuna-workspace-journal-${digest}`]
-    : [Object.freeze({
-      host: "127.0.0.1" as const,
-      // Every writer must contend on the same endpoint. A fallback port would
-      // admit another writer when the original colliding listener disappears.
-      port: 20_000 + Number.parseInt(digest.slice(0, 4), 16) % 40_000,
-      exclusive: true,
-    })];
-  let server: ReturnType<typeof createServer> | undefined;
-  for (const endpoint of endpoints) {
-    const candidate = createServer((socket) => socket.end(digest));
-    try {
-      await new Promise<void>((resolveListen, rejectListen) => {
-        const onError = (error: NodeJS.ErrnoException): void => {
-          candidate.removeListener("listening", onListening);
-          rejectListen(error);
-        };
-        const onListening = (): void => {
-          candidate.removeListener("error", onError);
-          resolveListen();
-        };
-        candidate.once("error", onError);
-        candidate.once("listening", onListening);
-        candidate.listen(endpoint);
-      });
-      server = candidate;
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-      break;
-    }
-  }
-  if (server === undefined) {
-    throw workspaceError("workspace_busy", "Another process owns the workspace journal.", "conflict", "active_writer");
+  // A Windows named pipe has the full directory digest in its kernel-owned
+  // name and disappears when the process exits.
+  const server = createServer((socket) => socket.end(digest));
+  try {
+    await new Promise<void>((resolveListen, rejectListen) => {
+      const onError = (error: NodeJS.ErrnoException): void => {
+        server.removeListener("listening", onListening);
+        rejectListen(error);
+      };
+      const onListening = (): void => {
+        server.removeListener("error", onError);
+        resolveListen();
+      };
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.listen(`\\\\.\\pipe\\cuna-workspace-journal-${digest}`);
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") throw writerBusy();
+    throw error;
   }
   let closed = false;
   return Object.freeze({
-    server,
+    assertHeld: async (): Promise<void> => { if (closed || !server.listening) throw journalFailure("writer_lock_lost"); },
     close: async (): Promise<void> => {
       if (closed) return;
       await new Promise<void>((resolveClose, rejectClose) => {
@@ -617,6 +606,90 @@ async function acquireWriterAuthority(directory: string): Promise<WriterAuthorit
       closed = true;
     },
   });
+}
+
+/**
+ * Unix flock/lockf locks the same journal-local inode for every writer. The
+ * helper writes READY only after acquiring the kernel lock, then waits on a
+ * pipe from this process; EOF after a crash releases the lock automatically.
+ * A file lock has no finite TCP port namespace and no stale socket pathname.
+ */
+async function acquireUnixWriterAuthority(directory: string): Promise<WriterAuthority> {
+  const lockPath = join(directory, AUTHORITY_LOCK_FILE);
+  const handle = await openSecureAppendFile(lockPath);
+  const command = process.platform === "darwin" ? "lockf" : "flock";
+  const helper = "process.stdout.write('CUNA_JOURNAL_LOCK_READY\\n'); process.stdin.resume(); process.stdin.on('end', () => process.exit(0));";
+  const args = process.platform === "darwin"
+    // macOS -n requires an existing file; -t 0 is the nonblocking lock attempt.
+    ? ["-k", "-n", "-t", "0", lockPath, process.execPath, "-e", helper]
+    // -F execs the helper without a wrapper that could outlive this parent.
+    : ["-F", "-n", "-E", "75", lockPath, process.execPath, "-e", helper];
+  const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
+  let spawnError: unknown;
+  child.once("error", (error) => { spawnError = error; });
+  child.stdin.on("error", () => undefined);
+  child.stderr.resume();
+  const ended = new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>((resolveExit) => {
+    child.once("close", (code, signal) => resolveExit({ code, signal }));
+  });
+  const ready = new Promise<true>((resolveReady) => {
+    let output = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      output += chunk.toString("utf8");
+      if (output.includes("CUNA_JOURNAL_LOCK_READY\n")) resolveReady(true);
+    });
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const handshake = new Promise<"timeout">((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout("timeout"), WRITER_LOCK_HANDSHAKE_MS);
+  });
+  const result = await Promise.race([ready.then(() => "ready" as const), ended.then(() => "exit" as const), handshake]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (result !== "ready") {
+    if (result === "timeout") {
+      child.stdin.end();
+      // lockf may spawn the helper on macOS. Kill the separate process group
+      // so a timed-out wrapper cannot leave an orphan holding the lock.
+      try { if (child.pid === undefined) child.kill("SIGKILL"); else process.kill(-child.pid, "SIGKILL"); }
+      catch { child.kill("SIGKILL"); }
+      await ended;
+    }
+    await handle.close();
+    if (result === "timeout") throw journalFailure("writer_lock_timeout");
+    if (spawnError !== undefined) throw journalFailure("writer_lock_unavailable");
+    const exit = await ended;
+    if (exit.code === 75) throw writerBusy();
+    throw journalFailure("writer_lock_unavailable");
+  }
+  try { await assertSecureHandle(handle, lockPath); } catch (error) {
+    child.stdin.end();
+    await ended;
+    await handle.close();
+    throw error;
+  }
+  let closePromise: Promise<void> | undefined;
+  return Object.freeze({
+    assertHeld: async (): Promise<void> => {
+      if (closePromise !== undefined || child.exitCode !== null || child.signalCode !== null) {
+        throw journalFailure("writer_lock_lost");
+      }
+      await assertSecureHandle(handle, lockPath);
+      if (child.exitCode !== null || child.signalCode !== null) throw journalFailure("writer_lock_lost");
+    },
+    close: (): Promise<void> => {
+      closePromise ??= (async () => {
+        child.stdin.end();
+        const exit = await ended;
+        await handle.close();
+        if (exit.code !== 0) throw journalFailure("writer_lock_close_failed");
+      })();
+      return closePromise;
+    },
+  });
+}
+
+function writerBusy() {
+  return workspaceError("workspace_busy", "Another process owns the workspace journal.", "conflict", "active_writer");
 }
 
 function validLeaseRecord(value: unknown): value is LeaseRecord {

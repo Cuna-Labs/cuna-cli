@@ -2578,3 +2578,215 @@ test("R11: the rich host lease clears mouse reporting on entry and restores it o
   assert.ok(restored.includes("\u001b[?1000l") && restored.includes("\u001b[?1006l"), "reporting is off after restore");
   assert.ok(restored.lastIndexOf("\u001b[?1000l") < restored.lastIndexOf("\u001b[?1049l"), "and off before the alternate screen is left");
 });
+
+/* -------------------------------------------------------------------------- */
+/* Session tabs: the Machine's sessions on the bar, switched by click or chord */
+/* -------------------------------------------------------------------------- */
+
+const SESSION_C = "33333333-3333-4333-8333-333333333333";
+const ENABLE_MOUSE = "\u001b[?1000h\u001b[?1006h";
+
+function rosterOf(entries) {
+  const listeners = new Set();
+  return {
+    list: entries,
+    entries() { return this.list; },
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    change(next) { this.list = next; for (const listener of listeners) listener(); },
+  };
+}
+
+function machineRoster() {
+  return rosterOf([
+    { number: 1, agentSessionId: SESSION_A, agent: "claude-code", label: "projA", ended: false },
+    { number: 2, agentSessionId: SESSION_B, agent: "claude-code", label: "projB", ended: false },
+    { number: 3, agentSessionId: SESSION_C, agent: "claude-code", label: "old", ended: true },
+  ]);
+}
+
+async function tabColumn(host, text) {
+  const top = (await visibleHostText(host)).split("\n")[0];
+  const index = top.indexOf(text);
+  assert.ok(index >= 0, `the bar shows ${text}: ${top}`);
+  return index + 1;
+}
+
+async function sessionTabsHarness(options = {}) {
+  const roster = options.roster ?? machineRoster();
+  const system = harness({
+    ...options,
+    coordinatorOptions: { mouseReporting: options.mouseReporting ?? true, sessionRoster: roster, ...options.coordinatorOptions },
+  });
+  await system.coordinator.start(system.intents.slice(0, 1));
+  await waitUntil(() => /2:Claude projB/u.test(decoder.decode(system.host.writes.at(-1))), "the roster reaches the bar");
+  return { ...system, roster };
+}
+
+const press = (column, row = 1) => encoder.encode(`\u001b[<0;${column};${row}M`);
+
+test("session tabs: a click on another session detaches this one and asks for that one; later keys go nowhere", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    assert.ok(host.writes.some((bytes) => decoder.decode(bytes).includes(ENABLE_MOUSE)), "press reports are asked for");
+    assert.match((await visibleHostText(host)).split("\n")[0], /\[1:Claude projA\].*2:Claude projB.*3:Claude old ended/u);
+    const column = await tabColumn(host, "2:Claude projB");
+    host.emitInput(encoder.encode("before"));
+    host.emitInput(Uint8Array.from([...press(column), ...encoder.encode("after-in-chunk")]));
+    host.emitInput(encoder.encode("after"));
+    await waitUntil(() => coordinator.state === "stopped", "the switch ends this attachment");
+    assert.deepEqual(calls.input.map((item) => item.text), ["before"], "only keys typed before the click reach A");
+    assert.deepEqual(calls.detach, ["tab-a"]);
+    assert.deepEqual(coordinator.switchRequest, { agentSessionId: SESSION_B, agent: "claude-code", label: "projB" });
+    assert.deepEqual(coordinator.detachedSessions.map((item) => item.agentSessionId), [SESSION_A]);
+    assert.equal(host.restored, 1, "the lease is released by its owner");
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: a click split after Escape within the input window never reaches the remote", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const column = await tabColumn(host, "2:Claude projB");
+    const click = press(column);
+    host.emitInput(click.subarray(0, 1));
+    host.emitInput(click.subarray(1));
+    await waitUntil(() => coordinator.state === "stopped", "the split click still switches");
+    assert.deepEqual(calls.input, [], "no click byte reached the remote");
+    assert.equal(coordinator.switchRequest?.agentSessionId, SESSION_B);
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: a distinct SGR prefix survives an idle gap without reaching the remote", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const click = press(await tabColumn(host, "2:Claude projB"));
+    host.emitInput(click.subarray(0, 5)); // ESC[<0;
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.deepEqual(calls.input, [], "an incomplete but distinct report stays local");
+    host.emitInput(click.subarray(5));
+    await waitUntil(() => coordinator.state === "stopped", "the delayed report still switches");
+    assert.deepEqual(calls.input, []);
+    assert.equal(coordinator.switchRequest?.agentSessionId, SESSION_B);
+  } finally { await coordinator.stop(); }
+});
+
+test("LIMIT: a mouse report split beyond the Escape window is indistinguishable from a lone Escape", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const click = press(await tabColumn(host, "2:Claude projB"));
+    host.emitInput(click.subarray(0, 1));
+    await waitUntil(() => calls.input.length === 1, "the lone Escape is released promptly");
+    host.emitInput(click.subarray(1));
+    await waitUntil(() => calls.input.length === 2, "the delayed suffix is ordinary bytes");
+    assert.equal(calls.input.map((item) => item.text).join(""), decoder.decode(click));
+    assert.equal(coordinator.switchRequest, undefined, "the late suffix cannot be recognized as a click");
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: the attached tab, an ended tab and the brand are not switch targets", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    host.emitInput(press(await tabColumn(host, "1:Claude projA")));
+    await waitUntil(() => /Already on Claude projA/u.test(decoder.decode(host.writes.at(-1))), "own tab says so");
+    host.emitInput(press(await tabColumn(host, "3:Claude old")));
+    await waitUntil(() => /Claude old ended · it cannot be attached/u.test(decoder.decode(host.writes.at(-1))), "ended tab says so");
+    host.emitInput(press(2));
+    host.emitInput(press(await tabColumn(host, "2:Claude projB"), 2));
+    host.emitInput(encoder.encode("still here"));
+    await waitUntil(() => calls.input.length === 1, "typing still reaches A");
+    assert.equal(calls.input[0].text, "still here");
+    assert.deepEqual(calls.detach, []);
+    assert.equal(coordinator.switchRequest, undefined);
+    assert.equal(coordinator.state, "active");
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: Ctrl+] <n> is the keyboard click; the rest of the chunk is not sent", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    host.emitInput(Uint8Array.of(0x1d, 0x39));
+    await waitUntil(() => /No session 9/u.test(decoder.decode(host.writes.at(-1))), "an unknown number says so");
+    host.emitInput(Uint8Array.of(0x1d, 0x33));
+    await waitUntil(() => /Claude old ended/u.test(decoder.decode(host.writes.at(-1))), "an ended number says so");
+    host.emitInput(Uint8Array.from([0x1d, 0x32, ...encoder.encode("tail")]));
+    await waitUntil(() => coordinator.state === "stopped", "the chord switches");
+    assert.deepEqual(calls.input, []);
+    assert.equal(coordinator.switchRequest?.agentSessionId, SESSION_B);
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: Ctrl+] n picks the next session that has not ended", async () => {
+  const roster = rosterOf([
+    { number: 1, agentSessionId: SESSION_C, agent: "claude-code", label: "old", ended: true },
+    { number: 2, agentSessionId: SESSION_A, agent: "claude-code", label: "projA", ended: false },
+    { number: 3, agentSessionId: "44444444-4444-4444-8444-444444444444", agent: "codex", label: "gone", ended: true },
+    { number: 4, agentSessionId: SESSION_B, agent: "claude-code", label: "projB", ended: false },
+  ]);
+  const host = new FakeHost();
+  host.columns = 120;
+  const system = harness({ host, coordinatorOptions: { mouseReporting: true, sessionRoster: roster } });
+  try {
+    await system.coordinator.start(system.intents.slice(0, 1));
+    await waitUntil(() => /4:Claude projB/u.test(decoder.decode(system.host.writes.at(-1))), "the roster reaches the bar");
+    system.host.emitInput(Uint8Array.of(0x1d, 0x6e));
+    await waitUntil(() => system.coordinator.state === "stopped", "n switches");
+    assert.equal(system.coordinator.switchRequest?.agentSessionId, SESSION_B);
+  } finally { await system.coordinator.stop(); }
+});
+
+test("session tabs: Ctrl+C after the click cancels the switch; the run just ends", async () => {
+  let release;
+  const detachGate = new Promise((resolve) => { release = resolve; });
+  const { coordinator, calls, host } = await sessionTabsHarness({ detachGate });
+  try {
+    host.emitInput(press(await tabColumn(host, "2:Claude projB")));
+    await waitUntil(() => calls.detach.length === 1, "the detach starts");
+    host.emitInput(Uint8Array.of(0x03));
+    release();
+    await waitUntil(() => coordinator.state === "stopped", "the run ends");
+    assert.equal(coordinator.switchRequest, undefined);
+    assert.deepEqual(calls.input, []);
+  } finally { release?.(); await coordinator.stop(); }
+});
+
+test("session tabs: a paste that contains a mouse-like sequence is pasted, not clicked", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const column = await tabColumn(host, "2:Claude projB");
+    const pasted = `\u001b[200~x\u001b[<0;${column};1My\u001b[201~`;
+    host.emitInput(encoder.encode(pasted));
+    await waitUntil(() => calls.input.length === 1, "the paste is sent");
+    assert.equal(calls.input[0].text, pasted);
+    assert.equal(coordinator.switchRequest, undefined);
+    assert.deepEqual(calls.detach, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("NEGATIVE CONTROL session tabs: without mouse reporting the same bytes are keys, not a click", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness({ mouseReporting: false });
+  try {
+    assert.ok(!host.writes.some((bytes) => decoder.decode(bytes).includes(ENABLE_MOUSE)));
+    const column = await tabColumn(host, "2:Claude projB");
+    host.emitInput(press(column));
+    await waitUntil(() => calls.input.length === 1, "the bytes go to the remote");
+    assert.equal(calls.input[0].text, `\u001b[<0;${column};1M`);
+    assert.equal(coordinator.switchRequest, undefined);
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: a roster change repaints the bar; a multi-session run keeps its own tabs", async () => {
+  const wide = new FakeHost();
+  wide.columns = 120;
+  const { coordinator, host, roster } = await sessionTabsHarness({ host: wide });
+  try {
+    roster.change([...roster.list, { number: 4, agentSessionId: "44444444-4444-4444-8444-444444444444", agent: "claude-code", label: "fresh", ended: false }]);
+    await waitUntil(() => /4:Claude fresh/u.test(decoder.decode(host.writes.at(-1))), "a new session appears");
+  } finally { await coordinator.stop(); }
+  const multi = harness({ coordinatorOptions: { mouseReporting: true, sessionRoster: machineRoster() } });
+  try {
+    await multi.coordinator.start(multi.intents);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const top = (await visibleHostText(multi.host)).split("\n")[0];
+    assert.match(top, /\[1:Claude primary\].*2:Codex review/u);
+    assert.doesNotMatch(top, /projB/u);
+  } finally { await multi.coordinator.stop(); }
+});

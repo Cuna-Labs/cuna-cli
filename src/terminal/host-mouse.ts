@@ -44,17 +44,32 @@ export const HOST_MOUSE_REPORTING_OFF = "\u001b[?1000l\u001b[?1002l\u001b[?1003l
 /**
  * Splits host input into ordinary bytes and SGR mouse reports.
  *
- * Only an `ESC [ <` prefix is ever held back across chunks: a lone Escape, or
- * `ESC [` (the start of every cursor key), goes out at once, so no key is
- * delayed waiting for a report that is not coming. Bracketed paste content is
- * never parsed: a pasted report is text.
+ * Potential mouse and bracketed-paste prefixes are held across chunks until
+ * complete or until the owner releases them after a short idle window. Raw
+ * terminal bytes cannot distinguish a lone Escape key from the first chunk
+ * of a report delayed beyond that window. Bracketed paste content is never
+ * parsed: a pasted report is text.
  */
 export class HostMouseDecoder {
   #carry: number[] = [];
   #pasting = false;
   #pasteMatch = 0;
 
+  get hasPending(): boolean { return this.#carry.length > 0; }
+  get needsIdleRelease(): boolean {
+    return this.#carry.length === 1 && this.#carry[0] === ESC ||
+      this.#carry.length === 2 && this.#carry[0] === ESC && this.#carry[1] === 0x5b;
+  }
+
+  /** Release an ambiguous prefix after the host input has gone idle. */
+  flushPending(): Uint8Array {
+    const pending = Uint8Array.from(this.#carry);
+    this.#carry = [];
+    return pending;
+  }
+
   push(chunk: Uint8Array): HostInputSegment[] {
+    const hadCarry = this.#carry.length > 0;
     const input = this.#carry.length === 0 ? chunk : Uint8Array.from([...this.#carry, ...chunk]);
     this.#carry = [];
     const segments: HostInputSegment[] = [];
@@ -73,6 +88,21 @@ export class HostMouseDecoder {
         if (this.#pasteMatch === PASTE_END.length) { this.#pasting = false; this.#pasteMatch = 0; }
         index += 1;
         continue;
+      }
+      if (hadCarry && index === 0 && byte === ESC && input.length > 1 && input[1] !== 0x5b) {
+        // An isolated Escape followed by an unrelated key is two input acts.
+        // Keep their receipt boundaries so local decisions (for example a
+        // browser request's "d" response) still see the key alone.
+        plain.push(ESC);
+        flushPlain();
+        index += 1;
+        continue;
+      }
+      if (byte === ESC && (incompletePrefix(input, index, PASTE_START) ||
+        incompletePrefix(input, index, [ESC, 0x5b, 0x3c]))) {
+        flushPlain();
+        this.#carry = [...input.subarray(index)];
+        return segments;
       }
       if (byte === ESC && startsWith(input, index, PASTE_START)) {
         plain.push(...PASTE_START);
@@ -106,6 +136,11 @@ export class HostMouseDecoder {
 function startsWith(input: Uint8Array, index: number, prefix: readonly number[]): boolean {
   if (index + prefix.length > input.length) return false;
   return prefix.every((value, offset) => input[index + offset] === value);
+}
+
+function incompletePrefix(input: Uint8Array, index: number, prefix: readonly number[]): boolean {
+  const available = input.length - index;
+  return available < prefix.length && prefix.slice(0, available).every((value, offset) => input[index + offset] === value);
 }
 
 function parseSgrReport(input: Uint8Array, start: number):

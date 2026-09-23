@@ -15,6 +15,15 @@ export interface WorkbenchTab {
   readonly viewport: ViewportSnapshot;
 }
 
+/** One AgentSession of the Machine, as a clickable tab on the first bar row. */
+export interface WorkbenchSessionTab {
+  readonly agentSessionId: string;
+  readonly number: number;
+  readonly agent: WorkbenchTab["agent"];
+  readonly label: string;
+  readonly ended: boolean;
+}
+
 export interface WorkbenchFrameInput {
   readonly columns: number;
   readonly rows: number;
@@ -24,6 +33,23 @@ export interface WorkbenchFrameInput {
   readonly notice?: string;
   readonly action?: string;
   readonly color?: boolean;
+  /**
+   * The Machine's sessions. When present and it names `activeSessionId`, the
+   * first row lists these instead of the attached tabs, numbered as given.
+   */
+  readonly sessions?: readonly WorkbenchSessionTab[];
+  readonly activeSessionId?: string;
+  /** Mouse reporting is on, so plain drag no longer selects: say Shift+drag. */
+  readonly mouseReporting?: boolean;
+}
+
+/** Where a tab was drawn on the bar, in 1-based host cells, for a click to find. */
+export interface WorkbenchAppbarTarget {
+  readonly row: number;
+  readonly firstColumn: number;
+  readonly lastColumn: number;
+  /** `session:<id>` for a Machine session, `tab:<id>` for an attached tab. */
+  readonly target: string;
 }
 
 export interface WorkbenchFrame {
@@ -36,6 +62,13 @@ export interface WorkbenchFrame {
   readonly text: string;
   readonly appbarRows: number;
   readonly viewportRows: number;
+  readonly appbarTargets: readonly WorkbenchAppbarTarget[];
+}
+
+/** The tab under a host cell, if the frame drew one there. */
+export function workbenchAppbarTargetAt(frame: WorkbenchFrame, column: number, row: number): string | undefined {
+  return frame.appbarTargets.find((target) =>
+    target.row === row && column >= target.firstColumn && column <= target.lastColumn)?.target;
 }
 
 export class WorkbenchRenderError extends Error {
@@ -96,14 +129,24 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
 
   const appbarRows = input.rows >= 5 ? 2 : 1;
   const viewportRows = input.rows - appbarRows;
-  const lines = appbarRows === 2
-    ? [
-        input.action === undefined ? renderTabs(input.tabs, input.activeTabId, input.columns) : truncate(`[ ${input.action} ]  ${renderTabs(input.tabs, input.activeTabId, input.columns)}`, input.columns),
+  let appbarTargets: readonly WorkbenchAppbarTarget[] = Object.freeze([]);
+  let lines: string[];
+  if (appbarRows === 2) {
+    const tabRow = renderTabRow(tabRowEntries(input), input.action, input.columns);
+    appbarTargets = tabRow.targets;
+    lines = [
+      tabRow.line,
+      withClipboardHint(
         input.notice === undefined ? renderTruth(input.appbar, active.agent, input.columns) : truncate(` ${safeText(input.notice)}`, input.columns),
-      ]
-    : [input.notice === undefined
-        ? renderCompact(input.tabs, input.activeTabId, input.appbar, input.columns)
-        : truncate(` CUNA  ${safeText(input.notice)}`, input.columns)];
+        input.columns,
+        input.mouseReporting === true,
+      ),
+    ];
+  } else {
+    lines = [input.notice === undefined
+      ? renderCompact(input.tabs, input.activeTabId, input.appbar, input.columns)
+      : truncate(` CUNA  ${safeText(input.notice)}`, input.columns)];
+  }
   const color = input.color !== false;
   let text = `${ESC}?25l${ESC}H`;
   const rowCommands: string[] = [];
@@ -140,6 +183,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
     text,
     appbarRows,
     viewportRows,
+    appbarTargets,
   });
 }
 
@@ -196,20 +240,102 @@ export function workbenchUpdate(previous: WorkbenchFrame | undefined, next: Work
   return new TextEncoder().encode(`${ESC}?25l${changed.join("")}${next.cursorCommand}`);
 }
 
-function renderTabs(tabs: readonly WorkbenchTab[], activeTabId: string, columns: number): string {
-  const parts = [" CUNA"];
-  for (let index = 0; index < tabs.length; index += 1) {
-    const tab = tabs[index];
-    if (tab === undefined) continue;
-    const active = tab.id === activeTabId;
-    const label = `${index + 1}:${agentLabel(tab.agent)} ${safeText(tab.label)}`;
-    parts.push(active ? `[${label}]` : ` ${label} `);
+interface TabRowEntry {
+  readonly text: string;
+  readonly active: boolean;
+  readonly target: string;
+}
+
+function tabRowEntries(input: WorkbenchFrameInput): readonly TabRowEntry[] {
+  const sessions = input.sessions;
+  if (sessions !== undefined && input.activeSessionId !== undefined &&
+      sessions.some((session) => session.agentSessionId === input.activeSessionId)) {
+    return sessions.map((session) => {
+      const active = session.agentSessionId === input.activeSessionId;
+      const label = [`${session.number}:${agentLabel(session.agent)}`, safeText(session.label), session.ended ? "ended" : ""]
+        .filter((part) => part.length > 0).join(" ");
+      return { text: active ? `[${label}]` : ` ${label} `, active, target: `session:${session.agentSessionId}` };
+    });
   }
-  const tabLabels = parts.join("  ");
-  const clipboard = "Select text: Ctrl+Shift+C copy | Ctrl+Shift+V paste";
-  return truncate(process.platform === "win32" && columns >= 100
-    ? `${truncate(tabLabels, Math.max(20, columns - clipboard.length - 3))}   ${clipboard}`
-    : tabLabels, columns);
+  return input.tabs.map((tab, index) => {
+    const active = tab.id === input.activeTabId;
+    const label = `${index + 1}:${agentLabel(tab.agent)} ${safeText(tab.label)}`;
+    return { text: active ? `[${label}]` : ` ${label} `, active, target: `tab:${tab.id}` };
+  });
+}
+
+/**
+ * ` CUNA` on the left, the tabs on the right. Tabs that do not fit give way to
+ * a `+k` count, but the active tab is always drawn: it is the one thing on the
+ * row the person must never lose.
+ */
+function renderTabRow(
+  entries: readonly TabRowEntry[],
+  action: string | undefined,
+  columns: number,
+): { readonly line: string; readonly targets: readonly WorkbenchAppbarTarget[] } {
+  const gap = 2;
+  let left = action === undefined ? " CUNA" : ` CUNA  [ ${safeText(action)} ]`;
+  const active = entries.find((entry) => entry.active);
+  const activeIdentityWidth = active === undefined ? 0 : displayCellWidth(active.text.split(" ")[0] ?? "") + 2;
+  const overflowWidth = entries.length > 1 ? gap + `+${entries.length - 1}`.length : 0;
+  if (action !== undefined && columns - displayCellWidth(left) - gap - 1 < activeIdentityWidth + overflowWidth) {
+    left = " CUNA";
+  }
+  const room = columns - displayCellWidth(left) - gap - 1;
+  const widths = entries.map((entry) => displayCellWidth(entry.text));
+  const total = (chosen: readonly number[], hidden: number): number =>
+    chosen.reduce((sum, index) => sum + (widths[index] ?? 0), 0) + Math.max(0, chosen.length - 1) * gap +
+    (hidden > 0 ? gap + `+${hidden}`.length : 0);
+  let chosen = entries.map((_, index) => index);
+  if (total(chosen, 0) > room) {
+    const activeIndex = entries.findIndex((entry) => entry.active);
+    chosen = activeIndex < 0 ? [] : [activeIndex];
+    for (let index = 0; index < entries.length; index += 1) {
+      if (index === activeIndex) continue;
+      const candidate = [...chosen, index].sort((a, b) => a - b);
+      if (total(candidate, entries.length - candidate.length) <= room) chosen = candidate;
+    }
+  }
+  const hidden = entries.length - chosen.length;
+  const hiddenMarker = hidden > 0 ? `+${hidden}` : "";
+  const parts = chosen.map((index) => entries[index]?.text ?? "");
+  if (chosen.length === 1 && parts[0] !== undefined) {
+    const available = Math.max(0, room - (hidden > 0 ? gap + displayCellWidth(hiddenMarker) : 0));
+    if (displayCellWidth(parts[0]) > available) {
+      // Keep the active number and agent at narrow admitted widths, with a
+      // closing bracket and a hit target matching only the cells actually drawn.
+      parts[0] = available >= 3 ? `${truncate(parts[0], available - 2)}…]` : truncate(parts[0], available);
+    }
+  }
+  if (hidden > 0) parts.push(`+${hidden}`);
+  const right = parts.join(" ".repeat(gap));
+  const start = Math.max(displayCellWidth(left) + gap, columns - 1 - displayCellWidth(right));
+  const line = truncate(`${left}${" ".repeat(Math.max(0, start - displayCellWidth(left)))}${right}`, columns);
+  const targets: WorkbenchAppbarTarget[] = [];
+  let column = start + 1;
+  for (let position = 0; position < chosen.length; position += 1) {
+    const index = chosen[position] as number;
+    const width = displayCellWidth(parts[position] ?? "");
+    const entry = entries[index];
+    if (entry !== undefined && column + width - 1 <= columns) {
+      targets.push(Object.freeze({ row: 1, firstColumn: column, lastColumn: column + width - 1, target: entry.target }));
+    }
+    column += width + gap;
+  }
+  return { line, targets: Object.freeze(targets) };
+}
+
+/** Windows hosts get the copy/paste keys on the right of the second row when they fit. */
+function withClipboardHint(line: string, columns: number, mouseReporting: boolean): string {
+  if (process.platform !== "win32") return line;
+  const hint = mouseReporting
+    ? "Shift+drag select | Ctrl+Shift+C copy | Ctrl+Shift+V paste"
+    : "Select text: Ctrl+Shift+C copy | Ctrl+Shift+V paste";
+  const used = displayCellWidth(line.trimEnd());
+  const start = columns - 1 - hint.length;
+  if (start < used + 3) return line;
+  return `${line.trimEnd()}${" ".repeat(start - used)}${hint}`;
 }
 
 function renderTruth(model: AppbarModel, agent: WorkbenchTab["agent"], columns: number): string {

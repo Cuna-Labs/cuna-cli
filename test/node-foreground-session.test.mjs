@@ -282,8 +282,10 @@ test("one pre-negotiation ticket race is recovered without repeating user input"
   host.emitInput(Uint8Array.of(0x03));
   await operation;
   assert.equal(connections, 2);
-  assert.equal(host.acquired, 2);
-  assert.equal(host.restored, 2);
+  // The host is held for the whole command (session tabs): the retry reuses
+  // it, and it is restored exactly once, after the last attempt.
+  assert.equal(host.acquired, 1);
+  assert.equal(host.restored, 1);
 });
 
 test("a failed early-terminal retry preserves the first typed failure alongside fresh capability refusal", async () => {
@@ -348,8 +350,10 @@ test("one early post-ready passthrough close is recovered without another comman
   host.emitInput(Uint8Array.of(0x03));
   await operation;
   assert.equal(connections, 2);
-  assert.equal(host.acquired, 2);
-  assert.equal(host.restored, 2);
+  // The host is held for the whole command (session tabs): the retry reuses
+  // it, and it is restored exactly once, after the last attempt.
+  assert.equal(host.acquired, 1);
+  assert.equal(host.restored, 1);
 });
 
 class AsyncByteQueue {
@@ -1580,4 +1584,152 @@ test("R14: while another attachment here holds the client, a second one is new a
   const second = await attachAndDetach({ terminalClients });
   assert.notEqual(second.client, holder.clientInstanceId, "two processes are never the same client at once");
   assert.deepEqual(second.notices, [TERMINAL_CLIENT_BUSY_NOTICE]);
+});
+
+/* -------------------------------------------------------------------------- */
+/* Session tabs: a switch is a sequence of single-session runs                  */
+/* -------------------------------------------------------------------------- */
+
+function machineClient(events) {
+  const sessions = {
+    [SESSION_A]: session(SESSION_A, { name: "projA", agent: "claude-code", createdAt: new Date(NOW - 20_000).toISOString() }),
+    [SESSION_B]: session(SESSION_B, { name: "projB", agent: "claude-code" }),
+  };
+  return {
+    async getAgentSession(id) { events.push(`get:${id}`); return sessions[id]; },
+    async listAgentSessions() { return { items: Object.values(sessions) }; },
+  };
+}
+
+async function clickTab(host, text) {
+  await waitUntil(() => new TextDecoder().decode(host.writes.at(-1) ?? new Uint8Array()).includes(text), `the bar shows ${text}`);
+  const top = (await visibleHostText(host)).split("\n")[0];
+  const column = top.indexOf(text) + 1;
+  assert.ok(column > 0, top);
+  host.emitInput(new TextEncoder().encode(`\u001b[<0;${column};1M`));
+}
+
+test("session tabs: a click attaches the other session as its own client, and going back resumes the first client", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: machineClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    terminalClients,
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
+  await clickTab(host, "2:Claude projB");
+  await waitUntil(() => system.grantClients().length === 2 && host.input !== undefined, "B is attached");
+  await waitUntil(() => /\[2:Claude projB\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "B is the bracketed tab");
+  await clickTab(host, "1:Claude projA");
+  await waitUntil(() => system.grantClients().length === 3 && host.input !== undefined, "A is attached again");
+  await waitUntil(() => /\[1:Claude projA\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "A is the bracketed tab");
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  const grants = events.filter((event) => event.startsWith("grant:"));
+  assert.deepEqual(grants, [`grant:${SESSION_A}`, `grant:${SESSION_B}`, `grant:${SESSION_A}`]);
+  const [first, second, third] = system.grantClients();
+  assert.notEqual(second, first, "B is not attached as A's client");
+  assert.equal(third, first, "back on A, the same client asks for the seat: it resumes, no takeover");
+  assert.equal(host.acquired, 1, "the host terminal is held across the switch");
+  assert.equal(host.restored, 1);
+  const text = host.writes.map((bytes) => new TextDecoder().decode(bytes)).join("");
+  assert.match(text, /SWITCHING TO CLAUDE PROJB/u);
+  const lines = host.writes.map((bytes) => new TextDecoder().decode(bytes)).filter((line) => line.startsWith("Detached ·"));
+  assert.deepEqual(lines.sort(), [
+    `Detached · projA keeps running · cuna connect ${SESSION_A}\n`,
+    `Detached · projB keeps running · cuna connect ${SESSION_B}\n`,
+  ]);
+  assert.ok(events.lastIndexOf("host:restore") < events.indexOf("detach-line"), "the lines follow the one restore");
+});
+
+test("session tabs: when the target cannot be attached, the run returns once to the session it left and says why", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events, (id) => id === SESSION_B ? "unsupported" : "supported");
+  const operation = runSupportedForegroundSessions({
+    client: machineClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    terminalClients,
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
+  await clickTab(host, "2:Claude projB");
+  await waitUntil(() => system.grantClients().length === 2 && host.input !== undefined, "A is attached again");
+  await waitUntil(() => /Could not switch to Claude projB: capability/u.test(new TextDecoder().decode(host.writes.at(-1))), "the reason is on the bar");
+  const [first, back] = system.grantClients();
+  assert.equal(back, first, "the way back is the same client");
+  assert.deepEqual(events.filter((event) => event.startsWith("grant:")), [`grant:${SESSION_A}`, `grant:${SESSION_A}`], "B never got a grant");
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+});
+
+test("session tabs: Ctrl+C while switching ends the run; both sessions keep running", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  let releaseB;
+  const gateB = new Promise((resolve) => { releaseB = resolve; });
+  const controlPlane = { ...system.controlPlane,
+    async observeAgentSession(id, signal) {
+      if (id === SESSION_B) {
+        await new Promise((resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          void gateB.then(resolve);
+        });
+      }
+      return await system.controlPlane.observeAgentSession(id, signal);
+    },
+  };
+  const operation = runSupportedForegroundSessions({
+    client: machineClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+    terminalClients,
+  }, { host, controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
+  await clickTab(host, "2:Claude projB");
+  await waitUntil(() => new TextDecoder().decode(host.writes.at(-1)).includes("SWITCHING TO CLAUDE PROJB"), "the switching screen");
+  await new Promise((resolve) => setTimeout(resolve, 3_100));
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /Checking [^\r\n]+ · 3s/u,
+    "a blocked switch keeps naming the step and shows elapsed seconds");
+  host.emitInput(Uint8Array.of(0x03));
+  await operation;
+  releaseB();
+  assert.deepEqual(events.filter((event) => event.startsWith("grant:")), [`grant:${SESSION_A}`]);
+  assert.equal(host.restored, 1);
+  const lines = host.writes.map((bytes) => new TextDecoder().decode(bytes)).filter((line) => line.startsWith("Detached ·"));
+  assert.deepEqual(lines, [`Detached · projA keeps running · cuna connect ${SESSION_A}\n`]);
+});
+
+test("session tabs: a switch does not wait on a slow provider sign-in probe", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const probes = [];
+  const client = {
+    ...machineClient(events),
+    async getAgentSessionAuth(id, signal) {
+      probes.push({ id, bounded: signal !== undefined });
+      if (id === SESSION_A) throw new Error("auth status unavailable");
+      // B's probe never answers: only its own abort can end it.
+      return await new Promise((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+  };
+  const operation = runSupportedForegroundSessions({
+    client, baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A], terminalClients,
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
+  await clickTab(host, "2:Claude projB");
+  const started = Date.now();
+  await waitUntil(() => system.grantClients().length === 2, "B is granted");
+  await waitUntil(() => host.input !== undefined && /\[2:Claude projB\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "B is on screen");
+  assert.ok(Date.now() - started < 5_000, "bounded by the 2 s advisory timeout");
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /Claude auth unknown/u, "an unanswered probe is shown as unknown");
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.deepEqual(probes.map((probe) => probe.id), [SESSION_A, SESSION_B]);
 });
