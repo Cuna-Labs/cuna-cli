@@ -28,6 +28,10 @@ import { buildAppbarModel, type AppbarModel, type StatusEvidence } from "./appba
 import { renderWorkbenchFrame, workbenchUpdate, type WorkbenchFrame, type WorkbenchTab } from "./workbench.js";
 import { ViewportRegistry } from "./viewport.js";
 import { XtermViewportAdapter } from "./xterm-vte.js";
+import { encodeRemoteMouse, HostMouseDecoder, wheelDirection, type HostMouseEvent } from "./host-mouse.js";
+
+/** Lines one wheel notch moves the local view, the common terminal default. */
+const WHEEL_SCROLL_LINES = 3;
 
 const ESCAPE_PREFIX = 0x1d;
 export const HISTORICAL_INPUT_NOTICE = "Prior input uncertain · not resent";
@@ -246,6 +250,7 @@ export class ForegroundTerminalCoordinator {
   readonly #localActionBroker: LocalActionBroker;
   #removeAbort: (() => void) | undefined;
   #pendingInputBytes = 0;
+  readonly #hostMouse = new HostMouseDecoder();
   #helpVisible = false;
   #pendingBrowserAction: LocalBrowserActionRequest | undefined;
   #pendingBrowserActionTabId: string | undefined;
@@ -834,6 +839,53 @@ export class ForegroundTerminalCoordinator {
 
   #queueInput(bytes: Uint8Array): void {
     if (bytes.byteLength < 1) return;
+    // Mouse reports are Cuna's own input (host-mouse.ts): they are handled
+    // here, in order with the keys around them, and never reach the key path.
+    for (const segment of this.#hostMouse.push(bytes)) {
+      if (segment.kind === "mouse") this.#handleHostMouse(segment.event);
+      else this.#queueInputBytes(segment.bytes);
+    }
+  }
+
+  /**
+   * The wheel scrolls Cuna's copy of the remote screen. Only a remote program
+   * that asked for mouse reports receives them, in its own coordinates and
+   * encoding, and only from the writer; nothing else is ever sent for a mouse
+   * event, so a wheel notch can no longer arrive as an arrow key.
+   */
+  #handleHostMouse(event: HostMouseEvent): void {
+    if (this.#state !== "active" || this.#closingTabId !== undefined) return;
+    const tab = this.#activeTabId === undefined ? undefined : this.#tabs.get(this.#activeTabId);
+    if (tab === undefined) return;
+    const reporting = tab.viewport.mouseReporting();
+    const target = this.#captureInputTarget();
+    if (reporting.tracking !== "none" && tab.snapshot.accessMode !== "observer" && target !== undefined) {
+      const hostRows = admitForegroundDimensions(this.#options.host.dimensions()).rows;
+      const row = event.row - (hostRows - remoteRows(hostRows));
+      if (row < 1 || row > remoteRows(hostRows)) return;
+      const bytes = encodeRemoteMouse(event, reporting, { column: event.column, row });
+      if (bytes === undefined) return;
+      tab.viewport.resetScroll();
+      const operation = this.#inputTail.then(async () => {
+        await this.#requireRuntime().sendInput(bytes, target.tabId, target.binding);
+      });
+      this.#inputTail = operation.catch((error) => this.#inputFailure(error));
+      return;
+    }
+    const direction = wheelDirection(event);
+    if (direction === 0) return;
+    const before = tab.viewport.scrollOffset;
+    if (tab.viewport.scrollBy(-direction * WHEEL_SCROLL_LINES) !== before) void this.#render().catch(() => undefined);
+  }
+
+  #queueInputBytes(bytes: Uint8Array): void {
+    if (bytes.byteLength < 1) return;
+    const scrolled = this.#activeTabId === undefined ? undefined : this.#tabs.get(this.#activeTabId);
+    if (scrolled !== undefined && scrolled.viewport.scrollOffset > 0) {
+      // A key is typed at the live screen, so the view returns to it first.
+      scrolled.viewport.resetScroll();
+      void this.#render().catch(() => undefined);
+    }
     if (this.#state === "starting" && bytes.includes(INTERRUPT)) {
       if (this.#startupDetached) return;
       this.#startupDetached = true;
@@ -893,29 +945,31 @@ export class ForegroundTerminalCoordinator {
     const operation = this.#inputTail.then(async () => {
       try { await this.#routeInput(payload, receiptTarget); } finally { this.#pendingInputBytes -= payload.byteLength; }
     });
-    this.#inputTail = operation.catch((error) => {
-      if (error instanceof RuntimeBoundaryError && error.code === "terminal_observer") {
-        // Typing into an observed terminal is refused, not fatal: the seat is
-        // someone else's. Say so on the notice line and keep observing.
-        const snapshot = this.#activeTabId === undefined ? undefined : this.#tabs.get(this.#activeTabId)?.snapshot;
-        this.#seatNotice = snapshot === undefined ? "Read-only · input was not sent."
-          : writerCapabilityRefusal(snapshot) ?? "Input not sent · press Ctrl+] then w to take control";
-        this.#helpVisible = false;
-        void this.#render().catch(() => undefined);
-        return;
+    this.#inputTail = operation.catch((error) => this.#inputFailure(error));
+  }
+
+  #inputFailure(error: unknown): void {
+    if (error instanceof RuntimeBoundaryError && error.code === "terminal_observer") {
+      // Typing into an observed terminal is refused, not fatal: the seat is
+      // someone else's. Say so on the notice line and keep observing.
+      const snapshot = this.#activeTabId === undefined ? undefined : this.#tabs.get(this.#activeTabId)?.snapshot;
+      this.#seatNotice = snapshot === undefined ? "Read-only · input was not sent."
+        : writerCapabilityRefusal(snapshot) ?? "Input not sent · press Ctrl+] then w to take control";
+      this.#helpVisible = false;
+      void this.#render().catch(() => undefined);
+      return;
+    }
+    if (error instanceof RuntimeBoundaryError && (error.code === "terminal_disconnected" || error.code === "session_unknown")) {
+      if (this.#pendingBrowserActionTabId === this.#activeTabId) {
+        this.#pendingBrowserAction = undefined;
+        this.#pendingBrowserActionTabId = undefined;
       }
-      if (error instanceof RuntimeBoundaryError && (error.code === "terminal_disconnected" || error.code === "session_unknown")) {
-        if (this.#pendingBrowserActionTabId === this.#activeTabId) {
-          this.#pendingBrowserAction = undefined;
-          this.#pendingBrowserActionTabId = undefined;
-        }
-        this.#browserNotice = this.#unavailableInputNotice();
-        void this.#render().catch(() => undefined);
-        return;
-      }
-      this.#recordFailure(error);
-      void this.stop().catch(() => { this.#state = "failed"; });
-    });
+      this.#browserNotice = this.#unavailableInputNotice();
+      void this.#render().catch(() => undefined);
+      return;
+    }
+    this.#recordFailure(error);
+    void this.stop().catch(() => { this.#state = "failed"; });
   }
 
   async #routeInput(bytes: Uint8Array, receiptTarget: ForegroundInputTarget | undefined, releasedPrefix = false): Promise<void> {
@@ -1829,8 +1883,9 @@ export class ForegroundTerminalCoordinator {
         label: tab.intent.label,
         agent: tab.intent.agent,
         // Hidden tabs contribute labels only; projecting their cells would
-        // recapture a full terminal on every visible output frame.
-        viewport: tab.intent.tabId === activeTabId && tab.snapshot.accessMode === "observer"
+        // recapture a full terminal on every visible output frame. A view the
+        // person scrolled back is projected from local history.
+        viewport: tab.intent.tabId === activeTabId && (tab.snapshot.accessMode === "observer" || tab.viewport.scrollOffset > 0)
           ? tab.viewport.snapshotForHost(dimensions.columns, remoteRows(dimensions.rows))
           : tab.viewport.snapshot(),
       }));
@@ -1862,8 +1917,10 @@ export class ForegroundTerminalCoordinator {
                     ? "Retained sign-in link; validity unknown · Enter/o open · d/Esc deny"
                     : `${providerName(this.#pendingBrowserAction.provider)} requests browser authentication · Enter/o open · d/Esc deny`,
               }
+              : (this.#tabs.get(activeTabId)?.viewport.scrollOffset ?? 0) > 0
+                ? { notice: scrolledBackNotice(this.#tabs.get(activeTabId)?.viewport.scrollOffset ?? 0) }
               : this.#helpVisible
-                ? { notice: "Keys: Ctrl+C detach | " + (process.platform === "win32" ? "Select text + Ctrl+Shift+C copy | Ctrl+Shift+V paste | " : "") + "Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry" +
+                ? { notice: "Keys: Ctrl+C detach | " + (process.platform === "win32" ? "Shift+drag select + Ctrl+Shift+C copy | Ctrl+Shift+V paste | " : "") + "Wheel scroll | " + "Ctrl+S keep active | Ctrl+] c/s/q remote | 1-4 tab | n next | r retry" +
                     (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
                       ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"
@@ -2200,6 +2257,10 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
     if (left[index] !== right[index]) return false;
   }
   return true;
+}
+
+function scrolledBackNotice(lines: number): string {
+  return `Scrolled back ${lines} line${lines === 1 ? "" : "s"} · scroll down or type to return`;
 }
 
 function remoteRows(hostRows: number): number {
