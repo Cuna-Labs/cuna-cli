@@ -348,6 +348,39 @@ test("same-path divergence keeps the local edit, retains remote bytes beside it,
   assert.notEqual(supervisor.snapshot.state, "conflicted");
 });
 
+// A sibling is written once: a replay that finds the same name holding the
+// same bytes is done, and a name holding other bytes is never overwritten.
+async function divergedWithExistingSibling(t, existing) {
+  const fx = await fixture(t, { "shared.txt": "base" });
+  const desiredFiles = { "shared.txt": "remote" };
+  const desired = await desiredManifest(fx, desiredFiles);
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  loadChunks(authority, desired, desiredFiles);
+  await writeFile(join(fx.root, "shared.txt"), "local");
+  await writeFile(join(fx.root, sibling("shared.txt", 2)), existing);
+  authority.generation = 2;
+  authority.manifestRoot = desired.manifestRoot;
+  authority.pages = [remotePage(2, fx.manifest, desired)];
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness()));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  return { fx, supervisor };
+}
+
+test("a replayed conflict sibling holding the same bytes is accepted and syncing continues", async (t) => {
+  const { fx, supervisor } = await divergedWithExistingSibling(t, "remote");
+  await waitFor(() => supervisor.snapshot.generation === 3, () => `the replayed sibling stopped synchronization: ${JSON.stringify(supervisor.snapshot)}`);
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "local");
+  assert.equal(await readFile(join(fx.root, sibling("shared.txt", 2)), "utf8"), "remote");
+});
+
+test("a conflict sibling name holding other bytes is never overwritten", async (t) => {
+  const { fx, supervisor } = await divergedWithExistingSibling(t, "someone else's");
+  await waitFor(() => supervisor.snapshot.state === "conflicted", () => `the collision was not refused: ${JSON.stringify(supervisor.snapshot)}`);
+  assert.equal(supervisor.snapshot.reason, "conflict_retention_collision");
+  assert.equal(await readFile(join(fx.root, sibling("shared.txt", 2)), "utf8"), "someone else's");
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "local");
+});
+
 // qa6 witness 2026-09-22, step 4. This folder commits README (gen N); the
 // Machine held its own unsaved edit, kept it (the guest rule), and captured it
 // as gen N+1. Taking N+1 is right — it is the Machine's resolution — but it

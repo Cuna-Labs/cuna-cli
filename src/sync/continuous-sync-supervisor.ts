@@ -978,15 +978,35 @@ function conflictSiblingPath(bindingId: string, generation: number, path: string
  * overwritten.
  */
 async function writeRetainedSibling(root: string, path: string, chunks: readonly Uint8Array[], executable: boolean): Promise<void> {
-  if (await pathExists(path)) {
-    const metadata = await lstat(path);
-    if (metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 1) {
-      const existing = await readFile(path);
-      if (existing.equals(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))))) return;
+  // Open first, then judge the open descriptor, then confirm the path still
+  // names it: checking the path and reading it separately would judge one file
+  // and compare the bytes of another.
+  let handle;
+  try {
+    handle = await open(path, fileConstants.O_RDONLY | noFollowFlag());
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      await atomicReplaceFile(root, path, chunks, executable, true);
+      return;
     }
-    throw syncFailure("conflict_retention_collision", EXIT_CODES.conflict);
+    if (code === "ELOOP") throw syncFailure("conflict_retention_collision", EXIT_CODES.conflict);
+    throw error;
   }
-  await atomicReplaceFile(root, path, chunks, executable, true);
+  let same = false;
+  try {
+    const opened = await handle.stat();
+    if (opened.isFile() && opened.nlink === 1) {
+      const linked = await lstat(path);
+      if (!linked.isSymbolicLink() && linked.dev === opened.dev && linked.ino === opened.ino) {
+        const existing = await handle.readFile();
+        same = existing.equals(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))));
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+  if (!same) throw syncFailure("conflict_retention_collision", EXIT_CODES.conflict);
 }
 
 function projectManifest(manifest: WorkspaceManifest): readonly EntryProjection[] {
