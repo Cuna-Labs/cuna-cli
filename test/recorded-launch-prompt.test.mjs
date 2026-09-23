@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   RECORDED_LAUNCH_ACKNOWLEDGEMENT_BUDGET_MS,
+  RECORDED_LAUNCH_ENDED_QUESTION,
   RECORDED_LAUNCH_QUESTION,
   askRecordedLaunch,
   recordedLaunchAcknowledgement,
@@ -114,4 +115,21 @@ test("--new-session answers the recorded-launch question without asking", async 
   assert.equal(asked, 0);
   assert.equal(await recordedLaunchConfirmation(false, ask)(undefined), false);
   assert.equal(asked, 1, "without the flag the person is asked");
+});
+
+// qa6 re-witness 2026-09-23, run j6: when the recorded launch's session has
+// ended, the question may not promise a resume, and a No is not called one.
+test("an ended recorded launch is asked about truthfully and No is not called a resume", async () => {
+  const asked = [];
+  const lines = [];
+  const another = await askRecordedLaunch({
+    ask: async (question) => { asked.push(question); return "n"; },
+    acknowledge: (line) => lines.push(line),
+    createLabel: CREATE_LABEL,
+    ended: true,
+  });
+  assert.equal(another, false);
+  assert.deepEqual(asked, [RECORDED_LAUNCH_ENDED_QUESTION]);
+  assert.doesNotMatch(asked[0], /resume/iu);
+  assert.deepEqual(lines, ["Not starting a new session"]);
 });

@@ -12,7 +12,7 @@ import { admitCapability } from "../dist/runtime/capability-gate.js";
 import { CunaRuntimeBoundary } from "../dist/runtime/boundary.js";
 import { RuntimeBoundaryError } from "../dist/runtime/errors.js";
 import { DurableSyncJournal } from "../dist/sync/journal.js";
-import { createUnavailableTerminalControlPlane, validateTerminalGrant } from "../dist/runtime/terminal-transport.js";
+import { assertRemoteAgentSessionEvidence, createUnavailableTerminalControlPlane, validateTerminalGrant } from "../dist/runtime/terminal-transport.js";
 
 const NOW = 1_800_000_000_000;
 const CAPABILITY_ID = "terminal_connections.create";
@@ -2887,4 +2887,74 @@ test("R12: acknowledged input never trips the deadline", async (t) => {
   assert.equal(runtime.listTerminals()[0].state, "active");
   assert.equal(runtime.listTerminals()[0].inputContinuity, "complete");
   await runtime.shutdown();
+});
+
+// qa6 re-witness 2026-09-23, run j2: the preflight capability was read at
+// 00:21:06, the provider sign-in check and a bounded admission wait took the
+// clock past its expiry, and the attach then read a FRESH capability with the
+// same authority -- and was refused with capability_snapshot_expired because
+// the older, preflight copy had aged out. The preflight copy anchors
+// continuity (same scope, same authority etag, same process); the fresh copy
+// is the authority the grant uses.
+function preflightAdmission(agentSessionId, expiresAt) {
+  return {
+    observation: assertRemoteAgentSessionEvidence({ evidence: observation(agentSessionId), expectedAgentSessionId: agentSessionId, now: NOW }),
+    capability: admitCapability(capabilitySnapshot(agentSessionId, { expiresAt: new Date(expiresAt).toISOString() }), {
+      id: CAPABILITY_ID, scope: "agent_session", subjectId: agentSessionId, surface: "cli", interaction: "native",
+    }, NOW),
+  };
+}
+
+test("an attach is admitted on fresh authority after its preflight capability aged out", async () => {
+  const system = new FakeTerminalSystem();
+  const now = NOW + 10_000;
+  system.controlPlane.discoverCapabilities = async (_scope, id) => capabilitySnapshot(id, {
+    observedAt: new Date(now - 500).toISOString(),
+    expiresAt: new Date(now + 30_000).toISOString(),
+  });
+  const { runtime } = createRuntime(system, { clock: () => now });
+  try {
+    await runtime.attach({
+      tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24,
+      expectedAdmission: preflightAdmission("agent-a", NOW + 5_000),
+    });
+    assert.equal(system.createCalls.length, 1, "the grant is issued on the fresh capability");
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
+test("control: a preflight admission whose authority changed is still refused", async () => {
+  const system = new FakeTerminalSystem();
+  const now = NOW + 10_000;
+  system.controlPlane.discoverCapabilities = async (_scope, id) => capabilitySnapshot(id, {
+    observedAt: new Date(now - 500).toISOString(),
+    expiresAt: new Date(now + 30_000).toISOString(),
+    etag: `changed-${id}`,
+  });
+  const { runtime } = createRuntime(system, { clock: () => now });
+  try {
+    await assert.rejects(
+      runtime.attach({
+        tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24,
+        expectedAdmission: preflightAdmission("agent-a", NOW + 5_000),
+      }),
+      (error) => error instanceof RuntimeBoundaryError && error.code === "capability_unknown",
+    );
+    assert.equal(system.createCalls.length, 0);
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
+test("attach reports each remote step it waits on, in order", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  const stages = [];
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24, onStage: (stage) => stages.push(stage) });
+    assert.deepEqual(stages, ["admission", "grant", "connect", "ready_wait"]);
+  } finally {
+    await runtime.shutdown();
+  }
 });

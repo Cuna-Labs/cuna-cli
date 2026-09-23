@@ -357,7 +357,10 @@ function isProvenAgentSessionCreateRejection(cause: unknown): cause is CunaError
     // another Workspace version or preset: refused locally, nothing sent, and
     // its own hint (answer y / --new-session) is the way forward. Wrapped as
     // an unprovable create it told the person not to request a new session.
-    (cause.code === "cuna.provider.pending_intent_conflict" && cause.details?.reason === "recorded_launch_mismatch")
+    (cause.code === "cuna.provider.pending_intent_conflict" && cause.details?.reason === "recorded_launch_mismatch") ||
+    // The recorded launch's session has ended; nothing was started, and the
+    // refusal names the way to a new session (qa6 re-witness 2026-09-23, j6).
+    cause.code === "cuna.provider.recorded_launch_ended"
   );
 }
 

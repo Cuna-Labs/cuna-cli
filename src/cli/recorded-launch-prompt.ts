@@ -31,6 +31,14 @@ export const RECORDED_LAUNCH_QUESTION =
   "A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ";
 
 /**
+ * Asked instead when the recorded launch's session is known to have ended:
+ * there is nothing to resume, so No may not promise one (qa6 re-witness
+ * 2026-09-23, run j6: "No resumes" led to a dead session called "reused").
+ */
+export const RECORDED_LAUNCH_ENDED_QUESTION =
+  "The last session for this folder has ended. Start a new session? [y/N; No starts nothing] ";
+
+/**
  * How long the screen may stay unchanged after the answer is accepted.
  *
  * DERIVATION. Not a tuning knob: it is the bound this module exists to hold,
@@ -47,10 +55,10 @@ export const RECORDED_LAUNCH_ACKNOWLEDGEMENT_BUDGET_MS = 500;
  * not asked again: asking let a No, or a slow answer, override the flag (qa6
  * witness 2026-09-22). Without the flag the person is asked.
  */
-export function recordedLaunchConfirmation<S>(
+export function recordedLaunchConfirmation<A extends unknown[]>(
   newSessionFlag: boolean,
-  ask: (signal: S) => Promise<boolean>,
-): (signal: S) => Promise<boolean> {
+  ask: (...args: A) => Promise<boolean>,
+): (...args: A) => Promise<boolean> {
   return newSessionFlag ? async () => true : ask;
 }
 
@@ -68,8 +76,9 @@ export function recordedLaunchWantsNewSession(answer: string): boolean {
  * as the silence, one layer up: a screen that does not describe what is
  * happening.
  */
-export function recordedLaunchAcknowledgement(wantsNewSession: boolean, createLabel: string): string {
-  return wantsNewSession ? createLabel : "Resuming the recorded launch";
+export function recordedLaunchAcknowledgement(wantsNewSession: boolean, createLabel: string, ended = false): string {
+  if (wantsNewSession) return createLabel;
+  return ended ? "Not starting a new session" : "Resuming the recorded launch";
 }
 
 export interface RecordedLaunchPromptInput {
@@ -84,6 +93,8 @@ export interface RecordedLaunchPromptInput {
   readonly acknowledge: (line: string) => void;
   /** What the create branch is called, e.g. `Creating Claude Code session`. */
   readonly createLabel: string;
+  /** The recorded launch's session has ended: ask the question that does not promise a resume. */
+  readonly ended?: boolean;
 }
 
 /**
@@ -97,7 +108,8 @@ export interface RecordedLaunchPromptInput {
  * nothing, which is what `acknowledge` exists to prevent.
  */
 export async function askRecordedLaunch(input: RecordedLaunchPromptInput): Promise<boolean> {
-  const wantsNewSession = recordedLaunchWantsNewSession(await input.ask(RECORDED_LAUNCH_QUESTION));
-  input.acknowledge(recordedLaunchAcknowledgement(wantsNewSession, input.createLabel));
+  const ended = input.ended === true;
+  const wantsNewSession = recordedLaunchWantsNewSession(await input.ask(ended ? RECORDED_LAUNCH_ENDED_QUESTION : RECORDED_LAUNCH_QUESTION));
+  input.acknowledge(recordedLaunchAcknowledgement(wantsNewSession, input.createLabel, ended));
   return wantsNewSession;
 }

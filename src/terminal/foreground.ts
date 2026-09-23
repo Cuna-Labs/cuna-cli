@@ -83,6 +83,25 @@ export const MAX_FOREGROUND_PENDING_INPUT_BYTES = 1_048_576;
 
 export type ForegroundTerminalState = "idle" | "starting" | "active" | "stopping" | "stopped" | "failed";
 
+/** The remote steps of one attach, in order. */
+export type TerminalAttachStage = "admission" | "grant" | "connect" | "ready_wait";
+
+/**
+ * What the loader says while an attach waits. Each line names the step being
+ * waited on (qa6 re-witness 2026-09-23, j5: ten minutes on "Checking terminal
+ * authority" after that check had long passed).
+ */
+const ATTACH_STAGE_LABELS: Readonly<Record<TerminalAttachStage | "first_screen", string>> = Object.freeze({
+  admission: "Checking terminal authority",
+  grant: "Requesting a terminal connection",
+  connect: "Connecting to the Machine's terminal",
+  ready_wait: "Waiting for the terminal to answer",
+  first_screen: "Waiting for the first screen",
+});
+
+/** A stage shown longer than this also shows how long it has waited. */
+const ATTACH_STAGE_ELAPSED_AFTER_MS = 3_000;
+
 export interface ForegroundTerminalRuntime {
   readonly activeTabId: string | undefined;
   attach(input: {
@@ -92,6 +111,8 @@ export interface ForegroundTerminalRuntime {
     readonly rows: number;
     readonly expectedAdmission?: TerminalAttachmentAdmission;
     readonly signal?: AbortSignal;
+    /** Reports which remote step the attach is waiting on, so the loader can say it. */
+    readonly onStage?: (stage: TerminalAttachStage) => void;
   }): Promise<RuntimeTerminalSnapshot>;
   detach(tabId: string): Promise<void>;
   reconnect(input: { readonly tabId: string; readonly signal?: AbortSignal }): Promise<RuntimeTerminalSnapshot>;
@@ -237,6 +258,14 @@ export class ForegroundTerminalCoordinator {
   #disconnectNotice: string | undefined;
   #attachingAnimationTimer: NodeJS.Timeout | undefined;
   #attachingFrame = 0;
+  #attachingStage: TerminalAttachStage | "first_screen" = "admission";
+  #attachingStageSince = 0;
+  /**
+   * Set by the first terminal frame painted to the host. From then on no
+   * loader frame may paint: both go through `#renderTail`, so this flag, not
+   * the timer, is what keeps loader chrome from ever following PTY output.
+   */
+  #firstFrameRendered = false;
 
   constructor(options: ForegroundTerminalCoordinatorOptions) {
     const resizeCoalesceMs = options.resizeCoalesceMs ?? RESIZE_COALESCE_MS;
@@ -357,6 +386,7 @@ export class ForegroundTerminalCoordinator {
       this.#removeInput = this.#options.host.onInput((bytes) => this.#queueInput(bytes));
       this.#removeResize = this.#options.host.onResize(() => this.#queueResize());
       const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
+      this.#attachingStageSince = this.#clock();
       await this.#renderAttaching(intents.length, dimensions);
       this.#startAttachingAnimation(intents.length);
       const attachSignal = signal === undefined
@@ -375,6 +405,7 @@ export class ForegroundTerminalCoordinator {
             ? {}
             : { expectedAdmission: intent.attachmentAdmission }),
           signal: attachSignal,
+          onStage: (stage) => this.#setAttachingStage(stage, intents.length),
         });
         if (this.#startupDetached || this.#state !== "starting") {
           await runtime.detach(snapshot.tabId);
@@ -491,11 +522,12 @@ export class ForegroundTerminalCoordinator {
   }
 
   async #terminalReady(snapshot: RuntimeTerminalSnapshot): Promise<void> {
-    // `onTerminalReady` is the precise boundary at which remote bytes may be
-    // rendered. Stop the local timer first, then drain its last queued paint;
-    // this guarantees the loading chrome never races or interleaves with PTY
-    // output.
-    this.#stopAttachingAnimation();
+    // `onTerminalReady` is the boundary at which remote bytes may be rendered,
+    // but nothing is on screen until the first terminal frame paints. Until
+    // then the loader keeps moving and says it is waiting for that frame; the
+    // first painted frame retires it (`#firstFrameRendered`), so loader chrome
+    // still never follows PTY output.
+    if (this.#state === "starting") this.#setAttachingStage("first_screen", this.#pendingIntents.length);
     const runtime = this.#requireRuntime();
     const intent = this.#findIntent(snapshot.tabId, snapshot.agentSessionId);
     const previous = this.#tabs.get(snapshot.tabId);
@@ -1849,6 +1881,8 @@ export class ForegroundTerminalCoordinator {
       if (this.#lastHostFrame !== undefined && sameBytes(this.#lastHostFrame, frame.bytes)) return;
       const update = workbenchUpdate(this.#lastHostFrame === undefined ? undefined : this.#lastWorkbenchFrame, frame);
       this.#lastHostFrame = undefined;
+      this.#firstFrameRendered = true;
+      this.#stopAttachingAnimation();
       await this.#options.host.write(update);
       this.#lastHostFrame = frame.bytes;
       this.#lastWorkbenchFrame = frame;
@@ -1895,7 +1929,9 @@ export class ForegroundTerminalCoordinator {
   ): Promise<void> {
     const color = this.#options.color ?? true;
     const top = padTrustedLine(` CUNA  ATTACHING ${count} EXACT AGENTSESSION${count === 1 ? "" : "S"}`, dimensions.columns);
-    const indicator = `${ATTACHING_FRAMES[this.#attachingFrame % ATTACHING_FRAMES.length]} Checking terminal authority  ${ATTACHING_PROGRESS[this.#attachingFrame % ATTACHING_PROGRESS.length]}`;
+    const waitedMs = this.#clock() - this.#attachingStageSince;
+    const waited = waitedMs >= ATTACH_STAGE_ELAPSED_AFTER_MS ? ` · ${Math.floor(waitedMs / 1_000)}s` : "";
+    const indicator = `${ATTACHING_FRAMES[this.#attachingFrame % ATTACHING_FRAMES.length]} ${ATTACH_STAGE_LABELS[this.#attachingStage]}${waited}  ${ATTACHING_PROGRESS[this.#attachingFrame % ATTACHING_PROGRESS.length]}`;
     const detail = padTrustedLine(` ${indicator}  ·  Ctrl-C cancels`, dimensions.columns);
     const text = [
       "\u001b[?25l\u001b[H\u001b[2J",
@@ -1911,11 +1947,21 @@ export class ForegroundTerminalCoordinator {
     await this.#options.host.write(new TextEncoder().encode(text));
   }
 
+  #setAttachingStage(stage: TerminalAttachStage | "first_screen", count: number): void {
+    if (this.#state !== "starting" || this.#startupDetached || this.#firstFrameRendered) return;
+    if (this.#attachingStage !== stage) {
+      this.#attachingStage = stage;
+      this.#attachingStageSince = this.#clock();
+    }
+    // The running animation repaints within one frame; no extra write here.
+    this.#startAttachingAnimation(count);
+  }
+
   #startAttachingAnimation(count: number): void {
-    if (this.#state !== "starting" || this.#startupDetached) return;
+    if (this.#state !== "starting" || this.#startupDetached || this.#firstFrameRendered) return;
     if (this.#attachingAnimationTimer !== undefined) return;
     this.#attachingAnimationTimer = setInterval(() => {
-      if (this.#state !== "starting" || this.#startupDetached) {
+      if (this.#state !== "starting" || this.#startupDetached || this.#firstFrameRendered) {
         this.#stopAttachingAnimation();
         return;
       }
@@ -1933,7 +1979,7 @@ export class ForegroundTerminalCoordinator {
 
   #queueAttachingRender(count: number): void {
     const operation = this.#renderTail.then(async () => {
-      if (this.#state !== "starting" || this.#startupDetached) return;
+      if (this.#state !== "starting" || this.#startupDetached || this.#firstFrameRendered) return;
       await this.#renderAttaching(count, admitForegroundDimensions(this.#options.host.dimensions()));
     });
     this.#renderTail = operation.then(() => undefined, () => undefined);

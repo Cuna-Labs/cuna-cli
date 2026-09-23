@@ -1,4 +1,5 @@
-import {withProviderLaunchIntent} from "./provider-launch-intent.js";
+import {withProviderLaunchIntent,type RecordedLaunchContext} from "./provider-launch-intent.js";
+import { isAgentSessionGone } from "../runtime/terminal-client-identity.js";
 import type {ProviderPreset} from "../api/provider-v2.js";
 import {createPublishedProviderSessionV2,requireMatchingPreset} from "./remote-workspace.js";
 import type { AgentSession, AgentSessionTerminalSeat, Machine } from "../api/contracts.js";
@@ -66,7 +67,7 @@ const TERMINAL_AUTHORITY_WAIT: Readonly<Record<string, string>> = Object.freeze(
 
 export interface ApiAgentJourneyEffectsInput {
   readonly client: CunaApiClient;
-  readonly confirmNewProviderLaunch?: (signal:AbortSignal)=>Promise<boolean>;
+  readonly confirmNewProviderLaunch?: (signal:AbortSignal, context:RecordedLaunchContext)=>Promise<boolean>;
   readonly providerLaunchState?: {readonly stateDirectory:string;readonly ownerId:string;readonly workspaceId:string};
   readonly selectProviderPreset?: (signal:AbortSignal)=>Promise<ProviderPreset>;
   /** The only provider executable this journey may select a machine for. */
@@ -470,7 +471,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         requireMatchingPreset(agent,preset);
         if(!input.providerLaunchState)throw fail('cuna.provider.v2_unavailable','Durable provider launch state is unavailable.');
         const executionWorkspaceId=workspace.executionWorkspaceId;
-        const session=await withProviderLaunchIntent({...input.providerLaunchState,machineId,executionWorkspaceId,confirmNew:async()=>await input.confirmNewProviderLaunch?.(signal)??false,intent:{executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,profileId:preset.profile_id,profileRevision:preset.profile_revision,agent,authMode},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId,agent,preset,operationId,executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,signal})});
+        const session=await withProviderLaunchIntent({...input.providerLaunchState,machineId,executionWorkspaceId,confirmNew:async(context)=>await input.confirmNewProviderLaunch?.(signal,context)??false,isSessionEnded:async(id)=>isAgentSessionGone(await input.client.getAgentSession(id,signal)),intent:{executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,profileId:preset.profile_id,profileRevision:preset.profile_revision,agent,authMode},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId,agent,preset,operationId,executionWorkspaceId,generation:workspace.generation,cwd:workspace.remoteCwd,signal})});
         return Object.freeze({id:session.id,machineId:session.machineId});
       }
       throw fail('cuna.provider.v2_unavailable','This agent has no supported canonical V2 launch profile.');

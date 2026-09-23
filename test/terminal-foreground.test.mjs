@@ -241,10 +241,12 @@ function harness(options = {}) {
     activeTabId: undefined,
     async attach(input) {
       calls.attach.push(input);
+      for (const stage of options.attachStages ?? []) input.onStage?.(stage);
       await waitForGateOrAbort(options.attachGate, input.signal);
       const intent = intents.find((item) => item.tabId === input.tabId);
       const ready = snapshot(intent);
       await callbacks.onTerminalReady(ready);
+      await waitForGateOrAbort(options.postReadyGate, input.signal);
       runtime.activeTabId ??= input.tabId;
       return ready;
     },
@@ -395,6 +397,47 @@ test("rich attach keeps a visible animated authority check until the remote term
   await starting;
   await coordinator.waitForStop();
   releaseAttach();
+});
+
+// qa6 re-witness 2026-09-23, run j5: the attaching screen froze on "Checking
+// terminal authority" for ten minutes after the writer seat was taken. The
+// animation stopped at READY, so any wait between READY and the first painted
+// frame looked like a hang and named the wrong step. Until the first real
+// frame, the loader keeps moving and says what it is waiting for.
+test("after READY the loader keeps moving and names the first screen as what it waits for", async () => {
+  let releaseFirstFrame;
+  const postReadyGate = new Promise((resolve) => { releaseFirstFrame = resolve; });
+  const { coordinator, callbacks, host, intents } = harness({ postReadyGate });
+  const starting = coordinator.start(intents.slice(0, 1));
+  await waitUntil(
+    () => host.writes.some((bytes) => decoder.decode(bytes).includes("Waiting for the first screen")),
+    "the loader must name the post-READY wait",
+  );
+  const afterReady = host.writes.length;
+  await waitUntil(() => host.writes.length >= afterReady + 2, "the loader must keep moving after READY");
+  releaseFirstFrame();
+  await starting;
+  const firstTabFrame = host.writes.length;
+  await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("cloud output")));
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const later = host.writes.slice(firstTabFrame).map((bytes) => decoder.decode(bytes));
+  assert.equal(later.some((frame) => frame.includes("ATTACHING")), false, "no loader frame may follow the first terminal frame");
+  assert.equal(later.some((frame) => frame.includes("cloud output")), true);
+  await coordinator.stop();
+});
+
+test("the loader names each attach stage the runtime reports", async () => {
+  let releaseAttach;
+  const attachGate = new Promise((resolve) => { releaseAttach = resolve; });
+  const { coordinator, host, intents } = harness({ attachGate, attachStages: ["admission", "grant", "connect", "ready_wait"] });
+  const starting = coordinator.start(intents.slice(0, 1));
+  await waitUntil(
+    () => host.writes.some((bytes) => decoder.decode(bytes).includes("Waiting for the terminal to answer")),
+    "the latest reported stage must be on screen",
+  );
+  releaseAttach();
+  await starting;
+  await coordinator.stop();
 });
 
 test("disconnect feedback cadence is bounded to one second total", () => {

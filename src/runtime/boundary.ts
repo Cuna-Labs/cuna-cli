@@ -406,9 +406,14 @@ export class CunaRuntimeBoundary {
     readonly rows: number;
     readonly expectedAdmission?: TerminalAttachmentAdmission;
     readonly signal?: AbortSignal;
+    readonly onStage?: (stage: "admission" | "grant" | "connect" | "ready_wait") => void;
   }): Promise<RuntimeTerminalSnapshot> {
     this.#assertReady();
     assertIdentifier(input.tabId, "tab ID");
+    // A stage observer only labels the wait on screen; it never decides anything.
+    const stage = (value: "admission" | "grant" | "connect" | "ready_wait"): void => {
+      try { input.onStage?.(value); } catch { /* observers cannot fail an attach */ }
+    };
     assertIdentifier(input.agentSessionId, "AgentSession ID");
     assertDimensions(input.columns, input.rows);
     if (this.#terminals.has(input.tabId) || this.#pendingTerminalTabs.has(input.tabId)) {
@@ -447,12 +452,14 @@ export class CunaRuntimeBoundary {
     try {
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
       await this.#cancelConnectionRequests(input.agentSessionId);
+      stage("admission");
       const admitted = await this.#admitRemoteTerminal(input.agentSessionId, attachAbort.signal);
       if (input.expectedAdmission !== undefined) {
         this.#assertAttachmentAdmissionContinuity(input.expectedAdmission, admitted, "preflight");
       }
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
+      stage("grant");
       const grant = await this.#createGrant(admitted.observation, admitted.capability, undefined, undefined, attachAbort.signal);
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
@@ -463,6 +470,7 @@ export class CunaRuntimeBoundary {
       }
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
+      stage("connect");
       connection = await this.#options.terminalConnector.connect({
         ...(this.#options.canonicalTerminalViews === true ? { terminalViewProtocol: "cuna.terminal-view.v1" as const } : {}),
         url: grant.connectUrl,
@@ -513,6 +521,7 @@ export class CunaRuntimeBoundary {
         outputAbort: new AbortController(),
       };
       const iterator = connection.receive()[Symbol.asyncIterator]();
+      stage("ready_wait");
       const ready = await this.#awaitReady(entry, iterator, attachAbort.signal);
       if (ready.payload.terminalViewProtocol !== undefined) {
         if (this.#options.canonicalTerminalViews !== true) throw runtimeFailure("terminal_protocol_error", "Unrequested terminal view protocol.");
@@ -1449,7 +1458,16 @@ export class CunaRuntimeBoundary {
         `Terminal capability scope changed during ${phase === "preflight" ? "preflight" : "post-grant"} admission.`,
       );
     }
-    if (expected.capability.expiresAt <= now || actual.capability.expiresAt <= now) {
+    // The authority an attach acts on is `actual`, read just now; it must be
+    // live. In the preflight phase `expected` is older evidence that anchors
+    // continuity (same scope, same authority etag, same process) and is never
+    // used to issue anything, so its own age is not a refusal: the provider
+    // sign-in check plus a bounded admission wait routinely outlive a
+    // capability lease capped at 30 s (qa6 re-witness 2026-09-23, j2: preflight
+    // read 00:21:06, refused 00:21:28 with a fresh capability in hand). A
+    // post-grant `expected` is the capability the grant was issued on, and
+    // stays bound by its expiry.
+    if ((phase === "post_grant" && expected.capability.expiresAt <= now) || actual.capability.expiresAt <= now) {
       throw runtimeFailure(
         "capability_snapshot_expired",
         `Terminal capability authority expired during ${phase === "preflight" ? "preflight" : "post-grant"} admission.`,

@@ -36,4 +36,5 @@ test('a recorded-launch mismatch is a proven rejection, not an unreconcilable cr
  const proven=scope.isProvenAgentSessionCreateRejection;
  assert.equal(proven(new CunaError({code:'cuna.provider.pending_intent_conflict',message:'m',exitCode:6,details:{reason:'recorded_launch_mismatch'}})),true);
  assert.equal(proven(new CunaError({code:'cuna.provider.pending_intent_conflict',message:'m',exitCode:6})),false,'an unresolved earlier launch stays unreconcilable');
+ assert.equal(proven(new CunaError({code:'cuna.provider.recorded_launch_ended',message:'m',exitCode:6,details:{reason:'recorded_launch_ended'}})),true,'an ended recorded launch is refused as itself');
 });
