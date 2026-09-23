@@ -1552,7 +1552,12 @@ test("production login uses the encrypted backend and reuses the canonical durab
     assert.equal(exit, EXIT_CODES.success, streams.stderr());
     assert.match(browserUrl, /^https:\/\/app\.getcuna\.com\/cli\/continue#/u);
     const files = await readdir(join(configDirectory, "sessions-v1"));
-    assert.equal(files.length, 2);
+    // Ciphertext and key; on Windows also the verified-ACL record, which holds
+    // file stats and a SID and nothing secret.
+    const aclRecords = files.filter((file) => file.endsWith(".json.acl"));
+    assert.equal(files.length - aclRecords.length, 2);
+    assert.equal(aclRecords.length, process.platform === "win32" ? 1 : 0);
+    for (const record of aclRecords) assert.doesNotMatch(await readFile(join(configDirectory, "sessions-v1", record), "utf8"), /cuna_/u);
     const storedFile = files.find((file) => file.endsWith(".json"));
     const stored = await readFile(join(configDirectory, "sessions-v1", storedFile), "utf8");
     assert.doesNotMatch(stored, /cuna_(?:at|rt)_/u);

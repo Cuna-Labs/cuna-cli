@@ -1,4 +1,4 @@
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type BigIntStats } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { basename, dirname, resolve } from "node:path";
@@ -208,6 +208,46 @@ function windowsAclScopeKey(path: string, directory: boolean): string {
 }
 
 /**
+ * The identity and change clock of one filesystem object, as decimal strings
+ * of `lstat({ bigint: true })`. On NTFS an ACL or owner change moves `ctime`
+ * (the ChangeTime field) and leaves `mtime` alone, so `ctime` is the witness
+ * here; `dev`/`ino`/`birthtime` make a replaced object a different object.
+ * Measured 2026-09-23: `icacls /grant` moved the file's and the directory's
+ * ctime; an in-place rewrite of a file did not move its directory's ctime.
+ */
+interface WindowsAclStatFingerprint {
+  readonly dev: string;
+  readonly ino: string;
+  readonly size: string;
+  readonly birthtimeNs: string;
+  readonly mtimeNs: string;
+  readonly ctimeNs: string;
+}
+
+/**
+ * A verified owner-only observation that outlives the process. It is written
+ * only when every present object's fingerprint was identical immediately
+ * before and immediately after the OS inspection that found it owner-only, so
+ * each record is a true statement: "an object with exactly these stats was
+ * owner-only". It lives inside the verified directory: rewriting or replacing
+ * it needs write access there, which the verified DACL grants to the current
+ * user alone, and any change to that DACL moves the directory's ctime and
+ * voids every record. Principals who can bypass or rewrite ACLs (the same OS
+ * account, administrators) can already read the key; the store never claimed
+ * to resist them.
+ */
+interface WindowsAclFingerprintRecord {
+  readonly version: 1;
+  readonly currentSid: string;
+  readonly directory: WindowsAclStatFingerprint;
+  readonly key?: WindowsAclStatFingerprint;
+  readonly session?: WindowsAclStatFingerprint;
+}
+
+const WINDOWS_ACL_FINGERPRINT_MAX_BYTES = 4 * 1024;
+const WINDOWS_ACL_FINGERPRINT_ROLES = ["directory", "key", "session"] as const;
+
+/**
  * Pure-JavaScript session persistence for the durable browser login code.
  * The random AES key and ciphertext are separate current-user-only files.
  * Their separation is not a backup boundary: a copied profile containing both
@@ -221,6 +261,7 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
   readonly #clock: () => number;
   readonly #lockTimeoutMs: number;
   readonly #windowsAcl: WindowsAclAuthority;
+  readonly #aclFingerprintFile: string | undefined;
   #aclScope: WindowsAclOperationScope | undefined;
 
   constructor(input: {
@@ -230,6 +271,14 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
     readonly clock?: () => number;
     readonly lockTimeoutMs?: number;
     readonly windowsAcl?: WindowsAclAuthority;
+    /**
+     * Persist verified Windows ACL observations (see
+     * `WindowsAclFingerprintRecord`). On by default with the OS authority,
+     * off by default with an injected one: a test authority can change its
+     * answer without moving any ctime, which is exactly the change a record
+     * cannot see.
+     */
+    readonly windowsAclFingerprint?: boolean;
   }) {
     this.#sessionFile = exactJsonPath(input.sessionFile, "session");
     this.#keyFile = exactKeyPath(input.keyFile);
@@ -240,6 +289,9 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
     this.#clock = input.clock ?? Date.now;
     this.#lockTimeoutMs = input.lockTimeoutMs ?? LOCK_TIMEOUT_MS;
     this.#windowsAcl = input.windowsAcl ?? WINDOWS_ACL_AUTHORITY;
+    this.#aclFingerprintFile = this.platform === "win32" && (input.windowsAclFingerprint ?? input.windowsAcl === undefined)
+      ? `${this.#sessionFile}.acl`
+      : undefined;
     if (!Number.isSafeInteger(this.#lockTimeoutMs) || this.#lockTimeoutMs < 10 || this.#lockTimeoutMs > 120_000) {
       throw credentialFailure("credential_backend_unverified", "The encrypted session lock timeout is invalid.");
     }
@@ -366,6 +418,11 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
     if (failure !== undefined) {
       throw credentialFailure("credential_backend_failure", "The encrypted local session could not be removed.", { retryable: true, cause: failure });
     }
+    // A record about objects that no longer exist can never match again;
+    // removing it is housekeeping, and failing to is harmless.
+    if (this.#aclFingerprintFile !== undefined && files.includes(this.#sessionFile)) {
+      try { await unlink(this.#aclFingerprintFile); } catch {}
+    }
     return deleted ? "deleted" : "absent";
   }
 
@@ -451,16 +508,30 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
         { path: this.#keyFile, directory: false },
         { path: this.#sessionFile, directory: false },
       ];
+      // A record matching what is on disk now stands in for the spawn. It is
+      // all or nothing: one changed object sends every path to the OS.
+      const before = this.#aclFingerprintFile === undefined ? undefined : await statFingerprints(requests);
+      const recorded = before === undefined ? undefined : await this.#readAclFingerprint(before);
+      if (recorded !== undefined) {
+        requests.forEach((request, index) => {
+          if (before![index] !== undefined) scope.entries.set(windowsAclScopeKey(request.path, request.directory), recorded);
+        });
+        const hit = scope.entries.get(key);
+        if (hit !== undefined) return hit;
+      }
+      let results: readonly (WindowsAclInspection | undefined)[] | undefined;
       try {
-        const results = await inspectMany.call(this.#windowsAcl, requests);
+        results = await inspectMany.call(this.#windowsAcl, requests);
         if (results.length !== requests.length) throw new Error("Windows ACL batch inspection is misaligned");
         requests.forEach((request, index) => {
-          const result = results[index];
+          const result = results![index];
           if (result !== undefined) scope.entries.set(windowsAclScopeKey(request.path, request.directory), result);
         });
       } catch (error) {
         scope.failure = error;
+        results = undefined;
       }
+      if (before !== undefined && results !== undefined) await this.#recordAclFingerprint(requests, before, results);
       const batched = scope.entries.get(key);
       if (batched !== undefined) return batched;
     }
@@ -468,6 +539,74 @@ export class LocalEncryptedSessionBackend implements SecureCredentialBackend {
     const inspection = await this.#windowsAcl.inspectOwnerOnly(path, directory);
     scope.entries.set(key, inspection);
     return inspection;
+  }
+
+  /**
+   * The recorded owner-only observation, only if every object present now
+   * (the directory always) carries exactly the recorded identity and ctime.
+   * Anything unreadable, malformed or different is "no record", never a
+   * refusal: the caller then asks the OS as it always did.
+   */
+  async #readAclFingerprint(
+    current: readonly (WindowsAclStatFingerprint | undefined)[],
+  ): Promise<WindowsAclInspection | undefined> {
+    const file = this.#aclFingerprintFile;
+    if (file === undefined || current[0] === undefined) return undefined;
+    let record: WindowsAclFingerprintRecord | undefined;
+    try {
+      record = parseWindowsAclFingerprintRecord(await readRegularFileBounded(file, WINDOWS_ACL_FINGERPRINT_MAX_BYTES));
+    } catch {
+      return undefined;
+    }
+    if (record === undefined) return undefined;
+    for (const [index, role] of WINDOWS_ACL_FINGERPRINT_ROLES.entries()) {
+      const observed = current[index];
+      if (observed === undefined) continue;
+      const stored = record[role];
+      if (stored === undefined || !sameStatFingerprint(stored, observed)) return undefined;
+    }
+    return Object.freeze({ currentSid: record.currentSid, ownerSid: record.currentSid, daclOwnerOnly: true });
+  }
+
+  /**
+   * Records the batch only when it proved every present object owner-only for
+   * one SID and nothing moved between the `before` stats and a second read
+   * taken now. A failure here costs the next operation one inspection; it
+   * never changes this operation's verdict.
+   */
+  async #recordAclFingerprint(
+    requests: readonly WindowsAclInspectionRequest[],
+    before: readonly (WindowsAclStatFingerprint | undefined)[],
+    results: readonly (WindowsAclInspection | undefined)[],
+  ): Promise<void> {
+    const file = this.#aclFingerprintFile;
+    if (file === undefined || before[0] === undefined) return;
+    let currentSid: string | undefined;
+    for (const index of requests.keys()) {
+      const result = results[index];
+      if (before[index] === undefined) {
+        if (result !== undefined) return;
+        continue;
+      }
+      if (result === undefined || result.ownerSid !== result.currentSid || !result.daclOwnerOnly) return;
+      if (currentSid !== undefined && currentSid !== result.currentSid) return;
+      currentSid = result.currentSid;
+    }
+    if (currentSid === undefined) return;
+    try {
+      const after = await statFingerprints(requests);
+      if (after === undefined || !before.every((entry, index) => sameOptionalStatFingerprint(entry, after[index]))) return;
+      const record: WindowsAclFingerprintRecord = {
+        version: 1,
+        currentSid,
+        directory: before[0],
+        ...(before[1] === undefined ? {} : { key: before[1] }),
+        ...(before[2] === undefined ? {} : { session: before[2] }),
+      };
+      await rewriteInPlace(file, Buffer.from(JSON.stringify(record), "utf8"));
+    } catch {
+      // See above: an unwritten record is a slower next operation, nothing more.
+    }
   }
 
   async #assertWindowsOwnerOnlyAcl(path: string, directory: boolean): Promise<void> {
@@ -780,11 +919,123 @@ function stripWindowsAclChildEnvironment(inherited: NodeJS.ProcessEnv): NodeJS.P
   return environment;
 }
 
-const WINDOWS_ACL_AUTHORITY: WindowsAclAuthority = Object.freeze({
+/**
+ * The OS authority. Exported so tests can count its real spawns while the
+ * backend keeps the production defaults (including ACL fingerprints).
+ */
+export const WINDOWS_ACL_AUTHORITY: WindowsAclAuthority = Object.freeze({
   inspectOwnerOnly: async (path: string, directory: boolean) => await inspectWindowsAcl(path, directory),
   inspectManyOwnerOnly: async (requests: readonly WindowsAclInspectionRequest[]) => await inspectWindowsAclMany(requests),
   reconcileNewOwnerOnly: async (path: string, directory: boolean) => await reconcileNewWindowsAcl(path, directory),
 });
+
+/** `undefined` entries are absent paths; any other stat failure means "no fingerprints at all". */
+async function statFingerprints(
+  requests: readonly WindowsAclInspectionRequest[],
+): Promise<readonly (WindowsAclStatFingerprint | undefined)[] | undefined> {
+  try {
+    return await Promise.all(requests.map(async ({ path }) => {
+      try {
+        const metadata = await lstat(path, { bigint: true });
+        if (metadata.isSymbolicLink()) throw new Error("reparse point");
+        return Object.freeze({
+          dev: metadata.dev.toString(),
+          ino: metadata.ino.toString(),
+          size: metadata.size.toString(),
+          birthtimeNs: metadata.birthtimeNs.toString(),
+          mtimeNs: metadata.mtimeNs.toString(),
+          ctimeNs: metadata.ctimeNs.toString(),
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw error;
+      }
+    }));
+  } catch {
+    return undefined;
+  }
+}
+
+function sameStatFingerprint(left: WindowsAclStatFingerprint, right: WindowsAclStatFingerprint): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+    left.birthtimeNs === right.birthtimeNs && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+function sameOptionalStatFingerprint(left: WindowsAclStatFingerprint | undefined, right: WindowsAclStatFingerprint | undefined): boolean {
+  return left === undefined || right === undefined ? left === right : sameStatFingerprint(left, right);
+}
+
+/** Strict: exact keys, decimal strings, one SID. Anything else is "no record". */
+export function parseWindowsAclFingerprintRecord(text: string): WindowsAclFingerprintRecord | undefined {
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return undefined; }
+  if (!isRecord(value) || value.version !== 1 || typeof value.currentSid !== "string" || !/^S-1-[0-9]+(?:-[0-9]+)+$/u.test(value.currentSid)) return undefined;
+  const allowed = new Set(["version", "currentSid", ...WINDOWS_ACL_FINGERPRINT_ROLES]);
+  if (Object.keys(value).some((name) => !allowed.has(name))) return undefined;
+  const entry = (candidate: unknown): WindowsAclStatFingerprint | undefined | false => {
+    if (candidate === undefined) return undefined;
+    if (!isRecord(candidate)) return false;
+    const names = ["dev", "ino", "size", "birthtimeNs", "mtimeNs", "ctimeNs"];
+    if (Object.keys(candidate).sort().join(",") !== [...names].sort().join(",")) return false;
+    if (!names.every((name) => typeof candidate[name] === "string" && /^(?:0|[1-9][0-9]{0,39})$/u.test(candidate[name] as string))) return false;
+    return Object.freeze(candidate as unknown as WindowsAclStatFingerprint);
+  };
+  const directory = entry(value.directory);
+  const key = entry(value.key);
+  const session = entry(value.session);
+  if (directory === undefined || directory === false || key === false || session === false) return undefined;
+  return Object.freeze({
+    version: 1,
+    currentSid: value.currentSid,
+    directory,
+    ...(key === undefined ? {} : { key }),
+    ...(session === undefined ? {} : { session }),
+  });
+}
+
+/**
+ * Rewrites an existing file without replacing it: a new directory entry (a
+ * create or a rename) would move the directory's ctime and void the record
+ * being written. Only the very first write creates the file.
+ */
+async function rewriteInPlace(file: string, bytes: Uint8Array): Promise<void> {
+  // One call opens the existing file or creates it; without O_TRUNC an
+  // existing file keeps its directory entry, so nothing is checked first.
+  const handle = await open(file, fsConstants.O_RDWR | fsConstants.O_CREAT, 0o600);
+  try {
+    await assertOpenedRegularFile(handle, file);
+    await handle.write(bytes, 0, bytes.byteLength, 0);
+    await handle.truncate(bytes.byteLength);
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Open first, then judge the opened object: nothing is read on the strength of an earlier path check. */
+async function readRegularFileBounded(file: string, maximumBytes: number): Promise<string> {
+  const handle = await open(file, "r");
+  try {
+    const metadata = await assertOpenedRegularFile(handle, file);
+    if (metadata.size < 1n || metadata.size > BigInt(maximumBytes)) throw new Error("ACL fingerprint size is out of bounds");
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * The opened object must be a regular file, and the path must name that same
+ * object without a link: `open` follows reparse points, so a link is caught by
+ * comparing the path's own `lstat` identity with the handle's.
+ */
+async function assertOpenedRegularFile(handle: Awaited<ReturnType<typeof open>>, file: string): Promise<BigIntStats> {
+  const opened = await handle.stat({ bigint: true });
+  const named = await lstat(file, { bigint: true });
+  if (!opened.isFile() || named.isSymbolicLink() || named.dev !== opened.dev || named.ino !== opened.ino) {
+    throw new Error("ACL fingerprint path is not a regular file");
+  }
+  return opened;
+}
 
 function assertWindowsOwnerOnlyInspection(inspection: WindowsAclInspection): void {
   assertWindowsCurrentUserOwner(inspection);
