@@ -34,7 +34,18 @@ try{
  child.resize(80,24);term.resize(80,24);await wait(()=>screen().includes('RESIZE 80x22'),'resize restore');
  child.write('~');await wait(()=>screen().includes('Restoring terminal'),'reconnect restoring');await wait(()=>screen().includes('CANONICAL_VIEW_2')&&!screen().includes('Restoring terminal'),'fresh replacement');
  await key('R','INPUT_HEX 52');assert.equal(screen().match(/INPUT_HEX ([0-9a-f]+)/)?.[1],'52');
+ await wait(()=>screen().includes('2:Codex session 2222'),'second session tab');
+ // Separate ConPTY writes exercise a delayed selector; Windows may still coalesce host input callbacks.
+ child.write('\x1d');await new Promise(r=>setTimeout(r,10));child.write('2');
+ await wait(()=>screen().includes('CANONICAL_VIEW_3')&&!screen().includes('Restoring terminal'),'switch to second session');
+ actions.push({inputWritesHex:['1d','32'],writeGapMs:10,phase:'switchToSecondSession',screen:screen()});
+ await key('B','INPUT_HEX 42');assert.equal(screen().match(/INPUT_HEX ([0-9a-f]+)/)?.[1],'42');
+ child.write('\x1d');await new Promise(r=>setTimeout(r,10));child.write('1');
+ await wait(()=>screen().includes('CANONICAL_VIEW_4')&&!screen().includes('Restoring terminal'),'switch back to first session');
+ actions.push({inputWritesHex:['1d','31'],writeGapMs:10,phase:'switchBackToFirstSession',screen:screen()});
+ await key('A','INPUT_HEX 41');assert.equal(screen().match(/INPUT_HEX ([0-9a-f]+)/)?.[1],'41');
  child.write('\x03');await wait(()=>exit!==undefined,'detach');assert.equal(exit.exitCode,0);
+ assert.match(raw,/CANONICAL_SWITCH_RECEIPT /u,'the synthetic transport did not attest the native tab sequence');
 }catch(error){failure=String(error);}
 finally{
  if(child&&!exit){try{child.kill();await Promise.race([exited,new Promise(r=>setTimeout(r,2000))]);if(!exit)failure=(failure??'')+' cleanup_timeout_child_exit_unconfirmed';}catch(error){failure=(failure??'')+' cleanup_failed:'+String(error);}}
