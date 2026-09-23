@@ -2946,3 +2946,15 @@ test("control: a preflight admission whose authority changed is still refused", 
     await runtime.shutdown();
   }
 });
+
+test("attach reports each remote step it waits on, in order", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  const stages = [];
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24, onStage: (stage) => stages.push(stage) });
+    assert.deepEqual(stages, ["admission", "grant", "connect", "ready_wait"]);
+  } finally {
+    await runtime.shutdown();
+  }
+});

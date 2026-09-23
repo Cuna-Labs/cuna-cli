@@ -406,9 +406,14 @@ export class CunaRuntimeBoundary {
     readonly rows: number;
     readonly expectedAdmission?: TerminalAttachmentAdmission;
     readonly signal?: AbortSignal;
+    readonly onStage?: (stage: "admission" | "grant" | "connect" | "ready_wait") => void;
   }): Promise<RuntimeTerminalSnapshot> {
     this.#assertReady();
     assertIdentifier(input.tabId, "tab ID");
+    // A stage observer only labels the wait on screen; it never decides anything.
+    const stage = (value: "admission" | "grant" | "connect" | "ready_wait"): void => {
+      try { input.onStage?.(value); } catch { /* observers cannot fail an attach */ }
+    };
     assertIdentifier(input.agentSessionId, "AgentSession ID");
     assertDimensions(input.columns, input.rows);
     if (this.#terminals.has(input.tabId) || this.#pendingTerminalTabs.has(input.tabId)) {
@@ -447,12 +452,14 @@ export class CunaRuntimeBoundary {
     try {
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
       await this.#cancelConnectionRequests(input.agentSessionId);
+      stage("admission");
       const admitted = await this.#admitRemoteTerminal(input.agentSessionId, attachAbort.signal);
       if (input.expectedAdmission !== undefined) {
         this.#assertAttachmentAdmissionContinuity(input.expectedAdmission, admitted, "preflight");
       }
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
+      stage("grant");
       const grant = await this.#createGrant(admitted.observation, admitted.capability, undefined, undefined, attachAbort.signal);
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
@@ -463,6 +470,7 @@ export class CunaRuntimeBoundary {
       }
       this.#assertOpen();
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
+      stage("connect");
       connection = await this.#options.terminalConnector.connect({
         ...(this.#options.canonicalTerminalViews === true ? { terminalViewProtocol: "cuna.terminal-view.v1" as const } : {}),
         url: grant.connectUrl,
@@ -513,6 +521,7 @@ export class CunaRuntimeBoundary {
         outputAbort: new AbortController(),
       };
       const iterator = connection.receive()[Symbol.asyncIterator]();
+      stage("ready_wait");
       const ready = await this.#awaitReady(entry, iterator, attachAbort.signal);
       if (ready.payload.terminalViewProtocol !== undefined) {
         if (this.#options.canonicalTerminalViews !== true) throw runtimeFailure("terminal_protocol_error", "Unrequested terminal view protocol.");
