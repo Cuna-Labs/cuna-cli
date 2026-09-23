@@ -29,7 +29,12 @@ import type {
 } from "./workspace-sync-protocol.js";
 import { decodeChangePage } from "./workspace-sync-protocol.js";
 
-const STATE_SCHEMA = 1;
+/**
+ * Schema 2 adds `last_local_commit`. A schema 1 file is still read, with that
+ * fact unknown (null): it is the state a folder detached under before this
+ * build, and it is exactly the state a re-attach must resume from.
+ */
+const STATE_SCHEMA = 2;
 const ZERO_DIGEST = "0".repeat(64);
 const DEFAULT_DEBOUNCE_MS = 250;
 const DEFAULT_RECONCILE_MS = 60_000;
@@ -58,6 +63,29 @@ export interface ContinuousSyncSnapshot {
   readonly pendingRemoteChanges: number;
   readonly reason?: string;
   readonly observedAt: string;
+}
+
+/**
+ * One path both sides changed, and where each version now lives. Nothing is
+ * ever resolved by discarding bytes: one version stays at `path`, the other is
+ * written beside it as `sibling` (null only when the other side deleted it).
+ *
+ * - `local_in_place`: this folder changed `path` and the incoming generation
+ *   changed it too. The local bytes stay; the incoming ones go to the sibling.
+ *   This is the guest's rule (PRD workspace live apply 2026-09-22 §3) seen
+ *   from the other side, and the next local commit proposes the local version.
+ * - `remote_in_place`: the incoming generation directly follows this folder's
+ *   own commit and replaces a path that commit carried. That is how a
+ *   conflict the Machine already resolved comes back (it kept its own bytes
+ *   and captured them as the next generation), so the Machine's version is
+ *   accepted and the local bytes are kept as the sibling.
+ */
+export interface ContinuousSyncConflict {
+  readonly code: "cuna.workspace_sync.conflict_retained";
+  readonly resolution: "local_in_place" | "remote_in_place";
+  readonly path: string;
+  readonly sibling: string | null;
+  readonly generation: number;
 }
 
 export interface ContinuousSyncCommitReceipt {
@@ -117,7 +145,7 @@ export type WorkspaceWatchFactory = (input: {
   readonly onError: (error: unknown) => void;
 }) => Promise<WorkspaceWatchSubscription>;
 
-interface EntryProjection {
+export interface EntryProjection {
   readonly path: string;
   readonly kind: ManifestEntry["kind"];
   readonly fingerprint: string;
@@ -141,8 +169,14 @@ interface PendingRemoteApply {
   readonly nextIndex: number;
 }
 
+/** The paths this folder's own most recent commit carried, as committed. */
+interface LocalCommitRecord {
+  readonly generation: number;
+  readonly entries: readonly { readonly path: string; readonly fingerprint: string }[];
+}
+
 interface DurableSupervisorState {
-  readonly schema_version: 1;
+  readonly schema_version: 2;
   readonly binding_id: string;
   readonly binding_generation: number;
   readonly policy_digest: string;
@@ -156,7 +190,17 @@ interface DurableSupervisorState {
   readonly baseline: readonly EntryProjection[];
   readonly pending_local: readonly PendingLocalOperation[];
   readonly pending_remote: PendingRemoteApply | null;
+  readonly last_local_commit: LocalCommitRecord | null;
   readonly updated_at: string;
+}
+
+/** What a folder's durable sync state says about where its tree came from. */
+export interface ContinuousSyncDurableBase {
+  readonly generation: number;
+  readonly manifestRoot: string;
+  readonly syncId: string;
+  readonly baseline: readonly EntryProjection[];
+  readonly updatedAt: string;
 }
 
 export interface ContinuousWorkspaceSyncSupervisorInput {
@@ -182,6 +226,22 @@ export interface ContinuousWorkspaceSyncSupervisorInput {
   readonly clock?: () => number;
   readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly manifestBuilder?: typeof createWorkspaceManifest;
+  /**
+   * Refuse to start unless a durable state already exists in
+   * `stateDirectory`. A re-attach resumes from the tree the folder last
+   * synchronized; if that state vanished, a fresh one would adopt the current,
+   * possibly edited, tree as its baseline and the next remote apply would
+   * overwrite those edits as if they were unchanged.
+   */
+  readonly requireDurableState?: boolean;
+  /**
+   * The durable state of the generation this start directly follows, when the
+   * caller has just committed the local tree on top of it. It lets the new
+   * state know which paths that commit carried (see `remote_in_place`).
+   */
+  readonly priorBase?: Pick<ContinuousSyncDurableBase, "generation" | "baseline">;
+  /** Called once per retained conflict. Observers never own sync correctness. */
+  readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
 }
 
 /**
@@ -236,6 +296,9 @@ export class ContinuousWorkspaceSyncSupervisor {
     }
     const statePath = join(stateDirectory, "continuous-sync.state.json");
     const loaded = await loadState(statePath);
+    if (loaded === undefined && input.requireDurableState === true) {
+      throw syncFailure("durable_state_missing", EXIT_CODES.conflict);
+    }
     const state = loaded === undefined
       ? createInitialState(normalizedInput, initialManifest)
       : admitState(loaded, normalizedInput);
@@ -252,6 +315,33 @@ export class ContinuousWorkspaceSyncSupervisor {
       }
       throw error;
     }
+  }
+
+  /**
+   * Reads, without starting anything, the tree a durable state says this
+   * folder last synchronized. Undefined when there is no state file; a file
+   * that fails admission throws exactly as a start would.
+   */
+  static async readDurableBase(input: {
+    readonly stateDirectory: string;
+    readonly bindingId: string;
+    readonly bindingGeneration: number;
+    readonly policyDigest: string;
+  }): Promise<ContinuousSyncDurableBase | undefined> {
+    const loaded = await loadState(join(input.stateDirectory, "continuous-sync.state.json"));
+    if (loaded === undefined) return undefined;
+    const state = admitState(loaded, {
+      bindingId: input.bindingId,
+      bindingGeneration: input.bindingGeneration,
+      policy: { digest: input.policyDigest },
+    });
+    return Object.freeze({
+      generation: state.generation,
+      manifestRoot: state.manifest_root,
+      syncId: state.sync_id,
+      baseline: state.baseline,
+      updatedAt: state.updated_at,
+    });
   }
 
   get snapshot(): ContinuousSyncSnapshot {
@@ -368,13 +458,18 @@ export class ContinuousWorkspaceSyncSupervisor {
           await this.#reconcile(signal);
           lastReconciliation = this.#clock();
         }
+        // Remote generations are taken in before local edits are committed.
+        // A commit names `this.#state.generation` as its base, which is only
+        // true if nothing newer was published; committing first would either
+        // be refused or, worse, be the stale tree a newer generation lost to
+        // (qa6 witness 2026-09-22, step 6).
+        if (this.#state.status !== "conflicted" && this.#state.status !== "recovery_required" && this.#state.status !== "paused") {
+          await this.#consumeRemote(signal);
+        }
         if (this.#scanRequested && this.#state.status !== "conflicted" && this.#state.status !== "recovery_required") {
           this.#scanRequested = false;
           await this.#sleep(this.#input.debounceMs ?? DEFAULT_DEBOUNCE_MS, signal);
           await this.#scanAndCommit(signal);
-        }
-        if (this.#state.status !== "conflicted" && this.#state.status !== "recovery_required" && this.#state.status !== "paused") {
-          await this.#consumeRemote(signal);
         }
         await this.#journal?.renew();
         await this.#waitForWake(this.#input.remotePollIntervalMs ?? DEFAULT_REMOTE_POLL_MS, signal);
@@ -453,6 +548,7 @@ export class ContinuousWorkspaceSyncSupervisor {
       manifest_root: receipt.manifestRoot,
       baseline: projectManifest(manifest),
       pending_local: [],
+      last_local_commit: localCommitRecord(receipt.generation, operations),
       cursor: null,
       status: "live_unverified",
       dirty: false,
@@ -523,6 +619,12 @@ export class ContinuousWorkspaceSyncSupervisor {
     const currentEntries = new Map(projectManifest(current).map((entry) => [entry.path, entry]));
     const baseline = new Map(this.#state.baseline.map((entry) => [entry.path, entry]));
     const ordered = orderRemoteItems(pending.items);
+    // The paths this folder's own commit carried, when the incoming generation
+    // is the one directly after it: the only generation in which the Machine
+    // can return a conflict it resolved against that commit.
+    const ownCommit = this.#state.last_local_commit?.generation === pending.generation - 1
+      ? new Map(this.#state.last_local_commit.entries.map((entry) => [entry.path, entry.fingerprint]))
+      : undefined;
     for (let index = pending.nextIndex; index < ordered.length; index += 1) {
       const item = ordered[index];
       if (item === undefined) continue;
@@ -531,36 +633,62 @@ export class ContinuousWorkspaceSyncSupervisor {
         if (path === null) throw syncFailure("remote_change_shape", EXIT_CODES.remote);
         const prior = baseline.get(path);
         const observed = currentEntries.get(path);
-        if (!sameProjection(prior, observed)) {
-          await this.#retainConflict(item, signal);
-          await this.#replaceState({
-            pending_remote: Object.freeze({ ...pending, items: Object.freeze(ordered), nextIndex: index + 1 }),
-            status: "conflicted",
-            dirty: true,
-            reason: "same_path_diverged",
-          });
-          throw syncFailure("same_path_diverged", EXIT_CODES.conflict);
+        const target = projectRemoteItem(item);
+        if (sameProjection(observed, target)) {
+          // Both sides already hold the same bytes; there is nothing to write.
+        } else if (!sameProjection(prior, observed)) {
+          // Changed here and in the incoming generation: the local bytes are
+          // never touched, the incoming ones are kept beside them.
+          const sibling = await this.#retainRemoteSibling(item, signal);
+          this.#announceConflict({ resolution: "local_in_place", path, sibling, generation: pending.generation });
+        } else {
+          if (observed?.kind === "file" && ownCommit?.get(path) === observed.fingerprint) {
+            const sibling = await this.#retainLocalSibling(path, pending.generation - 1);
+            this.#announceConflict({ resolution: "remote_in_place", path, sibling, generation: pending.generation });
+          }
+          await this.#applyRemoteItem(item, signal);
         }
-        await this.#applyRemoteItem(item, signal);
       }
       await this.#replaceState({
         pending_remote: Object.freeze({ ...pending, items: Object.freeze(ordered), nextIndex: index + 1 }),
       });
     }
     const manifest = await this.#buildManifest();
+    const adopted = remoteTargetProjection(this.#state.baseline, ordered);
     if (manifest.manifestRoot !== pending.manifestRoot) {
-      throw syncFailure("remote_apply_manifest_mismatch", EXIT_CODES.conflict);
+      // Only local edits may explain a difference. A path the incoming
+      // generation named that still shows its pre-apply bytes was not applied.
+      const after = new Map(projectManifest(manifest).map((entry) => [entry.path, entry]));
+      for (const item of ordered) {
+        if (item.path === null) continue;
+        const local = after.get(item.path);
+        if (!sameProjection(local, adopted.get(item.path)) && sameProjection(local, baseline.get(item.path))) {
+          throw syncFailure("remote_apply_manifest_mismatch", EXIT_CODES.conflict);
+        }
+      }
     }
+    const localAhead = manifest.manifestRoot !== pending.manifestRoot;
     await this.#replaceState({
       generation: pending.generation,
       manifest_root: pending.manifestRoot,
-      baseline: projectManifest(manifest),
+      // The baseline is the generation just adopted, not the folder: whatever
+      // the folder holds beyond it (a kept conflict, an unsent edit) is then a
+      // local change the next scan commits on top of this generation.
+      baseline: localAhead
+        ? Object.freeze([...adopted.values()].sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path))))
+        : projectManifest(manifest),
       cursor: pending.cursor,
       pending_remote: null,
-      dirty: false,
+      dirty: localAhead,
       status: "live_unverified",
       reason: null,
     });
+    if (localAhead) this.#scanRequested = true;
+  }
+
+  #announceConflict(input: Omit<ContinuousSyncConflict, "code">): void {
+    const conflict = Object.freeze({ code: "cuna.workspace_sync.conflict_retained" as const, ...input });
+    try { this.#input.onConflict?.(conflict); } catch { /* Observers cannot own sync correctness. */ }
   }
 
   async #applyRemoteItem(item: WorkspaceSyncChangeItem, signal: AbortSignal): Promise<void> {
@@ -599,13 +727,10 @@ export class ContinuousWorkspaceSyncSupervisor {
     await atomicReplaceFile(this.#input.canonicalRoot, physical, chunks, entry.executable);
   }
 
-  async #retainConflict(item: WorkspaceSyncChangeItem, signal: AbortSignal): Promise<void> {
-    if (item.operation !== "upsert" || item.entry === null || item.path === null || item.entry.kind !== "file") return;
-    const suffix = createHash("sha256")
-      .update(`${this.#input.bindingId}\0${item.generation}\0${item.path}`)
-      .digest("hex")
-      .slice(0, 12);
-    const retained = `${item.path}.cuna-conflict-${item.generation}-${suffix}`;
+  /** Writes the incoming file beside the local one. Null when there are no incoming bytes to keep. */
+  async #retainRemoteSibling(item: WorkspaceSyncChangeItem, signal: AbortSignal): Promise<string | null> {
+    if (item.operation !== "upsert" || item.entry === null || item.path === null || item.entry.kind !== "file") return null;
+    const retained = conflictSiblingPath(this.#input.bindingId, item.generation, item.path);
     const physical = assertLexicallyInsideRoot(this.#input.canonicalRoot, join(this.#input.canonicalRoot, retained));
     const chunks: Uint8Array[] = [];
     for (const chunk of item.entry.chunks) {
@@ -620,7 +745,35 @@ export class ContinuousWorkspaceSyncSupervisor {
       }
       chunks.push(bytes);
     }
-    await atomicReplaceFile(this.#input.canonicalRoot, physical, chunks, item.entry.executable, true);
+    await writeRetainedSibling(this.#input.canonicalRoot, physical, chunks, item.entry.executable);
+    return retained;
+  }
+
+  /**
+   * Copies the local file beside itself before an incoming generation
+   * replaces it. `generation` is the generation that carried these bytes (this
+   * folder's own commit), matching the guest, which names a sibling after the
+   * generation whose bytes it holds.
+   */
+  async #retainLocalSibling(path: string, generation: number): Promise<string> {
+    const wirePath = normalizeWirePath(path, this.#input.filesystemCapabilities);
+    const source = assertLexicallyInsideRoot(this.#input.canonicalRoot, join(this.#input.canonicalRoot, wirePath));
+    await assertSafeAncestors(this.#input.canonicalRoot, dirname(source));
+    const handle = await open(source, fileConstants.O_RDONLY | noFollowFlag());
+    let bytes: Buffer;
+    let executable: boolean;
+    try {
+      const metadata = await handle.stat();
+      if (!metadata.isFile() || metadata.nlink !== 1) throw syncFailure("conflict_source_untrusted", EXIT_CODES.policy);
+      executable = (metadata.mode & 0o111) !== 0;
+      bytes = await handle.readFile();
+    } finally {
+      await handle.close();
+    }
+    const retained = conflictSiblingPath(this.#input.bindingId, generation, wirePath);
+    const physical = assertLexicallyInsideRoot(this.#input.canonicalRoot, join(this.#input.canonicalRoot, retained));
+    await writeRetainedSibling(this.#input.canonicalRoot, physical, [bytes], executable);
+    return retained;
   }
 
   async #reconcile(signal: AbortSignal): Promise<void> {
@@ -658,6 +811,7 @@ export class ContinuousWorkspaceSyncSupervisor {
         manifest_root: receipt.manifestRoot,
         baseline: projectManifest(manifest),
         pending_local: [],
+        last_local_commit: localCommitRecord(receipt.generation, this.#state.pending_local),
         cursor: null,
         dirty: false,
         status: "converged",
@@ -707,7 +861,7 @@ export class ContinuousWorkspaceSyncSupervisor {
     const next = Object.freeze({
       ...this.#state,
       ...patch,
-      schema_version: STATE_SCHEMA as 1,
+      schema_version: STATE_SCHEMA as 2,
       updated_at: new Date(this.#clock()).toISOString(),
     });
     this.#state = admitState(next, this.#input);
@@ -743,8 +897,12 @@ export class ContinuousWorkspaceSyncSupervisor {
 }
 
 function createInitialState(input: ContinuousWorkspaceSyncSupervisorInput, manifest: WorkspaceManifest): DurableSupervisorState {
+  const prior = input.priorBase;
   return Object.freeze({
-    schema_version: 1,
+    schema_version: STATE_SCHEMA as 2,
+    last_local_commit: prior !== undefined && prior.generation === input.initialGeneration - 1
+      ? localCommitRecord(input.initialGeneration, diffManifest(prior.baseline, manifest, prior.generation))
+      : null,
     binding_id: input.bindingId,
     binding_generation: input.bindingGeneration,
     policy_digest: input.policy.digest,
@@ -760,6 +918,95 @@ function createInitialState(input: ContinuousWorkspaceSyncSupervisorInput, manif
     pending_remote: null,
     updated_at: new Date(input.clock?.() ?? Date.now()).toISOString(),
   });
+}
+
+function localCommitRecord(generation: number, operations: readonly PendingLocalOperation[]): LocalCommitRecord {
+  return Object.freeze({
+    generation,
+    entries: Object.freeze(operations.map((operation) => Object.freeze({ path: operation.path, fingerprint: operation.fingerprint }))),
+  });
+}
+
+/** The projection a remote upsert describes, fingerprinted exactly as `entryFingerprint` does for a local entry. */
+function projectRemoteItem(item: WorkspaceSyncChangeItem): EntryProjection | undefined {
+  if (item.operation !== "upsert" || item.entry === null || item.path === null) return undefined;
+  const entry = item.entry;
+  return Object.freeze({
+    path: item.path,
+    kind: entry.kind,
+    fingerprint: createHash("sha256").update(JSON.stringify({
+      path: item.path,
+      kind: entry.kind,
+      byte_length: entry.kind === "symlink" ? 0 : entry.byte_length,
+      executable: entry.executable,
+      chunks: entry.chunks.map((chunk) => ({ digest: chunk.digest, byte_length: chunk.byte_length })),
+      link_target: entry.link_target,
+    })).digest("hex"),
+    byteLength: entry.byte_length,
+  });
+}
+
+/** The tree an incoming generation describes: the baseline with its changes applied. */
+function remoteTargetProjection(
+  baseline: readonly EntryProjection[],
+  items: readonly WorkspaceSyncChangeItem[],
+): Map<string, EntryProjection> {
+  const target = new Map(baseline.map((entry) => [entry.path, entry]));
+  for (const item of items) {
+    if (item.path === null) continue;
+    const projected = projectRemoteItem(item);
+    if (projected === undefined) target.delete(item.path);
+    else target.set(item.path, projected);
+  }
+  return target;
+}
+
+/**
+ * `<path>.cuna-conflict-<generation>-<sha12>`, where sha12 is the first 12 hex
+ * digits of sha256(binding id NUL generation NUL path). The guest uses the same
+ * shape with its execution workspace id, so the two sides never write the
+ * same name for different reasons.
+ */
+function conflictSiblingPath(bindingId: string, generation: number, path: string): string {
+  const suffix = createHash("sha256").update(`${bindingId}\0${generation}\0${path}`).digest("hex").slice(0, 12);
+  return `${path}.cuna-conflict-${generation}-${suffix}`;
+}
+
+/**
+ * Writes a conflict sibling once. A replay after a crash finds the same name
+ * holding the same bytes and is done; a name holding other bytes is never
+ * overwritten.
+ */
+async function writeRetainedSibling(root: string, path: string, chunks: readonly Uint8Array[], executable: boolean): Promise<void> {
+  // Open first, then judge the open descriptor, then confirm the path still
+  // names it: checking the path and reading it separately would judge one file
+  // and compare the bytes of another.
+  let handle;
+  try {
+    handle = await open(path, fileConstants.O_RDONLY | noFollowFlag());
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      await atomicReplaceFile(root, path, chunks, executable, true);
+      return;
+    }
+    if (code === "ELOOP") throw syncFailure("conflict_retention_collision", EXIT_CODES.conflict);
+    throw error;
+  }
+  let same = false;
+  try {
+    const opened = await handle.stat();
+    if (opened.isFile() && opened.nlink === 1) {
+      const linked = await lstat(path);
+      if (!linked.isSymbolicLink() && linked.dev === opened.dev && linked.ino === opened.ino) {
+        const existing = await handle.readFile();
+        same = existing.equals(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))));
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+  if (!same) throw syncFailure("conflict_retention_collision", EXIT_CODES.conflict);
 }
 
 function projectManifest(manifest: WorkspaceManifest): readonly EntryProjection[] {
@@ -993,15 +1240,22 @@ async function atomicWriteState(path: string, state: DurableSupervisorState): Pr
   }
 }
 
-function admitState(value: unknown, input: ContinuousWorkspaceSyncSupervisorInput): DurableSupervisorState {
+function admitState(
+  value: unknown,
+  input: Pick<ContinuousWorkspaceSyncSupervisorInput, "bindingId" | "bindingGeneration"> & { readonly policy: Pick<ExclusionPolicy, "digest"> },
+): DurableSupervisorState {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw syncFailure("state_invalid", EXIT_CODES.conflict);
   const source = value as Record<string, unknown>;
   const keys = [
     "baseline", "binding_generation", "binding_id", "cursor", "dirty", "generation",
     "manifest_root", "pending_local", "pending_remote", "policy_digest", "reason",
     "schema_version", "status", "sync_id", "updated_at",
+    ...(source.schema_version === 1 ? [] : ["last_local_commit"]),
   ];
-  if (Object.keys(source).sort().join("\0") !== keys.sort().join("\0") || source.schema_version !== STATE_SCHEMA) {
+  if (
+    Object.keys(source).sort().join("\0") !== keys.sort().join("\0") ||
+    (source.schema_version !== 1 && source.schema_version !== STATE_SCHEMA)
+  ) {
     throw syncFailure("state_schema_incompatible", EXIT_CODES.conflict);
   }
   if (
@@ -1024,8 +1278,12 @@ function admitState(value: unknown, input: ContinuousWorkspaceSyncSupervisorInpu
   const baseline = Object.freeze(source.baseline.map(decodeEntryProjection));
   const pendingLocal = Object.freeze(source.pending_local.map(decodePendingLocal));
   const pendingRemote = source.pending_remote === null ? null : decodePendingRemote(source.pending_remote);
+  const lastLocalCommit = source.last_local_commit === undefined || source.last_local_commit === null
+    ? null
+    : decodeLocalCommitRecord(source.last_local_commit);
   return Object.freeze({
-    schema_version: 1,
+    schema_version: STATE_SCHEMA as 2,
+    last_local_commit: lastLocalCommit,
     binding_id: input.bindingId,
     binding_generation: input.bindingGeneration,
     policy_digest: input.policy.digest,
@@ -1053,6 +1311,26 @@ function decodeEntryProjection(value: unknown): EntryProjection {
     !Number.isSafeInteger(source.byteLength) || (source.byteLength as number) < 0
   ) throw syncFailure("state_invalid", EXIT_CODES.conflict);
   return Object.freeze(source as unknown as EntryProjection);
+}
+
+function decodeLocalCommitRecord(value: unknown): LocalCommitRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw syncFailure("state_invalid", EXIT_CODES.conflict);
+  const source = value as Record<string, unknown>;
+  if (
+    Object.keys(source).sort().join("\0") !== ["entries", "generation"].join("\0") ||
+    !Number.isSafeInteger(source.generation) || (source.generation as number) < 1 ||
+    !Array.isArray(source.entries)
+  ) throw syncFailure("state_invalid", EXIT_CODES.conflict);
+  const entries = source.entries.map((entry: unknown) => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) throw syncFailure("state_invalid", EXIT_CODES.conflict);
+    const fields = entry as Record<string, unknown>;
+    if (
+      Object.keys(fields).sort().join("\0") !== ["fingerprint", "path"].join("\0") ||
+      typeof fields.path !== "string" || !isDigest(fields.fingerprint)
+    ) throw syncFailure("state_invalid", EXIT_CODES.conflict);
+    return Object.freeze({ path: fields.path, fingerprint: fields.fingerprint });
+  });
+  return Object.freeze({ generation: source.generation as number, entries: Object.freeze(entries) });
 }
 
 function decodePendingLocal(value: unknown): PendingLocalOperation {

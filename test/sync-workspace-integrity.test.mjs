@@ -381,7 +381,7 @@ test("fenced journal admits exactly one concurrent writer", async (t) => {
   await winners[0].value.close();
 });
 
-test("journal retries a positively identified foreign TCP-port collision without bypassing its own writer fence", async (t) => {
+test("journal never bypasses its writer fence when a foreign TCP listener disappears", { skip: process.platform === "win32" }, async (t) => {
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const root = await temporaryDirectory(t);
     const directory = join(root, "journal");
@@ -401,8 +401,18 @@ test("journal retries a positively identified foreign TCP-port collision without
       if (error.code === "EADDRINUSE") continue;
       throw error;
     }
-    t.after(() => new Promise((resolveClose, rejectClose) => foreign.close((error) => error === undefined ? resolveClose() : rejectClose(error))));
+    t.after(() => foreign.listening ? new Promise((resolveClose, rejectClose) => foreign.close((error) => error === undefined ? resolveClose() : rejectClose(error))) : undefined);
+    await assert.rejects(
+      DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "blocked" }),
+      (error) => error.code === "cuna.workspace.workspace_busy",
+    );
+    await new Promise((resolveClose, rejectClose) => foreign.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
     const journal = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" });
+    t.after(() => journal.close());
+    await assert.rejects(
+      DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "second" }),
+      (error) => error.code === "cuna.workspace.workspace_busy",
+    );
     await journal.close();
     return;
   }

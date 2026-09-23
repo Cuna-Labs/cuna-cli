@@ -6,6 +6,9 @@ import test from "node:test";
 
 import { CunaError, EXIT_CODES } from "../dist/core/errors.js";
 import { conservativeFilesystemCapabilities, createWorkspaceJourneyEffects } from "../dist/journey/workspace-effects.js";
+import { inspectWorkspaceSyncPolicy } from "../dist/sync/workspace-sync-product-service.js";
+import { manifestEntryForPublicProtocol } from "../dist/sync/workspace-sync-protocol.js";
+import { compileExclusionPolicy, createWorkspaceManifest } from "../dist/workspace/index.js";
 
 const USER = "10000000-0000-4000-8000-000000000001";
 const WORKSPACE = "20000000-0000-4000-8000-000000000001";
@@ -14,7 +17,7 @@ const OTHER_MACHINE = "30000000-0000-4000-8000-000000000002";
 
 async function roots(t) {
   const base = await mkdtemp(join(tmpdir(), "cuna-journey-workspace-"));
-  t.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(base, { recursive: true, force: true })); });
+  t.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })); });
   const project = join(base, "project");
   const state = join(base, "state");
   await Promise.all([mkdir(project), mkdir(state)]);
@@ -159,7 +162,14 @@ test("E14-D1: a bound Machine that no longer exists rebinds the folder to the se
   assert.equal(record.recordRevision, seeded.record.recordRevision + 1, "the local record is bumped, not replaced");
   assert.equal(record.generation, 1);
 
-  assert.deepEqual(notices, [`Rebound this folder to ${MACHINE} · the previous Machine no longer exists`]);
+  // Two lines, in order: the decision taken on the owner's behalf, then the
+  // consequence of reusing a generation this installation never committed —
+  // there is no durable sync session to poll remote changes with, so the
+  // attach proceeds and says so instead of pretending a poller is running.
+  assert.deepEqual(notices, [
+    `Rebound this folder to ${MACHINE} · the previous Machine no longer exists`,
+    "Remote workspace changes will not arrive this run · resume_session_unavailable",
+  ]);
 });
 
 test("E14-D1: a bound Machine the server still holds as deleted is treated as absent", async (t) => {
@@ -186,7 +196,10 @@ test("E14-D1: a bound Machine the server still holds as deleted is treated as ab
   });
   assert.deepEqual(creates, [MACHINE]);
   assert.equal((await readBoundRecord(project)).machineId, MACHINE);
-  assert.equal(notices.length, 1);
+  assert.deepEqual(notices, [
+    `Rebound this folder to claude-stack-1 · the previous Machine no longer exists`,
+    "Remote workspace changes will not arrive this run · resume_session_unavailable",
+  ]);
 });
 
 // Negative control for the rebind: the bound Machine exists and merely differs
@@ -350,7 +363,9 @@ test("an unchanged workspace reuses its committed generation instead of committi
 
   // The transport throws on any request, so reaching the network at all fails
   // this test rather than silently passing on a slower path.
-  const result = await effects(client, state).synchronizeWorkspace({
+  const notices = [];
+  const reused = effects(client, state, { onNotice: (line) => notices.push(line) });
+  const result = await reused.synchronizeWorkspace({
     machineId: MACHINE,
     localPath: project,
     syncMode: "enabled",
@@ -359,6 +374,283 @@ test("an unchanged workspace reuses its committed generation instead of committi
 
   assert.equal(result.generation, 7, "the committed generation must be reused, not advanced");
   assert.equal(result.bindingId, binding.bindingId);
+  // This installation never committed generation 7, so it holds no sync session
+  // to read remote changes with. The attach still succeeds, and the missing
+  // capability is named rather than left as silence.
+  assert.equal(reused.continuousSyncSnapshot(), undefined, "no poller may claim to run without a read handle");
+  assert.deepEqual(notices, ["Remote workspace changes will not arrive this run · resume_session_unavailable"]);
+});
+
+/**
+ * One authenticated workspace-sync transport, answering the public wire
+ * protocol well enough to commit a generation and then to serve one produced
+ * by somebody else. `changePage` and `chunks` stay empty until a test arms
+ * them, so nothing arrives by accident.
+ */
+class WireAuthority {
+  authentication = "authenticated";
+  credentialAuthority = "interactive";
+  requests = [];
+  commits = [];
+  policyDigest;
+  baseGeneration = 0;
+  committedGeneration = 0;
+  committedRoot;
+  changePage = Object.freeze({ selected_protocol: 2, items: Object.freeze([]), next_cursor: null });
+  chunks = new Map();
+
+  async request(request) {
+    this.requests.push(Object.freeze({ method: request.method, path: request.path }));
+    if (request.path.endsWith("/sync-sessions")) {
+      this.policyDigest = request.body.exclusion_policy_digest;
+      this.baseGeneration = request.body.base_generation;
+      return this.#envelope(this.#session());
+    }
+    if (request.path.endsWith("/manifests")) {
+      return this.#envelope({
+        sync: this.#session(),
+        page_index: request.body.page_index,
+        page_digest: "a".repeat(64),
+        missing_digests: request.body.entries.flatMap((entry) => entry.chunks.map((chunk) => chunk.digest)),
+      });
+    }
+    if (request.method === "PUT") {
+      return this.#envelope({
+        selected_protocol: 2,
+        digest: request.path.split("/").at(-1),
+        byte_length: request.body.byteLength,
+        stored: true,
+      });
+    }
+    if (request.path.endsWith("/commit")) {
+      this.commits.push(Object.freeze({ expectedGeneration: request.body.expected_generation, manifestRoot: request.body.manifest_root }));
+      this.committedGeneration = request.body.expected_generation + 1;
+      this.committedRoot = request.body.manifest_root;
+      return this.#envelope({
+        selected_protocol: 2,
+        state: "committed",
+        generation: this.committedGeneration,
+        manifest_root: this.committedRoot,
+        committed_at: "2026-09-22T12:00:00.000Z",
+        minimum_reader: 1,
+        minimum_writer: 1,
+      });
+    }
+    if (request.path.endsWith("/changes")) return this.#envelope(this.changePage);
+    if (request.method === "GET" && request.path.includes("/chunks/")) {
+      const digest = request.path.split("/").at(-1);
+      const bytes = this.chunks.get(digest);
+      if (bytes === undefined) throw new Error("the change page named a chunk the authority does not hold");
+      return this.#envelope({
+        selected_protocol: 2,
+        digest,
+        byte_length: bytes.byteLength,
+        minimum_reader: 1,
+        content_base64: bytes.toString("base64"),
+      });
+    }
+    if (request.path.endsWith("/reconcile")) {
+      return this.#envelope({
+        selected_protocol: 2,
+        status: "converged",
+        active_generation: request.body.observed_generation,
+        active_manifest_root: request.body.manifest_root,
+        exclusion_policy_digest: request.body.exclusion_policy_digest,
+      });
+    }
+    throw new Error(`unexpected workspace sync operation ${request.method} ${request.path}`);
+  }
+
+  count(suffix) {
+    return this.requests.filter((request) => request.path.endsWith(suffix)).length;
+  }
+
+  #session() {
+    return {
+      id: WIRE_SYNC,
+      workspace_id: WORKSPACE,
+      machine_id: MACHINE,
+      base_generation: this.baseGeneration,
+      exclusion_policy_digest: this.policyDigest,
+      selected_protocol: 2,
+      capabilities: WIRE_CAPABILITIES,
+      state: "staging",
+      manifest_entry_count: 0,
+      manifest_encoded_bytes: 0,
+      content_bytes: 0,
+      expires_at: "2026-09-23T00:00:00.000Z",
+      created_at: "2026-09-22T00:00:00.000Z",
+      updated_at: "2026-09-22T00:00:00.000Z",
+    };
+  }
+
+  #envelope(data) {
+    return Object.freeze({
+      request_id: "44444444-4444-4444-8444-444444444444",
+      selected_protocol: 2,
+      capabilities: WIRE_CAPABILITIES,
+      data,
+    });
+  }
+}
+
+const WIRE_SYNC = "33333333-3333-4333-8333-333333333333";
+const WIRE_CAPABILITIES = Object.freeze([
+  "atomic_generation_commit",
+  "bounded_manifest_pages",
+  "content_digest_verification",
+  "explicit_reconciliation",
+  "ordered_generation_changes",
+  "policy_bound_admission",
+]);
+
+async function waitFor(predicate, message, timeout = 5_000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((settle) => setTimeout(settle, 10));
+  }
+  assert.fail(message);
+}
+
+/** The change page one remote generation would produce, from the manifest before it and the manifest after it. */
+function remoteGeneration(generation, before, after, policyDigest) {
+  const prior = new Map(before.entries.map((entry) => [entry.path, entry]));
+  const current = new Map(after.entries.map((entry) => [entry.path, entry]));
+  const shared = {
+    manifest_root: after.manifestRoot,
+    exclusion_policy_digest: policyDigest,
+    committed_at: "2026-09-22T12:05:00.000Z",
+    minimum_reader: 1,
+    minimum_writer: 1,
+  };
+  const items = [{ generation, operation: "revision", path: null, entry: null, ...shared }];
+  for (const path of [...new Set([...prior.keys(), ...current.keys()])].sort()) {
+    const left = prior.get(path);
+    const right = current.get(path);
+    if (JSON.stringify(left) === JSON.stringify(right)) continue;
+    items.push({
+      generation,
+      operation: right === undefined ? "delete" : "upsert",
+      path,
+      entry: right === undefined ? null : manifestEntryForPublicProtocol(right),
+      ...shared,
+    });
+  }
+  return Object.freeze({ selected_protocol: 2, items: Object.freeze(items), next_cursor: null });
+}
+
+// The required gate fix, stated as the journey it unblocks: a returning owner
+// runs the same command on an unchanged folder, so nothing is committed — and a
+// generation produced on the Machine must still land in the folder. Before the
+// fix this test times out waiting for the file, because the reuse path returned
+// without ever starting the supervisor that reads `GET /changes`
+// (PRD workspace remote-to-local sync 2026-09-22, §1 gate G1).
+test("a reconnect that commits nothing still delivers a remote generation into the folder", async (t) => {
+  const { project, state } = await roots(t);
+  const { mkdir: makeDirectory, readFile, writeFile } = await import("node:fs/promises");
+  const capabilities = conservativeFilesystemCapabilities("windows");
+  await writeFile(join(project, "main.js"), "console.log(1);\n");
+
+  const wire = new WireAuthority();
+  const inspected = await inspectWorkspaceSyncPolicy({ localRoot: project, filesystemCapabilities: capabilities });
+  const policy = compileExclusionPolicy(
+    [{ source: "gitignore", text: "" }, { source: "cunaignore", text: "" }],
+    capabilities,
+  );
+  assert.equal(policy.digest, inspected.exclusionPolicyDigest, "the test must compile the policy the journey compiles");
+  const localManifest = await createWorkspaceManifest({ root: project, policy, capabilities });
+
+  const binding = {
+    bindingId: "40000000-0000-4000-8000-000000000020",
+    projectId: "50000000-0000-4000-8000-000000000020",
+    localInstanceId: "60000000-0000-4000-8000-000000000020",
+    remoteRoot: "/workspace/projects/50000000-0000-4000-8000-000000000020",
+    exclusionPolicyDigest: undefined,
+    bindingEpoch: 1,
+    minimumReader: 1,
+    minimumWriter: 2,
+    createdAt: "2026-09-22T09:00:00.000Z",
+    updatedAt: "2026-09-22T09:00:00.000Z",
+  };
+  const published = () => Object.freeze({
+    ...binding,
+    workspaceId: WORKSPACE,
+    machineId: MACHINE,
+    activeGeneration: wire.committedGeneration,
+    activeManifestRoot: wire.committedRoot ?? "0".repeat(64),
+  });
+  const client = {
+    async createWorkspaceBinding(input) {
+      binding.exclusionPolicyDigest = input.exclusionPolicyDigest;
+      return published();
+    },
+    async getWorkspaceBinding() { return published(); },
+    async getMachine(id) { return { id, name: "qa3", state: "running" }; },
+  };
+
+  // The first run is the ordinary upload path: it commits generation 1 and
+  // leaves the durable session this installation will later read with.
+  const first = effects(client, state, { transport: wire });
+  const firstResult = await first.synchronizeWorkspace({
+    machineId: MACHINE, localPath: project, syncMode: "enabled", signal: new AbortController().signal,
+  });
+  assert.equal(firstResult.generation, 1);
+  await first.stopContinuousSync();
+  const commitsAfterFirstRun = wire.count("/commit");
+  assert.equal(commitsAfterFirstRun, 1);
+
+  // Somebody else advances the workspace: generation 2 adds a file this folder
+  // has never seen. It is armed only now, after the first run's poller has been
+  // stopped, so that poller cannot be what delivered it.
+  const desired = join(state, "desired");
+  await makeDirectory(desired);
+  await writeFile(join(desired, "main.js"), "console.log(1);\n");
+  await writeFile(join(desired, "from-agent.txt"), "written by the agent\n");
+  const desiredManifest = await createWorkspaceManifest({ root: desired, policy, capabilities });
+  for (const entry of desiredManifest.entries) {
+    if (entry.kind !== "file") continue;
+    const content = await readFile(join(desired, entry.path));
+    let offset = 0;
+    for (const chunk of entry.chunks) {
+      wire.chunks.set(chunk.digest, content.subarray(offset, offset + chunk.byteLength));
+      offset += chunk.byteLength;
+    }
+  }
+  wire.changePage = remoteGeneration(2, localManifest, desiredManifest, policy.digest);
+
+  // The reconnect. Content is byte-identical, so no generation is committed.
+  // The supervisor is stopped in `finally` rather than in an `after` hook:
+  // `t.after` runs in registration order and the temporary-directory hook was
+  // registered first, so a still-running poller would write its durable state
+  // into a directory already removed, and the test would fail on that instead
+  // of on what it measures.
+  const second = effects(client, state, { transport: wire });
+  try {
+    const secondResult = await second.synchronizeWorkspace({
+      machineId: MACHINE, localPath: project, syncMode: "enabled", signal: new AbortController().signal,
+    });
+    assert.equal(secondResult.generation, 1, "the reconnect must reuse the committed generation");
+
+    await waitFor(
+      async () => (await readFile(join(project, "from-agent.txt"), "utf8").catch(() => undefined)) !== undefined,
+      "the remote generation never reached the local folder",
+    );
+    assert.equal(await readFile(join(project, "from-agent.txt"), "utf8"), "written by the agent\n");
+    await waitFor(
+      () => second.continuousSyncSnapshot()?.generation === 2,
+      "the supervisor never adopted the remote generation",
+    );
+    assert.notEqual(second.continuousSyncSnapshot(), undefined, "the reconnect must run a supervisor");
+    assert.equal(
+      await readFile(join(project, "main.js"), "utf8"),
+      "console.log(1);\n",
+      "the file that did not change must not be rewritten",
+    );
+    assert.equal(wire.count("/commit"), commitsAfterFirstRun, "an unchanged reconnect must commit nothing");
+  } finally {
+    await second.stopContinuousSync();
+  }
 });
 
 // Negative control: the skip must be keyed on the manifest, not on nothing at
@@ -397,4 +689,189 @@ test("a changed workspace still synchronizes rather than reusing a stale generat
     }),
     "a differing manifest must reach the transport, not silently reuse generation 7",
   );
+});
+
+/**
+ * The qa6 witness, step 6, reduced to the wire: a first run commits generation
+ * 1 and, while attached, takes in generation 2 from the Machine. The owner
+ * detaches; the Machine then edits `from-agent.txt` and captures generation 3.
+ * The folder still holds generation 2's tree, and its durable sync state says
+ * so, while its binding record still says 1 (only the admission commit writes
+ * the record). The returned fixture is the moment just before re-attach.
+ */
+async function folderBehindTheMachine(t, { machineEdit }) {
+  const { project, state } = await roots(t);
+  const { mkdir: makeDirectory, readFile, writeFile } = await import("node:fs/promises");
+  const capabilities = conservativeFilesystemCapabilities("windows");
+  await writeFile(join(project, "main.js"), "console.log(1);\n");
+  const policy = compileExclusionPolicy(
+    [{ source: "gitignore", text: "" }, { source: "cunaignore", text: "" }],
+    capabilities,
+  );
+  const wire = new WireAuthority();
+  const binding = {
+    bindingId: "40000000-0000-4000-8000-000000000030",
+    projectId: "50000000-0000-4000-8000-000000000030",
+    localInstanceId: "60000000-0000-4000-8000-000000000030",
+    remoteRoot: "/workspace/projects/50000000-0000-4000-8000-000000000030",
+    exclusionPolicyDigest: undefined,
+    bindingEpoch: 1,
+    minimumReader: 1,
+    minimumWriter: 2,
+    createdAt: "2026-09-22T09:00:00.000Z",
+    updatedAt: "2026-09-22T09:00:00.000Z",
+  };
+  const published = () => Object.freeze({
+    ...binding,
+    workspaceId: WORKSPACE,
+    machineId: MACHINE,
+    activeGeneration: wire.committedGeneration,
+    activeManifestRoot: wire.committedRoot ?? "0".repeat(64),
+  });
+  const client = {
+    async createWorkspaceBinding(input) {
+      binding.exclusionPolicyDigest = input.exclusionPolicyDigest;
+      return published();
+    },
+    async getWorkspaceBinding() { return published(); },
+    async getMachine(id) { return { id, name: "qa6", state: "running" }; },
+  };
+  let trees = 0;
+  const machineTree = async (files) => {
+    trees += 1;
+    const directory = join(state, `machine-tree-${trees}`);
+    await makeDirectory(directory);
+    for (const [path, content] of Object.entries(files)) await writeFile(join(directory, path), content);
+    const manifest = await createWorkspaceManifest({ root: directory, policy, capabilities });
+    for (const entry of manifest.entries) {
+      if (entry.kind !== "file") continue;
+      const content = await readFile(join(directory, entry.path));
+      let offset = 0;
+      for (const chunk of entry.chunks) {
+        wire.chunks.set(chunk.digest, content.subarray(offset, offset + chunk.byteLength));
+        offset += chunk.byteLength;
+      }
+    }
+    return manifest;
+  };
+
+  const generation1 = await createWorkspaceManifest({ root: project, policy, capabilities });
+  const generation2 = await machineTree({ "main.js": "console.log(1);\n", "from-agent.txt": "written by the agent\n" });
+  const first = effects(client, state, { transport: wire });
+  try {
+    assert.equal((await first.synchronizeWorkspace({
+      machineId: MACHINE, localPath: project, syncMode: "enabled", signal: new AbortController().signal,
+    })).generation, 1);
+    wire.changePage = remoteGeneration(2, generation1, generation2, policy.digest);
+    wire.committedGeneration = 2;
+    wire.committedRoot = generation2.manifestRoot;
+    await waitFor(() => first.continuousSyncSnapshot()?.generation === 2, "the attached run never took in generation 2");
+  } finally {
+    await first.stopContinuousSync();
+  }
+
+  const generation3 = await machineTree({ "main.js": "console.log(1);\n", "from-agent.txt": machineEdit });
+  wire.changePage = Object.freeze({
+    selected_protocol: 2,
+    items: Object.freeze([
+      ...remoteGeneration(2, generation1, generation2, policy.digest).items,
+      ...remoteGeneration(3, generation2, generation3, policy.digest).items,
+    ]),
+    next_cursor: null,
+  });
+  wire.committedGeneration = 3;
+  wire.committedRoot = generation3.manifestRoot;
+  return { project, state, wire, client, policy, capabilities, binding, commitsBefore: wire.commits.length };
+}
+
+function reattach(fixture, notices) {
+  return effects(fixture.client, fixture.state, { transport: fixture.wire, onNotice: (line) => notices.push(line) });
+}
+
+const CATCH_UP_NOTICE = "The Machine changed this workspace while you were away · bringing generation 3 into this folder before sending local changes";
+
+// Defect A. Before the fix the re-attach committed generation 4 claiming base 3
+// with generation 2's tree, and live apply then put the old bytes back on the
+// Machine: the Machine's edit survived only in revision 3.
+test("a folder the Machine moved ahead of pulls the newer generation instead of committing its stale tree over it", async (t) => {
+  const { readFile } = await import("node:fs/promises");
+  const fixture = await folderBehindTheMachine(t, { machineEdit: "edited on the Machine while detached\n" });
+  const notices = [];
+  const second = reattach(fixture, notices);
+  try {
+    const result = await second.synchronizeWorkspace({
+      machineId: MACHINE, localPath: fixture.project, syncMode: "enabled", signal: new AbortController().signal,
+    });
+    assert.deepEqual(
+      fixture.wire.commits.slice(fixture.commitsBefore),
+      [],
+      "no commit may claim base 3 while the folder holds generation 2's tree",
+    );
+    assert.equal(result.generation, 3);
+    await waitFor(
+      async () => (await readFile(join(fixture.project, "from-agent.txt"), "utf8")) === "edited on the Machine while detached\n",
+      "the Machine's edit never reached the folder",
+    );
+    await waitFor(() => second.continuousSyncSnapshot()?.generation === 3, "the folder never adopted generation 3");
+    assert.deepEqual(fixture.wire.commits.slice(fixture.commitsBefore), [], "an unedited folder that caught up commits nothing");
+    assert.deepEqual(notices, [CATCH_UP_NOTICE]);
+  } finally {
+    await second.stopContinuousSync();
+  }
+});
+
+// Defect A with an edit on each side, on different files: the Machine's change
+// lands, the local change survives, and the commit that follows names the head
+// as its base and carries both.
+test("a folder behind the Machine with its own edit merges first and commits on top of the head", async (t) => {
+  const { readFile, writeFile } = await import("node:fs/promises");
+  const fixture = await folderBehindTheMachine(t, { machineEdit: "edited on the Machine while detached\n" });
+  await writeFile(join(fixture.project, "main.js"), "console.log(2);\n");
+  const second = reattach(fixture, []);
+  try {
+    await second.synchronizeWorkspace({
+      machineId: MACHINE, localPath: fixture.project, syncMode: "enabled", signal: new AbortController().signal,
+    });
+    await waitFor(() => fixture.wire.commits.length > fixture.commitsBefore, "the local edit was never sent");
+    const merged = await createWorkspaceManifest({ root: fixture.project, policy: fixture.policy, capabilities: fixture.capabilities });
+    assert.deepEqual(fixture.wire.commits.slice(fixture.commitsBefore), [
+      { expectedGeneration: 3, manifestRoot: merged.manifestRoot },
+    ]);
+    assert.equal(await readFile(join(fixture.project, "from-agent.txt"), "utf8"), "edited on the Machine while detached\n");
+    assert.equal(await readFile(join(fixture.project, "main.js"), "utf8"), "console.log(2);\n");
+  } finally {
+    await second.stopContinuousSync();
+  }
+});
+
+// Defects A and B together: both sides changed the same file while detached.
+// The local bytes stay, the Machine's go beside them, one typed line says so,
+// and the local version is then committed on top of the head.
+test("a path changed here and on the Machine while detached keeps both versions and says so", async (t) => {
+  const { createHash } = await import("node:crypto");
+  const { readFile, writeFile } = await import("node:fs/promises");
+  const fixture = await folderBehindTheMachine(t, { machineEdit: "edited on the Machine while detached\n" });
+  await writeFile(join(fixture.project, "from-agent.txt"), "edited here while detached\n");
+  const suffix = createHash("sha256").update(`${fixture.binding.bindingId}\u00003\u0000from-agent.txt`).digest("hex").slice(0, 12);
+  const sibling = `from-agent.txt.cuna-conflict-3-${suffix}`;
+  const notices = [];
+  const second = reattach(fixture, notices);
+  try {
+    await second.synchronizeWorkspace({
+      machineId: MACHINE, localPath: fixture.project, syncMode: "enabled", signal: new AbortController().signal,
+    });
+    await waitFor(() => fixture.wire.commits.length > fixture.commitsBefore, "the local version was never sent");
+    assert.equal(await readFile(join(fixture.project, "from-agent.txt"), "utf8"), "edited here while detached\n");
+    assert.equal(await readFile(join(fixture.project, sibling), "utf8"), "edited on the Machine while detached\n");
+    assert.deepEqual(notices, [
+      CATCH_UP_NOTICE,
+      `Workspace conflict on from-agent.txt · changed here and on the Machine · your version stays in place; the Machine's version is in ${sibling} (cuna.workspace_sync.conflict_retained)`,
+    ]);
+    const merged = await createWorkspaceManifest({ root: fixture.project, policy: fixture.policy, capabilities: fixture.capabilities });
+    assert.deepEqual(fixture.wire.commits.slice(fixture.commitsBefore), [
+      { expectedGeneration: 3, manifestRoot: merged.manifestRoot },
+    ]);
+  } finally {
+    await second.stopContinuousSync();
+  }
 });

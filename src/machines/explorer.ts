@@ -16,7 +16,7 @@ import {
 } from "./opencode-supervisor.js";
 import { machineProviderAvailability, providerDisplayName, providerVerdict, type ActionableProvider } from "./provider-availability.js";
 import { classifySessionActionability, displaySessionActionability } from "./session-actionability.js";
-import { isAgentSessionIntendedActive } from "./session-visibility.js";
+import { isAgentSessionVisibleInPicker } from "./session-visibility.js";
 import {
   INITIAL_MACHINE_FIRST_STATE,
   reduceMachineFirstNavigation,
@@ -614,7 +614,7 @@ export async function runNodeMachinesExplorer(
             if (stopped || closingNotice !== undefined) return;
             const previous = rows.find((row) => row.machine.id === machine.id)?.sessions ?? Object.freeze([]);
             const sessions = mergeAgentSessionObservations(previous, observedSessions)
-              .filter(isAgentSessionIntendedActive)
+              .filter(isAgentSessionVisibleInPicker)
               .sort((left, right) => left.agent.localeCompare(right.agent) || left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
             updateMachineRow(machine.id, {
               sessions: Object.freeze(sessions),

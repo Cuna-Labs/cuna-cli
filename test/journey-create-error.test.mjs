@@ -26,3 +26,14 @@ test('actual HTTP 409 memory refusal survives the create wrapper without raw ser
 });
 
 test('memory-like reason without exact conflict status remains uncertain',()=>{for(const status of [404,502,503]){const result=wrap(new CunaError({code:'cuna.remote.conflict',message:'SECRET',exitCode:7,details:{http_status:status,reason:'agent_session_memory_capacity'}}));assert.equal(result.code,'cuna.journey.agent_session_create_outcome_unreconcilable');}});
+
+// The recorded-launch mismatch is refused before anything is sent and carries
+// its own way forward; the journey must surface it as is, not as an
+// unprovable create whose advice is never to request a new session.
+test('a recorded-launch mismatch is a proven rejection, not an unreconcilable create',()=>{
+ const from=source.indexOf('function isProvenAgentSessionCreateRejection('),to=source.indexOf('\nfunction ',from+10);
+ const scope={CunaError};vm.runInNewContext(ts.transpileModule(source.slice(from,to),{compilerOptions:{target:ts.ScriptTarget.ES2023}}).outputText,scope);
+ const proven=scope.isProvenAgentSessionCreateRejection;
+ assert.equal(proven(new CunaError({code:'cuna.provider.pending_intent_conflict',message:'m',exitCode:6,details:{reason:'recorded_launch_mismatch'}})),true);
+ assert.equal(proven(new CunaError({code:'cuna.provider.pending_intent_conflict',message:'m',exitCode:6})),false,'an unresolved earlier launch stays unreconcilable');
+});

@@ -1,6 +1,7 @@
 import type { AgentSession, Machine } from "../api/contracts.js";
 import { machineProviderAvailability, type ActionableProvider } from "./provider-availability.js";
 import { classifySessionActionability } from "./session-actionability.js";
+import { isAgentSessionVisibleInPicker } from "./session-visibility.js";
 
 export type MachineFirstScreen =
   | Readonly<{ readonly kind: "machines" }>
@@ -165,6 +166,7 @@ export function resolveProviderContextActions(input: Readonly<{
   const availability = machineProviderAvailability(input.machine);
   if (input.machine.state !== "running" || !availability.actionable || availability.agent !== input.provider) return Object.freeze([]);
   const sessions = input.sessions
+    .filter(isAgentSessionVisibleInPicker)
     .filter((session) => session.agent === input.provider)
     .filter((session) => classifySessionActionability({ session, machine: input.machine, now: input.now }).recoveryAction !== "none")
     .map((session) => Object.freeze({ kind: "session" as const, label: session.name, session }));

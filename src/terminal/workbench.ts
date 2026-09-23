@@ -27,6 +27,11 @@ export interface WorkbenchFrameInput {
 }
 
 export interface WorkbenchFrame {
+  readonly columns: number;
+  readonly rows: number;
+  readonly activeTabId: string;
+  readonly rowCommands: readonly string[];
+  readonly cursorCommand: string;
   readonly bytes: Uint8Array;
   readonly text: string;
   readonly appbarRows: number;
@@ -101,11 +106,13 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
         : truncate(` CUNA  ${safeText(input.notice)}`, input.columns)];
   const color = input.color !== false;
   let text = `${ESC}?25l${ESC}H`;
+  const rowCommands: string[] = [];
   for (let index = 0; index < lines.length; index += 1) {
     const background = index === 0 ? CUNA_ORANGE : CUNA_ORANGE_DARK;
-    text += `${ESC}${index + 1};1H${ESC}0m${ESC}2K${color ? `${ESC}${background}m${ESC}${index === 0 ? WHITE : MUTED}m` : ""}`;
-    text += padLine(lines[index] ?? "", input.columns);
-    if (color) text += `${ESC}0m`;
+    let command = `${ESC}${index + 1};1H${ESC}0m${ESC}2K${color ? `${ESC}${background}m${ESC}${index === 0 ? WHITE : MUTED}m` : ""}`;
+    command += padLine(lines[index] ?? "", input.columns);
+    if (color) command += `${ESC}0m`;
+    rowCommands.push(command);
   }
 
   const cells = active.viewport.cells.slice(0, viewportRows);
@@ -116,18 +123,33 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
     const renderRuns = active.viewport.renderRows?.[row];
     if (renderRuns !== undefined) assertViewportRenderRuns(renderRuns, cell, displayWidth, input.columns);
     const rendered = renderRuns === undefined || !color ? cell : renderStyledRuns(renderRuns);
-    text += `${ESC}${appbarRows + row + 1};1H${ESC}0m${ESC}2K${rendered}`;
+    rowCommands.push(`${ESC}${appbarRows + row + 1};1H${ESC}0m${ESC}2K${rendered}`);
   }
   const cursorRow = Math.min(viewportRows - 1, Math.max(0, active.viewport.cursorY));
   const cursorColumn = Math.min(input.columns - 1, Math.max(0, active.viewport.cursorX));
-  text += `${ESC}0m${ESC}${appbarRows + cursorRow + 1};${cursorColumn + 1}H`;
-  text += active.viewport.modes.cursorVisible ? `${ESC}?25h` : `${ESC}?25l`;
+  const cursorCommand = `${ESC}0m${ESC}${appbarRows + cursorRow + 1};${cursorColumn + 1}H` +
+    (active.viewport.modes.cursorVisible ? `${ESC}?25h` : `${ESC}?25l`);
+  text += rowCommands.join("") + cursorCommand;
   return Object.freeze({
+    columns: input.columns,
+    rows: input.rows,
+    activeTabId: input.activeTabId,
+    rowCommands: Object.freeze(rowCommands),
+    cursorCommand,
     bytes: new TextEncoder().encode(text),
     text,
     appbarRows,
     viewportRows,
   });
+}
+
+/** Only use a baseline whose host write completed and no other writer invalidated. */
+export function workbenchUpdate(previous: WorkbenchFrame | undefined, next: WorkbenchFrame): Uint8Array {
+  if (previous === undefined || previous.columns !== next.columns || previous.rows !== next.rows ||
+      previous.activeTabId !== next.activeTabId) return next.bytes;
+  const changed = next.rowCommands.filter((row, index) => row !== previous.rowCommands[index]);
+  if (changed.length === 0 && previous.cursorCommand === next.cursorCommand) return new Uint8Array();
+  return new TextEncoder().encode(`${ESC}?25l${changed.join("")}${next.cursorCommand}`);
 }
 
 function renderTabs(tabs: readonly WorkbenchTab[], activeTabId: string, columns: number): string {

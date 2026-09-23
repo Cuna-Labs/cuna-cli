@@ -466,8 +466,15 @@ test("both interactive menus create in the selected remote Workspace without loc
       const text = interactive.stderr();
       await new Promise((resolve) => physical.write(text.slice(consumed), resolve));
       consumed = text.length;
-      observedRows.push({ columns: physical.cols, row: physical.buffer.active.cursorY,
-        extraRows: Array.from({ length: 29 }, (_, index) => physical.buffer.active.getLine(index + 1)?.translateToString(true) ?? "").filter(Boolean).length });
+      // The progress row is the LAST row, not absolutely the first. A durable
+      // note legitimately sits above it — on this path, the one line naming the
+      // AgentSession this launch settled on. Counting those keeps both defects
+      // this was written to catch: a row that wraps leaves the cursor below its
+      // own line, and a stale row after a resize survives underneath it.
+      const durableRows = stripAnsi(text).split("\n").length - 1;
+      const row = physical.buffer.active.cursorY;
+      observedRows.push({ columns: physical.cols, row, durableRows,
+        extraRows: Array.from({ length: 29 - row }, (_, index) => physical.buffer.active.getLine(row + index + 1)?.translateToString(true) ?? "").filter(Boolean).length });
     };
     const attached = [], created = [];
     const root = `/workspace/workspaces/${FOREGROUND_SESSION_D}`;
@@ -487,6 +494,8 @@ test("both interactive menus create in the selected remote Workspace without loc
       },
       async createProviderSessionV2(id, input) {
         created.push({ id, input });
+        assert.match(stripAnsi(interactive.stderr()), /Creating Codex session/u,
+          "progress must resume after the provider picker before remote creation waits");
         await new Promise((resolve) => setTimeout(resolve, 100));
         await checkRow();
         return { agentSession: session };
@@ -518,7 +527,16 @@ test("both interactive menus create in the selected remote Workspace without loc
     assert.equal(created[0].input.agent,"codex");assert.equal(created[0].input.execution_workspace_id,FOREGROUND_SESSION_D);
     assert.deepEqual(attached.map(a => a.agentSessionIds), [[FOREGROUND_SESSION_A]]);
     for (const observation of observedRows) {
-      assert.equal(observation.row, 0, `progress wrapped at ${observation.columns} columns`);
+      // `<=`, not `===`, and the difference is a real property of the repaint
+      // loop rather than slack. `startInlineProgress` compensates for a
+      // narrowing resize by walking up the rows its line would occupy once the
+      // terminal reflows it; @xterm/headless truncates such a line instead of
+      // reflowing it, so on this model the walk reclaims a row ABOVE the
+      // progress line. What must never happen is the opposite — a progress row
+      // sitting BELOW the durable output it follows, which is what a line that
+      // wrapped looks like.
+      assert.ok(observation.row <= observation.durableRows,
+        `progress wrapped at ${observation.columns} columns: row ${observation.row} below ${observation.durableRows} durable rows`);
       assert.equal(observation.extraRows, 0, `progress left old rows at ${observation.columns} columns`);
     }
     physical.dispose();
@@ -934,7 +952,7 @@ test("non-TTY help and version are versioned JSON records", async () => {
   assert.match(allRecord.data.help, /Use --agent-session SESSION_ID to bypass reconciliation/u);
   const version = memoryStreams();
   assert.equal(await runCli(["--version"], { streams: version.streams }), EXIT_CODES.success);
-  assert.equal(JSON.parse(version.stdout()).data.version, "0.1.0");
+  assert.equal(JSON.parse(version.stdout()).data.version, "0.1.1");
 });
 
 test("missing automation auth fails before a remote call and emits no prompt", async () => {
@@ -2057,6 +2075,30 @@ test("terminal supervisor update never stops a running Machine or terminates ses
   const error = JSON.parse(streams.stderr()).error;
   assert.equal(error.code, "cuna.machine.supervisor_update_requires_stopped");
   assert.match(error.hint, /will not stop protected-open-dev or terminate any AgentSessions/u);
+});
+
+test("terminal supervisor update recovers stopped Claude without an OpenCode prerequisite", async () => {
+  const streams = memoryStreams();
+  let replacements = 0;
+  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams, platform, env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot(["agent_sessions.create", "machines.lifecycle"].map(id => ({
+          id, availability: "supported", interaction: "native", mutationClass: "reversible",
+          surfaces: ["cli"], requiredPermissions: ["machines:update"],
+        })), scope, resourceId);
+      },
+      async getMachine(id) { return { id, name: "example", state: "stopped", agent: "claude-code" }; },
+      async replaceMachineSupervisor(id) {
+        replacements += 1;
+        return { id, name: "example", state: "running", agent: "claude-code" };
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  assert.equal(replacements, 1);
 });
 
 test("terminal supervisor update remains hidden unless the exact OpenCode prerequisite is advertised", async () => {
@@ -3653,11 +3695,11 @@ test("api-keys list derives its status word from expiry as well as revocation", 
   assert.equal(lines[3], `${keys[3].id}\trevoked-key\tcuna_sk_mnop…9012\trevoked 2026-08-02T00:00:00.000Z`);
 });
 
-test("cuna version prints the build digest that separates two installations reporting 0.1.0", async () => {
+test("cuna version prints the build digest that separates two installations reporting the same version", async () => {
   const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
   assert.equal(await runCli(["version"], { streams: human.streams, platform, env: {} }), EXIT_CODES.success);
   const printed = human.stdout().trim();
-  assert.match(printed, /^0\.1\.0\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
+  assert.match(printed, /^0\.1\.1\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
 
   // The digest printed is the exact 12-hex prefix of the one the JSON record
   // carries, so the two surfaces can never name different builds.

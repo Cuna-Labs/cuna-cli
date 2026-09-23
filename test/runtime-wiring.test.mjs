@@ -2781,3 +2781,110 @@ test("expired view retires input and permits fresh admission to the same session
     assert.equal(system.createCalls.length, 2);
   } finally { await runtime.shutdown(); }
 });
+
+/*
+ * R12, measured 2026-09-22 17:44Z on qa5: keys i7-i9 were sent and never
+ * acknowledged, and the screen said nothing for 19.2 s, until Windows aborted
+ * the socket. The heartbeat (45 s) was the only Cuna bound on that path. The
+ * tests below mock setTimeout, setInterval and Date, so every deadline is
+ * reached by ticking the clock, never by waiting for it.
+ */
+async function settle() {
+  for (let turn = 0; turn < 20; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function writerOnMockedClock(t, extra = {}) {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  const system = new FakeTerminalSystem();
+  const { runtime, states } = createRuntime(system, { clock: () => Date.now(), ...extra });
+  await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  return { system, runtime, states };
+}
+
+function acknowledge(connection, clientSequence, sequence) {
+  connection.incoming.push(encodeTerminalControl("acknowledgement", sequence, {
+    clientSequence: String(clientSequence),
+    meaning: "durably_accepted_not_executed",
+  }));
+}
+
+test("R12: a key left unacknowledged for 5 s interrupts the attachment at once and is never resent", async (t) => {
+  const { system, runtime, states } = await writerOnMockedClock(t);
+  const stalled = system.connections[0];
+  await runtime.sendInput(new TextEncoder().encode("i7"), "tab-a");
+  t.mock.timers.tick(4_999);
+  await settle();
+  assert.equal(runtime.listTerminals()[0].state, "active", "a slow acknowledgement inside the deadline is not a stall");
+
+  t.mock.timers.tick(1);
+  await settle();
+  const [interrupted] = runtime.listTerminals();
+  assert.equal(interrupted.state, "interrupted");
+  assert.equal(interrupted.reason, "input_ack_timeout");
+  assert.equal(interrupted.historicalInputUncertainty, true, "the unacknowledged key becomes uncertain history");
+  assert.ok(states.some((state) => state.state === "interrupted" && state.reason === "input_ack_timeout"));
+  assert.equal(stalled.closeCalls.at(-1).reason, "cuna_input_ack_timeout");
+
+  const reconnected = await runtime.reconnect({ tabId: "tab-a" });
+  assert.equal(reconnected.state, "active");
+  assert.equal(inputFrames(system.connections[1]).length, 0, "the stalled key is not resent on the new connection");
+  assert.equal(inputFrames(stalled).length, 1, "and was sent exactly once on the old one");
+  await runtime.shutdown();
+});
+
+test("NEGATIVE CONTROL R12: without the input deadline the same stall holds the terminal for the full 45 s", async (t) => {
+  // The only variable changed is the input deadline, moved past the heartbeat.
+  const { system, runtime } = await writerOnMockedClock(t, { inputAcknowledgementTimeoutMs: 120_000 });
+  await runtime.sendInput(new TextEncoder().encode("i7"), "tab-a");
+  t.mock.timers.tick(5_000);
+  await settle();
+  assert.equal(runtime.listTerminals()[0].state, "active", "nothing notices the stall at 5 s");
+  t.mock.timers.tick(39_999);
+  await settle();
+  assert.equal(runtime.listTerminals()[0].state, "active", "nor at 44.999 s");
+  t.mock.timers.tick(10_001);
+  await settle();
+  assert.equal(runtime.listTerminals()[0].reason, "heartbeat_expired", "the first bound to act is the 45 s heartbeat");
+  assert.equal(system.connections[0].closeCalls.at(-1).reason, "cuna_heartbeat_expired");
+  await runtime.shutdown();
+});
+
+test("R12: the deadline follows the oldest unacknowledged key, not the first key ever sent", async (t) => {
+  const { system, runtime } = await writerOnMockedClock(t);
+  const connection = system.connections[0];
+  await runtime.sendInput(new TextEncoder().encode("a"), "tab-a");
+  const first = runtime.listTerminals()[0].inputSequence;
+  t.mock.timers.tick(3_000);
+  await runtime.sendInput(new TextEncoder().encode("b"), "tab-a");
+  t.mock.timers.tick(1_000);
+  acknowledge(connection, first, 50n);
+  await settle();
+  assert.equal(runtime.listTerminals()[0].acknowledgedInputSequence, first);
+
+  t.mock.timers.tick(1_000);
+  await settle();
+  assert.equal(runtime.listTerminals()[0].state, "active", "5 s after the first key, the pending one is only 2 s old");
+  t.mock.timers.tick(2_999);
+  await settle();
+  assert.equal(runtime.listTerminals()[0].state, "active");
+  t.mock.timers.tick(1);
+  await settle();
+  assert.equal(runtime.listTerminals()[0].reason, "input_ack_timeout", "5 s after the second key");
+  await runtime.shutdown();
+});
+
+test("R12: acknowledged input never trips the deadline", async (t) => {
+  const { system, runtime } = await writerOnMockedClock(t);
+  const connection = system.connections[0];
+  for (let key = 0; key < 4; key += 1) {
+    await runtime.sendInput(new TextEncoder().encode(String(key)), "tab-a");
+    t.mock.timers.tick(2_847);
+    acknowledge(connection, runtime.listTerminals()[0].inputSequence, BigInt(100 + key));
+    await settle();
+  }
+  t.mock.timers.tick(10_000);
+  await settle();
+  assert.equal(runtime.listTerminals()[0].state, "active");
+  assert.equal(runtime.listTerminals()[0].inputContinuity, "complete");
+  await runtime.shutdown();
+});

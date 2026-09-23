@@ -163,3 +163,18 @@ test("the displayed line separates the refresh overlay from the process provenan
   assert.equal(merged.processObservation, "unproven");
   assert.equal(Object.values(merged).includes("checking"), false, "checking must not be stored as a base state");
 });
+
+ test("an expired launched session cannot remain starting when observations are unknown", () => {
+  for (const processState of ["unknown", "starting"]) {
+    const expired = classifySessionActionability({
+      session: session({ processState, runtimeExpiresAt: new Date(NOW - 1).toISOString() }),
+      machine: machine(), now: NOW,
+    });
+    assert.equal(expired.baseState, "stale");
+    assert.equal(expired.recoveryAction, "refresh");
+    assert.equal(expired.canAttach, false);
+    const current = classifySessionActionability({ session: session({ processState }), machine: machine(), now: NOW });
+    assert.equal(current.baseState, "starting");
+    assert.equal(current.canAttach, false);
+  }
+});

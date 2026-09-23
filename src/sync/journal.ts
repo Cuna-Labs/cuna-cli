@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fileConstants } from "node:fs";
 import { chmod, lstat, mkdir, open, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { connect, createServer, type Server } from "node:net";
+import { createServer, type Server } from "node:net";
 import { isAbsolute, join, parse, resolve } from "node:path";
 
 import { assertReadableSchema, assertWritableSchema, type DurableSchemaEnvelope } from "../workspace/schema.js";
@@ -572,15 +572,13 @@ async function acquireWriterAuthority(directory: string): Promise<WriterAuthorit
   // and released automatically when the process exits.
   const endpoints = process.platform === "win32"
     ? [`\\\\.\\pipe\\cuna-workspace-journal-${digest}`]
-    : Array.from({ length: 4 }, (_, attempt) => Object.freeze({
+    : [Object.freeze({
       host: "127.0.0.1" as const,
-      // A single deterministic TCP port can collide with an unrelated
-      // workspace test.  The ordered candidate set remains identical for one
-      // journal across processes, while making that unrelated collision a
-      // recoverable selection event instead of a false busy result.
-      port: 20_000 + Number.parseInt(digest.slice(attempt * 4, attempt * 4 + 4), 16) % 40_000,
+      // Every writer must contend on the same endpoint. A fallback port would
+      // admit another writer when the original colliding listener disappears.
+      port: 20_000 + Number.parseInt(digest.slice(0, 4), 16) % 40_000,
       exclusive: true,
-    }));
+    })];
   let server: ReturnType<typeof createServer> | undefined;
   for (const endpoint of endpoints) {
     const candidate = createServer((socket) => socket.end(digest));
@@ -602,31 +600,7 @@ async function acquireWriterAuthority(directory: string): Promise<WriterAuthorit
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-      // Falling back is safe only when a peer positively identifies itself as
-      // a different journal.  A legacy listener or arbitrary process that
-      // owns the port remains a fail-closed busy result; otherwise a new
-      // writer could bypass a live older writer for the same directory.
-      if (process.platform === "win32" || typeof endpoint === "string") break;
-      const owner = await new Promise<"same" | "other" | "unknown">((resolveOwner) => {
-        const peer = connect(endpoint);
-        let response = "";
-        let settled = false;
-        const finish = (result: "same" | "other" | "unknown"): void => {
-          if (settled) return;
-          settled = true;
-          peer.destroy();
-          resolveOwner(result);
-        };
-        peer.setEncoding("utf8");
-        peer.setTimeout(250, () => finish("unknown"));
-        peer.on("data", (chunk: string) => {
-          response += chunk;
-          if (response.length > digest.length) finish("unknown");
-        });
-        peer.once("end", () => finish(response === digest ? "same" : /^[a-f0-9]{64}$/u.test(response) ? "other" : "unknown"));
-        peer.once("error", () => finish("unknown"));
-      });
-      if (owner !== "other") break;
+      break;
     }
   }
   if (server === undefined) {

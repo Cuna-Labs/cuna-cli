@@ -52,6 +52,12 @@ export function isAgentSessionIntendedActive(session: AgentSession): boolean {
   return session.desiredState === "running" && session.requestState !== "termination_pending";
 }
 
+/** The picker excludes ended sessions even when their requested state stayed running. */
+export function isAgentSessionVisibleInPicker(session: AgentSession): boolean {
+  return isAgentSessionIntendedActive(session) && session.requestState !== "terminal" &&
+    !["exited", "failed", "terminating", "terminated"].includes(session.processState);
+}
+
 /**
  * What an AgentSession row supports about its runtime, as two separate facts.
  *

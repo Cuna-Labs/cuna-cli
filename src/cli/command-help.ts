@@ -142,8 +142,8 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
   "machines update-supervisor": topic(
     "Usage:\n  cuna machines update-supervisor MACHINE_ID --yes",
     [
-      "Update the terminal supervisor on one stopped OpenCode machine when Cuna",
-      "reports that exact prerequisite.",
+      "Recover the terminal supervisor on one stopped machine.",
+      "Cuna verifies eligibility and active-session blockers before updating.",
       "",
       "Cuna never stops the machine or terminates AgentSessions for this action.",
       "End only the sessions you intend to end, stop the Machine yourself, then run it.",

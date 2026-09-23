@@ -52,6 +52,15 @@ export interface AgentSessionSelectionObservation {
   readonly name: string;
   readonly agent: AgentKind;
   readonly workspaceIdentity: string;
+  /**
+   * Which Workspace object `workspaceIdentity` names. A `binding` session was
+   * created against a workspace binding and a generation, both published on
+   * the wire. An `execution` session was created against an execution
+   * Workspace (v2) and is published without a generation, so a generation
+   * comparison against it has no operand. `unknown` is a session the wire
+   * names no Workspace for; it can never equal the journey's Workspace.
+   */
+  readonly workspaceKind: "binding" | "execution" | "unknown";
   readonly workspaceGeneration: number;
   readonly cwd: string;
   readonly authMode: AgentAuthMode;
@@ -629,6 +638,7 @@ function validAgentSession(session: AgentSessionSelectionObservation): boolean {
     isSafeDisplay(session.name) &&
     AGENTS.has(session.agent) &&
     isSafePublicId(session.workspaceIdentity) &&
+    (session.workspaceKind === "binding" || session.workspaceKind === "execution" || session.workspaceKind === "unknown") &&
     Number.isSafeInteger(session.workspaceGeneration) &&
     session.workspaceGeneration >= 0 &&
     isSafeRelativeCwd(session.cwd) &&
@@ -655,10 +665,25 @@ function isExactSessionKey(
     session.machineId === input.machineId &&
     session.agent === input.requestedAgent &&
     session.workspaceIdentity === input.workspaceIdentity &&
-    session.workspaceGeneration === input.workspaceGeneration &&
+    generationMatches(session, input) &&
     session.cwd === input.cwd &&
     session.authMode === input.authMode
   );
+}
+
+/**
+ * Only a binding session has a generation to compare. An execution-Workspace
+ * session is published without one, and its Workspace has exactly one
+ * authority generation (the one the journey just synchronized), so the
+ * identity match above is the whole comparison. Requiring `0 === generation`
+ * here is what refused every running v2 session until 2026-09-21 and sent
+ * `cuna claude <path>` to create a second session in the same Workspace.
+ */
+function generationMatches(
+  session: AgentSessionSelectionObservation,
+  input: AgentSessionSelectionInput,
+): boolean {
+  return session.workspaceKind === "execution" || session.workspaceGeneration === input.workspaceGeneration;
 }
 
 function safeAgentSession(session: AgentSessionSelectionObservation): SafeAgentSessionCandidate {
@@ -707,7 +732,7 @@ function incompatibleSession(
   if (session.machineId !== input.machineId) reason = "machine-mismatch";
   else if (session.agent !== input.requestedAgent) reason = "agent-mismatch";
   else if (session.workspaceIdentity !== input.workspaceIdentity) reason = "workspace-identity-mismatch";
-  else if (session.workspaceGeneration !== input.workspaceGeneration) reason = "workspace-generation-mismatch";
+  else if (!generationMatches(session, input)) reason = "workspace-generation-mismatch";
   else if (session.cwd !== input.cwd) reason = "cwd-mismatch";
   else if (session.authMode !== input.authMode) reason = "auth-mode-mismatch";
   if (reason === undefined) return undefined;

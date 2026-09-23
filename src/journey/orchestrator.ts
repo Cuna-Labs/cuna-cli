@@ -44,6 +44,25 @@ export interface JourneyAgentSession {
 }
 
 /**
+ * Which AgentSession this journey settled on, and whether it is new.
+ *
+ * WHY IT EXISTS. Measured 2026-09-22
+ * (`prds/cuna-cli-latency-before-20260922.md` § 2, finding (ii)): the CLI
+ * printed the INTENT — `Creating Claude Code session` — and never printed a
+ * completion. The row `00b6d65a` existed at t+11 446 ms while the screen still
+ * read `Starting Claude Code`, and the nearest thing to a reuse statement was a
+ * QUESTION (`A previous launch is recorded. Create another session?`), not an
+ * acknowledgement. The orchestrator is the only place that knows which of the
+ * two branches ran, so it is the only place that can say so without guessing.
+ */
+export interface JourneyAgentSessionDisposition {
+  readonly agentSessionId: string;
+  readonly machineId: string;
+  /** `created` only when THIS journey dispatched the create that produced it. */
+  readonly disposition: "created" | "reused";
+}
+
+/**
  * The account authority one journey runs under.
  *
  * It is required rather than optional because it enters the machine-create
@@ -147,6 +166,12 @@ export interface AgentJourneyEffects {
     readonly signal: AbortSignal;
   }): Promise<void>;
   onPhase?(phase: AgentJourneyPhase): void;
+  /**
+   * Called exactly once per successful selection or create, before readiness
+   * is waited on — which is the moment the row exists and the 2026-09-22
+   * measurement found nothing on screen for the next 11 seconds.
+   */
+  onAgentSession?(disposition: JourneyAgentSessionDisposition): void;
 }
 
 export interface AgentJourneyResult {
@@ -326,8 +351,14 @@ function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
  * through here. An HTTP status alone does not establish non-commit.
  */
 function isProvenAgentSessionCreateRejection(cause: unknown): cause is CunaError {
-  return cause instanceof CunaError &&
-    cause.code === "cuna.agent.opencode_supervisor_upgrade_required";
+  return cause instanceof CunaError && (
+    cause.code === "cuna.agent.opencode_supervisor_upgrade_required" ||
+    // A No to the recorded-launch question for a launch recorded under
+    // another Workspace version or preset: refused locally, nothing sent, and
+    // its own hint (answer y / --new-session) is the way forward. Wrapped as
+    // an unprovable create it told the person not to request a new session.
+    (cause.code === "cuna.provider.pending_intent_conflict" && cause.details?.reason === "recorded_launch_mismatch")
+  );
 }
 
 function defaultAuthMode(intent: ReconciledAgentJourneyIntent): AgentAuthMode {
@@ -503,7 +534,10 @@ export async function orchestrateAgentJourney(input: {
     const sessionPlan = planAgentSessionSelection({
       machineId: machine.id,
       requestedAgent: input.intent.agent,
-      workspaceIdentity: workspace.workspaceIdentity,
+      // An execution Workspace is the identity a v2 session is published
+      // under (through its cwd); the binding id is what a legacy binding
+      // session carries. Look for the one this Workspace will produce.
+      workspaceIdentity: workspace.executionWorkspaceId ?? workspace.workspaceIdentity,
       workspaceGeneration: workspace.generation,
       cwd: workspace.remoteCwd.replace(/^\/workspace\/?/u, "") || ".",
       authMode,
@@ -513,8 +547,13 @@ export async function orchestrateAgentJourney(input: {
     });
 
     let agentSession: JourneyAgentSession;
+    // Read from the branch that ran, never inferred afterwards from the ledger:
+    // `createdAgentSessionId` is also set by recovery paths, and a reused row
+    // announced as created would be a false claim about what this journey did.
+    let disposition: JourneyAgentSessionDisposition["disposition"];
     if (sessionPlan.kind === "select" && sessionPlan.target === "agent-session") {
       agentSession = { id: sessionPlan.agentSessionId, machineId: sessionPlan.machineId };
+      disposition = "reused";
     } else if (sessionPlan.kind === "create-required" && sessionPlan.target === "agent-session") {
       try {
         agentSession = await boundary({
@@ -538,9 +577,15 @@ export async function orchestrateAgentJourney(input: {
         throw unreconcilableAgentSessionCreate(createError);
       }
       ledger.createdAgentSessionId = agentSession.id;
+      disposition = "created";
     } else {
       throw selectionFailure("AgentSession", sessionPlan);
     }
+    input.effects.onAgentSession?.(Object.freeze({
+      agentSessionId: agentSession.id,
+      machineId: agentSession.machineId,
+      disposition,
+    }));
 
     agentSession = await boundary({
       phase: "ready-agent-session", signal, effects: input.effects, ledger,

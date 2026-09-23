@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import test from "node:test";
 
-import { startContinuousWorkspaceSync, synchronizeLocalWorkspace } from "../dist/sync/index.js";
+import {
+  resumeContinuousWorkspaceSync,
+  startContinuousWorkspaceSync,
+  synchronizeLocalWorkspace,
+} from "../dist/sync/index.js";
 
 const workspaceId = "11111111-1111-4111-8111-111111111111";
 const workspaceBindingId = "55555555-5555-4555-8555-555555555555";
@@ -126,6 +130,12 @@ function session(request) {
     created_at: "2026-08-09T00:00:00.000Z",
     updated_at: "2026-08-09T00:00:00.000Z",
   };
+}
+
+/** The resume admission names the published generation, so it carries no base generation at all. */
+function resumeInput(input) {
+  const { baseGeneration: _unusedBaseGeneration, ...rest } = input;
+  return rest;
 }
 
 function productInput(root, checkpointRoot, transport, overrides = {}) {
@@ -250,6 +260,100 @@ test("continuous product lifecycle starts only from the durable initial commit a
   assert.equal(restarted.snapshot.generation, 10);
   await restarted.stop();
   assert.ok(authority.requests.filter((request) => request.path.endsWith("/commit")).length >= 3);
+});
+
+// A reconnect on byte-identical content commits nothing, so there is no
+// receipt to start the live writer from — and without a live writer nothing
+// ever reads `GET /changes`, which is the only way a generation produced on
+// the Machine reaches the folder. The resume path proves its start state from
+// the published generation instead and borrows only the read handle from the
+// durable commit this installation already made.
+test("a reconnect that commits nothing resumes the poller from the durable committed session", async (t) => {
+  const root = await temporaryDirectory(t, "cuna-resume-root-");
+  const checkpointRoot = await temporaryDirectory(t, "cuna-resume-state-");
+  await writeFile(join(root, "first.txt"), "one\n");
+  const authority = new RecordingAuthority();
+  const input = productInput(root, checkpointRoot, authority);
+  const receipt = await synchronizeLocalWorkspace(input);
+  const commitsAfterInitialUpload = authority.requests.filter((request) => request.path.endsWith("/commit")).length;
+
+  const supervisor = await resumeContinuousWorkspaceSync({
+    ...resumeInput(input),
+    activeGeneration: receipt.generation,
+    activeManifestRoot: receipt.manifest_root,
+  });
+  // Stopped inside the test body, not in an `after` hook: `t.after` runs in
+  // registration order and the temporary-directory hooks were registered first,
+  // so a live supervisor would still be writing its durable state into a
+  // directory already removed.
+  try {
+    assert.equal(supervisor.snapshot.generation, receipt.generation);
+    assert.equal(supervisor.snapshot.manifestRoot, receipt.manifest_root);
+    const deadline = Date.now() + 5_000;
+    while (
+      !authority.requests.some((request) => request.path.endsWith("/changes")) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((settle) => setTimeout(settle, 10));
+    }
+    assert.ok(
+      authority.requests.some((request) => request.path.endsWith("/changes")),
+      "the resumed supervisor must poll the remote change feed",
+    );
+    assert.equal(
+      authority.requests.filter((request) => request.path.endsWith("/commit")).length,
+      commitsAfterInitialUpload,
+      "unchanged content must not commit a second generation",
+    );
+    const changeRequest = authority.requests.find((request) => request.path.endsWith("/changes"));
+    assert.equal(changeRequest.method, "GET");
+    assert.equal(changeRequest.path, `/v1/workspace-sync/${syncId}/changes`);
+  } finally {
+    await supervisor.stop();
+  }
+});
+
+// Two negative controls for the resume admission. Neither may start a poller:
+// one has no durable session to read with, the other's local tree no longer
+// reproduces the generation the authority publishes, so the caller was never
+// entitled to the reuse path at all.
+test("resuming refuses with distinguishable reasons when the session or the manifest is unproven", async (t) => {
+  const root = await temporaryDirectory(t, "cuna-resume-control-root-");
+  const checkpointRoot = await temporaryDirectory(t, "cuna-resume-control-state-");
+  const emptyState = await temporaryDirectory(t, "cuna-resume-control-empty-");
+  await writeFile(join(root, "first.txt"), "one\n");
+  const authority = new RecordingAuthority();
+  const input = productInput(root, checkpointRoot, authority);
+  const receipt = await synchronizeLocalWorkspace(input);
+
+  await assert.rejects(
+    resumeContinuousWorkspaceSync({
+      ...resumeInput(input),
+      checkpointRoot: emptyState,
+      activeGeneration: receipt.generation,
+      activeManifestRoot: receipt.manifest_root,
+    }),
+    (error) =>
+      error.code === "cuna.workspace_sync.resume_unavailable" &&
+      error.details.reason === "resume_session_unavailable",
+  );
+
+  await writeFile(join(root, "second.txt"), "two\n");
+  await assert.rejects(
+    resumeContinuousWorkspaceSync({
+      ...resumeInput(input),
+      activeGeneration: receipt.generation,
+      activeManifestRoot: receipt.manifest_root,
+    }),
+    (error) =>
+      error.code === "cuna.workspace_sync.resume_unavailable" &&
+      error.details.reason === "resume_manifest_unproven",
+  );
+  assert.equal(
+    authority.requests.filter((request) => request.path.endsWith("/changes")).length,
+    0,
+    "a refused resume must reach no remote surface",
+  );
 });
 
 test("identity, generation, and authenticated authority fail before local filesystem or network effects", async () => {

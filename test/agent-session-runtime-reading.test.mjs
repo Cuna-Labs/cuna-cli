@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   hasCurrentAgentSessionRuntimeLease,
   isAgentSessionIntendedActive,
+  isAgentSessionVisibleInPicker,
   readAgentSessionRuntime,
   readRuntimeWindow,
   wasAgentSessionObservedRunning,
@@ -11,6 +12,16 @@ import {
 import { classifySessionActionability } from "../dist/machines/session-actionability.js";
 
 const NOW = Date.parse("2026-09-13T12:00:00.000Z");
+test("picker hides ended rows with a leftover running intent and retains unknown live candidates", () => {
+  for (const processState of ["exited", "failed", "terminating", "terminated"]) {
+    assert.equal(isAgentSessionVisibleInPicker(session({ processState })), false);
+  }
+  assert.equal(isAgentSessionVisibleInPicker(session({ requestState: "terminal" })), false);
+  assert.equal(isAgentSessionVisibleInPicker(session({ requestState: "termination_pending" })), false);
+  for (const processState of ["unknown", "starting", "ready", "running"]) {
+    assert.equal(isAgentSessionVisibleInPicker(session({ processState })), true);
+  }
+});
 const HOUR = 3_600_000;
 
 function session(overrides = {}) {

@@ -19,9 +19,50 @@ import type {
   JourneyResourceLedger,
   JourneyWorkspaceReceipt,
 } from "./orchestrator.js";
+import {
+  AGENT_SESSION_READY_DEADLINE_MS,
+  MACHINE_READY_DEADLINE_MS,
+  readinessBackoffMs,
+  reissueIdempotentRead,
+  startJourneyDeadline,
+  type JourneyDeadline,
+  type JourneyDeadlineElapsed,
+  type JourneyWaitReporter,
+} from "./wait-policy.js";
 
 const MACHINE_POLL_LIMIT = 60;
-const CHILD_POLL_LIMIT = 90;
+
+/**
+ * The noun phrases the readiness loops put on screen, as one vocabulary.
+ *
+ * Each one is a state this loop ALREADY distinguishes internally and never
+ * said out loud: measured 2026-09-22, `Starting Claude Code · still working`
+ * held for 61 259 ms across every one of these transitions
+ * (`prds/cuna-cli-latency-before-20260922.md` § 3). They complete the sentence
+ * "Still waiting for ___", so each is a noun phrase and none names a route.
+ */
+const WAITING_FOR = Object.freeze({
+  sessionRead: "Cuna to answer the AgentSession read",
+  terminalAuthorityRead: "Cuna to answer the terminal-authority read",
+  machineRead: "Cuna to answer the machine read",
+  processStart: "the session process to start",
+  supervisorRegistry: "the machine's terminal supervisor to register",
+  sessionAcceptsTerminal: "the session to accept a terminal",
+  runtimeObservation: "a fresh runtime observation",
+  machineRunning: "the machine to reach running",
+});
+
+/**
+ * The capability refusal reasons this loop waits through, mapped to what a
+ * person is actually waiting for. Three different causes produced one
+ * indistinguishable sentence before; they must render differently or the
+ * screen cannot discriminate them.
+ */
+const TERMINAL_AUTHORITY_WAIT: Readonly<Record<string, string>> = Object.freeze({
+  supervisor_registry_unavailable: WAITING_FOR.supervisorRegistry,
+  agent_session_not_ready: WAITING_FOR.sessionAcceptsTerminal,
+  runtime_lease_expired: WAITING_FOR.runtimeObservation,
+});
 
 export interface ApiAgentJourneyEffectsInput {
   readonly client: CunaApiClient;
@@ -49,6 +90,13 @@ export interface ApiAgentJourneyEffectsInput {
   }) => Promise<void>;
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  /**
+   * Where a wait goes on screen. It is an input rather than a member of
+   * `AgentJourneyEffects` because the waiting happens INSIDE an effect, and
+   * `cli/run.ts` wraps the finished effects object by spreading it — a member
+   * added by that wrapper is not the one these closures would call.
+   */
+  readonly onWait?: JourneyWaitReporter;
 }
 
 function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.remote, details?: Record<string, string>): CunaError {
@@ -117,13 +165,42 @@ function isSeatUnserved(error: unknown): boolean {
     (error.code === "cuna.remote.operation_not_served" || error.code === "cuna.remote.not_found");
 }
 
+/**
+ * The execution Workspace a v2 session runs in, read from its cwd.
+ *
+ * A session created through the execution-Workspace path
+ * (`createPublishedProviderSessionV2`) is published WITHOUT
+ * `workspace_binding_id`: the wire names its Workspace only through `cwd`,
+ * which the create call itself pinned to `/workspace/workspaces/<id>` and the
+ * server echoed. Until 2026-09-21 `sessionObservation` mapped that absence to
+ * the identity `"unknown"`, so no v2 session could ever equal the identity the
+ * journey was looking for, and every `cuna claude <path>` on an already-running
+ * session went to "Creating Claude Code session". Measured in production on
+ * Machine bd94a624: session 8d99301b running, detached, fresh, same cwd, and
+ * the second run offered the profile picker for a NEW session.
+ */
+const EXECUTION_WORKSPACE_CWD = /^\/workspace\/workspaces\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/.*)?$/u;
+
+export function executionWorkspaceIdFromCwd(cwd: string): string | undefined {
+  return EXECUTION_WORKSPACE_CWD.exec(cwd)?.[1];
+}
+
 function sessionObservation(session: AgentSession, seat: SeatAttachment) {
+  const executionWorkspaceId = session.workspaceBindingId === undefined
+    ? executionWorkspaceIdFromCwd(session.cwd)
+    : undefined;
   return Object.freeze({
     id: session.id,
     machineId: session.machineId,
     name: session.name,
     agent: session.agent,
-    workspaceIdentity: session.workspaceBindingId ?? "unknown",
+    workspaceIdentity: session.workspaceBindingId ?? executionWorkspaceId ?? "unknown",
+    // A binding session carries the generation it was created against; an
+    // execution-Workspace session is published without one, so the journey
+    // compares generations only for binding sessions (see `workspaceKind`).
+    workspaceKind: session.workspaceBindingId !== undefined
+      ? "binding" as const
+      : executionWorkspaceId !== undefined ? "execution" as const : "unknown" as const,
     workspaceGeneration: session.workspaceGeneration ?? 0,
     cwd: relativeCwd(session.cwd),
     authMode: session.authMode,
@@ -145,6 +222,34 @@ async function defaultSleep(milliseconds: number, signal: AbortSignal): Promise<
 export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput): AgentJourneyEffects {
   const now = input.now ?? Date.now;
   const sleep = input.sleep ?? defaultSleep;
+  /**
+   * Run one idempotent read under a phase deadline, re-issuing it if the CLI's
+   * own per-request budget elapses. Written once here so no readiness loop can
+   * spell the policy differently: the 2026-09-22 abort happened because ONE
+   * read's budget was, in effect, the whole journey's deadline.
+   */
+  const readWithin = <T>(context: {
+    readonly waitingFor: string;
+    readonly deadline: JourneyDeadline;
+    readonly signal: AbortSignal;
+    readonly deadlineFailure: (elapsed: JourneyDeadlineElapsed) => Error;
+    readonly read: () => Promise<T>;
+  }): Promise<T> => reissueIdempotentRead({
+    waitingFor: context.waitingFor,
+    read: context.read,
+    deadline: context.deadline,
+    signal: context.signal,
+    sleep,
+    deadlineFailure: context.deadlineFailure,
+    ...(input.onWait === undefined ? {} : { onWait: input.onWait }),
+  });
+  const reportWait = (deadline: JourneyDeadline, waitingFor: string): void => {
+    input.onWait?.(Object.freeze({
+      waitingFor,
+      elapsedMs: deadline.elapsedMs(),
+      deadlineMs: deadline.deadlineMs,
+    }));
+  };
   const effects: AgentJourneyEffects = {
     inspectWorkspace: input.inspectWorkspace,
     async observeMachines({ signal }) {
@@ -254,7 +359,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         if (request.state === "terminal_failed" || request.action === "none") {
           throw fail("cuna.journey.machine_create_failed", "Machine creation reached an authoritative failure.");
         }
-        await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
+        await sleep(readinessBackoffMs(attempt), signal);
       }
       return "unreconcilable";
     },
@@ -267,16 +372,46 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       } else if (state === "deleted" || state === "error" || state === "unknown") {
         throw fail("cuna.journey.machine_not_reusable", "The selected machine is not safely reusable.", EXIT_CODES.policy);
       }
-      for (let attempt = 0; attempt < MACHINE_POLL_LIMIT; attempt += 1) {
+      const deadline = startJourneyDeadline(MACHINE_READY_DEADLINE_MS, now);
+      const deadlineFailure = (elapsed: JourneyDeadlineElapsed): CunaError => new CunaError({
+        code: "cuna.journey.machine_ready_timeout",
+        message: `Cuna stopped waiting for ${elapsed.waitingFor} after ${Math.round(elapsed.elapsedMs / 1_000)} s. Machine readiness remains unproven.`,
+        exitCode: EXIT_CODES.network,
+        retryable: true,
+        hint: `Read the machine before starting another: cuna machines list`,
+        details: {
+          machine_id: machineId,
+          waiting_for: elapsed.waitingFor,
+          deadline_ms: elapsed.deadlineMs,
+          elapsed_ms: elapsed.elapsedMs,
+          read_reissues: elapsed.readReissues,
+        },
+        ...(elapsed.cause === undefined ? {} : { cause: elapsed.cause }),
+      });
+      for (let attempt = 0; !deadline.elapsed(); attempt += 1) {
         if (state === "running") return Object.freeze({ id: machineId, state });
-        const observed = await input.client.getMachine(machineId, signal);
+        const observed = await readWithin({
+          waitingFor: WAITING_FOR.machineRead,
+          deadline,
+          signal,
+          deadlineFailure,
+          read: () => input.client.getMachine(machineId, signal),
+        });
         state = machineState(observed.state);
         if (state === "deleted" || state === "error" || state === "unknown") {
           throw fail("cuna.journey.machine_not_ready", "The machine did not reach running state.");
         }
-        await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
+        if (state === "running") return Object.freeze({ id: machineId, state });
+        reportWait(deadline, WAITING_FOR.machineRunning);
+        await sleep(readinessBackoffMs(attempt), signal);
       }
-      throw fail("cuna.journey.machine_ready_timeout", "Machine readiness remained unproven.", EXIT_CODES.network);
+      throw deadlineFailure(Object.freeze({
+        waitingFor: WAITING_FOR.machineRunning,
+        elapsedMs: deadline.elapsedMs(),
+        deadlineMs: deadline.deadlineMs,
+        readReissues: 0,
+        cause: undefined,
+      }));
     },
     synchronizeWorkspace: input.synchronizeWorkspace,
     async observeAgentSessions({ machineId, signal }) {
@@ -341,9 +476,37 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       throw fail('cuna.provider.v2_unavailable','This agent has no supported canonical V2 launch profile.');
     },
     async ensureAgentSessionReady({ agentSessionId, signal }) {
-      for (let attempt = 0; attempt < CHILD_POLL_LIMIT; attempt += 1) {
+      const deadline = startJourneyDeadline(AGENT_SESSION_READY_DEADLINE_MS, now);
+      const deadlineFailure = (elapsed: JourneyDeadlineElapsed): CunaError => new CunaError({
+        code: "cuna.journey.agent_session_ready_timeout",
+        message: `Cuna stopped waiting for ${elapsed.waitingFor} after ${Math.round(elapsed.elapsedMs / 1_000)} s. The remote request may still be pending.`,
+        exitCode: EXIT_CODES.network,
+        retryable: true,
+        hint: `Inspect the existing request before starting another session: cuna agent-sessions get ${agentSessionId}`,
+        details: {
+          agent_session_id: agentSessionId,
+          // The three numbers the screen was already showing, so a transcript
+          // and an error record cannot disagree about what was waited for.
+          waiting_for: elapsed.waitingFor,
+          deadline_ms: elapsed.deadlineMs,
+          elapsed_ms: elapsed.elapsedMs,
+          read_reissues: elapsed.readReissues,
+        },
+        ...(elapsed.cause === undefined ? {} : { cause: elapsed.cause }),
+      });
+      // What the CLI is waiting for RIGHT NOW. It moves with the loop's own
+      // observations, so the deadline failure names the last real blocker
+      // instead of the phase.
+      let waitingFor: string = WAITING_FOR.processStart;
+      for (let attempt = 0; !deadline.elapsed(); attempt += 1) {
         if (signal?.aborted) throw signal.reason;
-        const session = await input.client.getAgentSession(agentSessionId, signal);
+        const session = await readWithin({
+          waitingFor: WAITING_FOR.sessionRead,
+          deadline,
+          signal,
+          deadlineFailure,
+          read: () => input.client.getAgentSession(agentSessionId, signal),
+        });
         if (session.requestState === "failed") {
           if (session.workspaceFailureCode !== undefined) {
             const messages: Record<string, string> = {
@@ -363,9 +526,16 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         if (session.processState === "ready" || session.processState === "running") {
           // A durable process acknowledgement can precede the registry's exact
           // PTY attachment. Wait for that authority without dispatching again.
+          waitingFor = WAITING_FOR.sessionAcceptsTerminal;
           try {
-            await requireCapability({ client: input.client, scope: "agent_session", resourceId: agentSessionId,
-              capabilityId: "terminal_connections.create", allowedInteractions: ["native"], now, signal });
+            await readWithin({
+              waitingFor: WAITING_FOR.terminalAuthorityRead,
+              deadline,
+              signal,
+              deadlineFailure,
+              read: () => requireCapability({ client: input.client, scope: "agent_session", resourceId: agentSessionId,
+                capabilityId: "terminal_connections.create", allowedInteractions: ["native"], now, signal }),
+            });
             if (signal?.aborted) throw signal.reason;
             return Object.freeze({ id: session.id, machineId: session.machineId });
           } catch (error) {
@@ -374,20 +544,27 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
               && ["cuna.capability.unknown", "cuna.capability.temporarily_unavailable"].includes(error.code)
               && error.details?.capability_id === "terminal_connections.create"
               && ["supervisor_registry_unavailable", "agent_session_not_ready", "runtime_lease_expired"].includes(String(error.details?.reason)))) throw error;
+            // Three causes shared one sentence on screen for 61 s. The refusal
+            // reason is the only thing that separates them, and it is already
+            // here.
+            waitingFor = TERMINAL_AUTHORITY_WAIT[String(error.details?.reason)] ?? WAITING_FOR.sessionAcceptsTerminal;
           }
+        } else {
+          waitingFor = WAITING_FOR.processStart;
         }
         if (["exited", "failed", "terminated"].includes(session.processState)) {
           throw sessionFailure(session, "The AgentSession reached a terminal state before attach.");
         }
-        await sleep(Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)), signal);
+        reportWait(deadline, waitingFor);
+        await sleep(readinessBackoffMs(attempt), signal);
       }
-      throw new CunaError({
-        code: "cuna.journey.agent_session_ready_timeout",
-        message: "Cuna stopped waiting for AgentSession readiness. The remote request may still be pending.",
-        exitCode: EXIT_CODES.network,
-        hint: `Inspect the existing request before starting another session: cuna agent-sessions get ${agentSessionId}`,
-        details: { agent_session_id: agentSessionId },
-      });
+      throw deadlineFailure(Object.freeze({
+        waitingFor,
+        elapsedMs: deadline.elapsedMs(),
+        deadlineMs: deadline.deadlineMs,
+        readReissues: 0,
+        cause: undefined,
+      }));
     },
     attach: input.attach,
     async reconcileCancellation({ ledger, signal }) {

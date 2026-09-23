@@ -5,8 +5,9 @@ import {runOwnerGrantsScreen,type ShareableSession,type ShareableSessionListing}
 import {ownerGrantOperationStore} from "../runtime/owner-grant-operations.js";
 import { runProviderScreen } from "../machines/provider-screen.js";
 import { Writable } from "node:stream";
-import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
+import { terminalCellWidth } from "../terminal/cell-width.js";
 import { createInterface } from "node:readline/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { launchRemoteWorkspaceSession } from "../journey/remote-workspace.js";
@@ -41,13 +42,33 @@ import {
   conservativeFilesystemCapabilities,
   createApiAgentJourneyEffects,
   createWorkspaceJourneyEffects,
+  journeyWaitLine,
   orchestrateAgentJourney,
   preflightAgentJourneyInvocation,
+  readAccountIdentityWithin,
   type AgentJourneyEffects,
   type AgentJourneyPhase,
+  type JourneyAgentSessionDisposition,
+  type JourneyWait,
   type ReconciledAgentJourneyIntent,
 } from "../journey/index.js";
 import {
+  agentSessionDispositionLine,
+  composeInlineProgressLine,
+  inlineProgressColumns,
+  renderInlineProgressFrame,
+} from "./progress-line.js";
+import {
+  agentDisplayName,
+  journeyPreparationLabel,
+  ROOT_FIRST_LINE_LABEL,
+  type FirstLine,
+  type PaintedFirstLine,
+} from "./first-line.js";
+import { askRecordedLaunch, recordedLaunchConfirmation } from "./recorded-launch-prompt.js";
+import { settledAgentSessionDisposition } from "../journey/session-disposition.js";
+import {
+  agentJourneyCommand,
   rootJourneyArgv,
   runNodeRootJourney,
   type RootJourneyRunner,
@@ -56,6 +77,7 @@ import { createPlatformAdapter, type PlatformAdapter } from "../platform/adapter
 import { CLI_VERSION, OUTPUT_SCHEMA_VERSION } from "../version.js";
 import { runtimeFeatureGates, type RuntimeFeatureGate } from "../runtime/contracts.js";
 import { RuntimeBoundaryError } from "../runtime/errors.js";
+import type { TerminalClientScope } from "../runtime/terminal-client-identity.js";
 import {
   runNodeForegroundSessions,
   selectNodeForegroundPresentation,
@@ -107,6 +129,24 @@ export interface RunCliDependencies {
   readonly managedWorkspaceMachineId?: string;
   /** Test seam for the folder a command resolves its workspace binding from. */
   readonly workspaceRoot?: string;
+  /**
+   * Test seam for the stream a mid-journey question reads its answer from.
+   * Production always leaves this absent and uses the real `process.stdin`.
+   *
+   * It exists because the recorded-launch question is the one place the CLI
+   * stops and waits for a person mid-journey, and the measured defect there was
+   * entirely about WHEN the next line appears relative to the answer
+   * (`prds/cuna-cli-latency-before-20260922.md` § 3, finding 1). Without a seam
+   * that ordering is only assertable through a real TTY, and the live evidence
+   * for the repair is n=0: none of the nine runs of § 8.2 met the question.
+   */
+  readonly promptInput?: NodeJS.ReadableStream;
+  /**
+   * The row `bin/cuna.ts` painted before this module loaded, if it painted one.
+   * The paint site that would have drawn the same row claims it instead of
+   * drawing it again; see `cli/first-line.ts`.
+   */
+  readonly firstLine?: FirstLine;
   readonly automaticJourneyEffectsFactory?: (input: {
     readonly client: CunaApiClient;
     readonly intent: ReconciledAgentJourneyIntent;
@@ -514,13 +554,6 @@ function managedWorkspaceScope(intent: ReconciledAgentJourneyIntent, machineId?:
   return `${intent.agent}-${intent.machine.kind}`;
 }
 
-function agentDisplayName(agent: string): string {
-  return agent === "claude-code" ? "Claude Code"
-    : agent === "codex" ? "Codex"
-    : agent === "opencode" ? "OpenCode"
-    : "OpenClaw";
-}
-
 type BrowserLoginRemoteProbe = Readonly<{
   status: "verified" | "unavailable" | "unknown" | "not_checked";
   reason: string;
@@ -630,6 +663,17 @@ function credentialError(error: CredentialBoundaryError): CunaError {
 
 interface InlineProgress {
   update(label: string): void;
+  /**
+   * Take over the line with a live "Still waiting for X · Ns of Ms" wait, or
+   * give it back to the plain label with `undefined`.
+   *
+   * The elapsed figure is re-derived on every repaint rather than reprinted
+   * from the caller's last notice, because the caller reports once per poll —
+   * up to 1 600 ms apart, the ceiling of `readinessBackoffMs` — and a number
+   * that only moves when the poll does reproduces the dwell it is meant to
+   * cure.
+   */
+  wait(notice: JourneyWait | undefined): void;
   /** Print one durable line above the spinner, then keep spinning. */
   note(line: string): void;
   stop(): void;
@@ -739,53 +783,63 @@ function writeTerminalSupervisorReadiness(
   }
 }
 
-function inlineProgressColumns(stream: Writable): number {
-  const tty = stream as Writable & {
-    columns?: number;
-    _handle?: { getWindowSize?: (size: number[]) => number };
-  };
-  // Node 24 on Windows can retain stale public columns after ConPTY resize.
-  // Read this stream's native TTY observation without changing its prototype
-  // or cached fields. This guarded private API depends on the supported Node
-  // engine; absent/failed/malformed observations retain the ordinary fallback.
-  if (process.platform === "win32" && typeof tty._handle?.getWindowSize === "function") {
-    try {
-      const size: number[] = [];
-      if (tty._handle.getWindowSize(size) === 0 && size.length === 2 &&
-        Number.isSafeInteger(size[0]) && size[0]! >= 2 && size[0]! <= 4096 &&
-        Number.isSafeInteger(size[1]) && size[1]! >= 1 && size[1]! <= 4096) return size[0]!;
-    } catch { /* An unavailable native observation does not break progress. */ }
-  }
-  return Number.isSafeInteger(tty.columns) && tty.columns! >= 2 && tty.columns! <= 4096 ? tty.columns! : 80;
-}
-
-function startInlineProgress(stream: Writable, color: boolean, initialLabel = "Loading machines"): Readonly<InlineProgress> {
-  const frames = ["◐", "◓", "◑", "◒"];
-  const bars = ["━╺━━━━", "━━╺━━━", "━━━╺━━", "━━━━╺━", "━━━━━╺", "━━━━╸━", "━━━╸━━", "━━╸━━━"];
-  const startedAt = Date.now();
-  let frame = 0;
+/**
+ * Start the one inline progress row, or continue a row `cli/first-line.ts`
+ * already painted before this module loaded (`adopted`). An adopted row is not
+ * painted again: its frame 0 is on screen, so the loop starts at frame 1 and its
+ * clocks start when that row appeared, not when this code got to run.
+ */
+function startInlineProgress(
+  stream: Writable,
+  color: boolean,
+  initialLabel = "Loading machines",
+  adopted?: PaintedFirstLine,
+): Readonly<InlineProgress> {
+  const startedAt = adopted?.paintedAt ?? Date.now();
+  let frame = adopted === undefined ? 0 : 1;
   let label = initialLabel;
+  // When THIS label started, not when the spinner did. The measured defect was
+  // label dwell — 61 259 ms on one unchanging sentence
+  // (`prds/cuna-cli-latency-before-20260922.md` § 3) — so the number a person
+  // needs is how long the current step has been running, not the command.
+  let labelStartedAt = startedAt;
+  let waiting: Readonly<{ notice: JourneyWait; observedAt: number }> | undefined;
   let stopped = false;
-  let lastColumns = 0;
-  let lastCells = 0;
+  let lastColumns = adopted?.columns ?? 0;
+  let lastCells = adopted?.cells ?? 0;
   const paint = (): void => {
     const columns = inlineProgressColumns(stream);
-    const elapsed = Date.now() - startedAt;
+    const now = Date.now();
     // A spinner alone is too easy to mistake for a frozen cursor on slower
-    // Windows terminals. Keep the phase honest, then add a small, actionable
-    // acknowledgement while an authenticated read is still in flight.
-    const slowHint = elapsed >= 12_000
-      ? " · still working — Ctrl-C cancels"
-      : elapsed >= 4_000
-        ? " · still working"
-        : "";
-    const text = `◆ CUNA  ${frames[frame % frames.length]} ${label}${slowHint}  ${bars[frame % bars.length]}`;
-    const fitted = truncateTerminalLine(text, columns - 1);
-    const styled = color && fitted === text
-      ? `\u001b[38;5;202m\u001b[1m◆ CUNA\u001b[0m  \u001b[38;5;202m${frames[frame % frames.length]}\u001b[0m \u001b[38;5;255m\u001b[1m${label}\u001b[0m\u001b[38;5;245m${slowHint}\u001b[0m  \u001b[38;5;208m${bars[frame % bars.length]}\u001b[0m`
-      : color ? `\u001b[38;5;255m${fitted}\u001b[0m` : fitted;
+    // Windows terminals, and `· still working` — the whole escalation this
+    // replaces — said nothing a second repaint had not already said. The
+    // sentence and its thresholds live in `progress-line.ts`, where they can
+    // be asserted without a clock or a TTY.
+    const { headline, trailer } = composeInlineProgressLine({
+      label,
+      ...(waiting === undefined ? {} : {
+        waiting: {
+          waitingFor: waiting.notice.waitingFor,
+          // Re-derived per repaint: the reporter speaks once per poll, up to
+          // 1 600 ms apart, and a number that only moves when the poll does
+          // reproduces the dwell it is meant to cure.
+          elapsedMs: waiting.notice.elapsedMs + (now - waiting.observedAt),
+          deadlineMs: waiting.notice.deadlineMs,
+        },
+      }),
+      labelElapsedMs: now - labelStartedAt,
+      totalElapsedMs: now - startedAt,
+    });
+    const { styled, fitted } = renderInlineProgressFrame({ headline, trailer, frame, columns, color });
     if (lastColumns > columns && lastCells >= columns) {
       // A terminal resize can reflow our previously single row before repaint.
+      // HAZARD, unrepaired: this assumes the terminal reflowed. One that
+      // truncated instead still has a single row here, so the walk clears
+      // whatever is above it — on this path, the durable `note()` line naming
+      // the AgentSession. @xterm/headless truncates, which is why
+      // `test/cli.test.mjs` asserts the progress row is never BELOW the durable
+      // rows rather than exactly at row 0. Distinguishing the two needs
+      // terminal feedback the CLI does not have.
       for (let row = 0; row < Math.floor(lastCells / columns); row += 1) stream.write("\r\u001b[2K\u001b[1A");
     }
     stream.write(`\r\u001b[2K${styled}`);
@@ -793,13 +847,28 @@ function startInlineProgress(stream: Writable, color: boolean, initialLabel = "L
     lastCells = terminalCellWidth(fitted);
     frame += 1;
   };
-  paint();
+  if (adopted === undefined) paint();
   const timer = setInterval(paint, 90);
   timer.unref();
   return Object.freeze({
     update(nextLabel: string) {
-      if (stopped || nextLabel === label) return;
-      label = nextLabel;
+      if (stopped) return;
+      // A repeat of the same label must not restart the dwell clock, but it
+      // MUST still end a wait: the phase resuming is exactly the state change
+      // the wait line was standing in for, and an early return on the label
+      // alone would leave the stale wait on screen forever.
+      if (nextLabel === label && waiting === undefined) return;
+      waiting = undefined;
+      if (nextLabel !== label) {
+        label = nextLabel;
+        labelStartedAt = Date.now();
+      }
+      paint();
+    },
+    wait(notice: JourneyWait | undefined) {
+      if (stopped) return;
+      waiting = notice === undefined ? undefined : Object.freeze({ notice, observedAt: Date.now() });
+      if (notice === undefined) labelStartedAt = Date.now();
       paint();
     },
     note(line: string) {
@@ -934,12 +1003,6 @@ function journeyPhaseLabel(phase: AgentJourneyPhase, agent: "claude-code" | "cod
   }
 }
 
-function journeyPreparationLabel(agent: string): string {
-  return agent === "opencode"
-    ? "Preparing OpenCode — use /connect in its terminal"
-    : `Preparing ${agentDisplayName(agent)}`;
-}
-
 function foregroundAttachLabel(agent: string): string {
   return agent === "opencode"
     ? "Opening OpenCode terminal — use /connect there"
@@ -965,9 +1028,19 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   let interactiveCloseUi = false;
   let interactiveCloseColor = false;
   let terminalSessionIds: readonly string[] = [];
+  // Known once configuration is read; every attach happens after that.
+  let terminalClients: TerminalClientScope | undefined;
   const runForeground: ForegroundSessionRunner = async (input) => {
     terminalSessionIds = [...input.agentSessionIds];
-    await (dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions)(input);
+    await (dependencies.foregroundTerminalRunner ?? runNodeForegroundSessions)({
+      ...(terminalClients === undefined ? {} : { terminalClients }),
+      onNotice: (line) => {
+        const row = inlineJourneyProgress ?? inlineRootProgress;
+        if (row !== undefined) row.note(line);
+        else streams.stderr.write(`${line}\n`);
+      },
+      ...input,
+    });
   };
   try {
     const parsed = parseArgv(argv);
@@ -1077,7 +1150,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       interactiveCloseUi = true;
       interactiveCloseColor = color;
       if (streams.stderrIsTTY === true) {
-        inlineRootProgress = startInlineProgress(streams.stderr, color, "Starting Cuna");
+        inlineRootProgress = startInlineProgress(streams.stderr, color, ROOT_FIRST_LINE_LABEL,
+          dependencies.firstLine?.claim({ kind: "root", label: ROOT_FIRST_LINE_LABEL, color, stream: streams.stderr }));
       } else {
         streams.stderr.write("Cuna: starting...\n");
       }
@@ -1134,7 +1208,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // tells the truth immediately without claiming that attach has begun.
       const preparation = journeyPreparationLabel(journeyIntent.agent);
       const color = !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
-      if (streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr, color, preparation);
+      if (streams.stderrIsTTY === true) {
+        inlineJourneyProgress = startInlineProgress(streams.stderr, color, preparation,
+          dependencies.firstLine?.claim({ kind: "journey", label: preparation, color, stream: streams.stderr }));
+      }
       else streams.stderr.write(`Cuna: ${preparation.charAt(0).toLowerCase()}${preparation.slice(1)}...\n`);
     }
     const platform = dependencies.platform ?? createPlatformAdapter({ env: effectiveEnvironment });
@@ -1180,6 +1257,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       },
       ...(creatingProfile ? { allowMissingProfile: true } : {}),
     });
+    terminalClients = Object.freeze({ platform, profile: config.profile });
     if (interactiveRoot) {
       inlineRootProgress?.update(config.apiKey === undefined ? "Checking your Cuna sign-in" : "Checking Cuna access");
     }
@@ -1625,6 +1703,79 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         throw unsupportedError("openclaw", "provider_route_unavailable");
       }
       const journeyAgent = journeyIntent.agent;
+      const journeyColor = (): boolean =>
+        !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR");
+      const resumeJourneyProgress = (): Readonly<InlineProgress> | undefined => {
+        if (streams.stderrIsTTY === true) {
+          return startInlineProgress(
+            streams.stderr,
+            journeyColor(),
+            journeyPhaseLabel("create-agent-session", journeyAgent),
+          );
+        }
+        return undefined;
+      };
+      // Both launch paths render these two the same way, so they are written
+      // once: a declared wait takes the spinner row and gives it back, while a
+      // settled AgentSession is a durable note that stays above it. Without the
+      // row, each becomes a plain line on stderr.
+      const renderJourneyWait = (notice: JourneyWait): void => {
+        if (inlineJourneyProgress !== undefined) inlineJourneyProgress.wait(notice);
+        else streams.stderr.write(`${journeyWaitLine(notice)}\n`);
+      };
+      const renderAgentSession = (event: JourneyAgentSessionDisposition): void => {
+        const line = agentSessionDispositionLine(event);
+        if (inlineJourneyProgress !== undefined) inlineJourneyProgress.note(line);
+        else streams.stderr.write(`${line}\n`);
+      };
+      /**
+       * True once the recorded-launch question has been answered No, on either
+       * launch path. It is what separates a new launch from a resumed one; see
+       * `journey/session-disposition.ts` for why nothing else on the path can.
+       */
+      let recordedLaunchResumed = false;
+      /**
+       * Ask the one recorded-launch question, and answer the screen at once.
+       *
+       * ONE HELPER BECAUSE THERE WAS ONE QUESTION AND TWO BEHAVIOURS. The
+       * journey copy stopped the spinner to ask and never took the row back;
+       * the remote-menu copy left the spinner running, so its 90 ms repaint
+       * erased the question before it could be read. Measured 2026-09-22
+       * (`prds/cuna-cli-latency-before-20260922.md` § 3, finding 1): the
+       * terminal went BYTE-silent for up to 18 314 ms in 3 of 5 runs, always
+       * immediately after this answer was accepted — the screen froze on the
+       * person's own keystroke. What is said, and that it is said before this
+       * returns, live in `recorded-launch-prompt.ts`, which can be asserted
+       * without a TTY; this closure owns only the readline and the row.
+       */
+      const askCreateAnotherSession = async (signal: AbortSignal | undefined): Promise<boolean> => {
+        inlineJourneyProgress?.stop();
+        inlineJourneyProgress = undefined;
+        const another = await askRecordedLaunch({
+          // The readline is opened and closed inside `ask`, so it has released
+          // the cursor before the acknowledgement is painted onto the same row.
+          ask: async (question) => {
+            const prompt = createInterface({ input: dependencies.promptInput ?? process.stdin, output: streams.stderr });
+            try {
+              return signal === undefined
+                ? await prompt.question(question)
+                : await prompt.question(question, { signal });
+            } finally {
+              prompt.close();
+            }
+          },
+          acknowledge: (line) => {
+            if (streams.stderrIsTTY === true) {
+              inlineJourneyProgress = startInlineProgress(streams.stderr, journeyColor(), line);
+            } else {
+              streams.stderr.write(`${line}\n`);
+            }
+          },
+          createLabel: journeyPhaseLabel("create-agent-session", journeyAgent),
+        });
+        recordedLaunchResumed = recordedLaunchResumed || !another;
+        return another;
+      };
       if (credentialMode === undefined) {
         throw new CunaError({
           code: "cuna.auth.required",
@@ -1638,7 +1789,29 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // Read before the effects branch, not inside it: the principal and the
       // workspace are half of the machine-create request identity, so every
       // journey needs them, including the one built from injected effects.
-      const identity = await client.getIdentity(dependencies.signal);
+      //
+      // Under the journey's own wait policy rather than under the per-request
+      // budget alone. Being first is exactly why this read needed it: it sits
+      // outside `journey/api-effects.ts` and `journey/remote-workspace.ts`, so
+      // the re-issue repair reached neither of the two places it runs, and one
+      // elapsed 15 000 ms budget still ended the whole command — measured
+      // 2026-09-22 (`prds/cuna-cli-latency-before-20260922.md` § 8.3, runs `a5`
+      // and the `--timeout-ms 800` control `slow1`, both exit 5 on `GET /v1/me`).
+      // `journey/account-identity.ts` holds the deadline and its derivation.
+      let accountWaitShown = false;
+      const identity = await readAccountIdentityWithin({
+        read: () => client.getIdentity(dependencies.signal),
+        signal: dependencies.signal ?? new AbortController().signal,
+        sleep: async (milliseconds, signal) => { await delay(milliseconds, undefined, { signal }); },
+        now: dependencies.now ?? Date.now,
+        onWait: (notice) => {
+          accountWaitShown = true;
+          renderJourneyWait(notice);
+        },
+      });
+      // The account answered, so the row stops counting a wait that is over.
+      // Nothing else ends it: the next phase label can be several steps away.
+      if (accountWaitShown) inlineJourneyProgress?.wait(undefined);
       const workspaceId = identity.workspaceId;
       if (workspaceId === undefined) {
         throw new CunaError({
@@ -1653,17 +1826,25 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         inlineJourneyProgress?.stop(); inlineJourneyProgress = undefined;
         const preset=await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"preset",agent:journeyAgent},undefined,dependencies.signal);
         if(preset===undefined)return EXIT_CODES.success;
+        inlineJourneyProgress = resumeJourneyProgress();
         const agentSessionId = await launchRemoteWorkspaceSession({
           preset,
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id},
-          confirmNew:async()=>{const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal:dependencies.signal})).trim());}finally{prompt.close();}},
+          confirmNew: () => askCreateAnotherSession(dependencies.signal),
           client, machineId: dependencies.managedWorkspaceMachineId, workspaceId, agent: journeyAgent,
           onProgress: (label) => inlineJourneyProgress?.update(label),
+          onWait: renderJourneyWait,
+          onAgentSession: renderAgentSession,
           ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
+        inlineJourneyProgress?.stop();
+        inlineJourneyProgress = undefined;
         return await runCli([
-          journeyAgent,
+          // The COMMAND, not the agent identifier. `claude-code` is not a
+          // command, and passing it here ended this path at `Unknown command
+          // claude-code` right after the AgentSession was created.
+          agentJourneyCommand(journeyAgent),
           "--agent-session", agentSessionId,
           ...(booleanOption(parsed, "no-color") ? ["--no-color"] : []),
         ], { ...dependencies, ...(humanAuth === undefined ? {} : { humanAuth }) });
@@ -1711,9 +1892,16 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         effects = createApiAgentJourneyEffects({
           client,
           requestedAgent: journeyAgent,
-          confirmNewProviderLaunch:async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const prompt=createInterface({input:process.stdin,output:streams.stderr});try{return /^y(?:es)?$/iu.test((await prompt.question("A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ",{signal})).trim());}finally{prompt.close();}},
+          confirmNewProviderLaunch: recordedLaunchConfirmation(journeyIntent.newSession, askCreateAnotherSession),
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
-          selectProviderPreset: async(signal)=>{inlineJourneyProgress?.stop();inlineJourneyProgress=undefined;const preset=await (dependencies.providerScreenRunner ?? runProviderScreen)(client,{kind:"preset",agent:journeyAgent},undefined,signal);if(!preset)throw new CunaError({code:"cuna.provider.selection_cancelled",message:"Provider selection cancelled. The synchronized Workspace is preserved.",exitCode:EXIT_CODES.usage});return preset;},
+          selectProviderPreset: async (signal) => {
+            inlineJourneyProgress?.stop();
+            inlineJourneyProgress = undefined;
+            const preset = await (dependencies.providerScreenRunner ?? runProviderScreen)(client, { kind: "preset", agent: journeyAgent }, undefined, signal);
+            if (!preset) throw new CunaError({ code: "cuna.provider.selection_cancelled", message: "Provider selection cancelled. The synchronized Workspace is preserved.", exitCode: EXIT_CODES.usage });
+            inlineJourneyProgress = resumeJourneyProgress();
+            return preset;
+          },
           inspectWorkspace: workspace.inspectWorkspace,
           synchronizeWorkspace: workspace.synchronizeWorkspace,
           // The spinner and the prompt write to the same row of the same
@@ -1762,6 +1950,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
               signal,
             });
           },
+          onWait: renderJourneyWait,
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         });
       }
@@ -1771,6 +1960,23 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         onPhase(phase: AgentJourneyPhase) {
           baseEffects.onPhase?.(phase);
           inlineJourneyProgress?.update(journeyPhaseLabel(phase, journeyAgent));
+        },
+        onAgentSession(event: JourneyAgentSessionDisposition) {
+          baseEffects.onAgentSession?.(event);
+          // The orchestrator reads its disposition from the selection plan,
+          // which cannot see the answer to the recorded-launch question asked
+          // inside the create. On No, the create carries the recorded operation
+          // id and returns the row that launch already produced, so the plan
+          // still says `create-required` while the screen has just said
+          // `Resuming the recorded launch`. This closure owns that question, so
+          // it is the only place that can reconcile the two.
+          renderAgentSession({
+            ...event,
+            disposition: settledAgentSessionDisposition({
+              planned: event.disposition,
+              resumedRecordedLaunch: recordedLaunchResumed,
+            }),
+          });
         },
         async attach(input: Parameters<AgentJourneyEffects["attach"]>[0]) {
           inlineJourneyProgress?.update(`Attaching to ${agentDisplayName(journeyAgent)}`);
@@ -2021,6 +2227,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     writer.success(result.command, result.data, result.human);
     return EXIT_CODES.success;
   } catch (unknownError) {
+    // A first line painted before this module loaded, and refused before any
+    // progress row took it over, is cleared here, before the error is written
+    // after it on the same row.
+    dependencies.firstLine?.release();
     inlineMachinesProgress?.stop();
     inlineJourneyProgress?.stop();
     inlineRootProgress?.stop();

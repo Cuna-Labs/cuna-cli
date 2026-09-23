@@ -25,7 +25,7 @@ import { RuntimeBoundaryError, runtimeFailure, terminalHistoryGap } from "../run
 import type { HostTerminalLease } from "./mode.js";
 import { assertCanonicalUuid } from "../core/validation.js";
 import { buildAppbarModel, type AppbarModel, type StatusEvidence } from "./appbar.js";
-import { renderWorkbenchFrame, type WorkbenchTab } from "./workbench.js";
+import { renderWorkbenchFrame, workbenchUpdate, type WorkbenchFrame, type WorkbenchTab } from "./workbench.js";
 import { ViewportRegistry } from "./viewport.js";
 import { XtermViewportAdapter } from "./xterm-vte.js";
 
@@ -61,6 +61,10 @@ const ATTACHING_FRAME_MS = 90;
 // never more than one second under an injected/test cadence.
 const MAX_DISCONNECT_FRAME_MS = 250;
 const INPUT_WITHHELD_NOTICE = "Reconnecting · input was not sent. Retry after terminal attached.";
+// Sent keys went unacknowledged past the runtime's input deadline (R12). Said
+// the moment the runtime gives up on the connection, and it already carries the
+// "not resent" half, so it is never prefixed with HISTORICAL_INPUT_NOTICE.
+const INPUT_STALLED_NOTICE = "Connection stalled · reconnecting — input not resent";
 const FLOW_CONTROL_NOTICE = "Terminal output kept active · Ctrl+] s sends Ctrl+S remotely.";
 const RECONNECT_FAILED_NOTICE = "Reconnect failed · Ctrl+] r retries · Ctrl+C disconnects.";
 // Automatic recovery back-off: 100 ms doubling, capped at 5 s per wait, ten
@@ -186,6 +190,7 @@ export class ForegroundTerminalCoordinator {
   #renderTail: Promise<void> = Promise.resolve();
   /** The last complete frame the host accepted; undefined whenever the host screen is not known to show it. */
   #lastHostFrame: Uint8Array | undefined;
+  #lastWorkbenchFrame: WorkbenchFrame | undefined;
   #inputTail: Promise<void> = Promise.resolve();
   readonly #copyDetectors = new Map<string, ProviderBrowserActionDetector[]>();
   readonly #copyLinks = new Map<string, LocalBrowserActionRequest>();
@@ -682,19 +687,34 @@ export class ForegroundTerminalCoordinator {
     await raceAbort(tab.viewport.write(event.bytes, event.sequence, event.sequence), event.signal);
     const current = this.#tabs.get(event.tabId);
     if (event.signal.aborted || current !== tab || !sameSnapshotBinding(tab.snapshot, event.binding)) return;
-    await this.#render();
+    // Parsing preserves every ordered byte; painting may skip intermediate
+    // screens. A slow host must not hold up ingestion of newer remote output.
+    this.#queueStateRender();
   }
 
   #terminalState(snapshot: RuntimeTerminalSnapshot): void {
     const tab = this.#tabs.get(snapshot.tabId);
     if (tab !== undefined) {
       this.#forgetSeatNoticeOnSeatChange(tab.snapshot, snapshot);
+      // The PTY keeps whatever geometry the previous writer set, and an
+      // observer never resizes it. Taking the seat is therefore the first
+      // moment this client may state its own size -- without this, the remote
+      // keeps painting at the old writer's height and the bottom of a larger
+      // local terminal stays empty until some later host resize happens to
+      // occur. Reconcile once, on the observer -> writer edge only.
+      const becameWriter = tab.snapshot.accessMode === "observer" &&
+        snapshot.accessMode === "writer" && snapshot.state === "active";
       tab.snapshot = snapshot;
+      if (becameWriter) this.#reconcileSeatGeometry(snapshot);
       if (
         snapshot.state === "active" &&
-        (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === RECONNECT_FAILED_NOTICE)
+        (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === INPUT_STALLED_NOTICE ||
+          isReconnectFailedNotice(this.#browserNotice))
       ) {
         this.#browserNotice = undefined;
+      }
+      if (snapshot.state === "interrupted" && snapshot.reason === "input_ack_timeout") {
+        this.#browserNotice = INPUT_STALLED_NOTICE;
       }
       if (
         this.#localDetachTabIds.has(snapshot.tabId) &&
@@ -738,7 +758,8 @@ export class ForegroundTerminalCoordinator {
       void this.stop().catch(() => { this.#state = "failed"; });
       return;
     }
-    if (snapshot.state === "interrupted" && !this.#reconnectTasks.has(snapshot.tabId)) {
+    if (snapshot.state === "interrupted" && !this.#reconnectTasks.has(snapshot.tabId) &&
+        !this.#recoverableReconnectFailures.has(snapshot.tabId)) {
       this.#startRecovery(snapshot.tabId);
     }
     this.#queueStateRender();
@@ -756,7 +777,8 @@ export class ForegroundTerminalCoordinator {
         const snapshot = await this.#requireRuntime().reconnect({ tabId, signal: this.#lifetimeAbort.signal });
         await this.#reconcileGeometry(snapshot, false);
         this.#recoverableReconnectFailures.delete(tabId);
-        if (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === RECONNECT_FAILED_NOTICE) {
+        if (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === INPUT_STALLED_NOTICE ||
+          isReconnectFailedNotice(this.#browserNotice)) {
           this.#browserNotice = undefined;
         }
         return;
@@ -772,7 +794,7 @@ export class ForegroundTerminalCoordinator {
         "Automatic terminal reconnection was exhausted.",
         { retryable: true },
       ));
-      this.#browserNotice = RECONNECT_FAILED_NOTICE;
+      this.#browserNotice = reconnectFailedNotice(this.#recoverableReconnectFailures.get(tabId));
       await this.#render();
     }
   }
@@ -811,7 +833,7 @@ export class ForegroundTerminalCoordinator {
         this.#pendingBrowserAction = undefined;
         this.#pendingBrowserActionTabId = undefined;
       }
-      this.#browserNotice = INPUT_WITHHELD_NOTICE;
+      this.#browserNotice = this.#unavailableInputNotice();
       void this.#render().catch(() => undefined);
       return;
     }
@@ -854,7 +876,7 @@ export class ForegroundTerminalCoordinator {
           this.#pendingBrowserAction = undefined;
           this.#pendingBrowserActionTabId = undefined;
         }
-        this.#browserNotice = INPUT_WITHHELD_NOTICE;
+        this.#browserNotice = this.#unavailableInputNotice();
         void this.#render().catch(() => undefined);
         return;
       }
@@ -1104,13 +1126,13 @@ export class ForegroundTerminalCoordinator {
     if (target === undefined || target.tabId !== this.#activeTabId || tab === undefined || link === undefined ||
         link.agentSessionId !== tab.snapshot.agentSessionId || link.processEpoch !== tab.snapshot.processEpoch ||
         link.fencingGeneration !== tab.snapshot.fencingGeneration) {
-      this.#browserNotice = "No hay enlace para copiar. Solicita un enlace de acceso en el agente.";
+      this.#browserNotice = "No sign-in link available. Request a new link in the agent.";
     } else {
       try {
         await (this.#options.copyText ?? copyLocalText)(link.url);
-        this.#browserNotice = "Enlace copiado al portapapeles local. Si caducó, solicita uno nuevo.";
+        this.#browserNotice = "Full link copied. Paste it into your browser.";
       } catch {
-        this.#browserNotice = "No se pudo copiar el enlace al portapapeles local. Inténtalo de nuevo.";
+        this.#browserNotice = "Could not copy the link. Try again.";
       }
     }
     await this.#render();
@@ -1604,6 +1626,11 @@ export class ForegroundTerminalCoordinator {
     try { await this.#render(); } catch { /* restore still owns terminal cleanup */ }
   }
 
+  #unavailableInputNotice(): string {
+    const failure = this.#activeTabId === undefined ? undefined : this.#recoverableReconnectFailures.get(this.#activeTabId);
+    return failure === undefined ? INPUT_WITHHELD_NOTICE : reconnectFailedNotice(failure);
+  }
+
   #captureInputTarget(): ForegroundInputTarget | undefined {
     const tabId = this.#activeTabId;
     if (tabId === undefined) return undefined;
@@ -1656,6 +1683,23 @@ export class ForegroundTerminalCoordinator {
       }
     }
     await this.#render();
+  }
+
+  /**
+   * Push this host's geometry to the PTY after the writer seat moves here.
+   * `#terminalState` is synchronous, so the reconciliation runs as its own
+   * guarded task; a refusal is reported like any other terminal failure and
+   * never silently leaves the viewport claiming a size the PTY does not have.
+   */
+  #reconcileSeatGeometry(snapshot: RuntimeTerminalSnapshot): void {
+    void this.#reconcileGeometry(snapshot, false).then(
+      () => this.#queueStateRender(),
+      (error) => {
+        if (this.#state !== "active") return;
+        if (error instanceof RuntimeBoundaryError && (error.code === "terminal_observer" || error.code === "terminal_disconnected")) return;
+        this.#recordFailure(error);
+      },
+    );
   }
 
   async #reconcileGeometry(
@@ -1751,7 +1795,9 @@ export class ForegroundTerminalCoordinator {
         id: tab.intent.tabId,
         label: tab.intent.label,
         agent: tab.intent.agent,
-        viewport: tab.snapshot.accessMode === "observer"
+        // Hidden tabs contribute labels only; projecting their cells would
+        // recapture a full terminal on every visible output frame.
+        viewport: tab.intent.tabId === activeTabId && tab.snapshot.accessMode === "observer"
           ? tab.viewport.snapshotForHost(dimensions.columns, remoteRows(dimensions.rows))
           : tab.viewport.snapshot(),
       }));
@@ -1760,7 +1806,7 @@ export class ForegroundTerminalCoordinator {
         rows: dimensions.rows,
         activeTabId,
         tabs,
-        ...(this.#copyLinks.has(activeTabId) ? { action: "Copiar enlace · Ctrl+] y" } : {}),
+        ...(this.#copyLinks.has(activeTabId) ? { action: "Copy link · Ctrl+] y" } : {}),
         appbar: this.#options.appbar?.() ?? runtimeAppbar(
           this.#clock(),
           this.#tabs.get(activeTabId)?.snapshot,
@@ -1773,7 +1819,7 @@ export class ForegroundTerminalCoordinator {
             ? { notice: "Restoring terminal\u2026" }
           : this.#browserNotice !== undefined
             ? { notice: this.#tabs.get(activeTabId)?.snapshot.historicalInputUncertainty === true &&
-                (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === RECONNECT_FAILED_NOTICE)
+                (this.#browserNotice === INPUT_WITHHELD_NOTICE || isReconnectFailedNotice(this.#browserNotice))
               ? `${HISTORICAL_INPUT_NOTICE} · ${this.#browserNotice}` : this.#browserNotice }
             : this.#pendingBrowserAction !== undefined && this.#pendingBrowserActionTabId === activeTabId
               ? {
@@ -1801,9 +1847,11 @@ export class ForegroundTerminalCoordinator {
       // key changed no row). A byte-identical frame is not written again;
       // anything else that touches the host clears this memory first.
       if (this.#lastHostFrame !== undefined && sameBytes(this.#lastHostFrame, frame.bytes)) return;
+      const update = workbenchUpdate(this.#lastHostFrame === undefined ? undefined : this.#lastWorkbenchFrame, frame);
       this.#lastHostFrame = undefined;
-      await this.#options.host.write(frame.bytes);
+      await this.#options.host.write(update);
       this.#lastHostFrame = frame.bytes;
+      this.#lastWorkbenchFrame = frame;
     });
     this.#renderTail = operation.then(() => undefined, () => undefined);
     await operation;
@@ -2075,6 +2123,28 @@ export function admitForegroundDimensions(input: { readonly columns: number; rea
     throw new RangeError("The foreground host terminal dimensions are outside supported bounds.");
   }
   return Object.freeze({ columns: input.columns, rows: input.rows });
+}
+
+/**
+ * Automatic recovery gave up. Name the typed reason it gave up on: the person
+ * is looking at a frozen frame and "Reconnect failed" alone tells them nothing
+ * about whether retrying can help. Only this client's own closed error codes
+ * are rendered -- never remote text.
+ */
+function reconnectFailedNotice(failure: unknown): string {
+  if (!(failure instanceof RuntimeBoundaryError)) return RECONNECT_FAILED_NOTICE;
+  // The capability name is this client's own closed enum, not remote text, and
+  // it is the one word that says WHICH contract the replacement grant failed to
+  // prove. Without it "capability unknown" cannot be acted on by anyone.
+  const capability = failure.safeDetails?.capability;
+  const subject = typeof capability === "string" && /^[a-z_]{1,32}$/u.test(capability)
+    ? `${failure.code.replaceAll("_", " ")} (${capability.replaceAll("_", " ")})`
+    : failure.code.replaceAll("_", " ");
+  return `Reconnect failed: ${subject} · Ctrl+] r retries · Ctrl+C disconnects.`;
+}
+
+function isReconnectFailedNotice(value: string | undefined): boolean {
+  return value !== undefined && value.startsWith("Reconnect failed");
 }
 
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {

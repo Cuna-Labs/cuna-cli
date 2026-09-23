@@ -48,6 +48,7 @@ function agentSession(overrides = {}) {
     name: "api work",
     agent: "claude-code",
     workspaceIdentity: WORKSPACE,
+    workspaceKind: "binding",
     workspaceGeneration: 7,
     cwd: "services/api",
     authMode: "interactive_login",
@@ -555,4 +556,43 @@ test("one usable Machine among same-named siblings is selected, not refused", ()
     ),
   );
   assert.equal(none.reason, "state-not-reusable");
+});
+
+/**
+ * A session created through the execution-Workspace path is published without
+ * `workspace_binding_id` or `workspace_generation`; its Workspace is named by
+ * its cwd. Until 2026-09-21 the observation mapped that to identity `"unknown"`
+ * and generation 0, so no running v2 session could equal the identity the
+ * journey looked for, and `cuna claude <path>` on a Machine that already ran
+ * that Workspace went to "Creating Claude Code session". Measured in production
+ * on Machine bd94a624, session 8d99301b (running, detached, fresh, same cwd).
+ */
+test("a running execution-Workspace session is reused by identity, without a generation operand", () => {
+  const EXECUTION = "275bcc3f-c3ca-425e-b827-861ed42d6533";
+  const v2 = agentSession({
+    workspaceIdentity: EXECUTION,
+    workspaceKind: "execution",
+    workspaceGeneration: 0,
+    cwd: `workspaces/${EXECUTION}`,
+  });
+  const input = agentSessionInput([v2], {
+    workspaceIdentity: EXECUTION,
+    workspaceGeneration: 1,
+    cwd: `workspaces/${EXECUTION}`,
+  });
+  const plan = planAgentSessionSelection(input);
+  assert.equal(plan.kind, "select");
+  assert.equal(plan.agentSessionId, SESSION_A);
+
+  // The same wire shape with no Workspace named at all is still never the
+  // journey's Workspace: identity `unknown` cannot match.
+  const unnamed = agentSession({ workspaceIdentity: "unknown", workspaceKind: "unknown", workspaceGeneration: 0, cwd: "." });
+  const refused = planAgentSessionSelection(agentSessionInput([unnamed], { workspaceIdentity: EXECUTION, workspaceGeneration: 1, cwd: `workspaces/${EXECUTION}` }));
+  assert.notEqual(refused.kind, "select");
+
+  // A binding session keeps the generation comparison it always had.
+  const staleBinding = agentSession({ workspaceGeneration: 6 });
+  const mismatch = planAgentSessionSelection(agentSessionInput([staleBinding], { agentSessionId: SESSION_A }));
+  assert.equal(mismatch.kind, "incompatible");
+  assert.equal(mismatch.reason, "workspace-generation-mismatch");
 });

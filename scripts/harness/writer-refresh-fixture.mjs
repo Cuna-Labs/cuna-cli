@@ -13,6 +13,7 @@ const callbacks = coordinator.runtimeCallbacks();
 let accessMode = "observer", epoch = 1, outputSequence = 0n;
 let capability = { supported: true, reasonCode: null, expiresAt: Date.now() - 1 };
 let discoveries = 0, transfers = 0, accepted = "";
+let observerInputDispatches = 0;
 const snapshot = () => ({
   tabId: intent.tabId, viewId: "fixture:1", userId: "fixture-user", machineId: "fixture-machine",
   agentSessionId: intent.agentSessionId, processEpoch: "44444444-4444-4444-8444-444444444444",
@@ -47,7 +48,10 @@ const runtime = {
     return snapshot();
   },
   async sendInput(bytes) {
-    if (accessMode !== "writer") throw runtimeFailure("terminal_observer", "Fixture observer input is disabled.");
+    if (accessMode !== "writer") {
+      observerInputDispatches++;
+      throw runtimeFailure("terminal_observer", "Fixture observer input is disabled.");
+    }
     accepted += new TextDecoder().decode(bytes);
     await output(`ACCEPTED ${JSON.stringify(accepted)}`);
   },
@@ -61,4 +65,5 @@ if (coordinator.failure !== undefined) throw coordinator.failure;
 assert.equal(discoveries, 1);
 assert.equal(transfers, mode === "supported" ? 1 : 0);
 assert.equal(accepted, mode === "supported" ? "safe-input" : "");
-console.log(`WRITER_REFRESH_RESULT ${JSON.stringify({ mode, discoveries, transfers, acceptedBytes: accepted.length, accessMode })}`);
+assert.equal(observerInputDispatches, mode === "unsupported" ? 1 : 0, "unsupported input must exercise the runtime refusal exactly once");
+console.log(`WRITER_REFRESH_RESULT ${JSON.stringify({ mode, discoveries, transfers, acceptedBytes: accepted.length, accessMode, observerInputDispatches })}`);
