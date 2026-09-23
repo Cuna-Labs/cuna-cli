@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,7 +17,9 @@ import {
   LocalEncryptedSessionBackend,
   localEncryptedSessionPaths,
   parseWindowsAclBatchInspection,
+  parseWindowsAclFingerprintRecord,
   SecretMaterial,
+  WINDOWS_ACL_AUTHORITY,
   WINDOWS_ACL_COMMAND_PROGRAMS,
 } from "../dist/credentials/index.js";
 
@@ -301,6 +303,130 @@ test("an authority without batching is inspected path by path within one operati
     assert.equal(compliant.delete(`file:${paths.sessionFile}`), true);
     await assert.rejects(backend.read("ignored"), (error) => error?.code === "credential_backend_unverified");
   } finally { await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); }
+});
+
+function countingOsAcl(counts) {
+  return {
+    inspectOwnerOnly: async (target, directoryEntry) => { counts.single += 1; return await WINDOWS_ACL_AUTHORITY.inspectOwnerOnly(target, directoryEntry); },
+    inspectManyOwnerOnly: async (requests) => { counts.batch += 1; return await WINDOWS_ACL_AUTHORITY.inspectManyOwnerOnly(requests); },
+    reconcileNewOwnerOnly: async (target, directoryEntry) => { counts.reconcile += 1; return await WINDOWS_ACL_AUTHORITY.reconcileNewOwnerOnly(target, directoryEntry); },
+  };
+}
+
+test("a verified ACL record spares later processes the OS inspection, and a real ACL change is still refused", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cuna-local-session-acl-record-"));
+  const paths = localEncryptedSessionPaths(directory, "acl-record");
+  const counts = { single: 0, batch: 0, reconcile: 0 };
+  // A new backend object has no in-memory state: it stands for a new process.
+  const nextProcess = () => new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl: countingOsAcl(counts), windowsAclFingerprint: true });
+  const spent = async (operation) => {
+    const before = { ...counts };
+    await operation();
+    return { single: counts.single - before.single, batch: counts.batch - before.batch, reconcile: counts.reconcile - before.reconcile };
+  };
+  const secret = Buffer.from(`cuna_login_${"r".repeat(43)}`);
+  try {
+    await nextProcess().replace("ignored", secret);
+    // The first reader after a write inspects once and records what it saw.
+    assert.deepEqual(await spent(async () => assert.deepEqual(Buffer.from(await nextProcess().read("ignored")), secret)), { single: 0, batch: 1, reconcile: 0 });
+    // Every later process: no OS inspection at all.
+    for (let index = 0; index < 3; index += 1) {
+      const backend = nextProcess();
+      assert.deepEqual(await spent(async () => {
+        assert.equal((await backend.probe()).status, "verified");
+        assert.deepEqual(Buffer.from(await backend.read("ignored")), secret);
+        await backend.withRefreshLock("ignored", async () => assert.deepEqual(Buffer.from(await backend.read("ignored")), secret));
+      }), { single: 0, batch: 0, reconcile: 0 }, "a matching record stands in for the spawn");
+    }
+
+    // Negative control at the real gate: grant Everyone read on the key. Only
+    // the ACL changes (no bytes), so only the ctime witness can see it.
+    await execFileAsync("C:\\Windows\\System32\\icacls.exe", [paths.keyFile, "/grant", "*S-1-1-0:R"]);
+    const tampered = nextProcess();
+    assert.deepEqual(await spent(async () => assert.equal((await tampered.probe()).status, "unavailable")), { single: 0, batch: 1, reconcile: 0 },
+      "the changed key sends the operation back to the OS");
+    await assert.rejects(tampered.read("ignored"), (error) => error?.code === "credential_backend_unverified" && error?.retryable === false);
+    assert.equal((await nextProcess().probe()).status, "unavailable", "a refusal is never recorded");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+
+  const second = await mkdtemp(path.join(tmpdir(), "cuna-local-session-acl-record-directory-"));
+  try {
+    const secondPaths = localEncryptedSessionPaths(second, "acl-record-directory");
+    const make = () => new LocalEncryptedSessionBackend({ ...secondPaths, platform: process.platform, windowsAcl: countingOsAcl(counts), windowsAclFingerprint: true });
+    await make().replace("ignored", secret);
+    assert.equal((await make().probe()).status, "verified");
+    assert.deepEqual(await spent(async () => assert.equal((await make().probe()).status, "verified")), { single: 0, batch: 0, reconcile: 0 });
+    // The directory's own ACL: children keep their protected DACLs, so only
+    // the directory's ctime moves.
+    await execFileAsync("C:\\Windows\\System32\\icacls.exe", [path.dirname(secondPaths.sessionFile), "/grant", "*S-1-1-0:(OI)(CI)R"]);
+    assert.equal((await make().probe()).status, "unavailable", "a changed directory ACL is seen by the next process");
+  } finally { await rm(second, { recursive: true, force: true }); }
+});
+
+test("an ACL record is written only for an unchanged, owner-only observation and a bad record is ignored", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cuna-local-session-acl-record-rules-"));
+  const paths = localEncryptedSessionPaths(directory, "acl-record-rules");
+  const record = `${paths.sessionFile}.acl`;
+  const compliant = new Set();
+  const counters = { single: 0, batch: 0, reconcile: 0, sid: 0, batchSizes: [] };
+  const acl = countingAcl(compliant, counters);
+  let duringBatch;
+  const windowsAcl = {
+    ...acl,
+    inspectManyOwnerOnly: async (requests) => {
+      const results = await acl.inspectManyOwnerOnly(requests);
+      await duringBatch?.();
+      return results;
+    },
+  };
+  // countingAcl hands out a fresh SID per spawn; a record is one SID's claim.
+  const make = () => new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl, windowsAclFingerprint: true });
+  const batches = async (operation) => { const before = counters.batch; await operation(); return counters.batch - before; };
+  try {
+    await make().replace("ignored", Buffer.from(`cuna_login_${"q".repeat(43)}`));
+    assert.equal(await batches(async () => assert.equal((await make().probe()).status, "verified")), 1);
+    assert.equal(await batches(async () => assert.equal((await make().probe()).status, "verified")), 0, "the record now matches");
+
+    // A change between the stats and the inspection's end voids the record.
+    await writeFile(record, "{}");
+    duringBatch = async () => { const now = new Date(); await utimes(paths.keyFile, now, now); };
+    assert.equal(await batches(async () => assert.equal((await make().probe()).status, "verified")), 1);
+    duringBatch = undefined;
+    assert.equal(await batches(async () => assert.equal((await make().probe()).status, "verified")), 1, "nothing was recorded across the change");
+    assert.equal(await batches(async () => assert.equal((await make().probe()).status, "verified")), 0);
+
+    // A record that does not describe what is on disk is ignored, then replaced.
+    const good = JSON.parse(await readFile(record, "utf8"));
+    await writeFile(record, JSON.stringify({ ...good, key: { ...good.key, ctimeNs: "1" } }));
+    assert.equal(await batches(async () => assert.equal((await make().probe()).status, "verified")), 1, "a forged stat is no record");
+    await writeFile(record, "not json");
+    assert.equal(await batches(async () => assert.equal((await make().probe()).status, "verified")), 1, "garbage is no record");
+
+    // A refusal is never recorded: an unsafe key stays unsafe on every read.
+    compliant.delete(`file:${paths.keyFile}`);
+    await writeFile(record, "{}");
+    for (let index = 0; index < 2; index += 1) {
+      assert.equal(await batches(async () => assert.equal((await make().probe()).status, "unavailable")), 1);
+    }
+    assert.equal(await readFile(record, "utf8"), "{}", "the refused observation left the placeholder untouched");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("an ACL record parses strictly", () => {
+  const stat = { dev: "1", ino: "2", size: "3", birthtimeNs: "4", mtimeNs: "5", ctimeNs: "6" };
+  const sid = "S-1-5-21-123-456-789-1001";
+  assert.deepEqual(parseWindowsAclFingerprintRecord(JSON.stringify({ version: 1, currentSid: sid, directory: stat })), { version: 1, currentSid: sid, directory: stat });
+  assert.equal(parseWindowsAclFingerprintRecord(JSON.stringify({ version: 1, currentSid: sid, directory: stat, key: stat, session: stat }))?.session?.ino, "2");
+  for (const bad of [
+    { version: 2, currentSid: sid, directory: stat },
+    { version: 1, currentSid: "S-1-", directory: stat },
+    { version: 1, currentSid: sid },
+    { version: 1, currentSid: sid, directory: { ...stat, extra: "1" } },
+    { version: 1, currentSid: sid, directory: { ...stat, ino: 2 } },
+    { version: 1, currentSid: sid, directory: { ...stat, ino: "-2" } },
+    { version: 1, currentSid: sid, directory: stat, other: stat },
+  ]) assert.equal(parseWindowsAclFingerprintRecord(JSON.stringify(bad)), undefined, JSON.stringify(bad));
+  assert.equal(parseWindowsAclFingerprintRecord("{"), undefined);
 });
 
 function waitForChild(child, phase) {
