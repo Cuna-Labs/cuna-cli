@@ -292,10 +292,19 @@ test("a crash-like dependency failure leaves a durable remote apply that resumes
   const authority = new MemoryAuthority(2, desired.manifestRoot);
   loadChunks(authority, desired, desiredFiles);
   authority.pages = [remotePage(2, fx.manifest, desired)];
-  authority.readFailures.push(networkFailure());
+  // The chunk stays unreadable for the whole first run. One failure is not
+  // enough: remote changes are taken in before the start-up scan, and that scan
+  // leaves `paused`, so the next pass read the chunk and finished the apply —
+  // on a fast host before this wait ever saw the pause (main CI, 2026-09-23).
+  authority.readFailures = Array.from({ length: 10_000 }, networkFailure);
   const first = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness()));
-  await waitFor(() => first.snapshot.state === "paused" && first.snapshot.pendingRemoteChanges > 0, "pending apply was not durable");
-  await first.stop();
+  try {
+    await waitFor(() => first.snapshot.state === "paused" && first.snapshot.pendingRemoteChanges > 0, "pending apply was not durable");
+  } finally {
+    await first.stop();
+  }
+  assert.equal(first.snapshot.generation, 1, "the first run must not have applied the generation");
+  authority.readFailures = [];
 
   const second = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness()));
   t.after(async () => { await second.stop(); await fx.cleanup(); });
