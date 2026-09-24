@@ -1,4 +1,5 @@
 import { copyLocalText } from "../local-actions/clipboard.js";
+import { AGENT_SESSION_AUTH_MAX_FUTURE_SKEW_MS, AGENT_SESSION_AUTH_MAX_TTL_MS } from "../api/contracts.js";
 import type {
   RuntimeTerminalResponse,
   RuntimeTerminalSnapshot,
@@ -236,6 +237,7 @@ interface ForegroundTab {
   readonly intent: ForegroundTabIntent;
   snapshot: RuntimeTerminalSnapshot;
   viewport: XtermViewportAdapter;
+  providerAuthentication: StatusEvidence<string> | undefined;
 }
 
 export class ForegroundTerminalCoordinator {
@@ -429,6 +431,37 @@ export class ForegroundTerminalCoordinator {
       localActionKinds: (agentSessionId) => this.#localActionKindsForSession(agentSessionId),
       onLocalActionFrame: async (event) => await this.#localActionFrame(event),
     });
+  }
+
+  /** Apply only fresh display evidence for the still-attached process. */
+  async applyProviderAuthentication(input: {
+    readonly tabId: string;
+    readonly agentSessionId: string;
+    readonly processEpoch: string;
+    readonly evidence: StatusEvidence<string>;
+  }): Promise<boolean> {
+    const tab = this.#tabs.get(input.tabId);
+    const now = this.#clock();
+    const evidence = input.evidence;
+    if (
+      this.#state !== "active" ||
+      tab === undefined ||
+      tab.snapshot.state !== "active" ||
+      tab.snapshot.agentSessionId !== input.agentSessionId ||
+      tab.snapshot.processEpoch !== input.processEpoch ||
+      evidence.source.length === 0 ||
+      evidence.correlationId.length === 0 ||
+      !Number.isFinite(evidence.observedAt) ||
+      !Number.isFinite(evidence.expiresAt) ||
+      evidence.observedAt > now + AGENT_SESSION_AUTH_MAX_FUTURE_SKEW_MS ||
+      evidence.expiresAt <= now ||
+      evidence.expiresAt < evidence.observedAt ||
+      evidence.expiresAt - evidence.observedAt > AGENT_SESSION_AUTH_MAX_TTL_MS ||
+      !["authenticated", "configured", "login_required", "unavailable"].includes(evidence.value)
+    ) return false;
+    tab.providerAuthentication = evidence;
+    if (this.#activeTabId === input.tabId) await this.#render();
+    return true;
   }
 
   async start(intents: readonly ForegroundTabIntent[], signal?: AbortSignal): Promise<void> {
@@ -705,7 +738,14 @@ export class ForegroundTerminalCoordinator {
         throw runtimeFailure("terminal_disconnected", "Terminal rebinding completed after foreground ownership ended.");
       }
     }
-    this.#tabs.set(snapshot.tabId, { intent, snapshot, viewport });
+    this.#tabs.set(snapshot.tabId, {
+      intent, snapshot, viewport,
+      providerAuthentication: previous === undefined
+        ? intent.providerAuthentication
+        : previous.snapshot.processEpoch === snapshot.processEpoch
+          ? previous.providerAuthentication
+          : undefined,
+    });
     // A reconnect for the same binding may have dropped the outcome after the
     // local side effect completed. The server ACK is the only condition that
     // clears the cache, so resubmit it once this exact attachment is ready.
@@ -831,6 +871,9 @@ export class ForegroundTerminalCoordinator {
       // occur. Reconcile once, on the observer -> writer edge only.
       const becameWriter = tab.snapshot.accessMode === "observer" &&
         snapshot.accessMode === "writer" && snapshot.state === "active";
+      if (tab.snapshot.agentSessionId !== snapshot.agentSessionId || tab.snapshot.processEpoch !== snapshot.processEpoch) {
+        tab.providerAuthentication = undefined;
+      }
       tab.snapshot = snapshot;
       if (becameWriter) this.#reconcileSeatGeometry(snapshot);
       if (
@@ -2185,6 +2228,7 @@ export class ForegroundTerminalCoordinator {
           this.#clock(),
           this.#tabs.get(activeTabId)?.snapshot,
           this.#tabs.get(activeTabId)?.intent,
+          this.#tabs.get(activeTabId)?.providerAuthentication,
         ),
         color: this.#options.color ?? true,
         ...(this.#disconnectNotice !== undefined
@@ -2597,6 +2641,7 @@ function runtimeAppbar(
   now: number,
   snapshot: RuntimeTerminalSnapshot | undefined,
   intent: ForegroundTabIntent | undefined,
+  providerAuthentication?: StatusEvidence<string>,
 ): AppbarModel {
   if (snapshot === undefined) return unknownAppbar(now);
   const evidence = {
@@ -2615,9 +2660,9 @@ function runtimeAppbar(
       ? []
       : [intent.agentSessionLifecycle],
     attachment: [{ ...evidence, value: snapshot.state === "active" ? "attached" : snapshot.state }],
-    providerAuthentication: intent?.providerAuthentication === undefined
+    providerAuthentication: providerAuthentication === undefined
       ? []
-      : [intent.providerAuthentication],
+      : [providerAuthentication],
     workspaceSync: [],
   });
 }

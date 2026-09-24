@@ -49,6 +49,12 @@ import {
 const TERMINAL_CAPABILITY_ID = "terminal_connections.create";
 const OPENCODE_AUTH_ADVISORY_TIMEOUT_MS = 250;
 const PROVIDER_AUTH_ADVISORY_TIMEOUT_MS = 2_000;
+interface PendingProviderAuthProbe {
+  readonly tabId: string;
+  readonly agentSessionId: string;
+  readonly processEpoch: string;
+  readonly evidence: Promise<ForegroundTabIntent["providerAuthentication"]>;
+}
 // A first interactive OpenCode session has no credential state yet. Provider
 // auth is an advisory display observation: it may be absent, temporarily
 // unreachable, or unavailable on an older deployment. A fresh supervisor
@@ -443,9 +449,15 @@ async function runNodeForegroundSessionsAdmitted(
   });
   const intents: ForegroundTabIntent[] = [];
   const sessions: AgentSession[] = [];
+  const authSubjects: Array<{
+    readonly tabId: string;
+    readonly session: AgentSession;
+    readonly observation: ReturnType<typeof assertRemoteAgentSessionEvidence>;
+  }> = [];
   for (let index = 0; index < sessionIds.length; index += 1) {
     const agentSessionId = sessionIds[index];
     if (agentSessionId === undefined) continue;
+    const tabId = dependencies.tabId?.(index) ?? `tab:${index + 1}`;
     throwIfAborted(input.signal);
     input.onProgress?.("Checking selected AgentSession");
     const session = await input.client.getAgentSession(agentSessionId, input.signal);
@@ -491,17 +503,17 @@ async function runNodeForegroundSessionsAdmitted(
     });
     throwIfAborted(input.signal);
     admitSessionIdentity(session, observation, agentSessionId);
-    input.onProgress?.("Checking provider sign-in");
-    const providerAuthentication = await observeProviderAuthentication({
-      client: input.client,
-      session,
-      observation,
-      now: clock,
-      ...(input.signal === undefined ? {} : { signal: input.signal }),
-      // Provider authentication decorates the terminal; it does not admit it.
-      // Apply the same bound on the first attach as on a session switch.
-      advisoryTimeoutMs: PROVIDER_AUTH_ADVISORY_TIMEOUT_MS,
-    });
+    // OpenCode's login-pending presentation is part of its existing admission
+    // semantics. Claude and Codex can open with auth unknown and update later.
+    let providerAuthentication: ForegroundTabIntent["providerAuthentication"];
+    if (session.agent === "opencode") {
+      input.onProgress?.("Checking provider sign-in");
+      providerAuthentication = await observeProviderAuthentication({
+        client: input.client, session, observation, now: clock,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        advisoryTimeoutMs: PROVIDER_AUTH_ADVISORY_TIMEOUT_MS,
+      });
+    }
     throwIfAborted(input.signal);
     if (capability.expiresAt <= clock()) {
       // Provider sign-in inspection can outlast the short authorization lease.
@@ -522,8 +534,11 @@ async function runNodeForegroundSessionsAdmitted(
       }, clock());
       throwIfAborted(input.signal);
     }
+    if (session.agent !== "opencode" && presentationMode === "rich") {
+      authSubjects.push({ tabId, session, observation });
+    }
     intents.push(Object.freeze({
-      tabId: dependencies.tabId?.(index) ?? `tab:${index + 1}`,
+      tabId,
       agentSessionId,
       label: safeSessionLabel(session),
       agent: session.agent,
@@ -563,6 +578,20 @@ async function runNodeForegroundSessionsAdmitted(
   }
 
   const identity = await claimClientIdentity(input, dependencies, sessions);
+  const authAbort = new AbortController();
+  const authSignal = input.signal === undefined
+    ? authAbort.signal
+    : AbortSignal.any([input.signal, authAbort.signal]);
+  const providerAuthProbes: readonly PendingProviderAuthProbe[] = authSubjects.map(({ tabId, session, observation }) => ({
+    tabId,
+    agentSessionId: session.id,
+    processEpoch: observation.processEpoch,
+    evidence: observeProviderAuthentication({
+      client: input.client, session, observation, now: clock,
+      signal: authSignal,
+      advisoryTimeoutMs: PROVIDER_AUTH_ADVISORY_TIMEOUT_MS,
+    }).catch(() => undefined),
+  }));
   try {
     return await runClaimedForeground(input, dependencies, {
       clock,
@@ -572,11 +601,13 @@ async function runNodeForegroundSessionsAdmitted(
       controlPlane,
       allowedOrigin,
       intents,
+      providerAuthProbes,
       clientInstanceId: identity?.clientInstanceId ?? dependencies.clientInstanceId?.() ?? `cli:${randomUUID()}`,
       ...(identity === undefined ? {} : { identity }),
       switchContext: context,
     });
   } finally {
+    authAbort.abort();
     await identity?.release();
   }
 }
@@ -626,6 +657,7 @@ async function runClaimedForeground(
     readonly controlPlane: TerminalControlPlane;
     readonly allowedOrigin: string;
     readonly intents: readonly ForegroundTabIntent[];
+    readonly providerAuthProbes: readonly PendingProviderAuthProbe[];
     readonly clientInstanceId: string;
     readonly identity?: TerminalClientIdentity;
     readonly switchContext: ForegroundSwitchContext;
@@ -680,7 +712,22 @@ async function runClaimedForeground(
 
   let failure: unknown;
   try {
-    await coordinator.start(intents, input.signal);
+    const starting = coordinator.start(intents, input.signal);
+    if (coordinator instanceof ForegroundTerminalCoordinator) {
+      for (const probe of context.providerAuthProbes) {
+        void probe.evidence.then(async (evidence) => {
+          if (evidence === undefined) return;
+          await starting;
+          await coordinator.applyProviderAuthentication({
+            tabId: probe.tabId,
+            agentSessionId: probe.agentSessionId,
+            processEpoch: probe.processEpoch,
+            evidence,
+          });
+        }).catch(() => undefined);
+      }
+    }
+    await starting;
     await coordinator.waitForStop();
     if (coordinator.failure !== undefined) throw coordinator.failure;
   } catch (error) {

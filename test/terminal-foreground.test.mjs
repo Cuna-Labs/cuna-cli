@@ -95,6 +95,45 @@ test("only the visible observer is projected for host rendering", async () => {
   }
 });
 
+test("late provider auth updates are fenced to the attached session, epoch and freshness", async () => {
+  const now = 1_800_000_000_000;
+  const host = new FakeHost();
+  host.columns = 160;
+  const { coordinator, callbacks, intents } = harness({ host, coordinatorOptions: { clock: () => now } });
+  const evidence = {
+    value: "authenticated", source: "provider-auth-observation",
+    observedAt: now - 100, expiresAt: now + 10_000,
+    correlationId: "observation-1",
+  };
+  const input = {
+    tabId: intents[0].tabId,
+    agentSessionId: SESSION_A,
+    processEpoch: `epoch-${SESSION_A}`,
+    evidence,
+  };
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    assert.match(await visibleHostText(host), /Claude auth unknown/u);
+    const before = host.writes.length;
+    assert.equal(await coordinator.applyProviderAuthentication({ ...input, agentSessionId: SESSION_B }), false);
+    assert.equal(await coordinator.applyProviderAuthentication({ ...input, processEpoch: `epoch-${SESSION_B}` }), false);
+    assert.equal(await coordinator.applyProviderAuthentication({ ...input, evidence: { ...evidence, expiresAt: now } }), false);
+    assert.equal(await coordinator.applyProviderAuthentication({ ...input, evidence: { ...evidence, observedAt: now + 60_000 } }), false);
+    assert.equal(host.writes.length, before, "rejected evidence cannot repaint the bar");
+    assert.equal(await coordinator.applyProviderAuthentication(input), true);
+    assert.match(await visibleHostText(host), /Claude auth authenticated/u);
+    callbacks.onTerminalState({ ...snapshot(intents[0], 2), processEpoch: "replacement-epoch" });
+    await waitUntil(() => new TextDecoder().decode(host.writes.at(-1)).includes("Claude auth unknown"),
+      "a replacement process discards the previous auth label");
+    assert.equal(await coordinator.applyProviderAuthentication(input), false);
+  } finally {
+    await coordinator.stop();
+  }
+  const afterStop = host.writes.length;
+  assert.equal(await coordinator.applyProviderAuthentication(input), false);
+  assert.equal(host.writes.length, afterStop);
+});
+
 test("canonical foreground resets the parser at higher fence and initial blank view uses real geometry", async () => {
   const {coordinator,callbacks,host,intents}=harness();
   try {

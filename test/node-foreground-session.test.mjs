@@ -45,7 +45,20 @@ for (const refreshedAvailability of ["supported", "unsupported"]) {
       async observeAgentSession(id) { return observation(id, { observedAt: new Date(time - 100).toISOString(), expiresAt: new Date(time + 20000).toISOString() }); },
     };
     await assert.rejects(runSupportedForegroundSessions({
-      client: fakeClient(events, { async getAgentSessionAuth() { time += 31000; throw new Error("auth status unavailable"); } }),
+      client: fakeClient(events, {
+        async getAgentSession(id) { return session(id, { agent: "opencode" }); },
+        async getAgentSessionAuth(id) {
+          time += 31000;
+          return {
+            observationId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            agentSessionId: id, agent: "opencode", processEpoch: `epoch-${id}`,
+            authMode: "interactive_login", agentVersion: "1.18.23",
+            adapterVersion: "runa.agent-auth.v1", evidenceClass: "provider_cli_credential_presence",
+            observedAt: new Date(time - 250).toISOString(),
+            validUntil: new Date(time + 10_000).toISOString(), state: "login_required",
+          };
+        },
+      }),
       baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A],
       onBeforeTerminalOwnership() { throw reached; },
     }, { host, controlPlane, terminalConnector: system.terminalConnector, clock: () => time }),
@@ -1714,6 +1727,87 @@ test("session tabs: Ctrl+C while switching ends the run; both sessions keep runn
   assert.deepEqual(lines, [`Detached · projA keeps running · cuna connect ${SESSION_A}\n`]);
 });
 
+test("first Claude terminal frame does not wait for advisory auth and accepts a fresh late answer", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const controller = new AbortController();
+  let finishAuth;
+  const authStatus = {
+    observationId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    agentSessionId: SESSION_A,
+    agent: "claude-code",
+    processEpoch: `epoch-${SESSION_A}`,
+    authMode: "interactive_login",
+    agentVersion: "2.1.226",
+    adapterVersion: "runa.agent-auth.v1",
+    evidenceClass: "provider_cli_login_status",
+    observedAt: new Date(NOW - 250).toISOString(),
+    validUntil: new Date(NOW + 10_000).toISOString(),
+    state: "authenticated",
+  };
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSessionAuth() { return await new Promise((resolve) => { finishAuth = resolve; }); },
+    }),
+    baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A], signal: controller.signal,
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW });
+  try {
+    await waitUntil(() => finishAuth !== undefined, "auth probe did not start");
+    await waitUntil(() => events.includes("wire:connected") && host.writes.some((bytes) =>
+      new TextDecoder().decode(bytes).includes("Claude auth unknown")),
+    "the terminal must paint while auth remains unresolved", 1_000);
+    assert.match(await visibleHostText(host), /Claude auth unknown/u);
+    finishAuth(authStatus);
+    await waitUntil(() => host.writes.some((bytes) => new TextDecoder().decode(bytes).includes("Claude auth authenticated")),
+      "fresh late auth evidence should update this terminal", 1_000);
+    assert.match(await visibleHostText(host), /Claude auth authenticated/u);
+    host.emitInput(Uint8Array.of(0x1d, 0x64));
+    await operation;
+  } finally {
+    finishAuth?.(authStatus);
+    controller.abort();
+    await operation.catch(() => undefined);
+  }
+});
+
+test("caller abort retires an unresolved auth probe and ignores its late answer", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const controller = new AbortController();
+  let finishAuth;
+  let probeSignal;
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events, {
+      async getAgentSessionAuth(_id, signal) {
+        probeSignal = signal;
+        // Deliberately ignore abort to test a late transport reply.
+        return await new Promise((resolve) => { finishAuth = resolve; });
+      },
+    }),
+    baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A], signal: controller.signal,
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW });
+  try {
+    await waitUntil(() => finishAuth !== undefined, "auth probe did not start");
+    await waitUntil(() => events.includes("wire:connected"), "auth must not hold the terminal admission", 1_000);
+    controller.abort();
+    await assert.rejects(operation, /cancelled/u);
+    assert.equal(probeSignal?.aborted, true);
+    const writesAtDetach = host.writes.length;
+    finishAuth({ state: "authenticated" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(host.writes.length, writesAtDetach, "late auth must not repaint a retired terminal");
+    assert.equal(host.restored, 1);
+  } finally {
+    finishAuth?.({ state: "authenticated" });
+    controller.abort();
+    await operation.catch(() => undefined);
+  }
+});
+
 test("first Claude attach does not wait on a slow advisory provider sign-in probe", async () => {
   const events = [];
   const host = new FakeHost(events);
@@ -1792,4 +1886,50 @@ test("session tabs: a switch does not wait on a slow provider sign-in probe", as
   host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   assert.deepEqual(probes.map((probe) => probe.id), [SESSION_A, SESSION_B]);
+});
+
+test("session tabs retire one client auth probe before starting another", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const controller = new AbortController();
+  const probes = [];
+  let active = 0;
+  let maximumActive = 0;
+  const client = {
+    ...machineClient(events),
+    async getAgentSessionAuth(id, signal) {
+      const probe = { id, signal };
+      probes.push(probe);
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      return await new Promise((_, reject) => {
+        const abort = () => {
+          active -= 1;
+          reject(signal.reason);
+        };
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      });
+    },
+  };
+  const operation = runSupportedForegroundSessions({
+    client, baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A],
+    terminalClients, signal: controller.signal,
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
+  try {
+    await waitUntil(() => probes.some((probe) => probe.id === SESSION_A), "A auth probe should begin");
+    await clickTab(host, "2:Claude projB");
+    await waitUntil(() => probes.some((probe) => probe.id === SESSION_B), "B auth probe should begin");
+    assert.equal(probes.find((probe) => probe.id === SESSION_A)?.signal.aborted, true);
+    assert.equal(maximumActive, 1, "the old client probe must end before the next one begins");
+    host.emitInput(Uint8Array.of(0x1d, 0x64));
+    await operation;
+    assert.equal(probes.find((probe) => probe.id === SESSION_B)?.signal.aborted, true);
+    assert.equal(active, 0);
+  } finally {
+    controller.abort();
+    await operation.catch(() => undefined);
+  }
 });
