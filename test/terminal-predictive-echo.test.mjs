@@ -35,12 +35,12 @@ function engine(mode = "on", onExpire = () => undefined) {
 }
 
 /** Three keys typed and echoed after `latencyMs`: the remote earns trust and an RTT estimate. */
-async function train(term, clock, latencyMs = 100, keys = "abc") {
+async function train(term, clock, latencyMs = 100, keys = "abc", keyId = KEY) {
   for (const key of keys) {
-    clock.echo.predict(encoder.encode(key), term.view(), KEY);
+    clock.echo.predict(encoder.encode(key), term.view(), keyId);
     clock.advance(latencyMs);
     await term.write(key);
-    clock.echo.reconcile(term.view(), KEY);
+    clock.echo.reconcile(term.view(), keyId);
   }
 }
 
@@ -178,6 +178,37 @@ test("a password prompt is never predicted, and an echo-off prompt loses trust",
   } finally { clock.echo.dispose(); term.viewport.dispose(); }
 });
 
+test("default mode never paints a secret after a prompt on the preceding row", async () => {
+  const term = screen(); const clock = engine(predictiveEchoModeFromEnvironment({}));
+  try {
+    await term.write("> ");
+    await train(term, clock, 100);
+    await term.write("\r\nPassword:\r\n> ");
+    clock.echo.predict(encoder.encode("s"), term.view(), KEY);
+    assert.equal(clock.echo.overlay(term.view(), KEY), undefined,
+      "the user's first secret glyph must wait for the remote screen even after earlier echoes");
+  } finally { clock.echo.dispose(); term.viewport.dispose(); }
+});
+
+test("echo trust from one tab never paints the next tab before its own confirmations", async () => {
+  const term = screen(); const clock = engine("on");
+  const otherKey = "tab-2:1:1:40x6";
+  try {
+    await term.write("> ");
+    await train(term, clock, 100);
+    clock.echo.predict(encoder.encode("s"), term.view(), otherKey);
+    assert.equal(clock.echo.overlay(term.view(), otherKey), undefined,
+      "a new tab's remote echo state is unknown");
+    clock.advance(100);
+    await term.write("s");
+    clock.echo.reconcile(term.view(), otherKey);
+    await train(term, clock, 100, "xyz", otherKey);
+    clock.echo.predict(encoder.encode("q"), term.view(), otherKey);
+    assert.equal(clock.echo.overlay(term.view(), otherKey)?.text, "q",
+      "the new tab can earn its own echo history when explicitly opted in");
+  } finally { clock.echo.dispose(); term.viewport.dispose(); }
+});
+
 test("Enter, Backspace and escape sequences withdraw guesses and pause predicting until the remote answers", async () => {
   const term = screen(); const clock = engine("on");
   try {
@@ -264,8 +295,9 @@ test("a guess never covers remote content or crosses a changed attachment", asyn
   } finally { clock.echo.dispose(); term.viewport.dispose(); }
 });
 
-test("CUNA_PREDICTIVE_ECHO accepts auto, on and off only", () => {
-  assert.equal(predictiveEchoModeFromEnvironment({}), "auto");
+test("CUNA_PREDICTIVE_ECHO defaults to off and accepts explicit auto, on and off", () => {
+  assert.equal(predictiveEchoModeFromEnvironment({}), "off");
+  assert.equal(predictiveEchoModeFromEnvironment({ CUNA_PREDICTIVE_ECHO: "auto" }), "auto");
   assert.equal(predictiveEchoModeFromEnvironment({ CUNA_PREDICTIVE_ECHO: " ON " }), "on");
   assert.equal(predictiveEchoModeFromEnvironment({ CUNA_PREDICTIVE_ECHO: "off" }), "off");
   assert.throws(() => predictiveEchoModeFromEnvironment({ CUNA_PREDICTIVE_ECHO: "yes" }), /auto, on, or off/u);
@@ -291,10 +323,10 @@ async function visibleHostText(host) {
   } finally { terminal.dispose(); }
 }
 
-function coordinatorHarness(accessMode = "writer") {
+function coordinatorHarness(accessMode = "writer", predictiveEcho = "on") {
   const host = new FakeHost();
   let now = 10_000;
-  const coordinator = new ForegroundTerminalCoordinator({ host, resizeCoalesceMs: 5, predictiveEcho: "on", clock: () => now });
+  const coordinator = new ForegroundTerminalCoordinator({ host, resizeCoalesceMs: 5, predictiveEcho, clock: () => now });
   const callbacks = coordinator.runtimeCallbacks();
   const intent = { tabId: "tab-a", agentSessionId: "11111111-1111-4111-8111-111111111111", label: "primary", agent: "claude-code" };
   const snapshot = {
@@ -343,6 +375,20 @@ async function trainCoordinator(h) {
   }
   await settle();
 }
+
+test("default rich writer forwards secret input without painting it before remote output", async () => {
+  const h = coordinatorHarness("writer", predictiveEchoModeFromEnvironment({}));
+  try {
+    await h.coordinator.start([h.intent]);
+    await trainCoordinator(h);
+    await h.output("\r\nPassword:\r\n> ");
+    h.host.emitInput("s");
+    await settle();
+    assert.equal(h.sent.at(-1), "s", "the input still reaches the remote once");
+    assert.doesNotMatch(await visibleHostText(h.host), /^> s$/mu,
+      "the host must not invent a local echo at the input cursor");
+  } finally { await h.coordinator.stop(); }
+});
 
 test("rich writer: the guess reaches the host before the network echo, and the key is still sent once", async () => {
   const h = coordinatorHarness();

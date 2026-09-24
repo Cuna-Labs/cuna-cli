@@ -21,12 +21,12 @@ import type { ViewportRenderRun, ViewportSnapshot } from "./viewport.js";
  *   or when it is still unconfirmed `PREDICTION_CONFIRM_TIMEOUT_MS` after it
  *   was typed. Rolling back is just painting the true row again.
  *
- * Guesses are always tracked, but only shown while the remote has earned it:
- * its last `PREDICTION_TRUST_CONFIRMATIONS` settled guesses were all echoed
- * exactly (an echo-off password prompt fails this at once), the measured echo
- * time is above `PREDICTIVE_ECHO_ENABLE_RTT_MS` (mode `auto`), and the input
- * line does not ask for a secret. `CUNA_PREDICTIVE_ECHO=off|on|auto` selects
- * the mode; `on` drops only the round-trip threshold, never a safety rule.
+ * Disabled by default: earlier echoes cannot prove that a later prompt will
+ * echo input, and secret prompts need not be on the current cursor row. Users
+ * may explicitly opt in with `CUNA_PREDICTIVE_ECHO=auto|on`. In those modes,
+ * guesses are shown only after recent echoes from this attachment were exact;
+ * `auto` also requires a measured slow echo. Prompt matching is defense in
+ * depth, not a guarantee that an arbitrary secret will never be painted.
  */
 
 export type PredictiveEchoMode = "off" | "on" | "auto";
@@ -45,7 +45,8 @@ const GRAPHEMES = new Intl.Segmenter("en", { granularity: "grapheme" });
 
 export function predictiveEchoModeFromEnvironment(environment: NodeJS.ProcessEnv): PredictiveEchoMode {
   const requested = environment.CUNA_PREDICTIVE_ECHO?.trim().toLowerCase();
-  if (requested === undefined || requested === "" || requested === "auto") return "auto";
+  if (requested === undefined || requested === "") return "off";
+  if (requested === "auto") return "auto";
   if (requested === "on" || requested === "off") return requested;
   throw runtimeFailure("pty_unavailable", "CUNA_PREDICTIVE_ECHO must be auto, on, or off.");
 }
@@ -288,9 +289,15 @@ export class PredictiveEcho {
 
   #adopt(key: string): boolean {
     if (this.#key === key) return false;
+    const shown = this.clear();
     this.#key = key;
     this.#barrierUntil = undefined;
-    return this.clear();
+    // A different tab, writer fence, or geometry has not earned the old
+    // attachment's echo history or latency estimate.
+    this.#recent = [];
+    this.#srtt = undefined;
+    this.#slowEcho = false;
+    return shown;
   }
 
   #displayAllowed(): boolean {
