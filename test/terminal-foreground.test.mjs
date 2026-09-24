@@ -122,6 +122,11 @@ test("late provider auth updates are fenced to the attached session, epoch and f
     assert.equal(host.writes.length, before, "rejected evidence cannot repaint the bar");
     assert.equal(await coordinator.applyProviderAuthentication(input), true);
     assert.match(await visibleHostText(host), /Claude auth authenticated/u);
+    await callbacks.onTerminalReady(snapshot(intents[0], 2));
+    const beforeReconnectPaint = host.writes.length;
+    host.emitResize();
+    await waitUntil(() => host.writes.length > beforeReconnectPaint, "the same-session reconnect should repaint");
+    assert.match(await visibleHostText(host), /Claude auth authenticated/u);
     callbacks.onTerminalState({ ...snapshot(intents[0], 2), processEpoch: "replacement-epoch" });
     await waitUntil(() => new TextDecoder().decode(host.writes.at(-1)).includes("Claude auth unknown"),
       "a replacement process discards the previous auth label");
@@ -132,6 +137,41 @@ test("late provider auth updates are fenced to the attached session, epoch and f
   const afterStop = host.writes.length;
   assert.equal(await coordinator.applyProviderAuthentication(input), false);
   assert.equal(host.writes.length, afterStop);
+});
+
+test("a sibling session on one tab cannot inherit auth from a matching process epoch", async () => {
+  // The production runtime rejects this cross-session callback earlier. Keep
+  // the coordinator's display projection safe if an injected callback reaches it.
+  const now = 1_800_000_000_000;
+  const host = new FakeHost();
+  host.columns = 160;
+  const { coordinator, callbacks, intents } = harness({ host, coordinatorOptions: { clock: () => now } });
+  const original = {
+    ...intents[0],
+    providerAuthentication: {
+      value: "authenticated", source: "provider-auth-observation",
+      observedAt: now - 100, expiresAt: now + 10_000,
+      correlationId: "observation-a",
+    },
+  };
+  try {
+    await coordinator.start([original]);
+    assert.match(await visibleHostText(host), /Claude auth authenticated/u);
+    const sibling = {
+      ...snapshot(original, 2),
+      agentSessionId: SESSION_B,
+      // A shared epoch string must not substitute for AgentSession identity.
+      processEpoch: `epoch-${SESSION_A}`,
+      terminalView: { viewId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ready: true },
+    };
+    await callbacks.onTerminalReady(sibling);
+    const before = host.writes.length;
+    host.emitResize();
+    await waitUntil(() => host.writes.length > before, "the sibling frame should repaint");
+    assert.match(await visibleHostText(host), /Claude auth unknown/u);
+  } finally {
+    await coordinator.stop();
+  }
 });
 
 test("canonical foreground resets the parser at higher fence and initial blank view uses real geometry", async () => {

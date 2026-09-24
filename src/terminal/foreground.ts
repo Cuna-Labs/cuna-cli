@@ -742,7 +742,10 @@ export class ForegroundTerminalCoordinator {
       intent, snapshot, viewport,
       providerAuthentication: previous === undefined
         ? intent.providerAuthentication
-        : previous.snapshot.processEpoch === snapshot.processEpoch
+        : previous.snapshot.userId === snapshot.userId &&
+          previous.snapshot.machineId === snapshot.machineId &&
+          previous.snapshot.agentSessionId === snapshot.agentSessionId &&
+          previous.snapshot.processEpoch === snapshot.processEpoch
           ? previous.providerAuthentication
           : undefined,
     });

@@ -1780,6 +1780,19 @@ test("caller abort retires an unresolved auth probe and ignores its late answer"
   const controller = new AbortController();
   let finishAuth;
   let probeSignal;
+  const validLateAuth = {
+    observationId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    agentSessionId: SESSION_A,
+    agent: "claude-code",
+    processEpoch: `epoch-${SESSION_A}`,
+    authMode: "interactive_login",
+    agentVersion: "2.1.226",
+    adapterVersion: "runa.agent-auth.v1",
+    evidenceClass: "provider_cli_login_status",
+    observedAt: new Date(NOW - 250).toISOString(),
+    validUntil: new Date(NOW + 10_000).toISOString(),
+    state: "authenticated",
+  };
   const operation = runSupportedForegroundSessions({
     client: fakeClient(events, {
       async getAgentSessionAuth(_id, signal) {
@@ -1797,12 +1810,13 @@ test("caller abort retires an unresolved auth probe and ignores its late answer"
     await assert.rejects(operation, /cancelled/u);
     assert.equal(probeSignal?.aborted, true);
     const writesAtDetach = host.writes.length;
-    finishAuth({ state: "authenticated" });
+    finishAuth(validLateAuth);
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(host.writes.length, writesAtDetach, "late auth must not repaint a retired terminal");
+    assert.doesNotMatch(await visibleHostText(host), /Claude auth authenticated/u);
     assert.equal(host.restored, 1);
   } finally {
-    finishAuth?.({ state: "authenticated" });
+    finishAuth?.(validLateAuth);
     controller.abort();
     await operation.catch(() => undefined);
   }
@@ -1929,6 +1943,63 @@ test("session tabs retire one client auth probe before starting another", async 
     assert.equal(probes.find((probe) => probe.id === SESSION_B)?.signal.aborted, true);
     assert.equal(active, 0);
   } finally {
+    controller.abort();
+    await operation.catch(() => undefined);
+  }
+});
+
+test("a fresh auth answer from a detached session cannot repaint its sibling after a switch", async (t) => {
+  const terminalClients = await terminalClientScope(t);
+  const events = [];
+  const host = new FakeHost(events);
+  host.columns = 160;
+  const system = terminalSystem(events);
+  const controller = new AbortController();
+  let finishA;
+  let signalA;
+  const validA = {
+    observationId: "abababab-abab-4bab-8bab-abababababab",
+    agentSessionId: SESSION_A,
+    agent: "claude-code",
+    processEpoch: `epoch-${SESSION_A}`,
+    authMode: "interactive_login",
+    agentVersion: "2.1.226",
+    adapterVersion: "runa.agent-auth.v1",
+    evidenceClass: "provider_cli_login_status",
+    observedAt: new Date(NOW - 250).toISOString(),
+    validUntil: new Date(NOW + 10_000).toISOString(),
+    state: "authenticated",
+  };
+  const client = {
+    ...machineClient(events),
+    async getAgentSessionAuth(id, signal) {
+      if (id === SESSION_B) throw new Error("B auth status unavailable");
+      signalA = signal;
+      // The producer ignores cancellation and answers after the switch.
+      return await new Promise((resolve) => { finishA = resolve; });
+    },
+  };
+  const operation = runSupportedForegroundSessions({
+    client, baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A],
+    terminalClients, signal: controller.signal,
+  }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
+  try {
+    await waitUntil(() => finishA !== undefined, "A auth probe should begin");
+    await clickTab(host, "2:Claude projB");
+    await waitUntil(() => /\[2:Claude projB\]/u.test(new TextDecoder().decode(host.writes.at(-1) ?? new Uint8Array())),
+      "B must become the active terminal");
+    assert.equal(signalA?.aborted, true);
+    assert.match(await visibleHostText(host), /Claude auth unknown/u);
+    const beforeLate = host.writes.length;
+    finishA(validA);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.doesNotMatch(host.writes.slice(beforeLate).map((bytes) => new TextDecoder().decode(bytes)).join(""),
+      /Claude auth authenticated/u);
+    assert.match(await visibleHostText(host), /Claude auth unknown/u);
+    host.emitInput(Uint8Array.of(0x1d, 0x64));
+    await operation;
+  } finally {
+    finishA?.(validA);
     controller.abort();
     await operation.catch(() => undefined);
   }
