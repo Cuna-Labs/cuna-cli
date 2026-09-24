@@ -28,7 +28,7 @@ test("version JSON carries a candidate-bound runtime identity", async () => {
   assert.equal(record.schema_version, "1");
   assert.equal(record.type, "result");
   assert.equal(record.command, "version");
-  assert.equal(record.data.version, "0.1.2");
+  assert.equal(record.data.version, "0.1.3");
   assert.match(record.data.buildDigest, /^[0-9a-f]{64}$/u);
   assert.equal(record.data.platform, process.platform);
   assert.equal(record.data.architecture, process.arch);
