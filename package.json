@@ -62,9 +62,9 @@
   ],
   "devDependencies": {
     "@types/node": "^22.15.0",
-    "oxlint": "1.77.0",
+    "oxlint": "1.84.0",
     "typescript": "^5.8.3",
-    "yaml": "2.9.0"
+    "yaml": "2.9.1"
   },
   "dependencies": {
     "@xterm/headless": "6.0.0"
