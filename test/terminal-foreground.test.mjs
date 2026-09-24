@@ -142,6 +142,49 @@ test("writer epoch change and local stop discard an unsent printable batch", asy
   }
 });
 
+test("a stale writer-seat refusal withholds queued input without closing the observer", async () => {
+  let releaseInput;
+  let refuseStale = false;
+  const inputGate = new Promise((resolve) => { releaseInput = resolve; });
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    inputGate,
+    sendInputError: () => refuseStale ? runtimeFailure("grant_scope_mismatch", "old writer epoch") : undefined,
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first send holds the input tail");
+    host.emitInput(encoder.encode("b"));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+    refuseStale = true;
+    releaseInput();
+    await waitUntil(() => /recent input was not sent/u.test(decoder.decode(host.writes.at(-1))),
+      "the stale-seat refusal is explained");
+    assert.equal(coordinator.state, "active", "writer transfer keeps the observer attached");
+    assert.deepEqual(calls.input.map((item) => item.text), ["a"]);
+    assert.deepEqual(calls.detach, []);
+  } finally {
+    releaseInput();
+    await coordinator.stop();
+  }
+});
+
+test("a grant mismatch against an unchanged writer remains a terminal failure", async () => {
+  let refuse = false;
+  const { coordinator, host, calls, intents } = harness({
+    sendInputError: () => refuse ? runtimeFailure("grant_scope_mismatch", "unexpected same-seat mismatch") : undefined,
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    refuse = true;
+    host.emitInput(encoder.encode("x"));
+    await waitUntil(() => coordinator.state === "stopped", "unexpected mismatch closes the terminal");
+    assert.deepEqual(calls.input, []);
+    assert.deepEqual(calls.detach, [intents[0].tabId]);
+  } finally { await coordinator.stop(); }
+});
+
 test("Ctrl+C flushes prior text before detaching and never batches the interrupt", async () => {
   const { coordinator, host, calls, intents } = harness();
   try {
@@ -924,7 +967,11 @@ test("OAuth guard releases Escape promptly, blocks delayed URL paste, and cancel
     }
     if (end === "rebind") await callbacks.onTerminalReady(snapshot(intents[0], 2));
     if (end === "stop") await coordinator.stop();
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    if (end === "normal" || end === "replacement") {
+      await waitUntil(() => calls.input.length === 1, "guarded Escape reaches the provider");
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    }
     assert.equal(calls.input.length, end === "normal" || end === "replacement" ? 1 : 0, end);
     if (end === "normal") {
       assert.equal(calls.input[0].text, "\u001b");

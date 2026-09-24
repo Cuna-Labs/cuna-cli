@@ -1110,7 +1110,7 @@ export class ForegroundTerminalCoordinator {
     const operation = this.#inputTail.then(async () => {
       await this.#requireRuntime().sendInput(bytes, target.tabId, target.binding);
     });
-    this.#inputTail = operation.catch((error) => this.#inputFailure(error));
+    this.#inputTail = operation.catch((error) => this.#inputFailure(error, target));
   }
 
   #enqueueInputOperation(operation: () => Promise<void>): void {
@@ -1169,9 +1169,12 @@ export class ForegroundTerminalCoordinator {
       void this.#render().catch(() => undefined);
       return;
     }
+    // The optional predictor samples each key's echo latency; keep its input
+    // frames separate so enabling prediction cannot change that measurement.
     const printable = this.#state === "active" && receiptTarget !== undefined &&
       this.#tabs.get(receiptTarget.tabId)?.snapshot.accessMode === "writer" &&
       payload.byteLength === 1 && payload[0]! >= 0x20 && payload[0]! <= 0x7e &&
+      this.#predictiveEcho.mode === "off" &&
       !this.#pasteActive && this.#pasteStartMatch === 0 && this.#pasteEndMatch === 0 &&
       !this.#prefixPending && receiptBrowserAction === undefined &&
       !this.#oauthPasteGuards.has(receiptTarget.tabId);
@@ -1260,10 +1263,22 @@ export class ForegroundTerminalCoordinator {
         if (barrierChunk) this.#unroutedBarrierChunks -= 1;
       }
     });
-    this.#inputTail = operation.catch((error) => this.#inputFailure(error));
+    this.#inputTail = operation.catch((error) => this.#inputFailure(error, receiptTarget));
   }
 
-  #inputFailure(error: unknown): void {
+  #inputFailure(error: unknown, receiptTarget?: ForegroundInputTarget): void {
+    if (error instanceof RuntimeBoundaryError && error.code === "grant_scope_mismatch" && receiptTarget !== undefined) {
+      const snapshot = this.#tabs.get(receiptTarget.tabId)?.snapshot;
+      if (snapshot === undefined || snapshot.state !== "active" || snapshot.accessMode !== "writer" ||
+        snapshot.writerEpoch !== receiptTarget.binding.writerEpoch ||
+        !sameSnapshotBinding(snapshot, receiptTarget.binding)) {
+        if (this.#activeTabId === receiptTarget.tabId) {
+          this.#browserNotice = BATCH_WITHHELD_NOTICE;
+          void this.#render().catch(() => undefined);
+        }
+        return;
+      }
+    }
     if (error instanceof RuntimeBoundaryError && error.code === "terminal_observer") {
       // Typing into an observed terminal is refused, not fatal: the seat is
       // someone else's. Say so on the notice line and keep observing.
