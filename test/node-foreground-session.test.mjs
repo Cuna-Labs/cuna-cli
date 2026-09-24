@@ -1715,9 +1715,17 @@ test("session tabs: Ctrl+C while switching ends the run; both sessions keep runn
   }, { host, controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
   await clickTab(host, "2:Claude projB");
   await waitUntil(() => new TextDecoder().decode(host.writes.at(-1)).includes("SWITCHING TO CLAUDE PROJB"), "the switching screen");
-  await new Promise((resolve) => setTimeout(resolve, 3_100));
-  assert.match(new TextDecoder().decode(host.writes.at(-1)), /Checking [^\r\n]+ · 3s/u,
-    "a blocked switch keeps naming the step and shows elapsed seconds");
+  // Observe the timer's painted frame, not the wall clock 100 ms after its
+  // third scheduled tick. A loaded runner may skip a numbered frame entirely.
+  const displayedElapsed = () => {
+    const match = /Checking live session status · (\d+)s/u.exec(new TextDecoder().decode(host.writes.at(-1)));
+    return match === null ? -1 : Number(match[1]);
+  };
+  await waitUntil(() => displayedElapsed() >= 3,
+    "a blocked switch must paint the named step with at least 3s elapsed", 4_500);
+  const firstElapsed = displayedElapsed();
+  await waitUntil(() => displayedElapsed() > firstElapsed,
+    "the blocked switch must keep advancing its elapsed counter", 2_500);
   host.emitInput(Uint8Array.of(0x03));
   await operation;
   releaseB();
