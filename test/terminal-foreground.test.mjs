@@ -3009,6 +3009,21 @@ test("session tabs: a click on another session detaches this one and asks for th
   } finally { await coordinator.stop(); }
 });
 
+test("session tabs: a click drains earlier batched typing before detaching", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const column = await tabColumn(host, "2:Claude projB");
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key reaches the writer immediately");
+    host.emitInput(encoder.encode("b"));
+    host.emitInput(press(column));
+    await waitUntil(() => coordinator.state === "stopped", "the click detaches the current session");
+    assert.deepEqual(calls.input.map((item) => item.text), ["a", "b"]);
+    assert.deepEqual(calls.detach, ["tab-a"]);
+    assert.equal(coordinator.switchRequest?.agentSessionId, SESSION_B);
+  } finally { await coordinator.stop(); }
+});
+
 test("session tabs: a click split after Escape within the input window never reaches the remote", async () => {
   const { coordinator, calls, host } = await sessionTabsHarness();
   try {
