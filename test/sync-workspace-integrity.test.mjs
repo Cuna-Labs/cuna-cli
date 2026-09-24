@@ -657,7 +657,19 @@ test("a crashed process releases kernel writer authority and the next process ad
   );
   child.kill("SIGKILL");
   await new Promise((resolve) => child.once("close", resolve));
-  const recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "parent" });
+  // The detached flock helper can still hold the kernel lock briefly after
+  // the child closes; its stdin EOF and exit are separate process events.
+  const deadline = Date.now() + 2_000;
+  let recovered;
+  for (;;) {
+    try {
+      recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "parent" });
+      break;
+    } catch (error) {
+      if (error?.code !== "cuna.workspace.workspace_busy" || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
   assert.equal(recovered.fence, 2);
   await recovered.close();
 });
