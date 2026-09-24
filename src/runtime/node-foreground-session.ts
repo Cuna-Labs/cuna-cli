@@ -48,7 +48,7 @@ import {
 
 const TERMINAL_CAPABILITY_ID = "terminal_connections.create";
 const OPENCODE_AUTH_ADVISORY_TIMEOUT_MS = 250;
-const SWITCH_AUTH_ADVISORY_TIMEOUT_MS = 2_000;
+const PROVIDER_AUTH_ADVISORY_TIMEOUT_MS = 2_000;
 // A first interactive OpenCode session has no credential state yet. Provider
 // auth is an advisory display observation: it may be absent, temporarily
 // unreachable, or unavailable on an older deployment. A fresh supervisor
@@ -498,7 +498,9 @@ async function runNodeForegroundSessionsAdmitted(
       observation,
       now: clock,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
-      ...(context.switching === undefined ? {} : { advisoryTimeoutMs: SWITCH_AUTH_ADVISORY_TIMEOUT_MS }),
+      // Provider authentication decorates the terminal; it does not admit it.
+      // Apply the same bound on the first attach as on a session switch.
+      advisoryTimeoutMs: PROVIDER_AUTH_ADVISORY_TIMEOUT_MS,
     });
     throwIfAborted(input.signal);
     if (capability.expiresAt <= clock()) {
@@ -921,9 +923,9 @@ async function observeProviderAuthentication(input: Readonly<{
   // process; holding the person behind a server-side auth probe (which may
   // wait for an older supervisor) does not add authority. Bound it so a first
   // `/connect` can reach the real OpenCode TUI promptly.
-  // A switch between sessions bounds the probe for Claude and Codex too: it
-  // is presentation-only for them (a failed read shows "auth unknown"), and on
-  // qa6 it took 15 s of a 22 s switch (2026-09-23, session tabs witness).
+  // Claude and Codex use the same bound on first attach and on switches:
+  // a failed read shows "auth unknown". A live first attach spent over 10 s
+  // waiting for this presentation-only read on 2026-09-24.
   const advisoryTimeoutMs = mayEnterOpenCodeLogin(input.session, input.observation, input.now())
     ? OPENCODE_AUTH_ADVISORY_TIMEOUT_MS
     : input.advisoryTimeoutMs !== undefined && input.session.agent !== "opencode"
