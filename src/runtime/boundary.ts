@@ -682,7 +682,7 @@ export class CunaRuntimeBoundary {
   async sendInput(
     bytes: Uint8Array,
     tabId = this.#activeTabId,
-    expectedBinding?: RuntimeTerminalResponse["binding"],
+    expectedBinding?: RuntimeTerminalResponse["binding"] & { readonly writerEpoch?: number },
   ): Promise<void> {
     this.#assertReady();
     const entry = this.#requireActiveTerminal(tabId);
@@ -698,7 +698,7 @@ export class CunaRuntimeBoundary {
     if (expectedBinding !== undefined && !sameEntryBinding(entry, expectedBinding)) {
       throw runtimeFailure("grant_scope_mismatch", "Terminal input targets a replaced attachment generation.");
     }
-    await this.#sendTerminalBytes(entry, bytes);
+    await this.#sendTerminalBytes(entry, bytes, expectedBinding?.writerEpoch);
   }
 
   async sendTerminalResponse(response: RuntimeTerminalResponse): Promise<void> {
@@ -722,10 +722,14 @@ export class CunaRuntimeBoundary {
     await this.#sendTerminalBytes(entry, response.bytes);
   }
 
-  async #sendTerminalBytes(entry: TerminalEntry, bytes: Uint8Array): Promise<void> {
+  async #sendTerminalBytes(entry: TerminalEntry, bytes: Uint8Array, expectedWriterEpoch?: number): Promise<void> {
     if (entry.terminalView !== undefined && !entry.terminalView.ready) throw runtimeFailure("terminal_protocol_error", "The current terminal view is not ready for input.");
     const payload = bytes.slice();
     await this.#enqueueTerminalSend(entry, async (authority) => {
+      if (expectedWriterEpoch !== undefined &&
+        (entry.accessMode !== "writer" || entry.writerEpoch !== expectedWriterEpoch)) {
+        throw runtimeFailure("grant_scope_mismatch", "Queued input targets a replaced writer seat.");
+      }
       if (entry.terminalView !== undefined && !entry.terminalView.ready) throw runtimeFailure("terminal_protocol_error", "The current terminal view is not ready for input.");
       if (entry.pendingInputSequences.size >= 4_096) {
         entry.connectionRevision += 1;

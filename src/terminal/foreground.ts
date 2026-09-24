@@ -68,6 +68,11 @@ const RESIZE_COALESCE_MS = 50;
 // this window; once a mouse or paste prefix is distinct, it stays buffered.
 // The two ambiguous prefixes can still leak if split across a longer gap.
 const HOST_INPUT_PREFIX_IDLE_MS = 25;
+// Delay only keys after the first key in a burst. A batch remains one RTP1
+// input frame, so the gateway still checks its durable writer fence per frame.
+const INPUT_BATCH_WINDOW_MS = 24;
+const INPUT_BURST_GAP_MS = INPUT_BATCH_WINDOW_MS;
+const INPUT_BATCH_MAX_BYTES = 32;
 const DISCONNECT_FRAME_MS = 30;
 const DISCONNECTING_FRAMES = Object.freeze([
   "✦ Disconnecting...",
@@ -82,6 +87,8 @@ const ATTACHING_FRAME_MS = 90;
 // never more than one second under an injected/test cadence.
 const MAX_DISCONNECT_FRAME_MS = 250;
 const INPUT_WITHHELD_NOTICE = "Reconnecting · input was not sent. Retry after terminal attached.";
+const BATCH_WITHHELD_NOTICE = "Terminal authority changed · recent input was not sent.";
+const BROWSER_BATCH_WITHHELD_NOTICE = "A browser request arrived · recent input was not sent.";
 // Sent keys went unacknowledged past the runtime's input deadline (R12). Said
 // the moment the runtime gives up on the connection, and it already carries the
 // "not resent" half, so it is never prefixed with HISTORICAL_INPUT_NOTICE.
@@ -177,7 +184,7 @@ export interface ForegroundTabIntent {
 
 interface ForegroundInputTarget {
   readonly tabId: string;
-  readonly binding: RuntimeTerminalResponse["binding"];
+  readonly binding: RuntimeTerminalResponse["binding"] & { readonly writerEpoch: number };
 }
 
 /** One AgentSession the person detached from; it keeps running remotely. */
@@ -197,6 +204,15 @@ interface PendingRemoteLocalActionResult {
   readonly snapshot: LocalActionSnapshot;
 }
 
+interface PendingPrintableInput {
+  readonly target: ForegroundInputTarget;
+  readonly bytes: number[];
+  readonly receipt: number;
+  readonly browserActionGeneration: number;
+  readonly browserAction: LocalBrowserActionRequest | undefined;
+  readonly timer: ReturnType<typeof setTimeout>;
+}
+
 export interface ForegroundTerminalCoordinatorOptions {
   readonly host: ForegroundTerminalHost;
   readonly browser?: BrowserOpener;
@@ -204,6 +220,8 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly appbar?: () => AppbarModel;
   readonly color?: boolean;
   readonly clock?: () => number;
+  /** Monotonic time used only to classify nearby keyboard input. */
+  readonly inputClock?: () => number;
   readonly resizeCoalesceMs?: number;
   readonly reconnectAttempts?: number;
   readonly reconnectBaseDelayMs?: number;
@@ -245,6 +263,7 @@ export class ForegroundTerminalCoordinator {
   readonly #registry = new ViewportRegistry();
   readonly #tabs = new Map<string, ForegroundTab>();
   readonly #clock: () => number;
+  readonly #inputClock: () => number;
   #runtime: ForegroundTerminalRuntime | undefined;
   #lease: HostTerminalLease | undefined;
   #state: ForegroundTerminalState = "idle";
@@ -252,15 +271,21 @@ export class ForegroundTerminalCoordinator {
   #removeInput: (() => void) | undefined;
   #removeResize: (() => void) | undefined;
   #resizeTimer: NodeJS.Timeout | undefined;
+  #resizeInputBarrier: Promise<void> | undefined;
   #renderTail: Promise<void> = Promise.resolve();
   /** The last complete frame the host accepted; undefined whenever the host screen is not known to show it. */
   #lastHostFrame: Uint8Array | undefined;
   #lastWorkbenchFrame: WorkbenchFrame | undefined;
   #inputTail: Promise<void> = Promise.resolve();
+  #inputBatch: PendingPrintableInput | undefined;
+  #lastPrintableAt: number | undefined;
+  #lastPrintableTarget: ForegroundInputTarget | undefined;
   readonly #copyDetectors = new Map<string, ProviderBrowserActionDetector[]>();
   readonly #copyLinks = new Map<string, LocalBrowserActionRequest>();
   #prefixPending = false;
   #prefixTarget: ForegroundInputTarget | undefined;
+  #prefixBrowserActionGeneration: number | undefined;
+  #prefixBrowserAction: LocalBrowserActionRequest | undefined;
   #pasteActive = false;
   #pasteStartMatch = 0;
   #pasteEndMatch = 0;
@@ -295,6 +320,7 @@ export class ForegroundTerminalCoordinator {
   #helpVisible = false;
   #pendingBrowserAction: LocalBrowserActionRequest | undefined;
   #pendingBrowserActionTabId: string | undefined;
+  readonly #browserActionGenerations = new Map<string, number>();
   #browserNotice: string | undefined;
   #browserOpening = false;
   #terminalFailure: unknown;
@@ -349,6 +375,7 @@ export class ForegroundTerminalCoordinator {
       // A guess that timed out is repainted away by an ordinary frame.
       onExpire: () => this.#queueStateRender(),
     });
+    this.#inputClock = options.inputClock ?? (() => performance.now());
     this.#localActionBroker = new LocalActionBroker({
       clock: this.#clock,
       isIdentityLive: (identity) => this.#isLocalActionIdentityLive(identity),
@@ -587,12 +614,14 @@ export class ForegroundTerminalCoordinator {
     this.#oauthPrefixTimers.clear();
     this.#predictiveEcho.dispose();
     this.#resizeTimer = undefined;
+    this.#resizeInputBarrier = undefined;
     this.#removeInput?.();
     this.#removeResize?.();
     this.#removeRoster?.();
     this.#removeInput = undefined;
     this.#removeResize = undefined;
     this.#removeRoster = undefined;
+    this.#discardInputBatch();
     const failures: unknown[] = [];
     const runtime = this.#runtime;
     for (const tab of this.#tabs.values()) {
@@ -864,6 +893,14 @@ export class ForegroundTerminalCoordinator {
 
   #terminalState(snapshot: RuntimeTerminalSnapshot): void {
     const tab = this.#tabs.get(snapshot.tabId);
+    const batch = this.#inputBatch;
+    if (batch?.target.tabId === snapshot.tabId &&
+      (snapshot.state !== "active" || snapshot.accessMode !== "writer" ||
+        !sameSnapshotBinding(snapshot, batch.target.binding) ||
+        snapshot.writerEpoch !== batch.target.binding.writerEpoch)) {
+      this.#discardInputBatch();
+      this.#browserNotice = BATCH_WITHHELD_NOTICE;
+    }
     if (tab !== undefined) {
       this.#forgetSeatNoticeOnSeatChange(tab.snapshot, snapshot);
       // The PTY keeps whatever geometry the previous writer set, and an
@@ -1068,11 +1105,12 @@ export class ForegroundTerminalCoordinator {
   }
 
   #sendRemote(bytes: Uint8Array, target: ForegroundInputTarget): void {
+    this.#flushInputBatch();
     if (this.#predictiveEcho.barrier()) void this.#render().catch(() => undefined);
     const operation = this.#inputTail.then(async () => {
       await this.#requireRuntime().sendInput(bytes, target.tabId, target.binding);
     });
-    this.#inputTail = operation.catch((error) => this.#inputFailure(error));
+    this.#inputTail = operation.catch((error) => this.#inputFailure(error, target));
   }
 
   #enqueueInputOperation(operation: () => Promise<void>): void {
@@ -1114,6 +1152,8 @@ export class ForegroundTerminalCoordinator {
     }
     const payload = bytes.slice();
     const receiptTarget = this.#captureInputTarget();
+    const receiptBrowserAction = this.#browserActionFor(receiptTarget);
+    const receiptBrowserActionGeneration = this.#browserActionGenerationFor(receiptTarget);
     if (
       this.#state === "active" &&
       receiptTarget === undefined &&
@@ -1128,6 +1168,53 @@ export class ForegroundTerminalCoordinator {
       this.#browserNotice = this.#unavailableInputNotice();
       void this.#render().catch(() => undefined);
       return;
+    }
+    // The optional predictor samples each key's echo latency; keep its input
+    // frames separate so enabling prediction cannot change that measurement.
+    const printable = this.#state === "active" && receiptTarget !== undefined &&
+      this.#tabs.get(receiptTarget.tabId)?.snapshot.accessMode === "writer" &&
+      payload.byteLength === 1 && payload[0]! >= 0x20 && payload[0]! <= 0x7e &&
+      this.#predictiveEcho.mode === "off" &&
+      !this.#pasteActive && this.#pasteStartMatch === 0 && this.#pasteEndMatch === 0 &&
+      !this.#prefixPending && receiptBrowserAction === undefined &&
+      !this.#oauthPasteGuards.has(receiptTarget.tabId);
+    if (printable) {
+      const now = this.#inputClock();
+      const batch = this.#inputBatch;
+      if (batch !== undefined && sameInputTarget(batch.target, receiptTarget) &&
+        batch.browserActionGeneration === receiptBrowserActionGeneration) {
+        batch.bytes.push(payload[0]!);
+        this.#pendingInputBytes += 1;
+        this.#lastPrintableAt = now;
+        if (batch.bytes.length >= INPUT_BATCH_MAX_BYTES) this.#flushInputBatch();
+        if (this.#predictAtReceipt(payload, receiptTarget, false)) void this.#render().catch(() => undefined);
+        return;
+      }
+      this.#flushInputBatch();
+      const closeToPrior = this.#lastPrintableAt !== undefined &&
+        now - this.#lastPrintableAt <= INPUT_BURST_GAP_MS &&
+        this.#lastPrintableTarget !== undefined &&
+        sameInputTarget(this.#lastPrintableTarget, receiptTarget);
+      this.#lastPrintableAt = now;
+      this.#lastPrintableTarget = receiptTarget;
+      if (closeToPrior) {
+        const timer = setTimeout(() => this.#flushInputBatch(), INPUT_BATCH_WINDOW_MS);
+        timer.unref?.();
+        this.#inputBatch = {
+          target: receiptTarget, bytes: [payload[0]!], receipt,
+          browserActionGeneration: receiptBrowserActionGeneration,
+          browserAction: receiptBrowserAction, timer,
+        };
+        this.#pendingInputBytes += 1;
+        if (this.#predictAtReceipt(payload, receiptTarget, false)) void this.#render().catch(() => undefined);
+        return;
+      }
+    } else {
+      // Enter, Ctrl+C, prefixes, paste, resize and local-action input cannot
+      // wait behind a timer or share a frame with printable bytes.
+      this.#flushInputBatch();
+      this.#lastPrintableAt = undefined;
+      this.#lastPrintableTarget = undefined;
     }
     if (
       payload.byteLength === 1 &&
@@ -1153,19 +1240,45 @@ export class ForegroundTerminalCoordinator {
     // Receipt time, not input-tail time: the guess is painted before the key
     // is even queued for the network.
     if (this.#predictAtReceipt(payload, receiptTarget, barrierChunk)) void this.#render().catch(() => undefined);
-    this.#pendingInputBytes += payload.byteLength;
+    this.#enqueueInput(payload, receiptTarget, receipt, barrierChunk, false,
+      receiptBrowserActionGeneration, receiptBrowserAction);
+  }
+
+  #enqueueInput(
+    payload: Uint8Array,
+    receiptTarget: ForegroundInputTarget | undefined,
+    receipt: number,
+    barrierChunk = false,
+    counted = false,
+    browserActionGeneration = this.#browserActionGenerationFor(receiptTarget),
+    browserAction = this.#browserActionFor(receiptTarget),
+  ): void {
+    if (!counted) this.#pendingInputBytes += payload.byteLength;
     const operation = this.#inputTail.then(async () => {
       try {
-        await this.#routeInput(payload, receiptTarget, false, receipt);
+        await this.#routeInput(payload, receiptTarget, false, receipt,
+          browserActionGeneration, browserAction);
       } finally {
         this.#pendingInputBytes -= payload.byteLength;
         if (barrierChunk) this.#unroutedBarrierChunks -= 1;
       }
     });
-    this.#inputTail = operation.catch((error) => this.#inputFailure(error));
+    this.#inputTail = operation.catch((error) => this.#inputFailure(error, receiptTarget));
   }
 
-  #inputFailure(error: unknown): void {
+  #inputFailure(error: unknown, receiptTarget?: ForegroundInputTarget): void {
+    if (error instanceof RuntimeBoundaryError && error.code === "grant_scope_mismatch" && receiptTarget !== undefined) {
+      const snapshot = this.#tabs.get(receiptTarget.tabId)?.snapshot;
+      if (snapshot === undefined || snapshot.state !== "active" || snapshot.accessMode !== "writer" ||
+        snapshot.writerEpoch !== receiptTarget.binding.writerEpoch ||
+        !sameSnapshotBinding(snapshot, receiptTarget.binding)) {
+        if (this.#activeTabId === receiptTarget.tabId) {
+          this.#browserNotice = BATCH_WITHHELD_NOTICE;
+          void this.#render().catch(() => undefined);
+        }
+        return;
+      }
+    }
     if (error instanceof RuntimeBoundaryError && error.code === "terminal_observer") {
       // Typing into an observed terminal is refused, not fatal: the seat is
       // someone else's. Say so on the notice line and keep observing.
@@ -1189,25 +1302,62 @@ export class ForegroundTerminalCoordinator {
     void this.stop().catch(() => { this.#state = "failed"; });
   }
 
+  #flushInputBatch(): void {
+    const batch = this.#inputBatch;
+    if (batch === undefined) return;
+    this.#inputBatch = undefined;
+    clearTimeout(batch.timer);
+    this.#enqueueInput(Uint8Array.from(batch.bytes), batch.target, batch.receipt, false, true,
+      batch.browserActionGeneration, batch.browserAction);
+  }
+
+  #discardInputBatch(): void {
+    const batch = this.#inputBatch;
+    if (batch === undefined) return;
+    this.#inputBatch = undefined;
+    clearTimeout(batch.timer);
+    this.#pendingInputBytes -= batch.bytes.length;
+    this.#lastPrintableAt = undefined;
+    this.#lastPrintableTarget = undefined;
+    if (this.#predictiveEcho.barrier()) void this.#render().catch(() => undefined);
+  }
+
   async #routeInput(
     bytes: Uint8Array,
     receiptTarget: ForegroundInputTarget | undefined,
     releasedPrefix = false,
     receipt = 0,
+    browserActionGeneration = this.#browserActionGenerationFor(receiptTarget),
+    browserAction = this.#browserActionFor(receiptTarget),
   ): Promise<void> {
     // Received after a switch was chosen (a chord processed ahead of it in
     // this queue): never sent, to either session.
     if (this.#switchCutoff !== undefined && receipt > this.#switchCutoff) return;
     const runtime = this.#requireRuntime();
+    // Permission keys are decisions only for the request already visible when
+    // the user typed them. A queued key cannot approve a request that arrived
+    // while an earlier send was blocked. Preserve explicit local detach/chords.
+    if (!releasedPrefix &&
+      (browserActionGeneration !== this.#browserActionGenerationFor(receiptTarget) ||
+        browserAction !== this.#browserActionFor(receiptTarget)) &&
+      !bytes.includes(INTERRUPT) && !bytes.includes(ESCAPE_PREFIX) && !this.#prefixPending) {
+      this.#browserNotice = BROWSER_BATCH_WITHHELD_NOTICE;
+      await this.#render();
+      return;
+    }
     if (bytes.includes(INTERRUPT)) {
-      const active = this.#pendingBrowserAction === undefined
+      const currentAction = this.#browserActionFor(receiptTarget);
+      const active = currentAction === undefined
         ? undefined
-        : this.#localActionBroker.get(this.#pendingBrowserAction.id);
+        : this.#localActionBroker.get(currentAction.id);
       if (active !== undefined) this.#localActionBroker.cancelBinding(active.request.identity, "user_interrupt");
-      this.#pendingBrowserAction = undefined;
-      this.#pendingBrowserActionTabId = undefined;
+      if (currentAction !== undefined) {
+        this.#pendingBrowserAction = undefined;
+        this.#pendingBrowserActionTabId = undefined;
+      }
       this.#browserNotice = undefined;
-    } else if (!releasedPrefix && await this.#routeBrowserActionInput(bytes, receiptTarget)) {
+    } else if (!releasedPrefix && !this.#prefixPending && !bytes.includes(ESCAPE_PREFIX) &&
+      await this.#routeBrowserActionInput(bytes, receiptTarget)) {
       return;
     }
     const guarded = releasedPrefix ? { bytes, blocked: false } : this.#guardProviderOAuthPaste(bytes, receiptTarget);
@@ -1262,6 +1412,8 @@ export class ForegroundTerminalCoordinator {
           await flush();
           this.#prefixPending = true;
           this.#prefixTarget = target;
+          this.#prefixBrowserActionGeneration = browserActionGeneration;
+          this.#prefixBrowserAction = browserAction;
         } else {
           remote.push(byte);
         }
@@ -1270,6 +1422,16 @@ export class ForegroundTerminalCoordinator {
       this.#prefixPending = false;
       const chordTarget = this.#prefixTarget;
       this.#prefixTarget = undefined;
+      const staleChord = this.#prefixBrowserActionGeneration !== this.#browserActionGenerationFor(chordTarget) ||
+        this.#prefixBrowserAction !== this.#browserActionFor(chordTarget);
+      this.#prefixBrowserActionGeneration = undefined;
+      this.#prefixBrowserAction = undefined;
+      if (staleChord && byte !== DETACH && byte !== HELP && byte !== NEXT_TAB &&
+        (byte < TAB_FIRST || byte > TAB_LAST)) {
+        this.#browserNotice = BROWSER_BATCH_WITHHELD_NOTICE;
+        await this.#render();
+        continue;
+      }
       if (byte === ESCAPE_PREFIX) {
         target = chordTarget ?? target;
         remote.push(ESCAPE_PREFIX);
@@ -1733,18 +1895,44 @@ export class ForegroundTerminalCoordinator {
   #promoteBrowserAction(): void {
     const current = this.#localActionBroker.current();
     if (current?.state !== "pending_user") {
+      if (this.#pendingBrowserActionTabId !== undefined) {
+        this.#advanceBrowserActionGeneration(this.#pendingBrowserActionTabId);
+      }
       this.#pendingBrowserAction = undefined;
       this.#pendingBrowserActionTabId = undefined;
       return;
     }
     const request = this.#browserRequests.get(current.request.id);
     if (request === undefined) return;
-    this.#pendingBrowserAction = request;
-    this.#pendingBrowserActionTabId = [...this.#tabs.entries()].find(([, tab]) =>
+    const tabId = [...this.#tabs.entries()].find(([, tab]) =>
       tab.snapshot.agentSessionId === request.agentSessionId &&
       tab.snapshot.processEpoch === request.processEpoch &&
       tab.snapshot.fencingGeneration === request.fencingGeneration)?.[0];
-    this.#browserNotice = undefined;
+    if (this.#pendingBrowserAction !== request || this.#pendingBrowserActionTabId !== tabId) {
+      if (this.#pendingBrowserActionTabId !== undefined) {
+        this.#advanceBrowserActionGeneration(this.#pendingBrowserActionTabId);
+      }
+      if (tabId !== undefined && tabId !== this.#pendingBrowserActionTabId) {
+        this.#advanceBrowserActionGeneration(tabId);
+      }
+    }
+    const withheld = this.#inputBatch?.target.tabId === tabId;
+    if (withheld) this.#discardInputBatch();
+    this.#pendingBrowserAction = request;
+    this.#pendingBrowserActionTabId = tabId;
+    this.#browserNotice = withheld ? BROWSER_BATCH_WITHHELD_NOTICE : undefined;
+  }
+
+  #browserActionFor(target: ForegroundInputTarget | undefined): LocalBrowserActionRequest | undefined {
+    return target?.tabId === this.#pendingBrowserActionTabId ? this.#pendingBrowserAction : undefined;
+  }
+
+  #browserActionGenerationFor(target: ForegroundInputTarget | undefined): number {
+    return target === undefined ? 0 : this.#browserActionGenerations.get(target.tabId) ?? 0;
+  }
+
+  #advanceBrowserActionGeneration(tabId: string): void {
+    this.#browserActionGenerations.set(tabId, (this.#browserActionGenerations.get(tabId) ?? 0) + 1);
   }
 
   #localActionIdentity(_intent: ForegroundTabIntent, snapshot: RuntimeTerminalSnapshot): LocalActionSessionIdentity {
@@ -1800,14 +1988,26 @@ export class ForegroundTerminalCoordinator {
       clearTimeout(previousTimer);
       this.#oauthPrefixTimers.delete(target.tabId);
     } else if (this.#state === "active" && guard.hasPendingPrefix && previousTimer === undefined) {
+      const browserAction = this.#browserActionFor(target);
+      const browserActionGeneration = this.#browserActionGenerationFor(target);
+      const receipt = this.#inputReceipt;
       const timer = setTimeout(() => {
         this.#oauthPrefixTimers.delete(target.tabId);
         const operation = this.#inputTail.then(async () => {
           const tab = this.#tabs.get(target.tabId);
-          if (this.#state !== "active" || tab === undefined || tab.snapshot.state !== "active" || this.#activeTabId !== target.tabId ||
-            this.#oauthPasteGuards.get(target.tabId) !== guard || !sameSnapshotBinding(tab.snapshot, target.binding)) return;
+          if (this.#state !== "active" || this.#switchCutoff !== undefined || tab === undefined || tab.snapshot.state !== "active" || this.#activeTabId !== target.tabId ||
+            this.#oauthPasteGuards.get(target.tabId) !== guard || !sameSnapshotBinding(tab.snapshot, target.binding) ||
+            tab.snapshot.writerEpoch !== target.binding.writerEpoch) return;
+          if (browserActionGeneration !== this.#browserActionGenerationFor(target) ||
+            browserAction !== this.#browserActionFor(target)) {
+            guard.releasePendingPrefix();
+            this.#browserNotice = BROWSER_BATCH_WITHHELD_NOTICE;
+            await this.#render();
+            return;
+          }
           const prefix = guard.releasePendingPrefix();
-          if (prefix.byteLength > 0) await this.#routeInput(prefix, target, true);
+          if (prefix.byteLength > 0) await this.#routeInput(prefix, target, true,
+            receipt, browserActionGeneration, browserAction);
         });
         this.#inputTail = operation.catch((error) => {
           if (error instanceof RuntimeBoundaryError &&
@@ -1873,6 +2073,7 @@ export class ForegroundTerminalCoordinator {
     }
     if (this.#state !== "active" || this.#switchCutoff !== undefined || this.#tabs.size !== 1 ||
         this.#closingTabId !== undefined) return false;
+    this.#flushInputBatch();
     this.#switchCutoff = receipt;
     this.#switchRequest = Object.freeze({ agentSessionId: entry.agentSessionId, agent: entry.agent, label: entry.label });
     this.#predictiveEcho.barrier();
@@ -2029,6 +2230,7 @@ export class ForegroundTerminalCoordinator {
         agentSessionId: tab.snapshot.agentSessionId,
         processEpoch: tab.snapshot.processEpoch,
         fencingGeneration: tab.snapshot.fencingGeneration,
+        writerEpoch: tab.snapshot.writerEpoch,
       }),
     });
   }
@@ -2065,13 +2267,17 @@ export class ForegroundTerminalCoordinator {
 
   #queueResize(): void {
     if (this.#state !== "active") return;
+    this.#flushInputBatch();
+    this.#resizeInputBarrier = this.#inputTail;
     // Output also requests reconciliation while geometry differs. Preserve the
     // first deadline so continuous output cannot postpone every paint; the
     // callback reads the latest host dimensions when it runs.
     if (this.#resizeTimer !== undefined) return;
     this.#resizeTimer = setTimeout(() => {
       this.#resizeTimer = undefined;
-      void this.#applyResize().catch((error) => {
+      const priorInput = this.#resizeInputBarrier;
+      this.#resizeInputBarrier = undefined;
+      void Promise.resolve(priorInput).then(() => this.#applyResize()).catch((error) => {
         this.#recordFailure(error);
         void this.stop().catch(() => { this.#state = "failed"; });
       });
@@ -2681,6 +2887,16 @@ function sameSnapshotBinding(snapshot: RuntimeTerminalSnapshot, binding: Runtime
     snapshot.agentSessionId === binding.agentSessionId &&
     snapshot.processEpoch === binding.processEpoch &&
     snapshot.fencingGeneration === binding.fencingGeneration;
+}
+
+function sameInputTarget(left: ForegroundInputTarget, right: ForegroundInputTarget): boolean {
+  return left.tabId === right.tabId &&
+    left.binding.userId === right.binding.userId &&
+    left.binding.machineId === right.binding.machineId &&
+    left.binding.agentSessionId === right.binding.agentSessionId &&
+    left.binding.processEpoch === right.binding.processEpoch &&
+    left.binding.fencingGeneration === right.binding.fencingGeneration &&
+    left.binding.writerEpoch === right.binding.writerEpoch;
 }
 
 function padTrustedLine(value: string, columns: number): string {

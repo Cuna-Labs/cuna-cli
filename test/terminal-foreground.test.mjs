@@ -36,6 +36,337 @@ test("slash command Enter is forwarded once and an alternate-screen selector rem
   } finally { await coordinator.stop(); }
 });
 
+test("a ten-key writer burst preserves bytes while using fewer input frames", async () => {
+  const { coordinator, host, calls, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    for (const character of "abcdefghij") {
+      host.emitInput(encoder.encode(character));
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "abcdefghij",
+      "all keys should reach the writer in order");
+    assert.ok(calls.input.length < 10, `expected fewer than ten input frames, got ${calls.input.length}`);
+    assert.ok(calls.input.every(item => item.tabId === intents[0].tabId));
+  } finally { await coordinator.stop(); }
+});
+
+test("30ms typing cadence sends each key without an unproductive batch delay", async () => {
+  let now = 0;
+  const { coordinator, host, calls, intents } = harness({
+    coordinatorOptions: { inputClock: () => now },
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    for (const [index, character] of [..."abcd"].entries()) {
+      now += 30;
+      host.emitInput(encoder.encode(character));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(calls.input.length, index + 1,
+        `key ${index + 1} should be sent immediately, before any 24ms batch timer`);
+    }
+    assert.deepEqual(calls.input.map(item => item.text), ["a", "b", "c", "d"]);
+  } finally { await coordinator.stop(); }
+});
+
+test("a binding change discards a delayed printable key before it can cross the new attachment", async () => {
+  const { coordinator, callbacks, host, calls, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should not wait for a batch");
+    host.emitInput(encoder.encode("b"));
+    callbacks.onTerminalState(snapshot(intents[0], 2));
+    await new Promise(resolve => setTimeout(resolve, 70));
+    assert.equal(calls.input.map(item => item.text).join(""), "a",
+      "an unsent key from the old binding must not enter the replacement");
+    assert.match(await visibleHostText(host), /recent input was not sent/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("Enter, local tab selection and resize flush pending printable input in order", async () => {
+  const { coordinator, host, calls, intents, runtime } = harness();
+  const order = [];
+  const sendInput = runtime.sendInput;
+  const resize = runtime.resize;
+  runtime.sendInput = async (...args) => {
+    order.push(`input:${args[1]}:${decoder.decode(args[0])}`);
+    return sendInput(...args);
+  };
+  runtime.resize = async (...args) => {
+    order.push(`resize:${args[2]}`);
+    return resize(...args);
+  };
+  try {
+    await coordinator.start(intents);
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+    host.emitInput(encoder.encode("b"));
+    host.emitInput(Uint8Array.of(0x0d));
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "ab\r", "Enter should flush text");
+    assert.deepEqual(calls.input.map(item => item.text), ["a", "b", "\r"]);
+    host.emitInput(encoder.encode("c"));
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "ab\rc", "next key should be immediate");
+    host.emitInput(encoder.encode("d"));
+    host.emitInput(Uint8Array.of(0x1d, 0x32));
+    await waitUntil(() => calls.switch.length === 1, "tab switch should not wait for a batch timer");
+    assert.equal(calls.input.map(item => item.text).join(""), "ab\rcd");
+    assert.equal(calls.input.at(-1).tabId, intents[0].tabId);
+    host.emitInput(encoder.encode("e"));
+    await waitUntil(() => calls.input.at(-1)?.text === "e", "new tab should receive its own key");
+    assert.equal(calls.input.at(-1).tabId, intents[1].tabId);
+    const orderStart = order.length;
+    host.emitInput(encoder.encode("f"));
+    host.emitResize();
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "ab\rcdef", "resize should flush text");
+    await waitUntil(() => order.slice(orderStart).includes("resize:tab-b"), "resize should follow queued input");
+    assert.equal(calls.input.map(item => item.text).join(""), "ab\rcdef");
+    const afterResizeRequest = order.slice(orderStart);
+    assert.ok(afterResizeRequest.indexOf("input:tab-b:f") < afterResizeRequest.indexOf("resize:tab-b"));
+  } finally { await coordinator.stop(); }
+});
+
+test("writer epoch change and local stop discard an unsent printable batch", async () => {
+  for (const action of ["epoch", "stop"]) {
+    const { coordinator, callbacks, host, calls, intents } = harness();
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      host.emitInput(encoder.encode("a"));
+      await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+      host.emitInput(encoder.encode("b"));
+      if (action === "epoch") callbacks.onTerminalState({ ...snapshot(intents[0]), writerEpoch: 2 });
+      else await coordinator.stop();
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(calls.input.map(item => item.text).join(""), "a", `${action} must retire pending text`);
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("a stale writer-seat refusal withholds queued input without closing the observer", async () => {
+  let releaseInput;
+  let refuseStale = false;
+  const inputGate = new Promise((resolve) => { releaseInput = resolve; });
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    inputGate,
+    sendInputError: () => refuseStale ? runtimeFailure("grant_scope_mismatch", "old writer epoch") : undefined,
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first send holds the input tail");
+    host.emitInput(encoder.encode("b"));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+    refuseStale = true;
+    releaseInput();
+    await waitUntil(() => /recent input was not sent/u.test(decoder.decode(host.writes.at(-1))),
+      "the stale-seat refusal is explained");
+    assert.equal(coordinator.state, "active", "writer transfer keeps the observer attached");
+    assert.deepEqual(calls.input.map((item) => item.text), ["a"]);
+    assert.deepEqual(calls.detach, []);
+  } finally {
+    releaseInput();
+    await coordinator.stop();
+  }
+});
+
+test("a grant mismatch against an unchanged writer remains a terminal failure", async () => {
+  let refuse = false;
+  const { coordinator, host, calls, intents } = harness({
+    sendInputError: () => refuse ? runtimeFailure("grant_scope_mismatch", "unexpected same-seat mismatch") : undefined,
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    refuse = true;
+    host.emitInput(encoder.encode("x"));
+    await waitUntil(() => coordinator.state === "stopped", "unexpected mismatch closes the terminal");
+    assert.deepEqual(calls.input, []);
+    assert.deepEqual(calls.detach, [intents[0].tabId]);
+  } finally { await coordinator.stop(); }
+});
+
+test("Ctrl+C flushes prior text before detaching and never batches the interrupt", async () => {
+  const { coordinator, host, calls, intents } = harness();
+  try {
+    await coordinator.start(intents);
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+    host.emitInput(encoder.encode("b"));
+    host.emitInput(Uint8Array.of(0x03));
+    await waitUntil(() => calls.detach.includes(intents[0].tabId), "Ctrl+C should detach without the batch timer");
+    assert.equal(calls.input.map(item => item.text).join(""), "ab");
+    assert.equal(calls.input.some(item => item.text.includes("\x03")), false);
+  } finally { await coordinator.stop(); }
+});
+
+test("bracketed paste remains one literal remote chunk after a pending printable batch", async () => {
+  const { coordinator, host, calls, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+    host.emitInput(encoder.encode("b"));
+    const paste = "\x1b[200~x\x1d2\x1b[201~";
+    host.emitInput(encoder.encode(paste));
+    await waitUntil(() => calls.input.map(item => item.text).join("") === `ab${paste}`,
+      "paste should preserve the local escape chord as literal bytes");
+    assert.deepEqual(calls.input.map(item => item.text), ["a", "b", paste]);
+    assert.equal(calls.switch.length, 0);
+  } finally { await coordinator.stop(); }
+});
+
+test("a browser request retires delayed typing and reports that it was not sent", async () => {
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    coordinatorOptions: { clock: () => 1_000 },
+  });
+  intents[0].localBrowserActions = true;
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+    host.emitInput(encoder.encode("b"));
+    const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.equal(calls.input.map(item => item.text).join(""), "a");
+    assert.match(await visibleHostText(host), /recent input was not sent/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("typing queued before a browser request cannot later approve or deny it", async () => {
+  for (const key of ["o", "d", "\r", "\x1b"]) {
+    const opened = [];
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const { coordinator, callbacks, host, calls, intents } = harness({
+      inputGate: gate,
+      coordinatorOptions: {
+        clock: () => 1_000,
+        browser: { async open(url) { opened.push(url); } },
+      },
+    });
+    intents[0].localBrowserActions = true;
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      host.emitInput(encoder.encode("x"));
+      await waitUntil(() => calls.input.length === 1, "the first send should hold the input tail");
+      host.emitInput(encoder.encode(key));
+      await new Promise(resolve => setTimeout(resolve, 40)); // the batch timer queues this key behind x
+      const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+      release();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      assert.deepEqual(opened, [], `${JSON.stringify(key)} was typed before the request and cannot authorize it`);
+      assert.equal(calls.input.map(item => item.text).join(""), "x", `${JSON.stringify(key)} cannot become delayed provider input`);
+      assert.match(await visibleHostText(host), /recent input was not sent/u);
+    } finally {
+      release();
+      await coordinator.stop();
+    }
+  }
+});
+
+test("a browser request on another tab does not discard queued writer input", async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const opened = [];
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    inputGate: gate,
+    coordinatorOptions: {
+      clock: () => 1_000,
+      browser: { async open(url) { opened.push(url); } },
+    },
+  });
+  intents[1].agent = "claude-code";
+  intents[1].localBrowserActions = true;
+  try {
+    await coordinator.start(intents);
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first input should hold the send tail");
+    host.emitInput(encoder.encode("b"));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+    await callbacks.onTerminalOutput(outputEvent(intents[1], 1n, encoder.encode(`${url}\r\n`)));
+    host.emitInput(encoder.encode("c"));
+    host.emitInput(encoder.encode("d"));
+    host.emitInput(encoder.encode("e"));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    release();
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "abcde",
+      "the unrelated request must not erase tab A's queued input");
+    assert.ok(calls.input.every(item => item.tabId === intents[0].tabId));
+    assert.ok(calls.input.length <= 4, "tab B's request must not disable tab A's input batching");
+    host.emitInput(Uint8Array.of(0x1d, 0x32));
+    await waitUntil(() => calls.switch.includes(intents[1].tabId), "the request's tab should become visible");
+    host.emitInput(encoder.encode("o"));
+    await waitUntil(() => opened.length === 1, "tab B's independent request should still be actionable");
+    assert.deepEqual(opened, [url]);
+  } finally {
+    release();
+    await coordinator.stop();
+  }
+});
+
+test("a queued local detach chord cannot turn into browser denial", async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const opened = [];
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    inputGate: gate,
+    coordinatorOptions: {
+      clock: () => 1_000,
+      browser: { async open(url) { opened.push(url); } },
+    },
+  });
+  intents[0].localBrowserActions = true;
+  try {
+    await coordinator.start(intents);
+    host.emitInput(encoder.encode("x"));
+    await waitUntil(() => calls.input.length === 1, "first input should hold the send tail");
+    host.emitInput(Uint8Array.of(0x1d));
+    host.emitInput(encoder.encode("d"));
+    const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+    release();
+    await waitUntil(() => calls.detach.includes(intents[0].tabId), "local detach should not become a decision");
+    assert.deepEqual(opened, []);
+    assert.equal(calls.input.map(item => item.text).join(""), "x");
+  } finally {
+    release();
+    await coordinator.stop();
+  }
+});
+
+test("a queued copy chord cannot act on a sign-in link revealed after receipt", async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const copied = [];
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    inputGate: gate,
+    coordinatorOptions: {
+      clock: () => 1_000,
+      copyText: async text => { copied.push(text); },
+    },
+  });
+  intents[0].localBrowserActions = true;
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("x"));
+    await waitUntil(() => calls.input.length === 1, "first input should hold the send tail");
+    host.emitInput(Uint8Array.of(0x1d));
+    host.emitInput(encoder.encode("y"));
+    const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+    release();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.deepEqual(copied, []);
+    assert.match(await visibleHostText(host), /recent input was not sent/u);
+  } finally {
+    release();
+    await coordinator.stop();
+  }
+});
+
 test("slow host painting does not stall ordered remote output and catches up without a frame backlog", async () => {
   const { coordinator, callbacks, intents, host } = harness();
   let release;
@@ -636,7 +967,11 @@ test("OAuth guard releases Escape promptly, blocks delayed URL paste, and cancel
     }
     if (end === "rebind") await callbacks.onTerminalReady(snapshot(intents[0], 2));
     if (end === "stop") await coordinator.stop();
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    if (end === "normal" || end === "replacement") {
+      await waitUntil(() => calls.input.length === 1, "guarded Escape reaches the provider");
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    }
     assert.equal(calls.input.length, end === "normal" || end === "replacement" ? 1 : 0, end);
     if (end === "normal") {
       assert.equal(calls.input[0].text, "\u001b");
@@ -2718,6 +3053,21 @@ test("session tabs: a click on another session detaches this one and asks for th
     assert.deepEqual(coordinator.switchRequest, { agentSessionId: SESSION_B, agent: "claude-code", label: "projB" });
     assert.deepEqual(coordinator.detachedSessions.map((item) => item.agentSessionId), [SESSION_A]);
     assert.equal(host.restored, 1, "the lease is released by its owner");
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: a click drains earlier batched typing before detaching", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const column = await tabColumn(host, "2:Claude projB");
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key reaches the writer immediately");
+    host.emitInput(encoder.encode("b"));
+    host.emitInput(press(column));
+    await waitUntil(() => coordinator.state === "stopped", "the click detaches the current session");
+    assert.deepEqual(calls.input.map((item) => item.text), ["a", "b"]);
+    assert.deepEqual(calls.detach, ["tab-a"]);
+    assert.equal(coordinator.switchRequest?.agentSessionId, SESSION_B);
   } finally { await coordinator.stop(); }
 });
 
