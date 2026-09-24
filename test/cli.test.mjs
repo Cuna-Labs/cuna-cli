@@ -952,7 +952,7 @@ test("non-TTY help and version are versioned JSON records", async () => {
   assert.match(allRecord.data.help, /Use --agent-session SESSION_ID to bypass reconciliation/u);
   const version = memoryStreams();
   assert.equal(await runCli(["--version"], { streams: version.streams }), EXIT_CODES.success);
-  assert.equal(JSON.parse(version.stdout()).data.version, "0.1.1");
+  assert.equal(JSON.parse(version.stdout()).data.version, "0.1.2");
 });
 
 test("missing automation auth fails before a remote call and emits no prompt", async () => {
@@ -1552,7 +1552,12 @@ test("production login uses the encrypted backend and reuses the canonical durab
     assert.equal(exit, EXIT_CODES.success, streams.stderr());
     assert.match(browserUrl, /^https:\/\/app\.getcuna\.com\/cli\/continue#/u);
     const files = await readdir(join(configDirectory, "sessions-v1"));
-    assert.equal(files.length, 2);
+    // Ciphertext and key; on Windows also the verified-ACL record, which holds
+    // file stats and a SID and nothing secret.
+    const aclRecords = files.filter((file) => file.endsWith(".json.acl"));
+    assert.equal(files.length - aclRecords.length, 2);
+    assert.equal(aclRecords.length, process.platform === "win32" ? 1 : 0);
+    for (const record of aclRecords) assert.doesNotMatch(await readFile(join(configDirectory, "sessions-v1", record), "utf8"), /cuna_/u);
     const storedFile = files.find((file) => file.endsWith(".json"));
     const stored = await readFile(join(configDirectory, "sessions-v1", storedFile), "utf8");
     assert.doesNotMatch(stored, /cuna_(?:at|rt)_/u);
@@ -3699,7 +3704,7 @@ test("cuna version prints the build digest that separates two installations repo
   const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
   assert.equal(await runCli(["version"], { streams: human.streams, platform, env: {} }), EXIT_CODES.success);
   const printed = human.stdout().trim();
-  assert.match(printed, /^0\.1\.1\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
+  assert.match(printed, /^0\.1\.2\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
 
   // The digest printed is the exact 12-hex prefix of the one the JSON record
   // carries, so the two surfaces can never name different builds.

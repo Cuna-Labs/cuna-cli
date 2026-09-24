@@ -8,6 +8,7 @@ import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import { reconnectDelay, type ReconnectPolicy } from "../runtime/backoff.js";
 import type { ForegroundTerminalHost } from "../terminal/foreground.js";
 import { terminalCellWidth, truncateTerminalLine } from "../terminal/cell-width.js";
+import type { MachineInventoryCache, MachineInventorySnapshot } from "./inventory-cache.js";
 import { listAllMachines } from "./pagination.js";
 import {
   isOpenCodeRuntimeUnverifiedReason,
@@ -127,6 +128,11 @@ export interface MachinesExplorerInput {
   readonly signal?: AbortSignal;
   readonly color?: boolean;
   readonly onBeforeTerminalOwnership?: () => void;
+  /**
+   * The last list this profile saw. Painted as "last known" until the first
+   * live list answers, and never selectable; the live list overwrites it.
+   */
+  readonly inventoryCache?: MachineInventoryCache;
 }
 
 export interface MachinesExplorerDependencies {
@@ -196,6 +202,8 @@ export async function runNodeMachinesExplorer(
 ): Promise<MachinesExplorerResult | undefined> {
   if (input.signal?.aborted) return;
   const host = dependencies.host ?? createNodeForegroundTerminalHost();
+  // Read before the first frame so the first frame can already show it.
+  const cachedInventory = await input.inventoryCache?.read();
   input.onBeforeTerminalOwnership?.();
   const lease = await host.acquire("rich");
   if (input.signal?.aborted) {
@@ -301,6 +309,7 @@ export async function runNodeMachinesExplorer(
             now: snapshotObservedAt,
             navigation,
             machinesListed: initialized,
+            ...(initialized || cachedInventory === undefined ? {} : { cachedInventory }),
             refreshError,
             interactionNotice: pendingDelete?.notice ?? interactionNotice,
             lifecycleNotice,
@@ -547,6 +556,26 @@ export async function runNodeMachinesExplorer(
     listRetryTimer.unref();
   };
 
+  // Serialized so a slow first write can never land after a later one.
+  let inventoryWrites = Promise.resolve();
+  const queueInventorySave = (): Promise<void> => {
+    const cache = input.inventoryCache;
+    if (cache === undefined) return inventoryWrites;
+    const snapshot = inventorySnapshot();
+    inventoryWrites = inventoryWrites.then(() => cache.write(snapshot));
+    return inventoryWrites;
+  };
+  const inventorySnapshot = (): MachineInventorySnapshot => (
+    Object.freeze({
+      savedAt: Date.now(),
+      machines: rows.map((row) => ({
+        id: row.machine.id,
+        name: row.machine.name,
+        state: row.machine.state,
+        ...(row.sessionsLoading === true || row.sessionsError !== undefined ? {} : { sessionCount: row.sessions.length }),
+      })),
+    }));
+
   const refresh = async (): Promise<void> => {
     if (refreshInFlight || stopped) return;
     refreshInFlight = true;
@@ -603,6 +632,9 @@ export async function runNodeMachinesExplorer(
         : visibleKeys[0];
       loadingPhase = rows.length === 0 ? undefined : "sessions";
       render();
+      // Saved now as well as after the sessions: a person who picks a row
+      // before the sessions settle still leaves a picture for next time.
+      void queueInventorySave();
 
       await Promise.all(rows.map(async ({ machine }) => {
         // Session inventory is the useful, non-mutating first answer.  Do not
@@ -665,6 +697,7 @@ export async function runNodeMachinesExplorer(
         });
         await Promise.all([sessionsTask, capabilityTask]);
       }));
+      if (!isClosing()) void queueInventorySave();
     } catch (error) {
       if (isClosing()) return;
       // E13-R7. Only a non-retryable failure (auth, policy, usage) leaves the
@@ -1099,6 +1132,7 @@ export async function runNodeMachinesExplorer(
     removeInput();
     removeResize();
     input.signal?.removeEventListener("abort", onAbort);
+    await inventoryWrites;
     await lease.restore();
   }
   return selection;
@@ -1197,6 +1231,8 @@ function renderMachinesExplorer(input: {
   readonly navigation: MachineFirstNavigationState;
   /** E13-R7: at least one machine list has succeeded. Until then an empty `rows` is not an empty inventory. */
   readonly machinesListed: boolean;
+  /** R2: shown, never selectable, only until the first live list. */
+  readonly cachedInventory?: MachineInventorySnapshot;
   readonly refreshError?: string | undefined;
   readonly interactionNotice?: string | undefined;
   readonly lifecycleNotice?: string | undefined;
@@ -1216,12 +1252,17 @@ function renderMachinesExplorer(input: {
   const lines = [machineHeader("Machines"), " Your machines and the agents running inside them.", ""];
   let selectedLine: number | undefined;
   const offerGlobalCreation = shouldOfferGlobalCreation(input.rows, input.now, input.machinesListed);
+  const cached = input.machinesListed ? undefined : input.cachedInventory;
   if (input.loadingPhase === "machines" && input.rows.length === 0) {
-    lines.push(loaderLine("Discovering machines", input.animationFrame));
+    lines.push(loaderLine(cached === undefined
+      ? "Discovering machines"
+      : `Refreshing machines · last known list from ${ageLabel(input.now - cached.savedAt)}`, input.animationFrame));
+    if (cached !== undefined) lines.push(...cachedInventoryLines(cached));
   } else if (!input.machinesListed) {
     // E13-R7: no list has succeeded yet. This is an error state, not an
     // empty inventory; the notice below carries the typed reason.
     lines.push("Machines could not be listed.");
+    if (cached !== undefined) lines.push(` Last known list, from ${ageLabel(input.now - cached.savedAt)}:`, ...cachedInventoryLines(cached));
   } else if (input.rows.length === 0) {
     lines.push("No machines yet. Choose a supported configuration:");
     for (const agent of providerCreationOrder()) {
@@ -1422,7 +1463,7 @@ function renderContextScreen(input: {
   if (input.refreshError !== undefined) lines.push("", input.refreshError);
   if (input.interactionNotice !== undefined) lines.push("", input.interactionNotice);
   if (input.lifecycleNotice !== undefined) lines.push("", ` ${input.lifecycleNotice}`);
-  lines.push("", " p Check provider  ·  w Workspaces  ·  e Executions", " ↑↓ move  ·  ←→ navigate  ·  Enter select  ·  Esc/Backspace back  ·  q quit");
+  lines.push("", " w Workspaces  ·  e Executions", " ↑↓ move  ·  ←→ navigate  ·  Enter select  ·  Esc/Backspace back  ·  q quit");
   return Object.freeze({
     lines: Object.freeze(lines.map((line) => truncateTerminalLine(line, input.columns))),
     ...(selectedLine === undefined ? {} : { selectedLine }),
@@ -1515,7 +1556,8 @@ function overviewFooter(
   now: number,
 ): string {
   // E13-R1: `n new machine` is on every overview footer, whatever is selected.
-  const tail = "p Check provider  ·  n new machine  ·  r refresh  ·  q quit";
+  const tail = "n new machine  ·  r refresh  ·  q quit";
+  const sessionTail = `p Check provider  ·  ${tail}`;
   if (selectedKey?.startsWith("machine:") === true) {
     return ` ↑↓ move  ·  Enter/→ manage machine  ·  ${tail}`;
   }
@@ -1526,18 +1568,18 @@ function overviewFooter(
     if (row !== undefined && session !== undefined && isActionableProvider(session.agent)) {
       const actionability = classifySessionActionability({ session, machine: row.machine, now });
       if (actionability.canAttach || actionability.recoveryAction === "authenticate") {
-        return ` ↑↓ move  ·  Enter/→ attach ${providerDisplayName(session.agent)}  ·  ${tail}`;
+        return ` ↑↓ move  ·  Enter/→ attach ${providerDisplayName(session.agent)}  ·  ${sessionTail}`;
       }
       if (actionability.recoveryAction === "refresh") {
-        return ` ↑↓ move  ·  Enter refresh session  ·  ← back  ·  ${tail}`;
+        return ` ↑↓ move  ·  Enter refresh session  ·  ← back  ·  ${sessionTail}`;
       }
       if (actionability.recoveryAction === "wait") {
         return hasLegacySupervisorBlockedOpenCodeSession(row) && session.agent === "opencode" &&
           isUnobservedLaunchedSession(session)
-          ? ` ↑↓ move  ·  Legacy supervisor blocked  ·  ← back  ·  ${tail}`
-          : ` ↑↓ move  ·  Waiting for process observation  ·  ← back  ·  ${tail}`;
+          ? ` ↑↓ move  ·  Legacy supervisor blocked  ·  ← back  ·  ${sessionTail}`
+          : ` ↑↓ move  ·  Waiting for process observation  ·  ← back  ·  ${sessionTail}`;
       }
-      return ` ↑↓ move  ·  Enter session details  ·  ← back  ·  ${tail}`;
+      return ` ↑↓ move  ·  Enter session details  ·  ← back  ·  ${sessionTail}`;
     }
   }
   if (selectedKey?.startsWith("create:") === true) {
@@ -1763,15 +1805,35 @@ function listFailureNotice(error: unknown, hasRows: boolean, retryDelayMs: numbe
   return ` ${reason}: ${subject}. ${retry}`;
 }
 
-function loaderLine(label: string, frame: number): string {
+export function loaderLine(label: string, frame: number): string {
   return `${SPINNER[frame % SPINNER.length]} ${label}  ${PROGRESS[frame % PROGRESS.length]}`;
 }
 
-function machineHeader(title: string): string {
+export function machineHeader(title: string): string {
   return ` CUNA  ◆── ${title}`;
 }
 
-function paintMachinesExplorer(lines: readonly string[], columns: number, color: boolean): readonly string[] {
+/** Cached rows start with `  · ` so the painter can dim them as not live. */
+function cachedInventoryLines(snapshot: MachineInventorySnapshot): readonly string[] {
+  if (snapshot.machines.length === 0) return ["  · no machines"];
+  return snapshot.machines.map((machine) => {
+    const sessions = machine.sessionCount === undefined
+      ? ""
+      : `  ${machine.sessionCount === 0 ? "no sessions" : `${machine.sessionCount} session${machine.sessionCount === 1 ? "" : "s"}`}`;
+    return `  · ${safeLine(machine.name)}  ${safeLine(machine.state)}${sessions}`;
+  });
+}
+
+function ageLabel(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `${seconds} s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours} h ago` : `${Math.round(hours / 24)} days ago`;
+}
+
+export function paintMachinesExplorer(lines: readonly string[], columns: number, color: boolean): readonly string[] {
   if (!color) return lines;
   return Object.freeze(lines.map((line, index) => {
     if (index === 0 && line.startsWith(" CUNA ")) {
@@ -1780,6 +1842,8 @@ function paintMachinesExplorer(lines: readonly string[], columns: number, color:
       const padding = " ".repeat(Math.max(0, columns - terminalCellWidth(line)));
       return `${ANSI.flareBackground}${ANSI.ground}${ANSI.bold}${brand}${ANSI.reset}${ANSI.emberBackground}${ANSI.cream}${ANSI.bold}${context}${padding}${ANSI.reset}`;
     }
+    // Last known, not live: dim, and no state colours that would read as current.
+    if (line.startsWith("  · ")) return `${ANSI.gray}${ANSI.dim}${line}${ANSI.reset}`;
     if (line.startsWith("❯")) return `${ANSI.orange}${ANSI.bold}${paintStatus(line)}${ANSI.reset}`;
     if (line.startsWith("  ▾") || line.startsWith("  ▸") || line.startsWith(" ▾") || line.startsWith(" ▸")) {
       return `${ANSI.bold}${ANSI.orange}${paintStatus(line)}${ANSI.reset}`;

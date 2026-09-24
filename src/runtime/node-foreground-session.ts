@@ -11,16 +11,22 @@ import type { BrowserOpener } from "../auth/browser.js";
 import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import {
   ForegroundTerminalCoordinator,
+  SWITCH_INPUT_NOTICE,
   admitForegroundDimensions,
   admitForegroundSessionIds,
+  type DetachedForegroundSession,
+  type ForegroundSwitchRequest,
   type ForegroundTabIntent,
   type ForegroundTerminalCoordinatorOptions,
   type ForegroundTerminalHost,
 } from "../terminal/foreground.js";
+import type { HostTerminalLease } from "../terminal/mode.js";
+import { PollingSessionRoster, type SessionRosterEntry } from "../terminal/session-roster.js";
 import {
   PassthroughTerminalCoordinator,
   admitPassthroughDimensions,
 } from "../terminal/passthrough.js";
+import { predictiveEchoModeFromEnvironment, type PredictiveEchoMode } from "../terminal/predictive-echo.js";
 
 import { createApiTerminalControlPlane } from "./api-terminal-control-plane.js";
 import { CunaRuntimeBoundary } from "./boundary.js";
@@ -42,6 +48,13 @@ import {
 
 const TERMINAL_CAPABILITY_ID = "terminal_connections.create";
 const OPENCODE_AUTH_ADVISORY_TIMEOUT_MS = 250;
+const PROVIDER_AUTH_ADVISORY_TIMEOUT_MS = 2_000;
+interface PendingProviderAuthProbe {
+  readonly tabId: string;
+  readonly agentSessionId: string;
+  readonly processEpoch: string;
+  readonly evidence: Promise<ForegroundTabIntent["providerAuthentication"]>;
+}
 // A first interactive OpenCode session has no credential state yet. Provider
 // auth is an advisory display observation: it may be absent, temporarily
 // unreachable, or unavailable on an older deployment. A fresh supervisor
@@ -96,14 +109,190 @@ export interface NodeForegroundSessionDependencies {
     ForegroundTerminalCoordinatorOptions,
     "reconnectAttempts" | "reconnectBaseDelayMs" | "resizeCoalesceMs"
   >;
+  /** `false` turns the Machine session tabs off. */
+  readonly sessionRoster?: false;
+  readonly sessionRosterIntervalMs?: number;
+  /** SGR mouse reports for the clickable bar; on by default for the real host only. */
+  readonly mouseReporting?: boolean;
 }
 
+/** What one attached run ended with. */
+interface ForegroundRunOutcome {
+  readonly detached: readonly DetachedForegroundSession[];
+  readonly switchTo?: ForegroundSwitchRequest;
+}
+
+/**
+ * State shared by the attached runs of one command: the host terminal stays
+ * owned across a switch, and the Machine roster keeps its numbers.
+ */
+interface ForegroundSwitchContext {
+  readonly host: HeldForegroundHost;
+  roster: PollingSessionRoster | undefined;
+  /** Ctrl+C between two attachments: the run ends, nothing more is attached. */
+  cancelled?: boolean;
+  /** Set while a switch is between two attachments. */
+  switching: {
+    readonly title: string;
+    readonly initialNotice?: string;
+    notices: string[];
+  } | undefined;
+}
+
+/**
+ * Attach, and keep attaching whatever the person picks on the bar.
+ *
+ * A switch is a sequence of ordinary single-session runs, one runtime each,
+ * because the writer seat belongs to a client id and this computer remembers
+ * one id per AgentSession: going back to a session is the same client, and its
+ * seat resumes without a takeover. The host terminal is acquired once and
+ * restored once, so the shell never flashes between the two sessions.
+ */
 export async function runNodeForegroundSessions(
   input: ForegroundSessionRunnerInput,
   dependencies: NodeForegroundSessionDependencies = {},
 ): Promise<void> {
+  const context: ForegroundSwitchContext = {
+    host: holdForegroundHost(dependencies.host ?? createNodeForegroundTerminalHost()),
+    roster: undefined,
+    switching: undefined,
+  };
+  const detached = new Map<string, DetachedForegroundSession>();
+  let failure: unknown;
   try {
-    await runNodeForegroundSessionsWithRetry(input, dependencies);
+    await runSwitchingForeground(input, dependencies, context, detached);
+  } catch (error) {
+    failure = error;
+  }
+  context.roster?.stop();
+  const cleanupFailures: unknown[] = [];
+  try {
+    await context.host.release();
+  } catch (error) {
+    cleanupFailures.push(error);
+  }
+  // PRD-PM-008 E14-D6. Only after the host terminal is restored, and only for
+  // detaches the person asked for and the runtime confirmed: one line per
+  // session that survived and how to come back. A failed run says nothing
+  // here; its error is the message. A session the roster saw end is not
+  // announced as running.
+  if (failure === undefined && cleanupFailures.length === 0) {
+    const ended = new Set((context.roster?.entries() ?? []).filter((entry) => entry.ended).map((entry) => entry.agentSessionId));
+    for (const session of detached.values()) {
+      if (ended.has(session.agentSessionId)) continue;
+      try {
+        await context.host.write(new TextEncoder().encode(
+          `Detached · ${session.label} keeps running · cuna connect ${session.agentSessionId}\n`,
+        ));
+      } catch {
+        // The line is a courtesy after a completed detach. A host that cannot
+        // take one more write must not turn a confirmed detach into a failure.
+      }
+    }
+  }
+  if (failure !== undefined && cleanupFailures.length > 0) {
+    throw new AggregateError([failure, ...cleanupFailures], "Foreground terminal execution and cleanup both failed.");
+  }
+  if (failure !== undefined) throw failure;
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, "Foreground terminal cleanup was incomplete.");
+  }
+}
+
+async function runSwitchingForeground(
+  input: ForegroundSessionRunnerInput,
+  dependencies: NodeForegroundSessionDependencies,
+  context: ForegroundSwitchContext,
+  detached: Map<string, DetachedForegroundSession>,
+): Promise<void> {
+  let current: SwitchStep = { input, name: undefined };
+  // The session a switch left, to come back to once if the target fails.
+  let previous: SwitchStep | undefined;
+  let switchFailure: unknown;
+  for (;;) {
+    let outcome: ForegroundRunOutcome;
+    try {
+      outcome = await runForgettingEndedSessions(current.input, dependencies, context);
+    } catch (error) {
+      if (context.cancelled === true) return;
+      if (switchFailure !== undefined) {
+        // R15: the way back failed too. End with both typed errors.
+        throw new AggregateError([switchFailure, error], "Cuna could not switch sessions, nor return to the previous one.");
+      }
+      const origin = previous;
+      if (origin === undefined || input.signal?.aborted) throw error;
+      // R15: the target could not be attached. Go back, once, to the session
+      // the person left; it was running a moment ago and this computer is
+      // still its client, so its writer seat resumes.
+      switchFailure = error;
+      context.switching = {
+        title: `RETURNING TO ${(origin.name ?? "the previous session").toUpperCase()}`,
+        initialNotice: `Could not switch to ${current.name ?? "that session"}: ${typedFailureReason(error)}`,
+        notices: [],
+      };
+      current = origin;
+      previous = undefined;
+      continue;
+    }
+    switchFailure = undefined;
+    context.switching = undefined;
+    for (const session of outcome.detached) {
+      detached.delete(session.agentSessionId);
+      detached.set(session.agentSessionId, session);
+    }
+    const target = outcome.switchTo;
+    if (target === undefined) return;
+    const leftId = current.input.agentSessionIds[0];
+    const left = leftId === undefined ? undefined : context.roster?.entries().find((entry) => entry.agentSessionId === leftId);
+    previous = { input: current.input, name: current.name ?? (left === undefined ? undefined : `${rosterAgentName(left.agent)} ${left.label}`.trim()) };
+    const name = `${rosterAgentName(target.agent)} ${target.label}`.trim();
+    context.switching = { title: `SWITCHING TO ${name.toUpperCase()}`, notices: [] };
+    current = {
+      name,
+      input: Object.freeze({
+        ...input,
+        agentSessionIds: Object.freeze([target.agentSessionId]),
+        expectedAgentKinds: Object.freeze([target.agent]),
+      }),
+    };
+  }
+}
+
+interface SwitchStep {
+  readonly input: ForegroundSessionRunnerInput;
+  /** `Claude <label>`, known for every session reached through the bar. */
+  readonly name: string | undefined;
+}
+
+function rosterAgentName(agent: SessionRosterEntry["agent"]): string {
+  switch (agent) {
+    case "claude-code": return "Claude";
+    case "codex": return "Codex";
+    case "opencode": return "OpenCode";
+  }
+}
+
+/** A closed code, never remote text: what a switch failure is shown as. */
+function typedFailureReason(error: unknown): string {
+  if (error instanceof AggregateError) return typedFailureReason(error.errors.at(-1));
+  if (error instanceof RuntimeBoundaryError) {
+    const reason = error.safeDetails?.reason_code;
+    const code = typeof reason === "string" && /^[a-z0-9_.]{1,64}$/u.test(reason) ? reason : error.code;
+    return code.replace(/^cuna\./u, "").replace(/[._]+/gu, " ");
+  }
+  const code = (error as { readonly code?: unknown } | undefined)?.code;
+  return typeof code === "string" && /^[a-z0-9_.]{1,64}$/u.test(code)
+    ? code.replace(/^cuna\./u, "").replace(/[._]+/gu, " ")
+    : "unexpected error";
+}
+
+async function runForgettingEndedSessions(
+  input: ForegroundSessionRunnerInput,
+  dependencies: NodeForegroundSessionDependencies,
+  context: ForegroundSwitchContext,
+): Promise<ForegroundRunOutcome> {
+  try {
+    return await runNodeForegroundSessionsWithRetry(input, dependencies, context);
   } catch (error) {
     // A refusal that says the session's process is gone for good ends the
     // remembered client with it, whichever step of the run it came from.
@@ -121,9 +310,10 @@ export async function runNodeForegroundSessions(
 async function runNodeForegroundSessionsWithRetry(
   input: ForegroundSessionRunnerInput,
   dependencies: NodeForegroundSessionDependencies,
-): Promise<void> {
+  context: ForegroundSwitchContext,
+): Promise<ForegroundRunOutcome> {
   try {
-    await runNodeForegroundSessionsOnce(input, dependencies);
+    return await runNodeForegroundSessionsOnce(input, dependencies, context);
   } catch (error) {
     if (!retryableEarlyTerminalFailure(error) || input.signal?.aborted) throw error;
     // A newly issued one-use ticket can reach the public gateway just before
@@ -132,7 +322,7 @@ async function runNodeForegroundSessionsWithRetry(
     // and never repeats user input or an established terminal interaction.
     await new Promise<void>((resolve) => setTimeout(resolve, 250));
     try {
-      await runNodeForegroundSessionsOnce(input, dependencies);
+      return await runNodeForegroundSessionsOnce(input, dependencies, context);
     } catch (retryError) {
       if (retryError instanceof RuntimeBoundaryError) {
         throw new RuntimeBoundaryError({
@@ -158,7 +348,59 @@ function retryableEarlyTerminalFailure(error: unknown): error is RuntimeBoundary
 async function runNodeForegroundSessionsOnce(
   input: ForegroundSessionRunnerInput,
   dependencies: NodeForegroundSessionDependencies,
-): Promise<void> {
+  context: ForegroundSwitchContext,
+): Promise<ForegroundRunOutcome> {
+  const switching = context.switching;
+  if (switching === undefined) return await runNodeForegroundSessionsAdmitted(input, dependencies, context);
+  // Between two attachments the host still shows Cuna's alternate screen and
+  // nobody reads its input. Say what is happening, drop typed keys (R13), and
+  // let Ctrl+C end the run (R16); both sessions keep running.
+  const cancel = new AbortController();
+  const removeInput = context.host.onInput((bytes) => {
+    if (bytes.includes(0x03)) {
+      context.cancelled = true;
+      cancel.abort();
+    }
+  });
+  let frame = 0;
+  let step = "Checking the session";
+  let painting = true;
+  const startedAt = Date.now();
+  const paint = (nextStep?: string): void => {
+    if (!painting) return;
+    if (nextStep !== undefined) step = nextStep;
+    frame += 1;
+    const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1_000);
+    void context.host.write(switchingScreen(switching.title, step, frame, context.host.dimensions(), input.color ?? true, elapsedSeconds))
+      .catch(() => undefined);
+  };
+  paint();
+  const timer = setInterval(() => paint(), 1_000);
+  timer.unref();
+  try {
+    return await runNodeForegroundSessionsAdmitted({
+      ...input,
+      signal: input.signal === undefined ? cancel.signal : AbortSignal.any([input.signal, cancel.signal]),
+      onProgress: paint,
+      onBeforeTerminalOwnership: () => {
+        painting = false;
+        clearInterval(timer);
+        removeInput();
+      },
+      onNotice: (line) => { switching.notices.push(line); },
+    }, dependencies, context);
+  } finally {
+    painting = false;
+    clearInterval(timer);
+    removeInput();
+  }
+}
+
+async function runNodeForegroundSessionsAdmitted(
+  input: ForegroundSessionRunnerInput,
+  dependencies: NodeForegroundSessionDependencies,
+  context: ForegroundSwitchContext,
+): Promise<ForegroundRunOutcome> {
   const clock = dependencies.clock ?? Date.now;
   const sessionIds = admitForegroundSessionIds(input.agentSessionIds);
   if (
@@ -189,8 +431,10 @@ async function runNodeForegroundSessionsOnce(
   } else if (sessionIds.length !== 1) {
     throw runtimeFailure("capability_unsupported", "Plain passthrough mode binds exactly one AgentSession.");
   }
+  // Plain passthrough forwards bytes untouched and never paints guesses.
+  const predictiveEcho = presentationMode === "rich" ? predictiveEchoModeFromEnvironment(environment) : "off";
   const allowedOrigin = admitApiOrigin(input.baseUrl);
-  const host = dependencies.host ?? createNodeForegroundTerminalHost();
+  const host = context.host;
 
   // TTY authority and dimensions are admitted before any control-plane read or
   // one-use terminal grant. Acquiring raw/alternate-screen ownership remains a
@@ -205,9 +449,15 @@ async function runNodeForegroundSessionsOnce(
   });
   const intents: ForegroundTabIntent[] = [];
   const sessions: AgentSession[] = [];
+  const authSubjects: Array<{
+    readonly tabId: string;
+    readonly session: AgentSession;
+    readonly observation: ReturnType<typeof assertRemoteAgentSessionEvidence>;
+  }> = [];
   for (let index = 0; index < sessionIds.length; index += 1) {
     const agentSessionId = sessionIds[index];
     if (agentSessionId === undefined) continue;
+    const tabId = dependencies.tabId?.(index) ?? `tab:${index + 1}`;
     throwIfAborted(input.signal);
     input.onProgress?.("Checking selected AgentSession");
     const session = await input.client.getAgentSession(agentSessionId, input.signal);
@@ -253,14 +503,17 @@ async function runNodeForegroundSessionsOnce(
     });
     throwIfAborted(input.signal);
     admitSessionIdentity(session, observation, agentSessionId);
-    input.onProgress?.("Checking provider sign-in");
-    const providerAuthentication = await observeProviderAuthentication({
-      client: input.client,
-      session,
-      observation,
-      now: clock,
-      ...(input.signal === undefined ? {} : { signal: input.signal }),
-    });
+    // OpenCode's login-pending presentation is part of its existing admission
+    // semantics. Claude and Codex can open with auth unknown and update later.
+    let providerAuthentication: ForegroundTabIntent["providerAuthentication"];
+    if (session.agent === "opencode") {
+      input.onProgress?.("Checking provider sign-in");
+      providerAuthentication = await observeProviderAuthentication({
+        client: input.client, session, observation, now: clock,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        advisoryTimeoutMs: PROVIDER_AUTH_ADVISORY_TIMEOUT_MS,
+      });
+    }
     throwIfAborted(input.signal);
     if (capability.expiresAt <= clock()) {
       // Provider sign-in inspection can outlast the short authorization lease.
@@ -281,8 +534,11 @@ async function runNodeForegroundSessionsOnce(
       }, clock());
       throwIfAborted(input.signal);
     }
+    if (session.agent !== "opencode" && presentationMode === "rich") {
+      authSubjects.push({ tabId, session, observation });
+    }
     intents.push(Object.freeze({
-      tabId: dependencies.tabId?.(index) ?? `tab:${index + 1}`,
+      tabId,
       agentSessionId,
       label: safeSessionLabel(session),
       agent: session.agent,
@@ -309,19 +565,49 @@ async function runNodeForegroundSessionsOnce(
   }
   throwIfAborted(input.signal);
 
+  // The bar lists the Machine's sessions only for a one-session rich run; the
+  // same roster serves every switch of this command, so numbers stay put.
+  const machineId = sessions[0]?.machineId;
+  if (presentationMode === "rich" && sessions.length === 1 && machineId !== undefined &&
+      context.roster === undefined && dependencies.sessionRoster !== false) {
+    context.roster = new PollingSessionRoster({
+      list: async (signal) => await listMachineAgentSessions(input.client, machineId, signal),
+      ...(dependencies.sessionRosterIntervalMs === undefined ? {} : { intervalMs: dependencies.sessionRosterIntervalMs }),
+    });
+    context.roster.start();
+  }
+
   const identity = await claimClientIdentity(input, dependencies, sessions);
+  const authAbort = new AbortController();
+  const authSignal = input.signal === undefined
+    ? authAbort.signal
+    : AbortSignal.any([input.signal, authAbort.signal]);
+  const providerAuthProbes: readonly PendingProviderAuthProbe[] = authSubjects.map(({ tabId, session, observation }) => ({
+    tabId,
+    agentSessionId: session.id,
+    processEpoch: observation.processEpoch,
+    evidence: observeProviderAuthentication({
+      client: input.client, session, observation, now: clock,
+      signal: authSignal,
+      advisoryTimeoutMs: PROVIDER_AUTH_ADVISORY_TIMEOUT_MS,
+    }).catch(() => undefined),
+  }));
   try {
-    await runClaimedForeground(input, dependencies, {
+    return await runClaimedForeground(input, dependencies, {
       clock,
       host,
       presentationMode,
+      predictiveEcho,
       controlPlane,
       allowedOrigin,
       intents,
+      providerAuthProbes,
       clientInstanceId: identity?.clientInstanceId ?? dependencies.clientInstanceId?.() ?? `cli:${randomUUID()}`,
       ...(identity === undefined ? {} : { identity }),
+      switchContext: context,
     });
   } finally {
+    authAbort.abort();
     await identity?.release();
   }
 }
@@ -367,16 +653,23 @@ async function runClaimedForeground(
     readonly clock: () => number;
     readonly host: ForegroundTerminalHost;
     readonly presentationMode: ForegroundPresentationMode;
+    readonly predictiveEcho: PredictiveEchoMode;
     readonly controlPlane: TerminalControlPlane;
     readonly allowedOrigin: string;
     readonly intents: readonly ForegroundTabIntent[];
+    readonly providerAuthProbes: readonly PendingProviderAuthProbe[];
     readonly clientInstanceId: string;
     readonly identity?: TerminalClientIdentity;
+    readonly switchContext: ForegroundSwitchContext;
   },
-): Promise<void> {
-  const { clock, host, presentationMode, controlPlane, allowedOrigin, intents, clientInstanceId } = context;
+): Promise<ForegroundRunOutcome> {
+  const { clock, host, presentationMode, predictiveEcho, controlPlane, allowedOrigin, intents, clientInstanceId } = context;
   input.onProgress?.("Preparing your cloud terminal");
   input.onBeforeTerminalOwnership?.();
+  const switching = context.switchContext.switching;
+  const initialNotice = [switching?.initialNotice, ...(switching?.notices ?? [])]
+    .filter((line): line is string => line !== undefined).join(" · ");
+  const roster = intents.length === 1 ? context.switchContext.roster : undefined;
   const coordinator = presentationMode === "rich"
     ? new ForegroundTerminalCoordinator({
         ...dependencies.coordinatorOptions,
@@ -385,6 +678,11 @@ async function runClaimedForeground(
         clock,
         color: input.color ?? true,
         deviceId: clientInstanceId,
+        predictiveEcho,
+        ...(roster === undefined ? {} : { sessionRoster: roster }),
+        mouseReporting: dependencies.mouseReporting ?? dependencies.host === undefined,
+        ...(switching === undefined ? {} : { attachingTitle: switching.title }),
+        ...(initialNotice.length === 0 ? {} : { initialNotice }),
       })
     : new PassthroughTerminalCoordinator({
         host,
@@ -414,7 +712,22 @@ async function runClaimedForeground(
 
   let failure: unknown;
   try {
-    await coordinator.start(intents, input.signal);
+    const starting = coordinator.start(intents, input.signal);
+    if (coordinator instanceof ForegroundTerminalCoordinator) {
+      for (const probe of context.providerAuthProbes) {
+        void probe.evidence.then(async (evidence) => {
+          if (evidence === undefined) return;
+          await starting;
+          await coordinator.applyProviderAuthentication({
+            tabId: probe.tabId,
+            agentSessionId: probe.agentSessionId,
+            processEpoch: probe.processEpoch,
+            evidence,
+          });
+        }).catch(() => undefined);
+      }
+    }
+    await starting;
     await coordinator.waitForStop();
     if (coordinator.failure !== undefined) throw coordinator.failure;
   } catch (error) {
@@ -427,22 +740,15 @@ async function runClaimedForeground(
   } catch (error) {
     cleanupFailures.push(error);
   }
-  // PRD-PM-008 E14-D6. Only after the host terminal is restored, and only for
-  // detaches the person asked for and the runtime confirmed: one line that
-  // says the session survived and how to come back. A failed run says nothing
-  // here; its error is the message.
-  if (failure === undefined && cleanupFailures.length === 0) {
-    for (const detached of coordinator.detachedSessions) {
-      try {
-        await host.write(new TextEncoder().encode(
-          `Detached · ${detached.label} keeps running · cuna connect ${detached.agentSessionId}\n`,
-        ));
-      } catch {
-        // The line is a courtesy after a completed detach. A host that cannot
-        // take one more write must not turn a confirmed detach into a failure.
-      }
-    }
-  }
+  // The "keeps running" lines are written by `runNodeForegroundSessions` once
+  // the host is restored; a switch keeps the host, so they cannot go here.
+  const outcome: ForegroundRunOutcome = Object.freeze({
+    detached: coordinator.detachedSessions,
+    ...(coordinator instanceof ForegroundTerminalCoordinator && coordinator.switchRequest !== undefined &&
+      !context.switchContext.cancelled
+      ? { switchTo: coordinator.switchRequest }
+      : {}),
+  });
   try {
     await runtime.shutdown();
   } catch (error) {
@@ -462,6 +768,94 @@ async function runClaimedForeground(
   if (cleanupFailures.length > 0) {
     throw new AggregateError(cleanupFailures, "Foreground terminal cleanup was incomplete.");
   }
+  return outcome;
+}
+
+/**
+ * The host terminal for a whole command: acquired by the first attachment,
+ * restored by `release()` only. A switch stops one coordinator and starts the
+ * next without the shell ever showing through between them.
+ */
+interface HeldForegroundHost extends ForegroundTerminalHost {
+  release(): Promise<void>;
+}
+
+function holdForegroundHost(host: ForegroundTerminalHost): HeldForegroundHost {
+  let lease: HostTerminalLease | undefined;
+  let mode: "rich" | "plain" | undefined;
+  const held = Object.freeze({
+    restore: async (): Promise<void> => undefined,
+  }) as unknown as HostTerminalLease;
+  return Object.freeze({
+    dimensions: () => host.dimensions(),
+    write: async (bytes: Uint8Array) => await host.write(bytes),
+    onInput: (listener: (bytes: Uint8Array) => void) => host.onInput(listener),
+    onResize: (listener: () => void) => host.onResize(listener),
+    async acquire(requested?: "rich" | "plain"): Promise<HostTerminalLease> {
+      if (lease === undefined) {
+        lease = await host.acquire(requested);
+        mode = requested ?? "rich";
+      } else if (mode !== (requested ?? "rich")) {
+        throw runtimeFailure("session_conflict", "The host terminal is already held in another presentation mode.");
+      }
+      return held;
+    },
+    async release(): Promise<void> {
+      const current = lease;
+      lease = undefined;
+      mode = undefined;
+      await current?.restore();
+    },
+  });
+}
+
+async function listMachineAgentSessions(
+  client: CunaApiClient,
+  machineId: string,
+  signal: AbortSignal,
+): Promise<readonly AgentSession[]> {
+  const items: AgentSession[] = [];
+  const cursors = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await client.listAgentSessions(machineId, {
+      limit: 100,
+      ...(cursor === undefined ? {} : { cursor }),
+    }, signal);
+    items.push(...page.items);
+    cursor = page.nextCursor;
+    if (cursor !== undefined && cursors.has(cursor)) throw new Error("AgentSession pagination repeated a cursor.");
+    if (cursor !== undefined) cursors.add(cursor);
+  } while (cursor !== undefined);
+  return Object.freeze(items);
+}
+
+/** The two rows shown between two attachments, in the loader's own colors. */
+function switchingScreen(
+  title: string,
+  step: string,
+  frame: number,
+  dimensions: { readonly columns: number; readonly rows: number },
+  color: boolean,
+  elapsedSeconds: number,
+): Uint8Array {
+  const spinner = ["◐", "◓", "◑", "◒"][frame % 4] ?? "◐";
+  const pad = (text: string): string => {
+    const characters = [...text.replace(/[\p{Cc}\p{Cf}]/gu, "")];
+    return characters.length >= dimensions.columns
+      ? characters.slice(0, dimensions.columns).join("")
+      : `${characters.join("")}${" ".repeat(dimensions.columns - characters.length)}`;
+  };
+  return new TextEncoder().encode([
+    "\u001b[?25l\u001b[H\u001b[2J",
+    color ? "\u001b[48;2;235;86;37m\u001b[38;2;255;255;255m" : "",
+    pad(` CUNA  ${title}`),
+    color ? "\u001b[0m" : "",
+    dimensions.rows > 1 ? "\r\n" : "",
+    dimensions.rows > 1 && color ? "\u001b[48;2;121;48;25m\u001b[38;2;224;210;203m" : "",
+    dimensions.rows > 1 ? pad(` ${spinner} ${step}${elapsedSeconds >= 3 ? ` · ${elapsedSeconds}s` : ""}  ·  ${SWITCH_INPUT_NOTICE}  ·  Ctrl-C closes`) : "",
+    color ? "\u001b[0m" : "",
+  ].join(""));
 }
 
 export function admitForegroundTerminalEnvironment(input: {
@@ -567,6 +961,8 @@ async function observeProviderAuthentication(input: Readonly<{
   observation: ReturnType<typeof assertRemoteAgentSessionEvidence>;
   now: () => number;
   signal?: AbortSignal;
+  /** Bound for a non-OpenCode probe; absent, the probe waits as long as the request does. */
+  advisoryTimeoutMs?: number;
 }>): Promise<ForegroundTabIntent["providerAuthentication"]> {
   let status: AgentSessionAuth;
   // OpenCode authentication is presentation-only at this point.  The exact
@@ -574,11 +970,19 @@ async function observeProviderAuthentication(input: Readonly<{
   // process; holding the person behind a server-side auth probe (which may
   // wait for an older supervisor) does not add authority. Bound it so a first
   // `/connect` can reach the real OpenCode TUI promptly.
-  const authProbeSignal = mayEnterOpenCodeLogin(input.session, input.observation, input.now())
-    ? input.signal === undefined
-      ? AbortSignal.timeout(OPENCODE_AUTH_ADVISORY_TIMEOUT_MS)
-      : AbortSignal.any([input.signal, AbortSignal.timeout(OPENCODE_AUTH_ADVISORY_TIMEOUT_MS)])
-    : input.signal;
+  // Claude and Codex use the same bound on first attach and on switches:
+  // a failed read shows "auth unknown". A live first attach spent over 10 s
+  // waiting for this presentation-only read on 2026-09-24.
+  const advisoryTimeoutMs = mayEnterOpenCodeLogin(input.session, input.observation, input.now())
+    ? OPENCODE_AUTH_ADVISORY_TIMEOUT_MS
+    : input.advisoryTimeoutMs !== undefined && input.session.agent !== "opencode"
+      ? input.advisoryTimeoutMs
+      : undefined;
+  const authProbeSignal = advisoryTimeoutMs === undefined
+    ? input.signal
+    : input.signal === undefined
+      ? AbortSignal.timeout(advisoryTimeoutMs)
+      : AbortSignal.any([input.signal, AbortSignal.timeout(advisoryTimeoutMs)]);
   try {
     status = await input.client.getAgentSessionAuth(input.session.id, authProbeSignal);
   } catch (error) {

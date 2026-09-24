@@ -3,14 +3,16 @@ import type { ReadStream, WriteStream } from "node:tty";
 import type { HostTerminalAdapter } from "../terminal/mode.js";
 import { HostTerminalLease } from "../terminal/mode.js";
 import type { ForegroundTerminalHost } from "../terminal/foreground.js";
+import { HOST_MOUSE_REPORTING_OFF } from "../terminal/host-mouse.js";
 import { runtimeFailure } from "../runtime/errors.js";
 
 const ENABLE_LOCAL_BRACKETED_PASTE = "\u001b[?2004h";
-// Rich mode renders cells locally: inherited mouse reporting must not steal
-// the host terminal's text selection and clipboard gestures.
-const DISABLE_MOUSE_REPORTING = "\u001b[?1000l\u001b[?1002l\u001b[?1003l\u001b[?1006l";
-const ENTER_ALTERNATE_SCREEN = `\u001b[?1049h${DISABLE_MOUSE_REPORTING}${ENABLE_LOCAL_BRACKETED_PASTE}\u001b[H`;
-const LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
+// Rich mode renders cells locally: inherited mouse reporting is cleared here.
+// Only the attached terminal view turns button reporting back on
+// (ForegroundTerminalCoordinator, `terminal/host-mouse.ts`); the Machines
+// explorer and provider screens share this host and read keys only.
+const ENTER_ALTERNATE_SCREEN = `\u001b[?1049h${HOST_MOUSE_REPORTING_OFF}${ENABLE_LOCAL_BRACKETED_PASTE}\u001b[H`;
+const LEAVE_ALTERNATE_SCREEN = `${HOST_MOUSE_REPORTING_OFF}\u001b[?1049l`;
 const RESET_REMOTE_MODES = [
   "\u001b[?1000l\u001b[?1002l\u001b[?1003l\u001b[?1004l\u001b[?1006l",
   "\u001b[?2004l\u001b[?2026l",

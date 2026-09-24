@@ -2958,3 +2958,113 @@ test("attach reports each remote step it waits on, in order", async () => {
     await runtime.shutdown();
   }
 });
+
+// R5 (PRD cuna-cli-feel-20260923). A fresh AgentSession's first terminal
+// attestation reached production 51-61 s after creation (21 of 23 sessions,
+// 2026-09-20..23); every attach in that window was refused
+// supervisor_registry_unavailable and the owner saw "Machine terminal
+// supervisor unavailable" (session 7e421301). The 45 s admission wait is
+// shorter than that gap. A session younger than two renew periods is waited
+// for, with its own named step; an older one keeps the 45 s bound.
+function awaitingAttestation(agentSessionId, now) {
+  const snapshot = capabilitySnapshot(agentSessionId, {
+    observedAt: new Date(now - 500).toISOString(),
+    expiresAt: new Date(now + 30_000).toISOString(),
+  });
+  snapshot.capabilities[0] = { ...snapshot.capabilities[0], availability: "unknown", reasonCode: "supervisor_registry_unavailable" };
+  return snapshot;
+}
+
+function attestationArrivesAt(t, { createdAt, attestedAt }) {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  const system = new FakeTerminalSystem();
+  const reads = [];
+  system.controlPlane.discoverCapabilities = async (_scope, id) => {
+    const now = Date.now();
+    reads.push(now - NOW);
+    return now >= attestedAt
+      ? capabilitySnapshot(id, { observedAt: new Date(now - 500).toISOString(), expiresAt: new Date(now + 30_000).toISOString() })
+      : awaitingAttestation(id, now);
+  };
+  system.controlPlane.observeAgentSession = async (id) => ({
+    ...observation(id),
+    observedAt: new Date(Date.now() - 500).toISOString(),
+    expiresAt: new Date(Date.now() + 30_000).toISOString(),
+    ...(createdAt === undefined ? {} : { createdAt: new Date(createdAt).toISOString() }),
+  });
+  // The fake mints grants against the fixed NOW; this clock has moved on.
+  const createTerminalConnection = system.controlPlane.createTerminalConnection;
+  system.controlPlane.createTerminalConnection = async (input) => ({
+    ...(await createTerminalConnection(input)),
+    expiresAt: new Date(Date.now() + 30_000).toISOString(),
+  });
+  const { runtime } = createRuntime(system, { clock: () => Date.now() });
+  return { system, runtime, reads };
+}
+
+async function driveAttach(t, attach, limitMs) {
+  let outcome;
+  attach.then((value) => { outcome = { value }; }, (error) => { outcome = { error }; });
+  for (let elapsed = 0; outcome === undefined && elapsed <= limitMs; elapsed += 1_000) {
+    await settle();
+    t.mock.timers.tick(1_000);
+  }
+  await settle();
+  assert.ok(outcome !== undefined, "the attach settled inside its bound");
+  return outcome;
+}
+
+test("R5: a session younger than two renew periods waits for its first attestation, named, past the 45 s bound", async (t) => {
+  const { system, runtime } = attestationArrivesAt(t, { createdAt: NOW - 5_000, attestedAt: NOW + 55_000 });
+  const stages = [];
+  try {
+    const outcome = await driveAttach(t, runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24,
+      onStage: (stage) => stages.push(stage) }), 130_000);
+    assert.equal(outcome.error, undefined, String(outcome.error));
+    assert.deepEqual(stages, ["admission", "confirm_wait", "grant", "connect", "ready_wait"]);
+    assert.equal(system.createCalls.length, 1, "the grant is issued once the Machine confirms the terminal");
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
+test("R5 bound: a young session whose attestation never comes is refused with the typed reason at two renew periods", async (t) => {
+  const { system, runtime, reads } = attestationArrivesAt(t, { createdAt: NOW - 5_000, attestedAt: Number.POSITIVE_INFINITY });
+  try {
+    const outcome = await driveAttach(t, runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 }), 200_000);
+    assert.ok(outcome.error instanceof RuntimeBoundaryError && outcome.error.code === "capability_unknown" &&
+      outcome.error.safeDetails?.reason_code === "supervisor_registry_unavailable", String(outcome.error));
+    assert.equal(system.createCalls.length, 0);
+    const last = reads.at(-1);
+    assert.ok(last >= 110_000 && last <= 118_000, `the last read is at the end of the window (created -5 s + 120 s), got ${last}`);
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
+test("control: a session older than two renew periods keeps the 45 s admission bound", async (t) => {
+  const { system, runtime, reads } = attestationArrivesAt(t, { createdAt: NOW - 300_000, attestedAt: NOW + 55_000 });
+  const stages = [];
+  try {
+    const outcome = await driveAttach(t, runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24,
+      onStage: (stage) => stages.push(stage) }), 130_000);
+    assert.ok(outcome.error instanceof RuntimeBoundaryError && outcome.error.safeDetails?.reason_code === "supervisor_registry_unavailable");
+    assert.equal(system.createCalls.length, 0);
+    assert.ok(reads.at(-1) <= 48_000, `refused at the 45 s bound, last read ${reads.at(-1)}`);
+    assert.deepEqual(stages, ["admission"], "an old session is not described as awaiting its first confirmation");
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
+test("control: a session whose age is unknown keeps the 45 s admission bound", async (t) => {
+  const { system, runtime, reads } = attestationArrivesAt(t, { createdAt: undefined, attestedAt: NOW + 55_000 });
+  try {
+    const outcome = await driveAttach(t, runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 }), 130_000);
+    assert.ok(outcome.error instanceof RuntimeBoundaryError && outcome.error.safeDetails?.reason_code === "supervisor_registry_unavailable");
+    assert.equal(system.createCalls.length, 0);
+    assert.ok(reads.at(-1) <= 48_000, `refused at the 45 s bound, last read ${reads.at(-1)}`);
+  } finally {
+    await runtime.shutdown();
+  }
+});

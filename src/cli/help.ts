@@ -192,6 +192,10 @@ Foreground terminal attach (the server must grant terminal_connections.create):
   JSON and redirected output fail closed. Nested SSH/tmux and TERM=dumb use a
   one-session byte-preserving plain fallback with no appbar; set
   CUNA_TERMINAL_MODE=plain for accessibility or diagnosis.
+  The terminal waits for the remote echo by default. Set
+  CUNA_PREDICTIVE_ECHO=auto to opt in to dim, underlined local guesses when
+  measured echo exceeds 60 ms, or =on to opt in regardless of echo speed.
+  Local guesses can expose input before a remote secret prompt suppresses echo.
   Ctrl+C detaches locally in one press. Use Ctrl+] c to send Ctrl+C to the agent.
   Background daemon and local companion behavior are absent from this build.
 

@@ -25,7 +25,12 @@ export interface RemoteAgentSessionEvidence {
   readonly observedAt: string;
   readonly expiresAt: string;
   readonly evidenceRevision: string;
+  /** When the AgentSession was created; absent from peers that do not project it. */
+  readonly createdAt?: string;
 }
+
+/** The remote steps of one attach, in order; `confirm_wait` only for a session awaiting its first attestation. */
+export type TerminalAttachStage = "admission" | "confirm_wait" | "grant" | "connect" | "ready_wait";
 
 /**
  * Immutable authority admitted before a terminal attach begins. The runtime

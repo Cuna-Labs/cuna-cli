@@ -38,6 +38,7 @@ import {
   type TerminalConnectionGrant,
   type TerminalConnectionCapability,
   type TerminalAttachmentAdmission,
+  type TerminalAttachStage,
   type TerminalConnector,
   type TerminalControlPlane,
   type TerminalWireConnection,
@@ -54,6 +55,27 @@ const MAX_RUNTIME_EVIDENCE_TTL_MS = 5 * 60_000;
  */
 const TERMINAL_ADMISSION_WAIT_MS = 45_000;
 const TERMINAL_ADMISSION_POLL_MS = 3_000;
+
+/**
+ * How long after its creation an AgentSession may still be waiting for the
+ * Machine's first terminal attestation.
+ *
+ * Measured on production 2026-09-20..23: 21 of 23 fresh sessions got their first
+ * attachment 51-61 s after creation, because the launch attestation was refused
+ * and only the first lease renewal carried one (infra 0225 repairs the cause;
+ * an edge without it keeps the gap). The 45 s bound above is shorter than that
+ * gap, so the owner's first attach was refused "Machine terminal supervisor
+ * unavailable" (session 7e421301). Two renew periods: the runtime lease is 60 s
+ * and is renewed before it lapses, so a session this young that still has no
+ * attestation is waiting for one, not failing. Past it the ordinary 45 s bound
+ * decides, and the typed refusal is reported unchanged.
+ */
+const YOUNG_SESSION_ATTESTATION_WINDOW_MS = 120_000;
+
+/** The refusal a session reports before the Machine first attests its PTY. */
+function awaitingFirstAttestation(error: unknown): boolean {
+  return error instanceof RuntimeBoundaryError && error.safeDetails?.reason_code === "supervisor_registry_unavailable";
+}
 
 /**
  * Refusals a later capability read can turn into an admission. Everything
@@ -406,12 +428,12 @@ export class CunaRuntimeBoundary {
     readonly rows: number;
     readonly expectedAdmission?: TerminalAttachmentAdmission;
     readonly signal?: AbortSignal;
-    readonly onStage?: (stage: "admission" | "grant" | "connect" | "ready_wait") => void;
+    readonly onStage?: (stage: TerminalAttachStage) => void;
   }): Promise<RuntimeTerminalSnapshot> {
     this.#assertReady();
     assertIdentifier(input.tabId, "tab ID");
     // A stage observer only labels the wait on screen; it never decides anything.
-    const stage = (value: "admission" | "grant" | "connect" | "ready_wait"): void => {
+    const stage = (value: TerminalAttachStage): void => {
       try { input.onStage?.(value); } catch { /* observers cannot fail an attach */ }
     };
     assertIdentifier(input.agentSessionId, "AgentSession ID");
@@ -453,7 +475,8 @@ export class CunaRuntimeBoundary {
       throwIfAborted(attachAbort.signal, "Terminal attachment was cancelled.");
       await this.#cancelConnectionRequests(input.agentSessionId);
       stage("admission");
-      const admitted = await this.#admitRemoteTerminal(input.agentSessionId, attachAbort.signal);
+      const admitted = await this.#admitRemoteTerminal(input.agentSessionId, attachAbort.signal,
+        () => stage("confirm_wait"));
       if (input.expectedAdmission !== undefined) {
         this.#assertAttachmentAdmissionContinuity(input.expectedAdmission, admitted, "preflight");
       }
@@ -1393,7 +1416,7 @@ export class CunaRuntimeBoundary {
     if (failures.length > 0) throw new AggregateError(failures, "The Cuna runtime stopped with cleanup failures.");
   }
 
-  async #admitRemoteTerminal(agentSessionId: string, signal?: AbortSignal): Promise<{
+  async #admitRemoteTerminal(agentSessionId: string, signal?: AbortSignal, onAwaitingConfirmation?: () => void): Promise<{
     readonly capabilitySnapshot: CapabilitySnapshot;
     readonly capability: ReturnType<typeof admitCapability>;
     readonly observation: RemoteAgentSessionEvidence;
@@ -1420,7 +1443,11 @@ export class CunaRuntimeBoundary {
      * cannot change by waiting (a gone process, a supervisor that needs an
      * update) is reported at once.
      */
-    const deadline = this.#clock() + TERMINAL_ADMISSION_WAIT_MS;
+    let deadline = this.#clock() + TERMINAL_ADMISSION_WAIT_MS;
+    // Read at most once, and only for the refusal a fresh session gives before
+    // its first attestation. `null` is an age this CLI cannot prove, which keeps
+    // the ordinary bound.
+    let createdAt: number | null | undefined;
     let snapshot: CapabilitySnapshot;
     let capability: ReturnType<typeof admitCapability>;
     for (;;) {
@@ -1429,7 +1456,15 @@ export class CunaRuntimeBoundary {
         capability = admitCapability(snapshot, requirement, this.#clock());
         break;
       } catch (error) {
-        if (!terminalAdmissionMayResolveByWaiting(error) || this.#clock() >= deadline || signal?.aborted === true) throw error;
+        if (!terminalAdmissionMayResolveByWaiting(error) || signal?.aborted === true) throw error;
+        if (createdAt === undefined && awaitingFirstAttestation(error)) {
+          createdAt = await this.#agentSessionCreatedAt(agentSessionId, signal);
+          if (createdAt !== null && this.#clock() < createdAt + YOUNG_SESSION_ATTESTATION_WINDOW_MS) {
+            deadline = Math.max(deadline, createdAt + YOUNG_SESSION_ATTESTATION_WINDOW_MS);
+            try { onAwaitingConfirmation?.(); } catch { /* observers cannot fail an attach */ }
+          }
+        }
+        if (this.#clock() >= deadline) throw error;
         await waitForTerminalAdmission(TERMINAL_ADMISSION_POLL_MS, signal);
       }
     }
@@ -1439,6 +1474,19 @@ export class CunaRuntimeBoundary {
       now: this.#clock(),
     });
     return Object.freeze({ capability, observation, capabilitySnapshot: snapshot });
+  }
+
+  async #agentSessionCreatedAt(agentSessionId: string, signal?: AbortSignal): Promise<number | null> {
+    try {
+      const evidence = await this.#options.controlPlane.observeAgentSession(agentSessionId, signal);
+      if (evidence.agentSessionId !== agentSessionId || evidence.createdAt === undefined) return null;
+      const createdAt = Date.parse(evidence.createdAt);
+      // A creation time in the future is not an age; it must never stretch the wait.
+      return Number.isFinite(createdAt) && createdAt <= this.#clock() ? createdAt : null;
+    } catch (error) {
+      if (signal?.aborted === true) throw error;
+      return null;
+    }
   }
 
   #assertAttachmentAdmissionContinuity(

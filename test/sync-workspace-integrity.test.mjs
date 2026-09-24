@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFile, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -381,7 +381,7 @@ test("fenced journal admits exactly one concurrent writer", async (t) => {
   await winners[0].value.close();
 });
 
-test("journal never bypasses its writer fence when a foreign TCP listener disappears", { skip: process.platform === "win32" }, async (t) => {
+test("a foreign listener on the legacy hash port cannot deny or bypass journal writer authority", { skip: process.platform === "win32" }, async (t) => {
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const root = await temporaryDirectory(t);
     const directory = join(root, "journal");
@@ -402,13 +402,13 @@ test("journal never bypasses its writer fence when a foreign TCP listener disapp
       throw error;
     }
     t.after(() => foreign.listening ? new Promise((resolveClose, rejectClose) => foreign.close((error) => error === undefined ? resolveClose() : rejectClose(error))) : undefined);
+    const journal = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" });
+    t.after(() => journal.close());
     await assert.rejects(
-      DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "blocked" }),
+      DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "second" }),
       (error) => error.code === "cuna.workspace.workspace_busy",
     );
     await new Promise((resolveClose, rejectClose) => foreign.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
-    const journal = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" });
-    t.after(() => journal.close());
     await assert.rejects(
       DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "second" }),
       (error) => error.code === "cuna.workspace.workspace_busy",
@@ -417,6 +417,127 @@ test("journal never bypasses its writer fence when a foreign TCP listener disapp
     return;
   }
   assert.fail("could not reserve a collision port for the journal authority test");
+});
+
+test("distinct journal directories with the same legacy hash port hold independent writer locks", { skip: process.platform === "win32" }, async (t) => {
+  const root = await temporaryDirectory(t);
+  const seen = new Map();
+  let pair;
+  for (let index = 0; index < 2_000; index += 1) {
+    const directory = join(root, `collision-${index}`);
+    const digest = createHash("sha256").update("cuna-journal-authority-v2\0").update(directory).digest("hex");
+    const port = 20_000 + Number.parseInt(digest.slice(0, 4), 16) % 40_000;
+    const prior = seen.get(port);
+    if (prior !== undefined) { pair = [prior, directory]; break; }
+    seen.set(port, directory);
+  }
+  assert.ok(pair, "the directed corpus has a legacy port collision");
+  const [left, right] = pair;
+  await mkdir(left);
+  await mkdir(right);
+  const writerLeft = await DurableSyncJournal.open({ directory: left, bindingId: "binding", bindingGeneration: 1, ownerId: "left" });
+  t.after(() => writerLeft.close());
+  const writerRight = await DurableSyncJournal.open({ directory: right, bindingId: "binding", bindingGeneration: 1, ownerId: "right" });
+  t.after(() => writerRight.close());
+  assert.equal(writerLeft.fence, 1);
+  assert.equal(writerRight.fence, 1);
+  await assert.rejects(
+    DurableSyncJournal.open({ directory: left, bindingId: "binding", bindingGeneration: 1, ownerId: "left-second" }),
+    (error) => error.code === "cuna.workspace.workspace_busy",
+  );
+  await writerLeft.close();
+  await assert.rejects(
+    DurableSyncJournal.open({ directory: right, bindingId: "binding", bindingGeneration: 1, ownerId: "right-second" }),
+    (error) => error.code === "cuna.workspace.workspace_busy",
+  );
+  await writerRight.close();
+});
+
+test("a replaced Unix lock inode fences its former writer", { skip: process.platform === "win32" }, async (t) => {
+  const directory = await temporaryDirectory(t);
+  const journal = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "writer" });
+  t.after(() => journal.close());
+  await rename(join(directory, "writer.authority.lock"), join(directory, "displaced.lock"));
+  await writeFile(join(directory, "writer.authority.lock"), "", { mode: 0o600 });
+  await assert.rejects(
+    journal.append({ operationId: "must-fence", baseGeneration: 1, digest: digestA, byteLength: 1 }),
+    (error) => error.code === "cuna.workspace.journal_invalid" && error.details?.reason === "file_identity_changed",
+  );
+  await journal.close();
+});
+
+test("Unix journal fails closed if its kernel-lock utility is unavailable", { skip: process.platform === "win32" }, async (t) => {
+  const directory = await temporaryDirectory(t);
+  const script = `
+    import { DurableSyncJournal } from ${JSON.stringify(new URL("../dist/sync/index.js", import.meta.url).href)};
+    try {
+      await DurableSyncJournal.open({ directory: process.argv[1], bindingId: "binding", bindingGeneration: 1, ownerId: "writer" });
+      process.exitCode = 2;
+    } catch (error) {
+      if (error.code === "cuna.workspace.journal_invalid" && error.details?.reason === "writer_lock_unavailable") {
+        process.stdout.write("lock unavailable\\n");
+      } else {
+        process.stderr.write(String(error) + "\\n");
+        process.exitCode = 3;
+      }
+    }
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, directory], {
+    env: { ...process.env, PATH: "/nonexistent" }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+  });
+  const result = await new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code, stdout, stderr }));
+  });
+  assert.deepEqual(result, { code: 0, stdout: "lock unavailable\n", stderr: "" });
+  const recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "recovered" });
+  assert.equal(recovered.fence, 1, "a failed lock attempt did not write a lease");
+  await recovered.close();
+});
+
+test("a timed-out Linux lock helper leaves no orphan holding the journal", { skip: process.platform !== "linux" }, async (t) => {
+  const root = await temporaryDirectory(t);
+  const directory = join(root, "journal");
+  const bin = join(root, "bin");
+  await mkdir(directory);
+  await mkdir(bin);
+  const fakeFlock = join(bin, "flock");
+  await writeFile(fakeFlock, "#!/bin/sh\nexec /usr/bin/flock -n \"$LOCK_TEST_PATH\" /bin/sleep 60\n", { mode: 0o700 });
+  await chmod(fakeFlock, 0o700);
+  const script = `
+    import { DurableSyncJournal } from ${JSON.stringify(new URL("../dist/sync/index.js", import.meta.url).href)};
+    try {
+      await DurableSyncJournal.open({ directory: process.argv[1], bindingId: "binding", bindingGeneration: 1, ownerId: "hung" });
+      process.exitCode = 2;
+    } catch (error) {
+      if (error.code === "cuna.workspace.journal_invalid" && error.details?.reason === "writer_lock_timeout") {
+        process.stdout.write("timed out\\n");
+      } else {
+        process.stderr.write(String(error) + "\\n");
+        process.exitCode = 3;
+      }
+    }
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, directory], {
+    env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, LOCK_TEST_PATH: join(directory, "writer.authority.lock") },
+    stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+  });
+  const result = await new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code, stdout, stderr }));
+  });
+  assert.deepEqual(result, { code: 0, stdout: "timed out\n", stderr: "" });
+  const recovered = await DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId: "recovered" });
+  assert.equal(recovered.fence, 1, "the killed process group released its lock without writing a lease");
+  await recovered.close();
 });
 
 test("journal replay is idempotent and unknown outcome requires an authoritative query", async (t) => {

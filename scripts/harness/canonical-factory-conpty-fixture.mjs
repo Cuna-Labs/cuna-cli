@@ -62,6 +62,7 @@ function observation(id, overrides = {}) {
 function fakeClient(events, overrides = {}) {
   return {
     async getAgentSession(id) { events.push(`get:${id}`); return session(id); },
+    async listAgentSessions() { return { items: [session(SESSION_A), session(SESSION_B)] }; },
     ...overrides,
   };
 }
@@ -95,6 +96,7 @@ function terminalSystem(events, availability = () => "supported", canonical = fa
   const activeQueues = new Set();
   const offers = [];
   const sent = [];
+  const inputs = [];
   const issuedRequests = new Map();
   const cancelledRequests = [];
   const controlPlane = {
@@ -159,6 +161,7 @@ function terminalSystem(events, availability = () => "supported", canonical = fa
       const terminalSessionId = new URL(input.url).pathname.split("/").at(-2);
       const grant = grants.get(terminalSessionId);
       assert.ok(grant);
+      const currentGeneration = grant.attachmentGeneration;
       const queue = new AsyncByteQueue();
       activeQueues.add(queue);
       queue.push(encodeTerminalControl("ready", 1n, {
@@ -174,10 +177,10 @@ function terminalSystem(events, availability = () => "supported", canonical = fa
       assert.equal(input.terminalViewProtocol,"cuna.terminal-view.v1");
       let sequence=0n;let received="";
       const output=(text)=>queue.push(encodeTerminalFrame({type:"output",critical:false,sequence:++sequence,payload:new TextEncoder().encode("\x1b[2J\x1b[H"+text)}));
-      const viewId=`aaaaaaaa-aaaa-4aaa-8aaa-${String(generation).padStart(12,"0")}`;
+      const viewId=`aaaaaaaa-aaaa-4aaa-8aaa-${String(currentGeneration).padStart(12,"0")}`;
       setTimeout(()=>{
         queue.push(encodeTerminalControl("view_started",0n,{protocol:"cuna.terminal-view.v1",operation:"new",viewId,columns:80,rows:22}));
-        output(`CANONICAL_VIEW_${generation} 界`);
+        output(`CANONICAL_VIEW_${currentGeneration} 界`);
         setTimeout(()=>queue.push(encodeTerminalControl("view_ready",0n,{viewId,afterOutputSequence:sequence.toString()})),300);
       },1200);
       events.push("wire:connected");
@@ -188,10 +191,11 @@ function terminalSystem(events, availability = () => "supported", canonical = fa
           const frame=decodeTerminalFrame(bytes);sent.push(frame);
           if(frame.type==="input") {
             const hex=Buffer.from(frame.payload).toString("hex");
+            inputs.push({agentSessionId:grant.agentSessionId,generation:currentGeneration,hex});
             if(hex==="7e") {activeQueues.delete(queue);queue.close();return;}
-            received+=hex;output(`CANONICAL_VIEW_${generation} 界\r\nINPUT_HEX ${received}`);
+            received+=hex;output(`CANONICAL_VIEW_${currentGeneration} 界\r\nINPUT_HEX ${received}`);
           }
-          if(frame.type==="resize") {const p=decodeTerminalControl(frame);if(sequence>0n)output(`CANONICAL_VIEW_${generation} 界\r\nRESIZE ${p.columns}x${p.rows}`);}
+          if(frame.type==="resize") {const p=decodeTerminalControl(frame);if(sequence>0n)output(`CANONICAL_VIEW_${currentGeneration} 界\r\nRESIZE ${p.columns}x${p.rows}`);}
         },
         async close() { events.push(`wire:close:${terminalSessionId}`); activeQueues.delete(queue); queue.close(); },
       };
@@ -200,6 +204,7 @@ function terminalSystem(events, availability = () => "supported", canonical = fa
   return {
     controlPlane,
     offers, sent,
+    inputs,
     push(bytes) { for (const queue of activeQueues) queue.push(bytes); },
     cancelledRequests,
     terminalConnector,
@@ -216,3 +221,17 @@ function terminalSystem(events, availability = () => "supported", canonical = fa
 
 const events=[];const system=terminalSystem(events,()=>"supported",true);
 await runNodeForegroundSessions({client:fakeClient(events),baseUrl:"https://api.getcuna.com",agentSessionIds:[SESSION_A]}, {environment:{},controlPlane:system.controlPlane,terminalConnector:system.terminalConnector,clock:()=>Date.now(),coordinatorOptions:{reconnectBaseDelayMs:10}});
+assert.deepEqual(events.filter((event)=>event.startsWith("grant:")),[`grant:${SESSION_A}`,`grant:${SESSION_A}`,`grant:${SESSION_B}`,`grant:${SESSION_A}`]);
+function assertNativeInputLedger(inputs) {
+  const byGeneration=(number)=>inputs.filter((input)=>input.generation===number);
+  const first=byGeneration(1);
+  assert.ok(first.every((input)=>input.agentSessionId===SESSION_A),"generation 1 belongs only to A");
+  assert.equal(first.map((input)=>input.hex).join(""),Buffer.from("\x1b[A\t\x1b\x7fhello\x1b[200~PASTE\x1b[201~~").toString("hex"),"generation 1 receives only its intended byte stream");
+  assert.deepEqual(byGeneration(2),[{agentSessionId:SESSION_A,generation:2,hex:"52"}],"generation 2 receives only R, never a tab selector");
+  assert.deepEqual(byGeneration(3),[{agentSessionId:SESSION_B,generation:3,hex:"42"}],"generation 3 receives only B after the native tab switch");
+  assert.deepEqual(byGeneration(4),[{agentSessionId:SESSION_A,generation:4,hex:"41"}],"generation 4 receives only A after switching back");
+  assert.ok(!inputs.some((input)=>Buffer.from(input.hex,"hex").includes(0x1d)),"tab switch prefixes stay local");
+}
+assertNativeInputLedger(system.inputs);
+assert.throws(()=>assertNativeInputLedger([...system.inputs,{agentSessionId:SESSION_A,generation:2,hex:"32"}]),/generation 2 receives only R/u,"negative control: an injected selector must fail the same ledger assertion");
+console.log(`CANONICAL_SWITCH_RECEIPT ${JSON.stringify({grants:events.filter((event)=>event.startsWith("grant:")),inputs:system.inputs})}`);

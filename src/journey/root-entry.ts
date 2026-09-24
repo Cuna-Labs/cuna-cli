@@ -1,6 +1,7 @@
 import type { CunaApiClient } from "../api/client.js";
 import type { ForegroundTerminalHost } from "../terminal/foreground.js";
 import { runNodeMachinesExplorer } from "../machines/explorer.js";
+import type { MachineInventoryCache } from "../machines/inventory-cache.js";
 import type { ActionableProvider } from "../machines/provider-availability.js";
 
 export type RootJourneySelection =
@@ -20,6 +21,8 @@ export interface RootJourneyInput {
   readonly color?: boolean;
   /** Clears any caller-owned progress UI immediately before alternate-screen ownership. */
   readonly onBeforeTerminalOwnership?: () => void;
+  /** The last-known Machines picture; see `machines/inventory-cache.ts`. */
+  readonly inventoryCache?: MachineInventoryCache;
 }
 
 export interface RootJourneyDependencies {

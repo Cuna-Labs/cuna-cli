@@ -95,6 +95,85 @@ test("only the visible observer is projected for host rendering", async () => {
   }
 });
 
+test("late provider auth updates are fenced to the attached session, epoch and freshness", async () => {
+  const now = 1_800_000_000_000;
+  const host = new FakeHost();
+  host.columns = 160;
+  const { coordinator, callbacks, intents } = harness({ host, coordinatorOptions: { clock: () => now } });
+  const evidence = {
+    value: "authenticated", source: "provider-auth-observation",
+    observedAt: now - 100, expiresAt: now + 10_000,
+    correlationId: "observation-1",
+  };
+  const input = {
+    tabId: intents[0].tabId,
+    agentSessionId: SESSION_A,
+    processEpoch: `epoch-${SESSION_A}`,
+    evidence,
+  };
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    assert.match(await visibleHostText(host), /Claude auth unknown/u);
+    const before = host.writes.length;
+    assert.equal(await coordinator.applyProviderAuthentication({ ...input, agentSessionId: SESSION_B }), false);
+    assert.equal(await coordinator.applyProviderAuthentication({ ...input, processEpoch: `epoch-${SESSION_B}` }), false);
+    assert.equal(await coordinator.applyProviderAuthentication({ ...input, evidence: { ...evidence, expiresAt: now } }), false);
+    assert.equal(await coordinator.applyProviderAuthentication({ ...input, evidence: { ...evidence, observedAt: now + 60_000 } }), false);
+    assert.equal(host.writes.length, before, "rejected evidence cannot repaint the bar");
+    assert.equal(await coordinator.applyProviderAuthentication(input), true);
+    assert.match(await visibleHostText(host), /Claude auth authenticated/u);
+    await callbacks.onTerminalReady(snapshot(intents[0], 2));
+    const beforeReconnectPaint = host.writes.length;
+    host.emitResize();
+    await waitUntil(() => host.writes.length > beforeReconnectPaint, "the same-session reconnect should repaint");
+    assert.match(await visibleHostText(host), /Claude auth authenticated/u);
+    callbacks.onTerminalState({ ...snapshot(intents[0], 2), processEpoch: "replacement-epoch" });
+    await waitUntil(() => new TextDecoder().decode(host.writes.at(-1)).includes("Claude auth unknown"),
+      "a replacement process discards the previous auth label");
+    assert.equal(await coordinator.applyProviderAuthentication(input), false);
+  } finally {
+    await coordinator.stop();
+  }
+  const afterStop = host.writes.length;
+  assert.equal(await coordinator.applyProviderAuthentication(input), false);
+  assert.equal(host.writes.length, afterStop);
+});
+
+test("a sibling session on one tab cannot inherit auth from a matching process epoch", async () => {
+  // The production runtime rejects this cross-session callback earlier. Keep
+  // the coordinator's display projection safe if an injected callback reaches it.
+  const now = 1_800_000_000_000;
+  const host = new FakeHost();
+  host.columns = 160;
+  const { coordinator, callbacks, intents } = harness({ host, coordinatorOptions: { clock: () => now } });
+  const original = {
+    ...intents[0],
+    providerAuthentication: {
+      value: "authenticated", source: "provider-auth-observation",
+      observedAt: now - 100, expiresAt: now + 10_000,
+      correlationId: "observation-a",
+    },
+  };
+  try {
+    await coordinator.start([original]);
+    assert.match(await visibleHostText(host), /Claude auth authenticated/u);
+    const sibling = {
+      ...snapshot(original, 2),
+      agentSessionId: SESSION_B,
+      // A shared epoch string must not substitute for AgentSession identity.
+      processEpoch: `epoch-${SESSION_A}`,
+      terminalView: { viewId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ready: true },
+    };
+    await callbacks.onTerminalReady(sibling);
+    const before = host.writes.length;
+    host.emitResize();
+    await waitUntil(() => host.writes.length > before, "the sibling frame should repaint");
+    assert.match(await visibleHostText(host), /Claude auth unknown/u);
+  } finally {
+    await coordinator.stop();
+  }
+});
+
 test("canonical foreground resets the parser at higher fence and initial blank view uses real geometry", async () => {
   const {coordinator,callbacks,host,intents}=harness();
   try {
@@ -434,6 +513,29 @@ test("the loader names each attach stage the runtime reports", async () => {
   await waitUntil(
     () => host.writes.some((bytes) => decoder.decode(bytes).includes("Waiting for the terminal to answer")),
     "the latest reported stage must be on screen",
+  );
+  releaseAttach();
+  await starting;
+  await coordinator.stop();
+});
+
+// R5: a fresh session whose PTY the Machine has not attested yet is a wait
+// with its own name and a counting clock, not "Checking terminal authority".
+test("the loader names the wait for the Machine to confirm a fresh terminal, with seconds", async () => {
+  let releaseAttach;
+  const attachGate = new Promise((resolve) => { releaseAttach = resolve; });
+  let offset = 0;
+  const { coordinator, host, intents } = harness({ attachGate, attachStages: ["admission", "confirm_wait"],
+    coordinatorOptions: { clock: () => Date.now() + offset } });
+  const starting = coordinator.start(intents.slice(0, 1));
+  await waitUntil(
+    () => host.writes.some((bytes) => decoder.decode(bytes).includes("Waiting for the Machine to confirm the terminal")),
+    "the confirmation wait must be named",
+  );
+  offset = 7_000;
+  await waitUntil(
+    () => host.writes.some((bytes) => /Waiting for the Machine to confirm the terminal · 7s/u.test(decoder.decode(bytes))),
+    "the confirmation wait must count seconds",
   );
   releaseAttach();
   await starting;
@@ -2376,4 +2478,394 @@ test("a typed capability refusal is not retried: one attempt, not the whole budg
   assert.equal(calls.reconnect.length, 1, "a non-retryable capability refusal is attempted exactly once");
   assert.match(decoder.decode(host.writes.at(-1)), /capability unknown \(live resize\)/u);
   await coordinator.stop();
+});
+
+// P5 / R11 (PRD cuna-cli-feel-20260923). Two-finger scroll inside an attached
+// session changed Claude Code's prompt instead of scrolling: the rich view sat
+// in the host's alternate screen with mouse reporting off, so Windows Terminal
+// (alternate-scroll mode on by default) sent each wheel notch as an arrow key
+// and Cuna forwarded it. The host now reports the wheel in SGR form; Cuna
+// scrolls its own copy of the remote screen and sends the remote nothing,
+// unless the remote program asked for mouse reports itself.
+const WHEEL_UP = "\u001b[<64;10;10M";
+const WHEEL_DOWN = "\u001b[<65;10;10M";
+
+async function scrolledHarness() {
+  const context = harness();
+  await context.coordinator.start(context.intents.slice(0, 1));
+  const lines = Array.from({ length: 60 }, (_, index) => `line-${String(index + 1).padStart(2, "0")}`).join("\r\n");
+  await context.callbacks.onTerminalOutput(outputEvent(context.intents[0], 1n, encoder.encode(lines)));
+  await waitUntil(() => decoder.decode(context.host.writes.at(-1) ?? new Uint8Array()).includes("line-60"), "the live screen shows the newest line");
+  return context;
+}
+
+test("R11: the wheel scrolls the local view back and sends nothing to the remote", async () => {
+  const { coordinator, host, calls } = await scrolledHarness();
+  try {
+    assert.doesNotMatch(await visibleHostText(host), /line-30/u, "line 30 has scrolled off the live screen");
+    for (let notch = 0; notch < 5; notch += 1) host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-30"), "five notches bring line 30 back");
+    const visible = await visibleHostText(host);
+    assert.match(visible, /line-30/u);
+    assert.doesNotMatch(visible, /line-60/u, "the live bottom is out of view while scrolled back");
+    assert.match(visible, /Scrolled back 15 lines/u, "the notice says the view is not live");
+    for (let notch = 0; notch < 5; notch += 1) host.emitInput(encoder.encode(WHEEL_DOWN));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-60"), "scrolling down returns to the live screen");
+    assert.doesNotMatch(await visibleHostText(host), /Scrolled back/u);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(calls.input, [], "no wheel notch reached the remote, as an arrow key or otherwise");
+  } finally { await coordinator.stop(); }
+});
+
+test("R11 control: an arrow key is still sent to the remote", async () => {
+  const { coordinator, host, calls } = await scrolledHarness();
+  try {
+    host.emitInput(encoder.encode("\u001b[A"));
+    await waitUntil(() => calls.input.length > 0, "a real arrow key must reach the remote");
+    assert.equal(calls.input.map((item) => item.text).join(""), "\u001b[A");
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: a key typed while scrolled back returns to the live screen and is sent", async () => {
+  const { coordinator, host, calls } = await scrolledHarness();
+  try {
+    for (let notch = 0; notch < 5; notch += 1) host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-30"), "scrolled back");
+    host.emitInput(encoder.encode("x"));
+    await waitUntil(() => calls.input.length > 0, "the key reaches the remote");
+    assert.equal(calls.input.map((item) => item.text).join(""), "x");
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-60"), "the view returns to the live screen");
+    assert.doesNotMatch(await visibleHostText(host), /Scrolled back/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: new output while scrolled back keeps the lines being read in place", async () => {
+  const { coordinator, host, callbacks, intents } = await scrolledHarness();
+  try {
+    for (let notch = 0; notch < 5; notch += 1) host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("line-30"), "scrolled back");
+    const before = (await visibleHostText(host)).split("\n").find((row) => row.includes("line-"));
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\r\nnew-1\r\nnew-2\r\nnew-3")));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const after = await visibleHostText(host);
+    assert.equal(after.split("\n").find((row) => row.includes("line-")), before, "the first visible history line did not move");
+    assert.doesNotMatch(after, /new-3/u);
+    assert.match(after, /Scrolled back 18 lines/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: when the remote program asks for mouse reports, the wheel is forwarded in its coordinates", async () => {
+  const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\u001b[?1000h\u001b[?1006h")));
+    host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => calls.input.length > 0, "the wheel must reach a remote that tracks the mouse");
+    // Host row 10 is remote row 8: the two app-bar rows sit above the remote screen.
+    assert.equal(calls.input.map((item) => item.text).join(""), "\u001b[<64;10;8M");
+    assert.doesNotMatch(await visibleHostText(host), /Scrolled back/u);
+    host.emitInput(encoder.encode("\u001b[<0;4;1M"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls.input.length, 1, "a click on the app bar is not the remote's");
+  } finally { await coordinator.stop(); }
+});
+
+// Lead decision 2026-09-23: the wheel behaves like a normal terminal. A remote
+// on its own alternate screen without mouse reports (less, vim, man) gets
+// three cursor keys per notch, as Windows Terminal's alternate-scroll mode
+// sends; the main screen (the agent's prompt, shells) scrolls locally.
+for (const [mode, enter] of [["1049", "\u001b[?1049h"], ["1047", "\u001b[?1047h"], ["47", "\u001b[?47h"]]) {
+  test(`R11: a remote on its alternate screen (?${mode}) without mouse reports gets three arrow keys per notch`, async () => {
+    const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+    try {
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(`${enter}\u001b[Hpager page`)));
+      host.emitInput(encoder.encode(WHEEL_UP));
+      await waitUntil(() => calls.input.length > 0, "the wheel reaches the pager as cursor keys");
+      host.emitInput(encoder.encode(WHEEL_DOWN));
+      await waitUntil(() => calls.input.map((item) => item.text).join("").length >= 18, "both notches are sent");
+      assert.equal(calls.input.map((item) => item.text).join(""), "\u001b[A".repeat(3) + "\u001b[B".repeat(3));
+      assert.doesNotMatch(await visibleHostText(host), /Scrolled back/u);
+    } finally { await coordinator.stop(); }
+  });
+}
+
+test("R11: the arrow keys follow the remote's application cursor mode", async () => {
+  const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\u001b[?1049h\u001b[?1h\u001b[Hvim")));
+    host.emitInput(encoder.encode(WHEEL_DOWN));
+    await waitUntil(() => calls.input.length > 0, "the wheel reaches vim");
+    assert.equal(calls.input.map((item) => item.text).join(""), "\u001bOB".repeat(3));
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: after the remote leaves its alternate screen the wheel scrolls locally again", async () => {
+  const { coordinator, host, calls, callbacks, intents } = await scrolledHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode("\u001b[?1049hpager\u001b[?1049l")));
+    host.emitInput(encoder.encode(WHEEL_UP));
+    await waitUntil(() => /Scrolled back 3 lines/u.test(decoder.decode(host.writes.at(-1))), "the main screen scrolls locally");
+    assert.deepEqual(calls.input, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: a click is not sent to a remote that did not ask for mouse reports", async () => {
+  const { coordinator, host, calls } = await scrolledHarness();
+  try {
+    host.emitInput(encoder.encode("\u001b[<0;5;6M\u001b[<0;5;6m"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(calls.input, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("R11: only the attached view turns on SGR button reporting, never motion", async () => {
+  const { coordinator, host, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    const written = host.writes.map((bytes) => decoder.decode(bytes)).join("");
+    assert.ok(written.includes("\u001b[?1000h\u001b[?1006h"), "button reporting in SGR form");
+    assert.ok(!written.includes("\u001b[?1002h") && !written.includes("\u001b[?1003h"), "motion is never reported");
+  } finally { await coordinator.stop(); }
+});
+
+// The Machines explorer and provider screens acquire the same rich host and
+// read keys only; a mouse report there would be typed into them.
+test("R11: the rich host lease clears mouse reporting on entry and restores it off on exit", async () => {
+  class FakeInput extends EventEmitter {
+    isTTY = true;
+    readableFlowing = null;
+    raw = false;
+    setRawMode(value) { this.raw = value; }
+    resume() { this.readableFlowing = true; return this; }
+    pause() { this.readableFlowing = false; return this; }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true;
+    columns = 80;
+    rows = 24;
+    writes = [];
+    write(value, callback) { this.writes.push(Buffer.from(value)); callback?.(null); return true; }
+  }
+  const stdout = new FakeOutput();
+  const host = createNodeForegroundTerminalHost({ stdin: new FakeInput(), stdout, writeTimeoutMs: 100 });
+  const lease = await host.acquire("rich");
+  const acquired = Buffer.concat(stdout.writes).toString();
+  assert.ok(acquired.includes("\u001b[?1000l") && !acquired.includes("\u001b[?1000h"), "a plain rich lease reports no mouse");
+  await host.write(new TextEncoder().encode("\u001b[?1000h\u001b[?1006h"));
+  const mark = stdout.writes.length;
+  await lease.restore();
+  const restored = Buffer.concat(stdout.writes.slice(mark)).toString();
+  assert.ok(restored.includes("\u001b[?1000l") && restored.includes("\u001b[?1006l"), "reporting is off after restore");
+  assert.ok(restored.lastIndexOf("\u001b[?1000l") < restored.lastIndexOf("\u001b[?1049l"), "and off before the alternate screen is left");
+});
+
+/* -------------------------------------------------------------------------- */
+/* Session tabs: the Machine's sessions on the bar, switched by click or chord */
+/* -------------------------------------------------------------------------- */
+
+const SESSION_C = "33333333-3333-4333-8333-333333333333";
+const ENABLE_MOUSE = "\u001b[?1000h\u001b[?1006h";
+
+function rosterOf(entries) {
+  const listeners = new Set();
+  return {
+    list: entries,
+    entries() { return this.list; },
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    change(next) { this.list = next; for (const listener of listeners) listener(); },
+  };
+}
+
+function machineRoster() {
+  return rosterOf([
+    { number: 1, agentSessionId: SESSION_A, agent: "claude-code", label: "projA", ended: false },
+    { number: 2, agentSessionId: SESSION_B, agent: "claude-code", label: "projB", ended: false },
+    { number: 3, agentSessionId: SESSION_C, agent: "claude-code", label: "old", ended: true },
+  ]);
+}
+
+async function tabColumn(host, text) {
+  const top = (await visibleHostText(host)).split("\n")[0];
+  const index = top.indexOf(text);
+  assert.ok(index >= 0, `the bar shows ${text}: ${top}`);
+  return index + 1;
+}
+
+async function sessionTabsHarness(options = {}) {
+  const roster = options.roster ?? machineRoster();
+  const system = harness({
+    ...options,
+    coordinatorOptions: { mouseReporting: options.mouseReporting ?? true, sessionRoster: roster, ...options.coordinatorOptions },
+  });
+  await system.coordinator.start(system.intents.slice(0, 1));
+  await waitUntil(() => /2:Claude projB/u.test(decoder.decode(system.host.writes.at(-1))), "the roster reaches the bar");
+  return { ...system, roster };
+}
+
+const press = (column, row = 1) => encoder.encode(`\u001b[<0;${column};${row}M`);
+
+test("session tabs: a click on another session detaches this one and asks for that one; later keys go nowhere", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    assert.ok(host.writes.some((bytes) => decoder.decode(bytes).includes(ENABLE_MOUSE)), "press reports are asked for");
+    assert.match((await visibleHostText(host)).split("\n")[0], /\[1:Claude projA\].*2:Claude projB.*3:Claude old ended/u);
+    const column = await tabColumn(host, "2:Claude projB");
+    host.emitInput(encoder.encode("before"));
+    host.emitInput(Uint8Array.from([...press(column), ...encoder.encode("after-in-chunk")]));
+    host.emitInput(encoder.encode("after"));
+    await waitUntil(() => coordinator.state === "stopped", "the switch ends this attachment");
+    assert.deepEqual(calls.input.map((item) => item.text), ["before"], "only keys typed before the click reach A");
+    assert.deepEqual(calls.detach, ["tab-a"]);
+    assert.deepEqual(coordinator.switchRequest, { agentSessionId: SESSION_B, agent: "claude-code", label: "projB" });
+    assert.deepEqual(coordinator.detachedSessions.map((item) => item.agentSessionId), [SESSION_A]);
+    assert.equal(host.restored, 1, "the lease is released by its owner");
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: a click split after Escape within the input window never reaches the remote", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const column = await tabColumn(host, "2:Claude projB");
+    const click = press(column);
+    host.emitInput(click.subarray(0, 1));
+    host.emitInput(click.subarray(1));
+    await waitUntil(() => coordinator.state === "stopped", "the split click still switches");
+    assert.deepEqual(calls.input, [], "no click byte reached the remote");
+    assert.equal(coordinator.switchRequest?.agentSessionId, SESSION_B);
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: a distinct SGR prefix survives an idle gap without reaching the remote", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const click = press(await tabColumn(host, "2:Claude projB"));
+    host.emitInput(click.subarray(0, 5)); // ESC[<0;
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.deepEqual(calls.input, [], "an incomplete but distinct report stays local");
+    host.emitInput(click.subarray(5));
+    await waitUntil(() => coordinator.state === "stopped", "the delayed report still switches");
+    assert.deepEqual(calls.input, []);
+    assert.equal(coordinator.switchRequest?.agentSessionId, SESSION_B);
+  } finally { await coordinator.stop(); }
+});
+
+test("LIMIT: a mouse report split beyond the Escape window is indistinguishable from a lone Escape", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const click = press(await tabColumn(host, "2:Claude projB"));
+    host.emitInput(click.subarray(0, 1));
+    await waitUntil(() => calls.input.length === 1, "the lone Escape is released promptly");
+    host.emitInput(click.subarray(1));
+    await waitUntil(() => calls.input.length === 2, "the delayed suffix is ordinary bytes");
+    assert.equal(calls.input.map((item) => item.text).join(""), decoder.decode(click));
+    assert.equal(coordinator.switchRequest, undefined, "the late suffix cannot be recognized as a click");
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: the attached tab, an ended tab and the brand are not switch targets", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    host.emitInput(press(await tabColumn(host, "1:Claude projA")));
+    await waitUntil(() => /Already on Claude projA/u.test(decoder.decode(host.writes.at(-1))), "own tab says so");
+    host.emitInput(press(await tabColumn(host, "3:Claude old")));
+    await waitUntil(() => /Claude old ended · it cannot be attached/u.test(decoder.decode(host.writes.at(-1))), "ended tab says so");
+    host.emitInput(press(2));
+    host.emitInput(press(await tabColumn(host, "2:Claude projB"), 2));
+    host.emitInput(encoder.encode("still here"));
+    await waitUntil(() => calls.input.length === 1, "typing still reaches A");
+    assert.equal(calls.input[0].text, "still here");
+    assert.deepEqual(calls.detach, []);
+    assert.equal(coordinator.switchRequest, undefined);
+    assert.equal(coordinator.state, "active");
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: Ctrl+] <n> is the keyboard click; the rest of the chunk is not sent", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    host.emitInput(Uint8Array.of(0x1d, 0x39));
+    await waitUntil(() => /No session 9/u.test(decoder.decode(host.writes.at(-1))), "an unknown number says so");
+    host.emitInput(Uint8Array.of(0x1d, 0x33));
+    await waitUntil(() => /Claude old ended/u.test(decoder.decode(host.writes.at(-1))), "an ended number says so");
+    host.emitInput(Uint8Array.from([0x1d, 0x32, ...encoder.encode("tail")]));
+    await waitUntil(() => coordinator.state === "stopped", "the chord switches");
+    assert.deepEqual(calls.input, []);
+    assert.equal(coordinator.switchRequest?.agentSessionId, SESSION_B);
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: Ctrl+] n picks the next session that has not ended", async () => {
+  const roster = rosterOf([
+    { number: 1, agentSessionId: SESSION_C, agent: "claude-code", label: "old", ended: true },
+    { number: 2, agentSessionId: SESSION_A, agent: "claude-code", label: "projA", ended: false },
+    { number: 3, agentSessionId: "44444444-4444-4444-8444-444444444444", agent: "codex", label: "gone", ended: true },
+    { number: 4, agentSessionId: SESSION_B, agent: "claude-code", label: "projB", ended: false },
+  ]);
+  const host = new FakeHost();
+  host.columns = 120;
+  const system = harness({ host, coordinatorOptions: { mouseReporting: true, sessionRoster: roster } });
+  try {
+    await system.coordinator.start(system.intents.slice(0, 1));
+    await waitUntil(() => /4:Claude projB/u.test(decoder.decode(system.host.writes.at(-1))), "the roster reaches the bar");
+    system.host.emitInput(Uint8Array.of(0x1d, 0x6e));
+    await waitUntil(() => system.coordinator.state === "stopped", "n switches");
+    assert.equal(system.coordinator.switchRequest?.agentSessionId, SESSION_B);
+  } finally { await system.coordinator.stop(); }
+});
+
+test("session tabs: Ctrl+C after the click cancels the switch; the run just ends", async () => {
+  let release;
+  const detachGate = new Promise((resolve) => { release = resolve; });
+  const { coordinator, calls, host } = await sessionTabsHarness({ detachGate });
+  try {
+    host.emitInput(press(await tabColumn(host, "2:Claude projB")));
+    await waitUntil(() => calls.detach.length === 1, "the detach starts");
+    host.emitInput(Uint8Array.of(0x03));
+    release();
+    await waitUntil(() => coordinator.state === "stopped", "the run ends");
+    assert.equal(coordinator.switchRequest, undefined);
+    assert.deepEqual(calls.input, []);
+  } finally { release?.(); await coordinator.stop(); }
+});
+
+test("session tabs: a paste that contains a mouse-like sequence is pasted, not clicked", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness();
+  try {
+    const column = await tabColumn(host, "2:Claude projB");
+    const pasted = `\u001b[200~x\u001b[<0;${column};1My\u001b[201~`;
+    host.emitInput(encoder.encode(pasted));
+    await waitUntil(() => calls.input.length === 1, "the paste is sent");
+    assert.equal(calls.input[0].text, pasted);
+    assert.equal(coordinator.switchRequest, undefined);
+    assert.deepEqual(calls.detach, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("NEGATIVE CONTROL session tabs: without mouse reporting the same bytes are keys, not a click", async () => {
+  const { coordinator, calls, host } = await sessionTabsHarness({ mouseReporting: false });
+  try {
+    assert.ok(!host.writes.some((bytes) => decoder.decode(bytes).includes(ENABLE_MOUSE)));
+    const column = await tabColumn(host, "2:Claude projB");
+    host.emitInput(press(column));
+    await waitUntil(() => calls.input.length === 1, "the bytes go to the remote");
+    assert.equal(calls.input[0].text, `\u001b[<0;${column};1M`);
+    assert.equal(coordinator.switchRequest, undefined);
+  } finally { await coordinator.stop(); }
+});
+
+test("session tabs: a roster change repaints the bar; a multi-session run keeps its own tabs", async () => {
+  const wide = new FakeHost();
+  wide.columns = 120;
+  const { coordinator, host, roster } = await sessionTabsHarness({ host: wide });
+  try {
+    roster.change([...roster.list, { number: 4, agentSessionId: "44444444-4444-4444-8444-444444444444", agent: "claude-code", label: "fresh", ended: false }]);
+    await waitUntil(() => /4:Claude fresh/u.test(decoder.decode(host.writes.at(-1))), "a new session appears");
+  } finally { await coordinator.stop(); }
+  const multi = harness({ coordinatorOptions: { mouseReporting: true, sessionRoster: machineRoster() } });
+  try {
+    await multi.coordinator.start(multi.intents);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const top = (await visibleHostText(multi.host)).split("\n")[0];
+    assert.match(top, /\[1:Claude primary\].*2:Codex review/u);
+    assert.doesNotMatch(top, /projB/u);
+  } finally { await multi.coordinator.stop(); }
 });

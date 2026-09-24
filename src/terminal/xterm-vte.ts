@@ -3,6 +3,7 @@ import xtermHeadless from "@xterm/headless";
 import type { IBufferCell, Terminal as XtermTerminal } from "@xterm/headless";
 
 import { MAX_TERMINAL_FRAME_BYTES } from "./codec.js";
+import type { RemoteMouseReporting } from "./host-mouse.js";
 import {
   MAX_VIEWPORT_CELLS,
   assertViewportRebind,
@@ -138,6 +139,13 @@ export class XtermViewportAdapter {
   #responseWindowEvents = 0;
   #responseWindowBytes = 0;
   #cursorVisible = true;
+  #mouseSgr = false;
+  /**
+   * Lines the person has scrolled back from the live bottom of the normal
+   * buffer. Zero follows the remote screen; anything else is a local view that
+   * no remote byte can move and no key the remote receives came from.
+   */
+  #scrollOffset = 0;
   #disposed = false;
 
   constructor(options: XtermViewportOptions) {
@@ -189,10 +197,12 @@ export class XtermViewportAdapter {
     }
     this.#terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
       if (params.some((value) => value === 25 || (Array.isArray(value) && value.includes(25)))) this.#cursorVisible = true;
+      if (params.some((value) => value === 1006 || (Array.isArray(value) && value.includes(1006)))) this.#mouseSgr = true;
       return false;
     });
     this.#terminal.parser.registerCsiHandler({ prefix: "?", final: "l" }, (params) => {
       if (params.some((value) => value === 25 || (Array.isArray(value) && value.includes(25)))) this.#cursorVisible = false;
+      if (params.some((value) => value === 1006 || (Array.isArray(value) && value.includes(1006)))) this.#mouseSgr = false;
       return false;
     });
     if (this.#onTerminalResponse !== undefined) {
@@ -252,6 +262,8 @@ export class XtermViewportAdapter {
         this.#responseWindowEvents = 0;
         this.#responseWindowBytes = 0;
         this.#cursorVisible = true;
+        this.#mouseSgr = false;
+        this.#scrollOffset = 0;
         this.#configureTerminal();
         const snapshot = this.#registry.resetForCurrentView(this.#tabId, nextBinding, columns, rows);
         this.#binding = nextBinding;
@@ -273,7 +285,46 @@ export class XtermViewportAdapter {
       throw new RangeError("The host projection dimensions exceed the viewport budget.");
     }
     const current = this.snapshot();
-    return this.#capture(current.outputSequence, current.replayCursor, false, { columns, rows });
+    return this.#capture(current.outputSequence, current.replayCursor, false, { columns, rows }, this.#scrollOffset);
+  }
+
+  /** What the remote program asked the terminal to report about the mouse. */
+  mouseReporting(): RemoteMouseReporting {
+    this.#assertOpen();
+    return Object.freeze({ tracking: this.#terminal.modes.mouseTrackingMode, sgr: this.#mouseSgr });
+  }
+
+  /**
+   * The screen the remote program is on, from its own ?1049/?1047/?47
+   * sequences, and whether it asked for application cursor keys (?1).
+   */
+  screenModes(): { readonly alternateScreen: boolean; readonly applicationCursorKeys: boolean } {
+    this.#assertOpen();
+    return Object.freeze({
+      alternateScreen: this.#terminal.buffer.active.type === "alternate",
+      applicationCursorKeys: this.#terminal.modes.applicationCursorKeysMode,
+    });
+  }
+
+  get scrollOffset(): number {
+    return this.#scrollOffset;
+  }
+
+  /**
+   * Move the local view `lines` into history (positive) or back toward the
+   * live screen (negative), bounded by the retained scrollback. The alternate
+   * buffer has no history, so it never scrolls. Returns the new offset.
+   */
+  scrollBy(lines: number): number {
+    this.#assertOpen();
+    const buffer = this.#terminal.buffer.active;
+    const limit = buffer.type === "alternate" ? 0 : buffer.baseY;
+    this.#scrollOffset = Math.min(limit, Math.max(0, this.#scrollOffset + Math.trunc(lines)));
+    return this.#scrollOffset;
+  }
+
+  resetScroll(): void {
+    this.#scrollOffset = 0;
   }
 
   async write(
@@ -319,6 +370,8 @@ export class XtermViewportAdapter {
 
   #resizeNow(columns: number, rows: number): ViewportSnapshot {
     this.#assertOpen();
+    // A resize reflows history; an offset into the old layout names other lines.
+    this.#scrollOffset = 0;
     const previousCells = bufferCells(this.#terminal.cols, this.#terminal.rows, this.#scrollback);
     this.#resourceBudget.resize(this.#tabId, bufferCells(columns, rows, this.#scrollback));
     try {
@@ -351,6 +404,7 @@ export class XtermViewportAdapter {
     this.#responseBatchBytes = 0;
     this.#responseOverflow = false;
     let timeout: NodeJS.Timeout | undefined;
+    const baseBefore = this.#terminal.buffer.active.baseY;
     try {
       this.#armSynchronousParse();
       await Promise.race([
@@ -361,6 +415,13 @@ export class XtermViewportAdapter {
       ]);
       if (this.#responseOverflow) {
         throw new Error("The remote terminal exceeded its protocol-response budget.");
+      }
+      if (this.#scrollOffset > 0) {
+        // Keep the lines the person is reading in place while new output
+        // pushes history up beneath them.
+        const buffer = this.#terminal.buffer.active;
+        this.#scrollOffset = buffer.type === "alternate" ? 0
+          : Math.min(buffer.baseY, this.#scrollOffset + Math.max(0, buffer.baseY - baseBefore));
       }
       const responses = this.#responseBatch;
       this.#responseBatch = undefined;
@@ -460,6 +521,7 @@ export class XtermViewportAdapter {
 
   #capture(outputSequence: bigint, replayCursor: bigint, localReflow = false,
     host?: { readonly columns: number; readonly rows: number },
+    scrollOffset = 0,
   ): ViewportSnapshot {
     const buffer = this.#terminal.buffer.active;
     const cells: string[] = [];
@@ -474,8 +536,9 @@ export class XtermViewportAdapter {
     // whenever the writer's screen already fits, which is the only case the
     // non-projecting capture can reach.
     const rowOffset = Math.min(Math.max(0, buffer.cursorY - rows + 1), this.#terminal.rows - rows);
+    const top = Math.max(0, buffer.viewportY + rowOffset - scrollOffset);
     for (let row = 0; row < rows; row += 1) {
-      const line = buffer.getLine(buffer.viewportY + rowOffset + row);
+      const line = buffer.getLine(top + row);
       let visibleWidth = 0;
       if (line !== undefined) {
         for (let column = 0; column < columns; column += 1) {
@@ -538,13 +601,13 @@ export class XtermViewportAdapter {
       // Clamping it reported a position the writer's terminal never held; the
       // offset maps the real row, and a cursor outside the clipped width is
       // genuinely off this host frame and stays hidden.
-      const projectedCursorY = frame.cursorY - rowOffset;
+      const projectedCursorY = frame.cursorY - rowOffset + (buffer.viewportY + rowOffset - top);
       return Object.freeze({ ...frame, columns: host.columns, rows: host.rows,
         cells: Object.freeze(cells), displayWidths: Object.freeze(displayWidths),
         renderRows: Object.freeze(renderRows.map(row => Object.freeze(row.map(run => Object.freeze(run))))),
         cursorX: Math.min(host.columns - 1, frame.cursorX),
         cursorY: projectedCursorY < 0 || projectedCursorY >= rows ? 0 : projectedCursorY,
-        modes: Object.freeze({ ...frame.modes, cursorVisible: frame.modes.cursorVisible &&
+        modes: Object.freeze({ ...frame.modes, cursorVisible: frame.modes.cursorVisible && scrollOffset === 0 &&
           frame.cursorX < columns && projectedCursorY >= 0 && projectedCursorY < rows }),
       });
     }
