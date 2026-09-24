@@ -71,7 +71,7 @@ const HOST_INPUT_PREFIX_IDLE_MS = 25;
 // Delay only keys after the first key in a burst. A batch remains one RTP1
 // input frame, so the gateway still checks its durable writer fence per frame.
 const INPUT_BATCH_WINDOW_MS = 24;
-const INPUT_BURST_GAP_MS = 35;
+const INPUT_BURST_GAP_MS = INPUT_BATCH_WINDOW_MS;
 const INPUT_BATCH_MAX_BYTES = 32;
 const DISCONNECT_FRAME_MS = 30;
 const DISCONNECTING_FRAMES = Object.freeze([
@@ -208,6 +208,8 @@ interface PendingPrintableInput {
   readonly target: ForegroundInputTarget;
   readonly bytes: number[];
   readonly receipt: number;
+  readonly browserActionGeneration: number;
+  readonly browserAction: LocalBrowserActionRequest | undefined;
   readonly timer: ReturnType<typeof setTimeout>;
 }
 
@@ -218,6 +220,8 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly appbar?: () => AppbarModel;
   readonly color?: boolean;
   readonly clock?: () => number;
+  /** Monotonic time used only to classify nearby keyboard input. */
+  readonly inputClock?: () => number;
   readonly resizeCoalesceMs?: number;
   readonly reconnectAttempts?: number;
   readonly reconnectBaseDelayMs?: number;
@@ -259,6 +263,7 @@ export class ForegroundTerminalCoordinator {
   readonly #registry = new ViewportRegistry();
   readonly #tabs = new Map<string, ForegroundTab>();
   readonly #clock: () => number;
+  readonly #inputClock: () => number;
   #runtime: ForegroundTerminalRuntime | undefined;
   #lease: HostTerminalLease | undefined;
   #state: ForegroundTerminalState = "idle";
@@ -279,6 +284,8 @@ export class ForegroundTerminalCoordinator {
   readonly #copyLinks = new Map<string, LocalBrowserActionRequest>();
   #prefixPending = false;
   #prefixTarget: ForegroundInputTarget | undefined;
+  #prefixBrowserActionGeneration: number | undefined;
+  #prefixBrowserAction: LocalBrowserActionRequest | undefined;
   #pasteActive = false;
   #pasteStartMatch = 0;
   #pasteEndMatch = 0;
@@ -313,6 +320,7 @@ export class ForegroundTerminalCoordinator {
   #helpVisible = false;
   #pendingBrowserAction: LocalBrowserActionRequest | undefined;
   #pendingBrowserActionTabId: string | undefined;
+  readonly #browserActionGenerations = new Map<string, number>();
   #browserNotice: string | undefined;
   #browserOpening = false;
   #terminalFailure: unknown;
@@ -367,6 +375,7 @@ export class ForegroundTerminalCoordinator {
       // A guess that timed out is repainted away by an ordinary frame.
       onExpire: () => this.#queueStateRender(),
     });
+    this.#inputClock = options.inputClock ?? (() => performance.now());
     this.#localActionBroker = new LocalActionBroker({
       clock: this.#clock,
       isIdentityLive: (identity) => this.#isLocalActionIdentityLive(identity),
@@ -1143,6 +1152,8 @@ export class ForegroundTerminalCoordinator {
     }
     const payload = bytes.slice();
     const receiptTarget = this.#captureInputTarget();
+    const receiptBrowserAction = this.#browserActionFor(receiptTarget);
+    const receiptBrowserActionGeneration = this.#browserActionGenerationFor(receiptTarget);
     if (
       this.#state === "active" &&
       receiptTarget === undefined &&
@@ -1162,12 +1173,13 @@ export class ForegroundTerminalCoordinator {
       this.#tabs.get(receiptTarget.tabId)?.snapshot.accessMode === "writer" &&
       payload.byteLength === 1 && payload[0]! >= 0x20 && payload[0]! <= 0x7e &&
       !this.#pasteActive && this.#pasteStartMatch === 0 && this.#pasteEndMatch === 0 &&
-      !this.#prefixPending && this.#pendingBrowserAction === undefined &&
+      !this.#prefixPending && receiptBrowserAction === undefined &&
       !this.#oauthPasteGuards.has(receiptTarget.tabId);
     if (printable) {
-      const now = performance.now();
+      const now = this.#inputClock();
       const batch = this.#inputBatch;
-      if (batch !== undefined && sameInputTarget(batch.target, receiptTarget)) {
+      if (batch !== undefined && sameInputTarget(batch.target, receiptTarget) &&
+        batch.browserActionGeneration === receiptBrowserActionGeneration) {
         batch.bytes.push(payload[0]!);
         this.#pendingInputBytes += 1;
         this.#lastPrintableAt = now;
@@ -1185,7 +1197,11 @@ export class ForegroundTerminalCoordinator {
       if (closeToPrior) {
         const timer = setTimeout(() => this.#flushInputBatch(), INPUT_BATCH_WINDOW_MS);
         timer.unref?.();
-        this.#inputBatch = { target: receiptTarget, bytes: [payload[0]!], receipt, timer };
+        this.#inputBatch = {
+          target: receiptTarget, bytes: [payload[0]!], receipt,
+          browserActionGeneration: receiptBrowserActionGeneration,
+          browserAction: receiptBrowserAction, timer,
+        };
         this.#pendingInputBytes += 1;
         if (this.#predictAtReceipt(payload, receiptTarget, false)) void this.#render().catch(() => undefined);
         return;
@@ -1221,7 +1237,8 @@ export class ForegroundTerminalCoordinator {
     // Receipt time, not input-tail time: the guess is painted before the key
     // is even queued for the network.
     if (this.#predictAtReceipt(payload, receiptTarget, barrierChunk)) void this.#render().catch(() => undefined);
-    this.#enqueueInput(payload, receiptTarget, receipt, barrierChunk);
+    this.#enqueueInput(payload, receiptTarget, receipt, barrierChunk, false,
+      receiptBrowserActionGeneration, receiptBrowserAction);
   }
 
   #enqueueInput(
@@ -1230,11 +1247,14 @@ export class ForegroundTerminalCoordinator {
     receipt: number,
     barrierChunk = false,
     counted = false,
+    browserActionGeneration = this.#browserActionGenerationFor(receiptTarget),
+    browserAction = this.#browserActionFor(receiptTarget),
   ): void {
     if (!counted) this.#pendingInputBytes += payload.byteLength;
     const operation = this.#inputTail.then(async () => {
       try {
-        await this.#routeInput(payload, receiptTarget, false, receipt);
+        await this.#routeInput(payload, receiptTarget, false, receipt,
+          browserActionGeneration, browserAction);
       } finally {
         this.#pendingInputBytes -= payload.byteLength;
         if (barrierChunk) this.#unroutedBarrierChunks -= 1;
@@ -1272,7 +1292,8 @@ export class ForegroundTerminalCoordinator {
     if (batch === undefined) return;
     this.#inputBatch = undefined;
     clearTimeout(batch.timer);
-    this.#enqueueInput(Uint8Array.from(batch.bytes), batch.target, batch.receipt, false, true);
+    this.#enqueueInput(Uint8Array.from(batch.bytes), batch.target, batch.receipt, false, true,
+      batch.browserActionGeneration, batch.browserAction);
   }
 
   #discardInputBatch(): void {
@@ -1291,20 +1312,37 @@ export class ForegroundTerminalCoordinator {
     receiptTarget: ForegroundInputTarget | undefined,
     releasedPrefix = false,
     receipt = 0,
+    browserActionGeneration = this.#browserActionGenerationFor(receiptTarget),
+    browserAction = this.#browserActionFor(receiptTarget),
   ): Promise<void> {
     // Received after a switch was chosen (a chord processed ahead of it in
     // this queue): never sent, to either session.
     if (this.#switchCutoff !== undefined && receipt > this.#switchCutoff) return;
     const runtime = this.#requireRuntime();
+    // Permission keys are decisions only for the request already visible when
+    // the user typed them. A queued key cannot approve a request that arrived
+    // while an earlier send was blocked. Preserve explicit local detach/chords.
+    if (!releasedPrefix &&
+      (browserActionGeneration !== this.#browserActionGenerationFor(receiptTarget) ||
+        browserAction !== this.#browserActionFor(receiptTarget)) &&
+      !bytes.includes(INTERRUPT) && !bytes.includes(ESCAPE_PREFIX) && !this.#prefixPending) {
+      this.#browserNotice = BROWSER_BATCH_WITHHELD_NOTICE;
+      await this.#render();
+      return;
+    }
     if (bytes.includes(INTERRUPT)) {
-      const active = this.#pendingBrowserAction === undefined
+      const currentAction = this.#browserActionFor(receiptTarget);
+      const active = currentAction === undefined
         ? undefined
-        : this.#localActionBroker.get(this.#pendingBrowserAction.id);
+        : this.#localActionBroker.get(currentAction.id);
       if (active !== undefined) this.#localActionBroker.cancelBinding(active.request.identity, "user_interrupt");
-      this.#pendingBrowserAction = undefined;
-      this.#pendingBrowserActionTabId = undefined;
+      if (currentAction !== undefined) {
+        this.#pendingBrowserAction = undefined;
+        this.#pendingBrowserActionTabId = undefined;
+      }
       this.#browserNotice = undefined;
-    } else if (!releasedPrefix && await this.#routeBrowserActionInput(bytes, receiptTarget)) {
+    } else if (!releasedPrefix && !this.#prefixPending && !bytes.includes(ESCAPE_PREFIX) &&
+      await this.#routeBrowserActionInput(bytes, receiptTarget)) {
       return;
     }
     const guarded = releasedPrefix ? { bytes, blocked: false } : this.#guardProviderOAuthPaste(bytes, receiptTarget);
@@ -1359,6 +1397,8 @@ export class ForegroundTerminalCoordinator {
           await flush();
           this.#prefixPending = true;
           this.#prefixTarget = target;
+          this.#prefixBrowserActionGeneration = browserActionGeneration;
+          this.#prefixBrowserAction = browserAction;
         } else {
           remote.push(byte);
         }
@@ -1367,6 +1407,16 @@ export class ForegroundTerminalCoordinator {
       this.#prefixPending = false;
       const chordTarget = this.#prefixTarget;
       this.#prefixTarget = undefined;
+      const staleChord = this.#prefixBrowserActionGeneration !== this.#browserActionGenerationFor(chordTarget) ||
+        this.#prefixBrowserAction !== this.#browserActionFor(chordTarget);
+      this.#prefixBrowserActionGeneration = undefined;
+      this.#prefixBrowserAction = undefined;
+      if (staleChord && byte !== DETACH && byte !== HELP && byte !== NEXT_TAB &&
+        (byte < TAB_FIRST || byte > TAB_LAST)) {
+        this.#browserNotice = BROWSER_BATCH_WITHHELD_NOTICE;
+        await this.#render();
+        continue;
+      }
       if (byte === ESCAPE_PREFIX) {
         target = chordTarget ?? target;
         remote.push(ESCAPE_PREFIX);
@@ -1830,6 +1880,9 @@ export class ForegroundTerminalCoordinator {
   #promoteBrowserAction(): void {
     const current = this.#localActionBroker.current();
     if (current?.state !== "pending_user") {
+      if (this.#pendingBrowserActionTabId !== undefined) {
+        this.#advanceBrowserActionGeneration(this.#pendingBrowserActionTabId);
+      }
       this.#pendingBrowserAction = undefined;
       this.#pendingBrowserActionTabId = undefined;
       return;
@@ -1840,11 +1893,31 @@ export class ForegroundTerminalCoordinator {
       tab.snapshot.agentSessionId === request.agentSessionId &&
       tab.snapshot.processEpoch === request.processEpoch &&
       tab.snapshot.fencingGeneration === request.fencingGeneration)?.[0];
+    if (this.#pendingBrowserAction !== request || this.#pendingBrowserActionTabId !== tabId) {
+      if (this.#pendingBrowserActionTabId !== undefined) {
+        this.#advanceBrowserActionGeneration(this.#pendingBrowserActionTabId);
+      }
+      if (tabId !== undefined && tabId !== this.#pendingBrowserActionTabId) {
+        this.#advanceBrowserActionGeneration(tabId);
+      }
+    }
     const withheld = this.#inputBatch?.target.tabId === tabId;
     if (withheld) this.#discardInputBatch();
     this.#pendingBrowserAction = request;
     this.#pendingBrowserActionTabId = tabId;
     this.#browserNotice = withheld ? BROWSER_BATCH_WITHHELD_NOTICE : undefined;
+  }
+
+  #browserActionFor(target: ForegroundInputTarget | undefined): LocalBrowserActionRequest | undefined {
+    return target?.tabId === this.#pendingBrowserActionTabId ? this.#pendingBrowserAction : undefined;
+  }
+
+  #browserActionGenerationFor(target: ForegroundInputTarget | undefined): number {
+    return target === undefined ? 0 : this.#browserActionGenerations.get(target.tabId) ?? 0;
+  }
+
+  #advanceBrowserActionGeneration(tabId: string): void {
+    this.#browserActionGenerations.set(tabId, (this.#browserActionGenerations.get(tabId) ?? 0) + 1);
   }
 
   #localActionIdentity(_intent: ForegroundTabIntent, snapshot: RuntimeTerminalSnapshot): LocalActionSessionIdentity {
@@ -1900,14 +1973,26 @@ export class ForegroundTerminalCoordinator {
       clearTimeout(previousTimer);
       this.#oauthPrefixTimers.delete(target.tabId);
     } else if (this.#state === "active" && guard.hasPendingPrefix && previousTimer === undefined) {
+      const browserAction = this.#browserActionFor(target);
+      const browserActionGeneration = this.#browserActionGenerationFor(target);
+      const receipt = this.#inputReceipt;
       const timer = setTimeout(() => {
         this.#oauthPrefixTimers.delete(target.tabId);
         const operation = this.#inputTail.then(async () => {
           const tab = this.#tabs.get(target.tabId);
-          if (this.#state !== "active" || tab === undefined || tab.snapshot.state !== "active" || this.#activeTabId !== target.tabId ||
-            this.#oauthPasteGuards.get(target.tabId) !== guard || !sameSnapshotBinding(tab.snapshot, target.binding)) return;
+          if (this.#state !== "active" || this.#switchCutoff !== undefined || tab === undefined || tab.snapshot.state !== "active" || this.#activeTabId !== target.tabId ||
+            this.#oauthPasteGuards.get(target.tabId) !== guard || !sameSnapshotBinding(tab.snapshot, target.binding) ||
+            tab.snapshot.writerEpoch !== target.binding.writerEpoch) return;
+          if (browserActionGeneration !== this.#browserActionGenerationFor(target) ||
+            browserAction !== this.#browserActionFor(target)) {
+            guard.releasePendingPrefix();
+            this.#browserNotice = BROWSER_BATCH_WITHHELD_NOTICE;
+            await this.#render();
+            return;
+          }
           const prefix = guard.releasePendingPrefix();
-          if (prefix.byteLength > 0) await this.#routeInput(prefix, target, true);
+          if (prefix.byteLength > 0) await this.#routeInput(prefix, target, true,
+            receipt, browserActionGeneration, browserAction);
         });
         this.#inputTail = operation.catch((error) => {
           if (error instanceof RuntimeBoundaryError &&

@@ -51,6 +51,24 @@ test("a ten-key writer burst preserves bytes while using fewer input frames", as
   } finally { await coordinator.stop(); }
 });
 
+test("30ms typing cadence sends each key without an unproductive batch delay", async () => {
+  let now = 0;
+  const { coordinator, host, calls, intents } = harness({
+    coordinatorOptions: { inputClock: () => now },
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    for (const [index, character] of [..."abcd"].entries()) {
+      now += 30;
+      host.emitInput(encoder.encode(character));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(calls.input.length, index + 1,
+        `key ${index + 1} should be sent immediately, before any 24ms batch timer`);
+    }
+    assert.deepEqual(calls.input.map(item => item.text), ["a", "b", "c", "d"]);
+  } finally { await coordinator.stop(); }
+});
+
 test("a binding change discards a delayed printable key before it can cross the new attachment", async () => {
   const { coordinator, callbacks, host, calls, intents } = harness();
   try {
@@ -170,6 +188,140 @@ test("a browser request retires delayed typing and reports that it was not sent"
     assert.equal(calls.input.map(item => item.text).join(""), "a");
     assert.match(await visibleHostText(host), /recent input was not sent/u);
   } finally { await coordinator.stop(); }
+});
+
+test("typing queued before a browser request cannot later approve or deny it", async () => {
+  for (const key of ["o", "d", "\r", "\x1b"]) {
+    const opened = [];
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const { coordinator, callbacks, host, calls, intents } = harness({
+      inputGate: gate,
+      coordinatorOptions: {
+        clock: () => 1_000,
+        browser: { async open(url) { opened.push(url); } },
+      },
+    });
+    intents[0].localBrowserActions = true;
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      host.emitInput(encoder.encode("x"));
+      await waitUntil(() => calls.input.length === 1, "the first send should hold the input tail");
+      host.emitInput(encoder.encode(key));
+      await new Promise(resolve => setTimeout(resolve, 40)); // the batch timer queues this key behind x
+      const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+      release();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      assert.deepEqual(opened, [], `${JSON.stringify(key)} was typed before the request and cannot authorize it`);
+      assert.equal(calls.input.map(item => item.text).join(""), "x", `${JSON.stringify(key)} cannot become delayed provider input`);
+      assert.match(await visibleHostText(host), /recent input was not sent/u);
+    } finally {
+      release();
+      await coordinator.stop();
+    }
+  }
+});
+
+test("a browser request on another tab does not discard queued writer input", async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const opened = [];
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    inputGate: gate,
+    coordinatorOptions: {
+      clock: () => 1_000,
+      browser: { async open(url) { opened.push(url); } },
+    },
+  });
+  intents[1].agent = "claude-code";
+  intents[1].localBrowserActions = true;
+  try {
+    await coordinator.start(intents);
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first input should hold the send tail");
+    host.emitInput(encoder.encode("b"));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+    await callbacks.onTerminalOutput(outputEvent(intents[1], 1n, encoder.encode(`${url}\r\n`)));
+    host.emitInput(encoder.encode("c"));
+    host.emitInput(encoder.encode("d"));
+    host.emitInput(encoder.encode("e"));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    release();
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "abcde",
+      "the unrelated request must not erase tab A's queued input");
+    assert.ok(calls.input.every(item => item.tabId === intents[0].tabId));
+    assert.ok(calls.input.length <= 4, "tab B's request must not disable tab A's input batching");
+    host.emitInput(Uint8Array.of(0x1d, 0x32));
+    await waitUntil(() => calls.switch.includes(intents[1].tabId), "the request's tab should become visible");
+    host.emitInput(encoder.encode("o"));
+    await waitUntil(() => opened.length === 1, "tab B's independent request should still be actionable");
+    assert.deepEqual(opened, [url]);
+  } finally {
+    release();
+    await coordinator.stop();
+  }
+});
+
+test("a queued local detach chord cannot turn into browser denial", async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const opened = [];
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    inputGate: gate,
+    coordinatorOptions: {
+      clock: () => 1_000,
+      browser: { async open(url) { opened.push(url); } },
+    },
+  });
+  intents[0].localBrowserActions = true;
+  try {
+    await coordinator.start(intents);
+    host.emitInput(encoder.encode("x"));
+    await waitUntil(() => calls.input.length === 1, "first input should hold the send tail");
+    host.emitInput(Uint8Array.of(0x1d));
+    host.emitInput(encoder.encode("d"));
+    const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+    release();
+    await waitUntil(() => calls.detach.includes(intents[0].tabId), "local detach should not become a decision");
+    assert.deepEqual(opened, []);
+    assert.equal(calls.input.map(item => item.text).join(""), "x");
+  } finally {
+    release();
+    await coordinator.stop();
+  }
+});
+
+test("a queued copy chord cannot act on a sign-in link revealed after receipt", async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const copied = [];
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    inputGate: gate,
+    coordinatorOptions: {
+      clock: () => 1_000,
+      copyText: async text => { copied.push(text); },
+    },
+  });
+  intents[0].localBrowserActions = true;
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("x"));
+    await waitUntil(() => calls.input.length === 1, "first input should hold the send tail");
+    host.emitInput(Uint8Array.of(0x1d));
+    host.emitInput(encoder.encode("y"));
+    const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+    release();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.deepEqual(copied, []);
+    assert.match(await visibleHostText(host), /recent input was not sent/u);
+  } finally {
+    release();
+    await coordinator.stop();
+  }
 });
 
 test("slow host painting does not stall ordered remote output and catches up without a frame backlog", async () => {
