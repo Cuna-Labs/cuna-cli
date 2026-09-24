@@ -88,6 +88,7 @@ const ATTACHING_FRAME_MS = 90;
 const MAX_DISCONNECT_FRAME_MS = 250;
 const INPUT_WITHHELD_NOTICE = "Reconnecting · input was not sent. Retry after terminal attached.";
 const BATCH_WITHHELD_NOTICE = "Terminal authority changed · recent input was not sent.";
+const BROWSER_BATCH_WITHHELD_NOTICE = "A browser request arrived · recent input was not sent.";
 // Sent keys went unacknowledged past the runtime's input deadline (R12). Said
 // the moment the runtime gives up on the connection, and it already carries the
 // "not resent" half, so it is never prefixed with HISTORICAL_INPUT_NOTICE.
@@ -1839,10 +1840,11 @@ export class ForegroundTerminalCoordinator {
       tab.snapshot.agentSessionId === request.agentSessionId &&
       tab.snapshot.processEpoch === request.processEpoch &&
       tab.snapshot.fencingGeneration === request.fencingGeneration)?.[0];
-    if (this.#inputBatch?.target.tabId === tabId) this.#discardInputBatch();
+    const withheld = this.#inputBatch?.target.tabId === tabId;
+    if (withheld) this.#discardInputBatch();
     this.#pendingBrowserAction = request;
     this.#pendingBrowserActionTabId = tabId;
-    this.#browserNotice = undefined;
+    this.#browserNotice = withheld ? BROWSER_BATCH_WITHHELD_NOTICE : undefined;
   }
 
   #localActionIdentity(_intent: ForegroundTabIntent, snapshot: RuntimeTerminalSnapshot): LocalActionSessionIdentity {

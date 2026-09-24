@@ -154,6 +154,24 @@ test("bracketed paste remains one literal remote chunk after a pending printable
   } finally { await coordinator.stop(); }
 });
 
+test("a browser request retires delayed typing and reports that it was not sent", async () => {
+  const { coordinator, callbacks, host, calls, intents } = harness({
+    coordinatorOptions: { clock: () => 1_000 },
+  });
+  intents[0].localBrowserActions = true;
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+    host.emitInput(encoder.encode("b"));
+    const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${url}\r\n`)));
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.equal(calls.input.map(item => item.text).join(""), "a");
+    assert.match(await visibleHostText(host), /recent input was not sent/u);
+  } finally { await coordinator.stop(); }
+});
+
 test("slow host painting does not stall ordered remote output and catches up without a frame backlog", async () => {
   const { coordinator, callbacks, intents, host } = harness();
   let release;
