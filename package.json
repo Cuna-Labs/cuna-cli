@@ -61,7 +61,7 @@
     "opencode"
   ],
   "devDependencies": {
-    "@types/node": "^22.15.0",
+    "@types/node": "^26.6.2",
     "oxlint": "1.77.0",
     "typescript": "^5.8.3",
     "yaml": "2.9.0"
