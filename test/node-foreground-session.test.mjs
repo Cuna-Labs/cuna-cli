@@ -1718,31 +1718,51 @@ test("first Claude attach does not wait on a slow advisory provider sign-in prob
   const events = [];
   const host = new FakeHost(events);
   const system = terminalSystem(events);
+  const controller = new AbortController();
+  let authStartedAt;
+  let authAbortDelayMs;
+  let authAbortReason;
   const client = {
     ...machineClient(events),
     async getAgentSessionAuth(id, signal) {
       events.push(`auth:${id}`);
+      authStartedAt = performance.now();
       return await new Promise((_, reject) => {
         const abort = () => {
+          authAbortDelayMs = performance.now() - authStartedAt;
+          authAbortReason = signal.reason;
           events.push(`auth-aborted:${id}`);
           reject(signal.reason);
         };
-        if (signal.aborted) abort();
-        else signal.addEventListener("abort", abort, { once: true });
+        // Without an advisory deadline this read stays pending, as on the old first-attach path.
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
       });
     },
   };
-  const started = Date.now();
   const operation = runSupportedForegroundSessions({
     client, baseUrl: "https://api.getcuna.com", agentSessionIds: [SESSION_A],
+    signal: controller.signal,
   }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW });
-  await waitUntil(() => events.includes(`auth-aborted:${SESSION_A}`), "the first attach auth read should be bounded", 4_000);
-  await waitUntil(() => system.grantClients().length === 1, "the first attach should reach the terminal grant", 4_000);
-  assert.ok(Date.now() - started < 4_000, "the advisory probe must not consume its normal 15 s read budget");
-  assert.match(new TextDecoder().decode(host.writes.at(-1)), /Claude auth unknown/u);
-  host.emitInput(Uint8Array.of(0x1d, 0x64));
-  await operation;
-  assert.equal(host.restored, 1);
+  try {
+    await waitUntil(() => events.includes(`auth:${SESSION_A}`), "the first attach auth read should begin");
+    await waitUntil(() => events.includes(`auth-aborted:${SESSION_A}`), "the first attach auth read should be bounded", 4_000);
+    assert.equal(authAbortReason?.name, "TimeoutError", "the advisory deadline, not caller cancellation, ends the probe");
+    assert.ok(authAbortDelayMs < 4_000, "the auth probe must not consume its normal 15 s read budget");
+    await waitUntil(() => events.includes("wire:connected") &&
+      /Claude auth unknown/u.test(new TextDecoder().decode(host.writes.at(-1) ?? new Uint8Array())),
+    "the first attach should render a connected terminal with unknown auth", 4_000);
+    assert.equal(system.grantClients().length, 1);
+    const activeFrame = await visibleHostText(host);
+    assert.match(activeFrame, /terminal attached/u);
+    assert.match(activeFrame, /Claude auth unknown/u);
+    host.emitInput(Uint8Array.of(0x1d, 0x64));
+    await operation;
+    assert.equal(host.restored, 1);
+  } finally {
+    controller.abort();
+    await operation.catch(() => undefined);
+  }
 });
 
 test("session tabs: a switch does not wait on a slow provider sign-in probe", async (t) => {
