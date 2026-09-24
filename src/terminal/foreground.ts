@@ -68,6 +68,11 @@ const RESIZE_COALESCE_MS = 50;
 // this window; once a mouse or paste prefix is distinct, it stays buffered.
 // The two ambiguous prefixes can still leak if split across a longer gap.
 const HOST_INPUT_PREFIX_IDLE_MS = 25;
+// Delay only keys after the first key in a burst. A batch remains one RTP1
+// input frame, so the gateway still checks its durable writer fence per frame.
+const INPUT_BATCH_WINDOW_MS = 24;
+const INPUT_BURST_GAP_MS = 35;
+const INPUT_BATCH_MAX_BYTES = 32;
 const DISCONNECT_FRAME_MS = 30;
 const DISCONNECTING_FRAMES = Object.freeze([
   "✦ Disconnecting...",
@@ -82,6 +87,7 @@ const ATTACHING_FRAME_MS = 90;
 // never more than one second under an injected/test cadence.
 const MAX_DISCONNECT_FRAME_MS = 250;
 const INPUT_WITHHELD_NOTICE = "Reconnecting · input was not sent. Retry after terminal attached.";
+const BATCH_WITHHELD_NOTICE = "Terminal authority changed · recent input was not sent.";
 // Sent keys went unacknowledged past the runtime's input deadline (R12). Said
 // the moment the runtime gives up on the connection, and it already carries the
 // "not resent" half, so it is never prefixed with HISTORICAL_INPUT_NOTICE.
@@ -177,7 +183,7 @@ export interface ForegroundTabIntent {
 
 interface ForegroundInputTarget {
   readonly tabId: string;
-  readonly binding: RuntimeTerminalResponse["binding"];
+  readonly binding: RuntimeTerminalResponse["binding"] & { readonly writerEpoch: number };
 }
 
 /** One AgentSession the person detached from; it keeps running remotely. */
@@ -195,6 +201,13 @@ export interface DetachedForegroundSession {
 interface PendingRemoteLocalActionResult {
   readonly tabId: string;
   readonly snapshot: LocalActionSnapshot;
+}
+
+interface PendingPrintableInput {
+  readonly target: ForegroundInputTarget;
+  readonly bytes: number[];
+  readonly receipt: number;
+  readonly timer: ReturnType<typeof setTimeout>;
 }
 
 export interface ForegroundTerminalCoordinatorOptions {
@@ -252,11 +265,15 @@ export class ForegroundTerminalCoordinator {
   #removeInput: (() => void) | undefined;
   #removeResize: (() => void) | undefined;
   #resizeTimer: NodeJS.Timeout | undefined;
+  #resizeInputBarrier: Promise<void> | undefined;
   #renderTail: Promise<void> = Promise.resolve();
   /** The last complete frame the host accepted; undefined whenever the host screen is not known to show it. */
   #lastHostFrame: Uint8Array | undefined;
   #lastWorkbenchFrame: WorkbenchFrame | undefined;
   #inputTail: Promise<void> = Promise.resolve();
+  #inputBatch: PendingPrintableInput | undefined;
+  #lastPrintableAt: number | undefined;
+  #lastPrintableTarget: ForegroundInputTarget | undefined;
   readonly #copyDetectors = new Map<string, ProviderBrowserActionDetector[]>();
   readonly #copyLinks = new Map<string, LocalBrowserActionRequest>();
   #prefixPending = false;
@@ -587,12 +604,14 @@ export class ForegroundTerminalCoordinator {
     this.#oauthPrefixTimers.clear();
     this.#predictiveEcho.dispose();
     this.#resizeTimer = undefined;
+    this.#resizeInputBarrier = undefined;
     this.#removeInput?.();
     this.#removeResize?.();
     this.#removeRoster?.();
     this.#removeInput = undefined;
     this.#removeResize = undefined;
     this.#removeRoster = undefined;
+    this.#discardInputBatch();
     const failures: unknown[] = [];
     const runtime = this.#runtime;
     for (const tab of this.#tabs.values()) {
@@ -864,6 +883,14 @@ export class ForegroundTerminalCoordinator {
 
   #terminalState(snapshot: RuntimeTerminalSnapshot): void {
     const tab = this.#tabs.get(snapshot.tabId);
+    const batch = this.#inputBatch;
+    if (batch?.target.tabId === snapshot.tabId &&
+      (snapshot.state !== "active" || snapshot.accessMode !== "writer" ||
+        !sameSnapshotBinding(snapshot, batch.target.binding) ||
+        snapshot.writerEpoch !== batch.target.binding.writerEpoch)) {
+      this.#discardInputBatch();
+      this.#browserNotice = BATCH_WITHHELD_NOTICE;
+    }
     if (tab !== undefined) {
       this.#forgetSeatNoticeOnSeatChange(tab.snapshot, snapshot);
       // The PTY keeps whatever geometry the previous writer set, and an
@@ -1068,6 +1095,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   #sendRemote(bytes: Uint8Array, target: ForegroundInputTarget): void {
+    this.#flushInputBatch();
     if (this.#predictiveEcho.barrier()) void this.#render().catch(() => undefined);
     const operation = this.#inputTail.then(async () => {
       await this.#requireRuntime().sendInput(bytes, target.tabId, target.binding);
@@ -1129,6 +1157,45 @@ export class ForegroundTerminalCoordinator {
       void this.#render().catch(() => undefined);
       return;
     }
+    const printable = this.#state === "active" && receiptTarget !== undefined &&
+      this.#tabs.get(receiptTarget.tabId)?.snapshot.accessMode === "writer" &&
+      payload.byteLength === 1 && payload[0]! >= 0x20 && payload[0]! <= 0x7e &&
+      !this.#pasteActive && this.#pasteStartMatch === 0 && this.#pasteEndMatch === 0 &&
+      !this.#prefixPending && this.#pendingBrowserAction === undefined &&
+      !this.#oauthPasteGuards.has(receiptTarget.tabId);
+    if (printable) {
+      const now = performance.now();
+      const batch = this.#inputBatch;
+      if (batch !== undefined && sameInputTarget(batch.target, receiptTarget)) {
+        batch.bytes.push(payload[0]!);
+        this.#pendingInputBytes += 1;
+        this.#lastPrintableAt = now;
+        if (batch.bytes.length >= INPUT_BATCH_MAX_BYTES) this.#flushInputBatch();
+        if (this.#predictAtReceipt(payload, receiptTarget, false)) void this.#render().catch(() => undefined);
+        return;
+      }
+      this.#flushInputBatch();
+      const closeToPrior = this.#lastPrintableAt !== undefined &&
+        now - this.#lastPrintableAt <= INPUT_BURST_GAP_MS &&
+        this.#lastPrintableTarget !== undefined &&
+        sameInputTarget(this.#lastPrintableTarget, receiptTarget);
+      this.#lastPrintableAt = now;
+      this.#lastPrintableTarget = receiptTarget;
+      if (closeToPrior) {
+        const timer = setTimeout(() => this.#flushInputBatch(), INPUT_BATCH_WINDOW_MS);
+        timer.unref?.();
+        this.#inputBatch = { target: receiptTarget, bytes: [payload[0]!], receipt, timer };
+        this.#pendingInputBytes += 1;
+        if (this.#predictAtReceipt(payload, receiptTarget, false)) void this.#render().catch(() => undefined);
+        return;
+      }
+    } else {
+      // Enter, Ctrl+C, prefixes, paste, resize and local-action input cannot
+      // wait behind a timer or share a frame with printable bytes.
+      this.#flushInputBatch();
+      this.#lastPrintableAt = undefined;
+      this.#lastPrintableTarget = undefined;
+    }
     if (
       payload.byteLength === 1 &&
       payload[0] === INTERRUPT &&
@@ -1153,7 +1220,17 @@ export class ForegroundTerminalCoordinator {
     // Receipt time, not input-tail time: the guess is painted before the key
     // is even queued for the network.
     if (this.#predictAtReceipt(payload, receiptTarget, barrierChunk)) void this.#render().catch(() => undefined);
-    this.#pendingInputBytes += payload.byteLength;
+    this.#enqueueInput(payload, receiptTarget, receipt, barrierChunk);
+  }
+
+  #enqueueInput(
+    payload: Uint8Array,
+    receiptTarget: ForegroundInputTarget | undefined,
+    receipt: number,
+    barrierChunk = false,
+    counted = false,
+  ): void {
+    if (!counted) this.#pendingInputBytes += payload.byteLength;
     const operation = this.#inputTail.then(async () => {
       try {
         await this.#routeInput(payload, receiptTarget, false, receipt);
@@ -1187,6 +1264,25 @@ export class ForegroundTerminalCoordinator {
     }
     this.#recordFailure(error);
     void this.stop().catch(() => { this.#state = "failed"; });
+  }
+
+  #flushInputBatch(): void {
+    const batch = this.#inputBatch;
+    if (batch === undefined) return;
+    this.#inputBatch = undefined;
+    clearTimeout(batch.timer);
+    this.#enqueueInput(Uint8Array.from(batch.bytes), batch.target, batch.receipt, false, true);
+  }
+
+  #discardInputBatch(): void {
+    const batch = this.#inputBatch;
+    if (batch === undefined) return;
+    this.#inputBatch = undefined;
+    clearTimeout(batch.timer);
+    this.#pendingInputBytes -= batch.bytes.length;
+    this.#lastPrintableAt = undefined;
+    this.#lastPrintableTarget = undefined;
+    if (this.#predictiveEcho.barrier()) void this.#render().catch(() => undefined);
   }
 
   async #routeInput(
@@ -1739,11 +1835,13 @@ export class ForegroundTerminalCoordinator {
     }
     const request = this.#browserRequests.get(current.request.id);
     if (request === undefined) return;
-    this.#pendingBrowserAction = request;
-    this.#pendingBrowserActionTabId = [...this.#tabs.entries()].find(([, tab]) =>
+    const tabId = [...this.#tabs.entries()].find(([, tab]) =>
       tab.snapshot.agentSessionId === request.agentSessionId &&
       tab.snapshot.processEpoch === request.processEpoch &&
       tab.snapshot.fencingGeneration === request.fencingGeneration)?.[0];
+    if (this.#inputBatch?.target.tabId === tabId) this.#discardInputBatch();
+    this.#pendingBrowserAction = request;
+    this.#pendingBrowserActionTabId = tabId;
     this.#browserNotice = undefined;
   }
 
@@ -1873,6 +1971,7 @@ export class ForegroundTerminalCoordinator {
     }
     if (this.#state !== "active" || this.#switchCutoff !== undefined || this.#tabs.size !== 1 ||
         this.#closingTabId !== undefined) return false;
+    this.#flushInputBatch();
     this.#switchCutoff = receipt;
     this.#switchRequest = Object.freeze({ agentSessionId: entry.agentSessionId, agent: entry.agent, label: entry.label });
     this.#predictiveEcho.barrier();
@@ -2029,6 +2128,7 @@ export class ForegroundTerminalCoordinator {
         agentSessionId: tab.snapshot.agentSessionId,
         processEpoch: tab.snapshot.processEpoch,
         fencingGeneration: tab.snapshot.fencingGeneration,
+        writerEpoch: tab.snapshot.writerEpoch,
       }),
     });
   }
@@ -2065,13 +2165,17 @@ export class ForegroundTerminalCoordinator {
 
   #queueResize(): void {
     if (this.#state !== "active") return;
+    this.#flushInputBatch();
+    this.#resizeInputBarrier = this.#inputTail;
     // Output also requests reconciliation while geometry differs. Preserve the
     // first deadline so continuous output cannot postpone every paint; the
     // callback reads the latest host dimensions when it runs.
     if (this.#resizeTimer !== undefined) return;
     this.#resizeTimer = setTimeout(() => {
       this.#resizeTimer = undefined;
-      void this.#applyResize().catch((error) => {
+      const priorInput = this.#resizeInputBarrier;
+      this.#resizeInputBarrier = undefined;
+      void Promise.resolve(priorInput).then(() => this.#applyResize()).catch((error) => {
         this.#recordFailure(error);
         void this.stop().catch(() => { this.#state = "failed"; });
       });
@@ -2681,6 +2785,16 @@ function sameSnapshotBinding(snapshot: RuntimeTerminalSnapshot, binding: Runtime
     snapshot.agentSessionId === binding.agentSessionId &&
     snapshot.processEpoch === binding.processEpoch &&
     snapshot.fencingGeneration === binding.fencingGeneration;
+}
+
+function sameInputTarget(left: ForegroundInputTarget, right: ForegroundInputTarget): boolean {
+  return left.tabId === right.tabId &&
+    left.binding.userId === right.binding.userId &&
+    left.binding.machineId === right.binding.machineId &&
+    left.binding.agentSessionId === right.binding.agentSessionId &&
+    left.binding.processEpoch === right.binding.processEpoch &&
+    left.binding.fencingGeneration === right.binding.fencingGeneration &&
+    left.binding.writerEpoch === right.binding.writerEpoch;
 }
 
 function padTrustedLine(value: string, columns: number): string {

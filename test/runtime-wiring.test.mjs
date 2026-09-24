@@ -1208,6 +1208,65 @@ test("receipt-time input authority rejects a tab that reconnected before the coo
   await runtime.shutdown();
 });
 
+test("a printable input captured for an old writer epoch cannot enter the current seat", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  const previousSeat = {
+    userId: attached.userId,
+    machineId: attached.machineId,
+    agentSessionId: attached.agentSessionId,
+    processEpoch: attached.processEpoch,
+    fencingGeneration: attached.fencingGeneration,
+    writerEpoch: attached.writerEpoch - 1,
+  };
+  const sentBefore = system.connections[0].sent.length;
+  await assert.rejects(runtime.sendInput(new TextEncoder().encode("old"), "tab-a", previousSeat),
+    (error) => error instanceof RuntimeBoundaryError && error.code === "grant_scope_mismatch");
+  assert.equal(system.connections[0].sent.length, sentBefore);
+  await runtime.shutdown();
+});
+
+test("a writer epoch notice fences old-seat input already queued behind another send", async () => {
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  const attached = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+  const binding = {
+    userId: attached.userId,
+    machineId: attached.machineId,
+    agentSessionId: attached.agentSessionId,
+    processEpoch: attached.processEpoch,
+    fencingGeneration: attached.fencingGeneration,
+    writerEpoch: attached.writerEpoch,
+  };
+  const connection = system.connections[0];
+  let releaseFirst;
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  let firstEntered = false;
+  connection.send = async bytes => {
+    if (decodeTerminalFrame(bytes)?.type === "input" && !firstEntered) {
+      firstEntered = true;
+      await firstGate;
+    }
+    connection.sent.push(bytes);
+  };
+  const first = runtime.sendInput(new TextEncoder().encode("a"), "tab-a", binding);
+  await waitUntil(() => firstEntered, "first input should hold the send tail");
+  const stale = runtime.sendInput(new TextEncoder().encode("b"), "tab-a", binding);
+  connection.incoming.push(encodeTerminalControl("writer_epoch", 3n, {
+    writerEpoch: attached.writerEpoch + 1,
+    writerClientInstanceId: "client-1",
+    accessMode: "writer",
+  }));
+  await waitUntil(() => runtime.listTerminals()[0]?.writerEpoch === attached.writerEpoch + 1,
+    "writer notice should move the seat before queued send");
+  releaseFirst();
+  await first;
+  await assert.rejects(stale, error => error instanceof RuntimeBoundaryError && error.code === "grant_scope_mismatch");
+  assert.equal(connection.sent.map(decodeTerminalFrame).filter(frame => frame?.type === "input").length, 1);
+  await runtime.shutdown();
+});
+
 test("detach is a revocation barrier for queued writes and waits for the admitted send tail", async () => {
   const system = new FakeTerminalSystem();
   const { runtime } = createRuntime(system);

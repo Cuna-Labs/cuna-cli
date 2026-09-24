@@ -36,6 +36,124 @@ test("slash command Enter is forwarded once and an alternate-screen selector rem
   } finally { await coordinator.stop(); }
 });
 
+test("a ten-key writer burst preserves bytes while using fewer input frames", async () => {
+  const { coordinator, host, calls, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    for (const character of "abcdefghij") {
+      host.emitInput(encoder.encode(character));
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "abcdefghij",
+      "all keys should reach the writer in order");
+    assert.ok(calls.input.length < 10, `expected fewer than ten input frames, got ${calls.input.length}`);
+    assert.ok(calls.input.every(item => item.tabId === intents[0].tabId));
+  } finally { await coordinator.stop(); }
+});
+
+test("a binding change discards a delayed printable key before it can cross the new attachment", async () => {
+  const { coordinator, callbacks, host, calls, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should not wait for a batch");
+    host.emitInput(encoder.encode("b"));
+    callbacks.onTerminalState(snapshot(intents[0], 2));
+    await new Promise(resolve => setTimeout(resolve, 70));
+    assert.equal(calls.input.map(item => item.text).join(""), "a",
+      "an unsent key from the old binding must not enter the replacement");
+    assert.match(await visibleHostText(host), /recent input was not sent/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("Enter, local tab selection and resize flush pending printable input in order", async () => {
+  const { coordinator, host, calls, intents, runtime } = harness();
+  const order = [];
+  const sendInput = runtime.sendInput;
+  const resize = runtime.resize;
+  runtime.sendInput = async (...args) => {
+    order.push(`input:${args[1]}:${decoder.decode(args[0])}`);
+    return sendInput(...args);
+  };
+  runtime.resize = async (...args) => {
+    order.push(`resize:${args[2]}`);
+    return resize(...args);
+  };
+  try {
+    await coordinator.start(intents);
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+    host.emitInput(encoder.encode("b"));
+    host.emitInput(Uint8Array.of(0x0d));
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "ab\r", "Enter should flush text");
+    assert.deepEqual(calls.input.map(item => item.text), ["a", "b", "\r"]);
+    host.emitInput(encoder.encode("c"));
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "ab\rc", "next key should be immediate");
+    host.emitInput(encoder.encode("d"));
+    host.emitInput(Uint8Array.of(0x1d, 0x32));
+    await waitUntil(() => calls.switch.length === 1, "tab switch should not wait for a batch timer");
+    assert.equal(calls.input.map(item => item.text).join(""), "ab\rcd");
+    assert.equal(calls.input.at(-1).tabId, intents[0].tabId);
+    host.emitInput(encoder.encode("e"));
+    await waitUntil(() => calls.input.at(-1)?.text === "e", "new tab should receive its own key");
+    assert.equal(calls.input.at(-1).tabId, intents[1].tabId);
+    const orderStart = order.length;
+    host.emitInput(encoder.encode("f"));
+    host.emitResize();
+    await waitUntil(() => calls.input.map(item => item.text).join("") === "ab\rcdef", "resize should flush text");
+    await waitUntil(() => order.slice(orderStart).includes("resize:tab-b"), "resize should follow queued input");
+    assert.equal(calls.input.map(item => item.text).join(""), "ab\rcdef");
+    const afterResizeRequest = order.slice(orderStart);
+    assert.ok(afterResizeRequest.indexOf("input:tab-b:f") < afterResizeRequest.indexOf("resize:tab-b"));
+  } finally { await coordinator.stop(); }
+});
+
+test("writer epoch change and local stop discard an unsent printable batch", async () => {
+  for (const action of ["epoch", "stop"]) {
+    const { coordinator, callbacks, host, calls, intents } = harness();
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      host.emitInput(encoder.encode("a"));
+      await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+      host.emitInput(encoder.encode("b"));
+      if (action === "epoch") callbacks.onTerminalState({ ...snapshot(intents[0]), writerEpoch: 2 });
+      else await coordinator.stop();
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(calls.input.map(item => item.text).join(""), "a", `${action} must retire pending text`);
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("Ctrl+C flushes prior text before detaching and never batches the interrupt", async () => {
+  const { coordinator, host, calls, intents } = harness();
+  try {
+    await coordinator.start(intents);
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+    host.emitInput(encoder.encode("b"));
+    host.emitInput(Uint8Array.of(0x03));
+    await waitUntil(() => calls.detach.includes(intents[0].tabId), "Ctrl+C should detach without the batch timer");
+    assert.equal(calls.input.map(item => item.text).join(""), "ab");
+    assert.equal(calls.input.some(item => item.text.includes("\x03")), false);
+  } finally { await coordinator.stop(); }
+});
+
+test("bracketed paste remains one literal remote chunk after a pending printable batch", async () => {
+  const { coordinator, host, calls, intents } = harness();
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(encoder.encode("a"));
+    await waitUntil(() => calls.input.length === 1, "first key should be immediate");
+    host.emitInput(encoder.encode("b"));
+    const paste = "\x1b[200~x\x1d2\x1b[201~";
+    host.emitInput(encoder.encode(paste));
+    await waitUntil(() => calls.input.map(item => item.text).join("") === `ab${paste}`,
+      "paste should preserve the local escape chord as literal bytes");
+    assert.deepEqual(calls.input.map(item => item.text), ["a", "b", paste]);
+    assert.equal(calls.switch.length, 0);
+  } finally { await coordinator.stop(); }
+});
+
 test("slow host painting does not stall ordered remote output and catches up without a frame backlog", async () => {
   const { coordinator, callbacks, intents, host } = harness();
   let release;
