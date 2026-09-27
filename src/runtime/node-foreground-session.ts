@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   AGENT_SESSION_AUTH_MAX_FUTURE_SKEW_MS,
@@ -47,6 +49,8 @@ import {
 } from "./terminal-transport.js";
 
 const TERMINAL_CAPABILITY_ID = "terminal_connections.create";
+const RUNTIME_LEASE_REFRESH_WAIT_MS = 30_000;
+const RUNTIME_LEASE_REFRESH_POLL_MS = 1_500;
 const OPENCODE_AUTH_ADVISORY_TIMEOUT_MS = 250;
 const PROVIDER_AUTH_ADVISORY_TIMEOUT_MS = 2_000;
 interface PendingProviderAuthProbe {
@@ -103,6 +107,8 @@ export interface NodeForegroundSessionDependencies {
   readonly platform?: NodeJS.Platform;
   readonly environment?: NodeJS.ProcessEnv;
   readonly clock?: () => number;
+  /** Test clock partner; production waits remain abortable. */
+  readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly clientInstanceId?: () => string;
   readonly tabId?: (index: number) => string;
   readonly coordinatorOptions?: Pick<
@@ -402,6 +408,7 @@ async function runNodeForegroundSessionsAdmitted(
   context: ForegroundSwitchContext,
 ): Promise<ForegroundRunOutcome> {
   const clock = dependencies.clock ?? Date.now;
+  const leaseClock = dependencies.clock ?? (() => performance.now());
   const sessionIds = admitForegroundSessionIds(input.agentSessionIds);
   if (
     input.expectedAgentKinds !== undefined &&
@@ -460,8 +467,7 @@ async function runNodeForegroundSessionsAdmitted(
     const tabId = dependencies.tabId?.(index) ?? `tab:${index + 1}`;
     throwIfAborted(input.signal);
     input.onProgress?.("Checking selected AgentSession");
-    const session = await input.client.getAgentSession(agentSessionId, input.signal);
-    sessions.push(session);
+    let session = await input.client.getAgentSession(agentSessionId, input.signal);
     // A session in a typed terminal state takes its remembered client with it.
     if (input.terminalClients !== undefined && isAgentSessionGone(session)) {
       try {
@@ -482,19 +488,39 @@ async function runNodeForegroundSessionsAdmitted(
       );
     }
     input.onProgress?.("Verifying terminal authority");
-    const capabilitySnapshot = await controlPlane.discoverCapabilities(
-      "agent_session",
-      agentSessionId,
-      input.signal,
-    );
-    throwIfAborted(input.signal);
-    let capability = admitCapability(capabilitySnapshot, {
-      id: TERMINAL_CAPABILITY_ID,
-      scope: "agent_session",
-      subjectId: agentSessionId,
-      surface: "cli",
-      interaction: "native",
-    }, clock());
+    const leaseRefreshStartedAt = leaseClock();
+    let capability: ReturnType<typeof admitCapability>;
+    for (;;) {
+      throwIfAborted(input.signal);
+      const capabilitySnapshot = await controlPlane.discoverCapabilities("agent_session",agentSessionId,input.signal);
+      throwIfAborted(input.signal);
+      try {
+        capability = admitCapability(capabilitySnapshot, {
+          id: TERMINAL_CAPABILITY_ID,scope: "agent_session",subjectId: agentSessionId,
+          surface: "cli",interaction: "native",
+        },clock());
+        break;
+      } catch (error) {
+        // A just-detached session can outrun one supervisor lease renewal. This
+        // is an exact, read-only wait before any terminal grant or host input.
+        // Every other refusal retains its original fail-closed path.
+        if (!isRefreshableRuntimeLease(error,session,agentSessionId) || leaseClock()-leaseRefreshStartedAt>=RUNTIME_LEASE_REFRESH_WAIT_MS) throw error;
+        input.onProgress?.("Waiting for a fresh runtime observation");
+        const remaining=RUNTIME_LEASE_REFRESH_WAIT_MS-(leaseClock()-leaseRefreshStartedAt);
+        try {
+          if (dependencies.sleep !== undefined) await dependencies.sleep(Math.min(RUNTIME_LEASE_REFRESH_POLL_MS,remaining));
+          else await delay(Math.min(RUNTIME_LEASE_REFRESH_POLL_MS,remaining),undefined,input.signal===undefined?{}:{signal:input.signal});
+        } catch (sleepError) {
+          throwIfAborted(input.signal);
+          throw sleepError;
+        }
+        throwIfAborted(input.signal);
+        const refreshed=await input.client.getAgentSession(agentSessionId,input.signal);
+        if (!sameLiveSessionProcess(session,refreshed)) throw runtimeFailure("remote_state_unproven","The selected AgentSession process changed while waiting for its runtime observation.");
+        session=refreshed;
+      }
+    }
+    sessions.push(session);
     input.onProgress?.("Checking live session status");
     let observation = assertRemoteAgentSessionEvidence({
       evidence: await controlPlane.observeAgentSession(agentSessionId, input.signal),
@@ -926,6 +952,24 @@ function admitApiOrigin(baseUrl: string): string {
     throw runtimeFailure("control_plane_unavailable", "Foreground terminals require an exact Cuna HTTPS API authority.");
   }
   return url.origin;
+}
+
+function isRefreshableRuntimeLease(error:unknown,session:AgentSession,expectedId:string):boolean {
+  return error instanceof RuntimeBoundaryError &&
+    (error.code==="capability_unavailable" || error.code==="capability_unknown") &&
+    error.safeDetails?.capability_id===TERMINAL_CAPABILITY_ID &&
+    error.safeDetails.reason_code==="runtime_lease_expired" &&
+    session.id===expectedId && session.processEpoch!==undefined &&
+    (session.processState==="ready" || session.processState==="running");
+}
+
+function sameLiveSessionProcess(previous:AgentSession,current:AgentSession):boolean {
+  return current.id===previous.id && current.machineId===previous.machineId &&
+    current.agent===previous.agent && current.authMode===previous.authMode &&
+    current.cwd===previous.cwd && current.processEpoch===previous.processEpoch &&
+    current.workspaceBindingId===previous.workspaceBindingId &&
+    current.workspaceGeneration===previous.workspaceGeneration &&
+    (current.processState==="ready" || current.processState==="running");
 }
 
 function admitSessionIdentity(

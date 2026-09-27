@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm} from 'node:fs/promises';
+import {mkdtemp,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
+import {setTimeout as delay} from 'node:timers/promises';
 import {withProviderLaunchIntent} from '../dist/journey/provider-launch-intent.js';
-import {DurableSyncJournal} from '../dist/sync/journal.js';
+import {DurableSyncJournal,inspectSyncJournal} from '../dist/sync/journal.js';
 import {stableUuid} from '../dist/journey/derived-identity.js';
+
+async function removeFixture(directory){await rm(directory,{recursive:true,force:true,maxRetries:8,retryDelay:50});}
 
 test('restart after uncertain admission reuses operation; resolved next launch gets a new operation',async()=>{
  const directory=await mkdtemp(join(tmpdir(),'cuna-provider-intent-'));try{
@@ -17,14 +20,83 @@ test('restart after uncertain admission reuses operation; resolved next launch g
  const crashAfterApplied=await withProviderLaunchIntent({...scope,create:async id=>id});assert.equal(crashAfterApplied,first);
  const deliberate=await withProviderLaunchIntent({...scope,confirmNew:async()=>true,create:async id=>id});assert.notEqual(deliberate,first);
  const foreign=await withProviderLaunchIntent({...scope,ownerId:'B',create:async id=>id});assert.notEqual(foreign,first);
- }finally{await rm(directory,{recursive:true,force:true});}
+ }finally{await removeFixture(directory);}
 });
 test('exclusive journal rejects concurrent admission before a second network mutation',async()=>{
  const directory=await mkdtemp(join(tmpdir(),'cuna-provider-intent-'));let release;try{
  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{profile:'p'}};let entered;const started=new Promise(resolve=>{entered=resolve;});const held=new Promise(resolve=>{release=resolve;});let calls=0;
  const first=withProviderLaunchIntent({...scope,create:async id=>{calls++;entered();await held;return id;}});await started;
  await assert.rejects(withProviderLaunchIntent({...scope,create:async()=>{calls++;}}));assert.equal(calls,1);release();await first;
- }finally{release?.();await rm(directory,{recursive:true,force:true});}
+ }finally{release?.();await removeFixture(directory);}
+});
+
+test('long provider preparation renews the real journal lease and applies the same operation',async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'cuna-provider-lease-'));
+ try{
+  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{profile:'p'},leaseMs:500};
+  const result=await withProviderLaunchIntent({...scope,create:async(operationId,signal)=>{await delay(1_250,undefined,{signal});return {id:'session-1',operationId};}});
+  const key=JSON.stringify(['provider-launch-v2','A','account','machine','execution']);
+  const journalDirectory=join(directory,'provider-launch-v2',createHash('sha256').update(key).digest('hex'));
+  const latest=(await inspectSyncJournal(journalDirectory)).records.filter(row=>row.operationId===result.operationId).at(-1);
+  assert.equal(latest?.state,'applied');
+  assert.equal(result.id,'session-1');
+ }finally{await removeFixture(directory);}
+});
+
+test('replaying an applied launch also keeps its writer lease current throughout a slow POST',async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'cuna-provider-lease-'));
+ try{
+  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{profile:'p'},leaseMs:500};
+  const first=await withProviderLaunchIntent({...scope,create:async operationId=>({id:'session-1',operationId})});
+  const key=JSON.stringify(['provider-launch-v2','A','account','machine','execution']);
+  const journalDirectory=join(directory,'provider-launch-v2',createHash('sha256').update(key).digest('hex'));
+  const resumed=await withProviderLaunchIntent({...scope,confirmNew:async()=>false,create:async operationId=>{
+   await delay(900);
+   const lease=JSON.parse(await readFile(join(journalDirectory,'writer.lease'),'utf8'));
+   assert.ok(lease.expiresAt>Date.now(),'the resume branch must still own a live writer lease after its original expiry');
+   return {id:'session-1',operationId};
+  }});
+  assert.equal(resumed.operationId,first.operationId);
+  assert.equal((await inspectSyncJournal(journalDirectory)).records.at(-1)?.state,'applied');
+ }finally{await removeFixture(directory);}
+});
+
+test('lost lease aborts the in-flight create and preserves the pending operation for reconciliation',async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'cuna-provider-lease-'));
+ try{
+  let journalNow=1_000,firstOperation;
+  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{profile:'p'},leaseMs:300,journalClock:()=>journalNow};
+  await assert.rejects(withProviderLaunchIntent({...scope,create:async(operationId,signal)=>{
+   firstOperation=operationId;journalNow+=301;
+   await Promise.race([new Promise(resolve=>signal.addEventListener('abort',resolve,{once:true})),delay(1_000).then(()=>assert.fail('lease failure did not abort the in-flight create'))]);
+   assert.equal(signal.aborted,true);
+   return {id:'session-1'};
+  }}),error=>{
+   assert.equal(error.code,'cuna.provider.launch_lease_unavailable');
+   assert.equal(error.details.operation_id,firstOperation);
+   assert.equal(error.details.recovery,'same_operation_identity_preserved');
+   return true;
+  });
+  const key=JSON.stringify(['provider-launch-v2','A','account','machine','execution']);
+  const journalDirectory=join(directory,'provider-launch-v2',createHash('sha256').update(key).digest('hex'));
+  assert.equal((await inspectSyncJournal(journalDirectory)).records.at(-1)?.state,'sending');
+  const replay=await withProviderLaunchIntent({...scope,create:async operationId=>({id:'session-1',operationId})});
+  assert.equal(replay.operationId,firstOperation);
+  assert.equal((await inspectSyncJournal(journalDirectory)).records.at(-1)?.state,'applied');
+ }finally{await removeFixture(directory);}
+});
+
+test('an undefined rejection still leaves the recorded launch pending',async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'cuna-provider-lease-'));
+ try{
+  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{profile:'p'}};
+  let rejected=false;
+  try{await withProviderLaunchIntent({...scope,create:async()=>{throw undefined;}});}catch(error){rejected=true;assert.equal(error,undefined);}
+  assert.equal(rejected,true);
+  const key=JSON.stringify(['provider-launch-v2','A','account','machine','execution']);
+  const journalDirectory=join(directory,'provider-launch-v2',createHash('sha256').update(key).digest('hex'));
+  assert.equal((await inspectSyncJournal(journalDirectory)).records.at(-1)?.state,'sending');
+ }finally{await removeFixture(directory);}
 });
 
 // qa6 witness 2026-09-22: the question was answered y four minutes after it
@@ -46,7 +118,7 @@ test('the recorded-launch question is asked without holding the journal writer l
   return true;
  },create:async id=>id});
  assert.equal(asked,true);assert.notEqual(second,first);
- }finally{await rm(directory,{recursive:true,force:true});}
+ }finally{await removeFixture(directory);}
 });
 
 // qa6 witness 2026-09-22: No to the question, after the recorded launch's
@@ -64,7 +136,7 @@ test('No for a launch recorded under another Workspace version is a typed local 
   return true;
  });
  assert.equal(calls,0);
- }finally{await rm(directory,{recursive:true,force:true});}
+ }finally{await removeFixture(directory);}
 });
 
 // qa6 re-witness 2026-09-23, run j6: the recorded launch's session had been
@@ -88,7 +160,7 @@ test('a recorded launch whose session ended is not offered for resume, and No st
  assert.equal(creates,0,'nothing is re-sent for a session known to have ended');
  const fresh=await withProviderLaunchIntent({...scope,confirmNew:async()=>true,isSessionEnded:async(id)=>id==='session-1',create:async id=>({id:'session-2',operation:id})});
  assert.equal(fresh.id,'session-2','yes starts a new session');
- }finally{await rm(directory,{recursive:true,force:true});}
+ }finally{await removeFixture(directory);}
 });
 test('a resumed launch that turns out to have ended is refused before anyone calls it reused',async()=>{
  const directory=await mkdtemp(join(tmpdir(),'cuna-provider-intent-'));try{
@@ -103,7 +175,7 @@ test('a resumed launch that turns out to have ended is refused before anyone cal
   isSessionEnded:async(id)=>id==='session-1',create:async()=>({id:'session-1'})}),
   error=>error.code==='cuna.provider.recorded_launch_ended');
  assert.equal(resumed,0,'a dead session is never announced as resumed');
- }finally{await rm(directory,{recursive:true,force:true});}
+ }finally{await removeFixture(directory);}
 });
 test('control: a recorded launch whose session is live still resumes',async()=>{
  const directory=await mkdtemp(join(tmpdir(),'cuna-provider-intent-'));try{
@@ -112,5 +184,5 @@ test('control: a recorded launch whose session is live still resumes',async()=>{
  const asked=[];
  const again=await withProviderLaunchIntent({...scope,confirmNew:async(context)=>{asked.push(context?.state);return false;},isSessionEnded:async()=>false,create:async id=>({id:'session-1',operation:id})});
  assert.equal(again.operation,first.operation);assert.deepEqual(asked,['resumable']);
- }finally{await rm(directory,{recursive:true,force:true});}
+ }finally{await removeFixture(directory);}
 });

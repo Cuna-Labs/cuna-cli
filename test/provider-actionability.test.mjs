@@ -5,6 +5,7 @@ import {
   classifySessionActionability,
   displaySessionActionability,
   machineProviderAvailability,
+  machineSupportsProvider,
   mergeSessionActionabilityObservation,
   providerAuthLabel,
   providerDisplayName,
@@ -69,6 +70,14 @@ test("provider inventory derives only the declared machine provider and never al
   assert.equal(providerAuthLabel("future-agent"), "Unknown (future-agent) auth");
   assert.equal(machineProviderAvailability(machine({ agent: "openclaw" })).actionable, false);
   assert.equal(machineProviderAvailability(machine({ agent: "openclaw" })).usability, "unavailable");
+  for (const defaultAgent of ["claude-code", "codex", "opencode"]) {
+    for (const requested of ["claude-code", "codex", "opencode"]) {
+      assert.equal(machineSupportsProvider(machine({ agent: defaultAgent }), requested), true);
+    }
+  }
+  assert.equal(machineSupportsProvider(machine({ agent: "future-agent" }), "codex"), false);
+  assert.equal(machineSupportsProvider(machine({ agent: "openclaw" }), "codex"), false);
+  assert.equal(machineSupportsProvider(machine(), "openclaw"), false);
   assert.deepEqual(machineProviderAvailability(machine({ agent: "opencode" })), {
     machineId: MACHINE_ID,
     declaredId: "opencode",
@@ -88,7 +97,9 @@ test("shared actionability policy covers lifecycle, clock, provider, refresh, an
     ["future observation", { runtimeObservedAt: new Date(NOW + 5_001).toISOString() }, {}, {}, "stale", false, "refresh"],
     ["failed", { processState: "failed" }, {}, {}, "failed", false, "show-failure"],
     ["terminated", { desiredState: "terminated", processState: "terminated" }, {}, {}, "terminated", false, "none"],
-    ["provider mismatch", {}, { agent: "codex" }, {}, "unsupported", false, "none"],
+    ["cross-provider attach", {}, { agent: "codex" }, {}, "attachable", true, "attach"],
+    ["cross-provider OpenCode attach", { agent: "opencode" }, {}, {}, "attachable", true, "attach"],
+    ["session belongs to another Machine", { machineId: "99999999-9999-4999-8999-999999999999" }, {}, {}, "unsupported", false, "none"],
     ["unknown provider", {}, { agent: "future-agent" }, {}, "unsupported", false, "none"],
     ["login", {}, {}, { authState: "login_required" }, "login-required", false, "authenticate"],
   ];

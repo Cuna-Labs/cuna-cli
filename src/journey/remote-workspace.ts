@@ -3,6 +3,7 @@ import {withProviderLaunchIntent,type RecordedLaunchContext} from "./provider-la
 import { isAgentSessionGone } from "../runtime/terminal-client-identity.js";
 import { sessionFailure } from "./session-failure.js";
 import { setTimeout as delay } from "node:timers/promises";
+import { performance } from "node:perf_hooks";
 import { requireCapability, type CunaApiClient } from "../api/client.js";
 import type { AgentSession } from "../api/contracts.js";
 import type { MachineDefaultWorkspace } from "../api/remote-workspace.js";
@@ -143,7 +144,7 @@ export async function launchRemoteWorkspaceSession(input: {
   }
   const agentName = input.agent === "opencode" ? "OpenCode" : input.agent === "codex" ? "Codex" : "Claude";
   input.onProgress?.(`Starting ${agentName} with the selected profile`);
-  let session = await withProviderLaunchIntent({...input.providerLaunchState,workspaceId:input.workspaceId,machineId:input.machineId,executionWorkspaceId:workspace.executionWorkspaceId,...(input.confirmNew?{confirmNew:input.confirmNew}:{}),isSessionEnded:async(id)=>isAgentSessionGone(await input.client.getAgentSession(id,signal)),onResume:()=>{resumedRecordedLaunch=true;},intent:{executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,profileId:input.preset.profile_id,profileRevision:input.preset.profile_revision,agent:input.agent,authMode:"interactive_login"},create:operationId=>createPublishedProviderSessionV2({client:input.client,machineId:input.machineId,agent:input.agent,preset:input.preset,operationId,executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,signal})});
+  let session = await withProviderLaunchIntent({...input.providerLaunchState,workspaceId:input.workspaceId,machineId:input.machineId,executionWorkspaceId:workspace.executionWorkspaceId,...(input.confirmNew?{confirmNew:input.confirmNew}:{}),isSessionEnded:async(id)=>isAgentSessionGone(await input.client.getAgentSession(id,signal)),onResume:()=>{resumedRecordedLaunch=true;},intent:{executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,profileId:input.preset.profile_id,profileRevision:input.preset.profile_revision,agent:input.agent,authMode:"interactive_login"},create:(operationId,leaseSignal)=>createPublishedProviderSessionV2({client:input.client,machineId:input.machineId,agent:input.agent,preset:input.preset,operationId,executionWorkspaceId:workspace.executionWorkspaceId,generation:workspace.workspaceGeneration,cwd:workspace.remoteRoot,signal:AbortSignal.any([signal,leaseSignal]),...(input.now===undefined||input.sleep===undefined?{}:{now,sleep})})});
   const sessionId = session.id;
   const validate = (value: AgentSession) => {
     if (value.id !== sessionId || value.machineId !== input.machineId || value.agent !== input.agent ||
@@ -179,12 +180,44 @@ export async function launchRemoteWorkspaceSession(input: {
 }
 
 /** Shared canonical admission for already published remote or synchronized Workspaces. */
-export async function createPublishedProviderSessionV2(input:{client:CunaApiClient;machineId:string;agent:"opencode"|"codex"|"claude-code";preset:ProviderPreset;operationId:string;executionWorkspaceId:string;generation:number;cwd:string;signal:AbortSignal}):Promise<AgentSession>{
+const AGENT_INSTALL_WAIT_MS = 120_000;
+const AGENT_INSTALL_POLL_MS = 3_000;
+
+function agentInstallPreparing(error:unknown):error is CunaError {
+ return error instanceof CunaError && error.code==='cuna.remote.conflict' &&
+   error.details?.http_status===409 && error.details.reason==='agent_session_agent_preparing' &&
+   error.retryable;
+}
+
+export async function createPublishedProviderSessionV2(input:{client:CunaApiClient;machineId:string;agent:"opencode"|"codex"|"claude-code";preset:ProviderPreset;operationId:string;executionWorkspaceId:string;generation:number;cwd:string;signal:AbortSignal;now?:()=>number;sleep?:(milliseconds:number,signal:AbortSignal)=>Promise<void>}):Promise<AgentSession>{
  requireMatchingPreset(input.agent,input.preset);
  const request={agent:input.agent,operation_id:input.operationId,cwd:input.cwd,execution_workspace_id:input.executionWorkspaceId,workspace_generation:input.generation,profile_id:input.preset.profile_id,profile_revision:input.preset.profile_revision};
  const create=async()=>(await input.client.createProviderSessionV2(input.machineId,request,input.signal)).agentSession;
+ const now=input.now??(()=>performance.now());
+ const sleep=input.sleep??(async(ms:number,signal:AbortSignal)=>{await delay(ms,undefined,{signal});});
+ const deadline=now()+AGENT_INSTALL_WAIT_MS;
  let session:AgentSession;
- try{session=await create();}catch(error){if(!(error instanceof CunaError)||!(isObservationBudgetCode(error.code)||error.code==='cuna.network.failed')||input.signal.aborted)throw error;session=await create();}
+ let retriedUnknownOutcome=false;
+ for(;;){
+  input.signal.throwIfAborted();
+  try{session=await create();break;}
+  catch(error){
+   if(input.signal.aborted)throw error;
+   if(agentInstallPreparing(error)){
+    // This exact 409 is emitted before the server creates a session intent.
+    // Reissue only the recorded operation identity; a previous network-unknown
+    // attempt may still have committed, so never claim global non-creation.
+    if(now()>=deadline)throw new CunaError({code:'cuna.agent.installing',message:`${input.agent==='opencode'?'OpenCode':input.agent==='codex'?'Codex':'Claude Code'} is still being installed on this Machine.`,exitCode:EXIT_CODES.conflict,retryable:true,hint:'Run the same command again. Cuna will resume its recorded launch operation; do not start another session to bypass it.',details:{machine_id:input.machineId,operation_id:input.operationId,recovery:'pending_identity_preserved',wait_budget_ms:AGENT_INSTALL_WAIT_MS},cause:error});
+    await sleep(Math.min(AGENT_INSTALL_POLL_MS,Math.max(1,deadline-now())),input.signal);
+    continue;
+   }
+   if(error instanceof CunaError && (isObservationBudgetCode(error.code)||error.code==='cuna.network.failed') && !retriedUnknownOutcome){
+    retriedUnknownOutcome=true;
+    continue;
+   }
+   throw error;
+  }
+ }
  if(session.machineId!==input.machineId||session.agent!==input.agent||session.cwd!==input.cwd||session.authMode!=='interactive_login'||session.workspaceBindingId!==undefined||session.workspaceGeneration!==undefined)throw new CunaError({code:'cuna.journey.agent_session_create_authority_mismatch',message:'The admitted session does not match the selected published Workspace.',exitCode:EXIT_CODES.conflict});
  return session;
 }

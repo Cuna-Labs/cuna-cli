@@ -49,6 +49,34 @@ test('lost V2 reply replays the exact atomic operation without V1 inspection',as
   f.client.inspectAgentSessionCreate=async()=>{assert.fail('V1 inspection forbidden');};
   assert.equal(await launchRemoteWorkspaceSession(f.input),'session');assert.deepEqual(posts[0],posts[1]);
 });
+test('known agent installation waits and reuses the exact operation before admitting OpenCode',async()=>{
+  const f=fixture();const posts=[];
+  f.client.createProviderSessionV2=async(_machine,request)=>{posts.push(request);if(posts.length===1)throw new CunaError({code:'cuna.remote.conflict',message:'Agent is being installed',exitCode:6,retryable:true,details:{http_status:409,reason:'agent_session_agent_preparing'}});return {agentSession:f.session};};
+  assert.equal(await launchRemoteWorkspaceSession(f.input),'session');
+  assert.equal(posts.length,2);assert.deepEqual(posts[0],posts[1]);
+  assert.equal(f.calls.filter(call=>call[0]==='sleep').length,1);
+});
+test('installation wait is bounded and the pending journal resumes the same operation later',async()=>{
+  const f=fixture();const operationIds=[];let preparing=true;
+  f.client.createProviderSessionV2=async(_machine,request)=>{operationIds.push(request.operation_id);if(preparing)throw new CunaError({code:'cuna.remote.conflict',message:'Agent is being installed',exitCode:6,retryable:true,details:{http_status:409,reason:'agent_session_agent_preparing'}});return {agentSession:f.session};};
+  await assert.rejects(launchRemoteWorkspaceSession(f.input),error=>{
+    assert.equal(error.code,'cuna.agent.installing');assert.equal(error.retryable,true);
+    assert.equal(error.details.recovery,'pending_identity_preserved');
+    assert.equal(error.details.operation_id,operationIds[0]);
+    assert.match(error.hint,/same command again/);return true;
+  });
+  assert.ok(operationIds.length>1);preparing=false;
+  assert.equal(await launchRemoteWorkspaceSession(f.input),'session');
+  assert.equal(new Set(operationIds).size,1);
+});
+test('an unrelated or untyped 409 is never retried as agent installation',async()=>{
+  for(const details of [{http_status:409,reason:'provider_session_v2_operation_conflict'},{http_status:409},{http_status:503,reason:'agent_session_agent_preparing'}]){
+    const f=fixture();let posts=0;
+    f.client.createProviderSessionV2=async()=>{posts++;throw new CunaError({code:'cuna.remote.conflict',message:'conflict',exitCode:6,retryable:true,details});};
+    await assert.rejects(launchRemoteWorkspaceSession(f.input),{code:'cuna.remote.conflict'});
+    assert.equal(posts,1);
+  }
+});
 test('foreign authority, failed publication, missing capability and cancellation never dispatch',async()=>{
   for(const mode of ['foreign','failed','missing','cancel']){
     const f=fixture();

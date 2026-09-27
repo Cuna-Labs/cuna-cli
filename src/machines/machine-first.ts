@@ -1,5 +1,5 @@
 import type { AgentSession, Machine } from "../api/contracts.js";
-import { machineProviderAvailability, type ActionableProvider } from "./provider-availability.js";
+import { machineProviderAvailability, machineSupportsProvider, providerDisplayName, type ActionableProvider } from "./provider-availability.js";
 import { classifySessionActionability } from "./session-actionability.js";
 import { isAgentSessionVisibleInPicker } from "./session-visibility.js";
 
@@ -101,6 +101,7 @@ export function resolveMachineContextActions(
   options: Readonly<{
     readonly hasSessions?: boolean;
     readonly canCreateSession?: boolean;
+    readonly sessions?: readonly AgentSession[];
     /** Exact, current server evidence—not a local provider guess. */
     readonly opencodeSupervisorRepairRequired?: boolean;
   }> = {},
@@ -132,25 +133,31 @@ export function resolveMachineContextActions(
   // `error`, `creating`, `deleted`, or any state this client does not know:
   // no transition is offered, but the console's Delete still is.
   if (machine.state !== "running") return Object.freeze([remove]);
+  const providers: readonly ActionableProvider[] = ["claude-code", "codex", "opencode"];
+  const defaultProvider = providers.find((agent) => agent === provider.agent);
+  const ordered = defaultProvider === undefined
+    ? []
+    : [defaultProvider, ...providers.filter((agent) => agent !== defaultProvider && machineSupportsProvider(machine, agent))];
   return Object.freeze([
     ...(options.opencodeSupervisorRepairRequired === true
       ? [Object.freeze({ kind: "supervisor-blocked" as const, label: "OpenCode needs a terminal update" as const, machineId: machine.id })]
       : []),
-    ...(provider.actionable && provider.agent !== undefined && options.hasSessions !== false
-      ? [Object.freeze({
+    ...ordered.filter((agent) => agent === provider.agent
+      ? options.hasSessions !== false
+      : options.sessions?.some((session) => session.agent === agent) === true)
+      .map((agent) => Object.freeze({
           kind: "provider" as const,
-          label: provider.displayName,
+          label: providerDisplayName(agent),
           machineId: machine.id,
-          provider: provider.agent as ActionableProvider,
-        })]
-      : []),
-    ...(provider.actionable && provider.agent !== undefined && options.canCreateSession === true
-      ? [Object.freeze({
+          provider: agent,
+        })),
+    ...(options.canCreateSession === true
+      ? ordered.map((agent) => Object.freeze({
           kind: "new-session" as const,
-          label: `New ${provider.displayName} session`,
+          label: `New ${providerDisplayName(agent)} session${agent === provider.agent ? "" : " (install if needed)"}`,
           machineId: machine.id,
-          provider: provider.agent as ActionableProvider,
-        })]
+          provider: agent,
+        }))
       : []),
     Object.freeze({ kind: "stop" as const, label: "Stop" as const, machineId: machine.id }),
     remove,
@@ -163,10 +170,10 @@ export function resolveProviderContextActions(input: Readonly<{
   readonly sessions: readonly AgentSession[];
   readonly now: number;
 }>): readonly ProviderContextAction[] {
-  const availability = machineProviderAvailability(input.machine);
-  if (input.machine.state !== "running" || !availability.actionable || availability.agent !== input.provider) return Object.freeze([]);
+  if (input.machine.state !== "running" || !machineSupportsProvider(input.machine, input.provider)) return Object.freeze([]);
   const sessions = input.sessions
     .filter(isAgentSessionVisibleInPicker)
+    .filter((session) => session.machineId === input.machine.id)
     .filter((session) => session.agent === input.provider)
     .filter((session) => classifySessionActionability({ session, machine: input.machine, now: input.now }).recoveryAction !== "none")
     .map((session) => Object.freeze({ kind: "session" as const, label: session.name, session }));

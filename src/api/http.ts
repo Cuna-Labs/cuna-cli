@@ -342,19 +342,22 @@ function apiError(input: {
       details,
     });
   }
-  // This is not a retryable state conflict: the durable create authority
-  // rejected an AgentSession because its provider is not installed on the
-  // selected Machine. Keep the server's reason in safe details, but turn it
-  // into the same actionable provider-selection result the CLI emits when its
-  // immediately preceding machine observation detects the mismatch.
+  // The server rejected the requested provider on this Machine. Its reason
+  // does not prove that another Machine is needed, or that this Machine could
+  // never install the provider on demand. Name only the provider in the
+  // request body when it is one this CLI recognizes.
   if (status === 409 && reason === "agent_session_provider_unavailable") {
+    const requested = isObject(input.requestBody) ? input.requestBody.agent : undefined;
+    const provider = requested === "claude-code" ? "Claude" :
+      requested === "codex" ? "Codex" :
+      requested === "opencode" ? "OpenCode" : undefined;
     return new CunaError({
       code: "cuna.agent.provider_not_installed",
-      message: "OpenCode is not installed on the selected Machine.",
+      message: `${provider ?? "The requested provider"} is unavailable on the selected Machine, according to the server.`,
       exitCode: EXIT_CODES.unsupported,
-      hint: "Choose a running Machine configured for OpenCode, or create one with `cuna machines create --agent opencode --name NAME --yes`.",
+      hint: "Read the Machine's current capability and AgentSessions before choosing the next action. The server did not admit this provider request.",
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
-      details,
+      details: { ...details, ...(provider === undefined ? {} : { requested_provider: requested as string }) },
     });
   }
   // This is an authoritative refusal from the durable AgentSession create

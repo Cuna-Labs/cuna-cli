@@ -1190,7 +1190,7 @@ test("HTTP errors expose only stable safe metadata", async () => {
   );
 });
 
-test("OpenCode provider admission names the Machine remedy from the durable server refusal", async () => {
+test("provider refusal names the requested agent without inventing a second Machine remedy", async () => {
   const requestId = "55555555-5555-4555-8555-555555555555";
   const transport = createHttpTransport({
     baseUrl: "https://api.getcuna.com",
@@ -1206,15 +1206,22 @@ test("OpenCode provider admission names the Machine remedy from the durable serv
       action: "none",
     }), { status: 409, headers: { "content-type": "application/problem+json" } }),
   });
-  await assert.rejects(
-    transport.request({ method: "POST", path: "/v1/agent-sessions" }),
-    (error) => error instanceof CunaError &&
-      error.code === "cuna.agent.provider_not_installed" &&
-      error.exitCode === 8 &&
-      error.details?.reason === "agent_session_provider_unavailable" &&
-      error.details?.request_id === requestId &&
-      /Machine configured for OpenCode/u.test(error.hint ?? ""),
-  );
+  for (const [agent, display] of [["claude-code", "Claude"], ["codex", "Codex"], ["opencode", "OpenCode"]]) {
+    await assert.rejects(
+      transport.request({ method: "POST", path: "/v1/agent-sessions", body: { agent } }),
+      (error) => {
+        assert.ok(error instanceof CunaError);
+        assert.equal(error.code, "cuna.agent.provider_not_installed");
+        assert.equal(error.exitCode, 8);
+        assert.equal(error.details?.reason, "agent_session_provider_unavailable");
+        assert.equal(error.details?.request_id, requestId);
+        assert.equal(error.details?.requested_provider, agent);
+        assert.match(error.message, new RegExp(`^${display} is unavailable on the selected Machine`));
+        assert.doesNotMatch(error.hint ?? "", /create.*Machine|configured for OpenCode/iu);
+        return true;
+      },
+    );
+  }
 });
 
 test("OpenCode supervisor upgrade refusal proves no AgentSession was created", async () => {

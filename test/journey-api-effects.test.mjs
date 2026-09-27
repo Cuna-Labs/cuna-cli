@@ -88,7 +88,7 @@ test("unknown and absent runtime reasons cannot leak provider text into journey 
   }
 });
 
-test("machine observation rejects a provider mismatch before capability discovery", async () => {
+test("machine observation admits cross-provider selection only after capability discovery", async () => {
   let capabilityReads = 0;
   const observed = await createApiAgentJourneyEffects({
     client: {
@@ -104,9 +104,22 @@ test("machine observation rejects a provider mismatch before capability discover
     async authorizeMachineCreate() { return false; },
     now: () => NOW,
   }).observeMachines({ signal: new AbortController().signal });
-  assert.equal(capabilityReads, 0);
-  assert.equal(observed[0].requestedAgentSupport, "unsupported");
+  assert.equal(capabilityReads, 1);
+  assert.equal(observed[0].requestedAgentSupport, "supported");
   assert.equal(observed[0].agent, "claude-code");
+});
+
+test("machine observation keeps unknown and unsupported defaults fail closed", async () => {
+  let capabilityReads = 0;
+  const observed = await effects({
+    async listMachines() { return { items: [
+      { id: MACHINE_ID, name: "unknown", state: "running", agent: "future-agent" },
+      { id: "44444444-4444-4444-8444-444444444444", name: "unsupported", state: "running", agent: "openclaw" },
+    ] }; },
+    async discoverCapabilities() { capabilityReads += 1; return capability(); },
+  }, "opencode").observeMachines({ signal: new AbortController().signal });
+  assert.equal(capabilityReads, 0);
+  assert.deepEqual(observed.map((machine) => machine.requestedAgentSupport), ["unsupported", "unsupported"]);
 });
 
 test("OpenCode machine observation preserves a supervisor-repair blocker without inventing a provider", async () => {
