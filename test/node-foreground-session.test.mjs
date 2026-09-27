@@ -28,6 +28,49 @@ const SESSION_B = "22222222-2222-4222-8222-222222222222";
 const SESSION_C = "33333333-3333-4333-8333-333333333333";
 const SESSION_D = "44444444-4444-4444-8444-444444444444";
 
+test("exact expired runtime lease is observed again before reconnecting the same process", async () => {
+  const events=[],host=new FakeHost(events),system=terminalSystem(events);
+  let time=NOW,reads=0,sessionReads=0;const progress=[];
+  const reached=new Error("fresh preflight admitted");
+  system.controlPlane.discoverCapabilities=async (_scope,id)=>{
+    reads++;
+    const snapshot=capability(id,reads<3?"temporarily_unavailable":"supported");
+    return {...snapshot,observedAt:new Date(time-100).toISOString(),expiresAt:new Date(time+30_000).toISOString(),capabilities:snapshot.capabilities.map(item=>({...item,reasonCode:reads<3?"runtime_lease_expired":undefined}))};
+  };
+  await assert.rejects(runSupportedForegroundSessions({
+    client:fakeClient(events,{async getAgentSession(id){sessionReads++;return session(id,{runtimeObservedAt:new Date(time-100).toISOString()});}}),
+    baseUrl:"https://api.getcuna.com",agentSessionIds:[SESSION_A],onProgress:label=>progress.push(label),
+    onBeforeTerminalOwnership(){throw reached;},
+  },{host,controlPlane:system.controlPlane,terminalConnector:system.terminalConnector,clock:()=>time,sleep:async ms=>{time+=ms;}}),error=>error===reached);
+  assert.equal(reads,3);assert.equal(sessionReads,3);
+  assert.ok(progress.includes("Waiting for a fresh runtime observation"));
+  assert.equal(host.acquired,0);
+  assert.equal(events.filter(event=>event.startsWith("grant:")).length,0);
+});
+
+test("expired lease wait stops at one bounded renewal window without a terminal grant", async () => {
+  const events=[],host=new FakeHost(events),system=terminalSystem(events);
+  let time=NOW,reads=0;
+  system.controlPlane.discoverCapabilities=async (_scope,id)=>{
+    reads++;
+    const snapshot=capability(id,"temporarily_unavailable");
+    return {...snapshot,observedAt:new Date(time-100).toISOString(),expiresAt:new Date(time+30_000).toISOString(),capabilities:snapshot.capabilities.map(item=>({...item,reasonCode:"runtime_lease_expired"}))};
+  };
+  await assert.rejects(runSupportedForegroundSessions({client:fakeClient(events),baseUrl:"https://api.getcuna.com",agentSessionIds:[SESSION_A]},
+    {host,controlPlane:system.controlPlane,clock:()=>time,sleep:async ms=>{time+=ms;}}),error=>error.code==="capability_unavailable"&&error.safeDetails?.reason_code==="runtime_lease_expired");
+  assert.equal(time-NOW,30_000);assert.ok(reads>1);
+  assert.equal(host.acquired,0);assert.equal(events.filter(event=>event.startsWith("grant:")).length,0);
+});
+
+test("runtime lease refresh cannot switch process epoch during reconnect", async () => {
+  const events=[],host=new FakeHost(events),system=terminalSystem(events);
+  let time=NOW,sessionReads=0,capabilityReads=0;
+  system.controlPlane.discoverCapabilities=async (_scope,id)=>{capabilityReads++;const snapshot=capability(id,"temporarily_unavailable");return {...snapshot,capabilities:snapshot.capabilities.map(item=>({...item,reasonCode:"runtime_lease_expired"}))};};
+  await assert.rejects(runSupportedForegroundSessions({client:fakeClient(events,{async getAgentSession(id){sessionReads++;return session(id,{processEpoch:sessionReads===1?`epoch-${id}`:"replacement-epoch"});}}),baseUrl:"https://api.getcuna.com",agentSessionIds:[SESSION_A]},
+    {host,controlPlane:system.controlPlane,clock:()=>time,sleep:async ms=>{time+=ms;}}),error=>error.code==="remote_state_unproven");
+  assert.equal(sessionReads,2);assert.equal(capabilityReads,1);assert.equal(host.acquired,0);
+});
+
 for (const refreshedAvailability of ["supported", "unsupported"]) {
   test(`preflight renews expired authority once after slow auth inspection: ${refreshedAvailability}`, async () => {
     let time = NOW;

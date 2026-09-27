@@ -24,8 +24,22 @@ test('actual HTTP 409 memory refusal survives the create wrapper without raw ser
  let cause;try{await transport.request({method:'POST',path:'/v1/collaboration/2/sessions/22222222-2222-4222-8222-222222222222/workspace-agent-sessions',body:{}});}catch(error){cause=error;}
  const error=wrap(cause);assert.equal(calls,1);assert.equal(error.details.cause_code,'cuna.remote.conflict');assert.equal(error.details.http_status,409);assert.equal(error.details.cause_reason,'agent_session_memory_capacity');assert.equal(error.code,'cuna.agent.memory_capacity');assert.match(error.message,/not have enough available memory/);assert.match(error.hint,/same Workspace and preset/);assert.equal(error.details.recovery,'pending_identity_preserved');assert.doesNotMatch(error.message,/SECRET/);assert.equal(error.details.failure_stage,undefined);
 });
+test('memory refusal names the provider in the request, not a fixed OpenCode label',()=>{
+ const cause=new CunaError({code:'cuna.remote.conflict',message:'SECRET',exitCode:6,details:{http_status:409,reason:'agent_session_memory_capacity'}});
+ for(const [agent,label] of [['codex','Codex'],['claude-code','Claude Code'],['opencode','OpenCode']]){
+  const result=wrap(cause,agent);assert.equal(result.code,'cuna.agent.memory_capacity');assert.match(result.message,new RegExp(`this ${label} session`));
+ }
+ assert.doesNotMatch(wrap(cause,'codex').message,/OpenCode/);
+});
 
 test('memory-like reason without exact conflict status remains uncertain',()=>{for(const status of [404,502,503]){const result=wrap(new CunaError({code:'cuna.remote.conflict',message:'SECRET',exitCode:7,details:{http_status:status,reason:'agent_session_memory_capacity'}}));assert.equal(result.code,'cuna.journey.agent_session_create_outcome_unreconcilable');}});
+
+test('known installation response retains its safe reason if it reaches the fallback diagnostic',()=>{const result=wrap(new CunaError({code:'cuna.remote.conflict',message:'SECRET',exitCode:6,retryable:true,details:{http_status:409,reason:'agent_session_agent_preparing'}}));assert.equal(result.details.cause_reason,'agent_session_agent_preparing');assert.equal(result.code,'cuna.journey.agent_session_create_outcome_unreconcilable');assert.doesNotMatch(result.message,/SECRET/);});
+test('canonical V2 install response reaches the retry classifier with its exact reason',async()=>{
+ const {createHttpTransport}=await import('../dist/api/http.js');
+ const transport=createHttpTransport({baseUrl:'https://api.getcuna.com',apiKey:'cuna_sk_'+'a'.repeat(43),fetch:async()=>new Response(JSON.stringify({type:'https://api.getcuna.com/problems/agent_session_agent_preparing',title:'Agent is being installed',status:409,code:'agent_session_agent_preparing',request_id:'11111111-1111-4111-8111-111111111111',detail:'Retry the same operation identity.',retryable:true,action:'retry'}),{status:409,headers:{'content-type':'application/problem+json'}})});
+ await assert.rejects(transport.request({method:'POST',path:'/v1/collaboration/2/sessions/22222222-2222-4222-8222-222222222222/workspace-agent-sessions',body:{}}),error=>{assert.equal(error.code,'cuna.remote.conflict');assert.equal(error.details.http_status,409);assert.equal(error.details.reason,'agent_session_agent_preparing');assert.equal(error.retryable,true);return true;});
+});
 
 // The recorded-launch mismatch is refused before anything is sent and carries
 // its own way forward; the journey must surface it as is, not as an
@@ -37,4 +51,5 @@ test('a recorded-launch mismatch is a proven rejection, not an unreconcilable cr
  assert.equal(proven(new CunaError({code:'cuna.provider.pending_intent_conflict',message:'m',exitCode:6,details:{reason:'recorded_launch_mismatch'}})),true);
  assert.equal(proven(new CunaError({code:'cuna.provider.pending_intent_conflict',message:'m',exitCode:6})),false,'an unresolved earlier launch stays unreconcilable');
  assert.equal(proven(new CunaError({code:'cuna.provider.recorded_launch_ended',message:'m',exitCode:6,details:{reason:'recorded_launch_ended'}})),true,'an ended recorded launch is refused as itself');
+ assert.equal(proven(new CunaError({code:'cuna.agent.installing',message:'m',exitCode:6,retryable:true})),true,'bounded installation progress is surfaced without an ambiguous-create wrapper');
 });

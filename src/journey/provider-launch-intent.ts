@@ -17,6 +17,10 @@ export interface RecordedLaunchContext {readonly state:'resumable'|'ended'}
 
 /** Reuses the fsync journal and exclusive local writer; no provider credentials are persisted. */
 export async function withProviderLaunchIntent<T extends {readonly id:string}>(input:{stateDirectory:string;ownerId:string;workspaceId:string;machineId:string;executionWorkspaceId:string;intent:Readonly<Record<string,unknown>>;confirmNew?:(context:RecordedLaunchContext)=>Promise<boolean>;
+ /** Short lease for real-clock regression tests; production keeps LEASE_MS. */
+ leaseMs?:number;
+ /** Journal-clock injection for expiry and renewal failure tests. */
+ journalClock?:()=>number;
  /**
   * Called when this call re-dispatches a RECORDED launch identity instead of
   * minting one — the branch below that reuses `resolved.operationId` — and
@@ -36,7 +40,7 @@ export async function withProviderLaunchIntent<T extends {readonly id:string}>(i
   * receipt cannot answer this.
   */
  isSessionEnded?:(agentSessionId:string)=>Promise<boolean>;
- create:(operationId:string)=>Promise<T>}):Promise<T>{
+ create:(operationId:string,leaseSignal:AbortSignal)=>Promise<T>}):Promise<T>{
  const scope=JSON.stringify(['provider-launch-v2',input.ownerId,input.workspaceId,input.machineId,input.executionWorkspaceId]);
  const directory=join(input.stateDirectory,'provider-launch-v2',createHash('sha256').update(scope).digest('hex'));
  const serialized=JSON.stringify(input.intent),digest=createHash('sha256').update(serialized).digest('hex');
@@ -49,12 +53,14 @@ export async function withProviderLaunchIntent<T extends {readonly id:string}>(i
  const observed=await readLaunchRecords(directory);
  const sessions=await readLaunchSessions(directory);
  const decision=await decide(observed.latest,digest,sessions,input.confirmNew,input.isSessionEnded);
- const journal=await DurableSyncJournal.open({directory,bindingId:stableUuid('provider-launch-v2',scope),bindingGeneration:1,ownerId:randomUUID(),leaseMs:LEASE_MS});
+ const leaseMs=input.leaseMs??LEASE_MS;
+ const journal=await DurableSyncJournal.open({directory,bindingId:stableUuid('provider-launch-v2',scope),bindingGeneration:1,ownerId:randomUUID(),leaseMs,...(input.journalClock===undefined?{}:{clock:input.journalClock})});
  try{
   const current=await readLaunchRecords(directory);
   if(current.fingerprint!==observed.fingerprint)throw new CunaError({code:'cuna.provider.pending_intent_conflict',message:'Another launch changed the local launch record while this one was deciding. Nothing was sent. Run the command again.',exitCode:EXIT_CODES.conflict});
   if(decision.kind==='resume'){
-   const session=await input.create(decision.operationId);
+   const session=await createUnderRenewedLease(journal,decision.operationId,leaseMs,input.create);
+   await journal.renew();
    await rememberLaunchSession(directory,decision.operationId,session.id);
    // A record kept before session ids were stored is only identified by the
    // replay, so the ended check runs again on what it returned.
@@ -64,13 +70,40 @@ export async function withProviderLaunchIntent<T extends {readonly id:string}>(i
   }
   let record=decision.pending??await journal.append({operationId:randomUUID(),baseGeneration:1,digest,byteLength:Buffer.byteLength(serialized)});
   if(record.state==='queued')record=await journal.transition(record.operationId,'sending');
-  const result=await input.create(record.operationId);
+  const result=await createUnderRenewedLease(journal,record.operationId,leaseMs,input.create);
   await journal.renew();
   if(record.state==='sending'||record.state==='uncertain')await journal.transition(record.operationId,'acknowledged');
   await journal.transition(record.operationId,'applied');
   await rememberLaunchSession(directory,record.operationId,result.id);
   return result;
  }finally{await journal.close();}
+}
+
+/** Keep the fsync writer lease current while a provider POST or install wait is in flight. */
+async function createUnderRenewedLease<T>(journal:DurableSyncJournal,operationId:string,leaseMs:number,create:(operationId:string,leaseSignal:AbortSignal)=>Promise<T>):Promise<T>{
+ const leaseAbort=new AbortController();
+ let stopped=false;
+ let renewal:Promise<void>|undefined;
+ let leaseFailure:unknown;
+ const renew=():void=>{
+  if(stopped||renewal!==undefined||leaseFailure!==undefined)return;
+  renewal=journal.renew().catch(error=>{leaseFailure=error;leaseAbort.abort(error);}).finally(()=>{renewal=undefined;});
+ };
+ const timer=setInterval(renew,Math.max(1,Math.floor(leaseMs/3)));
+ timer.unref();
+ let result:T|undefined;
+ let createFailed=false;
+ let createFailure:unknown;
+ try{
+  try{result=await create(operationId,leaseAbort.signal);}catch(error){createFailed=true;createFailure=error;}
+ }finally{
+  stopped=true;
+  clearInterval(timer);
+  if(renewal!==undefined)await renewal;
+ }
+ if(leaseFailure!==undefined)throw new CunaError({code:'cuna.provider.launch_lease_unavailable',message:"Cuna lost its local launch writer lease while an AgentSession request was in flight; this attempt's remote outcome is unknown.",exitCode:EXIT_CODES.remote,retryable:false,hint:'Run the same command again to reconcile the recorded operation identity. Do not request another session with a new operation.',details:{operation_id:operationId,recovery:'same_operation_identity_preserved'},cause:new AggregateError([leaseFailure,...(createFailed?[createFailure]:[])],'Launch lease and remote outcome require reconciliation.')});
+ if(createFailed)throw createFailure;
+ return result as T;
 }
 
 async function decide(latest:ReadonlyMap<string,JournalRecord>,digest:string,sessions:ReadonlyMap<string,string>,confirmNew:((context:RecordedLaunchContext)=>Promise<boolean>)|undefined,isSessionEnded:((agentSessionId:string)=>Promise<boolean>)|undefined):Promise<{kind:'resume';operationId:string}|{kind:'dispatch';pending?:JournalRecord}>{

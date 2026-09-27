@@ -299,10 +299,10 @@ function unreconcilableCreate(cause: unknown): CunaError {
   });
 }
 
-function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
+function unreconcilableAgentSessionCreate(cause: unknown, requestedAgent?: string): CunaError {
   // Only fixed vocabulary and opaque UUIDs cross this diagnostic boundary.
   const codes = new Set(["cuna.network.failed", "cuna.network.service_unavailable", "cuna.network.rate_limited", "cuna.remote.rejected", "cuna.remote.conflict", "cuna.remote.not_found", "cuna.remote.operation_not_served", "cuna.remote.malformed_response", "cuna.provider.v2_unavailable", "cuna.provider.selection_cancelled", "cuna.provider.pending_intent_conflict", "cuna.provider.intent_history_full", "cuna.journey.agent_session_create_authority_mismatch"]);
-  const reasons = new Set(["agent_session_memory_capacity", "agent_session_machine_not_found", "invalid_provider_session_request", "provider_session_v2_invalid_input", "provider_session_v2_credentials_unavailable", "provider_session_v2_scope_unavailable", "provider_session_v2_profile_unavailable", "provider_session_v2_receipt_invalid", "provider_session_v2_authority_unavailable", "provider_session_v2_operation_conflict", "provider_session_v2_profile_mismatch", "provider_session_v2_capacity_exceeded", "provider_session_v2_machine_not_running"]);
+  const reasons = new Set(["agent_session_memory_capacity", "agent_session_agent_preparing", "agent_session_machine_not_found", "invalid_provider_session_request", "provider_session_v2_invalid_input", "provider_session_v2_credentials_unavailable", "provider_session_v2_scope_unavailable", "provider_session_v2_profile_unavailable", "provider_session_v2_receipt_invalid", "provider_session_v2_authority_unavailable", "provider_session_v2_operation_conflict", "provider_session_v2_profile_mismatch", "provider_session_v2_capacity_exceeded", "provider_session_v2_machine_not_running"]);
   const predicates = new Set(["provider_v2_create", "provider_v2_create_scope", "provider_v2_schema", "provider_v2_exact_contract", "contract_decode_failed", "matches_requested_resource", "response_within_size_limit"]);
   const details: Record<string,string|number> = {recovery:"exhausted"};
   const own=(value:object,key:string):unknown=>{const descriptor=Object.getOwnPropertyDescriptor(value,key);return descriptor&&"value" in descriptor?descriptor.value:undefined;};
@@ -324,9 +324,10 @@ function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
     if(typeof code==="string"&&["cuna.provider.v2_unavailable","cuna.provider.selection_cancelled","cuna.provider.pending_intent_conflict","cuna.provider.intent_history_full"].includes(code))details.failure_stage="local_pre_admission";
   }
   if(details.cause_code==="cuna.remote.conflict"&&details.http_status===409&&details.cause_reason==="agent_session_memory_capacity"){
+    const agentLabel=requestedAgent==='opencode'?'OpenCode':requestedAgent==='codex'?'Codex':requestedAgent==='claude-code'?'Claude Code':'agent';
     return new CunaError({
       code:"cuna.agent.memory_capacity",
-      message:"The selected Machine does not have enough available memory to start this OpenCode session.",
+      message:`The selected Machine does not have enough available memory to start this ${agentLabel} session.`,
       exitCode:EXIT_CODES.conflict,
       retryable:false,
       hint:"Inspect the Machine's running sessions. If appropriate, stop an unneeded session to free memory, then repeat this command with the same Workspace and preset to resume the recorded launch. Its pending operation identity is preserved; do not request a different launch to bypass this refusal.",
@@ -352,6 +353,10 @@ function unreconcilableAgentSessionCreate(cause: unknown): CunaError {
  */
 function isProvenAgentSessionCreateRejection(cause: unknown): cause is CunaError {
   return cause instanceof CunaError && (
+    // The canonical V2 create retried the exact pre-admission install response
+    // with one recorded operation until its bounded wait elapsed. Surface that
+    // typed progress state; the local launch journal still owns the identity.
+    cause.code === "cuna.agent.installing" ||
     cause.code === "cuna.agent.opencode_supervisor_upgrade_required" ||
     // A No to the recorded-launch question for a launch recorded under
     // another Workspace version or preset: refused locally, nothing sent, and
@@ -574,10 +579,11 @@ export async function orchestrateAgentJourney(input: {
           }),
         });
       } catch (createError) {
-        if (signal.aborted || isProvenAgentSessionCreateRejection(createError)) {
+        if (signal.aborted || isProvenAgentSessionCreateRejection(createError) ||
+            (createError instanceof CunaError && createError.code === "cuna.provider.launch_lease_unavailable")) {
           throw createError;
         }
-        throw unreconcilableAgentSessionCreate(createError);
+        throw unreconcilableAgentSessionCreate(createError,input.intent.agent);
       }
       ledger.createdAgentSessionId = agentSession.id;
       disposition = "created";
