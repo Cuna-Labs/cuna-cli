@@ -46,6 +46,8 @@ test("T8.5 machine action resolver is machine-first and provider truthful", () =
   ]);
   assert.deepEqual(resolveMachineContextActions(machine(), { hasSessions: false, canCreateSession: true }), [
     { kind: "new-session", label: "New Claude session", machineId: MACHINE_ID, provider: "claude-code" },
+    { kind: "new-session", label: "New Codex session (install if needed)", machineId: MACHINE_ID, provider: "codex" },
+    { kind: "new-session", label: "New OpenCode session (install if needed)", machineId: MACHINE_ID, provider: "opencode" },
     { kind: "stop", label: "Stop", machineId: MACHINE_ID },
     DELETE,
   ]);
@@ -53,6 +55,19 @@ test("T8.5 machine action resolver is machine-first and provider truthful", () =
     { kind: "provider", label: "OpenCode", machineId: MACHINE_ID, provider: "opencode" },
     { kind: "stop", label: "Stop", machineId: MACHINE_ID },
     DELETE,
+  ]);
+});
+
+test("cross-provider sessions appear under their own provider and can reconnect on the same Machine", () => {
+  const codex = session({ id: "22222222-2222-4222-8222-222222222222", agent: "codex", name: "codex-main" });
+  const opencode = session({ id: "33333333-3333-4333-8333-333333333333", agent: "opencode", name: "open-main" });
+  const actions = resolveMachineContextActions(machine(), { hasSessions: false, sessions: [codex, opencode], canCreateSession: true });
+  assert.deepEqual(actions.filter((action) => action.kind === "provider").map((action) => action.provider), ["codex", "opencode"]);
+  for (const [provider, expected] of [["codex", codex], ["opencode", opencode]]) {
+    assert.deepEqual(resolveProviderContextActions({ machine: machine(), provider, sessions: [codex, opencode], now: NOW }).map((action) => action.session.id), [expected.id]);
+  }
+  assert.deepEqual(resolveMachineContextActions(machine({ agent: "future-agent" }), { canCreateSession: true, sessions: [codex] }), [
+    { kind: "stop", label: "Stop", machineId: MACHINE_ID }, DELETE,
   ]);
 });
 

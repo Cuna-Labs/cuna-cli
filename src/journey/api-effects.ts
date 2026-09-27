@@ -13,7 +13,7 @@ import {
   openCodeRuntimeUnverified,
   openCodeSupervisorUpgradeRequired,
 } from "../machines/opencode-supervisor.js";
-import { machineProviderAvailability } from "../machines/provider-availability.js";
+import { machineProviderAvailability, machineSupportsProvider } from "../machines/provider-availability.js";
 import type { MachineSelectionState } from "./selection.js";
 import type {
   AgentJourneyEffects,
@@ -267,7 +267,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         let support: "supported" | "unsupported" | "unknown" = "unknown";
         let supportReason: string | undefined;
         const provider = machineProviderAvailability(machine);
-        if (!provider.actionable || provider.agent !== input.requestedAgent) {
+        if (!machineSupportsProvider(machine, input.requestedAgent)) {
           return Object.freeze({
             id: machine.id,
             name: machine.name,

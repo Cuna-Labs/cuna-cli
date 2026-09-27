@@ -22,9 +22,9 @@ const DISPLAY_NAMES: Readonly<Record<AgentKind, string>> = Object.freeze({
 });
 
 /**
- * Until the producer exposes an observed installed-provider collection,
- * `machine.agent` is the sole provider inventory. Never infer a different
- * provider from sessions, capabilities, or a display fallback.
+ * `machine.agent` describes the default provider installed at creation. It is
+ * not an inventory of providers installed later on demand. Never infer another
+ * installed provider from sessions, capabilities, or a display fallback.
  */
 export function machineProviderAvailability(machine: Pick<Machine, "id" | "agent" | "updatedAt">): MachineProviderAvailability {
   const declaredId = machine.agent?.trim();
@@ -56,22 +56,9 @@ export function machineProviderAvailability(machine: Pick<Machine, "id" | "agent
 }
 
 /**
- * The provider verdict a person acts on, not the declaration they cannot act on.
- *
- * `usability` and `actionable` are independent by construction above: a machine
- * declaring a provider this CLI cannot drive comes back
- * `usability: "declared-installed"` WITH `actionable: false` and a reason code.
- * The human renderings printed the first field alone, so
- * `Unknown (foo) declared-installed` read as installed and usable on exactly
- * the machines where `agent-sessions create` fails closed with
- * `cuna.agent.provider_not_installed`. One word decides whether the next
- * command can run, so that is the word; the reason follows only when the
- * answer is no.
- *
- * It lives here, beside the two fields it reconciles, so that every surface
- * reaches one verdict instead of deriving its own. `machines` and
- * `machines list` use it; the TUI explorer at `explorer.ts` still prints raw
- * `usability` and carries the same defect until it adopts this.
+ * Whether the declared default provider is one this CLI can drive. This is
+ * not a live installation probe for other providers and does not replace a
+ * Machine-scoped capability read before creation.
  */
 export function providerVerdict(provider: MachineProviderAvailability): string {
   return provider.actionable
@@ -93,7 +80,11 @@ export function machineSupportsProvider(
   requested: AgentKind,
 ): boolean {
   const availability = machineProviderAvailability(machine);
-  return availability.actionable && availability.agent === requested;
+  // A known supported default identifies a Machine on which the server can
+  // provision another supported provider. This is local eligibility only:
+  // capability admission and the create response decide whether it can run.
+  return availability.actionable &&
+    (requested === "claude-code" || requested === "codex" || requested === "opencode");
 }
 
 function normalizeKnownProvider(provider: string | undefined): AgentKind | undefined {

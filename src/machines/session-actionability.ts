@@ -4,7 +4,7 @@ import type {
   AgentSessionProcessObservation,
   Machine,
 } from "../api/contracts.js";
-import { machineProviderAvailability } from "./provider-availability.js";
+import { machineSupportsProvider } from "./provider-availability.js";
 import {
   agentSessionProcessObservation,
   AGENT_SESSION_OBSERVATION_NOTE,
@@ -51,6 +51,7 @@ export type SessionActionReasonCode =
   | "session_failed"
   | "termination_intended"
   | "machine_not_running"
+  | "machine_mismatch"
   | "provider_unavailable"
   | "provider_mismatch";
 
@@ -160,9 +161,8 @@ function classifyBase(input: SessionActionabilityInput): ClassifiedBase {
   }
   if (machine !== undefined) {
     if (machine.state !== "running") return result("unsupported", "machine_not_running");
-    const provider = machineProviderAvailability(machine);
-    if (!provider.actionable) return result("unsupported", "provider_unavailable");
-    if (provider.agent !== session.agent) return result("unsupported", "provider_mismatch");
+    if (session.machineId !== machine.id) return result("unsupported", "machine_mismatch");
+    if (!machineSupportsProvider(machine, session.agent)) return result("unsupported", "provider_unavailable");
   } else if (session.agent !== "claude-code" && session.agent !== "codex" && session.agent !== "opencode") {
     return result("unsupported", "provider_unavailable");
   }

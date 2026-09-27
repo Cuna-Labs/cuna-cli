@@ -141,23 +141,23 @@ test("bare machines opens the TTY explorer while JSON returns the nested read-on
   const record = JSON.parse(json.stdout());
   assert.equal(record.command, "machines.overview");
   assert.deepEqual(record.data.items[0].session_counts.claude, { running: 1, total: 2 });
-  assert.deepEqual(record.data.items[0].session_counts.codex, { running: 0, total: 1 });
-  assert.deepEqual(record.data.items[0].session_counts.opencode, { running: 0, total: 1 });
+  assert.deepEqual(record.data.items[0].session_counts.codex, { running: 1, total: 1 });
+  assert.deepEqual(record.data.items[0].session_counts.opencode, { running: 1, total: 1 });
   assert.deepEqual(Object.keys(record.data.items[0].session_counts), ["claude", "codex", "opencode"]);
   assert.equal(record.data.items[0].agent_sessions.length, 4);
   assert.equal(record.data.items[0].agent_sessions.some((item) => item.desired_state === "terminated"), false);
   assert.equal(record.data.items[0].agent_sessions.some((item) => item.request_state === "termination_pending"), false);
   const visibleOpenCode = record.data.items[0].agent_sessions.find((item) => item.agent === "opencode");
-  assert.equal(visibleOpenCode.can_attach, false);
-  assert.equal(visibleOpenCode.base_state, "unsupported");
-  assert.equal(visibleOpenCode.reason_code, "provider_mismatch");
+  assert.equal(visibleOpenCode.can_attach, true);
+  assert.equal(visibleOpenCode.base_state, "attachable");
+  assert.equal(visibleOpenCode.reason_code, "runtime_lease_current_observation_unknown");
   assert.deepEqual(record.data.items[0].provider_availability, {
     declared_id: "claude-code",
     display_name: "Claude",
     usability: "declared-installed",
     actionable: true,
   });
-  assert.equal(record.data.items[0].agent_sessions.find((item) => item.agent === "codex").base_state, "unsupported");
+  assert.equal(record.data.items[0].agent_sessions.find((item) => item.agent === "codex").base_state, "attachable");
 });
 
 test("machines overview keeps OpenCode observations visible and actionable on a compatible machine", async () => {
@@ -2544,7 +2544,7 @@ test("AgentSession create keeps auth mode explicit and rename is capability-gate
   assert.equal(JSON.parse(renameStreams.stdout()).data.name, "renamed");
 });
 
-test("AgentSession create rejects a provider not installed on the machine before capability discovery or mutation", async () => {
+test("AgentSession create rejects an unknown Machine default before capability discovery or mutation", async () => {
   let capabilityReads = 0;
   let creates = 0;
   const streams = memoryStreams();
@@ -2557,7 +2557,7 @@ test("AgentSession create rejects a provider not installed on the machine before
     platform,
     env: { CUNA_API_KEY: API_KEY },
     clientFactory: () => fakeClient({
-      async getMachine(id) { return { id, name: "claude-only", state: "running", agent: "claude-code" }; },
+      async getMachine(id) { return { id, name: "unknown-default", state: "running", agent: "future-agent" }; },
       async discoverCapabilities() { capabilityReads += 1; return capabilitySnapshot([]); },
       async createAgentSession() { creates += 1; throw new Error("unreachable"); },
     }),
@@ -2566,9 +2566,82 @@ test("AgentSession create rejects a provider not installed on the machine before
   assert.equal(capabilityReads, 0);
   assert.equal(creates, 0);
   const error = JSON.parse(streams.stderr()).error;
-  assert.equal(error.code, "cuna.agent.provider_not_installed");
-  assert.match(error.message, /Codex is unavailable on machine claude-only.*Declared installed provider: Claude/u);
-  assert.match(error.hint, /machines create --agent codex/u);
+  assert.equal(error.code, "cuna.agent.machine_provider_unsupported");
+  assert.match(error.message, /Codex cannot be requested on machine unknown-default.*Declared default provider: Unknown/u);
+  assert.match(error.hint, /supported default provider/u);
+});
+
+test("agent-sessions create sends cross-provider requests on one Machine after capability admission", async () => {
+  const bindingId = "33333333-3333-4333-8333-333333333333";
+  const cases = [
+    ["claude-code", "opencode"], ["claude-code", "codex"], ["opencode", "claude-code"],
+  ];
+  for (const [defaultAgent, requested] of cases) {
+    const calls = [];
+    const streams = memoryStreams();
+    const exit = await runCli([
+      "agent-sessions", "create", "--machine", MACHINE_ID,
+      "--workspace-binding-id", bindingId, "--workspace-generation", "7",
+      "--agent", requested, "--idempotency-key", `cross-${requested}`, "--yes", "--json",
+    ], {
+      streams: streams.streams,
+      platform,
+      env: { CUNA_API_KEY: API_KEY },
+      now: () => Date.parse("2026-08-08T00:00:00Z"),
+      clientFactory: () => fakeClient({
+        async getMachine(id) { return { id, name: "shared", state: "running", agent: defaultAgent }; },
+        async discoverCapabilities(scope, resourceId) {
+          calls.push(["capability", scope, resourceId]);
+          return capabilitySnapshot([{ id: "agent_sessions.create", availability: "supported", interaction: "native", mutationClass: "reversible", surfaces: ["cli"] }], scope, resourceId);
+        },
+        async createAgentSession(id, input, key) {
+          calls.push(["create", id, input.agent, key]);
+          return agentSession({ machineId: id, agent: input.agent, workspaceBindingId: input.workspaceBindingId, workspaceGeneration: input.workspaceGeneration });
+        },
+        async getAgentSession(id) {
+          return agentSession({ id, machineId: MACHINE_ID, agent: requested, workspaceBindingId: bindingId, workspaceGeneration: 7 });
+        },
+      }),
+    });
+    assert.equal(exit, EXIT_CODES.success, `${defaultAgent} -> ${requested}: ${streams.stderr()}`);
+    assert.deepEqual(calls, [
+      ["capability", "machine", MACHINE_ID],
+      ["create", MACHINE_ID, requested, `cross-${requested}`],
+    ]);
+    assert.equal(JSON.parse(streams.stdout()).data.agent, requested);
+  }
+});
+
+test("a retryable provider install result does not dispatch a second session and preserves the operation key", async () => {
+  let creates = 0;
+  const streams = memoryStreams();
+  const exit = await runCli([
+    "agent-sessions", "create", "--machine", MACHINE_ID,
+    "--workspace-binding-id", "33333333-3333-4333-8333-333333333333", "--workspace-generation", "7",
+    "--agent", "opencode", "--idempotency-key", "install-pending-1", "--yes", "--json",
+  ], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async getMachine(id) { return { id, name: "shared", state: "running", agent: "claude-code" }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot([{ id: "agent_sessions.create", availability: "supported", interaction: "native", mutationClass: "reversible", surfaces: ["cli"] }], scope, resourceId);
+      },
+      async createAgentSession() {
+        creates += 1;
+        throw new CunaError({ code: "cuna.remote.conflict", message: "Provider installation is in progress.", exitCode: EXIT_CODES.conflict, retryable: true, details: { reason: "provider_install_in_progress" } });
+      },
+    }),
+  });
+  assert.equal(exit, EXIT_CODES.conflict);
+  assert.equal(creates, 1);
+  const error = JSON.parse(streams.stderr()).error;
+  assert.equal(error.retryable, true);
+  assert.equal(error.details.idempotency_key, "install-pending-1");
+  assert.match(error.hint, /agent-sessions list --machine/u);
+  assert.match(error.hint, /--idempotency-key install-pending-1/u);
 });
 
 test("OpenCode create names a supervisor prerequisite before any session dispatch", async () => {
@@ -2801,7 +2874,7 @@ test("OpenCode machine creation is stopped by a live backend capability refusal 
   assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.capability.unsupported");
 });
 
-test("OpenCode AgentSession journey surfaces the server's compatible-Machine remedy", async () => {
+test("OpenCode AgentSession command surfaces the server refusal without claiming only OpenCode Machines qualify", async () => {
   const requests = [];
   const streams = memoryStreams();
   const exit = await runCli([
@@ -2868,7 +2941,9 @@ test("OpenCode AgentSession journey surfaces the server's compatible-Machine rem
     method: "POST",
   });
   assert.equal(error.code, "cuna.agent.provider_not_installed");
-  assert.match(error.hint, /Machine configured for OpenCode/u);
+  assert.match(error.message, /OpenCode was refused by the server on Machine open-dev/u);
+  assert.doesNotMatch(error.hint, /Machine configured for OpenCode/u);
+  assert.equal(error.details.requested_provider, "opencode");
 });
 
 test("OpenCode create rejects a remotely downgraded auth mode after authoritative readback", async () => {

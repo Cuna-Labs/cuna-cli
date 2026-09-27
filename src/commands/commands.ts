@@ -2981,14 +2981,14 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     if (!machineSupportsProvider(machine, agent)) {
       const installed = machineProviderAvailability(machine);
       throw new CunaError({
-        code: "cuna.agent.provider_not_installed",
-        message: `${providerDisplayName(agent)} is unavailable on machine ${machine.name}. Declared installed provider: ${installed.displayName}.`,
+        code: "cuna.agent.machine_provider_unsupported",
+        message: `${providerDisplayName(agent)} cannot be requested on machine ${machine.name}. Declared default provider: ${installed.displayName}.`,
         exitCode: EXIT_CODES.unsupported,
-        hint: `Choose a machine whose installed provider is ${providerDisplayName(agent)}, or create one with \`cuna machines create --agent ${agent} ...\`.`,
+        hint: `Choose a Machine with a supported default provider, or create one with \`cuna machines create --agent ${agent} ...\`.`,
         details: {
           machine_id: machine.id,
           requested_provider: agent,
-          installed_provider: installed.declaredId ?? "unknown",
+          declared_default_provider: installed.declaredId ?? "unknown",
         },
       });
     }
@@ -3011,17 +3011,50 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
       }
       throw error;
     }
-    const session = await client.createAgentSession(machineId, {
-      ...(name === undefined ? {} : { name }),
-      agent,
-      cwd,
-      workspaceBindingId,
-      workspaceGeneration,
-      ...(authMode === undefined ? {} : { authMode }),
-      ...(credentialBinding === undefined
-        ? {}
-        : { credentialBindingId: assertCanonicalUuid(credentialBinding, "credential binding ID") }),
-    }, idempotencyKey(parsed));
+    const operationKey = idempotencyKey(parsed);
+    let session: AgentSession;
+    try {
+      session = await client.createAgentSession(machineId, {
+        ...(name === undefined ? {} : { name }),
+        agent,
+        cwd,
+        workspaceBindingId,
+        workspaceGeneration,
+        ...(authMode === undefined ? {} : { authMode }),
+        ...(credentialBinding === undefined
+          ? {}
+          : { credentialBindingId: assertCanonicalUuid(credentialBinding, "credential binding ID") }),
+      }, operationKey);
+    } catch (error) {
+      if (error instanceof CunaError && error.code === "cuna.agent.provider_not_installed") {
+        throw new CunaError({
+          code: error.code,
+          message: `${providerDisplayName(agent)} was refused by the server on Machine ${machine.name}.`,
+          exitCode: error.exitCode,
+          retryable: error.retryable,
+          hint: `The server reported that this provider is unavailable here. Inspect \`cuna agent-sessions list --machine ${machineId}\` and the Machine's current capability before choosing another action.${error.retryable ? ` If retrying, use the same \`--idempotency-key ${operationKey}\`.` : ""}`,
+          details: { ...error.details, machine_id: machineId, requested_provider: agent, ...(error.retryable ? { idempotency_key: operationKey } : {}) },
+          cause: error,
+        });
+      }
+      // A retryable install wait or a lost create response is not permission to
+      // dispatch another operation. Carry the exact key so the caller can read
+      // first and, if still needed, repeat this same intent rather than minting
+      // a second AgentSession while installation converges.
+      if (error instanceof CunaError &&
+        (error.retryable || error.details?.remote_outcome === "unobserved")) {
+        throw new CunaError({
+          code: error.code,
+          message: error.message,
+          exitCode: error.exitCode,
+          retryable: error.retryable,
+          hint: `${error.hint ?? "The create outcome is not settled."} Inspect \`cuna agent-sessions list --machine ${machineId}\` before retrying. If a retry is needed, use the same \`--idempotency-key ${operationKey}\`; do not start a new operation while this one is pending.`,
+          details: { ...error.details, idempotency_key: operationKey, machine_id: machineId },
+          cause: error,
+        });
+      }
+      throw error;
+    }
     const observed = await client.getAgentSession(session.id);
     if (
       observed.id !== session.id || observed.machineId !== machineId || observed.agent !== agent ||

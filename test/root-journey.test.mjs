@@ -201,10 +201,49 @@ test("running provider exposes New session only when current capability advertis
   await waitUntil(() => host.writes.some((frame) => frame.includes("dev")));
   host.send([0x0d]);
   await waitUntil(() => host.writes.at(-1).includes("New Claude session"));
-  assert.doesNotMatch(host.writes.at(-1), /OpenCode|ensure/iu);
+  assert.match(host.writes.at(-1), /New Codex session \(install if needed\)/u);
+  assert.match(host.writes.at(-1), /New OpenCode session \(install if needed\)/u);
+  assert.doesNotMatch(host.writes.at(-1), /\bensure\b/iu);
   host.send([0x0d]);
   assert.deepEqual(await operation, { kind: "launch", agent: "claude-code", machineId: MACHINE, machineName: "dev", newSession: true });
 });
+
+for (const [defaultAgent, requested, moves] of [
+  ["claude-code", "codex", 1], ["claude-code", "opencode", 2], ["opencode", "claude-code", 1],
+]) {
+  test(`root journey selects ${requested} on the exact ${defaultAgent} Machine`, async () => {
+    const host = new Host();
+    const operation = runNodeRootJourney({ client: {
+      async listMachines() { return { items: [{ id: MACHINE, name: "shared", state: "running", agent: defaultAgent, updatedAt: "v1" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities() { return sessionCreateCapability(); },
+    } }, { host, now: () => NOW });
+    await waitUntil(() => host.writes.some((frame) => frame.includes("shared") && frame.includes("no sessions")));
+    host.send([0x0d]);
+    await waitUntil(() => host.writes.at(-1).includes("install if needed"));
+    for (let index = 0; index < moves; index += 1) host.send([0x1b, 0x5b, 0x42]);
+    await waitUntil(() => host.writes.at(-1).includes(`❯ New ${requested === "claude-code" ? "Claude" : requested === "codex" ? "Codex" : "OpenCode"} session`));
+    host.send([0x0d]);
+    assert.deepEqual(await operation, { kind: "launch", agent: requested, machineId: MACHINE, machineName: "shared", newSession: true });
+  });
+}
+
+for (const defaultAgent of ["future-agent", "openclaw"]) {
+  test(`root journey does not offer sessions on a ${defaultAgent} default Machine`, async () => {
+    const host = new Host();
+    const operation = runNodeRootJourney({ client: {
+      async listMachines() { return { items: [{ id: MACHINE, name: "unsupported", state: "running", agent: defaultAgent, updatedAt: "v1" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities() { return sessionCreateCapability(); },
+    } }, { host, now: () => NOW });
+    await waitUntil(() => host.writes.some((frame) => frame.includes("unsupported") && frame.includes("no sessions")));
+    host.send([0x0d]);
+    await waitUntil(() => host.writes.at(-1).includes("Stop machine"));
+    assert.doesNotMatch(host.writes.at(-1), /New (Claude|Codex|OpenCode) session/u);
+    host.send([0x03]);
+    assert.equal(await operation, undefined);
+  });
+}
 
 test("root journey argv contains no internal identifiers", () => {
   const selection = { kind: "launch", agent: "codex", machineId: MACHINE, machineName: "owner-dev" };

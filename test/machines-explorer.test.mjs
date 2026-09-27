@@ -413,6 +413,47 @@ test("machine-menu selection remains on New session when refresh inserts another
   });
 });
 
+for (const [defaultAgent, requested, moves] of [
+  ["claude-code", "codex", 1],
+  ["claude-code", "opencode", 2],
+  ["opencode", "claude-code", 1],
+]) {
+  test(`machine menu can launch ${requested} on a ${defaultAgent} Machine without creating another Machine`, async () => {
+    const host = new FakeHost();
+    const operation = runNodeMachinesExplorer({ client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "shared", state: "running", agent: defaultAgent }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, id) { return capabilitySnapshot(scope, id, [supported("agent_sessions.workspace.create")]); },
+    } }, { host });
+    await waitUntil(() => host.writes.at(-1) !== undefined && stripAnsi(host.writes.at(-1)).includes("no sessions") &&
+      !stripAnsi(host.writes.at(-1)).includes("Checking whether"), "inventory and capacity should settle");
+    host.emitInput([0x0d]);
+    await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("New") &&
+      stripAnsi(host.writes.at(-1)).includes("install if needed"), "all three provider choices should render");
+    for (let index = 0; index < moves; index += 1) host.emitInput([0x1b, 0x5b, 0x42]);
+    await waitUntil(() => stripAnsi(host.writes.at(-1)).includes(`❯ New ${requested === "claude-code" ? "Claude" : requested === "codex" ? "Codex" : "OpenCode"} session`), "cross-provider choice should select");
+    host.emitInput([0x0d]);
+    assert.deepEqual(await operation, { kind: "launch", agent: requested, newSession: true, machineId: MACHINE_ID, machineName: "shared" });
+  });
+}
+
+for (const agent of ["codex", "opencode"]) {
+  test(`an existing cross-provider ${agent} session reconnects by exact ID from the TUI`, async () => {
+    const host = new FakeHost();
+    const operation = runNodeMachinesExplorer({ client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "shared", state: "running", agent: "claude-code" }] }; },
+      async listAgentSessions() { return { items: [agentSession({ agent, name: `${agent}-main` })] }; },
+    } }, { host });
+    await waitUntil(() => host.writes.at(-1) !== undefined && stripAnsi(host.writes.at(-1)).includes(`${agent}-main`), "cross-provider session should render");
+    host.emitInput([0x0d]);
+    await waitUntil(() => stripAnsi(host.writes.at(-1)).includes("sessions"), "machine menu should show existing provider");
+    host.emitInput([0x0d]);
+    await waitUntil(() => stripAnsi(host.writes.at(-1)).includes(`${agent === "codex" ? "Codex" : "OpenCode"} sessions`), "provider menu should open");
+    host.emitInput([0x0d]);
+    assert.deepEqual(await operation, { kind: "attach", agentSessionId: SESSION_ID, agent });
+  });
+}
+
 test("Enter on a Claude or Codex child returns the exact attach selection", async () => {
   const host = new FakeHost();
   const operation = runNodeMachinesExplorer({
@@ -1653,7 +1694,7 @@ test("E13-R3 negative: a transition that never converges leaves the screen alive
   await waitUntil(() => lastFrame(host).includes("sticky  running"), "inventory should render");
   host.emitInput([0x0d]);
   await waitUntil(() => lastFrame(host).includes("Stop machine"), "Stop should be offered");
-  host.emitInput([0x1b, 0x5b, 0x42]);
+  for (let index = 0; index < 3; index += 1) host.emitInput([0x1b, 0x5b, 0x42]);
   await waitUntil(() => lastFrame(host).includes("❯ Stop machine"), "Down should select Stop");
   host.emitInput([0x0d]);
   await waitUntil(() => host.writes.some((frame) => stripAnsi(frame).includes("Stopping…")), "the row must show the transient state");

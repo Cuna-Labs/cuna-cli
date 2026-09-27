@@ -1502,6 +1502,7 @@ function machineContextActions(row: MachineRow, now: number): readonly MachineCo
   return resolveMachineContextActions(row.machine, {
     hasSessions,
     canCreateSession: row.canCreateSession === true,
+    sessions: row.sessions,
     opencodeSupervisorRepairRequired: row.opencodeSupervisorRepairReason !== undefined,
   });
 }
