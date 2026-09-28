@@ -10,8 +10,11 @@ const firstLine = paintFirstLine(argv, {
   stdoutIsTTY: process.stdout.isTTY === true,
   stderr: process.stderr,
 });
-const { runProcessCli } = await import("../cli/process-entrypoint.js");
+const { exitAfterCommandReturned, runProcessCli } = await import("../cli/process-entrypoint.js");
 process.exitCode = await runProcessCli(argv, {
   stdin: process.stdin,
   ...(firstLine === undefined ? {} : { firstLine }),
 });
+// A handle the command does not own (a WebSocket waiting for the server to
+// answer its close) must not keep the shell prompt away; see the function.
+exitAfterCommandReturned();
