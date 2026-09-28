@@ -3801,15 +3801,15 @@ test("doctor and config get answer a terminal in lines, not in a JSON dump", asy
     ],
   }), EXIT_CODES.success, doctor.stderr());
   const doctorLines = doctor.stdout().trim().split("\n");
-  assert.equal(doctorLines[0], `platform\t${process.platform}`);
-  assert.equal(doctorLines[1], `node\t${process.version}`);
-  assert.equal(doctorLines[2], "environment_credential\tabsent");
-  assert.equal(doctorLines[3], "environment_credential_variable\tnull");
-  assert.equal(doctorLines[4], "runtime_features");
-  // The reason code is the field that names the prerequisite, and it is on the
-  // line that reports the feature rather than in a nested JSON object.
-  assert.equal(doctorLines[5], "  daemon\tunsupported\tdaemon_runtime_unavailable");
-  assert.equal(doctorLines[6], "  terminal_workspace\tavailable\tforeground_exact_session_composed_live_producer_required");
+  assert.equal(doctorLines[0], `Platform               ${process.platform}`);
+  assert.equal(doctorLines[1], `Node.js                ${process.version}`);
+  assert.equal(doctorLines[2], "Automation credential  not set; commands use your browser sign-in");
+  assert.equal(doctorLines[3], "");
+  assert.equal(doctorLines[4], "This build");
+  // Each feature says what its reason code means, on the line that reports it;
+  // the code itself stays in `--json`.
+  assert.equal(doctorLines[5], "  Background daemon      not in this build");
+  assert.equal(doctorLines[6], "  Cloud terminal attach  in this build; each attach still asks the server");
   assert.doesNotMatch(doctor.stdout(), /[{}]/u, doctor.stdout());
 
   const config = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });

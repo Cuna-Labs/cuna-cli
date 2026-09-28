@@ -143,7 +143,7 @@ Available now:
   signup                               Create a waitlist-only Cuna account in the browser
   login                                Sign in through the browser and paste the durable login code
   whoami                               Show account context; reuse the encrypted session
-  access status                        Print the same line whoami prints, as record access.status
+  access status                        Print the same lines whoami prints, as record access.status
   logout                               Revoke the login-code family server-first;
                                        reuse the encrypted session automatically
   capabilities                         Inspect current server capability truth

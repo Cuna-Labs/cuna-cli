@@ -6,6 +6,7 @@ import {
   type CunaApiClient,
 } from "../api/client.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
+import { labelledLines } from "../cli/labelled-lines.js";
 import type {
   AgentAuthMode,
   AgentKind,
@@ -1516,20 +1517,22 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         environment_credential_variable: config.apiKeyVariable ?? null,
         runtime_features: features,
       });
-      // `doctor` is the command the help text sends a stuck user to first, and
-      // it answered with a JSON dump on a TTY. Every field the record carries is
-      // still here; each feature now states its implementation AND the reason
-      // code that names the prerequisite, on the line that reports it.
+      // `doctor` is the command the help text sends a stuck user to first. It
+      // answered a terminal first with a JSON dump, then with the record's own
+      // keys, `null` and internal reason codes. Every fact the record carries
+      // is still here, in words; the codes stay in `--json`.
       return Object.freeze({
         command: "doctor",
         data,
         human: [
-          `platform\t${data.platform}`,
-          `node\t${data.node}`,
-          `environment_credential\t${data.environment_credential}`,
-          `environment_credential_variable\t${data.environment_credential_variable ?? "null"}`,
-          "runtime_features",
-          ...features.map((gate) => `  ${gate.feature}\t${gate.implementation}\t${gate.reason}`),
+          labelledLines([
+            ["Platform", data.platform],
+            ["Node.js", data.node],
+            ["Automation credential", environmentCredentialLine(data.environment_credential, config.apiKeyVariable)],
+          ]),
+          "",
+          "This build",
+          labelledLines(features.map((gate) => [DOCTOR_FEATURE_LABELS[gate.feature], doctorFeatureState(gate)]), "  "),
         ].join("\n"),
       });
     }
@@ -2823,6 +2826,49 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     return Object.freeze({ command: "machines.delete", data: { id, acknowledged: true }, human: `Delete acknowledged for ${id}.` });
   }
   throw usageError(`Unknown machines action ${action}.`);
+}
+
+const DOCTOR_FEATURE_LABELS: Readonly<Record<RuntimeFeatureGate["feature"], string>> = Object.freeze({
+  daemon: "Background daemon",
+  terminal_workspace: "Cloud terminal attach",
+  workspace_sync: "Workspace sync",
+  browser_auth: "Browser sign-in",
+  browser_login_remote: "Sign-in service",
+  local_companion: "Local companion",
+  encrypted_local_session_store: "Encrypted session store",
+});
+
+/** What each reason code means to a person. `--json` keeps the code itself. */
+const DOCTOR_REASON_TEXT: Readonly<Record<string, string>> = Object.freeze({
+  daemon_runtime_unavailable: "not in this build",
+  local_companion_unavailable: "not in this build",
+  foreground_exact_session_composed_live_producer_required: "in this build; each attach still asks the server",
+  initial_and_continuous_sync_composed_live_producer_required: "in this build; each sync still asks the server",
+  remote_browser_login_not_checked: "not checked; run `cuna doctor --check-browser-login`",
+  remote_browser_login_bootstrap_verified: "the service answered",
+  remote_browser_login_disabled: "the service reports browser sign-in is off",
+  remote_browser_login_probe_failed: "the service could not be reached",
+  remote_browser_login_unknown: "the service's state is unknown",
+  remote_browser_login_unavailable: "the service reports browser sign-in unavailable",
+  browser_login_remote_and_encrypted_local_verified: "ready: the service answered and the local store is verified",
+  encrypted_local_aes256gcm_verified: "verified (AES-256-GCM)",
+  encrypted_session_permissions_unverified: "the encrypted session files' permissions could not be verified",
+});
+
+function doctorFeatureState(gate: RuntimeFeatureGate): string {
+  if (Object.hasOwn(DOCTOR_REASON_TEXT, gate.reason)) return DOCTOR_REASON_TEXT[gate.reason] as string;
+  // `encrypted_local_session_<status>` may carry a backend id after it.
+  if (/^encrypted_local_session_(unknown|unavailable)\b/u.test(gate.reason)) return "not verified";
+  return `${gate.implementation === "available" ? "available" : "not available"}; \`cuna doctor --json\` has the reason`;
+}
+
+function environmentCredentialLine(state: ReturnType<typeof environmentCredentialState>, variable: string | undefined): string {
+  const name = variable ?? "CUNA_API_KEY";
+  switch (state) {
+    case "absent": return "not set; commands use your browser sign-in";
+    case "configured_not_validated": return `set in ${name}; doctor does not check it`;
+    case "invalid": return `set in ${name}, but its value is unusable`;
+  }
 }
 
 function preflightExecutions(parsed: ParsedInvocation): void {

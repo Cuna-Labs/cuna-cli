@@ -93,6 +93,7 @@ import { runExecutionsScreen } from "../machines/executions-screen.js";
 import { isOpenCodeSupervisorUpgradeReason } from "../machines/opencode-supervisor.js";
 import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
+import { labelledLines } from "./labelled-lines.js";
 import { createOutputWriter, sanitizeHumanTerminalOutput, type CliStreams } from "./output.js";
 import { booleanOption, parseArgv, stringOption } from "./parser.js";
 import { rejectUnknownOptions } from "./parser.js";
@@ -1530,10 +1531,20 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         const data = humanResult(result);
         authProgress?.stop();
         authProgress = undefined;
+        // The line was `active\tadmitted\tassigned`: three bare values, no
+        // labels, and none of the ids the JSON record carries beside them.
+        const workspace = result.context.workspace;
         writer.success(
           parsed.command === "access" ? "access.status" : "whoami",
           data,
-          `${result.context.identity}\t${result.context.admission}\t${result.context.workspace.state}`,
+          labelledLines([
+            ["Account", result.context.identity],
+            ["Admission", result.context.waitlistPosition === undefined
+              ? result.context.admission
+              : `${result.context.admission} (waitlist position ${result.context.waitlistPosition})`],
+            ["Workspace", workspace.id === undefined ? workspace.state : `${workspace.state} · ${workspace.id}`],
+            ["Profile", result.profile],
+          ]),
         );
       } else {
         const result = await (await getHumanAuth()).logout(dependencies.signal);
