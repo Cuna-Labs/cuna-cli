@@ -968,9 +968,18 @@ function batchProgressLabel(parsed: ParsedInvocation): string | undefined {
       return "Reading what this account can do";
     case "records":
       return "Reading your records";
+    case "executions":
+      // A cancel is a request, not an outcome: the answer says whether the
+      // server accepted it, and cleanup is read afterwards.
+      return action === "cancel"
+        ? "Requesting cancellation of the remote command"
+        : "Reading remote commands";
     case "authorizations":
       return "Reading your authorizations";
     case "account":
+      // `account show` reads the account identity (id and email), not the
+      // workspace; the two labels were shared, so the row named the wrong read.
+      return "Reading your account";
     case "workspace":
       return "Reading your workspace";
     case "usage":
