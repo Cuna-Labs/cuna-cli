@@ -626,9 +626,16 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     for (const topic of INTERACTIVE_HUMAN_LOGIN_TOPICS) {
       const before = authority.state.servedRequests;
       const refused = await invokeInstalled(installedEntrypoint, [topic, "--project", PROJECT_ID], env, sandbox);
-      assert.equal(refused.code, 2, `installed ${topic} must refuse a redirected terminal`);
-      assert.equal(JSON.parse(refused.stderr).error.code, "cuna.usage.invalid", topic);
-      assert.match(JSON.parse(refused.stderr).error.message, /interactive terminal/u, topic);
+      if (UNSERVED_TOPICS.has(topic)) {
+        // Refused earlier still: the API version this build speaks cannot
+        // serve it, which is decided before the terminal is even looked at.
+        assert.equal(refused.code, 8, `installed ${topic} must refuse as not served`);
+        assert.equal(JSON.parse(refused.stderr).error.code, "cuna.contract.operation_not_served", topic);
+      } else {
+        assert.equal(refused.code, 2, `installed ${topic} must refuse a redirected terminal`);
+        assert.equal(JSON.parse(refused.stderr).error.code, "cuna.usage.invalid", topic);
+        assert.match(JSON.parse(refused.stderr).error.message, /interactive terminal/u, topic);
+      }
       assert.equal(authority.state.servedRequests, before, `installed ${topic} reached the producer before refusing`);
     }
     await runBoundedConcurrent(INSTALLED_FAILURE_MATRIX, READ_ONLY_MATRIX_CONCURRENCY, async (entry) => {
@@ -1028,6 +1035,11 @@ const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze([
 // A refusal is not a success. Interactive success acceptance for `observe` and
 // `share` stays OPEN and is not claimed by this test.
 const INTERACTIVE_HUMAN_LOGIN_TOPICS = Object.freeze(["observe", "share"]);
+// Routed, but the vendored contract (the deployed producer 3dfa1d1, C4.15) has
+// no operation they send, so they refuse before anything else is checked. When
+// a synchronized contract serves them again, these rows fail and must be
+// re-decided, which is the point.
+const UNSERVED_TOPICS = new Set(["share", "machines live-update-supervisor", "machines live-update-status"]);
 // Bare `sync` is still reserved (the `sync/reserved` row below), but it is no
 // longer a leaf topic once `sync recover` exists, exactly as `config` is not.
 const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "companion"]);
@@ -1046,12 +1058,13 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   // prove the combined refusal; the no-flag invocation in the read-only phase
   // covers the redirected-terminal case on valid arguments.
   { id: "observe/non-interactive", argv: ["observe", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
-  { id: "share/non-interactive", argv: ["share", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
+  { id: "share/non-interactive", argv: ["share", "--project", PROJECT_ID, "--json"], exit: 8, code: "cuna.contract.operation_not_served" },
   { id: "machines/usage", argv: ["machines", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
-  // Both live-update refusals are decided before configuration or transport.
-  { id: "machines/live-update-supervisor/confirmation", argv: ["machines", "live-update-supervisor", ID, "--json"], exit: 4, code: "cuna.confirmation.required" },
-  { id: "machines/live-update-status/usage", argv: ["machines", "live-update-status", "--json"], exit: 2, code: "cuna.usage.invalid" },
-  { id: "machines/live-update-supervisor/usage", argv: ["machines", "live-update-supervisor", ID, "--yes", "--forget-unknown", "--json"], exit: 2, code: "cuna.usage.invalid" },
+  // Both live-update commands are refused as not served before configuration,
+  // transport, confirmation or usage is checked (UNSERVED_TOPICS).
+  { id: "machines/live-update-supervisor/not-served", argv: ["machines", "live-update-supervisor", ID, "--json"], exit: 8, code: "cuna.contract.operation_not_served" },
+  { id: "machines/live-update-status/not-served", argv: ["machines", "live-update-status", "--json"], exit: 8, code: "cuna.contract.operation_not_served" },
+  { id: "machines/live-update-supervisor/not-served-with-usage-error", argv: ["machines", "live-update-supervisor", ID, "--yes", "--forget-unknown", "--json"], exit: 8, code: "cuna.contract.operation_not_served" },
   { id: "records/usage", argv: ["records", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "authorizations/usage", argv: ["authorizations", "list", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "account/usage", argv: ["account", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },

@@ -120,6 +120,12 @@ export interface RunCliDependencies {
    */
   readonly convergencePoller?: ConvergencePoller;
   readonly clientFactory?: (config: EffectiveConfig, timeoutMs: number) => CunaApiClient;
+  /**
+   * The API operations this invocation may send. Defaults to the vendored
+   * contract's; a test that exercises a command the vendored contract cannot
+   * serve names the operations of the contract it stands for.
+   */
+  readonly contractOperations?: ReadonlySet<string>;
   readonly humanAuth?: HumanAuthService;
   readonly credentialVault?: CredentialVault;
   readonly browser?: BrowserOpener;
@@ -1289,7 +1295,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // Preflight gates and configuration must read the same invocation
     // environment. This keeps credential and profile selection deterministic
     // across embedded invocations.
-    if (parsed.command !== undefined) preflightInvocation(parsed, (dependencies.now ?? Date.now)());
+    if (parsed.command !== undefined) {
+      preflightInvocation(parsed, (dependencies.now ?? Date.now)(), dependencies.contractOperations);
+    }
     if(parsed.command==="observe"&&(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true))throw usageError("observe requires an interactive terminal; JSON and redirected output are unsupported.");
     if(parsed.command==="share"&&(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true))throw usageError("share requires an interactive terminal; JSON and redirected output are unsupported.");
 

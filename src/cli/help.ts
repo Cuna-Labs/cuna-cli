@@ -2,7 +2,8 @@ import { exitCodeHelpSection } from "../core/exit-codes.js";
 import { brandedEnvironmentNames } from "../core/namespace.js";
 import { API_KEYS_URL } from "../core/product-web.js";
 import { CLI_PACKAGE_NAME } from "../version.js";
-import { CLI_ROUTE_REGISTRY } from "./parser.js";
+import { CLI_ROUTE_REGISTRY, type CliRouteDefinition } from "./parser.js";
+import { isRouteServedByContract, VENDORED_CONTRACT_OPERATIONS } from "./route-contract.js";
 
 // Help is the only place most users learn a variable name, so it is derived
 // from the same authority the resolver reads. A hand-written name here would go
@@ -135,24 +136,31 @@ export const SHORT_HELP = renderShortHelp();
  */
 export const COMMAND_REFERENCE_LEGEND = `  [routed]   this build dispatches the command
   [reserved] this build accepts the name and refuses
-  Neither marker is a server answer. Run \`cuna capabilities\` for what the
+  [unserved] this build routes the command, but the Cuna API version it speaks
+             has no operation it sends; it refuses before sending anything
+  None of these markers is a server answer. Run \`cuna capabilities\` for what the
   server currently proves for your account, machine, or AgentSession.
 `;
 
+/** The marker of one route: its dispatch, or `unserved` when the contract lacks an operation it sends. */
+export function routeMarker(route: CliRouteDefinition, served: ReadonlySet<string> = VENDORED_CONTRACT_OPERATIONS): string {
+  return route.dispatch === "routed" && !isRouteServedByContract(route, served) ? "unserved" : route.dispatch;
+}
+
 /** One generated line per semantic parser route; tests parse these markers. */
-export const COMPLETE_COMMAND_REFERENCE = CLI_ROUTE_REGISTRY
-  .map((route) => `  [${route.dispatch}] ${route.key} :: cuna ${route.syntax}\n      ${route.summary}`)
-  .join("\n");
+export function renderCompleteCommandReference(served: ReadonlySet<string> = VENDORED_CONTRACT_OPERATIONS): string {
+  return CLI_ROUTE_REGISTRY
+    .map((route) => `  [${routeMarker(route, served)}] ${route.key} :: cuna ${route.syntax}\n      ${route.summary}`)
+    .join("\n");
+}
 
-export const FULL_HELP = `Cuna CLI
+export const COMPLETE_COMMAND_REFERENCE = renderCompleteCommandReference();
 
-Run cloud development agents from your local command line through public Cuna contracts.
-
-Usage:
-  cuna <command> [options]
-
-Available now:
-  signup                               Create a waitlist-only Cuna account in the browser
+/**
+ * "Available now" as written, one entry per command line; a line indented
+ * deeper than two spaces continues the entry above it.
+ */
+const AVAILABLE_NOW_ENTRIES = `  signup                               Create a waitlist-only Cuna account in the browser
   login                                Sign in through the browser and paste the durable login code
   whoami                               Show account context; reuse the encrypted session
   access status                        Print the same lines whoami prints, as record access.status
@@ -194,9 +202,51 @@ Available now:
   version                              Show the CLI version, build digest, and protocol range
   help [--all]                         Show primary or complete help
   sync recover [PATH] --yes            Bring a folder whose workspace sync stopped back to syncing;
-                                       keeps both versions of every conflict, or refuses and says why
+                                       keeps both versions of every conflict, or refuses and says why`;
 
-Foreground terminal attach (the server must grant terminal_connections.create):
+/** The route keys one help line names, expanding `a|b|c` alternatives. */
+function helpLineKeys(line: string): readonly string[] {
+  const words: string[] = [];
+  for (const word of line.trim().split(/\s+/u)) {
+    if (!/^[a-z][a-z|-]*$/u.test(word)) break;
+    words.push(word);
+  }
+  const [command, action] = words;
+  if (command === undefined) return [];
+  return action === undefined ? command.split("|") : action.split("|").map((each) => `${command} ${each}`);
+}
+
+/**
+ * "Available now" minus every entry whose commands the vendored contract
+ * cannot serve; those move to their own section, so help never lists a
+ * command as available that the API it speaks has no route for.
+ */
+function availableNowSection(served: ReadonlySet<string>): string {
+  const unserved = new Set(CLI_ROUTE_REGISTRY.filter((route) => routeMarker(route, served) === "unserved").map((route) => route.key));
+  const entries: string[][] = [];
+  for (const line of AVAILABLE_NOW_ENTRIES.split("\n")) {
+    if (/^ {2}\S/u.test(line) || entries.length === 0) entries.push([line]);
+    else entries.at(-1)?.push(line);
+  }
+  const kept: string[] = [];
+  const moved: string[] = [];
+  for (const entry of entries) {
+    const keys = helpLineKeys(entry[0] ?? "");
+    (keys.length > 0 && keys.every((key) => unserved.has(key)) ? moved : kept).push(...entry);
+  }
+  const section = `Available now:\n${kept.join("\n")}\n\n`;
+  return moved.length === 0 ? section : `${section}Not served by this Cuna API version (it has no operation they send; they refuse\nbefore sending anything):\n${moved.join("\n")}\n\n`;
+}
+
+export function renderFullHelp(served: ReadonlySet<string> = VENDORED_CONTRACT_OPERATIONS): string {
+  return `Cuna CLI
+
+Run cloud development agents from your local command line through public Cuna contracts.
+
+Usage:
+  cuna <command> [options]
+
+${availableNowSection(served)}Foreground terminal attach (the server must grant terminal_connections.create):
   connect SESSION_ID [SESSION_ID...]   Attach 1-4 exact cloud sessions in this terminal
   agent-sessions attach SESSION_ID     Attach one exact cloud session in this terminal
   agent logout --agent-session ID      Sign Claude Code or Codex out of one exact AgentSession
@@ -250,7 +300,7 @@ Reserved and fail-closed in this build:
 
 Complete command reference:
 ${COMMAND_REFERENCE_LEGEND}
-${COMPLETE_COMMAND_REFERENCE}
+${renderCompleteCommandReference(served)}
 
 Compatibility aliases (advanced only):
   cuna --help             Alias for primary help
@@ -287,6 +337,9 @@ Authentication:
 Canonical install:
   npm install --global ${CLI_PACKAGE_NAME}
 `;
+}
+
+export const FULL_HELP = renderFullHelp();
 
 /**
  * The root topic. Bare \`cuna\` and \`cuna --help\` answer with the short

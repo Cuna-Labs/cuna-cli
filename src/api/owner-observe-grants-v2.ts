@@ -555,6 +555,10 @@ export function ownerObserveGrantsApi(transport:HttpTransport,owner:string,proje
    * history of the very change the owner is trying to finish.
    */
   async readAudience(input:ReadAudienceInput,operationId:string,signal:AbortSignal):Promise<SessionAudienceState>{
+   // Projected only when the vendored contract has it (the deployed d3d3d3c
+   // does not). Absent, the question is refused here and never sent.
+   const readOperation=(ownerObserveGrantOperations as Partial<Record<string,{readonly path:string}>>).readSessionAudienceStateV2;
+   if(readOperation===undefined)throw new OwnerGrantError('unavailable','This Cuna API version has no sharing-state reading, so Cuna asked nothing and nothing about sharing changed.');
    assertCanonicalUuid(input.agentSessionId,'AgentSession ID');assertCanonicalUuid(operationId,'Operation ID');
    if(input.reconcile!==undefined){
     assertCanonicalUuid(input.reconcile.operationId,'Operation ID');
@@ -562,7 +566,7 @@ export function ownerObserveGrantsApi(transport:HttpTransport,owner:string,proje
    }
    const body={version:'2',operation_id:operationId,...(input.reconcile===undefined?{}:{reconcile_operation_id:input.reconcile.operationId})};
    check(body,'ReadSessionAudienceStateV2Request','sharing question');
-   const answer=await send(ownerObserveGrantOperations.readSessionAudienceStateV2.path.replace('{id}',input.agentSessionId),body,false,signal,'audience-state');
+   const answer=await send(readOperation.path.replace('{id}',input.agentSessionId),body,false,signal,'audience-state');
    check(answer,'SessionAudienceStateV2Receipt','sharing state');
    const receipt=answer as {state:'reconciled';
     current:{request_id:string;agent_session_id:string;session_incarnation:string;process_epoch:string;logical_terminal_id:string;

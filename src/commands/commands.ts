@@ -9,6 +9,7 @@ import {
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import { labelledLines } from "../cli/labelled-lines.js";
 import { recordLabel } from "../cli/record-labels.js";
+import { assertRouteServedByContract } from "../cli/route-contract.js";
 import type {
   AgentAuthMode,
   AgentKind,
@@ -1223,8 +1224,9 @@ function capabilityRecord(snapshot: CapabilitySnapshot): Readonly<Record<string,
 export function preflightInvocation(
   parsed: ParsedInvocation,
   now: number = Date.now(),
+  contractOperations?: ReadonlySet<string>,
 ): void {
-  assertRegisteredCliRoute(parsed);
+  assertRouteServedByContract(assertRegisteredCliRoute(parsed), contractOperations);
   switch (parsed.command) {
     case "config":
       rejectUnknownOptions(parsed, []);

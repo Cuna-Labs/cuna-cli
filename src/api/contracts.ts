@@ -768,10 +768,24 @@ function decodeAgentSession(value: unknown): AgentSession {
     "row_version",
     "created_at",
     "updated_at",
+    // Declared by producer d3d3d3c and sent only to a read that asks with
+    // `include_readiness=true`, which this CLI never does. Accepted, checked
+    // for shape and not carried, so a row that carries them anyway stays
+    // readable instead of making its whole page `no_unknown_fields`.
+    "readiness_deadline_at",
+    "readiness_outcome",
+    "readiness_reason",
+    "readiness_settled_at",
   ]);
   if (Object.keys(value).some((key) => !allowed.has(key))) {
     throw contractViolation("no_unknown_fields");
   }
+  for (const key of ["readiness_outcome", "readiness_reason"]) {
+    const token = optionalString(value, key);
+    if (token !== undefined && !/^[a-z][a-z0-9_]{0,63}$/u.test(token)) throw contractViolation("safe_token", key);
+  }
+  optionalString(value, "readiness_deadline_at");
+  optionalString(value, "readiness_settled_at");
   const agent = enumField(value, "agent", AGENTS);
   const authMode = enumField(value, "auth_mode", AUTH_MODES);
   // Read paths intentionally remain tolerant of legacy OpenCode rows.  The

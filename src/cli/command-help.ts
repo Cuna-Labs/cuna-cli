@@ -1,5 +1,6 @@
-import { ROOT_HELP } from "./help.js";
+import { ROOT_HELP, routeMarker } from "./help.js";
 import { CLI_ROUTE_REGISTRY } from "./parser.js";
+import { missingContractOperations } from "./route-contract.js";
 
 /**
  * Help for one command, and for one action within a command.
@@ -493,6 +494,23 @@ export const HELP_ROUTE_KEYS: readonly string[] = Object.freeze(
   CLI_ROUTE_REGISTRY.map((route) => route.key),
 );
 
+/**
+ * The line that opens a topic whose command, or some of whose actions, the API
+ * version this build speaks cannot serve (`cli/route-contract.ts`). Help for
+ * such a command stays readable; it just never reads as available.
+ */
+function unservedNotice(command: string, action: string | undefined): string {
+  const unserved = CLI_ROUTE_REGISTRY.filter((route) =>
+    route.command === command && (action === undefined || route.action === action) && routeMarker(route) === "unserved");
+  if (unserved.length === 0) return "";
+  if (action !== undefined || (unserved.length === 1 && unserved[0]?.action === undefined)) {
+    return `Not served by this Cuna API version: it has no ${missingContractOperations(unserved[0]!).join(", ")}.\n` +
+      "This command refuses before sending anything.\n\n";
+  }
+  return `Not served by this Cuna API version, and refused before sending anything: ${
+    unserved.map((route) => route.action ?? route.command).join(", ")}.\n\n`;
+}
+
 /** Help for `command` plus its action operands, falling back to the root help. */
 export function commandHelp(command: string | undefined, operands: readonly string[]): string {
   if (command === undefined) return ROOT_HELP;
@@ -500,9 +518,10 @@ export function commandHelp(command: string | undefined, operands: readonly stri
   const action = operands[0];
   if (action !== undefined) {
     const specific = COMMAND_HELP[`${command} ${action}`];
-    if (specific !== undefined) return specific;
+    if (specific !== undefined) return `${unservedNotice(command, action)}${specific}`;
   }
-  return COMMAND_HELP[command] ?? ROOT_HELP;
+  const topic = COMMAND_HELP[command];
+  return topic === undefined ? ROOT_HELP : `${unservedNotice(command, undefined)}${topic}`;
 }
 
 /** The exact topic `commandHelp` resolved, for the `--json` record. */

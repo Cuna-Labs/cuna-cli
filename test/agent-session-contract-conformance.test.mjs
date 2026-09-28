@@ -66,6 +66,14 @@ const VALUE = Object.freeze({
   runtime_observed_at: "2026-09-07T22:00:00.000+00:00",
   runtime_expires_at: "2026-09-07T22:00:30.000+00:00",
   termination_requested_at: "2026-09-07T22:00:10.000+00:00",
+  // Added by the d3d3d3c synchronization. The producer sends these only to a
+  // read that asks with `include_readiness=true`, which this CLI never does;
+  // the decoder accepts them (and carries none), so a row that has them anyway
+  // stays readable.
+  readiness_deadline_at: "2026-09-07T22:05:00.000+00:00",
+  readiness_outcome: "refused",
+  readiness_reason: "deadline_unattested",
+  readiness_settled_at: "2026-09-07T22:05:01.000+00:00",
   row_version: 7,
   created_at: "2026-09-07T20:25:41.348866+00:00",
   updated_at: "2026-09-07T22:00:00.000000+00:00",
