@@ -279,6 +279,65 @@ test("E14-D6: detaching with Ctrl+] d prints one line after the terminal is rest
   assert.ok(events.indexOf("host:restore") < events.indexOf("detach-line"), "the line follows the restore, never precedes it");
 });
 
+// D13. A reconnect refused while attached is the tab's state; a later Ctrl+] d
+// is still a detach. Measured 2026-09-28: `cuna claude` detached after 8.5 min
+// attached and printed "This AgentSession's terminal cannot be recovered" for
+// AgentSession f3cd5d5c, which `cuna claude --agent-session` reattached a
+// minute later. Both commands run this same runner.
+test("D13: a deliberate detach after a refused reconnect prints the Detached line, not the refusal", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+    coordinatorOptions: { reconnectAttempts: 2, reconnectBaseDelayMs: 1 },
+  });
+  await waitUntil(() => events.filter((event) => event === "wire:connected").length === 1, "the initial terminal should connect");
+  // From here the Machine does not vouch for the terminal's owner, exactly the
+  // refusal the Edge sends while a live process is not re-attested yet.
+  system.controlPlane.discoverCapabilities = async (_scope, id) => {
+    events.push(`capability:${id}`);
+    const snapshot = capability(id, "temporarily_unavailable");
+    snapshot.capabilities[0].reasonCode = "terminal_owner_unrecoverable";
+    return snapshot;
+  };
+  system.interruptActiveConnections();
+  await waitUntil(() => /Reconnect failed/u.test(new TextDecoder().decode(host.writes.at(-1) ?? new Uint8Array())), "the refused reconnect is shown", 10_000);
+  const writesBeforeDetach = host.writes.length;
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
+  await operation;
+  assert.equal(host.restored, 1);
+  const afterRestore = host.writes.slice(writesBeforeDetach).map((bytes) => new TextDecoder().decode(bytes));
+  assert.equal(afterRestore.at(-1), `Detached · session 1111 keeps running · cuna connect ${SESSION_A}\n`);
+});
+
+test("D13 control: the same refusal at attach time still refuses the attach", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  system.controlPlane.discoverCapabilities = async (_scope, id) => {
+    const snapshot = capability(id, "temporarily_unavailable");
+    snapshot.capabilities[0].reasonCode = "terminal_owner_unrecoverable";
+    return snapshot;
+  };
+  await assert.rejects(
+    runSupportedForegroundSessions({
+      client: fakeClient(events),
+      baseUrl: "https://api.getcuna.com",
+      agentSessionIds: [SESSION_A],
+    }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW }),
+    (error) => error.safeDetails?.reason_code === "terminal_owner_unrecoverable",
+  );
+  assert.equal(host.acquired, 0);
+});
+
 // Control: a foreground that ends without a local detach prints no such line.
 test("E14-D6 control: a cancelled foreground prints no detach line", async () => {
   const events = [];

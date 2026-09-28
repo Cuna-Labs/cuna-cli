@@ -775,8 +775,12 @@ test("foreground Cuna renders an unrecoverable terminal with exact-session recov
 
   assert.equal(exit, EXIT_CODES.policy);
   const visible = stripAnsi(interactive.stderr());
-  assert.match(visible, /CUNA  This AgentSession's terminal cannot be recovered/u);
-  assert.match(visible, /cannot be recovered/u);
+  // The same reason code also answers for a live process whose Machine has not
+  // re-attested it yet (AgentSession f3cd5d5c, 2026-09-28, reattached a minute
+  // later), so the words never declare the session gone.
+  assert.match(visible, /CUNA  This AgentSession's terminal is not reachable right now/u);
+  assert.match(visible, /may have ended, or the Machine has not re-announced it yet/u);
+  assert.doesNotMatch(visible, /cannot be recovered|no longer available/u);
   assert.doesNotMatch(visible, /Machine restarted|machine restarted|No terminal connection was created|remote AgentSession was not changed/u);
   assert.ok(visible.includes(`cuna agent-sessions get ${FOREGROUND_SESSION_A}`), "recovery inspects the exact selected session before suggesting replacement");
   assert.match(visible, /--new-session/u);

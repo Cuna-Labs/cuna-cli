@@ -2148,6 +2148,14 @@ export class ForegroundTerminalCoordinator {
         label: departing.intent.label,
       }));
     }
+    // A reconnect that failed earlier on this tab was the tab's state, not the
+    // run's outcome, and the person has now left the tab on purpose. Kept, it
+    // outlived the confirmed detach and `failure` handed it to the runner as the
+    // run's failure. On 2026-09-28 a `Ctrl+] d` after 8.5 min attached printed
+    // "This AgentSession's terminal cannot be recovered" for AgentSession
+    // f3cd5d5c, which reattached a minute later; a stored reconnect refusal is
+    // the path from a confirmed detach to that message.
+    this.#recoverableReconnectFailures.delete(tabId);
     try {
       if (animate && this.#tabs.size === 1) {
         this.#disconnectNotice = "✓ Disconnected.";

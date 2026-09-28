@@ -722,9 +722,10 @@ function terminalSupervisorReadiness(error: CunaError): TerminalSupervisorReadin
     error.code !== "cuna.runtime.capability_unavailable"
   ) return undefined;
   const reason = error.details?.reason_code;
-  // The process this AgentSession named is gone for good (the Machine
-  // restarted, or the owner could not be recovered). Nothing can still
-  // arrive, so this is BLOCKED with a route, never a "try again in a moment".
+  // The Machine does not vouch for the process this AgentSession named: it
+  // may have ended, or it may not be re-attested yet. This attempt is refused
+  // with a route (inspect, then reopen or replace), never a promise that
+  // waiting a moment will fix it.
   if (reason === "terminal_owner_unrecoverable") return "ended";
   if (isOpenCodeSupervisorUpgradeReason(reason)) return "upgrade_required";
   if (reason === "runtime_lease_expired") return "lease_expired";
@@ -761,10 +762,16 @@ function writeTerminalSupervisorReadiness(
     }
   };
   if (state === "ended") {
-    stream.write(`${accent("◆ CUNA")}  This AgentSession's terminal cannot be recovered\n`);
-    stream.write("The exact process or retained terminal is no longer available.\n");
+    // The Edge answers `terminal_owner_unrecoverable` for two different facts:
+    // a process the durable row says has settled, and a live process whose
+    // Machine has not yet re-attested its terminal (a restart or reconnect
+    // window). This CLI cannot tell them apart, so it says what it knows and
+    // never that a session is gone: AgentSession f3cd5d5c was reported
+    // unrecoverable on 2026-09-28 and reattached a minute later.
+    stream.write(`${accent("◆ CUNA")}  This AgentSession's terminal is not reachable right now\n`);
+    stream.write("Its Machine does not currently vouch for the terminal's process: the process may have ended, or the Machine has not re-announced it yet.\n");
     inspection();
-    stream.write("Start a fresh one with `cuna <claude|codex|opencode> --new-session`.\n");
+    stream.write("If it still reads running, open it again with the same command; if it has ended, start a fresh one with `cuna <claude|codex|opencode> --new-session`.\n");
     return;
   }
   if (state === "upgrade_required") {
@@ -2342,8 +2349,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         supervisorReadiness,
         terminalSessionIds,
       );
-      // A process that is gone is a final refusal, not a network condition:
-      // retrying cannot change it, so the exit code must not say "retry".
+      // An unattested owner is a refusal of this attempt, not a network
+      // condition: an automatic retry cannot change it, so the exit code must
+      // not say "retry". The words above leave reopening to the person.
       return supervisorReadiness === "ended" ? EXIT_CODES.policy : error.exitCode;
     }
     writer.error(label, error);
