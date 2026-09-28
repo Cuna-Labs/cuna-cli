@@ -73,7 +73,12 @@ function isOpenCodeAgentSessionCreate(input: Readonly<{
  * operation was not found." The vaguer half is the half a reader meets straight
  * after typing an id, which is the worst place for it. One 404, one sentence.
  */
-function notFoundSubject(path: string): { readonly subject: string; readonly id: string } | undefined {
+function notFoundSubject(path: string): {
+  readonly subject: string;
+  readonly id: string;
+  /** Set when the subject lives inside one Machine and has its own id. */
+  readonly machineId?: string;
+} | undefined {
   // A resource-scoped capability query carries its subject in the query string
   // rather than the path, and it is the one command whose entire job is a
   // resource-scoped question -- so it is the last place that should answer with
@@ -83,6 +88,20 @@ function notFoundSubject(path: string): { readonly subject: string; readonly id:
     return {
       subject: scoped[1] === "machine" ? "Machine" : "AgentSession",
       id: decodeURIComponent(scoped[2]),
+    };
+  }
+  // A child with its own id inside a Machine is the subject, not the Machine.
+  // `cuna executions get <unknown> --machine M` on a running, owned M read
+  // "Machine M is not available to this account." with the server's reason
+  // `managed_exec_not_found` beside it (measured 2026-09-28): the execution was
+  // missing. The Machine stays in the sentence, because a 404 here cannot say
+  // which of the two is absent.
+  const child = /^\/v\d+\/sessions\/([^/?]+)\/(executions|supervisor\/live-update)\/([^/?]+)/u.exec(path);
+  if (child !== null && child[1] !== undefined && child[2] !== undefined && child[3] !== undefined) {
+    return {
+      subject: child[2] === "executions" ? "Execution" : "In-place supervisor update",
+      id: decodeURIComponent(child[3]),
+      machineId: decodeURIComponent(child[1]),
     };
   }
   const match = /^\/v\d+\/(sessions|agent-sessions|api-keys|workspace-bindings)\/([^/?]+)/u.exec(path);
@@ -463,14 +482,18 @@ function apiError(input: {
       ? "Cuna rejected the request."
       : subject === undefined
         ? "The requested Cuna resource or operation was not found."
-        : `${subject.subject} ${subject.id} is not available to this account.`,
+        : subject.machineId === undefined
+          ? `${subject.subject} ${subject.id} is not available to this account.`
+          : `${subject.subject} ${subject.id} on Machine ${subject.machineId} is not available to this account.`,
     exitCode: EXIT_CODES.remote,
     hint: status === 404
       ? subject?.subject === "Machine"
         ? "Run `cuna machines list` to see the Machines on this account."
         : subject?.subject === "AgentSession"
           ? "Run `cuna agent-sessions list --machine <id>` to see the AgentSessions on a Machine."
-          : "The identifier does not name a resource this account can see. Re-list to get a current one."
+          : subject?.subject === "Execution" && subject.machineId !== undefined
+            ? `Run \`cuna executions list --machine ${subject.machineId}\` to see the remote commands on that Machine.`
+            : "The identifier does not name a resource this account can see. Re-list to get a current one."
       : OFF_CONTRACT_RESPONSE_HINT,
     ...(problem === undefined ? {} : { retryable: problem.retryable }),
     details,
