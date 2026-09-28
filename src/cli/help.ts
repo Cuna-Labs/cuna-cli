@@ -56,6 +56,17 @@ const CURRENT_PROVIDER_COMMANDS = Object.freeze(
     .filter((key) => Object.hasOwn(PROVIDER_LABELS, key)),
 );
 
+/**
+ * One "Start here" row. Every row shares one description column; the provider
+ * rows used to pad from their own width and landed six columns right of the
+ * two rows above them.
+ */
+const START_COMMAND_WIDTH = 22;
+
+function startRow(command: string, description: string): string {
+  return `  ${command.padEnd(START_COMMAND_WIDTH)}  ${description}`;
+}
+
 /** Commands printed by first-run help, ending in the guided root journey. */
 export const FIRST_RUN_TRANSCRIPT: readonly (readonly string[])[] = Object.freeze([
   Object.freeze(["login"]),
@@ -86,15 +97,15 @@ export function renderShortHelp(
   const routed = new Set(routedProviderCommands);
   const providerLines = CURRENT_PROVIDER_COMMANDS
     .filter((command) => routed.has(command))
-    .map((command) => `  cuna ${command} [PATH]${" ".repeat(Math.max(1, 18 - command.length))}${PROVIDER_LABELS[command]}`)
+    .map((command) => startRow(`cuna ${command} [PATH]`, PROVIDER_LABELS[command] ?? ""))
     .join("\n");
   return `Cuna CLI
 
 Open a machine, pick an agent, keep working.
 
 Start here:
-  cuna                    Choose a machine, agent, and session
-  cuna machines           Browse machines and the sessions inside them
+${startRow("cuna", "Choose a machine, agent, and session")}
+${startRow("cuna machines", "Browse machines and the sessions inside them")}
 ${providerLines}
 
 First run:
@@ -173,9 +184,15 @@ Available now:
   agent-sessions get ID                Read one child process
   agent-sessions rename ID --name NAME Rename one child process
   agent-sessions terminate ID          Terminate when server-advertised
+  executions list --machine ID         List remote commands and their remaining process ownership
+  executions get ID --machine ID       Inspect one exact remote command
+  executions cancel ID --machine ID --yes
+                                       Request cancellation of one remote command and its descendants
   config get                           Show effective, redacted configuration
   self-test --offline                  Verify the installed CLI without network access
   doctor                               Report platform, runtime, and encrypted local session-store state
+  version                              Show the CLI version, build digest, and protocol range
+  help [--all]                         Show primary or complete help
 
 Foreground terminal attach (the server must grant terminal_connections.create):
   connect SESSION_ID [SESSION_ID...]   Attach 1-4 exact cloud sessions in this terminal
