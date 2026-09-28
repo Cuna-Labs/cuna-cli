@@ -1746,10 +1746,10 @@ test("session tabs: a click attaches the other session as its own client, and go
   }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
   await clickTab(host, "2:Claude projB");
   await waitUntil(() => system.grantClients().length === 2 && host.input !== undefined, "B is attached");
-  await waitUntil(() => /\[2:Claude projB\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "B is the bracketed tab");
+  await waitUntil(() => /\[2:Claude projB 22222222\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "B is the bracketed tab");
   await clickTab(host, "1:Claude projA");
   await waitUntil(() => system.grantClients().length === 3 && host.input !== undefined, "A is attached again");
-  await waitUntil(() => /\[1:Claude projA\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "A is the bracketed tab");
+  await waitUntil(() => /\[1:Claude projA 11111111\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "A is the bracketed tab");
   host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   const grants = events.filter((event) => event.startsWith("grant:"));
@@ -1782,7 +1782,7 @@ test("session tabs: when the target cannot be attached, the run returns once to 
   }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW, mouseReporting: true });
   await clickTab(host, "2:Claude projB");
   await waitUntil(() => system.grantClients().length === 2 && host.input !== undefined, "A is attached again");
-  await waitUntil(() => /Could not switch to Claude projB: capability/u.test(new TextDecoder().decode(host.writes.at(-1))), "the reason is on the bar");
+  await waitUntil(() => /Could not switch to Claude projB 22222222: capability/u.test(new TextDecoder().decode(host.writes.at(-1))), "the reason is on the bar");
   const [first, back] = system.grantClients();
   assert.equal(back, first, "the way back is the same client");
   assert.deepEqual(events.filter((event) => event.startsWith("grant:")), [`grant:${SESSION_A}`, `grant:${SESSION_A}`], "B never got a grant");
@@ -2004,7 +2004,7 @@ test("session tabs: a switch does not wait on a slow provider sign-in probe", as
   await clickTab(host, "2:Claude projB");
   const started = Date.now();
   await waitUntil(() => system.grantClients().length === 2, "B is granted", 4_000);
-  await waitUntil(() => host.input !== undefined && /\[2:Claude projB\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "B is on screen");
+  await waitUntil(() => host.input !== undefined && /\[2:Claude projB 22222222\]/u.test(new TextDecoder().decode(host.writes.at(-1))), "B is on screen");
   assert.ok(Date.now() - started < 5_000, "bounded by the 2 s advisory timeout");
   assert.match(new TextDecoder().decode(host.writes.at(-1)), /Claude auth unknown/u, "an unanswered probe is shown as unknown");
   host.emitInput(Uint8Array.of(0x1d, 0x64));
@@ -2096,7 +2096,7 @@ test("a fresh auth answer from a detached session cannot repaint its sibling aft
   try {
     await waitUntil(() => finishA !== undefined, "A auth probe should begin");
     await clickTab(host, "2:Claude projB");
-    await waitUntil(() => /\[2:Claude projB\]/u.test(new TextDecoder().decode(host.writes.at(-1) ?? new Uint8Array())),
+    await waitUntil(() => /\[2:Claude projB 22222222\]/u.test(new TextDecoder().decode(host.writes.at(-1) ?? new Uint8Array())),
       "B must become the active terminal");
     assert.equal(signalA?.aborted, true);
     assert.match(await visibleHostText(host), /Claude auth unknown/u);

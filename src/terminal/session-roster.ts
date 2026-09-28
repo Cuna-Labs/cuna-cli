@@ -33,7 +33,6 @@ interface RosterRecord {
   readonly agentSessionId: string;
   readonly agent: SessionRosterAgent;
   readonly name: string;
-  readonly folder: string;
   readonly createdAt: string;
   readonly ended: boolean;
   readonly rowVersion: number;
@@ -69,35 +68,38 @@ export function mergeSessionRoster(
 }
 
 /**
- * Numbers and labels for rendering. A name equal to the agent kind (the
- * journey names every session `claude-code`) says nothing next to the agent's
- * own label, so it is dropped. Equal displayed labels use the working folder's
- * last segment; when that also agrees, they use the id's first four characters.
- * The suffix survives the 40-character display limit.
+ * Numbers and labels for rendering: the session's own name when it has one,
+ * then the start of its AgentSession id, so every entry names a session and
+ * matches what `cuna agent-sessions list` prints. A name equal to the agent
+ * kind (the journey names every session `claude-code`) says nothing next to
+ * the agent's own label, so it is dropped. The id survives the 40-character
+ * display limit.
+ *
+ * The working folder is not part of the label. It used to break ties, and a
+ * journey's folder is its execution Workspace id, so the bar read `d3127234…`
+ * where the tab row named the session (installed 0.1.4, 2026-09-28). The
+ * folder stays in `cuna agent-sessions list` and `get`.
  */
 export function sessionRosterEntries(records: readonly RosterRecord[]): readonly SessionRosterEntry[] {
-  const bases = records.map((record) => truncateLabel(record.name === record.agent ? "" : record.name));
-  const baseCounts = countLabels(bases);
-  const folderCounts = countLabels(records.map((record, index) => `${bases[index]}\u0000${record.folder}`));
-  const labels = records.map((record, index) => {
-    const base = bases[index] ?? "";
-    if ((baseCounts.get(base) ?? 0) < 2) return base;
-    const folderKey = `${base}\u0000${record.folder}`;
-    const suffix = (folderCounts.get(folderKey) ?? 0) > 1 ? record.agentSessionId.slice(0, 4) : record.folder;
-    return appendLabelSuffix(base, suffix);
-  });
-  const displayedCounts = countLabels(labels);
-  return Object.freeze(records.map((record, index) => {
-    const label = labels[index] ?? "";
-    return Object.freeze({
-      number: index + 1,
-      agentSessionId: record.agentSessionId,
-      agent: record.agent,
-      label: (displayedCounts.get(label) ?? 0) > 1
-        ? appendLabelSuffix(bases[index] ?? "", record.agentSessionId.slice(0, 4)) : label,
-      ended: record.ended,
-    });
-  }));
+  const width = shortIdWidth(records.map((record) => record.agentSessionId));
+  return Object.freeze(records.map((record, index) => Object.freeze({
+    number: index + 1,
+    agentSessionId: record.agentSessionId,
+    agent: record.agent,
+    label: appendLabelSuffix(
+      truncateLabel(record.name === record.agent ? "" : record.name),
+      record.agentSessionId.slice(0, width),
+    ),
+    ended: record.ended,
+  })));
+}
+
+/** Eight id characters, as `f3cd5d5c`; longer only when two sessions here share them. */
+function shortIdWidth(ids: readonly string[]): number {
+  for (const width of [8, 13, 18, 23]) {
+    if (new Set(ids.map((id) => id.slice(0, width))).size === ids.length) return width;
+  }
+  return 36;
 }
 
 export interface PollingSessionRosterOptions {
@@ -184,17 +186,10 @@ function recordFor(session: AgentSession, ended: boolean): RosterRecord {
     agentSessionId: session.id,
     agent: session.agent as SessionRosterAgent,
     name: cleanText(session.name),
-    folder: cleanText(session.cwd.split(/[\\/]+/u).filter((part) => part.length > 0).at(-1) ?? ""),
     createdAt: session.createdAt,
     ended,
     rowVersion: session.rowVersion,
   });
-}
-
-function countLabels(labels: readonly string[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
-  return counts;
 }
 
 function appendLabelSuffix(base: string, suffix: string): string {
