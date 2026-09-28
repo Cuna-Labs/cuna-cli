@@ -398,6 +398,10 @@ class WireAuthority {
   committedRoot;
   changePage = Object.freeze({ selected_protocol: 2, items: Object.freeze([]), next_cursor: null });
   chunks = new Map();
+  /** Commits the authority refused; `refuseCommit` returns the error to raise, or undefined to accept. */
+  refused = [];
+  refuseCommit;
+  changesFailures = [];
 
   async request(request) {
     this.requests.push(Object.freeze({ method: request.method, path: request.path }));
@@ -423,6 +427,11 @@ class WireAuthority {
       });
     }
     if (request.path.endsWith("/commit")) {
+      const refusal = this.refuseCommit?.(request.body);
+      if (refusal !== undefined) {
+        this.refused.push(Object.freeze({ expectedGeneration: request.body.expected_generation, manifestRoot: request.body.manifest_root }));
+        throw refusal;
+      }
       this.commits.push(Object.freeze({ expectedGeneration: request.body.expected_generation, manifestRoot: request.body.manifest_root }));
       this.committedGeneration = request.body.expected_generation + 1;
       this.committedRoot = request.body.manifest_root;
@@ -436,7 +445,11 @@ class WireAuthority {
         minimum_writer: 1,
       });
     }
-    if (request.path.endsWith("/changes")) return this.#envelope(this.changePage);
+    if (request.path.endsWith("/changes")) {
+      const failure = this.changesFailures.shift();
+      if (failure !== undefined) throw failure;
+      return this.#envelope(this.changePage);
+    }
     if (request.method === "GET" && request.path.includes("/chunks/")) {
       const digest = request.path.split("/").at(-1);
       const bytes = this.chunks.get(digest);
@@ -788,6 +801,17 @@ function reattach(fixture, notices) {
   return effects(fixture.client, fixture.state, { transport: fixture.wire, onNotice: (line) => notices.push(line) });
 }
 
+/**
+ * The notices a test about catching up asserts, without the sync-state lines.
+ * On Windows a pull's atomic rename is sometimes refused with EPERM while
+ * another process holds the target (1 run in 6 locally, 2026-09-28); the
+ * supervisor pauses, retries and converges, and now says so in two lines whose
+ * presence depends on that timing, not on what these tests measure.
+ */
+function decisionNotices(notices) {
+  return notices.filter((line) => !line.startsWith("Workspace sync "));
+}
+
 const CATCH_UP_NOTICE = "The Machine changed this workspace while you were away · bringing generation 3 into this folder before sending local changes";
 
 // Defect A. Before the fix the re-attach committed generation 4 claiming base 3
@@ -814,7 +838,7 @@ test("a folder the Machine moved ahead of pulls the newer generation instead of 
     );
     await waitFor(() => second.continuousSyncSnapshot()?.generation === 3, "the folder never adopted generation 3");
     assert.deepEqual(fixture.wire.commits.slice(fixture.commitsBefore), [], "an unedited folder that caught up commits nothing");
-    assert.deepEqual(notices, [CATCH_UP_NOTICE]);
+    assert.deepEqual(decisionNotices(notices), [CATCH_UP_NOTICE]);
   } finally {
     await second.stopContinuousSync();
   }
@@ -863,7 +887,7 @@ test("a path changed here and on the Machine while detached keeps both versions 
     await waitFor(() => fixture.wire.commits.length > fixture.commitsBefore, "the local version was never sent");
     assert.equal(await readFile(join(fixture.project, "from-agent.txt"), "utf8"), "edited here while detached\n");
     assert.equal(await readFile(join(fixture.project, sibling), "utf8"), "edited on the Machine while detached\n");
-    assert.deepEqual(notices, [
+    assert.deepEqual(decisionNotices(notices), [
       CATCH_UP_NOTICE,
       `Workspace conflict on from-agent.txt · changed here and on the Machine · your version stays in place; the Machine's version is in ${sibling} (cuna.workspace_sync.conflict_retained)`,
     ]);
@@ -874,4 +898,190 @@ test("a path changed here and on the Machine while detached keeps both versions 
   } finally {
     await second.stopContinuousSync();
   }
+});
+
+/** The 409 the HTTP layer raises when a commit names a base that is no longer the newest generation. */
+function generationConflict() {
+  return new CunaError({
+    code: "cuna.remote.conflict",
+    message: "Cuna could not apply the operation because current state conflicts with it.",
+    exitCode: EXIT_CODES.conflict,
+    details: { http_status: 409, reason: "workspace_sync_generation_conflict" },
+  });
+}
+
+/**
+ * A folder attached right after committing generation 1, with its supervisor
+ * running. `arm` prepares the wire before the supervisor's first poll.
+ */
+async function attachedFolder(t, arm = () => {}) {
+  const { project, state } = await roots(t);
+  const { mkdir: makeDirectory, readFile, writeFile } = await import("node:fs/promises");
+  const capabilities = conservativeFilesystemCapabilities("windows");
+  await writeFile(join(project, "main.js"), "console.log(1);\n");
+  const policy = compileExclusionPolicy(
+    [{ source: "gitignore", text: "" }, { source: "cunaignore", text: "" }],
+    capabilities,
+  );
+  const wire = new WireAuthority();
+  const binding = {
+    bindingId: "40000000-0000-4000-8000-000000000040",
+    projectId: "50000000-0000-4000-8000-000000000040",
+    localInstanceId: "60000000-0000-4000-8000-000000000040",
+    remoteRoot: "/workspace/projects/50000000-0000-4000-8000-000000000040",
+    exclusionPolicyDigest: undefined,
+    bindingEpoch: 1,
+    minimumReader: 1,
+    minimumWriter: 2,
+    createdAt: "2026-09-28T01:00:00.000Z",
+    updatedAt: "2026-09-28T01:00:00.000Z",
+  };
+  const published = () => Object.freeze({
+    ...binding,
+    workspaceId: WORKSPACE,
+    machineId: MACHINE,
+    activeGeneration: wire.committedGeneration,
+    activeManifestRoot: wire.committedRoot ?? "0".repeat(64),
+  });
+  const client = {
+    async createWorkspaceBinding(input) {
+      binding.exclusionPolicyDigest = input.exclusionPolicyDigest;
+      return published();
+    },
+    async getWorkspaceBinding() { return published(); },
+    async getMachine(id) { return { id, name: "ws-qa", state: "running" }; },
+  };
+  const machineTree = async (files) => {
+    const directory = join(state, "machine-tree");
+    await makeDirectory(directory);
+    for (const [path, content] of Object.entries(files)) await writeFile(join(directory, path), content);
+    const manifest = await createWorkspaceManifest({ root: directory, policy, capabilities });
+    for (const entry of manifest.entries) {
+      if (entry.kind !== "file") continue;
+      const content = await readFile(join(directory, entry.path));
+      let offset = 0;
+      for (const chunk of entry.chunks) {
+        wire.chunks.set(chunk.digest, content.subarray(offset, offset + chunk.byteLength));
+        offset += chunk.byteLength;
+      }
+    }
+    return manifest;
+  };
+  const generation1 = await createWorkspaceManifest({ root: project, policy, capabilities });
+  arm(wire);
+  const notices = [];
+  const attached = effects(client, state, { transport: wire, onNotice: (line) => notices.push(line) });
+  assert.equal((await attached.synchronizeWorkspace({
+    machineId: MACHINE, localPath: project, syncMode: "enabled", signal: new AbortController().signal,
+  })).generation, 1);
+  return { project, wire, policy, capabilities, binding, attached, notices, generation1, machineTree };
+}
+
+// ws-qa 2026-09-28, through the real coordinator and its checkpoints: the
+// Machine commits generation 2 while this folder's commit on generation 1 is in
+// flight, and the authority answers 409 workspace_sync_generation_conflict.
+// Before the fix the supervisor stopped in `conflicted` for good and said
+// nothing; the folder's edit never reached the Machine.
+test("a commit refused because the Machine committed first is taken in, keeps both versions, and is sent again on top", async (t) => {
+  const { createHash } = await import("node:crypto");
+  const { readFile, writeFile } = await import("node:fs/promises");
+  const fixture = await attachedFolder(t);
+  const { wire, attached, notices } = fixture;
+  try {
+    const machine = await fixture.machineTree({ "main.js": "console.log('machine');\n" });
+    wire.refuseCommit = (body) => {
+      if (body.expected_generation !== 1) return undefined;
+      wire.refuseCommit = undefined;
+      wire.changePage = remoteGeneration(2, fixture.generation1, machine, fixture.policy.digest);
+      wire.committedGeneration = 2;
+      wire.committedRoot = machine.manifestRoot;
+      return generationConflict();
+    };
+    await writeFile(join(fixture.project, "main.js"), "console.log('here');\n");
+    await waitFor(() => wire.commits.length === 2, "the refused edit was never sent again");
+    await waitFor(() => attached.continuousSyncSnapshot()?.generation === 3, "the recommit was never adopted");
+    const suffix = createHash("sha256").update(`${fixture.binding.bindingId}\u00002\u0000main.js`).digest("hex").slice(0, 12);
+    const sibling = `main.js.cuna-conflict-2-${suffix}`;
+    assert.equal(await readFile(join(fixture.project, "main.js"), "utf8"), "console.log('here');\n");
+    assert.equal(await readFile(join(fixture.project, sibling), "utf8"), "console.log('machine');\n");
+    assert.deepEqual(wire.refused.map((commit) => commit.expectedGeneration), [1]);
+    const merged = await createWorkspaceManifest({ root: fixture.project, policy: fixture.policy, capabilities: fixture.capabilities });
+    assert.deepEqual(wire.commits.at(-1), { expectedGeneration: 2, manifestRoot: merged.manifestRoot });
+    const conflictLine = `Workspace conflict on main.js · changed here and on the Machine · your version stays in place; the Machine's version is in ${sibling} (cuna.workspace_sync.conflict_retained)`;
+    assert.deepEqual(decisionNotices(notices), [conflictLine]);
+    assert.equal(notices.some((line) => line.startsWith("Workspace sync stopped")), false, "a refusal as stale never stops sync");
+    await attached.stopContinuousSync();
+    assert.equal(
+      notices.some((line) => line.startsWith("Workspace sync was not live")),
+      false,
+      "a sync that was live when the run ended adds no line",
+    );
+  } finally {
+    await attached.stopContinuousSync();
+  }
+});
+
+// The notice, end to end, and the bound on the recovery above: an authority
+// that keeps refusing the base as stale while its change feed never moves. The
+// server answers the first commit; the next two are refused by the base's
+// `conflicted` checkpoint without a request. Before the fix the supervisor
+// stopped after the first refusal and nothing was ever shown.
+test("a sync that stops says so in one line while attached and again when the run ends", async (t) => {
+  const { writeFile } = await import("node:fs/promises");
+  const fixture = await attachedFolder(t);
+  const { wire, attached, notices } = fixture;
+  try {
+    wire.refuseCommit = () => generationConflict();
+    await writeFile(join(fixture.project, "main.js"), "console.log('here');\n");
+    const stopped = "Workspace sync stopped · files are not syncing between this folder and the Machine · conflicted (remote_advanced_unobserved)";
+    await waitFor(() => notices.includes(stopped), "the stop was never said");
+    assert.deepEqual(notices, [stopped]);
+    assert.equal(wire.refused.length, 1, "later attempts on the refused base are answered by its checkpoint, not sent");
+    await attached.stopContinuousSync();
+    assert.deepEqual(notices, [
+      stopped,
+      "Workspace sync was not live when this run ended · this folder is at generation 1 · conflicted (remote_advanced_unobserved)",
+    ]);
+  } finally {
+    await attached.stopContinuousSync();
+  }
+});
+
+// A pause says so once, and saying that sync is live again keeps the screen
+// true once the cause clears: here the first poll fails, and the reconciliation
+// that follows proves the folder converged.
+test("a paused sync says so once and says when it is live again", async (t) => {
+  const fixture = await attachedFolder(t, (wire) => { wire.changesFailures.push(new Error("offline")); });
+  const { attached, notices } = fixture;
+  try {
+    const paused = "Workspace sync paused · files are not syncing between this folder and the Machine · paused (dependency_unavailable)";
+    await waitFor(() => notices.length === 2, "the pause and the return to live sync were not both said");
+    assert.deepEqual(notices, [paused, "Workspace sync resumed · this folder is at generation 1"]);
+    await attached.stopContinuousSync();
+    assert.equal(notices.length, 2, "a converged sync adds no line when the run ends");
+  } finally {
+    await attached.stopContinuousSync();
+  }
+});
+
+test("sync state lines name the state and reason, and a live sync says nothing", async () => {
+  const { continuousSyncDetachNotice, continuousSyncNotice } = await import("../dist/journey/workspace-effects.js");
+  assert.equal(typeof continuousSyncNotice, "function");
+  const base = {
+    generation: 4, manifestRoot: "0".repeat(64), dirty: true,
+    pendingLocalOperations: 0, pendingRemoteChanges: 0, observedAt: "2026-09-28T01:18:20.767Z",
+  };
+  assert.equal(
+    continuousSyncNotice({ ...base, state: "recovery_required", reason: "remote_symlink_unsupported" }),
+    "Workspace sync stopped · files are not syncing between this folder and the Machine · recovery_required (remote_symlink_unsupported)",
+  );
+  for (const state of ["recovering", "reconciling", "catching_up", "live_unverified", "converged", "stopped"]) {
+    assert.equal(continuousSyncNotice({ ...base, state }), undefined, state);
+  }
+  assert.equal(continuousSyncDetachNotice({ ...base, state: "live_unverified" }), undefined);
+  assert.equal(continuousSyncDetachNotice({ ...base, state: "converged" }), undefined);
+  assert.equal(
+    continuousSyncDetachNotice({ ...base, state: "catching_up" }),
+    "Workspace sync was not live when this run ended · this folder is at generation 4 · catching_up",
+  );
 });

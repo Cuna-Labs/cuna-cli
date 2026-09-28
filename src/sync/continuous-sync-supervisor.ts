@@ -41,6 +41,13 @@ const DEFAULT_RECONCILE_MS = 60_000;
 const DEFAULT_REMOTE_POLL_MS = 750;
 const DEFAULT_OPERATION_LIMIT = 10_000;
 const DEFAULT_BYTE_LIMIT = 256 * 1024 * 1024;
+/**
+ * Commits refused as stale on one base before the supervisor stops. A stale
+ * refusal names a newer generation, and the change feed normally shows it on
+ * the very next poll; three refusals with the feed still silent mean the two
+ * authorities disagree, and retrying cannot settle that.
+ */
+const STALE_BASE_REFUSAL_LIMIT = 3;
 
 export type ContinuousSyncState =
   | "recovering"
@@ -75,7 +82,7 @@ export interface ContinuousSyncSnapshot {
  *   This is the guest's rule (PRD workspace live apply 2026-09-22 §3) seen
  *   from the other side, and the next local commit proposes the local version.
  * - `remote_in_place`: the incoming generation directly follows this folder's
- *   own commit and replaces a path that commit carried. That is how a
+ *   own commits and replaces a path one of them carried. That is how a
  *   conflict the Machine already resolved comes back (it kept its own bytes
  *   and captured them as the next generation), so the Machine's version is
  *   accepted and the local bytes are kept as the sibling.
@@ -128,6 +135,16 @@ export interface ContinuousSyncAuthority {
     readonly manifestRoot: string;
     readonly signal: AbortSignal;
   }): Promise<ContinuousSyncReconcileReceipt>;
+  /**
+   * Whether this installation's commit on `baseGeneration` was refused
+   * outright. A refusal is certain, unlike a lost answer: nothing of that
+   * commit landed, and its edits exist only in the folder. Without this
+   * method every interrupted commit stays uncertain until reconciled.
+   */
+  commitRefused?(input: {
+    readonly baseGeneration: number;
+    readonly signal: AbortSignal;
+  }): Promise<boolean>;
 }
 
 export interface WorkspaceWatchSubscription {
@@ -169,7 +186,10 @@ interface PendingRemoteApply {
   readonly nextIndex: number;
 }
 
-/** The paths this folder's own most recent commit carried, as committed. */
+/**
+ * The paths this folder's own commits carried, as committed, since the last
+ * generation it took in from the Machine. `generation` is the newest of them.
+ */
 interface LocalCommitRecord {
   readonly generation: number;
   readonly entries: readonly { readonly path: string; readonly fingerprint: string }[];
@@ -200,6 +220,11 @@ export interface ContinuousSyncDurableBase {
   readonly manifestRoot: string;
   readonly syncId: string;
   readonly baseline: readonly EntryProjection[];
+  /** The paths this folder's own commits carried; see `LocalCommitRecord`. */
+  readonly lastLocalCommit: {
+    readonly generation: number;
+    readonly entries: readonly { readonly path: string; readonly fingerprint: string }[];
+  } | null;
   readonly updatedAt: string;
 }
 
@@ -239,7 +264,8 @@ export interface ContinuousWorkspaceSyncSupervisorInput {
    * caller has just committed the local tree on top of it. It lets the new
    * state know which paths that commit carried (see `remote_in_place`).
    */
-  readonly priorBase?: Pick<ContinuousSyncDurableBase, "generation" | "baseline">;
+  readonly priorBase?: Pick<ContinuousSyncDurableBase, "generation" | "baseline"> &
+    Partial<Pick<ContinuousSyncDurableBase, "lastLocalCommit">>;
   /** Called once per retained conflict. Observers never own sync correctness. */
   readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
 }
@@ -267,6 +293,9 @@ export class ContinuousWorkspaceSyncSupervisor {
   #scanRequested = false;
   #reconcileRequested = false;
   #closed = false;
+  /** The base the last stale refusal named, and how many refusals it has had in a row. */
+  #staleBase: number | undefined;
+  #staleRefusals = 0;
 
   private constructor(input: ContinuousWorkspaceSyncSupervisorInput, state: DurableSupervisorState) {
     this.#input = input;
@@ -340,6 +369,7 @@ export class ContinuousWorkspaceSyncSupervisor {
       manifestRoot: state.manifest_root,
       syncId: state.sync_id,
       baseline: state.baseline,
+      lastLocalCommit: state.last_local_commit,
       updatedAt: state.updated_at,
     });
   }
@@ -462,7 +492,8 @@ export class ContinuousWorkspaceSyncSupervisor {
         // A commit names `this.#state.generation` as its base, which is only
         // true if nothing newer was published; committing first would either
         // be refused or, worse, be the stale tree a newer generation lost to
-        // (qa6 witness 2026-09-22, step 6).
+        // (qa6 witness 2026-09-22, step 6). A generation published while a
+        // commit is in flight still gets it refused; see `#acceptStaleRefusal`.
         if (this.#state.status !== "conflicted" && this.#state.status !== "recovery_required" && this.#state.status !== "paused") {
           await this.#consumeRemote(signal);
         }
@@ -528,6 +559,10 @@ export class ContinuousWorkspaceSyncSupervisor {
         signal,
       });
     } catch (error) {
+      if (isStaleBaseRefusal(error, this.#staleBase === this.#state.generation)) {
+        await this.#acceptStaleRefusal(operations);
+        return;
+      }
       for (const operation of operations) await transitionIfPossible(this.#journal, operation.operationId, "uncertain");
       throw error;
     }
@@ -548,12 +583,37 @@ export class ContinuousWorkspaceSyncSupervisor {
       manifest_root: receipt.manifestRoot,
       baseline: projectManifest(manifest),
       pending_local: [],
-      last_local_commit: localCommitRecord(receipt.generation, operations),
+      last_local_commit: localCommitRecord(receipt.generation, operations, this.#state.last_local_commit),
       cursor: null,
       status: "live_unverified",
       dirty: false,
       reason: null,
     });
+  }
+
+  /**
+   * The commit was refused because a newer generation exists (the Machine
+   * committed while this commit was in flight, ws-qa 2026-09-28). Nothing of
+   * it landed, so it is recorded as refused rather than uncertain, and its
+   * edits, still in the folder, stop being pending: the next pass takes the
+   * newer generation in under the conflict rule (a path changed on both sides
+   * keeps both versions) and then commits the folder on top of it. Before,
+   * this refusal stopped synchronization for good and said nothing.
+   */
+  async #acceptStaleRefusal(operations: readonly PendingLocalOperation[]): Promise<void> {
+    const base = this.#state.generation;
+    this.#staleRefusals = this.#staleBase === base ? this.#staleRefusals + 1 : 1;
+    this.#staleBase = base;
+    for (const operation of operations) await transitionIfPossible(this.#journal, operation.operationId, "conflicted");
+    const exhausted = this.#staleRefusals >= STALE_BASE_REFUSAL_LIMIT;
+    await this.#replaceState({
+      pending_local: [],
+      status: "catching_up",
+      dirty: true,
+      reason: "remote_advanced",
+    });
+    if (exhausted) throw syncFailure("remote_advanced_unobserved", EXIT_CODES.conflict);
+    this.#scanRequested = true;
   }
 
   async #consumeRemote(signal: AbortSignal): Promise<void> {
@@ -619,9 +679,12 @@ export class ContinuousWorkspaceSyncSupervisor {
     const currentEntries = new Map(projectManifest(current).map((entry) => [entry.path, entry]));
     const baseline = new Map(this.#state.baseline.map((entry) => [entry.path, entry]));
     const ordered = orderRemoteItems(pending.items);
-    // The paths this folder's own commit carried, when the incoming generation
-    // is the one directly after it: the only generation in which the Machine
-    // can return a conflict it resolved against that commit.
+    // The paths this folder's own commits carried since the last generation
+    // it took in, when the incoming generation directly follows the newest of
+    // them. The Machine applies every one of those commits before it can
+    // capture (a capture on an older base is refused), so the first
+    // generation it captures returns any conflict it resolved against any of
+    // them — not only against the newest (live apply PRD R-3).
     const ownCommit = this.#state.last_local_commit?.generation === pending.generation - 1
       ? new Map(this.#state.last_local_commit.entries.map((entry) => [entry.path, entry.fingerprint]))
       : undefined;
@@ -667,6 +730,10 @@ export class ContinuousWorkspaceSyncSupervisor {
         }
       }
     }
+    // An operation refused on an older base can never land. Kept, it would name
+    // a base this folder no longer holds, and the next scan would refuse the
+    // folder as `pending_local_intent_changed`.
+    await this.#releaseRefusedLocal();
     const localAhead = manifest.manifestRoot !== pending.manifestRoot;
     await this.#replaceState({
       generation: pending.generation,
@@ -751,9 +818,9 @@ export class ContinuousWorkspaceSyncSupervisor {
 
   /**
    * Copies the local file beside itself before an incoming generation
-   * replaces it. `generation` is the generation that carried these bytes (this
-   * folder's own commit), matching the guest, which names a sibling after the
-   * generation whose bytes it holds.
+   * replaces it. `generation` is a generation whose tree holds these bytes
+   * (this folder's newest own commit), matching the guest, which names a
+   * sibling after the generation whose bytes it holds.
    */
   async #retainLocalSibling(path: string, generation: number): Promise<string> {
     const wirePath = normalizeWirePath(path, this.#input.filesystemCapabilities);
@@ -811,7 +878,7 @@ export class ContinuousWorkspaceSyncSupervisor {
         manifest_root: receipt.manifestRoot,
         baseline: projectManifest(manifest),
         pending_local: [],
-        last_local_commit: localCommitRecord(receipt.generation, this.#state.pending_local),
+        last_local_commit: localCommitRecord(receipt.generation, this.#state.pending_local, this.#state.last_local_commit),
         cursor: null,
         dirty: false,
         status: "converged",
@@ -824,6 +891,18 @@ export class ContinuousWorkspaceSyncSupervisor {
 
   async #recoverPendingLocal(): Promise<void> {
     if (this.#state.pending_local.length === 0) return;
+    if (await this.#releaseRefusedLocal()) {
+      // A refused commit is not in flight, so there is nothing to reconcile:
+      // its edits are still in the folder, and the next scan proposes them on
+      // top of whatever the Machine has published since. Without this, a
+      // folder stopped by a refusal (ws-qa 2026-09-28) stalled again on
+      // re-attach at `pending_local_intent_changed`.
+      await this.#transition({ status: "catching_up", dirty: true, reason: "local_commit_refused" });
+      if (this.#state.pending_local.length === 0) {
+        this.#scanRequested = true;
+        return;
+      }
+    }
     const latest = latestJournalStates(this.#journal?.records ?? []);
     const uncertain = this.#state.pending_local.some((operation) => {
       const state = latest.get(operation.operationId);
@@ -835,6 +914,34 @@ export class ContinuousWorkspaceSyncSupervisor {
       return;
     }
     this.#scanRequested = true;
+  }
+
+  /**
+   * Drops the pending operations whose commit the authority refused, recording
+   * them as refused. True when any were dropped. Dropping loses nothing: an
+   * operation is a record of intent, its bytes are in the folder, and a pull
+   * never overwrites a path that differs from the baseline.
+   */
+  async #releaseRefusedLocal(): Promise<boolean> {
+    const commitRefused = this.#input.authority.commitRefused;
+    if (commitRefused === undefined || this.#state.pending_local.length === 0) return false;
+    const refusedBases = new Set<number>();
+    for (const baseGeneration of new Set(this.#state.pending_local.map((operation) => operation.baseGeneration))) {
+      let refused = false;
+      try {
+        refused = await commitRefused.call(this.#input.authority, { baseGeneration, signal: this.#controller.signal });
+      } catch {
+        // An unreadable proof is no proof: the operation stays as it was.
+      }
+      if (refused) refusedBases.add(baseGeneration);
+    }
+    if (refusedBases.size === 0) return false;
+    const refused = this.#state.pending_local.filter((operation) => refusedBases.has(operation.baseGeneration));
+    for (const operation of refused) await transitionIfPossible(this.#journal, operation.operationId, "conflicted");
+    await this.#replaceState({
+      pending_local: Object.freeze(this.#state.pending_local.filter((operation) => !refusedBases.has(operation.baseGeneration))),
+    });
+    return true;
   }
 
   async #buildManifest(): Promise<WorkspaceManifest> {
@@ -901,7 +1008,11 @@ function createInitialState(input: ContinuousWorkspaceSyncSupervisorInput, manif
   return Object.freeze({
     schema_version: STATE_SCHEMA as 2,
     last_local_commit: prior !== undefined && prior.generation === input.initialGeneration - 1
-      ? localCommitRecord(input.initialGeneration, diffManifest(prior.baseline, manifest, prior.generation))
+      ? localCommitRecord(
+        input.initialGeneration,
+        diffManifest(prior.baseline, manifest, prior.generation),
+        prior.lastLocalCommit ?? null,
+      )
       : null,
     binding_id: input.bindingId,
     binding_generation: input.bindingGeneration,
@@ -920,10 +1031,26 @@ function createInitialState(input: ContinuousWorkspaceSyncSupervisorInput, manif
   });
 }
 
-function localCommitRecord(generation: number, operations: readonly PendingLocalOperation[]): LocalCommitRecord {
+/**
+ * The record after this folder committed `operations` as `generation`. A
+ * commit on top of this folder's own previous commit extends that record (a
+ * later fingerprint wins); a commit on top of a generation taken in from the
+ * Machine starts a new one.
+ */
+function localCommitRecord(
+  generation: number,
+  operations: readonly Pick<PendingLocalOperation, "path" | "fingerprint">[],
+  previous: LocalCommitRecord | null,
+): LocalCommitRecord {
+  const entries = new Map(previous?.generation === generation - 1
+    ? previous.entries.map((entry) => [entry.path, entry.fingerprint])
+    : []);
+  for (const operation of operations) entries.set(operation.path, operation.fingerprint);
   return Object.freeze({
     generation,
-    entries: Object.freeze(operations.map((operation) => Object.freeze({ path: operation.path, fingerprint: operation.fingerprint }))),
+    entries: Object.freeze([...entries]
+      .sort(([left], [right]) => Buffer.from(left).compare(Buffer.from(right)))
+      .map(([path, fingerprint]) => Object.freeze({ path, fingerprint }))),
   });
 }
 
@@ -1456,6 +1583,21 @@ async function transitionToApplied(journal: DurableSyncJournal | undefined, oper
 
 async function transitionIfPossible(journal: DurableSyncJournal | undefined, operationId: string, state: JournalOperationState): Promise<void> {
   try { await journal?.transition(operationId, state); } catch { /* preserve the original ambiguous failure */ }
+}
+
+/**
+ * A commit refused because its base is no longer the newest generation. The
+ * server says so as `workspace_sync_generation_conflict`. A later commit on a
+ * base it already refused never reaches the server: the coordinator's
+ * per-base checkpoint holds that refusal and answers `checkpoint_conflicted`
+ * (or `checkpoint_intent_mismatch` once the folder changed again), so those
+ * count as the same refusal only when this supervisor saw it on this base.
+ */
+function isStaleBaseRefusal(error: unknown, refusedOnThisBase: boolean): boolean {
+  if (!(error instanceof CunaError) || error.exitCode !== EXIT_CODES.conflict) return false;
+  const reason = error.details?.reason;
+  if (reason === "workspace_sync_generation_conflict") return true;
+  return refusedOnThisBase && (reason === "checkpoint_conflicted" || reason === "checkpoint_intent_mismatch");
 }
 
 function classifyFailure(error: unknown): { readonly status: "paused" | "reconciling" | "conflicted" | "recovery_required"; readonly reason: string } {

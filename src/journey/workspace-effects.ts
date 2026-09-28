@@ -31,7 +31,8 @@ export interface WorkspaceJourneyEffectsInput {
   readonly filesystemCapabilities: FilesystemCapabilities;
   /**
    * One human-readable line about a decision the journey took on the person's
-   * behalf (today: the folder was rebound to another Machine). Absent in
+   * behalf (the folder was rebound to another Machine, a conflict kept both
+   * versions) or about workspace sync no longer being live. Absent in
    * structured or non-interactive runs; the decision is taken either way.
    */
   readonly onNotice?: (line: string) => void;
@@ -92,6 +93,36 @@ export function conflictNotice(conflict: ContinuousSyncConflict): string {
   return `Workspace conflict on ${conflict.path} · changed here and on the Machine · ${where} (${conflict.code})`;
 }
 
+function syncStateLabel(snapshot: ContinuousSyncSnapshot): string {
+  return snapshot.reason === undefined ? snapshot.state : `${snapshot.state} (${snapshot.reason})`;
+}
+
+function syncIsLive(snapshot: ContinuousSyncSnapshot): boolean {
+  return snapshot.state === "live_unverified" || snapshot.state === "converged";
+}
+
+/**
+ * The line for a sync that stopped moving files, or undefined while it still
+ * does. Before this, every such state was published to a listener nobody
+ * subscribed, and the folder stopped syncing without a word (ws-qa
+ * 2026-09-28).
+ */
+export function continuousSyncNotice(snapshot: ContinuousSyncSnapshot): string | undefined {
+  if (snapshot.state === "conflicted" || snapshot.state === "recovery_required") {
+    return `Workspace sync stopped · files are not syncing between this folder and the Machine · ${syncStateLabel(snapshot)}`;
+  }
+  if (snapshot.state === "paused") {
+    return `Workspace sync paused · files are not syncing between this folder and the Machine · ${syncStateLabel(snapshot)}`;
+  }
+  return undefined;
+}
+
+/** The last word when a run stops a sync that was not live, or undefined when it was. */
+export function continuousSyncDetachNotice(snapshot: ContinuousSyncSnapshot): string | undefined {
+  if (syncIsLive(snapshot) || snapshot.state === "stopped") return undefined;
+  return `Workspace sync was not live when this run ended · this folder is at generation ${snapshot.generation} · ${syncStateLabel(snapshot)}`;
+}
+
 function bindingKey(workspaceId: string, userId: string, canonicalRoot: string): string {
   return createHash("sha256").update(`${workspaceId}\0${userId}\0${canonicalRoot}`, "utf8").digest("hex");
 }
@@ -132,10 +163,29 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
   let supervisor: Awaited<ReturnType<typeof startContinuousWorkspaceSync>> | undefined;
   const syncListeners = new Set<(snapshot: ContinuousSyncSnapshot) => void>();
   let unsubscribeSupervisor: (() => void) | undefined;
+  // One line per entry into a state that moves no files; a repeat of the same
+  // state and reason stays silent until sync is live again, and then says so.
+  let announcedState: string | undefined;
+  const renderSyncState = (snapshot: ContinuousSyncSnapshot): void => {
+    const line = continuousSyncNotice(snapshot);
+    if (line !== undefined) {
+      const key = `${snapshot.state}\0${snapshot.reason ?? ""}`;
+      if (key === announcedState) return;
+      announcedState = key;
+      input.onNotice?.(line);
+      return;
+    }
+    if (announcedState !== undefined && syncIsLive(snapshot)) {
+      announcedState = undefined;
+      input.onNotice?.(`Workspace sync resumed · this folder is at generation ${snapshot.generation}`);
+    }
+  };
   /** One wiring for every admission path, so a resumed poller is as observable as a committed one. */
   const attachContinuousSync = (started: Awaited<ReturnType<typeof startContinuousWorkspaceSync>>): void => {
     supervisor = started;
+    announcedState = undefined;
     unsubscribeSupervisor = started.subscribe((snapshot) => {
+      renderSyncState(snapshot);
       for (const listener of syncListeners) {
         try { listener(snapshot); } catch { /* Status observers never own synchronization correctness. */ }
       }
@@ -173,7 +223,13 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       supervisor = undefined;
       unsubscribeSupervisor?.();
       unsubscribeSupervisor = undefined;
+      // Read before stopping: a stopped supervisor reports only `stopped`.
+      const last = current?.snapshot;
       await current?.stop();
+      // Lines written while a terminal owned the screen may be gone once it
+      // is released, so a sync that was not live gets the last word here.
+      const line = last === undefined ? undefined : continuousSyncDetachNotice(last);
+      if (line !== undefined) input.onNotice?.(line);
     },
     async inspectWorkspace({ localPath, syncMode, signal }) {
       signal.throwIfAborted();

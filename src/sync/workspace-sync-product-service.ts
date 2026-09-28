@@ -662,6 +662,22 @@ async function startProvenContinuousSupervisor(input: {
         manifestRoot: receipt.manifest_root,
       });
     },
+    async commitRefused({ baseGeneration }) {
+      // The coordinator writes `conflicted` only on an authoritative refusal,
+      // and a checkpoint that reached `committed` never leaves it, so this
+      // phase proves no commit on this base from this installation landed.
+      const directory = join(checkpointRoot, checkpointIntentDigest(
+        workspaceId, workspaceBindingId, machineId, baseGeneration,
+      ));
+      await assertSafeDerivedCheckpoint(directory, root);
+      const checkpoint = await new FileWorkspaceSyncCheckpointStore(directory).load();
+      return checkpoint?.phase === "conflicted" &&
+        checkpoint.workspace_id === workspaceId &&
+        checkpoint.workspace_binding_id === workspaceBindingId &&
+        checkpoint.machine_id === machineId &&
+        checkpoint.base_generation === baseGeneration &&
+        checkpoint.exclusion_policy_digest === policy.digest;
+    },
     async listChanges({ syncId, cursor, signal }) {
       const response = await client.changes(syncId, {
         ...(cursor === undefined ? {} : { cursor }),

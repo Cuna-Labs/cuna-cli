@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
+import { CunaError, EXIT_CODES } from "../dist/core/errors.js";
 import {
   ContinuousWorkspaceSyncSupervisor,
 } from "../dist/sync/index.js";
@@ -54,6 +55,8 @@ class MemoryAuthority {
   readFailures = [];
   reconcileFailure;
   reconcileCalls = 0;
+  /** The bases whose commit was refused: the per-base checkpoint the coordinator marks `conflicted`. */
+  refusedBases = new Set();
 
   constructor(generation, manifestRoot) {
     this.generation = generation;
@@ -61,7 +64,10 @@ class MemoryAuthority {
   }
 
   async commitLocalSnapshot({ baseGeneration, manifest }) {
-    if (baseGeneration !== this.generation) throw conflict("workspace_sync_generation_conflict");
+    if (baseGeneration !== this.generation) {
+      this.refusedBases.add(baseGeneration);
+      throw conflict("workspace_sync_generation_conflict");
+    }
     this.generation += 1;
     this.manifestRoot = manifest.manifestRoot;
     this.commits.push(manifest);
@@ -84,6 +90,10 @@ class MemoryAuthority {
     const value = this.chunks.get(digest);
     if (value === undefined || value.byteLength !== byteLength) throw new Error("chunk unavailable");
     return value;
+  }
+
+  async commitRefused({ baseGeneration }) {
+    return this.refusedBases.has(baseGeneration);
   }
 
   async reconcile({ generation, manifestRoot }) {
@@ -216,11 +226,16 @@ function networkFailure() {
   return error;
 }
 
+// The refusal exactly as the CLI's HTTP layer raises it for a 409 (api/http.ts).
+// A plain Error here classified as `paused`, so the suite could never fail the
+// way production failed (ws-qa 2026-09-28).
 function conflict(reason) {
-  const error = new Error(reason);
-  error.code = "cuna.remote.conflict";
-  error.exitCode = 6;
-  return error;
+  return new CunaError({
+    code: "cuna.remote.conflict",
+    message: "Cuna could not apply the operation because current state conflicts with it.",
+    exitCode: EXIT_CODES.conflict,
+    details: { http_status: 409, reason },
+  });
 }
 
 test("continuous supervisor uploads stable local edits and advances only an authoritative receipt", async (t) => {
@@ -357,6 +372,139 @@ test("same-path divergence keeps the local edit, retains remote bytes beside it,
   assert.notEqual(supervisor.snapshot.state, "conflicted");
 });
 
+// ws-qa 2026-09-28. The Machine's capture commits generation 2 while this
+// folder's commit on generation 1 is in flight, so the server refuses that
+// commit as stale. Only the timing differs from the test above (its control).
+// Before the fix the refusal was journaled `uncertain` and the supervisor
+// stopped in `conflicted` for good: no pull, no copy, no word.
+test("a remote generation that lands while this folder's commit is in flight is taken in and the local edit is recommitted on top", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "base" });
+  const desiredFiles = { "shared.txt": "remote" };
+  const desired = await desiredManifest(fx, desiredFiles);
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  loadChunks(authority, desired, desiredFiles);
+  const commit = authority.commitLocalSnapshot.bind(authority);
+  let raced = false;
+  authority.commitLocalSnapshot = async (input) => {
+    if (!raced) {
+      raced = true;
+      authority.generation = 2;
+      authority.manifestRoot = desired.manifestRoot;
+      authority.pages = [remotePage(2, fx.manifest, desired)];
+    }
+    return commit(input);
+  };
+  const watcher = new WatchHarness();
+  const conflicts = [];
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher, {
+    onConflict: (conflict) => conflicts.push(conflict),
+  }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await writeFile(join(fx.root, "shared.txt"), "local");
+  watcher.change("shared.txt");
+  await waitFor(() => supervisor.snapshot.generation === 3, () => `the refused edit was not recommitted on top of generation 2: ${JSON.stringify(supervisor.snapshot)}`);
+  assert.equal(raced, true, "the first commit must have lost the race");
+  assert.deepEqual([...authority.refusedBases], [1], "the commit on generation 1 was refused");
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "local");
+  assert.equal(await readFile(join(fx.root, sibling("shared.txt", 2)), "utf8"), "remote");
+  assert.deepEqual(conflicts, [{
+    code: "cuna.workspace_sync.conflict_retained",
+    resolution: "local_in_place",
+    path: "shared.txt",
+    sibling: sibling("shared.txt", 2),
+    generation: 2,
+  }]);
+  assert.deepEqual(
+    authority.commits.at(-1).entries.map((entry) => entry.path).sort(),
+    ["shared.txt", sibling("shared.txt", 2)].sort(),
+    "the recommit carries the local version and the retained remote bytes",
+  );
+  assert.notEqual(supervisor.snapshot.state, "conflicted");
+  assert.equal(supervisor.snapshot.pendingLocalOperations, 0);
+});
+
+// The durable state ws-qa was left in: an edit on generation 1 whose commit the
+// server refused (the per-base checkpoint says `conflicted`) while the journal
+// still says `uncertain`, and a Machine that published generation 2 since.
+// Before the fix the re-attach took generation 2 in and then stalled at
+// `pending_local_intent_changed`, because the refused edit stayed pending.
+test("a re-attach after a refused commit drops the refused intent and commits the local edit on top of the newer generation", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "base" });
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  const commit = authority.commitLocalSnapshot.bind(authority);
+  // A lost answer leaves the operation `uncertain` and pending, as ws-qa's was.
+  authority.commitLocalSnapshot = async () => { throw networkFailure(); };
+  const watcher = new WatchHarness();
+  const first = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher));
+  try {
+    await writeFile(join(fx.root, "shared.txt"), "local");
+    watcher.change("shared.txt");
+    await waitFor(
+      () => first.snapshot.state === "paused" && first.snapshot.pendingLocalOperations === 1,
+      () => `the first run did not leave a pending operation: ${JSON.stringify(first.snapshot)}`,
+    );
+  } finally {
+    await first.stop();
+  }
+  // The rest of the live shape: the refusal recorded as the terminal state and
+  // in the base-1 checkpoint, and the Machine's generation 2.
+  const statePath = join(fx.state, "continuous-sync.state.json");
+  const durable = JSON.parse(await readFile(statePath, "utf8"));
+  assert.equal(durable.pending_local.length, 1);
+  await writeFile(statePath, `${JSON.stringify({ ...durable, status: "conflicted", reason: "workspace_sync_generation_conflict" })}\n`);
+  authority.refusedBases.add(1);
+  authority.commitLocalSnapshot = commit;
+  const desiredFiles = { "shared.txt": "remote" };
+  const desired = await desiredManifest(fx, desiredFiles);
+  loadChunks(authority, desired, desiredFiles);
+  authority.generation = 2;
+  authority.manifestRoot = desired.manifestRoot;
+  authority.pages = [remotePage(2, fx.manifest, desired)];
+
+  const conflicts = [];
+  const second = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness(), {
+    requireDurableState: true,
+    onConflict: (conflict) => conflicts.push(conflict),
+  }));
+  t.after(async () => { await second.stop(); await fx.cleanup(); });
+  await waitFor(() => second.snapshot.generation === 3, () => `the re-attach did not converge: ${JSON.stringify(second.snapshot)}`);
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "local");
+  assert.equal(await readFile(join(fx.root, sibling("shared.txt", 2)), "utf8"), "remote");
+  assert.deepEqual(conflicts.map((conflict) => conflict.resolution), ["local_in_place"]);
+  assert.deepEqual(
+    authority.commits.at(-1).entries.map((entry) => entry.path).sort(),
+    ["shared.txt", sibling("shared.txt", 2)].sort(),
+  );
+  assert.equal(second.snapshot.pendingLocalOperations, 0);
+});
+
+// The bound on the recovery above: an authority that keeps refusing the base
+// as stale while its change feed never shows anything newer. Retrying cannot
+// settle that, so the supervisor stops after three refusals and says why.
+test("stale refusals with no newer generation in sight stop after three attempts with a typed reason", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "base" });
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  let attempts = 0;
+  authority.commitLocalSnapshot = async ({ baseGeneration }) => {
+    attempts += 1;
+    authority.refusedBases.add(baseGeneration);
+    throw conflict("workspace_sync_generation_conflict");
+  };
+  const watcher = new WatchHarness();
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await writeFile(join(fx.root, "shared.txt"), "local");
+  watcher.change("shared.txt");
+  await waitFor(() => supervisor.snapshot.state === "conflicted", () => `the refusals never stopped: ${JSON.stringify(supervisor.snapshot)}`);
+  assert.equal(supervisor.snapshot.reason, "remote_advanced_unobserved");
+  assert.equal(attempts, 3);
+  assert.equal(supervisor.snapshot.pendingLocalOperations, 0, "a refused edit is not left pending");
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "local");
+  watcher.change("shared.txt");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(attempts, 3, "a stopped supervisor sends nothing more");
+});
+
 // A sibling is written once: a replay that finds the same name holding the
 // same bytes is done, and a name holding other bytes is never overwritten.
 async function divergedWithExistingSibling(t, existing) {
@@ -457,6 +605,91 @@ test("control: a remote edit to a path this folder's last commit did not carry r
   assert.deepEqual(names.filter((name) => name.includes(".cuna-conflict-")), []);
   assert.deepEqual(conflicts, []);
   assert.equal(authority.commits.length, 1, "an ordinary remote edit commits nothing back");
+});
+
+// Live apply PRD R-3 (ws-qa report Q2). This folder commits shared.txt as
+// generation 2 and another path as generation 3 before the Machine captures.
+// The Machine applies both (a capture on an older base is refused), keeps its
+// own shared.txt against generation 2, and captures it as generation 4. Before
+// the fix only the directly preceding commit (3) was consulted, so the folder's
+// shared.txt was replaced with no copy and no word.
+test("a Machine-resolved conflict against an earlier one of this folder's consecutive commits keeps the local bytes beside the file", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "base", "other.txt": "base" });
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  const watcher = new WatchHarness();
+  const conflicts = [];
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher, {
+    onConflict: (conflict) => conflicts.push(conflict),
+  }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await writeFile(join(fx.root, "shared.txt"), "local");
+  watcher.change("shared.txt");
+  await waitFor(() => supervisor.snapshot.generation === 2, "the first local edit was not committed");
+  await writeFile(join(fx.root, "other.txt"), "local other");
+  watcher.change("other.txt");
+  await waitFor(() => supervisor.snapshot.generation === 3, "the second local edit was not committed");
+  const committed = authority.commits.at(-1);
+
+  const machineFiles = { "shared.txt": "machine", "other.txt": "local other" };
+  const machine = await desiredManifest(fx, machineFiles);
+  loadChunks(authority, machine, machineFiles);
+  authority.generation = 4;
+  authority.manifestRoot = machine.manifestRoot;
+  authority.pages = [remotePage(4, committed, machine)];
+  await waitFor(() => supervisor.snapshot.generation >= 4, "the Machine generation was not taken in");
+
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "machine", "the Machine's resolution is accepted");
+  assert.equal(await readFile(join(fx.root, sibling("shared.txt", 3)), "utf8"), "local", "the folder's bytes are kept");
+  assert.deepEqual(conflicts, [{
+    code: "cuna.workspace_sync.conflict_retained",
+    resolution: "remote_in_place",
+    path: "shared.txt",
+    sibling: sibling("shared.txt", 3),
+    generation: 4,
+  }]);
+});
+
+// Control for the rule above: a Machine generation taken in closes the record
+// of this folder's commits (its capture already returned every conflict against
+// them), so a later Machine edit of shared.txt is an ordinary remote edit even
+// though this folder committed shared.txt earlier. No copy, no notice.
+test("control: once a Machine generation was taken in, a later replacement of a path this folder committed before it is an ordinary remote edit", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "base", "other.txt": "base" });
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  const watcher = new WatchHarness();
+  const conflicts = [];
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher, {
+    onConflict: (conflict) => conflicts.push(conflict),
+  }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await writeFile(join(fx.root, "shared.txt"), "local");
+  watcher.change("shared.txt");
+  await waitFor(() => supervisor.snapshot.generation === 2, "the local edit was not committed");
+
+  const machine3Files = { "shared.txt": "local", "other.txt": "machine other" };
+  const machine3 = await desiredManifest(fx, machine3Files);
+  loadChunks(authority, machine3, machine3Files);
+  authority.generation = 3;
+  authority.manifestRoot = machine3.manifestRoot;
+  authority.pages = [remotePage(3, authority.commits.at(-1), machine3)];
+  await waitFor(() => supervisor.snapshot.generation === 3, "the first Machine generation was not taken in");
+
+  await writeFile(join(fx.root, "third.txt"), "local third");
+  watcher.change("third.txt");
+  await waitFor(() => supervisor.snapshot.generation === 4, "the later local edit was not committed");
+  const committed = authority.commits.at(-1);
+  const machine5Files = { "shared.txt": "machine", "other.txt": "machine other", "third.txt": "local third" };
+  const machine5 = await desiredManifest(fx, machine5Files);
+  loadChunks(authority, machine5, machine5Files);
+  authority.generation = 5;
+  authority.manifestRoot = machine5.manifestRoot;
+  authority.pages = [remotePage(5, committed, machine5)];
+  await waitFor(() => supervisor.snapshot.generation === 5, "the second Machine generation was not taken in");
+
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "machine");
+  const names = await (await import("node:fs/promises")).readdir(fx.root);
+  assert.deepEqual(names.filter((name) => name.includes(".cuna-conflict-")), []);
+  assert.deepEqual(conflicts, []);
 });
 
 test("a start that must resume from durable state refuses to create one", async (t) => {
