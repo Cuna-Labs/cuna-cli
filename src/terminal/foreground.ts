@@ -349,6 +349,13 @@ export class ForegroundTerminalCoordinator {
   #switchCutoff: number | undefined;
   #switchRequest: ForegroundSwitchRequest | undefined;
   #switchNotice: string | undefined;
+  /**
+   * The one line the attach arrived with (another process holds this client,
+   * or a switch had to come back). It shares row 2 with the seat instead of
+   * replacing it: shown alone, it hid observer-or-writer for 65 s after a
+   * roster switch (installed 0.1.4, 2026-09-28) until the person typed.
+   */
+  #arrivalNotice: string | undefined;
 
   constructor(options: ForegroundTerminalCoordinatorOptions) {
     const resizeCoalesceMs = options.resizeCoalesceMs ?? RESIZE_COALESCE_MS;
@@ -392,7 +399,7 @@ export class ForegroundTerminalCoordinator {
       resolveStopStarted = resolve;
     });
     this.#resolveStopStarted = resolveStopStarted;
-    if (options.initialNotice !== undefined) this.#browserNotice = options.initialNotice;
+    this.#arrivalNotice = options.initialNotice;
   }
 
   get state(): ForegroundTerminalState {
@@ -653,6 +660,7 @@ export class ForegroundTerminalCoordinator {
     this.#pendingBrowserAction = undefined;
     this.#pendingBrowserActionTabId = undefined;
     this.#browserNotice = undefined;
+    this.#arrivalNotice = undefined;
     this.#pendingIntents = Object.freeze([]);
     this.#pendingInputBytes = 0;
     this.#reconnectTasks.clear();
@@ -1369,6 +1377,7 @@ export class ForegroundTerminalCoordinator {
     if (guarded.bytes.byteLength === 0) return;
     bytes = guarded.bytes;
     if (this.#browserNotice !== undefined) this.#browserNotice = undefined;
+    this.#arrivalNotice = undefined;
     let target = this.#prefixPending ? this.#prefixTarget : receiptTarget;
     let remote: number[] = [];
     const flush = async (): Promise<void> => {
@@ -2458,6 +2467,8 @@ export class ForegroundTerminalCoordinator {
             ? { notice: this.#tabs.get(activeTabId)?.snapshot.historicalInputUncertainty === true &&
                 (this.#browserNotice === INPUT_WITHHELD_NOTICE || isReconnectFailedNotice(this.#browserNotice))
               ? `${HISTORICAL_INPUT_NOTICE} · ${this.#browserNotice}` : this.#browserNotice }
+          : this.#arrivalNotice !== undefined
+            ? { notice: this.#withSeat(this.#tabs.get(activeTabId)?.snapshot, this.#arrivalNotice) }
             : this.#pendingBrowserAction !== undefined && this.#pendingBrowserActionTabId === activeTabId
               ? {
                 notice: this.#pendingBrowserAction.type === "auth.device.present"
@@ -2738,6 +2749,13 @@ export class ForegroundTerminalCoordinator {
     if (before.accessMode !== after.accessMode || before.reason !== after.reason ||
         before.writerTransferCapability?.supported !== after.writerTransferCapability?.supported ||
         before.writerTransferCapability?.reasonCode !== after.writerTransferCapability?.reasonCode) this.#seatNotice = undefined;
+  }
+
+  /** The seat first, so a narrow row truncates the other line, never the seat. */
+  #withSeat(snapshot: RuntimeTerminalSnapshot | undefined, line: string): string {
+    const seat = this.#seatNoticeFor(snapshot) ??
+      (snapshot?.state === "active" && snapshot.accessMode === "writer" ? "You have control" : undefined);
+    return seat === undefined ? line : `${seat} · ${line}`;
   }
 
   #seatNoticeFor(snapshot: RuntimeTerminalSnapshot | undefined): string | undefined {

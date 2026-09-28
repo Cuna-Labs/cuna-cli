@@ -2455,6 +2455,37 @@ test("expired writer evidence permits a fresh check without promoting the observ
   }
 });
 
+// D15. Measured on installed 0.1.4, 2026-09-28: after a roster switch, row 2
+// showed only "Another Cuna process here is attached …" for 65 s, so whether
+// this client observed or wrote was hidden until the person typed.
+test("D15: the line an attach arrives with shares row 2 with the seat instead of hiding it", async () => {
+  const arrival = "Another Cuna process here is attached to this AgentSession";
+  const wide = new FakeHost();
+  wide.columns = 160;
+  const { coordinator, callbacks, host, intents } = harness({
+    coordinatorOptions: { initialNotice: arrival },
+    host: wide,
+  });
+  await coordinator.start(intents.slice(0, 1));
+  const secondRow = async () => (await visibleHostText(host)).split("\n")[1] ?? "";
+  const settle = async (text) => {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if ((await secondRow()).includes(text)) return;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.fail(`row 2 never showed ${text}: ${JSON.stringify(await secondRow())}`);
+  };
+
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+  await settle("Observing (read-only)");
+  assert.match(await secondRow(), /Observing \(read-only\).* · Another Cuna process here is attached/u);
+
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "writer", writerEpoch: 3 });
+  await settle("You have control");
+  assert.match(await secondRow(), /You have control · Another Cuna process here is attached/u);
+  await coordinator.stop();
+});
+
 test("a refused keystroke's notice yields to every later seat change", async () => {
   let observing = false;
   const { coordinator, callbacks, host, intents } = harness({
