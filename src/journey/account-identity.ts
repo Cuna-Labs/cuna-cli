@@ -74,6 +74,7 @@ export async function readAccountIdentityWithin<T>(input: AccountIdentityReadInp
       kind: "response",
       operation: "GET /v1/me",
       settleWith: "cuna whoami",
+      readOnly: true,
       budgetMs: elapsed.deadlineMs,
       details: {
         waiting_for: elapsed.waitingFor,

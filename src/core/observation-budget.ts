@@ -196,6 +196,14 @@ export interface ObservationBudgetElapsedInput {
   readonly operation: string;
   /** The read-only command that settles the question, e.g. `cuna machines list`. */
   readonly settleWith?: string;
+  /**
+   * The request only read. Without a `settleWith` the hint used to tell every
+   * caller to re-read "before re-issuing this mutation" -- including a plain
+   * `cuna machines list`, measured 2026-09-28, which mutates nothing. A read
+   * whose answer never arrived changed nothing and is settled by running it
+   * again. Absent means "may have changed something", the conservative side.
+   */
+  readonly readOnly?: boolean;
   /** The budget that elapsed, in milliseconds. */
   readonly budgetMs: number;
   readonly details?: SafeErrorDetails;
@@ -212,9 +220,11 @@ export interface ObservationBudgetElapsedInput {
  * operation which probably succeeded is worse than saying nothing.
  */
 export function observationBudgetElapsed(input: ObservationBudgetElapsedInput): CunaError {
-  const settle = input.settleWith === undefined
-    ? "Re-read the resource with a read-only `cuna` command before re-issuing this mutation."
-    : `Run \`${input.settleWith}\` to see the current state.`;
+  const settle = input.settleWith !== undefined
+    ? `Run \`${input.settleWith}\` to see the current state.`
+    : input.readOnly === true
+      ? "This request only reads, so nothing was changed; run the same command again."
+      : "Re-read the resource with a read-only `cuna` command before re-issuing this mutation.";
   return new CunaError({
     code: OBSERVATION_BUDGET_CODES[input.kind],
     message: input.kind === "response"
@@ -222,7 +232,9 @@ export function observationBudgetElapsed(input: ObservationBudgetElapsedInput): 
       : `Cuna accepted ${input.operation}; the CLI stopped reading back after ${input.budgetMs} ms, before the change became visible.`,
     exitCode: EXIT_CODES.network,
     hint: input.kind === "response"
-      ? `This is the CLI's own limit, not a Cuna failure, and the operation may have completed. ${settle} Raise --timeout-ms to wait longer.`
+      ? input.readOnly === true
+        ? `This is the CLI's own limit, not a Cuna failure. ${settle} Raise --timeout-ms to wait longer.`
+        : `This is the CLI's own limit, not a Cuna failure, and the operation may have completed. ${settle} Raise --timeout-ms to wait longer.`
       : `This is the CLI's own limit, not a Cuna failure, and the change may still be settling. ${settle}`,
     // Written once, here, and not reachable as a parameter. A budget refusal
     // that denied retry is the defect this module exists to make unspellable.

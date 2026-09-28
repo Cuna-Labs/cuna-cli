@@ -979,6 +979,9 @@ export function createHttpTransport(input: {
             kind: "response",
             operation: `${request.method} ${request.path}`,
             budgetMs,
+            // GET is the only method this transport treats as a read (the same
+            // test decides `retryable` for a transport failure above).
+            readOnly: request.method === "GET",
             ...(request.settleWith === undefined ? {} : { settleWith: request.settleWith }),
             details: { method: request.method, path: request.path },
             cause: error,
