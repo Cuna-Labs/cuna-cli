@@ -1,6 +1,7 @@
 import { exitCodeHelpSection } from "../core/exit-codes.js";
 import { brandedEnvironmentNames } from "../core/namespace.js";
 import { API_KEYS_URL } from "../core/product-web.js";
+import { CLI_PACKAGE_NAME } from "../version.js";
 import { CLI_ROUTE_REGISTRY } from "./parser.js";
 
 // Help is the only place most users learn a variable name, so it is derived
@@ -263,7 +264,7 @@ Authentication:
   service has issued; the first one that is SET wins, even when its value is unusable.
 
 Canonical install:
-  npm install --global ./cuna_labs-cli-0.1.0.tgz
+  npm install --global ${CLI_PACKAGE_NAME}
 `;
 
 /**
