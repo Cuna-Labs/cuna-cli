@@ -874,6 +874,37 @@ const CATCH_UP_NOTICE = "The Machine changed this workspace while you were away 
 // Defect A. Before the fix the re-attach committed generation 4 claiming base 3
 // with generation 2's tree, and live apply then put the old bytes back on the
 // Machine: the Machine's edit survived only in revision 3.
+// ws-c3, 2026-09-29: three runs each announced generation 3 and none brought
+// it in. The pull ran beside the journey, and whatever failed after it -- the
+// session selection at 10:12 and 10:21 -- stopped it; the binding record kept
+// naming generation 2 even once the bytes had landed.
+// Control: the test below, which waits for the pull itself.
+test("a pull announced at admission lands before the run goes on, and the binding record follows it", async (t) => {
+  const { readFile } = await import("node:fs/promises");
+  const fixture = await folderBehindTheMachine(t, { machineEdit: "edited on the Machine while detached\n" });
+  const serve = fixture.wire.request.bind(fixture.wire);
+  fixture.wire.request = async (request) => {
+    // Slow enough that a run which does not wait returns first.
+    if (request.method === "GET" && request.path.includes("/chunks/")) await new Promise((resolve) => setTimeout(resolve, 300));
+    return await serve(request);
+  };
+  const notices = [];
+  const second = reattach(fixture, notices);
+  try {
+    const result = await second.synchronizeWorkspace({
+      machineId: MACHINE, localPath: fixture.project, syncMode: "enabled", signal: new AbortController().signal,
+    });
+    assert.equal(result.generation, 3);
+    // No waiting here: the run must already hold what it announced.
+    assert.equal(await readFile(join(fixture.project, "from-agent.txt"), "utf8"), "edited on the Machine while detached\n");
+    assert.equal(second.continuousSyncSnapshot()?.generation, 3);
+    assert.equal((await readBoundRecord(fixture.project)).generation, 3, "the binding record names the generation the folder holds");
+    assert.deepEqual(decisionNotices(notices), [CATCH_UP_NOTICE]);
+  } finally {
+    await second.stopContinuousSync();
+  }
+});
+
 test("a folder the Machine moved ahead of pulls the newer generation instead of committing its stale tree over it", async (t) => {
   const { readFile } = await import("node:fs/promises");
   const fixture = await folderBehindTheMachine(t, { machineEdit: "edited on the Machine while detached\n" });

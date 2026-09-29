@@ -3,7 +3,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { CunaApiClient } from "../api/client.js";
-import type { Machine } from "../api/contracts.js";
+import type { Machine, WorkspaceBindingAuthority } from "../api/contracts.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import type { ContinuousSyncConflict, ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.js";
 import {
@@ -394,20 +394,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         authority.activeGeneration >= 1 &&
         authority.activeManifestRoot === currentManifestRoot
       ) {
-        if (localRecord === undefined || localRecord.generation !== authority.activeGeneration) {
-          await persistWorkspaceBinding({
-            root: inspected.policy.canonicalRoot,
-            binding: {
-              profileId: input.profileId, userId: input.userId, workspaceId: input.workspaceId,
-              bindingId: authority.bindingId, projectId: authority.projectId,
-              ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
-              localInstanceId: authority.localInstanceId, machineId, remoteRoot: authority.remoteRoot,
-              policyDigest: authority.exclusionPolicyDigest, generation: authority.activeGeneration,
-              bindingCreatedAt: authority.createdAt, bindingUpdatedAt: authority.updatedAt,
-            },
-            expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
-          });
-        }
+        await recordPublishedGeneration({ input, root: inspected.policy.canonicalRoot, authority, machineId, localRecord });
         // Skipping the commit must not also skip remote delivery. The
         // supervisor is the only reader of `GET …/changes` the product runs, so
         // with none running a generation produced on the Machine can never
@@ -489,7 +476,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         }
         input.onNotice?.(`The Machine changed this workspace while you were away · bringing generation ${authority.activeGeneration} into this folder before sending local changes`);
         try {
-          attachContinuousSync(await resumeContinuousWorkspaceSyncFromLocalBase({
+          const started = await resumeContinuousWorkspaceSyncFromLocalBase({
             localRoot: inspected.policy.canonicalRoot,
             workspaceId: input.workspaceId,
             workspaceBindingId: authority.bindingId,
@@ -499,7 +486,22 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             checkpointRoot,
             filesystemCapabilities: input.filesystemCapabilities,
             onConflict: renderConflict,
-          }));
+          });
+          attachContinuousSync(started);
+          // The pull finishes before the journey goes on. Left to run beside
+          // it, the pull was stopped with the run whenever a later step failed
+          // (ws-c3, 2026-09-29: three runs announced generation 3; the one at
+          // 10:12 was stopped by session selection with conflict.txt replaced
+          // and the copy of the local version not yet written, and the folder
+          // stayed at generation 2).
+          const reached = await waitForGeneration(started, authority.activeGeneration, signal);
+          if (reached.generation >= authority.activeGeneration && reached.pendingRemoteChanges === 0) {
+            // What `.cuna/workspace.json` names is now true of the folder.
+            await recordPublishedGeneration({ input, root: inspected.policy.canonicalRoot, authority, machineId, localRecord });
+          } else {
+            const why = reached.reason === undefined ? "" : ` (${reached.reason})`;
+            input.onNotice?.(`Generation ${authority.activeGeneration} has not reached this folder yet · ${reached.state}${why} · it keeps arriving while this run is open`);
+          }
         } catch (error) {
           if (!(error instanceof CunaError)) throw error;
           const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
@@ -579,6 +581,69 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
     },
   };
   return Object.freeze(effects);
+}
+
+/** How long a run waits for a newer Machine generation to land before it goes on. */
+const CATCH_UP_MS = 60_000;
+
+/**
+ * The supervisor's snapshot once it holds `generation` with nothing of it left
+ * to apply, once it stops for good, or when the wait is over or cancelled.
+ */
+async function waitForGeneration(
+  supervisor: {
+    readonly snapshot: ContinuousSyncSnapshot;
+    subscribe(listener: (snapshot: ContinuousSyncSnapshot) => void): () => void;
+  },
+  generation: number,
+  signal: AbortSignal,
+  timeoutMs = CATCH_UP_MS,
+): Promise<ContinuousSyncSnapshot> {
+  return await new Promise((resolve) => {
+    let unsubscribe: (() => void) | undefined;
+    let settled = false;
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", settle);
+      unsubscribe?.();
+      resolve(supervisor.snapshot);
+    };
+    const timer = setTimeout(settle, timeoutMs);
+    signal.addEventListener("abort", settle, { once: true });
+    unsubscribe = supervisor.subscribe((snapshot) => {
+      if ((snapshot.generation >= generation && snapshot.pendingRemoteChanges === 0) ||
+        snapshot.state === "conflicted" || snapshot.state === "recovery_required" || snapshot.state === "stopped") {
+        settle();
+      }
+    });
+    if (settled) unsubscribe();
+  });
+}
+
+/** Names the published generation in this folder's binding record, when it does not already. */
+async function recordPublishedGeneration(input: {
+  readonly input: WorkspaceJourneyEffectsInput;
+  readonly root: string;
+  readonly authority: WorkspaceBindingAuthority;
+  readonly machineId: string;
+  readonly localRecord: LoadedWorkspaceBinding["record"] | undefined;
+}): Promise<void> {
+  const { authority, localRecord } = input;
+  if (localRecord !== undefined && localRecord.generation === authority.activeGeneration) return;
+  await persistWorkspaceBinding({
+    root: input.root,
+    binding: {
+      profileId: input.input.profileId, userId: input.input.userId, workspaceId: input.input.workspaceId,
+      bindingId: authority.bindingId, projectId: authority.projectId,
+      ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
+      localInstanceId: authority.localInstanceId, machineId: input.machineId, remoteRoot: authority.remoteRoot,
+      policyDigest: authority.exclusionPolicyDigest, generation: authority.activeGeneration,
+      bindingCreatedAt: authority.createdAt, bindingUpdatedAt: authority.updatedAt,
+    },
+    expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
+  });
 }
 
 /**

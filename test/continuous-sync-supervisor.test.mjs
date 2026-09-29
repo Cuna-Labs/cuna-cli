@@ -572,6 +572,36 @@ test("a loop that stops for good gives the folder's writer authority back to the
   }
 });
 
+// ws-c3, 2026-09-29, 10:12:01: a pull of the Machine's generation 3 was
+// stopped after conflict.txt was replaced and before the copy of the folder's
+// version was written, so for five minutes the folder held neither.
+test("a pull stopped between two files never leaves the folder without its own version", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "local" });
+  const copy = "shared.txt.cuna-conflict-2-318d12700a4c";
+  const desiredFiles = { "shared.txt": "remote", [copy]: "local" };
+  const desired = await desiredManifest(fx, desiredFiles);
+  const authority = new MemoryAuthority(2, desired.manifestRoot);
+  loadChunks(authority, desired, desiredFiles);
+  authority.pages = [remotePage(2, fx.manifest, desired)];
+  // The first file of the generation lands; every read after it fails.
+  authority.readFailures = [undefined, ...Array.from({ length: 10_000 }, networkFailure)];
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness()));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await waitFor(() => supervisor.snapshot.state === "paused" && supervisor.snapshot.pendingRemoteChanges === 1,
+    () => `the pull did not stop between the two files: ${JSON.stringify(supervisor.snapshot)}`);
+  const held = [
+    await readFile(join(fx.root, "shared.txt"), "utf8"),
+    await readFile(join(fx.root, copy), "utf8").catch(() => undefined),
+  ];
+  assert.ok(held.includes("local"), `the folder's own version is gone: ${JSON.stringify(held)}`);
+  // And the pull still completes once the reads come back.
+  authority.readFailures = [];
+  supervisor.requestReconciliation("network_restored");
+  await waitFor(() => supervisor.snapshot.generation === 2, () => `the pull never completed: ${JSON.stringify(supervisor.snapshot)}`);
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "remote");
+  assert.equal(await readFile(join(fx.root, copy), "utf8"), "local");
+});
+
 // A sibling is written once: a replay that finds the same name holding the
 // same bytes is done, and a name holding other bytes is never overwritten.
 async function divergedWithExistingSibling(t, existing) {

@@ -766,7 +766,10 @@ export class ContinuousWorkspaceSyncSupervisor {
     const current = await this.#buildManifest();
     const currentEntries = new Map(projectManifest(current).map((entry) => [entry.path, entry]));
     const baseline = new Map(this.#state.baseline.map((entry) => [entry.path, entry]));
-    const ordered = orderRemoteItems(pending.items);
+    // Ordered once, when the apply starts. A resumed apply keeps the order it
+    // recorded, so `nextIndex` still names the same item, including one an
+    // older CLI recorded in its own order.
+    const ordered = pending.nextIndex === 0 ? orderRemoteItems(pending.items, baseline) : pending.items;
     // The paths this folder's own commits carried since the last generation
     // it took in, when the incoming generation directly follows the newest of
     // them. The Machine applies every one of those commits before it can
@@ -1273,14 +1276,32 @@ function sameProjection(left: EntryProjection | undefined, right: EntryProjectio
   return left === undefined ? right === undefined : right !== undefined && left.fingerprint === right.fingerprint && left.kind === right.kind;
 }
 
-function orderRemoteItems(items: readonly WorkspaceSyncChangeItem[]): readonly WorkspaceSyncChangeItem[] {
+/**
+ * Directories first, then files the folder does not have yet, then files it
+ * replaces, then removals. New files go before replacements so that a copy the
+ * generation carries of bytes it replaces is written first: stopped between
+ * the two in path order, the folder held neither the copy nor its own version
+ * (ws-c3, 2026-09-29, 10:12:01: conflict.txt replaced, its
+ * conflict.txt.cuna-conflict-2-… copy not yet written).
+ */
+function orderRemoteItems(
+  items: readonly WorkspaceSyncChangeItem[],
+  baseline: ReadonlyMap<string, unknown>,
+): readonly WorkspaceSyncChangeItem[] {
   const revisions = items.filter((item) => item.operation === "revision");
   const directoryCreates = items.filter((item) => item.operation === "upsert" && item.entry?.kind === "directory")
     .sort((left, right) => depth(left.path) - depth(right.path));
   const upserts = items.filter((item) => item.operation === "upsert" && item.entry?.kind !== "directory");
+  const isNew = (item: WorkspaceSyncChangeItem): boolean => item.path !== null && !baseline.has(item.path);
   const deletes = items.filter((item) => item.operation === "delete")
     .sort((left, right) => depth(right.path) - depth(left.path));
-  return Object.freeze([...revisions, ...directoryCreates, ...upserts, ...deletes]);
+  return Object.freeze([
+    ...revisions,
+    ...directoryCreates,
+    ...upserts.filter(isNew),
+    ...upserts.filter((item) => !isNew(item)),
+    ...deletes,
+  ]);
 }
 
 function depth(path: string | null): number {
