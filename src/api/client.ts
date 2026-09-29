@@ -89,6 +89,18 @@ export interface AgentSessionCreateInput {
   readonly credentialBindingId?: string;
 }
 
+/**
+ * The opt-in fields of `GET /v1/agent-sessions/{id}` (producer 2e4e1a2). The
+ * server returns them only when asked, because a strict reader that does not
+ * know a key refuses the whole row; this build knows both.
+ */
+export interface AgentSessionReadOptions {
+  /** `include_readiness=true`: the server's startup verdict. */
+  readonly readiness?: boolean;
+  /** `include_runtime_evidence=true`: the supervisor acknowledgement and its age. */
+  readonly runtimeEvidence?: boolean;
+}
+
 export interface WorkspaceBindingIdentityInput {
   readonly executionWorkspaceId?: string;
   readonly workspaceId: string;
@@ -221,7 +233,7 @@ export interface CunaApiClient {
     idempotencyKey: string,
     signal?: AbortSignal,
   ): Promise<AgentSession>;
-  getAgentSession(id: string, signal?: AbortSignal): Promise<AgentSession>;
+  getAgentSession(id: string, signal?: AbortSignal, options?: AgentSessionReadOptions): Promise<AgentSession>;
   getAgentSessionAuth(id: string, signal?: AbortSignal): Promise<AgentSessionAuth>;
   /**
    * `agentSessions.getTerminalSeat`: the durable writer seat of the terminal
@@ -509,6 +521,8 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
   async function fetchDecoded<T>(request: HttpRequest, decoder: (value: unknown) => T): Promise<T> {
     return decode(decoder, await transport.request(request), operationLabel(request));
   }
+  /** Set once this server has refused the AgentSession read opt-ins; see `getAgentSession`. */
+  let agentSessionReadOptInUnserved = false;
   const client: CunaApiClient = {
     async getIdentity(signal) {
       return fetchDecoded(
@@ -978,18 +992,39 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         decodeAgentSessionItem,
       );
     },
-    async getAgentSession(id, signal) {
+    async getAgentSession(id, signal, options) {
       const safeId = encodeCanonicalUuid(id, "AgentSession ID");
-      const request: HttpRequest = {
-        method: "GET",
-        path: `/v1/agent-sessions/${safeId}`,
-        ...(signal === undefined ? {} : { signal }),
+      const read = async (query: Readonly<Record<string, string>> | undefined): Promise<AgentSession> => {
+        const request: HttpRequest = {
+          method: "GET",
+          path: `/v1/agent-sessions/${safeId}`,
+          ...(query === undefined ? {} : { query }),
+          ...(signal === undefined ? {} : { signal }),
+        };
+        return assertAgentSessionBinding(
+          await fetchDecoded(request, decodeAgentSessionItem),
+          { id },
+          operationLabel(request),
+        );
       };
-      return assertAgentSessionBinding(
-        await fetchDecoded(request, decodeAgentSessionItem),
-        { id },
-        operationLabel(request),
-      );
+      const query = agentSessionReadOptInUnserved ? undefined : Object.freeze({
+        ...(options?.readiness === true ? { include_readiness: "true" } : {}),
+        ...(options?.runtimeEvidence === true ? { include_runtime_evidence: "true" } : {}),
+      });
+      if (query === undefined || Object.keys(query).length === 0) return read(undefined);
+      try {
+        return await read(query);
+      } catch (error) {
+        // An Edge from 528a797 (2026-09-27) to e5aefe8 (2026-09-28) validates
+        // this query strictly and knows only `include_readiness`; one older
+        // than that ignores it. The first refuses the read with this exact 422,
+        // which is a refusal of the opt-in and not of the session. Ask again
+        // without it, once, and stop asking for the rest of this process.
+        if (!(error instanceof CunaError) || error.code !== "cuna.remote.rejected" ||
+            error.details?.http_status !== 422 || error.details.reason !== "invalid_agent_session_request") throw error;
+        agentSessionReadOptInUnserved = true;
+        return read(undefined);
+      }
     },
     async getAgentSessionAuth(id, signal) {
       const safeId = encodeCanonicalUuid(id, "AgentSession ID");
