@@ -39,7 +39,7 @@ import {
   type WorkbenchTab,
 } from "./workbench.js";
 import type { SessionRoster, SessionRosterEntry } from "./session-roster.js";
-import { ViewportRegistry } from "./viewport.js";
+import { ViewportRegistry, type ViewportSnapshot } from "./viewport.js";
 import { orderBufferPoints, XtermViewportAdapter, type BufferLink, type BufferPoint } from "./xterm-vte.js";
 import { encodeRemoteMouse, HOST_MOUSE_REPORTING_ON, HostMouseDecoder, wheelDirection, type HostMouseEvent } from "./host-mouse.js";
 
@@ -204,6 +204,26 @@ export interface DetachedForegroundSession {
   readonly label: string;
 }
 
+/** One AgentSession whose process ended while it was on screen. */
+export interface EndedForegroundSession {
+  readonly agentSessionId: string;
+  readonly label: string;
+  readonly agent: WorkbenchTab["agent"];
+  /** "status 0" or "signal 9", when the terminal said. */
+  readonly status?: string;
+}
+
+/** The server's record that an AgentSession's process has ended. */
+export interface ForegroundSessionEndRecord {
+  /** When the server observed the end (ISO 8601), when it recorded one. */
+  readonly observedAt?: string;
+}
+
+interface TabEnd {
+  readonly status?: string;
+  readonly observedAt?: string;
+}
+
 /**
  * A completed local effect is retained until the remote MCP bridge confirms
  * the exact request digest.  Keeping the immutable broker snapshot—not just a
@@ -253,6 +273,14 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly attachingTitle?: string;
   /** One line shown once the terminal is on screen, until the next key. */
   readonly initialNotice?: string;
+  /**
+   * Reads the server's record of how an AgentSession's process ended, when
+   * its screen shows the terminal's pane-dead line. Undefined while the record
+   * does not say it ended: the screen alone never ends a tab.
+   */
+  readonly readSessionEnd?: (agentSessionId: string, signal: AbortSignal) => Promise<ForegroundSessionEndRecord | undefined>;
+  /** Waits before each read of that record; the supervisor records an exit a moment after it. */
+  readonly sessionEndReadDelaysMs?: readonly number[];
 }
 
 /** The session the person chose on the bar; the runner attaches it next. */
@@ -319,6 +347,10 @@ export class ForegroundTerminalCoordinator {
   readonly #outputTails = new Map<string, Promise<void>>();
   readonly #localDetachTabIds = new Set<string>();
   readonly #detachedSessions: DetachedForegroundSession[] = [];
+  readonly #endedSessions: EndedForegroundSession[] = [];
+  /** Tabs whose process the server says ended; their last screen stays, labelled ended. */
+  readonly #endedTabs = new Map<string, TabEnd>();
+  readonly #endReads = new Set<string>();
   readonly #browserDetectors = new Map<string, ProviderBrowserActionDetector>();
   readonly #retainedBrowserDetectors = new Map<string, ProviderBrowserActionDetector>();
   readonly #retainedBrowserCandidates = new Map<string, LocalBrowserActionRequest>();
@@ -454,6 +486,11 @@ export class ForegroundTerminalCoordinator {
    */
   get detachedSessions(): readonly DetachedForegroundSession[] {
     return Object.freeze([...this.#detachedSessions]);
+  }
+
+  /** AgentSessions whose process ended while on screen; none of them keeps running. */
+  get endedSessions(): readonly EndedForegroundSession[] {
+    return Object.freeze([...this.#endedSessions]);
   }
 
   bindRuntime(runtime: ForegroundTerminalRuntime): void {
@@ -923,9 +960,55 @@ export class ForegroundTerminalCoordinator {
       const view = tab.viewport.snapshot();
       this.#predictiveEcho.reconcile(view, predictionKey(tab, view));
     }
+    if (event.provenance === "live") this.#noticePaneDeath(tab);
     // Parsing preserves every ordered byte; painting may skip intermediate
     // screens. A slow host must not hold up ingestion of newer remote output.
     this.#queueStateRender();
+  }
+
+  /**
+   * tmux keeps a dead pane on screen and writes one line of its own under it
+   * (remain-on-exit): "Pane is dead (status 0, Tue Sep 29 17:41:10 2026)". A
+   * program can print the same words, so the line only starts a bounded read
+   * of the server's record, and the tab ends only when that record says so.
+   * The supervisor records the exit a moment after tmux draws the line.
+   */
+  #noticePaneDeath(tab: ForegroundTab): void {
+    const tabId = tab.intent.tabId;
+    const read = this.#options.readSessionEnd;
+    if (read === undefined || this.#endReads.has(tabId) || this.#endedTabs.has(tabId)) return;
+    const death = paneDeathRow(tab.viewport.snapshot().cells);
+    if (death === undefined) return;
+    this.#endReads.add(tabId);
+    void (async () => {
+      for (const delay of this.#options.sessionEndReadDelaysMs ?? SESSION_END_READ_DELAYS_MS) {
+        await abortableDelay(delay, this.#lifetimeAbort.signal);
+        if (this.#tabs.get(tabId) !== tab || this.#state !== "active") return;
+        const end = await read(tab.intent.agentSessionId, this.#lifetimeAbort.signal).catch(() => undefined);
+        if (end === undefined) continue;
+        if (this.#tabs.get(tabId) !== tab) return;
+        this.#endedTabs.set(tabId, Object.freeze({
+          status: death.status,
+          ...(end.observedAt === undefined ? {} : { observedAt: end.observedAt }),
+        }));
+        if (this.#pendingBrowserActionTabId === tabId) {
+          this.#pendingBrowserAction = undefined;
+          this.#pendingBrowserActionTabId = undefined;
+        }
+        await this.#render();
+        return;
+      }
+    })().catch(() => undefined).finally(() => this.#endReads.delete(tabId));
+  }
+
+  /** What an ended tab's bar says, and what its keys are answered with. */
+  #endedNotice(tab: ForegroundTab, end: TabEnd): string {
+    const provider = sessionProviderName(tab.intent.agent);
+    const at = end.observedAt === undefined || Number.isNaN(Date.parse(end.observedAt))
+      ? "" : ` at ${new Date(end.observedAt).toISOString().slice(11, 16)} UTC`;
+    const journey = journeyCommand(tab.intent.agent);
+    return `${provider} exited${end.status === undefined ? "" : ` (${end.status})`}${at} · this session has ended · ` +
+      (journey === undefined ? "start a new one with `cuna` (from its folder)" : `start a new one: \`${journey} --new-session\` (from its folder)`);
   }
 
   #terminalState(snapshot: RuntimeTerminalSnapshot): void {
@@ -987,6 +1070,17 @@ export class ForegroundTerminalCoordinator {
               })
               : runtimeFailure("terminal_disconnected", "A foreground AgentSession terminal failed."));
         }
+        if (snapshot.state === "closed" && snapshot.reason === "remote_process_exit") {
+          // The supervisor's EXIT frame: the process ended and the wire is
+          // closed. The runner says so once the host is restored.
+          this.#endedSessions.push(Object.freeze({
+            agentSessionId: tab.intent.agentSessionId,
+            label: tab.intent.label,
+            agent: tab.intent.agent,
+            ...(typeof snapshot.exitCode === "number" ? { status: `status ${snapshot.exitCode}` } : {}),
+          }));
+        }
+        this.#endedTabs.delete(snapshot.tabId);
         this.#localActionBroker.cancelBinding(this.#localActionIdentity(tab.intent, tab.snapshot), "terminal_detached");
         tab.viewport.dispose();
         this.#tabs.delete(snapshot.tabId);
@@ -2443,8 +2537,18 @@ export class ForegroundTerminalCoordinator {
       throw outcome.error;
     }
     // Recorded only once the runtime confirmed the detach: a failed detach
-    // above must never be announced as a session that keeps running.
-    if (departing !== undefined) {
+    // above must never be announced as a session that keeps running, and
+    // neither may one whose process the server says ended.
+    const ended = this.#endedTabs.get(tabId);
+    this.#endedTabs.delete(tabId);
+    if (departing !== undefined && ended !== undefined) {
+      this.#endedSessions.push(Object.freeze({
+        agentSessionId: departing.intent.agentSessionId,
+        label: departing.intent.label,
+        agent: departing.intent.agent,
+        ...(ended.status === undefined ? {} : { status: ended.status }),
+      }));
+    } else if (departing !== undefined) {
       this.#detachedSessions.push(Object.freeze({
         agentSessionId: departing.intent.agentSessionId,
         label: departing.intent.label,
@@ -2523,6 +2627,9 @@ export class ForegroundTerminalCoordinator {
   }
 
   #unavailableInputNotice(): string {
+    const tab = this.#activeTabId === undefined ? undefined : this.#tabs.get(this.#activeTabId);
+    const end = this.#activeTabId === undefined ? undefined : this.#endedTabs.get(this.#activeTabId);
+    if (tab !== undefined && end !== undefined) return this.#endedNotice(tab, end);
     const failure = this.#activeTabId === undefined ? undefined : this.#recoverableReconnectFailures.get(this.#activeTabId);
     return failure === undefined ? INPUT_WITHHELD_NOTICE : reconnectFailedNotice(failure);
   }
@@ -2531,7 +2638,10 @@ export class ForegroundTerminalCoordinator {
     const tabId = this.#activeTabId;
     if (tabId === undefined) return undefined;
     const tab = this.#tabs.get(tabId);
-    if (tab === undefined || tab.snapshot.state !== "active" || tab.snapshot.terminalView?.ready === false) return undefined;
+    // An ended tab has no process to send to: its keys get the ended notice,
+    // and Ctrl+C leaves it.
+    if (tab === undefined || tab.snapshot.state !== "active" || tab.snapshot.terminalView?.ready === false ||
+      this.#endedTabs.has(tabId)) return undefined;
     return Object.freeze({
       tabId,
       binding: Object.freeze({
@@ -2728,17 +2838,22 @@ export class ForegroundTerminalCoordinator {
       // this window's width is cut from every row that reaches that far.
       const hiddenColumns = this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer"
         ? Math.max(0, activeViewport.columns - dimensions.columns) : 0;
-      const tabs = [...this.#tabs.values()].map((tab): WorkbenchTab => Object.freeze({
-        id: tab.intent.tabId,
-        label: tab.intent.label,
-        agent: tab.intent.agent,
+      const tabs = [...this.#tabs.values()].map((tab): WorkbenchTab => {
+        const ended = this.#endedTabs.has(tab.intent.tabId);
         // Hidden tabs contribute labels only; projecting their cells would
         // recapture a full terminal on every visible output frame. A view the
         // person scrolled back is projected from local history.
-        viewport: tab.intent.tabId === activeTabId && this.#viewProjection(tab, dimensions) !== undefined
+        const viewport = tab.intent.tabId === activeTabId && this.#viewProjection(tab, dimensions) !== undefined
           ? tab.viewport.snapshotForHost(dimensions.columns, remoteRows(dimensions.rows))
-          : tab.viewport.snapshot(),
-      }));
+          : tab.viewport.snapshot();
+        return Object.freeze({
+          id: tab.intent.tabId,
+          label: ended ? `${tab.intent.label} · ended` : tab.intent.label,
+          agent: tab.intent.agent,
+          // The bar says the process ended; tmux's own line for it is not shown.
+          viewport: ended ? withoutPaneDeathRow(viewport) : viewport,
+        });
+      });
       const shownTab = this.#tabs.get(activeTabId);
       const selection = shownTab === undefined ? undefined : this.#selectionRows(shownTab, dimensions);
       const links = shownTab === undefined ? undefined : this.#linkSpans(shownTab, dimensions);
@@ -2770,6 +2885,8 @@ export class ForegroundTerminalCoordinator {
           ? { notice: this.#disconnectNotice }
           : this.#switchNotice !== undefined
             ? { notice: this.#switchNotice }
+          : this.#endedTabs.has(activeTabId) && this.#tabs.has(activeTabId)
+            ? { notice: this.#endedNotice(this.#tabs.get(activeTabId)!, this.#endedTabs.get(activeTabId)!) }
           : this.#tabs.get(activeTabId)?.snapshot.state === "active" && this.#tabs.get(activeTabId)?.snapshot.terminalView?.ready === false
             ? { notice: "Restoring terminal\u2026" }
           : this.#browserNotice !== undefined
@@ -3275,6 +3392,49 @@ function padTrustedLine(value: string, columns: number): string {
 function providerName(provider: LocalBrowserActionRequest["provider"]): string {
   if (provider === "claude-code") return "Claude Code";
   return "Codex";
+}
+
+const SESSION_END_READ_DELAYS_MS = Object.freeze([0, 1_500, 3_000, 6_000]);
+/**
+ * tmux's default remain-on-exit-format:
+ * "Pane is dead (status 0, Tue Sep 29 17:41:10 2026)", or "(signal 9, …)".
+ */
+const PANE_DEAD = /^Pane is dead \((status \d{1,3}|signal \d{1,2})(?:, [A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4})?\)$/u;
+
+/** tmux's pane-dead line, when it is the screen's last written row. */
+function paneDeathRow(cells: readonly string[]): { readonly row: number; readonly status: string } | undefined {
+  for (let row = cells.length - 1; row >= 0; row -= 1) {
+    const text = (cells[row] ?? "").trim();
+    if (text.length === 0) continue;
+    const match = PANE_DEAD.exec(text);
+    return match === null ? undefined : Object.freeze({ row, status: match[1] as string });
+  }
+  return undefined;
+}
+
+/** The same screen with tmux's pane-dead line blank. */
+function withoutPaneDeathRow(view: ViewportSnapshot): ViewportSnapshot {
+  const death = paneDeathRow(view.cells);
+  if (death === undefined) return view;
+  const blank = <T>(rows: readonly T[], value: T): readonly T[] =>
+    Object.freeze(rows.map((row, index) => index === death.row ? value : row));
+  return Object.freeze({
+    ...view,
+    cells: blank(view.cells, ""),
+    displayWidths: blank(view.displayWidths, 0),
+    ...(view.renderRows === undefined ? {} : { renderRows: blank(view.renderRows, Object.freeze([])) }),
+    ...(view.continuedRows === undefined ? {} : { continuedRows: blank(view.continuedRows, false) }),
+  });
+}
+
+function sessionProviderName(agent: WorkbenchTab["agent"]): string {
+  return agent === "claude-code" ? "Claude Code" : agent === "codex" ? "Codex" : agent === "opencode" ? "OpenCode" :
+    agent === "openclaw" ? "OpenClaw" : "The shell";
+}
+
+/** The journey that starts a new session of this provider, when there is one. */
+function journeyCommand(agent: WorkbenchTab["agent"]): string | undefined {
+  return agent === "claude-code" ? "cuna claude" : agent === "codex" ? "cuna codex" : agent === "opencode" ? "cuna opencode" : undefined;
 }
 
 async function raceAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {

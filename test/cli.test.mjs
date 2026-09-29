@@ -791,6 +791,50 @@ test("foreground Cuna renders an unrecoverable terminal with exact-session recov
   assert.doesNotMatch(visible, /again in a moment|Wait for a fresh runtime observation|reconnecting its terminal control|Error \[/u);
 });
 
+// Owner 2026-09-29 17:41Z, AgentSession 950501a4: Codex 0.147 quit at its
+// sign-in screen, and `connect` said the process "may have ended" while the
+// session's own record already read process_exited.
+test("an unreachable terminal whose session records its process exited says it ended and how to start anew", async () => {
+  const unreachable = async () => {
+    throw new CunaError({
+      code: "cuna.runtime.capability_unavailable",
+      message: "The terminal owner cannot be recovered.",
+      exitCode: EXIT_CODES.policy,
+      details: { capability_id: "terminal_connections.create", reason_code: "terminal_owner_unrecoverable" },
+    });
+  };
+  const connect = async (session) => {
+    const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+    const reads = [];
+    const exit = await runCli([], {
+      streams: interactive.streams,
+      platform,
+      env: { CUNA_API_KEY: API_KEY },
+      clientFactory: () => fakeClient({ async getAgentSession(id) { reads.push(id); return session(id); } }),
+      rootJourneyRunner: async () => ({ kind: "attach", agentSessionId: FOREGROUND_SESSION_A, agent: "codex" }),
+      foregroundTerminalRunner: unreachable,
+    });
+    return { exit, reads, visible: stripAnsi(interactive.stderr()) };
+  };
+  const ended = await connect((id) => agentSession({
+    id, agent: "codex", desiredState: "running", requestState: "terminal", processState: "exited",
+    terminalReason: "process_exited", runtimeObservedAt: "2026-09-29T17:41:11.500Z",
+  }));
+  assert.equal(ended.exit, EXIT_CODES.policy);
+  assert.deepEqual(ended.reads, [FOREGROUND_SESSION_A]);
+  assert.match(ended.visible, /CUNA  Codex exited at 17:41 UTC · this session has ended/u);
+  assert.match(ended.visible, /records its process as exited \(process_exited\)/u);
+  assert.match(ended.visible, /Start a new one from its folder: `cuna codex --new-session`/u);
+  assert.ok(ended.visible.includes(`cuna agent-sessions get ${FOREGROUND_SESSION_A}`));
+  assert.doesNotMatch(ended.visible, /may have ended|not reachable right now/u);
+
+  // Control: a record that still reads running keeps the words that claim nothing.
+  const running = await connect((id) => agentSession({ id, agent: "codex", requestState: "launched", processState: "running" }));
+  assert.match(running.visible, /This AgentSession's terminal is not reachable right now/u);
+  assert.match(running.visible, /may have ended, or the Machine has not re-announced it yet/u);
+  assert.doesNotMatch(running.visible, /Codex exited/u);
+});
+
 test("foreground Cuna recognizes the OpenCode supervisor-upgrade reason without claiming a session changed", async () => {
   const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
   const exit = await runCli([], {

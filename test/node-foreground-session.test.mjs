@@ -279,6 +279,30 @@ test("E14-D6: detaching with Ctrl+] d prints one line after the terminal is rest
   assert.ok(events.indexOf("host:restore") < events.indexOf("detach-line"), "the line follows the restore, never precedes it");
 });
 
+test("a process exit on the wire says, after the restore, that the session ended and how to start anew", async () => {
+  const events = [];
+  const host = new FakeHost(events);
+  const system = terminalSystem(events);
+  const operation = runSupportedForegroundSessions({
+    client: fakeClient(events),
+    baseUrl: "https://api.getcuna.com",
+    agentSessionIds: [SESSION_A],
+  }, {
+    host,
+    controlPlane: system.controlPlane,
+    terminalConnector: system.terminalConnector,
+    clock: () => NOW,
+  });
+  await waitUntil(() => host.input !== undefined, "foreground ownership should start after preflight");
+  const writesBeforeExit = host.writes.length;
+  system.push(encodeTerminalControl("exit", 2n, { exitCode: 0, reason: "exited" }));
+  await operation;
+  assert.equal(host.restored, 1);
+  const afterRestore = host.writes.slice(writesBeforeExit).map((bytes) => new TextDecoder().decode(bytes));
+  assert.match(afterRestore.at(-1), /^\S.* exited \(status 0\) · session 1111 has ended · start a new one from its folder: cuna \S+ --new-session\n$/u);
+  assert.equal(afterRestore.some((text) => text.includes("keeps running")), false, "an ended session is never said to keep running");
+});
+
 // D13. A reconnect refused while attached is the tab's state; a later Ctrl+] d
 // is still a detach. Measured 2026-09-28: `cuna claude` detached after 8.5 min
 // attached and printed "This AgentSession's terminal cannot be recovered" for

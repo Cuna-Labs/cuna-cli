@@ -3567,6 +3567,88 @@ test("help names Ctrl+C by seat: to the agent for a writer, detach only for an o
   } finally { await coordinator.stop(); }
 });
 
+// Owner 2026-09-29 17:41Z: Codex 0.147 quit at its sign-in screen, and the
+// terminal showed tmux's own "Pane is dead (status 0, …)" under it. The
+// supervisor recorded process_exited 1.5 s later; no EXIT frame reached the CLI.
+const PANE_DEAD_LINE = "Pane is dead (status 0, Tue Sep 29 17:41:10 2026)";
+/** A canonical view after its pane died: the last screen, then tmux's line on the view's last row. */
+const paneDeadView = (rows) => `\u001b[2J\u001b[H  Welcome to Codex\r\n  1. Sign in with ChatGPT\u001b[${rows};1H${PANE_DEAD_LINE}`;
+
+function endingHarness(recorded) {
+  const reads = [];
+  const context = harness({
+    host: Object.assign(new FakeHost(), { columns: 200 }),
+    coordinatorOptions: {
+      disconnectFrameMs: 1,
+      sessionEndReadDelaysMs: [0, 5, 5],
+      async readSessionEnd(agentSessionId) { reads.push(agentSessionId); return recorded(reads.length); },
+    },
+  });
+  return { ...context, reads };
+}
+
+test("a pane the server records as ended is labelled ended, and tmux's pane-dead line is not shown", async () => {
+  // The first read races the supervisor's record; the second finds it.
+  const { coordinator, callbacks, calls, host, intents, reads } = endingHarness((count) => count < 2 ? undefined : { observedAt: "2026-09-29T17:41:11.500Z" });
+  const codex = intents[1];
+  await coordinator.start([codex]);
+  await callbacks.onTerminalOutput(outputEvent(codex, 1n, encoder.encode(paneDeadView(22))));
+  await waitForScreen(host, /Codex exited \(status 0\) at 17:41 UTC · this session has ended · start a new one: `cuna codex --new-session` \(from its folder\)/u,
+    "the bar says the process ended, how, when and what to do");
+  const screen = await visibleHostText(host);
+  assert.doesNotMatch(screen, /Pane is dead/u, "tmux's own line is not shown");
+  assert.match(screen, /Welcome to Codex/u, "the last screen stays");
+  assert.match(screen, /review · ended/u, "the tab is labelled ended");
+  assert.deepEqual(reads, [codex.agentSessionId, codex.agentSessionId]);
+  host.emitInput(encoder.encode("x"));
+  host.emitInput(Uint8Array.of(0x0d));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(calls.input, [], "keys are not sent to an ended process");
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, [codex.tabId], "Ctrl+C leaves an ended tab");
+  assert.deepEqual(coordinator.detachedSessions, [], "an ended session is never said to keep running");
+  assert.deepEqual(coordinator.endedSessions, [{ agentSessionId: codex.agentSessionId, label: "review", agent: "codex", status: "status 0" }]);
+});
+
+test("DISCRIMINATING CONTROL: pane-dead words the server does not confirm are only screen text", async () => {
+  const { coordinator, callbacks, calls, host, intents, reads } = endingHarness(() => undefined);
+  const codex = intents[1];
+  try {
+    await coordinator.start([codex]);
+    await callbacks.onTerminalOutput(outputEvent(codex, 1n, encoder.encode(paneDeadView(22))));
+    await waitUntil(() => reads.length === 3, "every bounded read is made");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const screen = await visibleHostText(host);
+    assert.match(screen, /Pane is dead \(status 0/u, "unconfirmed, the screen is shown as it is");
+    assert.doesNotMatch(screen, /has ended|· ended/u);
+    host.emitInput(Uint8Array.of(0x03));
+    await waitUntil(() => calls.input.length === 1, "the writer's Ctrl+C still reaches the PTY");
+    assert.deepEqual(calls.detach, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("CONTROL: the words above later output are not tmux's line, and nothing is read", async () => {
+  const { coordinator, callbacks, intents, reads } = endingHarness(() => ({ observedAt: "2026-09-29T17:41:11.500Z" }));
+  const codex = intents[1];
+  try {
+    await coordinator.start([codex]);
+    await callbacks.onTerminalOutput(outputEvent(codex, 1n, encoder.encode(`\u001b[2J\u001b[H${PANE_DEAD_LINE}\r\n$ still typing`)));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(reads, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("an EXIT frame ends the tab as ended, with its status, never as detached", async () => {
+  const { coordinator, callbacks, intents } = harness();
+  const codex = intents[1];
+  await coordinator.start([codex]);
+  callbacks.onTerminalState({ ...snapshot(codex), state: "closed", reason: "remote_process_exit", exitCode: 0 });
+  await coordinator.waitForStop();
+  assert.deepEqual(coordinator.detachedSessions, []);
+  assert.deepEqual(coordinator.endedSessions, [{ agentSessionId: codex.agentSessionId, label: "review", agent: "codex", status: "status 0" }]);
+});
+
 test("Ctrl+click opens a drawn link; the exact OSC 8 link wins over a cut row", async () => {
   const { coordinator, callbacks, host, intents, opened, calls } = await selectionHarness({}, (intents) => { intents[0].localBrowserActions = true; });
   try {

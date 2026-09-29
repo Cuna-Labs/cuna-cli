@@ -15,7 +15,9 @@ import { launchRemoteWorkspaceSession } from "../journey/remote-workspace.js";
 import { join, resolve } from "node:path";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
+import type { AgentSession } from "../api/contracts.js";
 import { createHttpTransport, type BearerRefreshRequest, type HttpRequest } from "../api/http.js";
+import { providerDisplayName } from "../machines/provider-availability.js";
 import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import type { BrowserHandoffReporter } from "../auth/browser-handoff.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
@@ -83,6 +85,7 @@ import type { TerminalClientScope } from "../runtime/terminal-client-identity.js
 import {
   runNodeForegroundSessions,
   selectNodeForegroundPresentation,
+  sessionEndRecord,
   type ForegroundSessionRunner,
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
@@ -747,11 +750,38 @@ function writeTerminalReconnectConflict(stream: Writable, color: boolean): void 
   stream.write("Run `cuna` again to reconnect.\n");
 }
 
+/** A refused session whose process the server records as ended. */
+interface RecordedSessionEnd {
+  readonly session: AgentSession;
+  readonly observedAt?: string;
+}
+
+/**
+ * `terminal_owner_unrecoverable` names two facts the refusal cannot tell
+ * apart; the session's own record can. Read it once, bounded, and use it only
+ * when it says the process ended. A failed or slow read keeps the general text.
+ */
+async function recordedSessionEnd(
+  client: CunaApiClient | undefined,
+  sessionIds: readonly string[],
+): Promise<RecordedSessionEnd | undefined> {
+  const id = sessionIds[0];
+  if (client === undefined || id === undefined || sessionIds.length !== 1) return undefined;
+  try {
+    const session = await client.getAgentSession(id, AbortSignal.timeout(5_000));
+    const end = session.id === id ? sessionEndRecord(session) : undefined;
+    return end === undefined ? undefined : Object.freeze({ session, ...end });
+  } catch {
+    return undefined;
+  }
+}
+
 function writeTerminalSupervisorReadiness(
   stream: Writable,
   color: boolean,
   state: TerminalSupervisorReadiness,
   sessionIds: readonly string[],
+  recordedEnd?: RecordedSessionEnd,
 ): void {
   const accent = (value: string): string => color ? `\u001b[38;5;202m\u001b[1m${value}\u001b[0m` : value;
   const inspection = (): void => {
@@ -761,6 +791,20 @@ function writeTerminalSupervisorReadiness(
       }
     }
   };
+  if (state === "ended" && recordedEnd !== undefined) {
+    const { session, observedAt } = recordedEnd;
+    const provider = providerDisplayName(session.agent);
+    const at = observedAt === undefined || Number.isNaN(Date.parse(observedAt))
+      ? "" : ` at ${new Date(observedAt).toISOString().slice(11, 16)} UTC`;
+    const journey = session.agent === "claude-code" ? "claude" : session.agent === "opencode" ? "opencode" : session.agent === "codex" ? "codex" : undefined;
+    stream.write(`${accent("◆ CUNA")}  ${provider} exited${at} · this session has ended\n`);
+    stream.write(`Cuna records its process as ${session.processState}${session.terminalReason === undefined ? "" : ` (${session.terminalReason})`}; it cannot be opened again.\n`);
+    inspection();
+    stream.write(journey === undefined
+      ? "Start a new one from its folder with `cuna`.\n"
+      : `Start a new one from its folder: \`cuna ${journey} --new-session\`\n`);
+    return;
+  }
   if (state === "ended") {
     // The Edge answers `terminal_owner_unrecoverable` for two different facts:
     // a process the durable row says has settled, and a live process whose
@@ -1054,6 +1098,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   let interactiveCloseUi = false;
   let interactiveCloseColor = false;
   let terminalSessionIds: readonly string[] = [];
+  // Reads what the server recorded about a session whose terminal was refused.
+  let refusalReader: CunaApiClient | undefined;
   // Known once configuration is read; every attach happens after that.
   let terminalClients: TerminalClientScope | undefined;
   const runForeground: ForegroundSessionRunner = async (input) => {
@@ -1586,6 +1632,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     }) : undefined;
     const client = dependencies.clientFactory?.(config, effectiveTimeoutMs) ?? createCunaApiClient(httpTransport!);
+    refusalReader = client;
     const inventoryCache = dependencies.machineInventoryCache ??
       (credentialMode === "interactive" && dependencies.clientFactory === undefined
         ? machineInventoryCache(platform, { baseUrl: config.baseUrl, profile: config.profile })
@@ -2354,6 +2401,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         interactiveCloseColor && streams.stderrIsTTY === true,
         supervisorReadiness,
         terminalSessionIds,
+        supervisorReadiness === "ended" ? await recordedSessionEnd(refusalReader, terminalSessionIds) : undefined,
       );
       // An unattested owner is a refusal of this attempt, not a network
       // condition: an automatic retry cannot change it, so the exit code must

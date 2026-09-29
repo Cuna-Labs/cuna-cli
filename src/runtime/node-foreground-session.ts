@@ -17,6 +17,8 @@ import {
   admitForegroundDimensions,
   admitForegroundSessionIds,
   type DetachedForegroundSession,
+  type EndedForegroundSession,
+  type ForegroundSessionEndRecord,
   type ForegroundSwitchRequest,
   type ForegroundTabIntent,
   type ForegroundTerminalCoordinatorOptions,
@@ -125,6 +127,8 @@ export interface NodeForegroundSessionDependencies {
 /** What one attached run ended with. */
 interface ForegroundRunOutcome {
   readonly detached: readonly DetachedForegroundSession[];
+  /** Sessions whose process ended while on screen. */
+  readonly ended?: readonly EndedForegroundSession[];
   readonly switchTo?: ForegroundSwitchRequest;
 }
 
@@ -164,9 +168,10 @@ export async function runNodeForegroundSessions(
     switching: undefined,
   };
   const detached = new Map<string, DetachedForegroundSession>();
+  const endedSessions = new Map<string, EndedForegroundSession>();
   let failure: unknown;
   try {
-    await runSwitchingForeground(input, dependencies, context, detached);
+    await runSwitchingForeground(input, dependencies, context, detached, endedSessions);
   } catch (error) {
     failure = error;
   }
@@ -184,8 +189,15 @@ export async function runNodeForegroundSessions(
   // announced as running.
   if (failure === undefined && cleanupFailures.length === 0) {
     const ended = new Set((context.roster?.entries() ?? []).filter((entry) => entry.ended).map((entry) => entry.agentSessionId));
+    for (const session of endedSessions.values()) {
+      try {
+        await context.host.write(new TextEncoder().encode(`${endedSessionLine(session)}\n`));
+      } catch {
+        // A courtesy line, like the detach line below.
+      }
+    }
     for (const session of detached.values()) {
-      if (ended.has(session.agentSessionId)) continue;
+      if (ended.has(session.agentSessionId) || endedSessions.has(session.agentSessionId)) continue;
       try {
         await context.host.write(new TextEncoder().encode(
           `Detached · ${session.label} keeps running · cuna connect ${session.agentSessionId}\n`,
@@ -210,6 +222,7 @@ async function runSwitchingForeground(
   dependencies: NodeForegroundSessionDependencies,
   context: ForegroundSwitchContext,
   detached: Map<string, DetachedForegroundSession>,
+  endedSessions: Map<string, EndedForegroundSession>,
 ): Promise<void> {
   let current: SwitchStep = { input, name: undefined };
   // The session a switch left, to come back to once if the target fails.
@@ -245,6 +258,10 @@ async function runSwitchingForeground(
     for (const session of outcome.detached) {
       detached.delete(session.agentSessionId);
       detached.set(session.agentSessionId, session);
+    }
+    for (const session of outcome.ended ?? []) {
+      detached.delete(session.agentSessionId);
+      endedSessions.set(session.agentSessionId, session);
     }
     const target = outcome.switchTo;
     if (target === undefined) return;
@@ -663,6 +680,27 @@ async function claimClientIdentity(
 }
 
 /**
+ * The server's record that this AgentSession's process ended, or undefined
+ * while the record does not say so.
+ */
+export function sessionEndRecord(session: AgentSession): ForegroundSessionEndRecord | undefined {
+  const ended = session.terminalReason === "process_exited" ||
+    session.processState === "exited" || session.processState === "failed" || session.processState === "terminated";
+  if (!ended) return undefined;
+  return Object.freeze(session.runtimeObservedAt === undefined ? {} : { observedAt: session.runtimeObservedAt });
+}
+
+/** The line after the host is restored for a session whose process ended while on screen. */
+function endedSessionLine(session: EndedForegroundSession): string {
+  const provider = session.agent === "claude-code" ? "Claude Code" : session.agent === "codex" ? "Codex" :
+    session.agent === "opencode" ? "OpenCode" : session.agent === "openclaw" ? "OpenClaw" : "The shell";
+  const journey = session.agent === "claude-code" ? "claude" : session.agent === "codex" ? "codex" :
+    session.agent === "opencode" ? "opencode" : undefined;
+  return `${provider} exited${session.status === undefined ? "" : ` (${session.status})`} · ${session.label} has ended · ` +
+    (journey === undefined ? "start a new one with `cuna` from its folder" : `start a new one from its folder: cuna ${journey} --new-session`);
+}
+
+/**
  * The refusal after which the AgentSession cannot be attached again: the owner
  * of that exact process is gone. (A process exit seen on the wire is the other
  * typed end; `runClaimedForeground` watches for it.)
@@ -709,6 +747,7 @@ async function runClaimedForeground(
         mouseReporting: dependencies.mouseReporting ?? dependencies.host === undefined,
         ...(switching === undefined ? {} : { attachingTitle: switching.title }),
         ...(initialNotice.length === 0 ? {} : { initialNotice }),
+        readSessionEnd: async (agentSessionId, signal) => sessionEndRecord(await input.client.getAgentSession(agentSessionId, signal)),
       })
     : new PassthroughTerminalCoordinator({
         host,
@@ -770,6 +809,7 @@ async function runClaimedForeground(
   // the host is restored; a switch keeps the host, so they cannot go here.
   const outcome: ForegroundRunOutcome = Object.freeze({
     detached: coordinator.detachedSessions,
+    ...(coordinator instanceof ForegroundTerminalCoordinator ? { ended: coordinator.endedSessions } : {}),
     ...(coordinator instanceof ForegroundTerminalCoordinator && coordinator.switchRequest !== undefined &&
       !context.switchContext.cancelled
       ? { switchTo: coordinator.switchRequest }
