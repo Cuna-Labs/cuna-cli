@@ -38,6 +38,7 @@ import {
 } from "../core/validation.js";
 import { preflightAgentJourneyInvocation } from "../journey/intent.js";
 import type { JourneyWait } from "../journey/wait-policy.js";
+import { supervisorWaitCause } from "../journey/session-failure.js";
 import type { ManagedExecution } from "../api/managed-executions.js";
 import { listAllMachines } from "../machines/pagination.js";
 import {
@@ -143,6 +144,11 @@ export interface CommandContext {
    * deadline; `undefined` ends the wait. Only a painted progress row listens.
    */
   readonly reportWait?: (wait: JourneyWait | undefined) => void;
+  /**
+   * Says, once and as soon as it is true, that the server accepted a mutation
+   * the command will now wait on. See `OutputWriter.accepted`.
+   */
+  readonly reportAccepted?: (command: string, data: unknown, human: string) => void;
 }
 
 function productionConvergencePoller(): ConvergencePoller {
@@ -180,10 +186,16 @@ async function convergeOnRemoteState<T>(
     readonly operation: string;
     readonly settleWith: string;
     readonly probe: () => Promise<ConvergenceProbe<T>>;
+    /**
+     * What an unsettled observation is waiting for, for the progress row.
+     * Absent, the wait stays silent as it always was.
+     */
+    readonly describeWait?: (observation: T) => Pick<JourneyWait, "waitingFor" | "cause">;
   },
 ): Promise<T> {
   const poller = context.convergencePoller ?? productionConvergencePoller();
-  const deadline = poller.now() + REMOTE_CONVERGENCE_BUDGET_MS;
+  const startedAt = poller.now();
+  const deadline = startedAt + REMOTE_CONVERGENCE_BUDGET_MS;
   let probe = await input.probe();
   while (!probe.settled) {
     const remaining = deadline - poller.now();
@@ -195,6 +207,13 @@ async function convergeOnRemoteState<T>(
         budgetMs: REMOTE_CONVERGENCE_BUDGET_MS,
         details: probe.details,
       });
+    }
+    if (input.describeWait !== undefined) {
+      context.reportWait?.(Object.freeze({
+        ...input.describeWait(probe.observation),
+        elapsedMs: poller.now() - startedAt,
+        deadlineMs: REMOTE_CONVERGENCE_BUDGET_MS,
+      }));
     }
     await poller.sleep(Math.min(REMOTE_CONVERGENCE_POLL_INTERVAL_MS, remaining));
     probe = await input.probe();
@@ -704,6 +723,21 @@ function agentSessionRecord(session: AgentSession, machine?: Machine, now?: numb
     ...(session.terminationRequestedAt === undefined
       ? {}
       : { termination_requested_at: session.terminationRequestedAt }),
+    // Present only when the read asked for them and the server answered.
+    ...(session.readiness === undefined ? {} : {
+      readiness_outcome: session.readiness.outcome,
+      readiness_deadline_at: session.readiness.deadlineAt,
+      ...(session.readiness.reason === undefined ? {} : { readiness_reason: session.readiness.reason }),
+      ...(session.readiness.settledAt === undefined ? {} : { readiness_settled_at: session.readiness.settledAt }),
+    }),
+    ...(session.runtimeEvidence === undefined ? {} : {
+      runtime_evidence: Object.freeze({
+        source: session.runtimeEvidence.source,
+        observed_at: session.runtimeEvidence.observedAt,
+        age_seconds: session.runtimeEvidence.ageSeconds,
+        process_proof: session.runtimeEvidence.processProof,
+      }),
+    }),
     row_version: session.rowVersion,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
@@ -1335,7 +1369,7 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
     return;
   }
   if (action === "terminate" || action === "rename") {
-    rejectUnknownOptions(parsed, action === "rename" ? ["name", "yes"] : ["yes"]);
+    rejectUnknownOptions(parsed, action === "rename" ? ["name", "yes"] : ["yes", "no-wait"]);
     if (parsed.operands.length !== 2) throw usageError(`agent-sessions ${action} requires exactly one AgentSession ID.`);
     requireConfirmation(parsed, `agent-sessions.${action}`);
     assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
@@ -3255,8 +3289,13 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     rejectUnknownOptions(parsed, []);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions get requires exactly one AgentSession ID.");
     const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
-    const session = await client.getAgentSession(id);
-    return Object.freeze({ command: "agent-sessions.get", data: agentSessionRecord(session), human: `${session.id}\t${session.name}\t${session.agent}\t${agentSessionStateLabel(session)}\t${session.cwd}` });
+    // This is the command every startup failure names as its next step, so it
+    // shows the server's startup verdict and supervisor evidence when served.
+    const session = await client.getAgentSession(id, undefined, { readiness: true, runtimeEvidence: true });
+    const startup = session.readiness?.reason === undefined
+      ? ""
+      : `\tstartup ${session.readiness.outcome} (${session.readiness.reason})`;
+    return Object.freeze({ command: "agent-sessions.get", data: agentSessionRecord(session), human: `${session.id}\t${session.name}\t${session.agent}\t${agentSessionStateLabel(session)}\t${session.cwd}${startup}` });
   }
   if (action === "create") {
     rejectUnknownOptions(parsed, [
@@ -3403,17 +3442,33 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     return Object.freeze({ command: "agent-sessions.create", data: agentSessionRecord(observed), human: `Created ${observed.agent} AgentSession ${observed.id}.` });
   }
   if (action === "terminate") {
-    rejectUnknownOptions(parsed, ["yes"]);
+    rejectUnknownOptions(parsed, ["yes", "no-wait"]);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions terminate requires exactly one AgentSession ID.");
     requireConfirmation(parsed, "agent-sessions.terminate");
     const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    const wait = !booleanOption(parsed, "no-wait");
     await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.terminate", now: context.capabilityClock ?? now });
-    await client.terminateAgentSession(id);
+    const accepted = await client.terminateAgentSession(id);
+    // The acceptance is the server's answer to this command, so it is said
+    // the moment it arrives; the settlement below is a second, slower fact.
+    const acceptedRecord = agentSessionRecord(accepted);
+    const acceptedLine = `Termination requested for AgentSession ${accepted.id}${accepted.terminationRequestedAt === undefined ? "" : ` at ${accepted.terminationRequestedAt}`}.`;
+    if (!wait) {
+      return Object.freeze({ command: "agent-sessions.terminate", data: acceptedRecord, human: acceptedLine });
+    }
+    context.reportAccepted?.("agent-sessions.terminate", acceptedRecord, acceptedLine);
     const observed = await convergeOnRemoteState(context, {
       operation: "AgentSession termination",
       settleWith: `cuna agent-sessions get ${id}`,
+      describeWait: (session) => {
+        const cause = supervisorWaitCause(session);
+        return Object.freeze({
+          waitingFor: "the machine's supervisor to end the session process",
+          ...(cause === undefined ? {} : { cause }),
+        });
+      },
       probe: async () => {
-        const session = await client.getAgentSession(id);
+        const session = await client.getAgentSession(id, undefined, { runtimeEvidence: true });
         return Object.freeze({
           settled: session.id === id && agentSessionTerminationConfirmed(session),
           observation: session,
@@ -3422,6 +3477,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
             observed_desired_state: session.desiredState,
             observed_request_state: session.requestState,
             observed_process_state: session.processState,
+            ...(supervisorWaitCause(session) === undefined ? {} : { wait_cause: supervisorWaitCause(session) as string }),
           }),
         });
       },

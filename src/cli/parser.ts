@@ -232,6 +232,9 @@ const BOOLEAN_OPTIONS = new Set([
   // producer's own recovery: the same identity never rotates control twice.
   // Deliberately NOT spelled `--yes`, which starts a different update.
   "resume",
+  // `agent-sessions terminate --no-wait`. Returns the server's acceptance and
+  // does not read back until the process has ended.
+  "no-wait",
 ]);
 
 /**

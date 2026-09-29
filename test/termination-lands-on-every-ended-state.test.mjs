@@ -97,14 +97,18 @@ async function terminate(processState) {
             }],
           };
         },
-        async terminateAgentSession() { return undefined; },
+        // The real client returns the decoded, id-bound acceptance; the command
+        // prints it before reading back.
+        async terminateAgentSession() { return session("unknown"); },
         async getAgentSession() { reads += 1; return session(processState); },
       }),
     },
   );
   const stdout = streams.stdout().trim();
   const stderr = streams.stderr().trim();
-  const record = JSON.parse((stdout === "" ? stderr : stdout).split("\n").at(-1));
+  // stdout now opens with the `accepted` line even when the wait fails, so a
+  // failure's record is read from stderr by exit code, not by stdout's absence.
+  const record = JSON.parse((exit === EXIT_CODES.success ? stdout : stderr).split("\n").at(-1));
   return { exit, record, reads };
 }
 
@@ -168,7 +172,9 @@ test("a session the caller never asked to end is not read as terminated", async 
             }],
           };
         },
-        async terminateAgentSession() { return undefined; },
+        // The real client returns the decoded, id-bound acceptance; the command
+        // prints it before reading back.
+        async terminateAgentSession() { return session("unknown"); },
         async getAgentSession() {
           return Object.freeze({ ...session("exited"), desiredState: "running", requestState: "launched" });
         },

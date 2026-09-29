@@ -347,8 +347,8 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "Rename one child process.\n\nRequired:\n  --name NAME         1 through 80 characters\n  --yes               Confirm this mutating operation",
   ),
   "agent-sessions terminate": topic(
-    "Usage:\n  cuna agent-sessions terminate SESSION_ID --yes",
-    "Terminate one child process when server-advertised.\n\nRequired:\n  --yes               Confirm this destructive operation",
+    "Usage:\n  cuna agent-sessions terminate SESSION_ID --yes [--no-wait]",
+    "Terminate one child process when server-advertised.\n\nRequired:\n  --yes               Confirm this destructive operation\n\nOptions:\n  --no-wait           Return once Cuna accepts the request; do not wait for\n                      the process to end\n\nThe acceptance is printed as soon as Cuna records it. With --json it is a\n`type: \"accepted\"` line, and the last line is the `type: \"result\"`.\nExit 0 means the process ended (or, with --no-wait, that Cuna accepted).\nExit 5 means Cuna accepted but the process had not ended within 120 s;\nthe termination stays requested. Read it with `cuna agent-sessions get ID`.",
   ),
   "agent-sessions attach": topic(
     "Usage:\n  cuna agent-sessions attach SESSION_ID",

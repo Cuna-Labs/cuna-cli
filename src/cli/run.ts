@@ -2360,6 +2360,12 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // A command that follows a long remote operation says what it is still
       // waiting for on the same progress row.
       reportWait: (wait) => batchProgress?.wait(wait),
+      // Human output keeps the spinner row coherent by printing above it; with
+      // no row the line goes to stdout like the result that follows it.
+      reportAccepted: (command, data, human) => {
+        if (!writer.structured && batchProgress !== undefined) batchProgress.note(sanitizeHumanTerminalOutput(human));
+        else writer.accepted(command, data, human);
+      },
     });
     batchProgress?.stop();
     batchProgress = undefined;
