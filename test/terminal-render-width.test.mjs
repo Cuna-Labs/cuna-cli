@@ -297,3 +297,30 @@ test("an observer of a wider writer marks each cut row and hides no character si
     assert.deepEqual(machine.resizes, [], "an observer never resizes the writer's PTY");
   } finally { await run.detach(); }
 });
+
+test("an observer whose window grows past the writer shows the writer's rows whole, then takes control at the larger size", async () => {
+  // Owner 2026-09-29: a 120x34 observer grown to 240x50 kept rows cut at the
+  // writer's width, and after taking control rows stayed cut at 143. The
+  // CLI's part: the observer shows exactly the writer's rows, and the new
+  // writer states the whole larger window. (A supervisor view that never
+  // follows the resize cut the rows in production; see the infra fix.)
+  const machine = new FakeMachine({ columns: 143, rows: 40 }, "cli:other-writer");
+  const host = new Host(120, 34);
+  const run = await connect(machine, host);
+  try {
+    await waitFor(async () => (await paintedUrlRows(host)).length > 0, "the writer's screen is painted");
+    const cut = remoteUrlRows(143).map((row) => row.length > 120 ? `${row.slice(0, 119)}›` : row);
+    assert.deepEqual(await paintedUrlRows(host), cut, "a narrower observer marks every cut row");
+
+    host.emitResize(240, 50);
+    await waitFor(async () => JSON.stringify(await paintedUrlRows(host)) === JSON.stringify(remoteUrlRows(143)),
+      "a wider observer shows the writer's 143-column rows whole");
+    assert.deepEqual(machine.resizes, [], "an observer never resizes the writer's PTY");
+
+    host.emitInput(Uint8Array.of(0x1d, 0x77));
+    await waitFor(() => machine.resizes.length > 0, "the new writer states this window's size");
+    assert.deepEqual(machine.resizes, [{ columns: 240, rows: 48 }]);
+    await waitFor(async () => JSON.stringify(await paintedUrlRows(host)) === JSON.stringify(remoteUrlRows(240)),
+      "every 240-column row is painted whole after the takeover");
+  } finally { await run.detach(); }
+});
