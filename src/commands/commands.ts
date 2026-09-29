@@ -480,13 +480,15 @@ function idempotencyKey(parsed: ParsedInvocation): string {
  *
  * Derived rather than random so that running the same create again with the
  * same `--idempotency-key` reads the same receipt instead of starting a second
- * create. The credential scope keeps two accounts' keys from ever naming the
- * same request.
+ * create. The account scope keeps two accounts' keys from ever naming the
+ * same request. An API key authenticates as its account (Edge auth.ts: a
+ * programmatic principal's id is the user id), so the account id serves both
+ * credential kinds, and no credential material enters the derivation: the
+ * request id, sent in a header and printed, says nothing about the key.
  */
 async function machineCreateRequestId(context: CommandContext, key: string): Promise<string> {
-  const scope = context.config.apiKey === undefined
-    ? `human:${(await context.client.getIdentity()).id}`
-    : `automation:${createHash("sha256").update(context.config.apiKey).digest("hex")}`;
+  const account = (await context.client.getIdentity()).id;
+  const scope = `${context.config.apiKey === undefined ? "human" : "automation"}:${account}`;
   const bytes = createHash("sha256").update("cuna.machine-create-request.v1\0")
     .update(scope).update("\0").update(key).digest();
   bytes[6] = (bytes[6]! & 0x0f) | 0x40;

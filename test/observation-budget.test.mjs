@@ -359,6 +359,13 @@ test("without --timeout-ms a create is bounded by its own budget, not by the glo
           }],
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
+      // The create request id is scoped by the account the key belongs to.
+      if (new URL(String(url)).pathname === "/v1/me") {
+        return new Response(JSON.stringify({
+          id: "11111111-1111-4111-8111-111111111111", email: "owner@example.test",
+          workspace: { assigned: true, id: "22222222-2222-4222-8222-222222222222", usage: { est_spend_usd: 1, est_spend_is_lower_bound: true, balance_status: "unavailable", balance_usd: null, balance_unavailable_reason: "no balance endpoint", note: "fixture" } },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
       const receipt = /^\/v1\/machine-creates\/([0-9a-f-]{36})$/u.exec(new URL(String(url)).pathname);
       if (receipt !== null) {
         receiptReads.push(receipt[1]);

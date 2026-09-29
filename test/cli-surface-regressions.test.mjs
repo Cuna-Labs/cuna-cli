@@ -488,6 +488,8 @@ test("machines create generates an idempotency key and still honours an override
         requiredPermissions: ["machines:create"],
       }],
     }),
+    // The create request id is scoped by the account the key belongs to.
+    getIdentity: async () => ({ id: "11111111-1111-4111-8111-111111111111", email: "owner@example.test" }),
     createMachine: async (_body, idempotencyKey) => {
       keys.push(idempotencyKey);
       return { id: MACHINE_ID, name: "dev", state: "creating" };
