@@ -519,7 +519,12 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         if (session.requestState === "failed") {
           if (session.workspaceFailureCode !== undefined) {
             const messages: Record<string, string> = {
-              "workspace.remote_edits": "Remote edits prevent synchronization. Preserve and reconcile those edits before retrying.",
+              // No command reconciles a Machine's tree, so "preserve and
+              // reconcile" named nothing a person could do. What does work: the
+              // refused request leaves a settled session, the Machine's capture
+              // lane saves the edits as the next generation (ws-c3, 2026-09-29:
+              // 21 s after cbde8586 was refused), and the next run adopts it.
+              "workspace.remote_edits": "This Workspace has remote edits on the Machine that no generation carries yet. They were kept and nothing was replaced. The Machine saves them as a new generation shortly; run the same command again in a minute to continue with both versions.",
               "workspace.in_use": "This workspace is still in use or waiting for a previous session to finish. Inspect its sessions before retrying.",
               "workspace.replacement_requires_fence": "This Workspace cannot replace its files while writer exclusion is unverified. Its existing files were preserved.",
               "workspace.materialization_manifest_limit": "This Workspace exceeds the runtime file manifest limit. Reduce the synchronized file set before retrying.",

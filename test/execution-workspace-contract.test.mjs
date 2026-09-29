@@ -28,7 +28,7 @@ test('adopting already synchronized content persists the authoritative binding b
 test('failed materialization is a typed terminal outcome before any readiness sleep',async()=>{
   let reads=0;
   const effects=createApiAgentJourneyEffects({client:{async getAgentSession(){reads++;return {requestState:'failed',processState:'starting',workspaceFailureCode:'workspace.remote_edits'};}},requestedAgent:'codex',async sleep(){throw new Error('must not wait after known failure');}});
-  await assert.rejects(effects.ensureAgentSessionReady({agentSessionId:id(1),signal:new AbortController().signal}),e=>e.code==='cuna.journey.workspace_materialization_failed'&&e.details.reason==='workspace.remote_edits'&&/remote edits/i.test(e.message));
+  await assert.rejects(effects.ensureAgentSessionReady({agentSessionId:id(1),signal:new AbortController().signal}),e=>e.code==='cuna.journey.workspace_materialization_failed'&&e.details.reason==='workspace.remote_edits'&&/remote edits/i.test(e.message)&&/kept and nothing was replaced.*run the same command again/.test(e.message));
   assert.equal(reads,1);
 });
 test('workspace owner refusal explains inspection without retrying or replacing the session',async()=>{
