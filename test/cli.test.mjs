@@ -2330,7 +2330,12 @@ test("AgentSession termination waits for a fenced supervisor terminal observatio
   assert.equal(terminations, 1);
   assert.equal(reads, 2);
   assert.equal(sleeps, 1);
-  const record = JSON.parse(streams.stdout());
+  // The acceptance is its own line, printed before the wait; the settled row
+  // is still the one `result`, and still the last line.
+  const records = streams.stdout().trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(records.map((record) => record.type), ["accepted", "result"]);
+  assert.equal(records[0].data.request_state, "termination_pending");
+  const record = records.at(-1);
   assert.equal(record.data.request_state, "terminal");
   assert.equal(record.data.process_state, "terminated");
 });
