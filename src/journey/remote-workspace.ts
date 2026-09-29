@@ -1,7 +1,7 @@
 import type { ProviderPreset } from "../api/provider-v2.js";
 import {withProviderLaunchIntent,type RecordedLaunchContext} from "./provider-launch-intent.js";
 import { isAgentSessionGone } from "../runtime/terminal-client-identity.js";
-import { sessionFailure } from "./session-failure.js";
+import { readinessFailure, sessionFailure, supervisorWaitCause } from "./session-failure.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { performance } from "node:perf_hooks";
 import { requireCapability, type CunaApiClient } from "../api/client.js";
@@ -112,8 +112,10 @@ export async function launchRemoteWorkspaceSession(input: {
     deadlineFailure: context.deadlineFailure,
     ...(input.onWait === undefined ? {} : { onWait: input.onWait }),
   });
-  const reportWait = (deadline: JourneyDeadline, waitingFor: string): void => {
-    input.onWait?.(Object.freeze({ waitingFor, elapsedMs: deadline.elapsedMs(), deadlineMs: deadline.deadlineMs }));
+  const reportWait = (deadline: JourneyDeadline, waitingFor: string, cause?: string): void => {
+    input.onWait?.(Object.freeze({
+      waitingFor, ...(cause === undefined ? {} : { cause }), elapsedMs: deadline.elapsedMs(), deadlineMs: deadline.deadlineMs,
+    }));
   };
   const outOfTime = (deadline: JourneyDeadline, waitingFor: string): JourneyDeadlineElapsed => Object.freeze({
     waitingFor, elapsedMs: deadline.elapsedMs(), deadlineMs: deadline.deadlineMs, readReissues: 0, cause: undefined,
@@ -161,20 +163,23 @@ export async function launchRemoteWorkspaceSession(input: {
   }));
   input.onProgress?.(`Waiting for ${agentName} remotely · no local sync`);
   const admitted = startJourneyDeadline(REMOTE_CONVERGENCE_BUDGET_MS, now);
-  const readinessFailure = timeout("remote session readiness");
+  const readinessTimeout = timeout("remote session readiness");
   for (;;) {
     signal.throwIfAborted();
     session = await readWithin({
-      waitingFor: WAITING_FOR.sessionRead, deadline: admitted, deadlineFailure: readinessFailure,
-      read: () => input.client.getAgentSession(sessionId, signal),
+      waitingFor: WAITING_FOR.sessionRead, deadline: admitted, deadlineFailure: readinessTimeout,
+      read: () => input.client.getAgentSession(sessionId, signal, { readiness: true, runtimeEvidence: true }),
     });
     validate(session);
     if (session.requestState === "failed" || ["exited", "failed", "terminated"].includes(session.processState)) {
       throw sessionFailure(session, "The remote session ended before attachment.");
     }
     if (session.processState === "ready" || session.processState === "running") return sessionId;
-    if (admitted.elapsed()) throw readinessFailure(outOfTime(admitted, WAITING_FOR.sessionStart));
-    reportWait(admitted, WAITING_FOR.sessionStart);
+    // The server's own verdict outranks this loop's clock; see `readinessFailure`.
+    const settled = readinessFailure(session);
+    if (settled !== undefined) throw settled;
+    if (admitted.elapsed()) throw readinessTimeout(outOfTime(admitted, WAITING_FOR.sessionStart));
+    reportWait(admitted, WAITING_FOR.sessionStart, supervisorWaitCause(session));
     await sleep(REMOTE_CONVERGENCE_POLL_INTERVAL_MS, signal);
   }
 }

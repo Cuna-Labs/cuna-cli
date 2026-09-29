@@ -3,7 +3,7 @@ import { isAgentSessionGone } from "../runtime/terminal-client-identity.js";
 import type {ProviderPreset} from "../api/provider-v2.js";
 import {createPublishedProviderSessionV2,requireMatchingPreset} from "./remote-workspace.js";
 import type { AgentSession, AgentSessionTerminalSeat, Machine } from "../api/contracts.js";
-import { sessionFailure } from "./session-failure.js";
+import { readinessFailure, sessionFailure, supervisorWaitCause } from "./session-failure.js";
 import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import {
@@ -32,6 +32,9 @@ import {
 } from "./wait-policy.js";
 
 const MACHINE_POLL_LIMIT = 60;
+
+/** A readiness poll asks for the server's own verdict and its supervisor evidence. */
+const SERVER_TRUTH_READ = Object.freeze({ readiness: true, runtimeEvidence: true });
 
 /**
  * The noun phrases the readiness loops put on screen, as one vocabulary.
@@ -246,9 +249,10 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
     deadlineFailure: context.deadlineFailure,
     ...(input.onWait === undefined ? {} : { onWait: input.onWait }),
   });
-  const reportWait = (deadline: JourneyDeadline, waitingFor: string): void => {
+  const reportWait = (deadline: JourneyDeadline, waitingFor: string, cause?: string): void => {
     input.onWait?.(Object.freeze({
       waitingFor,
+      ...(cause === undefined ? {} : { cause }),
       elapsedMs: deadline.elapsedMs(),
       deadlineMs: deadline.deadlineMs,
     }));
@@ -498,6 +502,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           // The three numbers the screen was already showing, so a transcript
           // and an error record cannot disagree about what was waited for.
           waiting_for: elapsed.waitingFor,
+          ...(waitCause === undefined ? {} : { wait_cause: waitCause }),
           deadline_ms: elapsed.deadlineMs,
           elapsed_ms: elapsed.elapsedMs,
           read_reissues: elapsed.readReissues,
@@ -508,6 +513,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       // observations, so the deadline failure names the last real blocker
       // instead of the phase.
       let waitingFor: string = WAITING_FOR.processStart;
+      let waitCause: string | undefined;
       for (let attempt = 0; !deadline.elapsed(); attempt += 1) {
         if (signal?.aborted) throw signal.reason;
         const session = await readWithin({
@@ -515,7 +521,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           deadline,
           signal,
           deadlineFailure,
-          read: () => input.client.getAgentSession(agentSessionId, signal),
+          read: () => input.client.getAgentSession(agentSessionId, signal, SERVER_TRUTH_READ),
         });
         if (session.requestState === "failed") {
           if (session.workspaceFailureCode !== undefined) {
@@ -570,7 +576,14 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         if (["exited", "failed", "terminated"].includes(session.processState)) {
           throw sessionFailure(session, "The AgentSession reached a terminal state before attach.");
         }
-        reportWait(deadline, waitingFor);
+        // After the terminal-authority check on purpose: a session the server
+        // gave up on can still be attached if its terminal authority says so,
+        // and a late attestation promotes it. Anything else it already
+        // settled ends the wait here, on the read that carried it.
+        const settled = readinessFailure(session);
+        if (settled !== undefined) throw settled;
+        waitCause = supervisorWaitCause(session);
+        reportWait(deadline, waitingFor, waitCause);
         await sleep(readinessBackoffMs(attempt), signal);
       }
       throw deadlineFailure(Object.freeze({

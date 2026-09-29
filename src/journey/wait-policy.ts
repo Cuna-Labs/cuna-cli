@@ -186,6 +186,12 @@ export interface JourneyWait {
    * for ___", so it never repeats the verb and never names a transport path.
    */
   readonly waitingFor: string;
+  /**
+   * What the server says is holding it up, e.g. `no supervisor has claimed the
+   * launch`, when the last read said anything. A countdown alone was all
+   * 8df1553 showed for 180 s on 2026-09-29 while the row said why.
+   */
+  readonly cause?: string;
   readonly elapsedMs: number;
   readonly deadlineMs: number;
 }
@@ -204,7 +210,10 @@ function wholeSeconds(milliseconds: number): number {
  * exactly the overshoot `startJourneyDeadline` documents.
  */
 export function journeyWaitLine(wait: JourneyWait): string {
-  return `Still waiting for ${wait.waitingFor} · ${wholeSeconds(wait.elapsedMs)}s of ${wholeSeconds(wait.deadlineMs)}s`;
+  // The cause goes before the countdown: a narrow terminal truncates from the
+  // right, and the clause is the part a person cannot work out for themselves.
+  const cause = wait.cause === undefined ? "" : ` · ${wait.cause}`;
+  return `Still waiting for ${wait.waitingFor}${cause} · ${wholeSeconds(wait.elapsedMs)}s of ${wholeSeconds(wait.deadlineMs)}s`;
 }
 
 /* -------------------------------------------------------------------------- */

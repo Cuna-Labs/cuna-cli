@@ -881,6 +881,7 @@ function startInlineProgress(
       ...(waiting === undefined ? {} : {
         waiting: {
           waitingFor: waiting.notice.waitingFor,
+          ...(waiting.notice.cause === undefined ? {} : { cause: waiting.notice.cause }),
           // Re-derived per repaint: the reporter speaks once per poll, up to
           // 1 600 ms apart, and a number that only moves when the poll does
           // reproduces the dwell it is meant to cure.
