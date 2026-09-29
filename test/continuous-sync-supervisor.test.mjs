@@ -572,6 +572,61 @@ test("a loop that stops for good gives the folder's writer authority back to the
   }
 });
 
+/**
+ * A folder whose last run synced and then stopped for `reason`, as that run's
+ * loop records a stop (`#transition` in the catch of `#runLoop`), and ended.
+ */
+async function folderLeftStoppedBy(fx, authority, reason) {
+  const run = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness()));
+  try {
+    await waitFor(() => run.snapshot.state === "live_unverified", () => `never live: ${JSON.stringify(run.snapshot)}`);
+  } finally {
+    await run.stop();
+  }
+  const path = join(fx.state, "continuous-sync.state.json");
+  const state = JSON.parse(await readFile(path, "utf8"));
+  await writeFile(path, `${JSON.stringify({ ...state, status: "conflicted", dirty: true, reason })}\n`);
+}
+
+// ws-codex3 and a second QA folder, 2026-09-29: a run before 0.1.7 (no journal retake)
+// stopped when a sleep let its own journal lease run out, and left
+// `conflicted (stale_fence)` in the folder's durable state. Every later run
+// loaded that stop, synced nothing, and printed "Workspace sync stopped · ...
+// conflicted (stale_fence)" at start and at detach.
+test("a new run takes up a folder whose last run stopped on its own expired journal lease", async (t) => {
+  const fx = await fixture(t);
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  await folderLeftStoppedBy(fx, authority, "stale_fence");
+  const watcher = new WatchHarness();
+  const next = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher));
+  t.after(async () => { await next.stop(); await fx.cleanup(); });
+  const seen = [];
+  next.subscribe((snapshot) => seen.push(snapshot.state));
+  assert.notEqual(seen[0], "conflicted", "the new run announced the last run's stop as its own");
+  await writeFile(join(fx.root, "after-restart.txt"), "written in the new run");
+  watcher.change("after-restart.txt");
+  await waitFor(() => next.snapshot.generation === 2, () => `the new run never synced: ${JSON.stringify(next.snapshot)}`);
+  assert.deepEqual(authority.commits.at(-1).entries.map((entry) => entry.path), ["after-restart.txt"]);
+});
+
+// CONTROL: the same folder, with the last run stopped by the Machine's refusal
+// instead of its own lease. That stop is about the folder, not the process,
+// and still holds for the next run.
+test("control: a new run keeps a stop the Machine's refusal left", async (t) => {
+  const fx = await fixture(t);
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  await folderLeftStoppedBy(fx, authority, "workspace_sync_generation_conflict");
+  const watcher = new WatchHarness();
+  const next = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher));
+  t.after(async () => { await next.stop(); await fx.cleanup(); });
+  await writeFile(join(fx.root, "after-restart.txt"), "written in the new run");
+  watcher.change("after-restart.txt");
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(next.snapshot.state, "conflicted");
+  assert.equal(next.snapshot.reason, "workspace_sync_generation_conflict");
+  assert.equal(authority.commits.length, 0);
+});
+
 // ws-c3, 2026-09-29, 10:12:01: a pull of the Machine's generation 3 was
 // stopped after conflict.txt was replaced and before the copy of the folder's
 // version was written, so for five minutes the folder held neither.

@@ -462,6 +462,17 @@ export class ContinuousWorkspaceSyncSupervisor {
       await this.#writerLease?.close();
       throw error;
     }
+    // A stop on `stale_fence` says only that the stopped process's own journal
+    // lease ran out (journal.ts `#assertLease`; no server answers it), and the
+    // journal just opened above under a new fence. Kept, that stop outlived its
+    // process: every later run loaded it, skipped every pull and commit, and
+    // announced the dead run's stop at start and at detach (ws-codex3 and a
+    // second QA folder, 2026-09-29). This run recovers exactly as a retake does.
+    if ((this.#state.status === "conflicted" || this.#state.status === "recovery_required") &&
+        this.#state.reason === "stale_fence") {
+      await this.#transition({ status: "recovering", dirty: true, reason: null });
+      this.#reconcileRequested = true;
+    }
     if (this.#state.pending_remote !== null) await this.#resumeRemoteApply();
     await this.#recoverPendingLocal();
     const watchFactory = this.#input.watchFactory ?? createNodeWorkspaceWatcher;
