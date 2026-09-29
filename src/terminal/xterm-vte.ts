@@ -33,6 +33,15 @@ const DEFAULT_RESPONSE_DELIVERY_TIMEOUT_MS = 2_000;
 const CONTAINED_OSC_IDENTIFIERS = Object.freeze([0, 1, 2, 8, 52] as const);
 const CELL_EXTENDER = /\p{M}|\u200d/u;
 
+/** A cell of the VTE buffer: absolute line (history included) and 0-based column. */
+export interface BufferPoint {
+  readonly line: number;
+  readonly column: number;
+}
+
+/** Cells that end a word or URL: blanks, quotes, angle brackets and box rules. */
+const WORD_BREAK = /^[\s"'<>`│┃|]$/u;
+
 export interface XtermTerminalResponse {
   readonly tabId: string;
   readonly binding: ViewportBinding;
@@ -327,6 +336,110 @@ export class XtermViewportAdapter {
     this.#scrollOffset = 0;
   }
 
+  /**
+   * The buffer line shown on the first row of a view: the host projection
+   * when `host` is given (observer or scrolled view), else the live screen.
+   * It is the same window `snapshotForHost` and `snapshot` paint, so a host
+   * cell maps to exactly the buffer cell drawn there.
+   */
+  viewTop(host?: { readonly columns: number; readonly rows: number }): number {
+    this.#assertOpen();
+    return this.#viewWindow(host, host === undefined ? 0 : this.#scrollOffset).top;
+  }
+
+  /** The terminal's own width, which a selection's columns are bounded by. */
+  get columns(): number {
+    return this.#terminal.cols;
+  }
+
+  /**
+   * The text between two buffer cells, inclusive, in reading order. A row the
+   * terminal wrapped, or a full row the program wrapped itself and continued
+   * on the next row, joins without a line break; any other row ends in "\n"
+   * with its trailing blanks removed.
+   */
+  textBetween(first: BufferPoint, second: BufferPoint): string {
+    this.#assertOpen();
+    const [start, end] = orderBufferPoints(first, second);
+    const buffer = this.#terminal.buffer.active;
+    let text = "";
+    for (let index = start.line; index <= end.line; index += 1) {
+      const line = buffer.getLine(index);
+      if (line === undefined) break;
+      const from = index === start.line ? start.column : 0;
+      const to = index === end.line ? end.column + 1 : this.#terminal.cols;
+      const joined = index < end.line && this.#continues(index);
+      const cells = line.translateToString(!joined, from, to);
+      // Spaces a program wrote at the end of a line are still blanks to a reader.
+      text += joined ? cells : cells.replace(/ +$/u, "");
+      if (index < end.line && !joined) text += "\n";
+    }
+    return text;
+  }
+
+  /**
+   * The run of non-blank cells around a point: a word, or a whole URL, which
+   * follows the same row joins as `textBetween`. Undefined on a blank cell.
+   */
+  wordAt(point: BufferPoint): { readonly start: BufferPoint; readonly end: BufferPoint } | undefined {
+    this.#assertOpen();
+    const buffer = this.#terminal.buffer.active;
+    const blank = (line: number, column: number): boolean => {
+      const chars = buffer.getLine(line)?.getCell(column)?.getChars() ?? "";
+      return chars === "" || WORD_BREAK.test(chars);
+    };
+    if (blank(point.line, point.column)) return undefined;
+    let start = { ...point };
+    for (;;) {
+      if (start.column > 0) {
+        if (blank(start.line, start.column - 1)) break;
+        start = { line: start.line, column: start.column - 1 };
+      } else if (start.line > 0 && this.#continues(start.line - 1) && !blank(start.line - 1, this.#terminal.cols - 1)) {
+        start = { line: start.line - 1, column: this.#terminal.cols - 1 };
+      } else break;
+    }
+    let end = { ...point };
+    for (;;) {
+      if (end.column < this.#terminal.cols - 1) {
+        if (blank(end.line, end.column + 1)) break;
+        end = { line: end.line, column: end.column + 1 };
+      } else if (this.#continues(end.line) && !blank(end.line + 1, 0)) {
+        end = { line: end.line + 1, column: 0 };
+      } else break;
+    }
+    return Object.freeze({ start: Object.freeze(start), end: Object.freeze(end) });
+  }
+
+  /**
+   * Whether a buffer row continues on the next one: the terminal wrapped it,
+   * or it is full to the last cell and the next row starts with a non-blank
+   * cell, which is how a program that wraps its own lines (Claude Code's
+   * sign-in URL) or a row-addressed view carries one long line.
+   */
+  #continues(index: number): boolean {
+    const buffer = this.#terminal.buffer.active;
+    const next = buffer.getLine(index + 1);
+    if (next === undefined) return false;
+    if (next.isWrapped) return true;
+    const last = buffer.getLine(index)?.getCell(this.#terminal.cols - 1)?.getChars() ?? "";
+    const first = next.getCell(0)?.getChars() ?? "";
+    return last !== "" && !WORD_BREAK.test(last) && first !== "" && !WORD_BREAK.test(first);
+  }
+
+  #viewWindow(host: { readonly columns: number; readonly rows: number } | undefined, scrollOffset: number):
+    { readonly rows: number; readonly rowOffset: number; readonly top: number } {
+    const buffer = this.#terminal.buffer.active;
+    const rows = Math.min(this.#terminal.rows, host?.rows ?? this.#terminal.rows);
+    // A host frame shorter than the writer's screen shows a window onto that
+    // screen, not its first rows. Terminals are bottom-anchored: the live
+    // region -- prompt, status line, newest output -- sits at the cursor.
+    // Anchor the window so the cursor row stays inside it, and keep the top
+    // whenever the writer's screen already fits, which is the only case the
+    // non-projecting capture can reach.
+    const rowOffset = Math.min(Math.max(0, buffer.cursorY - rows + 1), this.#terminal.rows - rows);
+    return { rows, rowOffset, top: Math.max(0, buffer.viewportY + rowOffset - scrollOffset) };
+  }
+
   async write(
     bytes: Uint8Array,
     outputSequence: bigint,
@@ -528,21 +641,13 @@ export class XtermViewportAdapter {
     const displayWidths: number[] = [];
     const renderRows: ViewportRenderRun[][] = [];
     const columns = Math.min(this.#terminal.cols, host?.columns ?? this.#terminal.cols);
-    const rows = Math.min(this.#terminal.rows, host?.rows ?? this.#terminal.rows);
+    const { rows, rowOffset, top } = this.#viewWindow(host, scrollOffset);
     // A host narrower than the writer's screen cannot show every column, and
     // an observer must not resize the writer's PTY to fit. A row whose content
     // continues past the host edge gives up its last cell to a marker, so no
     // character is ever hidden without saying so. Rows that fit stay whole.
     const clipped = host !== undefined && this.#terminal.cols > host.columns;
     const continuedRows: boolean[] = [];
-    // A host frame shorter than the writer's screen shows a window onto that
-    // screen, not its first rows. Terminals are bottom-anchored: the live
-    // region -- prompt, status line, newest output -- sits at the cursor.
-    // Anchor the window so the cursor row stays inside it, and keep the top
-    // whenever the writer's screen already fits, which is the only case the
-    // non-projecting capture can reach.
-    const rowOffset = Math.min(Math.max(0, buffer.cursorY - rows + 1), this.#terminal.rows - rows);
-    const top = Math.max(0, buffer.viewportY + rowOffset - scrollOffset);
     for (let row = 0; row < rows; row += 1) {
       const line = buffer.getLine(top + row);
       let visibleWidth = line === undefined ? 0 : occupiedWidth(line, columns);
@@ -617,6 +722,11 @@ export class XtermViewportAdapter {
   #assertOpen(): void {
     if (this.#disposed) throw new Error("The xterm viewport adapter is disposed.");
   }
+}
+
+export function orderBufferPoints(first: BufferPoint, second: BufferPoint): readonly [BufferPoint, BufferPoint] {
+  return first.line < second.line || (first.line === second.line && first.column <= second.column)
+    ? [first, second] : [second, first];
 }
 
 /** Display columns a line occupies within its first `limit` cells. */

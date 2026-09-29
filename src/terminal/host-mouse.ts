@@ -11,9 +11,11 @@
  * were indistinguishable from real arrow keys and reached the agent as prompt
  * history (owner report, 2026-09-23). With button reporting (1000) in SGR form
  * (1006) the wheel arrives as `ESC [ < 64/65 ; x ; y M` instead, and Cuna
- * decides what it means. Text selection moves to Shift+drag, which Windows
- * Terminal, xterm and VTE all reserve for the local selection while an
- * application reports the mouse.
+ * decides what it means. The host's own selection then needs Shift+drag,
+ * which Windows Terminal, xterm and VTE all reserve for it while an
+ * application reports the mouse, so Cuna selects on a plain drag itself
+ * unless the remote program asked for the mouse (owner report, 2026-09-29:
+ * "only typing works").
  */
 
 export interface HostMouseEvent {
@@ -37,8 +39,13 @@ const MAX_REPORT_BYTES = 24;
 const MODIFIER_BITS = 4 | 8 | 16;
 const MOTION_BIT = 32;
 
-/** Enable button reporting in SGR encoding on the host; the inverse is in the reset sequence. */
-export const HOST_MOUSE_REPORTING_ON = "\u001b[?1000h\u001b[?1006h";
+/**
+ * Enable button reporting, with motion only while a button is held (1002), in
+ * SGR encoding on the host; the inverse is in the reset sequence. Held-button
+ * motion is what lets Cuna select on a plain drag. Motion with no button held
+ * (1003) is never asked for.
+ */
+export const HOST_MOUSE_REPORTING_ON = "\u001b[?1000h\u001b[?1002h\u001b[?1006h";
 export const HOST_MOUSE_REPORTING_OFF = "\u001b[?1000l\u001b[?1002l\u001b[?1003l\u001b[?1006l";
 
 /**
@@ -198,6 +205,10 @@ export function encodeRemoteMouse(
   position: { readonly column: number; readonly row: number },
 ): Uint8Array | undefined {
   if (reporting.tracking === "none") return undefined;
+  // Held-button motion reaches Cuna because the host reports drags (1002).
+  // Only a program that asked for drag (1002) or any-motion (1003) reports
+  // gets it; press/release (1000) and X10 programs never asked for motion.
+  if ((event.button & MOTION_BIT) !== 0 && reporting.tracking !== "drag" && reporting.tracking !== "any") return undefined;
   const wheel = wheelDirection(event) !== 0 || ((event.button & ~(MODIFIER_BITS | MOTION_BIT)) >= 64);
   // X10 compatibility reports presses only, without modifiers.
   if (reporting.tracking === "x10" && (event.release || wheel)) return undefined;

@@ -229,3 +229,28 @@ test("an oversized unfinished paste fails open at the one-MiB bound until reset"
   guard.reset();
   assert.equal(guard.push(urlPaste).blocked, true);
 });
+
+test("an OSC 8 target is the one sign-in link; the rows it is drawn as, cut or wrapped, are not", () => {
+  // Claude Code 2.1.226 bytes: the hyperlink target is the exact URL, then
+  // the same URL as rows it wraps itself (here also cut by a narrower view).
+  const url = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a&response_type=code" +
+    "&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&state=opaque-state-value";
+  const rows = [url.slice(0, 60), url.slice(70, 130), url.slice(140)];
+  const bytes = encoder.encode(`\u001b]8;;${url}\u0007\u001b[38;5;246m${rows.join("\r\n")}\u001b[39m\u001b]8;;\u0007\r\n\r\n Paste code here > `);
+  for (const copyOnly of [false, true]) {
+    const detector = new ProviderBrowserActionDetector({
+      provider: "claude-code", ...binding, copyOnly, clock: () => 1_000, id: () => "action-1", nonce: () => "nonce-1",
+    });
+    // Split inside the target: the partial URL must not be admitted.
+    assert.deepEqual(detector.push(bytes.slice(0, 50)), [], "a URL still arriving is not a link yet");
+    const requests = detector.push(bytes.slice(50));
+    assert.deepEqual(requests.map((request) => request.url), [url], `copyOnly ${copyOnly}: exactly the target`);
+  }
+});
+
+test("without a hyperlink, a whole URL on one line is still the link", () => {
+  const detector = new ProviderBrowserActionDetector({ provider: "claude-code", ...binding, clock: () => 1_000 });
+  const url = "https://platform.claude.com/oauth/authorize?code=true&state=opaque";
+  assert.deepEqual(detector.push(encoder.encode(`\u001b[31m${url}`)), [], "the end of what arrived may not be the end of the URL");
+  assert.deepEqual(detector.push(encoder.encode("\u001b[0m\r\n")).map((request) => request.url), [url]);
+});

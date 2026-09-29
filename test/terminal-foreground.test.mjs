@@ -3009,13 +3009,13 @@ test("R11: a click is not sent to a remote that did not ask for mouse reports", 
   } finally { await coordinator.stop(); }
 });
 
-test("R11: only the attached view turns on SGR button reporting, never motion", async () => {
+test("R11: only the attached view turns on SGR button reporting, with motion only while a button is held", async () => {
   const { coordinator, host, intents } = harness();
   try {
     await coordinator.start(intents.slice(0, 1));
     const written = host.writes.map((bytes) => decoder.decode(bytes)).join("");
-    assert.ok(written.includes("\u001b[?1000h\u001b[?1006h"), "button reporting in SGR form");
-    assert.ok(!written.includes("\u001b[?1002h") && !written.includes("\u001b[?1003h"), "motion is never reported");
+    assert.ok(written.includes("\u001b[?1000h\u001b[?1002h\u001b[?1006h"), "button and held-button motion reporting in SGR form");
+    assert.ok(!written.includes("\u001b[?1003h"), "motion with no button held is never reported");
   } finally { await coordinator.stop(); }
 });
 
@@ -3055,7 +3055,7 @@ test("R11: the rich host lease clears mouse reporting on entry and restores it o
 /* -------------------------------------------------------------------------- */
 
 const SESSION_C = "33333333-3333-4333-8333-333333333333";
-const ENABLE_MOUSE = "\u001b[?1000h\u001b[?1006h";
+const ENABLE_MOUSE = "\u001b[?1000h\u001b[?1002h\u001b[?1006h";
 
 function rosterOf(entries) {
   const listeners = new Set();
@@ -3275,4 +3275,225 @@ test("session tabs: a roster change repaints the bar; a multi-session run keeps 
     assert.match(top, /\[1:Claude primary\].*2:Codex review/u);
     assert.doesNotMatch(top, /projB/u);
   } finally { await multi.coordinator.stop(); }
+});
+
+/* -------------------------------------------------------------------------- */
+/* Selection, links and exact sign-in URLs (owner reports 2026-09-29)           */
+/* -------------------------------------------------------------------------- */
+
+const LONG_URL = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" +
+  "&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback" +
+  "&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers" +
+  `&code_challenge=${"x".repeat(43)}&state=${"y".repeat(20)}`;
+const mouse = (button, column, row, release = false) => encoder.encode(`\u001b[<${button};${column};${row}${release ? "m" : "M"}`);
+/** Rows the way a row-addressed view draws them: one cursor move per row, no newline. */
+const addressedRows = (text, columns, firstRow = 1) => {
+  let bytes = "";
+  for (let offset = 0, row = firstRow; offset < text.length; offset += columns, row += 1) bytes += `\u001b[${row};1H${text.slice(offset, offset + columns)}`;
+  return bytes;
+};
+
+async function waitForScreen(host, pattern, message) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (pattern.test(await visibleHostText(host))) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail(message);
+}
+
+async function selectionHarness(options = {}, prepare = () => undefined) {
+  const copied = [];
+  const opened = [];
+  const context = harness({ coordinatorOptions: {
+    mouseReporting: true,
+    copyText: async (text) => { copied.push(text); },
+    browser: { async open(url) { opened.push(url); } },
+    ...options,
+  } });
+  prepare(context.intents, context.host);
+  await context.coordinator.start(context.intents.slice(0, 1));
+  return { ...context, copied, opened };
+}
+
+test("a plain drag selects a long URL across wrapped rows and copies it exactly on release", async () => {
+  // Owner 2026-09-29: "only typing works". Cuna reports the mouse for its
+  // clickable bar, so the host no longer selects on a plain drag; Cuna must.
+  for (const [label, bytes] of [
+    ["terminal-wrapped", `\u001b[2J\u001b[H${LONG_URL}\r\nnext`],
+    ["row-addressed", `\u001b[2J${addressedRows(LONG_URL, 80)}\u001b[7;1Hnext`],
+  ]) {
+    const { coordinator, callbacks, host, intents, copied, calls } = await selectionHarness();
+    try {
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(bytes)));
+      const lastRow = 3 + Math.floor((LONG_URL.length - 1) / 80);
+      const lastColumn = ((LONG_URL.length - 1) % 80) + 1;
+      host.emitInput(mouse(0, 1, 3));
+      host.emitInput(mouse(32, 40, 4));
+      host.emitInput(mouse(32, lastColumn, lastRow));
+      await waitUntil(() => host.writes.some((write) => decoder.decode(write).includes("\u001b[0;7m")), `${label}: the selection is highlighted while dragging`);
+      host.emitInput(mouse(0, lastColumn, lastRow, true));
+      await waitUntil(() => copied.length === 1, `${label}: release copies`);
+      assert.equal(copied[0], LONG_URL, `${label}: the copy is the URL, byte for byte, without line breaks`);
+      const osc52 = host.writes.map((write) => decoder.decode(write)).find((text) => text.startsWith("\u001b]52;c;"));
+      assert.equal(osc52, `\u001b]52;c;${Buffer.from(LONG_URL).toString("base64")}\u0007`, `${label}: the host clipboard gets the same text`);
+      await waitUntil(() => /Copied \d+ characters/u.test(decoder.decode(host.writes.at(-1))), `${label}: the copy is confirmed`);
+      assert.deepEqual(calls.input, [], `${label}: a selection sends nothing to the remote`);
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("a double click selects the whole URL under it; a plain click selects nothing", async () => {
+  const { coordinator, callbacks, host, intents, copied } = await selectionHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`\u001b[2J\u001b[Hsee ${LONG_URL} now\r\nplain words here`)));
+    host.emitInput(mouse(0, 5, 4));
+    host.emitInput(mouse(0, 5, 4, true));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(copied, [], "a click without a drag copies nothing");
+    host.emitInput(mouse(0, 5, 4));
+    host.emitInput(mouse(0, 5, 4, true));
+    await waitUntil(() => copied.length === 1, "a double click copies");
+    assert.equal(copied[0], LONG_URL);
+  } finally { await coordinator.stop(); }
+});
+
+test("prose rows keep their line breaks and lose their trailing blanks", async () => {
+  const { coordinator, callbacks, host, intents, copied } = await selectionHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("\u001b[2J\u001b[Hfirst line   \r\nsecond line\r\nthird")));
+    host.emitInput(mouse(0, 1, 3));
+    host.emitInput(mouse(32, 5, 5));
+    host.emitInput(mouse(0, 5, 5, true));
+    await waitUntil(() => copied.length === 1, "release copies");
+    assert.equal(copied[0], "first line\nsecond line\nthird");
+  } finally { await coordinator.stop(); }
+});
+
+test("a remote that asked for the mouse still gets clicks and drags, in the modes it asked for", async () => {
+  for (const [modes, expected] of [
+    ["\u001b[?1002h\u001b[?1006h", ["\u001b[<0;2;1M", "\u001b[<32;6;2M", "\u001b[<0;6;2m"]],
+    ["\u001b[?1000h\u001b[?1006h", ["\u001b[<0;2;1M", "\u001b[<0;6;2m"]],
+  ]) {
+    // Wide enough for the whole hint; a narrower bar drops it and Ctrl+] ? says it.
+    const { coordinator, callbacks, host, intents, copied, calls } = await selectionHarness({}, (_intents, host) => { host.columns = 140; });
+    try {
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${modes}text`)));
+      if (process.platform === "win32") {
+        await waitForScreen(host, /Agent uses the mouse: Shift\+drag select/u, `${modes}: the hint names Shift+drag`);
+      }
+      host.emitInput(mouse(0, 2, 3));
+      host.emitInput(mouse(32, 6, 4));
+      host.emitInput(mouse(0, 6, 4, true));
+      await waitUntil(() => calls.input.length === expected.length, `${modes}: reports reach the remote`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(calls.input.map((item) => item.text), expected, "press/release always; held motion only to a drag-reporting program");
+      assert.deepEqual(copied, [], "Cuna does not select what the remote program owns");
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("an observer selects even when the writer's program asked for the mouse, and sends nothing", async () => {
+  const { coordinator, callbacks, host, intents, copied, calls } = await selectionHarness();
+  try {
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("\u001b[?1002h\u001b[?1006h\u001b[2J\u001b[Hobserved text")));
+    host.emitInput(mouse(0, 1, 3));
+    host.emitInput(mouse(32, 13, 3));
+    host.emitInput(mouse(0, 13, 3, true));
+    await waitUntil(() => copied.length === 1, "an observer's drag copies");
+    assert.equal(copied[0], "observed text");
+    assert.deepEqual(calls.input, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("Ctrl+click opens a drawn link; the exact OSC 8 link wins over a cut row", async () => {
+  const { coordinator, callbacks, host, intents, opened, calls } = await selectionHarness({}, (intents) => { intents[0].localBrowserActions = true; });
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("\u001b[2J\u001b[Hdocs https://getcuna.com/docs/cli. ok\r\n")));
+    host.emitInput(mouse(16, 10, 3));
+    await waitUntil(() => opened.length === 1, "Ctrl+click opens the link");
+    assert.equal(opened[0], "https://getcuna.com/docs/cli", "trailing punctuation is not part of the link");
+    // A provider link drawn in rows a view cut at 60 columns; the hyperlink target is whole.
+    let cut = "";
+    for (let offset = 0, row = 3; offset < LONG_URL.length; offset += 80, row += 1) cut += `\u001b[${row};1H${LONG_URL.slice(offset, offset + 80).slice(0, 60)}`;
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(`\u001b[2J\u001b]8;;${LONG_URL}\u0007${cut}\u001b]8;;\u0007\u001b[9;1HPaste code here > `)));
+    host.emitInput(mouse(16, 10, 5));
+    await waitUntil(() => opened.length === 2, "Ctrl+click on the cut row opens");
+    assert.equal(opened[1], LONG_URL);
+    assert.deepEqual(calls.input, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("Copy link and Enter/o open use the provider's exact URL even when the screen is cut", async () => {
+  // Claude Code 2.1.226 prints its sign-in link as an OSC 8 hyperlink whose
+  // target is the whole URL, then the URL again as rows it wraps itself. A
+  // narrower view cuts those rows. The structured link is the target.
+  const { coordinator, callbacks, host, intents, copied, opened } =
+    await selectionHarness({ clock: () => 1_000 }, (intents) => { intents[0].localBrowserActions = true; });
+  try {
+    const rows = [];
+    for (let offset = 0; offset < LONG_URL.length; offset += 143) rows.push(LONG_URL.slice(offset, offset + 143).slice(0, 120));
+    const claude = `\u001b]8;;${LONG_URL}\u0007\u001b[38;5;246m${rows.join("\r\n")}\u001b[39m\u001b]8;;\u0007\r\n\r\n Paste code here if prompted > `;
+    // Split inside the hyperlink target, the way a PTY read can.
+    const bytes = encoder.encode(claude);
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, bytes.slice(0, 60)));
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, bytes.slice(60)));
+    await waitForScreen(host, /requests browser authentication/u, "one sign-in request is pending");
+    host.emitInput(Uint8Array.of(0x1d, 0x79));
+    await waitUntil(() => copied.length === 1, "Ctrl+] y copies");
+    assert.equal(copied[0], LONG_URL, "the copied link is the provider's exact URL, not a cut row");
+    host.emitInput(Uint8Array.of(0x0d));
+    await waitUntil(() => opened.length === 1, "Enter opens");
+    assert.equal(opened[0], LONG_URL, "the opened link is the provider's exact URL");
+    host.emitInput(Uint8Array.of(0x0d));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(opened.length, 1, "no second request for a cut row of the same link");
+  } finally { await coordinator.stop(); }
+});
+
+test("a full-width row keeps its last column, as writer and as observer of an equal-width writer", async () => {
+  // Owner 2026-09-29: one character missing at every row end of a copied URL.
+  for (const accessMode of ["writer", "observer"]) {
+    const { coordinator, callbacks, host, intents } = harness();
+    await coordinator.start(intents.slice(0, 1));
+    try {
+      if (accessMode === "observer") {
+        const observer = { ...snapshot(intents[0]), accessMode, writerEpoch: 2 };
+        callbacks.onTerminalState(observer);
+        await callbacks.onTerminalGeometry({ snapshot: { ...observer, geometry: { columns: 80, rows: 22, writerEpoch: 2 } }, signal: new AbortController().signal });
+      }
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`\u001b[2J${addressedRows(LONG_URL, 80)}`)));
+      const rows = (await visibleHostText(host)).split("\n").slice(2, 2 + Math.ceil(LONG_URL.length / 80));
+      assert.equal(rows.join(""), LONG_URL, `${accessMode}: every row is painted to its last column`);
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("after a takeover shortens the screen, the lines above it stay reachable by scrolling back", async () => {
+  // Owner 2026-09-29, 19:48: the welcome banner was gone after taking
+  // control in a shorter window. Claude Code 2.1.226 keeps its banner on a
+  // resize (measured in a plain PTY and in the pinned tmux); a shorter
+  // screen pushes the top rows up, and this client keeps them in history.
+  const { coordinator, callbacks, host, intents } = harness({ coordinatorOptions: { mouseReporting: true } });
+  host.columns = 100;
+  host.rows = 27;
+  await coordinator.start(intents.slice(0, 1));
+  try {
+    const observer = { ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 };
+    callbacks.onTerminalState(observer);
+    await callbacks.onTerminalGeometry({ snapshot: { ...observer, geometry: { columns: 100, rows: 40, writerEpoch: 2 } }, signal: new AbortController().signal });
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`\u001b[2J\u001b[1;1HWelcome to Claude Code v2.1.226\u001b[40;1H> prompt`)));
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "writer", writerEpoch: 3 });
+    await waitUntil(() => !decoder.decode(host.writes.at(-1)).includes("Observing"), "the takeover is painted");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.doesNotMatch(await visibleHostText(host), /Welcome to Claude Code/u, "the banner is above a 25-row screen");
+    for (let notch = 0; notch < 10; notch += 1) host.emitInput(encoder.encode("\u001b[<64;10;10M"));
+    await waitUntil(() => /Scrolled back/u.test(decoder.decode(host.writes.at(-1))), "the wheel scrolls back");
+    let seen = false;
+    for (let attempt = 0; attempt < 100 && !seen; attempt += 1) {
+      seen = /Welcome to Claude Code v2\.1\.226/u.test(await visibleHostText(host));
+      if (!seen) await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(seen, "the banner is in this client's history");
+  } finally { await coordinator.stop(); }
 });

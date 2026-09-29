@@ -61,6 +61,11 @@ const MAX_URL_CHARACTERS = 8_192;
 const MAX_GUARDED_PASTE_BYTES = 1_048_576;
 const DEFAULT_TTL_MS = 2 * 60_000;
 const URL_CANDIDATE = /https:\/\/[^\s\p{Cc}<>"']{1,8192}(?=[\s\p{Cc}<>"']|$)/gu;
+/** An OSC 8 hyperlink opener; its parameters end at the next ";". */
+const HYPERLINK_OPENER = `${String.fromCharCode(0x1b)}]8;`;
+/** A hyperlink target, complete only once its BEL or ST terminator arrived. */
+const HYPERLINK_URL = /^https:\/\/[^\s\p{Cc}<>"']{1,8192}(?=\p{Cc})/u;
+const MAX_HYPERLINK_TARGETS = 16;
 const BRACKETED_PASTE_START = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e);
 const BRACKETED_PASTE_END = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e);
 
@@ -274,6 +279,8 @@ export class ProviderBrowserActionDetector {
     Pick<BrowserActionDetectorOptions, "clock" | "id" | "nonce" | "ttlMs" | "copyOnly">;
   readonly #decoder = new TextDecoder("utf-8", { fatal: false });
   readonly #seen = new Set<string>();
+  /** Recent OSC 8 targets: the exact URLs behind text the provider may wrap or a view may cut. */
+  readonly #hyperlinkTargets: string[] = [];
   #buffer = "";
 
   constructor(options: BrowserActionDetectorOptions) {
@@ -298,10 +305,22 @@ export class ProviderBrowserActionDetector {
     this.#buffer += this.#decoder.decode(bytes, { stream: true });
     if (this.#buffer.length > MAX_BUFFER_CHARACTERS) this.#buffer = this.#buffer.slice(-MAX_BUFFER_CHARACTERS);
     const requests: LocalBrowserActionRequest[] = [];
+    for (const target of hyperlinkTargets(this.#buffer)) {
+      if (this.#hyperlinkTargets.includes(target)) continue;
+      this.#hyperlinkTargets.push(target);
+      if (this.#hyperlinkTargets.length > MAX_HYPERLINK_TARGETS) this.#hyperlinkTargets.shift();
+    }
     for (const match of this.#buffer.matchAll(URL_CANDIDATE)) {
       const raw = match[0];
       if (raw.length > MAX_URL_CHARACTERS || this.#seen.has(raw)) continue;
-      if (this.#options.copyOnly && match.index + raw.length === this.#buffer.length) continue;
+      // A URL that runs to the end of what has arrived may continue in the
+      // next frame; admitting it now would open or copy a truncated link.
+      if (match.index + raw.length === this.#buffer.length) continue;
+      // Claude Code wraps its sign-in link in an OSC 8 hyperlink, then prints
+      // the same URL as rows it wraps itself, and a view narrower than the
+      // provider cuts those rows further. A row is only a prefix of the
+      // target; the target is the exact URL the provider meant.
+      if (this.#hyperlinkTargets.some((target) => target !== raw && target.startsWith(raw))) continue;
       let admitted = admitProviderAuthUrl(this.#options.provider, raw);
       if (admitted === undefined && this.#options.copyOnly && this.#options.provider === "codex") {
         try {
@@ -330,6 +349,19 @@ export class ProviderBrowserActionDetector {
     if (this.#buffer.length > MAX_URL_CHARACTERS) this.#buffer = this.#buffer.slice(-MAX_URL_CHARACTERS);
     return Object.freeze(requests);
   }
+}
+
+/** The complete OSC 8 hyperlink targets in a stretch of terminal output. */
+function hyperlinkTargets(text: string): string[] {
+  const targets: string[] = [];
+  for (let at = text.indexOf(HYPERLINK_OPENER); at >= 0; at = text.indexOf(HYPERLINK_OPENER, at + 1)) {
+    const parameters = at + HYPERLINK_OPENER.length;
+    const separator = text.indexOf(";", parameters);
+    if (separator < 0 || separator - parameters > 256 || /\p{Cc}/u.test(text.slice(parameters, separator))) continue;
+    const target = HYPERLINK_URL.exec(text.slice(separator + 1, separator + 1 + MAX_URL_CHARACTERS + 1))?.[0];
+    if (target !== undefined) targets.push(target);
+  }
+  return targets;
 }
 
 function browserActionProvider(value: string): value is BrowserActionProvider {

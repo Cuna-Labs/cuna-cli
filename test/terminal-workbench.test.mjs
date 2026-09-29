@@ -337,18 +337,25 @@ test("a long active roster tab remains identifiable and clickable at 40 columns"
   assert.ok(wideLabel.appbarTargets.some((entry) => entry.target === "session:active-long" && entry.lastColumn <= 40));
 });
 
-test("the copy/paste hint moves to the second row and says Shift+drag while the mouse is reported", () => {
-  const frame = renderWorkbenchFrame({
+test("the copy/paste hint says a plain drag selects, and Shift+drag only while the agent uses the mouse", () => {
+  // Owner 2026-09-29: "only typing works" -- the hint said Shift+drag while
+  // Cuna reported the mouse only for its clickable bar. Cuna selects on a
+  // plain drag itself unless the remote program asked for the mouse.
+  const frame = (remoteMouse) => renderWorkbenchFrame({
     columns: 140, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
-    sessions: rosterSessions, activeSessionId: "session-claude", mouseReporting: true,
+    sessions: rosterSessions, activeSessionId: "session-claude", mouseReporting: true, remoteMouse,
   });
-  const second = rowText(frame, 2);
+  const own = rowText(frame(false), 2);
+  const agent = rowText(frame(true), 2);
   if (process.platform === "win32") {
-    assert.match(second, /Claude auth authenticated.*Shift\+drag select \| Ctrl\+Shift\+C copy \| Ctrl\+Shift\+V paste $/u);
+    assert.match(own, /Claude auth authenticated.*Drag to select and copy \| Ctrl\+click opens a link \| Ctrl\+Shift\+V paste $/u);
+    assert.doesNotMatch(own, /Shift\+drag/u);
+    assert.match(agent, /Claude auth authenticated.*Agent uses the mouse: Shift\+drag select \| Ctrl\+Shift\+C copy \| Ctrl\+Shift\+V paste $/u);
   } else {
-    assert.doesNotMatch(second, /Ctrl\+Shift\+C/u);
+    assert.doesNotMatch(own, /Ctrl\+Shift\+C/u);
+    assert.doesNotMatch(agent, /Ctrl\+Shift\+C/u);
   }
-  assert.doesNotMatch(rowText(frame, 1), /Ctrl\+Shift/u);
+  assert.doesNotMatch(rowText(frame(false), 1), /Ctrl\+Shift/u);
 });
 
 test("workbench safely re-emits VTE-parsed palette and RGB styles", () => {

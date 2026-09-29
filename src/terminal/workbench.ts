@@ -43,6 +43,19 @@ export interface WorkbenchFrameInput {
   readonly activeSessionId?: string;
   /** Mouse reporting is on, so plain drag no longer selects: say Shift+drag. */
   readonly mouseReporting?: boolean;
+  /**
+   * The remote program asked for mouse reports, so Cuna forwards drags to it
+   * and only the host's own Shift+drag selects. Otherwise Cuna selects.
+   */
+  readonly remoteMouse?: boolean;
+  /** Cuna's own selection, as cell ranges [start, end) of viewport rows. */
+  readonly selection?: readonly WorkbenchSelectionRow[];
+}
+
+export interface WorkbenchSelectionRow {
+  readonly row: number;
+  readonly start: number;
+  readonly end: number;
 }
 
 /** Where a tab was drawn on the bar, in 1-based host cells, for a click to find. */
@@ -145,6 +158,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
         input.notice === undefined ? renderTruth(input.appbar, active.agent, input.columns) : truncate(` ${safeText(input.notice)}`, input.columns),
         input.columns,
         input.mouseReporting === true,
+        input.remoteMouse === true,
       ),
     ];
   } else {
@@ -173,8 +187,10 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
     const renderRuns = active.viewport.renderRows?.[row];
     if (renderRuns !== undefined) assertViewportRenderRuns(renderRuns, cell, displayWidth, cellColumns);
     const rendered = renderRuns === undefined || !color ? cell : renderStyledRuns(renderRuns);
+    const selected = input.selection?.find((range) => range.row === row);
     rowCommands.push(`${ESC}${appbarRows + row + 1};1H${ESC}0m${ESC}2K${rendered}` +
-      (continued ? continuedMarker(appbarRows + row + 1, input.columns, color) : ""));
+      (continued ? continuedMarker(appbarRows + row + 1, input.columns, color) : "") +
+      (selected === undefined ? "" : selectionHighlight(appbarRows + row + 1, cell, selected, cellColumns)));
   }
   const cursorRow = Math.min(viewportRows - 1, Math.max(0, active.viewport.cursorY));
   const cursorColumn = Math.min(input.columns - 1, Math.max(0, active.viewport.cursorX));
@@ -335,11 +351,16 @@ function renderTabRow(
 }
 
 /** Windows hosts get the copy/paste keys on the right of the second row when they fit. */
-function withClipboardHint(line: string, columns: number, mouseReporting: boolean): string {
+function withClipboardHint(line: string, columns: number, mouseReporting: boolean, remoteMouse: boolean): string {
   if (process.platform !== "win32") return line;
-  const hint = mouseReporting
-    ? "Shift+drag select | Ctrl+Shift+C copy | Ctrl+Shift+V paste"
-    : "Select text: Ctrl+Shift+C copy | Ctrl+Shift+V paste";
+  // Cuna reports the mouse so the bar is clickable; it then selects on a
+  // plain drag itself, unless the remote program asked for the mouse. Only
+  // then is the host's own Shift+drag the way to select.
+  const hint = !mouseReporting
+    ? "Select text: Ctrl+Shift+C copy | Ctrl+Shift+V paste"
+    : remoteMouse
+      ? "Agent uses the mouse: Shift+drag select | Ctrl+Shift+C copy | Ctrl+Shift+V paste"
+      : "Drag to select and copy | Ctrl+click opens a link | Ctrl+Shift+V paste";
   const used = displayCellWidth(line.trimEnd());
   const start = columns - 1 - hint.length;
   if (start < used + 3) return line;
@@ -505,6 +526,36 @@ function assertViewportStyle(style: ViewportCellStyle): void {
       throw new WorkbenchRenderError("binding_mismatch", "A viewport color is outside its admitted range.");
     }
   }
+}
+
+/**
+ * Cuna's selection over one row: the selected cells again, inverse, drawn
+ * over the row. Cells past the row's content are blanks; a wide glyph the
+ * range only partly covers is drawn whole.
+ */
+function selectionHighlight(hostRow: number, cell: string, range: WorkbenchSelectionRow, columns: number): string {
+  const cells: { readonly column: number; readonly text: string; readonly width: number }[] = [];
+  let column = 0;
+  for (const item of GRAPHEME_SEGMENTER.segment(cell)) {
+    const width = graphemeCellWidth(item.segment);
+    if (width === 0) continue;
+    cells.push({ column, text: item.segment, width });
+    column += width;
+  }
+  const end = Math.min(columns, Math.max(range.start, range.end));
+  let start = Math.max(0, range.start);
+  const straddled = cells.find((item) => item.column < start && item.column + item.width > start);
+  if (straddled !== undefined) start = straddled.column;
+  if (start >= end) return "";
+  let text = "";
+  let at = start;
+  for (const item of cells) {
+    if (item.column < start || item.column >= end || item.column + item.width > columns) continue;
+    text += " ".repeat(Math.max(0, item.column - at)) + item.text;
+    at = item.column + item.width;
+  }
+  text += " ".repeat(Math.max(0, end - at));
+  return `${ESC}${hostRow};${start + 1}H${ESC}0;7m${text}${ESC}0m`;
 }
 
 /**

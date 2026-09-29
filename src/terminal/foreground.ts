@@ -34,15 +34,24 @@ import {
   workbenchUpdate,
   withPredictionOverlay,
   type WorkbenchFrame,
+  type WorkbenchSelectionRow,
   type WorkbenchTab,
 } from "./workbench.js";
 import type { SessionRoster, SessionRosterEntry } from "./session-roster.js";
 import { ViewportRegistry } from "./viewport.js";
-import { XtermViewportAdapter } from "./xterm-vte.js";
+import { orderBufferPoints, XtermViewportAdapter, type BufferPoint } from "./xterm-vte.js";
 import { encodeRemoteMouse, HOST_MOUSE_REPORTING_ON, HostMouseDecoder, wheelDirection, type HostMouseEvent } from "./host-mouse.js";
 
 /** Lines one wheel notch moves the local view, the common terminal default. */
 const WHEEL_SCROLL_LINES = 3;
+/** A second press on the same cell within this window is a double-click. */
+const DOUBLE_CLICK_MS = 500;
+/** OSC 52 carries the selection to the host clipboard too; bounded like a paste. */
+const MAX_OSC52_TEXT_BYTES = 65_536;
+const MOUSE_SHIFT = 4;
+const MOUSE_META = 8;
+const MOUSE_CONTROL = 16;
+const MOUSE_MOTION = 32;
 
 const ESCAPE_PREFIX = 0x1d;
 export const HISTORICAL_INPUT_NOTICE = "Prior input uncertain · not resent";
@@ -252,6 +261,15 @@ export interface ForegroundSwitchRequest {
   readonly label: string;
 }
 
+interface ForegroundSelection {
+  readonly tabId: string;
+  anchor: BufferPoint;
+  focus: BufferPoint;
+  dragging: boolean;
+  /** Made by a double click: it holds a whole word or URL and is copied on release. */
+  readonly word: boolean;
+}
+
 interface ForegroundTab {
   readonly intent: ForegroundTabIntent;
   snapshot: RuntimeTerminalSnapshot;
@@ -316,6 +334,13 @@ export class ForegroundTerminalCoordinator {
   #removeAbort: (() => void) | undefined;
   #pendingInputBytes = 0;
   readonly #hostMouse = new HostMouseDecoder();
+  /**
+   * Cuna's own selection on one tab, in VTE buffer cells, made with a plain
+   * drag while the remote program has not asked for the mouse. It is local:
+   * nothing about it is ever sent to the remote.
+   */
+  #selection: ForegroundSelection | undefined;
+  #lastPress: { readonly at: number; readonly tabId: string; readonly point: BufferPoint } | undefined;
   #hostMousePendingTimer: ReturnType<typeof setTimeout> | undefined;
   #mouseReportingPending = false;
   #helpVisible = false;
@@ -702,6 +727,8 @@ export class ForegroundTerminalCoordinator {
       throw runtimeFailure("terminal_disconnected", "Terminal readiness arrived after foreground ownership ended.");
     }
     if (previous !== undefined) this.#forgetSeatNoticeOnSeatChange(previous.snapshot, snapshot);
+    // A new attachment may start a fresh view; the old cells are gone.
+    if (this.#selection?.tabId === snapshot.tabId) this.#selection = undefined;
     const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
     this.#copyLinks.delete(snapshot.tabId);
     this.#copyDetectors.set(snapshot.tabId, (["codex", "claude-code"] as const).map(provider => new ProviderBrowserActionDetector({ copyOnly: true, provider, agentSessionId: snapshot.agentSessionId, processEpoch: snapshot.processEpoch, fencingGeneration: snapshot.fencingGeneration, clock: this.#clock })));
@@ -1101,7 +1128,10 @@ export class ForegroundTerminalCoordinator {
       return;
     }
     const direction = wheelDirection(event);
-    if (direction === 0) return;
+    if (direction === 0) {
+      this.#selectWithMouse(tab, event);
+      return;
+    }
     const screen = tab.viewport.screenModes();
     if (screen.alternateScreen) {
       if (tab.snapshot.accessMode === "observer" || target === undefined) return;
@@ -1111,6 +1141,152 @@ export class ForegroundTerminalCoordinator {
     }
     const before = tab.viewport.scrollOffset;
     if (tab.viewport.scrollBy(-direction * WHEEL_SCROLL_LINES) !== before) void this.#render().catch(() => undefined);
+  }
+
+  /**
+   * A plain left drag selects, as in any terminal; release copies. A double
+   * click selects the word or URL under it, and Ctrl+click opens a link. The
+   * host sends these only because Cuna reports the mouse for its clickable
+   * bar; Shift+drag still reaches the host's own selection. Reached only when
+   * the remote program did not ask for the mouse, or this tab observes.
+   */
+  #selectWithMouse(tab: ForegroundTab, event: HostMouseEvent): void {
+    const tabId = tab.intent.tabId;
+    const button = event.button & ~(MOUSE_SHIFT | MOUSE_META | MOUSE_CONTROL | MOUSE_MOTION);
+    if (button !== 0 || (event.button & MOUSE_SHIFT) !== 0) return;
+    const selection = this.#selection?.tabId === tabId ? this.#selection : undefined;
+    if (event.release) {
+      if (selection === undefined || !selection.dragging) return;
+      selection.dragging = false;
+      if (!selection.word && selection.anchor.line === selection.focus.line && selection.anchor.column === selection.focus.column) {
+        this.#selection = undefined;
+        void this.#render().catch(() => undefined);
+        return;
+      }
+      void this.#copySelection(tab, selection);
+      return;
+    }
+    const point = this.#pointAt(tab, event);
+    if (point === undefined) return;
+    if ((event.button & MOUSE_MOTION) !== 0) {
+      if (selection === undefined || !selection.dragging) return;
+      selection.focus = point;
+      void this.#render().catch(() => undefined);
+      return;
+    }
+    if ((event.button & MOUSE_CONTROL) !== 0) {
+      void this.#openLinkAt(tab, point);
+      return;
+    }
+    const now = this.#inputClock();
+    const previous = this.#lastPress;
+    this.#lastPress = Object.freeze({ at: now, tabId, point });
+    const word = previous !== undefined && previous.tabId === tabId && now - previous.at <= DOUBLE_CLICK_MS &&
+      previous.point.line === point.line && previous.point.column === point.column
+      ? tab.viewport.wordAt(point) : undefined;
+    this.#selection = word === undefined
+      ? { tabId, anchor: point, focus: point, dragging: true, word: false }
+      : { tabId, anchor: word.start, focus: word.end, dragging: true, word: true };
+    void this.#render().catch(() => undefined);
+  }
+
+  /** The VTE buffer cell drawn under a host cell of the viewport, if any. */
+  #pointAt(tab: ForegroundTab, event: HostMouseEvent): BufferPoint | undefined {
+    const frame = this.#lastWorkbenchFrame;
+    if (frame === undefined) return undefined;
+    const row = event.row - frame.appbarRows - 1;
+    if (row < 0 || row >= frame.viewportRows) return undefined;
+    const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
+    const width = Math.min(tab.viewport.columns, dimensions.columns);
+    return Object.freeze({
+      line: tab.viewport.viewTop(this.#viewProjection(tab, dimensions)) + row,
+      column: Math.min(Math.max(0, event.column - 1), width - 1),
+    });
+  }
+
+  /**
+   * The host-sized window an active tab is painted through: an observer's
+   * writer-sized screen or a view scrolled into history. Undefined paints the
+   * live screen, which is already this host's size.
+   */
+  #viewProjection(tab: ForegroundTab, dimensions: { readonly columns: number; readonly rows: number }):
+    { readonly columns: number; readonly rows: number } | undefined {
+    return tab.snapshot.accessMode === "observer" || tab.viewport.scrollOffset > 0
+      ? { columns: dimensions.columns, rows: remoteRows(dimensions.rows) }
+      : undefined;
+  }
+
+  /** The selected cells, as ranges over the rows of the painted viewport. */
+  #selectionRows(tab: ForegroundTab, dimensions: { readonly columns: number; readonly rows: number }): readonly WorkbenchSelectionRow[] | undefined {
+    const selection = this.#selection;
+    if (selection === undefined || selection.tabId !== tab.intent.tabId) return undefined;
+    const [start, end] = orderBufferPoints(selection.anchor, selection.focus);
+    const top = tab.viewport.viewTop(this.#viewProjection(tab, dimensions));
+    const rows: WorkbenchSelectionRow[] = [];
+    for (let row = 0; row < remoteRows(dimensions.rows); row += 1) {
+      const line = top + row;
+      if (line < start.line || line > end.line) continue;
+      rows.push(Object.freeze({
+        row,
+        start: line === start.line ? start.column : 0,
+        end: line === end.line ? end.column + 1 : tab.viewport.columns,
+      }));
+    }
+    return Object.freeze(rows);
+  }
+
+  /**
+   * Copies the selection the way Ctrl+] y copies a link, through this
+   * computer's clipboard, and also offers it to the host terminal as OSC 52
+   * so a Cuna run over SSH still reaches the person's own clipboard.
+   */
+  async #copySelection(tab: ForegroundTab, selection: ForegroundSelection): Promise<void> {
+    const text = tab.viewport.textBetween(selection.anchor, selection.focus);
+    if (text.length === 0) {
+      this.#selection = undefined;
+      await this.#render();
+      return;
+    }
+    const bytes = new TextEncoder().encode(text);
+    if (bytes.byteLength <= MAX_OSC52_TEXT_BYTES) {
+      const osc52 = new TextEncoder().encode(`\u001b]52;c;${Buffer.from(bytes).toString("base64")}\u0007`);
+      const write = this.#renderTail.then(async () => await this.#writeHost(osc52));
+      this.#renderTail = write.then(() => undefined, () => undefined);
+      await write.catch(() => undefined);
+    }
+    try {
+      await (this.#options.copyText ?? copyLocalText)(text);
+      const characters = [...text].length;
+      this.#browserNotice = `Copied ${characters} character${characters === 1 ? "" : "s"}`;
+    } catch {
+      this.#browserNotice = "Could not copy the selection. Shift+drag selects in the host terminal.";
+    }
+    await this.#render();
+  }
+
+  /**
+   * Ctrl+click on a link opens it in this computer's browser. What was
+   * clicked is the URL as drawn; when the provider also published the exact
+   * link (an OSC 8 target Ctrl+] y copies) and the drawn text is a piece of
+   * it, the exact link is opened, never the cut or wrapped screen text.
+   */
+  async #openLinkAt(tab: ForegroundTab, point: BufferPoint): Promise<void> {
+    const word = tab.viewport.wordAt(point);
+    const drawn = word === undefined ? "" : tab.viewport.textBetween(word.start, word.end).replace(/[.,;:!?)\]}]+$/u, "");
+    let url: URL | undefined;
+    try { url = /^https?:\/\//u.test(drawn) ? new URL(drawn) : undefined; } catch { url = undefined; }
+    if (url === undefined) return;
+    const exact = this.#copyLinks.get(tab.intent.tabId);
+    const target = exact !== undefined && exact.url !== url.href && exact.url.startsWith(drawn) ? exact.url : url.href;
+    try {
+      const browser = this.#options.browser;
+      if (browser === undefined) throw new Error("browser unavailable");
+      await browser.open(target);
+      this.#browserNotice = `Opened ${new URL(target).origin} in your browser`;
+    } catch {
+      this.#browserNotice = "Could not open the link. Drag to select and copy it instead.";
+    }
+    await this.#render();
   }
 
   #sendRemote(bytes: Uint8Array, target: ForegroundInputTarget): void {
@@ -1133,6 +1309,11 @@ export class ForegroundTerminalCoordinator {
     if (this.#switchCutoff !== undefined) {
       if (bytes.includes(INTERRUPT)) this.#switchRequest = undefined;
       return;
+    }
+    if (this.#selection !== undefined) {
+      // As in any terminal, typing ends the selection; its copy stays copied.
+      this.#selection = undefined;
+      void this.#render().catch(() => undefined);
     }
     const scrolled = this.#activeTabId === undefined ? undefined : this.#tabs.get(this.#activeTabId);
     if (scrolled !== undefined && scrolled.viewport.scrollOffset > 0) {
@@ -1653,7 +1834,9 @@ export class ForegroundTerminalCoordinator {
       provider: candidate.provider, agentSessionId: candidate.agentSessionId,
       processEpoch: candidate.processEpoch, fencingGeneration: candidate.fencingGeneration, clock: this.#clock,
     });
-    const request = detector.push(new TextEncoder().encode(candidate.url))[0];
+    // The retained URL is complete; the line end says so to a detector that
+    // holds back a URL which might still be arriving.
+    const request = detector.push(new TextEncoder().encode(`${candidate.url}\n`))[0];
     if (request !== undefined) {
       this.#handledBrowserUrls.delete(this.#browserRequestKey(request));
       this.#enqueueBrowserAction(tabId, tab, request);
@@ -2111,6 +2294,7 @@ export class ForegroundTerminalCoordinator {
 
   #select(tabId: string): void {
     if (!this.#tabs.has(tabId)) return;
+    this.#selection = undefined;
     this.#requireRuntime().switchActive(tabId);
     this.#registry.select(tabId);
     this.#activeTabId = tabId;
@@ -2305,8 +2489,10 @@ export class ForegroundTerminalCoordinator {
 
   async #applyResize(): Promise<void> {
     // The host reflows or clears its alternate screen on resize; the last
-    // frame no longer describes what it shows.
+    // frame no longer describes what it shows. A reflow also moves the cells
+    // a selection names.
     this.#lastHostFrame = undefined;
+    this.#selection = undefined;
     const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
     const rows = remoteRows(dimensions.rows);
     for (const [tabId, tab] of this.#tabs) {
@@ -2441,10 +2627,16 @@ export class ForegroundTerminalCoordinator {
         // Hidden tabs contribute labels only; projecting their cells would
         // recapture a full terminal on every visible output frame. A view the
         // person scrolled back is projected from local history.
-        viewport: tab.intent.tabId === activeTabId && (tab.snapshot.accessMode === "observer" || tab.viewport.scrollOffset > 0)
+        viewport: tab.intent.tabId === activeTabId && this.#viewProjection(tab, dimensions) !== undefined
           ? tab.viewport.snapshotForHost(dimensions.columns, remoteRows(dimensions.rows))
           : tab.viewport.snapshot(),
       }));
+      const shownTab = this.#tabs.get(activeTabId);
+      const selection = shownTab === undefined ? undefined : this.#selectionRows(shownTab, dimensions);
+      // Drags go to the remote only for a writer whose program asked for the
+      // mouse; then the host's Shift+drag is the one way to select.
+      const remoteMouse = shownTab !== undefined && shownTab.snapshot.accessMode !== "observer" &&
+        shownTab.viewport.mouseReporting().tracking !== "none";
       const trueFrame = renderWorkbenchFrame({
         columns: dimensions.columns,
         rows: dimensions.rows,
@@ -2455,6 +2647,8 @@ export class ForegroundTerminalCoordinator {
           ? { sessions: this.#rosterEntries(), activeSessionId: this.#activeSessionId() as string }
           : {}),
         ...(this.#options.mouseReporting === true ? { mouseReporting: true } : {}),
+        ...(remoteMouse ? { remoteMouse: true } : {}),
+        ...(selection === undefined || selection.length === 0 ? {} : { selection }),
         appbar: this.#options.appbar?.() ?? runtimeAppbar(
           this.#clock(),
           this.#tabs.get(activeTabId)?.snapshot,
@@ -2485,7 +2679,7 @@ export class ForegroundTerminalCoordinator {
               : (this.#tabs.get(activeTabId)?.viewport.scrollOffset ?? 0) > 0
                 ? { notice: scrolledBackNotice(this.#tabs.get(activeTabId)?.viewport.scrollOffset ?? 0) }
               : this.#helpVisible
-                ? { notice: "Keys: Ctrl+C detach | " + (process.platform === "win32" ? "Shift+drag select + Ctrl+Shift+C copy | Ctrl+Shift+V paste | " : "") + "Wheel scroll | Ctrl+S keep active | Ctrl+] c/s/q remote | " + (this.#rosterActive() ? "1-9 or click switch session" : "1-4 tab") + " | n next | r retry" +
+                ? { notice: "Keys: Ctrl+C detach | " + (remoteMouse ? "Shift+drag select | " : "Drag select + copy | Ctrl+click open link | ") + (process.platform === "win32" ? "Ctrl+Shift+V paste | " : "") + "Wheel scroll | Ctrl+S keep active | Ctrl+] c/s/q remote | " + (this.#rosterActive() ? "1-9 or click switch session" : "1-4 tab") + " | n next | r retry" +
                     (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
                       ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"
