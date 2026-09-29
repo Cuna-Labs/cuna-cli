@@ -1972,6 +1972,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         });
         stopJourneyWorkspace = () => workspace.stopContinuousSync();
         const runner = runForeground;
+        const releaseWorkspaceNotices = (): void => workspace.releaseNotices();
         effects = createApiAgentJourneyEffects({
           client,
           requestedAgent: journeyAgent,
@@ -2029,10 +2030,12 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
               onBeforeTerminalOwnership: () => {
                 inlineJourneyProgress?.stop();
                 inlineJourneyProgress = undefined;
+                // The agent's screen from here: sync lines wait for detach.
+                workspace.holdNotices();
               },
               ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
               signal,
-            });
+            }).finally(releaseWorkspaceNotices);
           },
           onWait: renderJourneyWait,
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),

@@ -157,10 +157,26 @@ export interface WorkspaceJourneyEffects extends Pick<AgentJourneyEffects, "insp
   readonly continuousSyncSnapshot: () => ContinuousSyncSnapshot | undefined;
   readonly subscribeContinuousSync: (listener: (snapshot: ContinuousSyncSnapshot) => void) => () => void;
   readonly stopContinuousSync: () => Promise<void>;
+  /** From here until `releaseNotices`, lines are kept instead of written: an agent owns the terminal. */
+  readonly holdNotices: () => void;
+  /** Writes every kept line, in order, and writes lines as they come again. */
+  readonly releaseNotices: () => void;
 }
 
 export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInput): WorkspaceJourneyEffects {
   let supervisor: Awaited<ReturnType<typeof startContinuousWorkspaceSync>> | undefined;
+  // Lines said while an agent owns the terminal wait until it gives the
+  // terminal back. Written as they came, they landed on top of the agent's full
+  // screen (0.1.5 and 0.1.6: the sync lines over rows 29-32 of OpenCode, ws-c3
+  // 2026-09-29). Bounded: a sync that says more than this keeps the first lines
+  // and counts the rest.
+  let heldNotices: string[] | undefined;
+  let droppedNotices = 0;
+  const notice = (line: string): void => {
+    if (heldNotices === undefined) input.onNotice?.(line);
+    else if (heldNotices.length < HELD_NOTICE_LIMIT) heldNotices.push(line);
+    else droppedNotices += 1;
+  };
   const syncListeners = new Set<(snapshot: ContinuousSyncSnapshot) => void>();
   let unsubscribeSupervisor: (() => void) | undefined;
   // One line per entry into a state that moves no files; a repeat of the same
@@ -172,12 +188,12 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       const key = `${snapshot.state}\0${snapshot.reason ?? ""}`;
       if (key === announcedState) return;
       announcedState = key;
-      input.onNotice?.(line);
+      notice(line);
       return;
     }
     if (announcedState !== undefined && syncIsLive(snapshot)) {
       announcedState = undefined;
-      input.onNotice?.(`Workspace sync resumed · this folder is at generation ${snapshot.generation}`);
+      notice(`Workspace sync resumed · this folder is at generation ${snapshot.generation}`);
     }
   };
   /** One wiring for every admission path, so a resumed poller is as observable as a committed one. */
@@ -192,7 +208,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
     });
   };
   const renderConflict = (conflict: ContinuousSyncConflict): void => {
-    input.onNotice?.(conflictNotice(conflict));
+    notice(conflictNotice(conflict));
   };
   const inspect = async (localPath: string): Promise<{
     readonly policy: Awaited<ReturnType<typeof inspectWorkspaceSyncPolicy>>;
@@ -218,6 +234,17 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       }
       return () => syncListeners.delete(listener);
     },
+    holdNotices() {
+      heldNotices ??= [];
+    },
+    releaseNotices() {
+      const lines = heldNotices ?? [];
+      const dropped = droppedNotices;
+      heldNotices = undefined;
+      droppedNotices = 0;
+      for (const line of lines) input.onNotice?.(line);
+      if (dropped > 0) input.onNotice?.(`${dropped} more workspace lines were said while the agent had the terminal`);
+    },
     async stopContinuousSync() {
       const current = supervisor;
       supervisor = undefined;
@@ -229,7 +256,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       // Lines written while a terminal owned the screen may be gone once it
       // is released, so a sync that was not live gets the last word here.
       const line = last === undefined ? undefined : continuousSyncDetachNotice(last);
-      if (line !== undefined) input.onNotice?.(line);
+      if (line !== undefined) notice(line);
     },
     async inspectWorkspace({ localPath, syncMode, signal }) {
       signal.throwIfAborted();
@@ -323,7 +350,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             expected: workspaceBindingCompareAndSwap(record),
             rebind: true,
           });
-          input.onNotice?.(`Rebound this folder to ${await machineDisplayName(input.client, machineId, signal)} · the previous Machine no longer exists`);
+          notice(`Rebound this folder to ${await machineDisplayName(input.client, machineId, signal)} · the previous Machine no longer exists`);
         } else {
           authority = await input.client.getWorkspaceBinding(record.bindingId, {
             ...(record.executionWorkspaceId === undefined ? {} : { executionWorkspaceId: record.executionWorkspaceId }),
@@ -427,7 +454,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         } catch (error) {
           if (!(error instanceof CunaError)) throw error;
           const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
-          input.onNotice?.(`Remote workspace changes will not arrive this run · ${reason}${syncHolder(error)}`);
+          notice(`Remote workspace changes will not arrive this run · ${reason}${syncHolder(error)}`);
         }
         return Object.freeze({
           bindingId: authority.bindingId,
@@ -474,7 +501,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             details: { local_generation: baseGeneration, remote_generation: authority.activeGeneration },
           });
         }
-        input.onNotice?.(`The Machine changed this workspace while you were away · bringing generation ${authority.activeGeneration} into this folder before sending local changes`);
+        notice(`The Machine changed this workspace while you were away · bringing generation ${authority.activeGeneration} into this folder before sending local changes`);
         try {
           const started = await resumeContinuousWorkspaceSyncFromLocalBase({
             localRoot: inspected.policy.canonicalRoot,
@@ -500,12 +527,12 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             await recordPublishedGeneration({ input, root: inspected.policy.canonicalRoot, authority, machineId, localRecord });
           } else {
             const why = reached.reason === undefined ? "" : ` (${reached.reason})`;
-            input.onNotice?.(`Generation ${authority.activeGeneration} has not reached this folder yet · ${reached.state}${why} · it keeps arriving while this run is open`);
+            notice(`Generation ${authority.activeGeneration} has not reached this folder yet · ${reached.state}${why} · it keeps arriving while this run is open`);
           }
         } catch (error) {
           if (!(error instanceof CunaError)) throw error;
           const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
-          input.onNotice?.(`Workspace changes will not sync this run · ${reason}${syncHolder(error)}`);
+          notice(`Workspace changes will not sync this run · ${reason}${syncHolder(error)}`);
         }
         return Object.freeze({
           bindingId: authority.bindingId,
@@ -582,6 +609,9 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
   };
   return Object.freeze(effects);
 }
+
+/** Lines kept while an agent owns the terminal; past this they are only counted. */
+const HELD_NOTICE_LIMIT = 100;
 
 /** How long a run waits for a newer Machine generation to land before it goes on. */
 const CATCH_UP_MS = 60_000;

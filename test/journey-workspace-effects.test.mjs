@@ -1138,6 +1138,34 @@ test("a sync that stops says so in one line while attached and again when the ru
 // A pause says so once, and saying that sync is live again keeps the screen
 // true once the cause clears: here the first poll fails, and the reconciliation
 // that follows proves the folder converged.
+// 0.1.5 and 0.1.6 wrote these lines to stderr while OpenCode owned the full
+// screen, over its rows 29-32 (ws-c3, 2026-09-29). Held from the moment the
+// agent takes the terminal, they are written in order when it gives it back.
+// The optional calls keep the red honest on a build without the hold: the
+// lines then land at once, which is the defect.
+test("sync lines said while an agent owns the terminal wait for detach, in order", async (t) => {
+  const fixture = await attachedFolder(t);
+  const { attached, notices, wire } = fixture;
+  const paused = "Workspace sync paused · files are not syncing between this folder and the Machine · paused (dependency_unavailable)";
+  try {
+    const states = [];
+    attached.subscribeContinuousSync((snapshot) => states.push(snapshot.state));
+    attached.holdNotices?.();
+    wire.changesFailures.push(new Error("offline"));
+    await waitFor(() => states.includes("paused"), "the sync never paused", 10_000);
+    await new Promise((settle) => setTimeout(settle, 50));
+    assert.deepEqual(notices, [], "nothing is written while the agent owns the terminal");
+    attached.releaseNotices?.();
+    assert.deepEqual(notices, [paused], "the held line is written at detach");
+    // After detach a line is written as it comes.
+    await attached.stopContinuousSync();
+    assert.equal(notices.length, 2, `the run-end line was not written at once: ${JSON.stringify(notices)}`);
+    assert.match(notices[1], /^Workspace sync was not live when this run ended /u);
+  } finally {
+    await attached.stopContinuousSync();
+  }
+});
+
 test("a paused sync says so once and says when it is live again", async (t) => {
   const fixture = await attachedFolder(t, (wire) => { wire.changesFailures.push(new Error("offline")); });
   const { attached, notices } = fixture;
