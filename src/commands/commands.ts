@@ -62,7 +62,6 @@ import type {
 import type { PlatformAdapter } from "../platform/adapter.js";
 import {
   isOpenCodeRuntimeUnverifiedCapabilityRejection,
-  isOpenCodeSupervisorRepairCapabilityRejection,
   isOpenCodeSupervisorUpgradeCapabilityRejection,
   openCodeRuntimeUnverified,
   openCodeSupervisorUpgradeRequired,
@@ -735,6 +734,92 @@ function machineSessionCounts(machine: Machine, sessions: readonly AgentSession[
     codex: count("codex"),
     opencode: count("opencode"),
   });
+}
+
+/**
+ * The stopped-boundary replacement's own refusals
+ * (`LegacySupervisorUpgradeErrorCode`, infra edge/src/legacy-supervisor-upgrade.ts),
+ * each with the next step that is true for it. The CLI code is the wire code,
+ * so what the person reads names exactly what the server decided.
+ */
+async function supervisorReplaceRefusal(client: CunaApiClient, machine: Machine, error: unknown): Promise<unknown> {
+  if (!(error instanceof CunaError)) return error;
+  const reason = error.details?.reason;
+  const id = machine.id;
+  const again = `\`cuna machines update-supervisor ${id} --yes\``;
+  const refusal = (input: { readonly message: string; readonly hint: string; readonly details?: SafeErrorDetails }) => new CunaError({
+    code: `cuna.machine.${String(reason)}`,
+    message: input.message,
+    exitCode: error.exitCode,
+    hint: input.hint,
+    retryable: error.retryable,
+    details: { ...error.details, machine_id: id, ...input.details },
+    cause: error,
+  });
+  switch (reason) {
+    case "supervisor_upgrade_not_required":
+      return refusal({
+        message: `Cuna still sees a compatible supervisor connected for ${machine.name}, so there is nothing to update now.`,
+        hint: `Right after a stop, the supervisor's control lease stays live for up to 30 s. Wait 30 s and run ${again} again. If the same answer repeats, the supervisor is compatible and nothing needs updating: start the Machine with \`cuna machines start ${id} --yes\`.`,
+      });
+    case "supervisor_upgrade_machine_not_stopped":
+      return refusal({
+        message: `Cuna does not see ${machine.name} as stopped, so its supervisor was not updated.`,
+        hint: `Cuna will not stop it or terminate any AgentSessions. Stop it with \`cuna machines stop ${id} --yes\`, wait until \`cuna machines list\` says stopped, then run ${again}.`,
+      });
+    case "supervisor_upgrade_provider_not_stopped":
+      return refusal({
+        message: `${machine.name}'s stop is still settling: Cuna has not yet observed its runtime stopped. Nothing was changed.`,
+        hint: `Wait a few seconds and run ${again} again.`,
+      });
+    case "supervisor_upgrade_agent_sessions_active": {
+      // The server never names another AgentSession in a refusal; this
+      // person's own list does, with the same test the endpoint applies.
+      let blockers: readonly AgentSession[] | undefined;
+      try {
+        blockers = (await listAllMachineAgentSessions(client, id)).filter((session) =>
+          session.desiredState === "running" || ["starting", "ready", "running"].includes(session.processState));
+      } catch {
+        blockers = undefined;
+      }
+      const named = blockers === undefined || blockers.length === 0
+        ? undefined
+        : blockers.slice(0, 5).map((session) => `${session.name} (${session.id}, ${session.processState})`).join(", ") +
+          (blockers.length > 5 ? ` and ${blockers.length - 5} more` : "");
+      return refusal({
+        message: named === undefined
+          ? `An AgentSession on ${machine.name} is still desired or running, so its supervisor was not updated.`
+          : `These AgentSessions on ${machine.name} are still desired or running: ${named}.`,
+        hint: `Cuna will not end them. End only the ones you intend to end with \`cuna agent-sessions terminate SESSION_ID --yes\` (see \`cuna agent-sessions list --machine ${id}\`), then run ${again}.`,
+        ...(blockers === undefined ? {} : { details: { blocking_agent_sessions: blockers.map((session) => session.id) } }),
+      });
+    }
+    case "supervisor_upgrade_in_progress":
+      return refusal({
+        message: `Another wake or supervisor update already owns ${machine.name}.`,
+        hint: `Do not repeat the update. Read \`cuna machines list\` until the Machine settles.`,
+      });
+    case "supervisor_upgrade_runtime_unavailable":
+      return refusal({
+        message: `${machine.name} has no runtime Cuna can update in this workspace.`,
+        hint: `Read \`cuna machines list\`. ${error.hint ?? ""}`.trim(),
+      });
+    case "supervisor_upgrade_authority_unavailable":
+      return refusal({
+        message: `Cuna could not verify the stopped-machine update for ${machine.name}. Nothing was started.`,
+        hint: `Run ${again} again; do not start the Machine in between.`,
+      });
+    case "supervisor_upgrade_publish_pending":
+    case "supervisor_upgrade_v2_not_observed":
+      // The update may already have started the Machine: an uncertain
+      // outcome, never repeated blindly.
+      return refusal({
+        message: `Cuna may have started ${machine.name} for the update but has not confirmed its new supervisor yet.`,
+        hint: `Do not repeat the update. Read \`cuna machines list\` until the Machine is running, then check its AgentSessions.`,
+      });
+    default:
+      return error;
+  }
 }
 
 async function listAllMachineAgentSessions(
@@ -2873,36 +2958,14 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     requireConfirmation(parsed, "machines.update-supervisor");
     const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
 
-    // Preserve OpenCode's explicit repair signals. Other providers can keep
-    // creation supported even when their machine control lease needs repair.
-    let updateRequired = false;
-    let stoppedRuntimeUnverified: CunaError | undefined;
-    try {
-      await requireCapability({
-        client,
-        scope: "machine",
-        resourceId: id,
-        capabilityId: "agent_sessions.create",
-        now: context.capabilityClock ?? now,
-      });
-    } catch (error) {
-      if (isOpenCodeSupervisorRepairCapabilityRejection(error)) {
-        updateRequired = true;
-      } else if (isOpenCodeRuntimeUnverifiedCapabilityRejection(error)) {
-        // A stopped Machine cannot run the OpenCode binary probe.  That is the
-        // required precondition for this explicit repair, not evidence that
-        // the supervisor update itself is forbidden.  Re-read the exact
-        // Machine below; the endpoint remains the authority for whether a
-        // compatible supervisor already exists.
-        stoppedRuntimeUnverified = error;
-      } else {
-        throw error;
-      }
-    }
-
-    // The replacement route has the same `machines:update` authority as a
-    // start. Do not substitute the deliberately unsupported create capability
-    // for the authorization that permits the remediation.
+    // The replacement endpoint is the authority for this action. It checks
+    // that the Machine and its provider runtime are stopped, that no
+    // AgentSession is desired or live, and that no compatible supervisor is
+    // still connected, and it refuses each case with its own code. It carries
+    // the same `machines:update` authority as a start. AgentSession creation
+    // is no precondition: on a stopped Machine it is unavailable by definition
+    // (`agent_session_machine_not_running`), which made this stopped-only
+    // action unreachable on the Machines that need it (cd0696a7, 2026-09-29).
     await requireCapability({
       client,
       scope: "machine",
@@ -2920,23 +2983,12 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
         details: { machine_id: id, observed_state: current.state },
       });
     }
-    if (stoppedRuntimeUnverified !== undefined) {
-      if (current.agent !== "opencode") throw stoppedRuntimeUnverified;
-      updateRequired = true;
+    let updated: Machine;
+    try {
+      updated = await client.replaceMachineSupervisor(id);
+    } catch (error) {
+      throw await supervisorReplaceRefusal(client, current, error);
     }
-    // Claude/Codex creation can remain supported while the machine's control
-    // lease has expired. The stopped replacement endpoint validates that lease
-    // and all child-session blockers; OpenCode discovery is not its authority.
-    if (!updateRequired && current.agent === "opencode") {
-      throw new CunaError({
-        code: "cuna.machine.supervisor_update_not_required",
-        message: "Cuna does not report that this Machine needs an OpenCode terminal-supervisor update.",
-        exitCode: EXIT_CODES.unsupported,
-        hint: "Create an OpenCode AgentSession normally. This action is available only after Cuna reports the exact supervisor prerequisite.",
-        details: { machine_id: id },
-      });
-    }
-    const updated = await client.replaceMachineSupervisor(id);
     if (updated.id !== id) {
       postconditionUnverified("terminal supervisor update", { machine_id: id, observed_id: updated.id });
     }

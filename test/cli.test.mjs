@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { ContractViolation, CunaError, EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
+import { ContractViolation, createCunaApiClient, createHttpTransport, CunaError, EXIT_CODES, memoryStreams, parseArgv, runCli } from "../dist/index.js";
 import { CREDENTIAL_BACKEND_PROTOCOL } from "../dist/credentials/contracts.js";
 
 const API_KEY = "cuna_sk_abcdefghijklmnop";
@@ -1887,262 +1887,172 @@ test("machine lifecycle uses the producer-owned grouped capability ID", async ()
   assert.equal(JSON.parse(streams.stdout()).data.state, "paused");
 });
 
-test("terminal supervisor update is an explicit OpenCode-only remediation and preserves lifecycle ownership", async () => {
-  const discoveries = [];
-  let replacements = 0;
-  let lifecycleTransitions = 0;
+/* -------------------------------------------------------------------------- */
+/* machines update-supervisor: the replacement endpoint is the authority       */
+/* -------------------------------------------------------------------------- */
+
+const LIFECYCLE = {
+  id: "machines.lifecycle",
+  availability: "supported",
+  interaction: "native",
+  mutationClass: "reversible",
+  surfaces: ["cli"],
+  requiredPermissions: ["machines:update"],
+};
+/** What the server says about creation on any stopped Machine (cd0696a7, 2026-09-29). */
+const CREATE_WHILE_STOPPED = {
+  id: "agent_sessions.create",
+  availability: "temporarily_unavailable",
+  interaction: "native",
+  mutationClass: "reversible",
+  surfaces: ["cli"],
+  requiredPermissions: ["agent_sessions:create"],
+  reasonCode: "agent_session_machine_not_running",
+};
+
+async function updateSupervisor(overrides) {
   const streams = memoryStreams();
-  const client = fakeClient({
-    async discoverCapabilities(scope, resourceId) {
-      discoveries.push({ scope, resourceId });
-      if (discoveries.length === 1) {
-        return capabilitySnapshot([{
-          id: "agent_sessions.create",
-          availability: "unsupported",
-          interaction: "native",
-          mutationClass: "reversible",
-          surfaces: ["cli"],
-          requiredPermissions: ["agent_sessions:create"],
-          reasonCode: "opencode_supervisor_upgrade_required",
-        }], scope, resourceId);
-      }
-      return capabilitySnapshot([{
-        id: "machines.lifecycle",
-        availability: "supported",
-        interaction: "native",
-        mutationClass: "reversible",
-        surfaces: ["cli"],
-        requiredPermissions: ["machines:update"],
-      }], scope, resourceId);
-    },
-    async getMachine(id) {
-      return { id, name: "open-dev", state: "stopped", agent: "opencode" };
-    },
-    async transitionMachine() {
-      lifecycleTransitions += 1;
-      throw new Error("the explicit supervisor action must not transition lifecycle");
-    },
-    async replaceMachineSupervisor(id) {
-      replacements += 1;
-      assert.equal(id, MACHINE_ID);
-      return { id, name: "open-dev", state: "running", agent: "opencode" };
-    },
-  });
   const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
     streams: streams.streams,
     platform,
     env: { CUNA_API_KEY: API_KEY },
     now: () => Date.parse("2026-08-08T00:00:00Z"),
-    clientFactory: () => client,
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) { return capabilitySnapshot([CREATE_WHILE_STOPPED, LIFECYCLE], scope, resourceId); },
+      async transitionMachine() { throw new Error("the explicit supervisor action must not transition lifecycle"); },
+      ...overrides,
+    }),
   });
-  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  return { exit, stdout: streams.stdout(), stderr: streams.stderr() };
+}
+
+test("a stopped OpenCode Machine whose AgentSession creation is unavailable reaches the replacement", async () => {
+  // Owner 2026-09-29, cd0696a7: stopped, its sessions terminated, and both
+  // 0.1.5 and the 0.1.6 drop refused before any request because creation said
+  // agent_session_machine_not_running -- which every stopped Machine says.
+  let replacements = 0;
+  const result = await updateSupervisor({
+    async getMachine(id) { return { id, name: "qa-c3-20260929", state: "stopped", agent: "opencode" }; },
+    async replaceMachineSupervisor(id) {
+      replacements += 1;
+      assert.equal(id, MACHINE_ID);
+      return { id, name: "qa-c3-20260929", state: "running", agent: "opencode" };
+    },
+  });
+  assert.equal(result.exit, EXIT_CODES.success, result.stderr);
   assert.equal(replacements, 1);
-  assert.equal(lifecycleTransitions, 0);
-  assert.deepEqual(discoveries, [
-    { scope: "machine", resourceId: MACHINE_ID },
-    { scope: "machine", resourceId: MACHINE_ID },
-  ]);
-  const record = JSON.parse(streams.stdout());
+  const record = JSON.parse(result.stdout);
   assert.equal(record.command, "machines.update-supervisor");
   assert.equal(record.data.state, "running");
 });
 
-test("terminal supervisor update admits a stopped OpenCode runtime-unverified preflight", async () => {
-  let discoveries = 0;
+test("a Machine that is not stopped is refused locally, and nothing is replaced or stopped", async () => {
   let replacements = 0;
-  const streams = memoryStreams();
-  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
-    streams: streams.streams,
-    platform,
-    env: { CUNA_API_KEY: API_KEY },
-    now: () => Date.parse("2026-08-08T00:00:00Z"),
-    clientFactory: () => fakeClient({
-      async discoverCapabilities(scope, resourceId) {
-        discoveries += 1;
-        if (discoveries === 1) {
-          return capabilitySnapshot([{
-            id: "agent_sessions.create",
-            availability: "temporarily_unavailable",
-            interaction: "native",
-            mutationClass: "reversible",
-            surfaces: ["cli"],
-            requiredPermissions: ["agent_sessions:create"],
-            reasonCode: "opencode_runtime_unverified",
-          }], scope, resourceId);
-        }
-        return capabilitySnapshot([{
-          id: "machines.lifecycle",
-          availability: "supported",
-          interaction: "native",
-          mutationClass: "reversible",
-          surfaces: ["cli"],
-          requiredPermissions: ["machines:update"],
-        }], scope, resourceId);
-      },
-      async getMachine(id) {
-        return { id, name: "stopped-open-dev", state: "stopped", agent: "opencode" };
-      },
-      async replaceMachineSupervisor(id) {
-        replacements += 1;
-        return { id, name: "stopped-open-dev", state: "running", agent: "opencode" };
-      },
-    }),
+  const result = await updateSupervisor({
+    async getMachine(id) { return { id, name: "protected-open-dev", state: "running", agent: "opencode" }; },
+    async replaceMachineSupervisor() { replacements += 1; throw new Error("must not replace a running Machine"); },
   });
-  assert.equal(exit, EXIT_CODES.success, streams.stderr());
-  assert.equal(replacements, 1);
-  assert.equal(JSON.parse(streams.stdout()).data.state, "running");
-});
-
-test("terminal supervisor update admits the exact OpenCode protocol-unavailable repair signal", async () => {
-  let discoveries = 0;
-  let replacements = 0;
-  const streams = memoryStreams();
-  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
-    streams: streams.streams,
-    platform,
-    env: { CUNA_API_KEY: API_KEY },
-    now: () => Date.parse("2026-08-08T00:00:00Z"),
-    clientFactory: () => fakeClient({
-      async discoverCapabilities(scope, resourceId) {
-        discoveries += 1;
-        if (discoveries === 1) {
-          return capabilitySnapshot([{
-            id: "agent_sessions.create",
-            availability: "temporarily_unavailable",
-            interaction: "native",
-            mutationClass: "reversible",
-            surfaces: ["cli"],
-            requiredPermissions: ["agent_sessions:create"],
-            reasonCode: "opencode_supervisor_protocol_unavailable",
-          }], scope, resourceId);
-        }
-        return capabilitySnapshot([{
-          id: "machines.lifecycle",
-          availability: "supported",
-          interaction: "native",
-          mutationClass: "reversible",
-          surfaces: ["cli"],
-          requiredPermissions: ["machines:update"],
-        }], scope, resourceId);
-      },
-      async getMachine(id) {
-        return { id, name: "protocol-open-dev", state: "stopped", agent: "opencode" };
-      },
-      async replaceMachineSupervisor(id) {
-        replacements += 1;
-        return { id, name: "protocol-open-dev", state: "running", agent: "opencode" };
-      },
-    }),
-  });
-  assert.equal(exit, EXIT_CODES.success, streams.stderr());
-  assert.equal(replacements, 1);
-  assert.equal(JSON.parse(streams.stdout()).data.state, "running");
-});
-
-test("terminal supervisor update never stops a running Machine or terminates sessions", async () => {
-  let replacements = 0;
-  let discoveries = 0;
-  const streams = memoryStreams();
-  const client = fakeClient({
-    async discoverCapabilities(scope, resourceId) {
-      // The second discovery authorizes the same lifecycle/update authority as
-      // start. It is deliberately separate from the unsupported create proof.
-      discoveries += 1;
-      if (discoveries === 1) {
-        return capabilitySnapshot([{
-          id: "agent_sessions.create",
-          availability: "unsupported",
-          interaction: "native",
-          mutationClass: "reversible",
-          surfaces: ["cli"],
-          requiredPermissions: ["agent_sessions:create"],
-          reasonCode: "opencode_supervisor_upgrade_required",
-        }], scope, resourceId);
-      }
-      return capabilitySnapshot([{
-        id: "machines.lifecycle",
-        availability: "supported",
-        interaction: "native",
-        mutationClass: "reversible",
-        surfaces: ["cli"],
-        requiredPermissions: ["machines:update"],
-      }], scope, resourceId);
-    },
-    async getMachine(id) {
-      return { id, name: "protected-open-dev", state: "running", agent: "opencode" };
-    },
-    async replaceMachineSupervisor() {
-      replacements += 1;
-      throw new Error("must not replace a running Machine");
-    },
-  });
-  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
-    streams: streams.streams,
-    platform,
-    env: { CUNA_API_KEY: API_KEY },
-    now: () => Date.parse("2026-08-08T00:00:00Z"),
-    clientFactory: () => client,
-  });
-  assert.equal(exit, EXIT_CODES.conflict);
+  assert.equal(result.exit, EXIT_CODES.conflict);
   assert.equal(replacements, 0);
-  const error = JSON.parse(streams.stderr()).error;
+  const error = JSON.parse(result.stderr).error;
   assert.equal(error.code, "cuna.machine.supervisor_update_requires_stopped");
   assert.match(error.hint, /will not stop protected-open-dev or terminate any AgentSessions/u);
 });
 
-test("terminal supervisor update recovers stopped Claude without an OpenCode prerequisite", async () => {
-  const streams = memoryStreams();
-  let replacements = 0;
-  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
-    streams: streams.streams, platform, env: { CUNA_API_KEY: API_KEY },
-    now: () => Date.parse("2026-08-08T00:00:00Z"),
-    clientFactory: () => fakeClient({
-      async discoverCapabilities(scope, resourceId) {
-        return capabilitySnapshot(["agent_sessions.create", "machines.lifecycle"].map(id => ({
-          id, availability: "supported", interaction: "native", mutationClass: "reversible",
-          surfaces: ["cli"], requiredPermissions: ["machines:update"],
-        })), scope, resourceId);
-      },
-      async getMachine(id) { return { id, name: "example", state: "stopped", agent: "claude-code" }; },
-      async replaceMachineSupervisor(id) {
-        replacements += 1;
-        return { id, name: "example", state: "running", agent: "claude-code" };
-      },
-    }),
-  });
-  assert.equal(exit, EXIT_CODES.success, streams.stderr());
-  assert.equal(replacements, 1);
-});
-
-test("terminal supervisor update remains hidden unless the exact OpenCode prerequisite is advertised", async () => {
+test("the update needs the lifecycle authority, and nothing else is asked first", async () => {
   let machineReads = 0;
   let replacements = 0;
-  const streams = memoryStreams();
-  const exit = await runCli(["machines", "update-supervisor", MACHINE_ID, "--yes", "--json"], {
-    streams: streams.streams,
-    platform,
-    env: { CUNA_API_KEY: API_KEY },
-    now: () => Date.parse("2026-08-08T00:00:00Z"),
-    clientFactory: () => fakeClient({
-      async discoverCapabilities(scope, resourceId) {
-        return capabilitySnapshot([{
-          id: "agent_sessions.create",
-          availability: "unsupported",
-          interaction: "native",
-          mutationClass: "reversible",
-          surfaces: ["cli"],
-          requiredPermissions: ["agent_sessions:create"],
-          reasonCode: "supervisor_upgrade_required",
-        }], scope, resourceId);
-      },
-      async getMachine() { machineReads += 1; throw new Error("must not inspect a hidden remediation"); },
-      async replaceMachineSupervisor() { replacements += 1; throw new Error("must not replace"); },
-    }),
+  const result = await updateSupervisor({
+    async discoverCapabilities(scope, resourceId) {
+      return capabilitySnapshot([CREATE_WHILE_STOPPED, { ...LIFECYCLE, availability: "unsupported", reasonCode: "machine_lifecycle_forbidden" }], scope, resourceId);
+    },
+    async getMachine() { machineReads += 1; throw new Error("must not read before the authority"); },
+    async replaceMachineSupervisor() { replacements += 1; throw new Error("must not replace"); },
   });
-  assert.equal(exit, EXIT_CODES.unsupported);
+  assert.equal(result.exit, EXIT_CODES.unsupported);
   assert.equal(machineReads, 0);
   assert.equal(replacements, 0);
-  assert.equal(JSON.parse(streams.stderr()).error.code, "cuna.capability.unsupported");
+  assert.equal(JSON.parse(result.stderr).error.details.capability_id, "machines.lifecycle");
+});
+
+test("stopped Claude and Codex Machines are updated the same way", async () => {
+  for (const agent of ["claude-code", "codex"]) {
+    let replacements = 0;
+    const result = await updateSupervisor({
+      async getMachine(id) { return { id, name: "example", state: "stopped", agent }; },
+      async replaceMachineSupervisor(id) { replacements += 1; return { id, name: "example", state: "running", agent }; },
+    });
+    assert.equal(result.exit, EXIT_CODES.success, `${agent}: ${result.stderr}`);
+    assert.equal(replacements, 1, agent);
+  }
+});
+
+/** A Problem from the replacement route, through the real HTTP transport. */
+function replaceAnswering(status, code, title, detail, retryable = false) {
+  return createCunaApiClient(createHttpTransport({
+    baseUrl: "https://api.getcuna.com",
+    apiKey: API_KEY,
+    fetch: async () => new Response(JSON.stringify({
+      type: `https://api.getcuna.com/problems/${code}`, title, status, code, detail, retryable,
+      action: retryable ? "retry" : "none", request_id: "99999999-9999-4999-8999-999999999999",
+    }), { status, headers: { "content-type": "application/problem+json" } }),
+  }));
+}
+
+test("every replacement refusal keeps its wire code and says the next step that is true for it", async () => {
+  // The codes, titles and details are the endpoint's own
+  // (infra 5fcf57c edge/src/legacy-supervisor-upgrade.ts).
+  const cases = [
+    [409, "supervisor_upgrade_not_required", "Supervisor update not required", "This Machine already has a compatible supervisor. Start it normally.", false,
+      /nothing to update now/u, /Wait 30 s and run `cuna machines update-supervisor .* --yes` again.*start the Machine/u],
+    [409, "supervisor_upgrade_machine_not_stopped", "Machine must be stopped", "Stop this Machine and wait for Cuna to confirm it is stopped before updating its supervisor.", false,
+      /does not see qa-c3 as stopped/u, /cuna machines stop .* --yes/u],
+    [409, "supervisor_upgrade_provider_not_stopped", "Machine stop is still settling", "Cuna must independently observe the provider runtime stopped before updating its supervisor.", false,
+      /stop is still settling.*Nothing was changed/u, /Wait a few seconds and run .* again/u],
+    [409, "supervisor_upgrade_in_progress", "Supervisor update already in progress", "Another stopped-machine wake or update owns this Machine. Refresh its status instead of repeating the update.", false,
+      /already owns qa-c3/u, /Do not repeat the update/u],
+    [409, "supervisor_upgrade_runtime_unavailable", "Machine runtime unavailable", "This stopped Machine has no runtime to update.", false,
+      /no runtime Cuna can update/u, /cuna machines list/u],
+    [503, "supervisor_upgrade_authority_unavailable", "Supervisor update unavailable", "Cuna could not verify the stopped-machine update. Retry without starting the Machine.", true,
+      /could not verify.*Nothing was started/u, /again; do not start the Machine/u],
+    [503, "supervisor_upgrade_publish_pending", "Supervisor update is pending confirmation", "Cuna started the Machine but cannot yet publish the compatible supervisor.", true,
+      /may have started qa-c3/u, /Do not repeat the update/u],
+    [503, "supervisor_upgrade_v2_not_observed", "Compatible supervisor not yet observed", "Cuna installed the update but did not observe its compatible supervisor capability.", true,
+      /may have started qa-c3/u, /Do not repeat the update/u],
+  ];
+  for (const [status, code, title, detail, retryable, message, hint] of cases) {
+    const wire = replaceAnswering(status, code, title, detail, retryable);
+    const result = await updateSupervisor({
+      async getMachine(id) { return { id, name: "qa-c3", state: "stopped", agent: "opencode" }; },
+      async replaceMachineSupervisor(id) { return await wire.replaceMachineSupervisor(id); },
+    });
+    assert.notEqual(result.exit, EXIT_CODES.success, code);
+    const error = JSON.parse(result.stderr).error;
+    assert.equal(error.code, `cuna.machine.${code}`, code);
+    assert.equal(error.details.reason, code, code);
+    assert.equal(error.details.machine_id, MACHINE_ID, code);
+    assert.equal(error.retryable, retryable, `${code}: the server's own retryable`);
+    assert.match(error.message, message, code);
+    assert.match(error.hint, hint, code);
+  }
+});
+
+test("an AgentSession blocker is named from this person's own session list", async () => {
+  const wire = replaceAnswering(409, "supervisor_upgrade_agent_sessions_active", "AgentSessions must be stopped",
+    "Terminate or wait for every AgentSession on this Machine before updating its supervisor.");
+  const live = agentSession({ id: "44444444-4444-4444-8444-444444444444", name: "still-here", desiredState: "running", processState: "running" });
+  const ended = agentSession({ id: "55555555-5555-4555-8555-555555555555", name: "gone", desiredState: "terminated", processState: "terminated" });
+  const result = await updateSupervisor({
+    async getMachine(id) { return { id, name: "qa-c3", state: "stopped", agent: "opencode" }; },
+    async replaceMachineSupervisor(id) { return await wire.replaceMachineSupervisor(id); },
+    async listAgentSessions() { return { items: [live, ended] }; },
+  });
+  const error = JSON.parse(result.stderr).error;
+  assert.equal(error.code, "cuna.machine.supervisor_upgrade_agent_sessions_active");
+  assert.match(error.message, /still-here \(44444444-4444-4444-8444-444444444444, running\)/u);
+  assert.doesNotMatch(error.message, /gone/u);
+  assert.deepEqual(error.details.blocking_agent_sessions, [live.id]);
+  assert.match(error.hint, /cuna agent-sessions terminate SESSION_ID --yes/u);
 });
 
 test("mutations fail closed when independent readback contradicts the write response", async () => {

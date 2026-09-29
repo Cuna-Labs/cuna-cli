@@ -23,14 +23,9 @@ export function isOpenCodeSupervisorUpgradeReason(value: unknown): boolean {
   return typeof value === "string" && OPENCODE_SUPERVISOR_UPGRADE_REASONS.has(value);
 }
 
-/** Only these provider-specific reasons authorize the explicit Machine repair. */
-export function isOpenCodeSupervisorRepairReason(value: unknown): boolean {
-  return typeof value === "string" && OPENCODE_SUPERVISOR_REPAIR_REASONS.has(value);
-}
-
 /**
  * A legacy supervisor is a durable, explicit upgrade prerequisite. Keep this
- * narrower than `isOpenCodeSupervisorRepairReason`: an unannounced
+ * narrower than the OpenCode repair reasons: an unannounced
  * supervisor reports the same broad family of condition, but it is a
  * retryable heartbeat wait rather than evidence that a person should restart
  * anything.
@@ -73,20 +68,6 @@ export function isOpenCodeRuntimeUnverifiedCapabilityRejection(
   const details = error.details;
   return details?.capability_id === "agent_sessions.create" &&
     isOpenCodeRuntimeUnverifiedReason(details.reason ?? details.reason_code);
-}
-
-/**
- * The explicit Machine action has no selected provider argument, so it must
- * not reinterpret the provider-neutral supervisor reason as OpenCode intent.
- * Only the OpenCode-specific capability refusal makes the action available.
- */
-export function isOpenCodeSupervisorRepairCapabilityRejection(
-  error: unknown,
-): error is CunaError {
-  if (!(error instanceof CunaError)) return false;
-  const details = error.details;
-  return details?.capability_id === "agent_sessions.create" &&
-    isOpenCodeSupervisorRepairReason(details.reason ?? details.reason_code);
 }
 
 export function openCodeSupervisorUpgradeRequired(input: Readonly<{
