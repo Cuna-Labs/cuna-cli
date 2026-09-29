@@ -1,6 +1,6 @@
 {
   "name": "@cuna_labs/cli",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "The official Cuna command-line interface.",
   "type": "module",
   "bin": {
