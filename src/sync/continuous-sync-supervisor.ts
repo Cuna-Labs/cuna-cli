@@ -48,6 +48,12 @@ const DEFAULT_BYTE_LIMIT = 256 * 1024 * 1024;
  * authorities disagree, and retrying cannot settle that.
  */
 const STALE_BASE_REFUSAL_LIMIT = 3;
+/**
+ * Times in a row the operation journal may be taken again after its lease ran
+ * out under this process, with no renewal succeeding in between. One is a
+ * sleep; a pass that keeps outlasting the lease would retake forever.
+ */
+const JOURNAL_RETAKE_LIMIT = 3;
 
 export type ContinuousSyncState =
   | "recovering"
@@ -285,8 +291,8 @@ export class ContinuousWorkspaceSyncSupervisor {
   readonly #statePath: string;
   readonly #journalDirectory: string;
   #state: DurableSupervisorState;
-  #journal?: DurableSyncJournal;
-  #writerLease?: DurableSyncJournal;
+  #journal: DurableSyncJournal | undefined;
+  #writerLease: DurableSyncJournal | undefined;
   #watcher?: WorkspaceWatchSubscription;
   #loop?: Promise<void>;
   #wake: (() => void) | undefined;
@@ -296,6 +302,8 @@ export class ContinuousWorkspaceSyncSupervisor {
   /** The base the last stale refusal named, and how many refusals it has had in a row. */
   #staleBase: number | undefined;
   #staleRefusals = 0;
+  /** Journal retakes since the last renewal that succeeded. */
+  #journalRetakes = 0;
 
   private constructor(input: ContinuousWorkspaceSyncSupervisorInput, state: DurableSupervisorState) {
     this.#input = input;
@@ -503,18 +511,98 @@ export class ContinuousWorkspaceSyncSupervisor {
           await this.#scanAndCommit(signal);
         }
         await this.#journal?.renew();
+        this.#journalRetakes = 0;
         await this.#waitForWake(this.#input.remotePollIntervalMs ?? DEFAULT_REMOTE_POLL_MS, signal);
       } catch (error) {
         if (signal.aborted) break;
-        const classification = classifyFailure(error);
+        let failure: unknown = error;
+        let journalLost = false;
+        if (isJournalFenced(failure)) {
+          try {
+            if (await this.#retakeJournal()) continue;
+          } catch (retakeFailure) {
+            failure = retakeFailure;
+            journalLost = this.#journal === undefined;
+          }
+        }
+        // Without a journal no pass can record an operation, so a failed
+        // retake ends the loop whatever the failure would otherwise mean.
+        const classification = journalLost
+          ? { status: "recovery_required" as const, reason: classifyFailure(failure).reason }
+          : classifyFailure(failure);
         await this.#transition({
           status: classification.status,
           dirty: true,
           reason: classification.reason,
         });
-        if (classification.status === "recovery_required" || classification.status === "conflicted") break;
+        if (classification.status === "recovery_required" || classification.status === "conflicted") {
+          await this.#releaseWriterAuthority();
+          break;
+        }
         await this.#waitForWake(this.#input.remotePollIntervalMs ?? DEFAULT_REMOTE_POLL_MS, signal);
       }
+    }
+  }
+
+  /**
+   * Take the operation journal again after its lease ran out under this
+   * process, the way a restart of this process would take it.
+   *
+   * The lease is renewed once per pass, so a laptop that sleeps longer than it
+   * wakes to a lease that expired while this process still held the folder's
+   * writer authority. Nobody else can have written the journal in between:
+   * `DurableSyncJournal.open` needs that authority first. Treated as a
+   * conflict, the expiry ended sync for as long as the process lived (ws-c3,
+   * 2026-09-29: every loop on the laptop stopped at 04:20:08 with
+   * `stale_fence` after a sleep). The journal keeps refusing the old fence;
+   * this opens a new one and then recovers exactly as start-up does.
+   *
+   * False when the bound is spent: a pass that keeps outlasting the lease is
+   * not a sleep, and retaking it again would repeat it forever.
+   */
+  async #retakeJournal(): Promise<boolean> {
+    if (this.#journalRetakes >= JOURNAL_RETAKE_LIMIT) return false;
+    this.#journalRetakes += 1;
+    const expired = this.#journal;
+    this.#journal = undefined;
+    // Releases the directory authority; the stale lease file is removed only
+    // while it still names this owner and fence.
+    await expired?.close();
+    this.#journal = await DurableSyncJournal.open({
+      directory: this.#journalDirectory,
+      bindingId: this.#input.bindingId,
+      bindingGeneration: this.#input.bindingGeneration,
+      ownerId: `continuous-sync:${process.pid}:${randomUUID()}`,
+      clock: this.#clock,
+    });
+    if (this.#state.pending_remote !== null) await this.#resumeRemoteApply();
+    await this.#recoverPendingLocal();
+    this.#scanRequested = true;
+    this.#reconcileRequested = true;
+    return true;
+  }
+
+  /**
+   * Give the folder's writer authority back once the loop has stopped for
+   * good. Nothing in this process writes the folder's sync state again, and a
+   * later run of the CLI is the only thing that can resume from what this
+   * stop left; held, the authority refused every such run as `active_writer`
+   * for as long as this process lived (ws-c3, 2026-09-29: the 01:23 run's loop
+   * stopped at 04:20:08 and its process still held the lock at 10:04). A
+   * close that fails keeps its handle, so `stop` tries it again.
+   */
+  async #releaseWriterAuthority(): Promise<void> {
+    try {
+      await this.#journal?.close();
+      this.#journal = undefined;
+    } catch {
+      // stop() retries and reports it.
+    }
+    try {
+      await this.#writerLease?.close();
+      this.#writerLease = undefined;
+    } catch {
+      // stop() retries and reports it.
     }
   }
 
@@ -1598,6 +1686,11 @@ function isStaleBaseRefusal(error: unknown, refusedOnThisBase: boolean): boolean
   const reason = error.details?.reason;
   if (reason === "workspace_sync_generation_conflict") return true;
   return refusedOnThisBase && (reason === "checkpoint_conflicted" || reason === "checkpoint_intent_mismatch");
+}
+
+/** The operation journal refused this process's lease: expired, or superseded (journal.ts `#assertLease`). */
+function isJournalFenced(error: unknown): boolean {
+  return error instanceof CunaError && error.code === "cuna.workspace.writer_fenced";
 }
 
 function classifyFailure(error: unknown): { readonly status: "paused" | "reconciling" | "conflicted" | "recovery_required"; readonly reason: string } {

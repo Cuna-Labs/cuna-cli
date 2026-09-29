@@ -666,6 +666,63 @@ test("a reconnect that commits nothing still delivers a remote generation into t
   }
 });
 
+// ws-c3, 2026-09-29: a CLI started at 01:23 still held the folder's sync at
+// 10:04, and the next run said only `active_writer`, which named nothing a
+// person could find or end. The refusal now names the process that holds it.
+// Control: the test above, where the first run is stopped before the second.
+test("a reconnect refused because another run holds the folder's sync names that run's process", async (t) => {
+  const { project, state } = await roots(t);
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(join(project, "main.js"), "console.log(1);\n");
+  const wire = new WireAuthority();
+  const binding = {
+    bindingId: "40000000-0000-4000-8000-000000000021",
+    projectId: "50000000-0000-4000-8000-000000000021",
+    localInstanceId: "60000000-0000-4000-8000-000000000021",
+    remoteRoot: "/workspace/projects/50000000-0000-4000-8000-000000000021",
+    exclusionPolicyDigest: undefined,
+    bindingEpoch: 1,
+    minimumReader: 1,
+    minimumWriter: 2,
+    createdAt: "2026-09-29T01:23:00.000Z",
+    updatedAt: "2026-09-29T01:23:00.000Z",
+  };
+  const published = () => Object.freeze({
+    ...binding,
+    workspaceId: WORKSPACE,
+    machineId: MACHINE,
+    activeGeneration: wire.committedGeneration,
+    activeManifestRoot: wire.committedRoot ?? "0".repeat(64),
+  });
+  const client = {
+    async createWorkspaceBinding(input) {
+      binding.exclusionPolicyDigest = input.exclusionPolicyDigest;
+      return published();
+    },
+    async getWorkspaceBinding() { return published(); },
+    async getMachine(id) { return { id, name: "qa3", state: "running" }; },
+  };
+  const first = effects(client, state, { transport: wire });
+  const notices = [];
+  const second = effects(client, state, { transport: wire, onNotice: (line) => notices.push(line) });
+  try {
+    assert.equal((await first.synchronizeWorkspace({
+      machineId: MACHINE, localPath: project, syncMode: "enabled", signal: new AbortController().signal,
+    })).generation, 1);
+    const result = await second.synchronizeWorkspace({
+      machineId: MACHINE, localPath: project, syncMode: "enabled", signal: new AbortController().signal,
+    });
+    assert.equal(result.generation, 1, "the attach still proceeds");
+    assert.equal(second.continuousSyncSnapshot(), undefined, "no second poller");
+    assert.deepEqual(notices, [
+      `Remote workspace changes will not arrive this run · active_writer · cuna process ${process.pid} holds this folder's sync · if that run is no longer open, end the process and run this command again`,
+    ]);
+  } finally {
+    await second.stopContinuousSync();
+    await first.stopContinuousSync();
+  }
+});
+
 // Negative control: the skip must be keyed on the manifest, not on nothing at
 // all. With a different remote manifest root the journey must go to the network
 // — here that surfaces as the transport's own refusal, which is proof it tried.

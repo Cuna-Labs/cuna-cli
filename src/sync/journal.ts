@@ -7,6 +7,7 @@ import { isAbsolute, join, parse, resolve } from "node:path";
 
 import { assertReadableSchema, assertWritableSchema, type DurableSchemaEnvelope } from "../workspace/schema.js";
 import { workspaceError } from "../workspace/errors.js";
+import { CunaError, EXIT_CODES } from "../core/errors.js";
 
 export type JournalOperationState =
   | "queued"
@@ -592,7 +593,7 @@ async function acquireWriterAuthority(directory: string): Promise<WriterAuthorit
       server.listen(`\\\\.\\pipe\\cuna-workspace-journal-${digest}`);
     });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") throw writerBusy();
+    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") throw await writerBusy(directory);
     throw error;
   }
   let closed = false;
@@ -658,7 +659,7 @@ async function acquireUnixWriterAuthority(directory: string): Promise<WriterAuth
     if (result === "timeout") throw journalFailure("writer_lock_timeout");
     if (spawnError !== undefined) throw journalFailure("writer_lock_unavailable");
     const exit = await ended;
-    if (exit.code === 75) throw writerBusy();
+    if (exit.code === 75) throw await writerBusy(directory);
     throw journalFailure("writer_lock_unavailable");
   }
   try { await assertSecureHandle(handle, lockPath); } catch (error) {
@@ -688,8 +689,38 @@ async function acquireUnixWriterAuthority(directory: string): Promise<WriterAuth
   });
 }
 
-function writerBusy() {
-  return workspaceError("workspace_busy", "Another process owns the workspace journal.", "conflict", "active_writer");
+/**
+ * The refusal names the process holding the journal when its lease says which.
+ * `active_writer` alone left a person no way to find the run that kept their
+ * folder's sync (ws-c3, 2026-09-29: a CLI started at 01:23 still held it at
+ * 10:04, with its loop stopped since 04:20).
+ */
+async function writerBusy(directory: string): Promise<CunaError> {
+  const holder = await leaseHolderProcess(directory);
+  if (holder === undefined) {
+    return workspaceError("workspace_busy", "Another process owns the workspace journal.", "conflict", "active_writer");
+  }
+  return new CunaError({
+    code: "cuna.workspace.workspace_busy",
+    message: `Cuna process ${holder} owns the workspace journal.`,
+    exitCode: EXIT_CODES.conflict,
+    details: { reason: "active_writer", holder_pid: holder },
+  });
+}
+
+/**
+ * The process id in the owner id of the lease a journal's holder wrote when it
+ * opened (`continuous-sync:<pid>:<uuid>`). Best effort: the refusal stands
+ * without it.
+ */
+async function leaseHolderProcess(directory: string): Promise<number | undefined> {
+  try {
+    const lease = await readOptionalJson<LeaseRecord>(join(directory, LEASE_FILE), validLeaseRecord);
+    const pid = /^[a-z][a-z-]*:([1-9][0-9]{0,9}):/u.exec(lease?.ownerId ?? "")?.[1];
+    return pid === undefined ? undefined : Number(pid);
+  } catch {
+    return undefined;
+  }
 }
 
 function validLeaseRecord(value: unknown): value is LeaseRecord {

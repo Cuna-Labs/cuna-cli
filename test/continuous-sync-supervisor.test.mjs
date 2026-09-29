@@ -8,6 +8,7 @@ import test from "node:test";
 import { CunaError, EXIT_CODES } from "../dist/core/errors.js";
 import {
   ContinuousWorkspaceSyncSupervisor,
+  DurableSyncJournal,
 } from "../dist/sync/index.js";
 import {
   compileExclusionPolicy,
@@ -503,6 +504,72 @@ test("stale refusals with no newer generation in sight stop after three attempts
   watcher.change("shared.txt");
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(attempts, 3, "a stopped supervisor sends nothing more");
+});
+
+// ws-c3, 2026-09-29: the laptop slept from about 02:23 to 04:20. On waking,
+// every sync loop found its own journal lease (30 s) expired, stopped as
+// conflicted/stale_fence, and never synced again while its process lived.
+test("a journal lease that ran out while the machine slept is taken again and sync keeps running", async (t) => {
+  const fx = await fixture(t);
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  const watcher = new WatchHarness();
+  let now = Date.parse("2026-09-29T02:23:00.000Z");
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(
+    supervisorInput(fx, authority, watcher, { clock: () => now }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await waitFor(() => supervisor.snapshot.state === "live_unverified", () => `never live: ${JSON.stringify(supervisor.snapshot)}`);
+  // Asleep for two hours; the passes after this run on the woken clock.
+  now += 2 * 60 * 60 * 1_000;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await writeFile(join(fx.root, "after-sleep.txt"), "written after the sleep");
+  watcher.change("after-sleep.txt");
+  await waitFor(() => supervisor.snapshot.generation === 2,
+    () => `sync did not survive the sleep: ${JSON.stringify(supervisor.snapshot)}`);
+  assert.deepEqual(authority.commits.at(-1).entries.map((entry) => entry.path), ["after-sleep.txt"]);
+  assert.notEqual(supervisor.snapshot.state, "conflicted");
+});
+
+// The same laptop: a CLI whose loop had stopped kept the folder's writer
+// authority until 10:04, so every later run of the CLI in that folder was told
+// `active_writer` and could not deliver the Machine's generation 3.
+test("a loop that stops for good gives the folder's writer authority back to the next run", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "base" });
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  authority.commitLocalSnapshot = async ({ baseGeneration }) => {
+    authority.refusedBases.add(baseGeneration);
+    throw conflict("workspace_sync_generation_conflict");
+  };
+  const watcher = new WatchHarness();
+  const writerLeaseDirectory = join(fx.state, "writer-authority");
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(
+    supervisorInput(fx, authority, watcher, { writerLeaseDirectory }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  const directories = [writerLeaseDirectory, join(fx.state, "operation-journal")];
+  const nextRun = (directory) => DurableSyncJournal.open({
+    directory, bindingId: BINDING, bindingGeneration: 1, ownerId: `continuous-sync:${process.pid}:next-run`,
+  });
+  // CONTROL: while the loop runs, the next run is refused. Without this the
+  // assertion below could pass on a lock that was never held.
+  for (const directory of directories) {
+    await assert.rejects(nextRun(directory), (error) => error.code === "cuna.workspace.workspace_busy");
+  }
+  await writeFile(join(fx.root, "shared.txt"), "local");
+  watcher.change("shared.txt");
+  await waitFor(() => supervisor.snapshot.state === "conflicted", () => `never stopped: ${JSON.stringify(supervisor.snapshot)}`);
+  // The stop is published before the authority is given back, so the next run
+  // may have to try again for a moment -- never for as long as this process lives.
+  for (const directory of directories) {
+    let refusal;
+    await waitFor(async () => {
+      try {
+        await (await nextRun(directory)).close();
+        return true;
+      } catch (error) {
+        refusal = error;
+        return false;
+      }
+    }, () => `the stopped loop still holds ${directory}: ${refusal?.message}`, 2_000);
+  }
 });
 
 // A sibling is written once: a replay that finds the same name holding the

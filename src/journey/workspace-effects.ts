@@ -440,7 +440,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         } catch (error) {
           if (!(error instanceof CunaError)) throw error;
           const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
-          input.onNotice?.(`Remote workspace changes will not arrive this run · ${reason}`);
+          input.onNotice?.(`Remote workspace changes will not arrive this run · ${reason}${syncHolder(error)}`);
         }
         return Object.freeze({
           bindingId: authority.bindingId,
@@ -503,7 +503,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         } catch (error) {
           if (!(error instanceof CunaError)) throw error;
           const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
-          input.onNotice?.(`Workspace changes will not sync this run · ${reason}`);
+          input.onNotice?.(`Workspace changes will not sync this run · ${reason}${syncHolder(error)}`);
         }
         return Object.freeze({
           bindingId: authority.bindingId,
@@ -579,6 +579,18 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
     },
   };
   return Object.freeze(effects);
+}
+
+/**
+ * Which process keeps this folder's sync, when the refusal names one, and what
+ * frees it. A run that finds the folder's sync held cannot take it from a live
+ * process, and a bare `active_writer` left no way to find the one that held it.
+ */
+function syncHolder(error: CunaError): string {
+  const holder = error.details?.holder_pid;
+  return typeof holder === "number"
+    ? ` · cuna process ${holder} holds this folder's sync · if that run is no longer open, end the process and run this command again`
+    : "";
 }
 
 /** Safe under-claims never become guessed remote capabilities. */
