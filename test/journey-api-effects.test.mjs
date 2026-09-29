@@ -334,6 +334,16 @@ test("an edge that does not serve the seat route leaves attachment unknown; any 
   }
 });
 
+test("a session whose request failed or ended is observed as ended; a live request is not", async () => {
+  const signal = new AbortController().signal;
+  for (const [requestState, ended] of [["failed", true], ["terminal", true], ["launch_pending", false], ["launched", false], ["termination_pending", false]]) {
+    const { effects: fx } = seatEffects(seat(), OWN_CLIENT, recoveredSession({ requestState }));
+    const [observed] = await fx.observeAgentSessions({ machineId: MACHINE_ID, signal });
+    assert.equal(observed.ended === true, ended, requestState);
+    assert.equal(Object.hasOwn(observed, "ended"), ended, requestState);
+  }
+});
+
 test("only a live session is asked for its seat", async () => {
   const signal = new AbortController().signal;
   for (const processState of ["unknown", "starting", "exited", "failed", "terminating", "terminated"]) {

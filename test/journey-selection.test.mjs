@@ -404,6 +404,23 @@ test("duplicate AgentSession IDs and stale or unknown child state cannot select 
   }
 });
 
+// ws-c3, 2026-09-29: cbde8586's launch failed (request `failed`, process
+// `unknown`), and every later run in that workspace was refused as
+// authority-observation-stale while 482714e0 ran beside it.
+test("an ended request is never a pending observation and never blocks the live session beside it", () => {
+  const failed = agentSession({ id: SESSION_B, processState: "unknown", attachment: "unknown", ended: true });
+  const live = agentSession({ id: SESSION_A });
+  const reused = planAgentSessionSelection(agentSessionInput([failed, live]));
+  assert.equal(reused.kind, "select");
+  assert.equal(reused.agentSessionId, SESSION_A);
+  assert.equal(planAgentSessionSelection(agentSessionInput([failed])).kind, "create-required");
+  const explicit = planAgentSessionSelection(agentSessionInput([failed, live], { agentSessionId: SESSION_B }));
+  assert.deepEqual([explicit.kind, explicit.reason], ["unavailable", "state-not-reusable"]);
+  // CONTROL: the same request not ended is still an observation to wait for.
+  const pending = agentSession({ id: SESSION_B, processState: "unknown", attachment: "unknown" });
+  assert.equal(planAgentSessionSelection(agentSessionInput([pending, live])).reason, "authority-observation-stale");
+});
+
 test("nonmatching and terminal children never substitute for an exact detached child", () => {
   const nonmatching = agentSession({ id: SESSION_A, cwd: "services/web" });
   const terminated = agentSession({ id: SESSION_C, processState: "terminated" });

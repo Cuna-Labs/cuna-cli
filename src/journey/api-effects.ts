@@ -210,6 +210,7 @@ function sessionObservation(session: AgentSession, seat: SeatAttachment) {
     ...seat,
     freshness: "fresh" as const,
     createdAt: session.createdAt,
+    ...(session.requestState === "failed" || session.requestState === "terminal" ? { ended: true } : {}),
   });
 }
 
