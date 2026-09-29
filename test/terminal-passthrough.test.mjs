@@ -349,9 +349,10 @@ test("plain observer projects remote geometry without resize or query/input effe
     await callbacks.onTerminalGeometry({ snapshot: snapshot('active', { accessMode:'observer', geometry: { columns:143, rows:51, writerEpoch:1 } }), signal: new AbortController().signal });
     await callbacks.onTerminalOutput(event(encoder.encode('\x1b[2J\x1b[H' + 'x'.repeat(59) + '中' + 'z'.repeat(39) + '\r\nSECOND\x1b[6n'), { sequence:2n }));
     const line = row => physical.buffer.active.getLine(row).translateToString(true);
-    assert.equal(line(0), 'x'.repeat(59)); assert.equal(line(1), 'SECOND');
+    // A row the window cannot show whole ends in Cuna's marker, never in a silent cut.
+    assert.equal(line(0), 'x'.repeat(59) + '›'); assert.equal(line(1), 'SECOND');
     host.columns = 40; physical.resize(40,24); host.emitResize();
-    await waitUntil(() => line(0) === 'x'.repeat(40) && line(1) === 'SECOND', 'observer host change must repaint without remote reflow');
+    await waitUntil(() => line(0) === 'x'.repeat(39) + '›' && line(1) === 'SECOND', 'observer host change must repaint without remote reflow');
     host.emitInput(encoder.encode('denied'));
     await new Promise(resolve=>setTimeout(resolve,20));
     assert.deepEqual(calls.resize, []); assert.deepEqual(calls.input, []);
