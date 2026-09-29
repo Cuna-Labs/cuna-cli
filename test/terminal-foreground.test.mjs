@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import { connect as netConnect, createServer as createNetServer } from "node:net";
 import test from "node:test";
 import xterm from "@xterm/headless";
 
@@ -1104,7 +1107,7 @@ test("RTP local-action negotiation is scoped to the attached provider", async ()
   intents[0].agent = "opencode";
   await coordinator.start(intents);
   assert.deepEqual(callbacks.localActionKinds(SESSION_A), []);
-  assert.deepEqual(callbacks.localActionKinds(SESSION_B), ["browser.open", "auth.device.present"]);
+  assert.deepEqual(callbacks.localActionKinds(SESSION_B), ["browser.open", "auth.device.present", "auth.callback.relay"]);
   await coordinator.stop();
 });
 
@@ -3889,4 +3892,249 @@ test("CONTROL: two different URLs on adjacent full rows stay two links", async (
     assert.ok(painted.some((link) => link.uri === second && link.text === second));
     assert.ok(painted.every((link) => link.uri === first || link.uri === second), "no joined link is painted");
   } finally { await coordinator.stop(); }
+});
+
+/* -------------------------------------------------------------------------- */
+/* Codex "Sign in with ChatGPT" from a Machine: the callback relay             */
+/* -------------------------------------------------------------------------- */
+
+// OpenAI redirects the browser to http://localhost:1455/auth/callback?code=…
+// on this computer, while Codex's callback server listens on the Machine's
+// loopback. The supervisor originates `auth.callback.relay`; the CLI listens on
+// 127.0.0.1:<port> only after Enter, relays exactly one callback over one
+// local_to_remote stream, and answers the browser with what the Machine said.
+const RELAY_STATE = "state-9f2c";
+const RELAY_CODE = "ac_secret-code-value";
+const sha256 = (value) => `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+
+async function freePort() {
+  const server = createNetServer();
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen({ host: "127.0.0.1", port: 0 }, resolve); });
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+function browserGet(port, path, host = `localhost:${port}`) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ host: "127.0.0.1", port, path, method: "GET", headers: { host } }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+function refused(port) {
+  return new Promise((resolve) => {
+    const socket = netConnect({ host: "127.0.0.1", port });
+    socket.once("connect", () => { socket.destroy(); resolve(false); });
+    socket.once("error", () => resolve(true));
+  });
+}
+
+/**
+ * The supervisor side, faked: it originates the request and consumes the
+ * stream, making the GET against a stand-in for Codex's loopback server.
+ */
+function fakeSupervisor({ callbacks, runtime, calls }, { port, codexStatus = 200, answer = true }) {
+  const codexRequests = [];
+  const streamFrames = [];
+  let codex;
+  const originate = async () => {
+    codex = createHttpServer((request, response) => {
+      codexRequests.push({ url: request.url, host: request.headers.host });
+      response.writeHead(codexStatus, { "content-type": "text/html" });
+      response.end("<p>Signed in</p>");
+    });
+    await new Promise((resolve) => codex.listen({ host: "127.0.0.1", port: 0 }, resolve));
+    const createdAt = Date.now();
+    const nonce = "relay-nonce-1";
+    const args = Object.freeze({
+      provider: "codex",
+      localPath: "/auth/callback",
+      expectedStateDigest: sha256(RELAY_STATE),
+      expectedNonceDigest: sha256(nonce),
+      exactLocalPort: port,
+      remoteLoopbackPort: 1455,
+      deadlineMs: createdAt + 120_000,
+    });
+    const request = Object.freeze({
+      version: 1,
+      id: "relay-request-1",
+      identity: Object.freeze({
+        userId: "user-1", deviceId: "device-1", machineId: "machine-1",
+        workspaceBindingId: null, workspaceBindingGeneration: null,
+        agentSessionId: SESSION_B, processEpoch: `epoch-${SESSION_B}`, fencingGeneration: 1,
+      }),
+      provider: "codex",
+      kind: "auth.callback.relay",
+      arguments: args,
+      argumentsDigest: digestLocalActionArguments(args),
+      requestedScope: "provider-auth",
+      createdAt,
+      expiresAt: createdAt + 120_000,
+      nonce,
+    });
+    await callbacks.onLocalActionFrame({ tabId: "tab-b", frame: { type: "local_action_request" }, payload: { request } });
+  };
+  const recorded = runtime.sendLocalActionControl.bind(runtime);
+  runtime.sendLocalActionControl = async (type, payload, tabId) => {
+    await recorded(type, payload, tabId);
+    if (type === "local_stream_open" || type === "local_stream_close") streamFrames.push({ type, payload });
+    if (type !== "local_stream_data") return;
+    const line = Buffer.from(payload.bytesBase64url, "base64url").toString("utf8");
+    streamFrames.push({ type, payload, line });
+    assert.equal(payload.chunkSha256, createHash("sha256").update(Buffer.from(payload.bytesBase64url, "base64url")).digest("hex"));
+    if (!answer) return;
+    const match = /^GET (\/auth\/callback\?[^ ]+)$/u.exec(line);
+    const address = codex.address();
+    const status = match === null ? 0 : await new Promise((resolve) => {
+      const outbound = httpRequest({ host: "127.0.0.1", port: address.port, path: match[1], headers: { host: "localhost:1455" } }, (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      });
+      outbound.once("error", () => resolve(0));
+      outbound.end();
+    });
+    setImmediate(() => void callbacks.onLocalActionFrame({
+      tabId,
+      frame: { type: "local_stream_close" },
+      payload: { streamId: payload.streamId, finalOffset: payload.decodedLength, reason: status >= 200 && status < 400 ? "completed" : "failed" },
+    }));
+  };
+  const outcomes = () => calls.localActionControls.filter((item) => item.type === "local_action_result").map((item) => item.payload.result);
+  return { originate, codexRequests, streamFrames, outcomes, close: () => new Promise((resolve) => codex?.close(resolve) ?? resolve()) };
+}
+
+function relayHarness(options = {}) {
+  const context = harness({ host: Object.assign(new FakeHost(), { columns: 200 }), coordinatorOptions: { deviceId: "device-1", ...options } });
+  return context;
+}
+
+test("Codex's sign-in callback reaches the Machine only after Enter, once, and the browser hears the Machine's answer", async () => {
+  const port = await freePort();
+  const context = relayHarness();
+  const { coordinator, host, intents } = context;
+  const supervisor = fakeSupervisor(context, { port });
+  try {
+    await coordinator.start([intents[1]]);
+    await supervisor.originate();
+    await waitForScreen(host, new RegExp(`Codex asks to receive its sign-in on 127\\.0\\.0\\.1:${port} · Enter allow · Esc deny`, "u"), "the bar asks first");
+    assert.equal(await refused(port), true, "nothing listens before the person allows it");
+    host.emitInput(Uint8Array.of(0x0d));
+    await waitForScreen(host, new RegExp(`Waiting for Codex's sign-in on 127\\.0\\.0\\.1:${port}`, "u"), "allowed, it waits for the browser");
+    assert.equal(context.calls.input.length, 0, "the consent key is not sent to Codex");
+
+    const wrong = await browserGet(port, `/auth/callback?code=${RELAY_CODE}&state=someone-else`);
+    assert.equal(wrong.status, 400, "a callback for another sign-in is refused");
+    assert.equal(supervisor.streamFrames.length, 0);
+
+    const answer = await browserGet(port, `/auth/callback?code=${RELAY_CODE}&state=${RELAY_STATE}`);
+    assert.equal(answer.status, 200);
+    assert.match(answer.body, /Sent to Codex on your Machine/u);
+    assert.deepEqual(supervisor.streamFrames.map((frame) => frame.type), ["local_stream_open", "local_stream_data"]);
+    assert.equal(supervisor.streamFrames[0].payload.direction, "local_to_remote");
+    assert.equal(supervisor.streamFrames[1].line, `GET /auth/callback?state=${RELAY_STATE}&code=${RELAY_CODE}`);
+    assert.deepEqual(supervisor.codexRequests, [{ url: `/auth/callback?state=${RELAY_STATE}&code=${RELAY_CODE}`, host: "localhost:1455" }]);
+
+    await waitUntil(() => supervisor.outcomes().length === 1, "the request settles once");
+    assert.equal(supervisor.outcomes()[0].status, "succeeded");
+    assert.deepEqual(supervisor.outcomes()[0].safeData, { awaitingProvider: true });
+    await waitForScreen(host, /Sent to Codex on your Machine · finish the sign-in in the terminal/u, "the bar says where it went");
+    assert.equal(await refused(port), true, "the listener is gone after one callback");
+    const shown = host.writes.map((bytes) => decoder.decode(bytes)).join("");
+    assert.equal(shown.includes(RELAY_CODE), false, "the code is never painted");
+    assert.equal(shown.includes(RELAY_STATE), false, "the state is never painted");
+  } finally { await coordinator.stop(); await supervisor.close(); }
+});
+
+test("a sign-in the Machine refuses, or never answers, is told to the browser as such", async () => {
+  for (const [label, options, relayOptions, status, body, reason] of [
+    ["refused", { codexStatus: 400 }, {}, 502, /refused this sign-in/u, "adapter_failed"],
+    ["no answer", { answer: false }, { relayAnswerTimeoutMs: 50 }, 504, /did not answer this sign-in in time/u, "execution_timeout"],
+  ]) {
+    const port = await freePort();
+    const context = relayHarness(relayOptions);
+    const { coordinator, host, intents } = context;
+    const supervisor = fakeSupervisor(context, { port, ...options });
+    try {
+      await coordinator.start([intents[1]]);
+      await supervisor.originate();
+      await waitForScreen(host, /Enter allow · Esc deny/u, `${label}: the bar asks first`);
+      host.emitInput(Uint8Array.of(0x0d));
+      await waitForScreen(host, /Waiting for Codex's sign-in/u, `${label}: listening`);
+      const answer = await browserGet(port, `/auth/callback?code=${RELAY_CODE}&state=${RELAY_STATE}`);
+      assert.equal(answer.status, status, label);
+      assert.match(answer.body, body, label);
+      await waitUntil(() => supervisor.outcomes().length === 1, `${label}: settles once`);
+      assert.equal(supervisor.outcomes()[0].status, "failed", label);
+      assert.equal(supervisor.outcomes()[0].safeReason, reason, label);
+      if (label === "no answer") {
+        const closed = supervisor.streamFrames.find((frame) => frame.type === "local_stream_close");
+        assert.deepEqual(closed?.payload, { streamId: "relay:relay-request-1", finalOffset: supervisor.streamFrames[1].payload.decodedLength, reason: "expired" },
+          "an unanswered stream is closed from this side before the request settles");
+      }
+    } finally { await coordinator.stop(); await supervisor.close(); }
+  }
+});
+
+test("Esc denies the relay and a busy port is named; neither opens a stream", async () => {
+  {
+    const port = await freePort();
+    const context = relayHarness();
+    const supervisor = fakeSupervisor(context, { port });
+    try {
+      await context.coordinator.start([context.intents[1]]);
+      await supervisor.originate();
+      await waitForScreen(context.host, /Enter allow · Esc deny/u, "the bar asks first");
+      context.host.emitInput(Uint8Array.of(0x1b));
+      await waitUntil(() => supervisor.outcomes().length === 1, "a denial settles the request");
+      assert.equal(supervisor.outcomes()[0].status, "denied");
+      assert.equal(await refused(port), true, "a denied relay never listens");
+      assert.equal(context.calls.input.length, 0, "Esc was the answer, not a key for Codex");
+    } finally { await context.coordinator.stop(); await supervisor.close(); }
+  }
+  {
+    const port = await freePort();
+    const occupant = createNetServer();
+    await new Promise((resolve) => occupant.listen({ host: "127.0.0.1", port }, resolve));
+    const context = relayHarness();
+    const supervisor = fakeSupervisor(context, { port });
+    try {
+      await context.coordinator.start([context.intents[1]]);
+      await supervisor.originate();
+      await waitForScreen(context.host, /Enter allow · Esc deny/u, "the bar asks first");
+      context.host.emitInput(Uint8Array.of(0x0d));
+      await waitForScreen(context.host, new RegExp(`Port ${port} is in use on this computer · close what uses it, or choose Sign in with Device Code in Codex`, "u"),
+        "a busy port is named");
+      await waitUntil(() => supervisor.outcomes().length === 1, "the request settles");
+      assert.equal(supervisor.outcomes()[0].status, "failed");
+      assert.equal(supervisor.streamFrames.length, 0);
+    } finally {
+      await context.coordinator.stop();
+      await supervisor.close();
+      await new Promise((resolve) => occupant.close(resolve));
+    }
+  }
+});
+
+test("a listening relay stops listening when the terminal leaves, and settles as cancelled", async () => {
+  const port = await freePort();
+  const context = relayHarness();
+  const supervisor = fakeSupervisor(context, { port });
+  try {
+    await context.coordinator.start([context.intents[1]]);
+    await supervisor.originate();
+    await waitForScreen(context.host, /Enter allow · Esc deny/u, "the bar asks first");
+    context.host.emitInput(Uint8Array.of(0x0d));
+    await waitForScreen(context.host, /Waiting for Codex's sign-in/u, "listening");
+    assert.equal(await refused(port), false, "the listener is up");
+    await context.coordinator.stop();
+    assert.equal(await refused(port), true, "leaving closes the listener");
+    assert.equal(supervisor.outcomes().at(-1)?.status, "cancelled");
+    assert.equal(supervisor.streamFrames.length, 0);
+  } finally { await context.coordinator.stop(); await supervisor.close(); }
 });

@@ -1,3 +1,11 @@
+import { createHash } from "node:crypto";
+
+import {
+  startCallbackRelay,
+  type AcceptedProviderCallback,
+  type CallbackRelayAnswer,
+  type CallbackRelayHandle,
+} from "../local-actions/callback-relay.js";
 import { copyLocalText } from "../local-actions/clipboard.js";
 import { AGENT_SESSION_AUTH_MAX_FUTURE_SKEW_MS, AGENT_SESSION_AUTH_MAX_TTL_MS } from "../api/contracts.js";
 import type {
@@ -18,6 +26,7 @@ import {
   digestLocalActionArguments,
   sameLocalActionIdentity,
   type LocalActionRequest,
+  type LocalActionSafeReason,
   type LocalActionSessionIdentity,
   type LocalActionSnapshot,
 } from "../local-actions/index.js";
@@ -116,7 +125,10 @@ const DEFAULT_RECONNECT_ATTEMPTS = 10;
 const BRACKETED_PASTE_START = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e);
 const BRACKETED_PASTE_END = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e);
 const CLAUDE_LOCAL_ACTION_KINDS = Object.freeze(["browser.open"] as const);
-const CODEX_LOCAL_ACTION_KINDS = Object.freeze(["browser.open", "auth.device.present"] as const);
+const CODEX_LOCAL_ACTION_KINDS = Object.freeze(["browser.open", "auth.device.present", "auth.callback.relay"] as const);
+/** How long the Machine has to answer a relayed sign-in callback. */
+const RELAY_ANSWER_TIMEOUT_MS = 15_000;
+const RELAY_STREAM_CREDIT_BYTES = 16_384;
 const NO_LOCAL_ACTION_KINDS = Object.freeze([] as const);
 export const MAX_FOREGROUND_PENDING_INPUT_BYTES = 1_048_576;
 
@@ -281,6 +293,26 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly readSessionEnd?: (agentSessionId: string, signal: AbortSignal) => Promise<ForegroundSessionEndRecord | undefined>;
   /** Waits before each read of that record; the supervisor records an exit a moment after it. */
   readonly sessionEndReadDelaysMs?: readonly number[];
+  /** How long a relayed sign-in callback waits for the Machine's answer. */
+  readonly relayAnswerTimeoutMs?: number;
+}
+
+/**
+ * A provider's request to receive its sign-in callback on this computer:
+ * Codex redirects the browser to http://localhost:1455/… while its callback
+ * server listens on the Machine's loopback. The supervisor originates it.
+ */
+interface CallbackRelayConsent {
+  readonly tabId: string;
+  readonly request: LocalActionRequest;
+  readonly localPath: string;
+  readonly exactLocalPort: number;
+}
+
+interface RelayStreamWait {
+  readonly tabId: string;
+  readonly length: number;
+  readonly resolve: (answer: CallbackRelayAnswer) => void;
 }
 
 /** The session the person chose on the bar; the runner attaches it next. */
@@ -351,6 +383,12 @@ export class ForegroundTerminalCoordinator {
   /** Tabs whose process the server says ended; their last screen stays, labelled ended. */
   readonly #endedTabs = new Map<string, TabEnd>();
   readonly #endReads = new Set<string>();
+  /** Sign-in relay requests by id, from arrival until their outcome. */
+  readonly #relayRequests = new Map<string, CallbackRelayConsent>();
+  /** The relay request at the head of the local-action queue, awaiting Enter or Esc. */
+  #pendingRelay: CallbackRelayConsent | undefined;
+  readonly #relayHandles = new Map<string, CallbackRelayHandle>();
+  readonly #relayStreams = new Map<string, RelayStreamWait>();
   readonly #browserDetectors = new Map<string, ProviderBrowserActionDetector>();
   readonly #retainedBrowserDetectors = new Map<string, ProviderBrowserActionDetector>();
   readonly #retainedBrowserCandidates = new Map<string, LocalBrowserActionRequest>();
@@ -448,6 +486,7 @@ export class ForegroundTerminalCoordinator {
       onChange: (snapshot) => {
         if (["succeeded", "failed", "denied", "expired", "cancelled"].includes(snapshot.state)) {
           this.#browserRequests.delete(snapshot.request.id);
+          this.#endRelay(snapshot.request.id);
           this.#queueRemoteLocalActionResult(snapshot);
         }
         void this.#render().catch(() => undefined);
@@ -1721,7 +1760,7 @@ export class ForegroundTerminalCoordinator {
       }
       this.#browserNotice = undefined;
     } else if (!releasedPrefix && !this.#prefixPending && !bytes.includes(ESCAPE_PREFIX) &&
-      await this.#routeBrowserActionInput(bytes, receiptTarget)) {
+      (await this.#routeRelayConsent(bytes, receiptTarget) || await this.#routeBrowserActionInput(bytes, receiptTarget))) {
       return;
     }
     const guarded = releasedPrefix ? { bytes, blocked: false } : this.#guardProviderOAuthPaste(bytes, receiptTarget);
@@ -2097,6 +2136,10 @@ export class ForegroundTerminalCoordinator {
       this.#acknowledgeRemoteLocalActionResult(event.tabId, event.payload);
       return;
     }
+    if (event.frame.type === "local_stream_close") {
+      this.#relayStreamClosed(event.tabId, event.payload);
+      return;
+    }
     if (event.frame.type !== "local_action_request") return;
     const raw = event.payload.request;
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -2157,6 +2200,9 @@ export class ForegroundTerminalCoordinator {
         expiresAt: request.expiresAt,
         state: "pending_permission",
       });
+    } else if (request.kind === "auth.callback.relay" && request.provider === "codex") {
+      await this.#admitCallbackRelay(event.tabId, request);
+      return;
     } else {
       throw runtimeFailure("capability_unsupported", "This local action kind was not negotiated by the foreground.");
     }
@@ -2287,9 +2333,193 @@ export class ForegroundTerminalCoordinator {
     }
   }
 
+  /** Admits the supervisor's sign-in relay request and asks the person first. */
+  async #admitCallbackRelay(tabId: string, request: LocalActionRequest): Promise<void> {
+    const localPath = request.arguments.localPath;
+    const exactLocalPort = request.arguments.exactLocalPort;
+    if (typeof localPath !== "string" || typeof exactLocalPort !== "number" || exactLocalPort < 1_024) {
+      throw runtimeFailure("terminal_protocol_error", "The sign-in relay request is malformed.");
+    }
+    this.#remoteLocalActionTabs.set(request.id, tabId);
+    const consent: CallbackRelayConsent = Object.freeze({ tabId, request, localPath, exactLocalPort });
+    this.#relayRequests.set(request.id, consent);
+    let admitted: LocalActionSnapshot;
+    try {
+      admitted = this.#localActionBroker.submit(request);
+    } catch (error) {
+      this.#remoteLocalActionTabs.delete(request.id);
+      this.#relayRequests.delete(request.id);
+      throw error;
+    }
+    if (["succeeded", "failed", "denied", "expired", "cancelled"].includes(admitted.state)) {
+      this.#relayRequests.delete(request.id);
+      this.#queueRemoteLocalActionResult(admitted);
+      return;
+    }
+    this.#promoteBrowserAction();
+    await this.#render();
+  }
+
+  /** Enter allows the relay at the head of the queue, Esc denies it; any other key is the program's. */
+  async #routeRelayConsent(bytes: Uint8Array, target: ForegroundInputTarget | undefined): Promise<boolean> {
+    const consent = this.#pendingRelay;
+    if (consent === undefined || target === undefined || target.tabId !== consent.tabId || target.tabId !== this.#activeTabId) return false;
+    if (bytes.byteLength !== 1 || (bytes[0] !== 0x0d && bytes[0] !== 0x1b)) return false;
+    const allow = bytes[0] === 0x0d;
+    this.#pendingRelay = undefined;
+    let decided: LocalActionSnapshot | undefined;
+    try {
+      decided = this.#localActionBroker.decide(consent.request.id, allow);
+    } catch {
+      decided = undefined;
+    }
+    if (!allow || decided?.state !== "executing") {
+      this.#browserNotice = allow
+        ? "The sign-in request expired · start the sign-in again in Codex"
+        : `Codex's sign-in callback will not be received on this computer · Sign in with Device Code works without it`;
+      this.#promoteBrowserAction();
+      await this.#render();
+      return true;
+    }
+    this.#browserNotice = `Waiting for Codex's sign-in on 127.0.0.1:${consent.exactLocalPort} · open the sign-in link in your browser`;
+    await this.#render();
+    void this.#runCallbackRelay(consent).catch(() => undefined);
+    return true;
+  }
+
+  /**
+   * Listens on 127.0.0.1:<port> for exactly one callback until the request's
+   * deadline, hands it to the Machine, and settles the request with what the
+   * Machine answered. The code and state are never shown or logged.
+   */
+  async #runCallbackRelay(consent: CallbackRelayConsent): Promise<void> {
+    const { request } = consent;
+    const port = consent.exactLocalPort;
+    const deadline = request.arguments.deadlineMs;
+    let handle: CallbackRelayHandle;
+    try {
+      handle = await startCallbackRelay({
+        provider: "codex",
+        localHost: "127.0.0.1",
+        exactLocalPort: port,
+        localPath: consent.localPath,
+        expectedStateDigest: request.arguments.expectedStateDigest as `sha256:${string}`,
+        expectedNonceDigest: request.arguments.expectedNonceDigest as `sha256:${string}`,
+        requestNonce: request.nonce,
+        deadlineMs: Math.min(typeof deadline === "number" ? deadline : request.expiresAt, request.expiresAt),
+        maxAttempts: 8,
+        maxConnections: 16,
+        relay: async (callback, signal) => await this.#sendCallbackToMachine(consent, callback, signal),
+        signal: this.#lifetimeAbort.signal,
+        now: this.#clock,
+      });
+    } catch (error) {
+      this.#browserNotice = (error as NodeJS.ErrnoException | undefined)?.code === "EADDRINUSE"
+        ? `Port ${port} is in use on this computer · close what uses it, or choose Sign in with Device Code in Codex`
+        : `Cuna could not listen on 127.0.0.1:${port} for Codex's sign-in`;
+      this.#settleRelay(consent, "failed", "adapter_failed");
+      await this.#render().catch(() => undefined);
+      return;
+    }
+    this.#relayHandles.set(request.id, handle);
+    try {
+      const receipt = await handle.completion;
+      this.#browserNotice = receipt.answer === "delivered"
+        ? "Sent to Codex on your Machine · finish the sign-in in the terminal"
+        : receipt.answer === "refused"
+          ? "Codex on your Machine refused this sign-in · start the sign-in again in Codex"
+          : "Your Machine did not answer this sign-in in time · start the sign-in again in Codex";
+      this.#settleRelay(consent, receipt.answer === "delivered" ? "succeeded" : "failed",
+        receipt.answer === "delivered" ? undefined : receipt.answer === "refused" ? "adapter_failed" : "execution_timeout");
+    } catch {
+      if (this.#localActionBroker.get(request.id)?.result === undefined) {
+        this.#browserNotice = "Codex's sign-in did not arrive in time · start the sign-in again in Codex";
+        this.#settleRelay(consent, "failed", "request_expired");
+      }
+    } finally {
+      this.#relayHandles.delete(request.id);
+      await this.#render().catch(() => undefined);
+    }
+  }
+
+  /**
+   * One local_to_remote stream carries exactly `GET <path>?<query>`; the
+   * supervisor makes that request on the Machine's loopback and answers by
+   * closing the stream: completed, failed or expired.
+   */
+  async #sendCallbackToMachine(
+    consent: CallbackRelayConsent,
+    callback: AcceptedProviderCallback,
+    signal: AbortSignal,
+  ): Promise<CallbackRelayAnswer> {
+    const query = `state=${encodeURIComponent(callback.state)}&` + (callback.code === undefined
+      ? `error=${encodeURIComponent(callback.error ?? "")}`
+      : `code=${encodeURIComponent(callback.code)}`);
+    const line = Buffer.from(`GET ${consent.localPath}?${query}`, "utf8");
+    const streamId = `relay:${consent.request.id}`;
+    const answered = new Promise<CallbackRelayAnswer>((resolve) => {
+      this.#relayStreams.set(streamId, Object.freeze({ tabId: consent.tabId, length: line.byteLength, resolve }));
+    });
+    const runtime = this.#requireRuntime();
+    try {
+      await runtime.sendLocalActionControl("local_stream_open", {
+        streamId, requestId: consent.request.id, direction: "local_to_remote", initialCreditBytes: RELAY_STREAM_CREDIT_BYTES,
+      }, consent.tabId);
+      await runtime.sendLocalActionControl("local_stream_data", {
+        streamId, offset: 0, bytesBase64url: line.toString("base64url"), decodedLength: line.byteLength,
+        chunkSha256: createHash("sha256").update(line).digest("hex"),
+      }, consent.tabId);
+    } catch {
+      this.#relayStreams.delete(streamId);
+      return "no_answer";
+    }
+    const timedOut = abortableDelay(this.#options.relayAnswerTimeoutMs ?? RELAY_ANSWER_TIMEOUT_MS, signal)
+      .then(() => undefined, () => undefined);
+    const answer = await Promise.race([answered, timedOut]);
+    if (answer !== undefined) return answer;
+    // No answer: the stream is closed from this side so the request can settle.
+    this.#relayStreams.delete(streamId);
+    await runtime.sendLocalActionControl("local_stream_close", {
+      streamId, finalOffset: line.byteLength, reason: "expired",
+    }, consent.tabId).catch(() => undefined);
+    return "no_answer";
+  }
+
+  /** The supervisor's answer to a relayed callback: how it closed the stream. */
+  #relayStreamClosed(tabId: string, payload: Readonly<Record<string, unknown>>): void {
+    const streamId = String(payload.streamId);
+    const wait = this.#relayStreams.get(streamId);
+    if (wait === undefined || wait.tabId !== tabId) return;
+    this.#relayStreams.delete(streamId);
+    wait.resolve(payload.finalOffset !== wait.length ? "no_answer"
+      : payload.reason === "completed" ? "delivered"
+        : payload.reason === "failed" ? "refused" : "no_answer");
+  }
+
+  #settleRelay(consent: CallbackRelayConsent, status: "succeeded" | "failed", safeReason?: LocalActionSafeReason): void {
+    try {
+      this.#localActionBroker.complete(consent.request.id, consent.request.identity, status,
+        status === "succeeded" ? { awaitingProvider: true } : undefined, safeReason);
+    } catch {
+      // A request the broker already ended (expired, cancelled) keeps that result.
+    }
+  }
+
+  /** A relay request that ended for any reason stops listening at once. */
+  #endRelay(requestId: string): void {
+    if (!this.#relayRequests.delete(requestId)) return;
+    if (this.#pendingRelay?.request.id === requestId) this.#pendingRelay = undefined;
+    const handle = this.#relayHandles.get(requestId);
+    this.#relayHandles.delete(requestId);
+    void handle?.close("ended").catch(() => undefined);
+  }
+
   #promoteBrowserAction(): void {
     const current = this.#localActionBroker.current();
-    if (current?.state !== "pending_user") {
+    // The queue answers one request at a time; a sign-in relay at its head
+    // gets the bar's question instead of a browser action.
+    this.#pendingRelay = current?.state === "pending_user" ? this.#relayRequests.get(current.request.id) : undefined;
+    if (current?.state !== "pending_user" || this.#pendingRelay !== undefined) {
       if (this.#pendingBrowserActionTabId !== undefined) {
         this.#advanceBrowserActionGeneration(this.#pendingBrowserActionTabId);
       }
@@ -2887,6 +3117,8 @@ export class ForegroundTerminalCoordinator {
             ? { notice: this.#switchNotice }
           : this.#endedTabs.has(activeTabId) && this.#tabs.has(activeTabId)
             ? { notice: this.#endedNotice(this.#tabs.get(activeTabId)!, this.#endedTabs.get(activeTabId)!) }
+          : this.#pendingRelay !== undefined && this.#pendingRelay.tabId === activeTabId
+            ? { notice: `Codex asks to receive its sign-in on 127.0.0.1:${this.#pendingRelay.exactLocalPort} · Enter allow · Esc deny` }
           : this.#tabs.get(activeTabId)?.snapshot.state === "active" && this.#tabs.get(activeTabId)?.snapshot.terminalView?.ready === false
             ? { notice: "Restoring terminal\u2026" }
           : this.#browserNotice !== undefined

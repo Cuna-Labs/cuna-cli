@@ -64,6 +64,7 @@ export {
   CallbackRelayError,
   startCallbackRelay,
   type AcceptedProviderCallback,
+  type CallbackRelayAnswer,
   type CallbackRelayHandle,
   type CallbackRelayOptions,
   type CallbackRelayProvider,
