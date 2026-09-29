@@ -34,12 +34,13 @@ import {
   workbenchUpdate,
   withPredictionOverlay,
   type WorkbenchFrame,
+  type WorkbenchLinkSpan,
   type WorkbenchSelectionRow,
   type WorkbenchTab,
 } from "./workbench.js";
 import type { SessionRoster, SessionRosterEntry } from "./session-roster.js";
 import { ViewportRegistry } from "./viewport.js";
-import { orderBufferPoints, XtermViewportAdapter, type BufferPoint } from "./xterm-vte.js";
+import { orderBufferPoints, XtermViewportAdapter, type BufferLink, type BufferPoint } from "./xterm-vte.js";
 import { encodeRemoteMouse, HOST_MOUSE_REPORTING_ON, HostMouseDecoder, wheelDirection, type HostMouseEvent } from "./host-mouse.js";
 
 /** Lines one wheel notch moves the local view, the common terminal default. */
@@ -1265,28 +1266,76 @@ export class ForegroundTerminalCoordinator {
   }
 
   /**
-   * Ctrl+click on a link opens it in this computer's browser. What was
-   * clicked is the URL as drawn; when the provider also published the exact
-   * link (an OSC 8 target Ctrl+] y copies) and the drawn text is a piece of
-   * it, the exact link is opened, never the cut or wrapped screen text.
+   * Ctrl+click on a link opens it in this computer's browser, resolved as
+   * Ctrl+] y resolves it: the provider's OSC 8 target first, then the rows the
+   * screen joins into one link, never one row of a longer link. A click on a
+   * continuation row that the screen cannot join names the link it is part of.
    */
   async #openLinkAt(tab: ForegroundTab, point: BufferPoint): Promise<void> {
-    const word = tab.viewport.wordAt(point);
-    const drawn = word === undefined ? "" : tab.viewport.textBetween(word.start, word.end).replace(/[.,;:!?)\]}]+$/u, "");
+    const link = tab.viewport.linkAt(point);
+    let target = link === undefined ? undefined : this.#exactLink(tab, link.url, false);
+    if (target === undefined) {
+      const word = tab.viewport.wordAt(point);
+      const fragment = word === undefined ? "" : tab.viewport.textBetween(word.start, word.end);
+      target = this.#linkContaining(tab, fragment);
+    }
     let url: URL | undefined;
-    try { url = /^https?:\/\//u.test(drawn) ? new URL(drawn) : undefined; } catch { url = undefined; }
-    if (url === undefined) return;
-    const exact = this.#copyLinks.get(tab.intent.tabId);
-    const target = exact !== undefined && exact.url !== url.href && exact.url.startsWith(drawn) ? exact.url : url.href;
+    try { url = target === undefined ? undefined : new URL(target); } catch { url = undefined; }
+    if (url === undefined || (url.protocol !== "https:" && url.protocol !== "http:")) return;
     try {
       const browser = this.#options.browser;
       if (browser === undefined) throw new Error("browser unavailable");
-      await browser.open(target);
-      this.#browserNotice = `Opened ${new URL(target).origin} in your browser`;
+      await browser.open(target as string);
+      this.#browserNotice = `Opened ${url.origin} in your browser`;
     } catch {
       this.#browserNotice = "Could not open the link. Drag to select and copy it instead.";
     }
     await this.#render();
+  }
+
+  /**
+   * The exact target for a link read from the screen or from the byte stream.
+   * A provider OSC 8 target that is this link or continues it comes first.
+   * A link a byte stream read is then extended by the rows the screen still
+   * holds after it, because a program that wraps its own lines puts a row
+   * break inside the URL. The link itself is the fallback.
+   */
+  #exactLink(tab: ForegroundTab, url: string, fromStream: boolean): string {
+    const targets = (this.#copyDetectors.get(tab.intent.tabId) ?? []).flatMap((detector) => detector.hyperlinkTargets);
+    const target = [...targets].reverse().find((candidate) => candidate === url || candidate.startsWith(url));
+    if (target !== undefined) return target;
+    return fromStream ? tab.viewport.extendLink(url) ?? url : url;
+  }
+
+  /** A known exact link that a piece of screen text is part of (16 characters or more). */
+  #linkContaining(tab: ForegroundTab, fragment: string): string | undefined {
+    if (fragment.length < 16 || /\s/u.test(fragment)) return undefined;
+    const known = [
+      ...(this.#copyDetectors.get(tab.intent.tabId) ?? []).flatMap((detector) => detector.hyperlinkTargets),
+      ...[this.#copyLinks.get(tab.intent.tabId)?.url].filter((url): url is string => url !== undefined),
+    ];
+    return [...known].reverse().find((candidate) => candidate.includes(fragment));
+  }
+
+  /**
+   * Link cells of the painted viewport, each with its exact target, so the
+   * host terminal's own Ctrl+click (Windows Terminal opens a hovered link
+   * before it reports the click) opens the whole link, not one row of it. A
+   * target is the text drawn, joined across rows, or a provider's OSC 8
+   * target that begins with it: never a destination the screen does not show.
+   */
+  #linkSpans(tab: ForegroundTab, dimensions: { readonly columns: number; readonly rows: number }): readonly WorkbenchLinkSpan[] {
+    const projection = this.#viewProjection(tab, dimensions);
+    const top = tab.viewport.viewTop(projection);
+    const rows = remoteRows(dimensions.rows);
+    const width = Math.min(tab.viewport.columns, dimensions.columns);
+    const spans: WorkbenchLinkSpan[] = [];
+    for (const link of tab.viewport.linksInView(projection)) {
+      const uri = this.#exactLink(tab, link.url, false);
+      if (!paintableLink(uri)) continue;
+      spans.push(...linkRows(link, top, rows, width, tab.viewport.columns).map((span) => Object.freeze({ ...span, uri })));
+    }
+    return Object.freeze(spans);
   }
 
   #sendRemote(bytes: Uint8Array, target: ForegroundInputTarget): void {
@@ -1750,11 +1799,26 @@ export class ForegroundTerminalCoordinator {
     return true;
   }
 
+  /**
+   * A sign-in request read from the byte stream may be one row of a URL the
+   * provider wrapped itself. Open the whole link the screen holds, only when
+   * it continues the approved request and passes the same provider check.
+   * Requests the remote bridge sent carry their exact URL already.
+   */
+  #exactRequestUrl(request: LocalBrowserActionRequest): string {
+    if (request.type !== "browser.open" || this.#remoteLocalActionTabs.has(request.id)) return request.url;
+    const tab = [...this.#tabs.values()].find((candidate) => candidate.snapshot.agentSessionId === request.agentSessionId &&
+      candidate.snapshot.fencingGeneration === request.fencingGeneration);
+    if (tab === undefined) return request.url;
+    const exact = this.#exactLink(tab, request.url, true);
+    return exact.startsWith(request.url) && admitProviderAuthUrl(request.provider, exact) !== undefined ? exact : request.url;
+  }
+
   async #openBrowser(request: LocalBrowserActionRequest): Promise<void> {
     try {
       const browser = this.#options.browser;
       if (browser === undefined) throw new Error("browser unavailable");
-      await browser.open(request.url);
+      await browser.open(this.#exactRequestUrl(request));
       const tracked = this.#localActionBroker.get(request.id);
       if (tracked?.state !== "executing") return;
       this.#pendingBrowserAction = undefined;
@@ -1808,7 +1872,7 @@ export class ForegroundTerminalCoordinator {
       this.#browserNotice = "No sign-in link available. Request a new link in the agent.";
     } else {
       try {
-        await (this.#options.copyText ?? copyLocalText)(link.url);
+        await (this.#options.copyText ?? copyLocalText)(this.#exactLink(tab, link.url, true));
         this.#browserNotice = "Full link copied. Paste it into your browser.";
       } catch {
         this.#browserNotice = "Could not copy the link. Try again.";
@@ -2633,6 +2697,7 @@ export class ForegroundTerminalCoordinator {
       }));
       const shownTab = this.#tabs.get(activeTabId);
       const selection = shownTab === undefined ? undefined : this.#selectionRows(shownTab, dimensions);
+      const links = shownTab === undefined ? undefined : this.#linkSpans(shownTab, dimensions);
       // Drags go to the remote only for a writer whose program asked for the
       // mouse; then the host's Shift+drag is the one way to select.
       const remoteMouse = shownTab !== undefined && shownTab.snapshot.accessMode !== "observer" &&
@@ -2649,6 +2714,7 @@ export class ForegroundTerminalCoordinator {
         ...(this.#options.mouseReporting === true ? { mouseReporting: true } : {}),
         ...(remoteMouse ? { remoteMouse: true } : {}),
         ...(selection === undefined || selection.length === 0 ? {} : { selection }),
+        ...(links === undefined || links.length === 0 ? {} : { links }),
         appbar: this.#options.appbar?.() ?? runtimeAppbar(
           this.#clock(),
           this.#tabs.get(activeTabId)?.snapshot,
@@ -3051,6 +3117,29 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 
 function scrolledBackNotice(lines: number): string {
   return `Scrolled back ${lines} line${lines === 1 ? "" : "s"} · scroll down or type to return`;
+}
+
+/** Only a bounded http(s) URL of printable characters may enter a host hyperlink. */
+function paintableLink(uri: string): boolean {
+  if (uri.length > 2_048 || /[\p{Cc}\s]/u.test(uri)) return false;
+  try {
+    const url = new URL(uri);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/** The viewport rows a link covers, as cell ranges [start, end) within the painted width. */
+function linkRows(link: BufferLink, top: number, rows: number, width: number, columns: number):
+  readonly { readonly row: number; readonly start: number; readonly end: number }[] {
+  const spans: { row: number; start: number; end: number }[] = [];
+  for (let line = Math.max(link.start.line, top); line <= link.end.line && line < top + rows; line += 1) {
+    const start = line === link.start.line ? link.start.column : 0;
+    const end = Math.min(width, line === link.end.line ? link.end.column + 1 : columns);
+    if (end > start) spans.push({ row: line - top, start, end });
+  }
+  return spans;
 }
 
 function widerViewNotice(columns: number): string {

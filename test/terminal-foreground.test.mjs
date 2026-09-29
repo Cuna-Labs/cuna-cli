@@ -3518,3 +3518,132 @@ test("at 120 columns the observer seat line for a 190-column writer fits whole",
     assert.match(row, /Observing \(read-only\) · view is 70 columns wider than this window \(›\) · Press Ctrl\+\] then w to take control/u);
   } finally { await coordinator.stop(); }
 });
+
+/* -------------------------------------------------------------------------- */
+/* One exact target per link: Ctrl+click, Ctrl+] y, Enter/o and the host's own */
+/* hyperlink (owner 2026-09-29: Codex sign-in opened one row of its URL)       */
+/* -------------------------------------------------------------------------- */
+
+/** The host frame's OSC 8 hyperlinks: each opened link's target and the text it covers. */
+function hostHyperlinks(host) {
+  const text = host.writes.map((bytes) => decoder.decode(bytes)).join("");
+  const links = [];
+  // eslint-disable-next-line no-control-regex -- reading the host frame's own OSC 8 hyperlinks
+  for (const match of text.matchAll(/\u001b\]8;id=([^;\u001b]*);([^\u001b]+)\u001b\\(.*?)\u001b\]8;;\u001b\\/gsu)) {
+    // eslint-disable-next-line no-control-regex -- stripping the renderer's own SGR sequences
+    links.push({ id: match[1], uri: match[2], text: match[3].replace(/\u001b\[[0-9;]*m/gu, "") });
+  }
+  return links;
+}
+
+async function codexSignIn() {
+  const fixture = JSON.parse(await import("node:fs/promises").then((fs) => fs.readFile(new URL("./fixtures/codex-0.147-signin-view-145x40.json", import.meta.url), "utf8")));
+  const bytes = Buffer.from(fixture.base64, "base64");
+  // eslint-disable-next-line no-control-regex -- reading the fixture's OSC 8 target
+  const target = /\u001b\]8;[^;\u0007\u001b]*;(https:\/\/auth\.openai\.com[^\u0007\u001b]*)/u.exec(bytes.toString("utf8"))[1];
+  return { bytes, target };
+}
+
+async function linkHarness({ columns, rows, agent = "codex", localBrowserActions = false }) {
+  const copied = [];
+  const opened = [];
+  const context = harness({ coordinatorOptions: {
+    mouseReporting: true, clock: () => 1_000,
+    copyText: async (text) => { copied.push(text); },
+    browser: { async open(url) { opened.push(url); } },
+  } });
+  context.intents[0] = { ...context.intents[0], agent, localBrowserActions };
+  context.host.columns = columns;
+  context.host.rows = rows;
+  await context.coordinator.start(context.intents.slice(0, 1));
+  return { ...context, copied, opened };
+}
+
+async function rowOf(host, needle) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const index = (await visibleHostText(host)).split("\n").findIndex((line) => line.includes(needle));
+    if (index >= 0) return index + 1;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.fail(`never painted: ${needle}`);
+}
+
+test("the real Codex 0.147 sign-in screen gives Ctrl+click, Ctrl+] y and the host's own hyperlink the whole URL", async () => {
+  // The bytes a C4 canonical view sends at 145 columns (tmux 3.7c, hyperlinks
+  // forwarded). Windows Terminal opens a hovered link on Ctrl+click before it
+  // reports the click, so the painted rows must carry the whole link too.
+  const { bytes, target } = await codexSignIn();
+  assert.equal(target.length, 472);
+  const { coordinator, callbacks, host, intents, copied, opened } = await linkHarness({ columns: 145, rows: 42 });
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, bytes));
+    const row = await rowOf(host, "https://auth.openai.com");
+    host.emitInput(encoder.encode(`\u001b[<16;10;${row}M`));
+    host.emitInput(Uint8Array.of(0x1d, 0x79));
+    await waitUntil(() => opened.length === 1 && copied.length === 1, "Ctrl+click opens and Ctrl+] y copies");
+    assert.equal(opened[0], target);
+    assert.equal(copied[0], target);
+    const painted = hostHyperlinks(host).filter((link) => link.uri.startsWith("https://auth.openai.com"));
+    assert.ok(painted.length >= 4, `every row of the link is a host hyperlink (${painted.length})`);
+    assert.ok(painted.every((link) => link.uri === target), "each row's hyperlink is the whole URL");
+    assert.equal(new Set(painted.map((link) => link.id)).size, 1, "the rows share one hyperlink id");
+    assert.equal(painted.slice(-4).map((link) => link.text).join(""), target, "the four rows are the URL, row by row");
+  } finally { await coordinator.stop(); }
+});
+
+test("without OSC 8, the 4-row Codex layout still resolves to the whole URL, the same for every action", async () => {
+  // Owner layout: row 1 indented two cells and ending mid-escape, rows 2-4
+  // starting at column 0, each row placed by the cursor at the writer's 145.
+  const { target } = await codexSignIn();
+  const cut = 143;
+  let screen = `\u001b[2J\u001b[5;1H  If the link doesn't open automatically:\u001b[7;1H  ${target.slice(0, cut)}`;
+  for (let offset = cut, row = 8; offset < target.length; offset += 145, row += 1) screen += `\u001b[${row};1H${target.slice(offset, offset + 145)}`;
+  screen += "\u001b[12;1H  Press Esc to cancel\r\n";
+  const { coordinator, callbacks, host, intents, copied, opened } = await linkHarness({ columns: 145, rows: 42 });
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(screen)));
+    const first = await rowOf(host, "https://auth.openai.com");
+    for (const row of [first, first + 2]) host.emitInput(encoder.encode(`\u001b[<16;10;${row}M`));
+    host.emitInput(Uint8Array.of(0x1d, 0x79));
+    await waitUntil(() => opened.length === 2 && copied.length === 1, "two clicks open and Ctrl+] y copies");
+    assert.deepEqual(opened, [target, target], "a click on the first or a middle row opens the whole link");
+    assert.equal(copied[0], target, "Ctrl+] y copies the whole link, not its first row");
+    const painted = hostHyperlinks(host).filter((link) => link.uri.startsWith("https://auth.openai.com"));
+    assert.ok(painted.length >= 4 && painted.every((link) => link.uri === target));
+  } finally { await coordinator.stop(); }
+});
+
+test("Enter/o opens a sign-in link the provider wrapped over rows, not its first row", async () => {
+  const url = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" +
+    "&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&state=" + "s".repeat(40);
+  let screen = "\u001b[2J";
+  for (let offset = 0, row = 3; offset < url.length; offset += 80, row += 1) screen += `\u001b[${row};1H${url.slice(offset, offset + 80)}`;
+  screen += "\u001b[9;1H Paste code here if prompted > ";
+  const { coordinator, callbacks, host, intents, opened } = await linkHarness({ columns: 80, rows: 24, agent: "claude-code", localBrowserActions: true });
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(screen)));
+    await rowOf(host, "requests browser authentication");
+    host.emitInput(Uint8Array.of(0x0d));
+    await waitUntil(() => opened.length === 1, "Enter opens");
+    assert.equal(opened[0], url);
+  } finally { await coordinator.stop(); }
+});
+
+test("CONTROL: two different URLs on adjacent full rows stay two links", async () => {
+  const first = `https://example.com/first/${"a".repeat(80 - 26)}`;
+  const second = "https://example.org/second";
+  assert.equal(first.length, 80);
+  const { coordinator, callbacks, host, intents, opened } = await linkHarness({ columns: 80, rows: 24, agent: "claude-code" });
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`\u001b[2J\u001b[3;1H${first}\u001b[4;1H${second}\r\n`)));
+    const row = await rowOf(host, "https://example.com/first");
+    host.emitInput(encoder.encode(`\u001b[<16;10;${row}M`));
+    host.emitInput(encoder.encode(`\u001b[<16;10;${row + 1}M`));
+    await waitUntil(() => opened.length === 2, "both clicks open");
+    assert.deepEqual(opened, [first, second]);
+    const painted = hostHyperlinks(host);
+    assert.ok(painted.some((link) => link.uri === first && link.text === first));
+    assert.ok(painted.some((link) => link.uri === second && link.text === second));
+    assert.ok(painted.every((link) => link.uri === first || link.uri === second), "no joined link is painted");
+  } finally { await coordinator.stop(); }
+});

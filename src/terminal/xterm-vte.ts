@@ -41,6 +41,18 @@ export interface BufferPoint {
 
 /** Cells that end a word or URL: blanks, quotes, angle brackets and box rules. */
 const WORD_BREAK = /^[\s"'<>`│┃|]$/u;
+const LINK_START = /^https?:\/\//u;
+/** An http(s) link without the sentence punctuation that may follow it. */
+const LINK_TEXT = /^https?:\/\/.*?(?=[.,;:!?)\]}]*$)/u;
+const MAX_VIEW_LINKS = 64;
+const MAX_LINK_SEARCH_LINES = 400;
+
+/** A link as the screen draws it: its first and last cell, and its text. */
+export interface BufferLink {
+  readonly start: BufferPoint;
+  readonly end: BufferPoint;
+  readonly url: string;
+}
 
 export interface XtermTerminalResponse {
   readonly tabId: string;
@@ -423,7 +435,70 @@ export class XtermViewportAdapter {
     if (next.isWrapped) return true;
     const last = buffer.getLine(index)?.getCell(this.#terminal.cols - 1)?.getChars() ?? "";
     const first = next.getCell(0)?.getChars() ?? "";
-    return last !== "" && !WORD_BREAK.test(last) && first !== "" && !WORD_BREAK.test(first);
+    // A row that starts a new URL is a new line, even under a full row: two
+    // links drawn one above the other must never be read as one.
+    return last !== "" && !WORD_BREAK.test(last) && first !== "" && !WORD_BREAK.test(first) &&
+      !LINK_START.test(next.translateToString(false, 0, 8));
+  }
+
+  /**
+   * The http(s) link drawn under a cell: the whole run around it, across the
+   * rows `textBetween` joins, with trailing sentence punctuation left out.
+   */
+  linkAt(point: BufferPoint): BufferLink | undefined {
+    this.#assertOpen();
+    const word = this.wordAt(point);
+    if (word === undefined) return undefined;
+    const text = this.textBetween(word.start, word.end);
+    const url = LINK_TEXT.exec(text)?.[0];
+    return url === undefined ? undefined : Object.freeze({ start: word.start, end: word.end, url });
+  }
+
+  /**
+   * Every link with a cell on the rows a view shows, as `linkAt` reads it.
+   * A link that starts above the first row and continues into it is included.
+   */
+  linksInView(host?: { readonly columns: number; readonly rows: number }): readonly BufferLink[] {
+    this.#assertOpen();
+    const buffer = this.#terminal.buffer.active;
+    const window = this.#viewWindow(host, host === undefined ? 0 : this.#scrollOffset);
+    const links: BufferLink[] = [];
+    const seen = new Set<string>();
+    const add = (point: BufferPoint): void => {
+      const link = this.linkAt(point);
+      if (link === undefined) return;
+      const key = `${link.start.line}:${link.start.column}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      links.push(link);
+    };
+    for (let line = window.top; line < window.top + window.rows; line += 1) {
+      const text = buffer.getLine(line)?.translateToString(false) ?? "";
+      if (line === window.top && line > 0 && this.#continues(line - 1)) add({ line, column: 0 });
+      for (const match of text.matchAll(/https?:\/\//gu)) add({ line, column: cellColumn(buffer.getLine(line), match.index) });
+      if (links.length >= MAX_VIEW_LINKS) break;
+    }
+    return Object.freeze(links);
+  }
+
+  /**
+   * The longer link a shorter one is the start of, when the rows on screen
+   * continue it: a byte stream reads a URL a program wrapped itself only up
+   * to its first row break, but the screen still holds the whole of it.
+   */
+  extendLink(url: string): string | undefined {
+    this.#assertOpen();
+    const buffer = this.#terminal.buffer.active;
+    const head = url.slice(0, Math.min(url.length, 32));
+    const oldest = Math.max(0, buffer.length - MAX_LINK_SEARCH_LINES);
+    for (let line = buffer.length - 1; line >= oldest; line -= 1) {
+      const row = buffer.getLine(line);
+      const index = row?.translateToString(false).indexOf(head) ?? -1;
+      if (row === undefined || index < 0) continue;
+      const link = this.linkAt({ line, column: cellColumn(row, index) });
+      if (link !== undefined && link.url.length > url.length && link.url.startsWith(url)) return link.url;
+    }
+    return undefined;
   }
 
   #viewWindow(host: { readonly columns: number; readonly rows: number } | undefined, scrollOffset: number):
@@ -722,6 +797,20 @@ export class XtermViewportAdapter {
   #assertOpen(): void {
     if (this.#disposed) throw new Error("The xterm viewport adapter is disposed.");
   }
+}
+
+/** The cell column where a `translateToString(false)` string index starts. */
+function cellColumn(line: IBufferLine | undefined, index: number): number {
+  if (line === undefined) return 0;
+  let consumed = 0;
+  for (let column = 0; column < line.length; column += 1) {
+    const cell = line.getCell(column);
+    if (cell === undefined || cell.getWidth() === 0) continue;
+    const length = Math.max(1, cell.getChars().length);
+    if (consumed + length > index) return column;
+    consumed += length;
+  }
+  return Math.max(0, line.length - 1);
 }
 
 export function orderBufferPoints(first: BufferPoint, second: BufferPoint): readonly [BufferPoint, BufferPoint] {
