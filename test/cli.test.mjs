@@ -62,6 +62,10 @@ function fakeClient(overrides = {}) {
     async createApiKey() { throw new Error("unexpected create API key"); },
     async revokeApiKey() { throw new Error("unexpected revoke API key"); },
     async createMachine() { throw new Error("unexpected create"); },
+    // No create receipt exists until a create names one: Cuna answers 404.
+    async getMachineCreateRequest() {
+      throw new CunaError({ code: "cuna.remote.not_found", message: "Not found.", exitCode: EXIT_CODES.remote, details: { http_status: 404 } });
+    },
     async transitionMachine() { throw new Error("unexpected transition"); },
     async replaceMachineSupervisor() { throw new Error("unexpected terminal supervisor replacement"); },
     async deleteMachine() { throw new Error("unexpected delete"); },

@@ -326,9 +326,16 @@ test("without --timeout-ms a create is bounded by its own budget, not by the glo
   // `runCli`: it arrives at the transport indistinguishable from a typed flag and
   // outranks the per-operation budget. Mocked timers let the whole 90 s be
   // observed in microseconds.
+  //
+  // A create whose POST outlives that budget is then followed through its
+  // durable receipt instead of ending there (installed 0.1.5, 2026-09-29).
+  // The receipt here answers at once with a settled failure, so the run ends
+  // without the follow loop's own waits.
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const streams = memoryStreams();
   let settled;
+  let postAborted = false;
+  const receiptReads = [];
   const run = runCli(["machines", "create", "--name", "dev", "--yes", "--json"], {
     streams: streams.streams,
     platform,
@@ -352,8 +359,16 @@ test("without --timeout-ms a create is bounded by its own budget, not by the glo
           }],
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
+      const receipt = /^\/v1\/machine-creates\/([0-9a-f-]{36})$/u.exec(new URL(String(url)).pathname);
+      if (receipt !== null) {
+        receiptReads.push(receipt[1]);
+        return new Response(JSON.stringify({
+          id: receipt[1], machine_id: "33333333-3333-4333-8333-333333333333", state: "terminal_failed",
+          retryable: false, action: "none", updated_at: "2026-08-08T00:01:30.000Z",
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
       return new Promise((_resolve, reject) => {
-        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+        init.signal.addEventListener("abort", () => { postAborted = true; reject(init.signal.reason); }, { once: true });
       });
     },
   }).then((exit) => { settled = exit; });
@@ -365,13 +380,16 @@ test("without --timeout-ms a create is bounded by its own budget, not by the glo
   t.mock.timers.tick(DEFAULT_REQUEST_BUDGET_MS + 1);
   await new Promise((resolve) => process.nextTick(resolve));
   assert.equal(settled, undefined, "The create was cut off at the global default instead of its own budget.");
+  assert.equal(postAborted, false, "The create was cut off at the global default instead of its own budget.");
 
   t.mock.timers.tick(MACHINE_CREATE_REQUEST_BUDGET_MS);
   await run;
-  assert.equal(settled, EXIT_CODES.network);
+  assert.equal(postAborted, true, "the create's own budget ends the wait for its POST");
+  assert.equal(receiptReads.length, 1, "an unanswered create is followed through its receipt");
+  assert.equal(settled, EXIT_CODES.remote);
   const error = JSON.parse(streams.stderr()).error;
-  assert.equal(error.code, "cuna.client.response_budget_elapsed");
-  assert.equal(error.details.budget_ms, MACHINE_CREATE_REQUEST_BUDGET_MS);
+  assert.equal(error.code, "cuna.machine.create_failed");
+  assert.equal(error.details.create_request_id, receiptReads[0]);
 });
 
 test("an explicit --timeout-ms outranks a per-operation budget", async () => {

@@ -2306,6 +2306,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // The one batch command that keeps a durable local note across
       // invocations needs the same adapter every other on-disk state uses.
       platform,
+      // A command that follows a long remote operation says what it is still
+      // waiting for on the same progress row.
+      reportWait: (wait) => batchProgress?.wait(wait),
     });
     batchProgress?.stop();
     batchProgress = undefined;

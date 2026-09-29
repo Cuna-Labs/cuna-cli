@@ -492,6 +492,10 @@ test("machines create generates an idempotency key and still honours an override
       keys.push(idempotencyKey);
       return { id: MACHINE_ID, name: "dev", state: "creating" };
     },
+    // A key given for the first time names no receipt yet: Cuna answers 404.
+    getMachineCreateRequest: async () => {
+      throw new CunaError({ code: "cuna.remote.not_found", message: "Not found.", exitCode: EXIT_CODES.remote, details: { http_status: 404 } });
+    },
     getMachine: async (id) => ({ id, name: "dev", state: "creating" }),
   };
   const generated = await runJson(["machines", "create", "--name", "dev", "--yes", "--json"], {

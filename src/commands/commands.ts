@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   requireCapability,
@@ -14,11 +14,14 @@ import type {
   ApiKeyMetadata,
   CapabilitySnapshot,
   Machine,
+  MachineCreateRequest,
 } from "../api/contracts.js";
 import type { EffectiveConfig } from "../config/config.js";
 import { DEFAULT_BASE_URL, environmentCredentialState, publicConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError, unsupportedError, usageError, type SafeErrorDetails } from "../core/errors.js";
 import {
+  MACHINE_CREATE_FOLLOW_DEADLINE_MS,
+  MACHINE_CREATE_FOLLOW_POLL_INTERVAL_MS,
   REMOTE_CONVERGENCE_BUDGET_MS,
   REMOTE_CONVERGENCE_POLL_INTERVAL_MS,
   observationBudgetElapsed,
@@ -34,6 +37,7 @@ import {
   integerArgument,
 } from "../core/validation.js";
 import { preflightAgentJourneyInvocation } from "../journey/intent.js";
+import type { JourneyWait } from "../journey/wait-policy.js";
 import type { ManagedExecution } from "../api/managed-executions.js";
 import { listAllMachines } from "../machines/pagination.js";
 import {
@@ -135,6 +139,11 @@ export interface CommandContext {
    * requirement forbids.
    */
   readonly platform?: PlatformAdapter;
+  /**
+   * Says what a long command is still waiting for, with its elapsed time and
+   * deadline; `undefined` ends the wait. Only a painted progress row listens.
+   */
+  readonly reportWait?: (wait: JourneyWait | undefined) => void;
 }
 
 function productionConvergencePoller(): ConvergencePoller {
@@ -465,6 +474,179 @@ function apiKeyStatusLabel(key: ApiKeyMetadata, now: number): string {
 function idempotencyKey(parsed: ParsedInvocation): string {
   const value = stringOption(parsed, "idempotency-key");
   return value === undefined ? randomUUID() : assertIdempotencyKey(value);
+}
+
+/**
+ * The durable create request one credential and one idempotency key name.
+ *
+ * Derived rather than random so that running the same create again with the
+ * same `--idempotency-key` reads the same receipt instead of starting a second
+ * create. The credential scope keeps two accounts' keys from ever naming the
+ * same request.
+ */
+async function machineCreateRequestId(context: CommandContext, key: string): Promise<string> {
+  const scope = context.config.apiKey === undefined
+    ? `human:${(await context.client.getIdentity()).id}`
+    : `automation:${createHash("sha256").update(context.config.apiKey).digest("hex")}`;
+  const bytes = createHash("sha256").update("cuna.machine-create-request.v1\0")
+    .update(scope).update("\0").update(key).digest();
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * A create whose answer never arrived. The request may or may not have reached
+ * Cuna, so the only honest next step is to read its receipt. A refusal Cuna
+ * actually answered, and a connection never made, are not uncertain.
+ */
+function machineCreateOutcomeUnobserved(error: unknown): boolean {
+  if (!(error instanceof CunaError)) return false;
+  if (error.code === "cuna.client.response_budget_elapsed") return true;
+  if (error.code === "cuna.network.failed") return error.details?.remote_outcome !== "not_sent";
+  return error.code === "cuna.network.service_unavailable" || error.code === "cuna.remote.malformed_response";
+}
+
+/** A receipt read that may simply be early: absent so far, or itself unanswered. */
+function machineCreateReceiptNotYetReadable(error: unknown): boolean {
+  if (error instanceof CunaError && error.details?.http_status === 404) return true;
+  return machineCreateOutcomeUnobserved(error) ||
+    (error instanceof CunaError && error.code === "cuna.network.failed");
+}
+
+interface MachineCreateFollow {
+  readonly requestId: string;
+  readonly key: string;
+  readonly input: MachineCreateInput;
+  readonly startedAt: number;
+  /** A receipt was already read, or a POST was already sent, for this request. */
+  readonly posted: boolean;
+}
+
+/**
+ * Follow one create by re-reading its receipt until the Machine exists and is
+ * running (or merely exists, for `--background`), the receipt reports a
+ * failure, or the follow deadline elapses.
+ *
+ * Nothing is sent again because time passed. The one exception is the
+ * receipt's own `retry_create` on a `prepared` request, which says the create
+ * never reached the provider; the same POST, with the same key and request,
+ * is then sent once.
+ */
+async function followMachineCreate(context: CommandContext, follow: MachineCreateFollow): Promise<Machine> {
+  const { client } = context;
+  const poller = context.convergencePoller ?? productionConvergencePoller();
+  const deadline = follow.startedAt + MACHINE_CREATE_FOLLOW_DEADLINE_MS;
+  const name = follow.input.name;
+  let posted = follow.posted;
+  let receipt: MachineCreateRequest | undefined;
+  let machine: Machine | undefined;
+  for (;;) {
+    let waitingFor = `machine ${name} to be created`;
+    try {
+      receipt = await client.getMachineCreateRequest(follow.requestId);
+      if (receipt.state === "unknown" || receipt.action === "reconcile") {
+        receipt = await client.reconcileMachineCreateRequest(follow.requestId);
+      }
+    } catch (error) {
+      if (!machineCreateReceiptNotYetReadable(error)) throw error;
+      receipt = undefined;
+    }
+    if (receipt !== undefined) {
+      if (receipt.id !== follow.requestId) {
+        postconditionUnverified("machine creation", { create_request_id: follow.requestId, observed_id: receipt.id });
+      }
+      if (receipt.state === "terminal_failed" || (receipt.action === "none" &&
+        receipt.state !== "settled" && receipt.state !== "provider_succeeded")) {
+        throw machineCreateFailed(follow, `Cuna reports that creating machine ${name} failed.`, receipt);
+      }
+      if (receipt.state === "settled" || receipt.state === "provider_succeeded") {
+        try {
+          machine = await client.getMachine(receipt.machineId);
+        } catch (error) {
+          if (!machineCreateReceiptNotYetReadable(error)) throw error;
+        }
+        if (machine !== undefined) {
+          if (machine.id !== receipt.machineId) {
+            postconditionUnverified("machine creation", { create_request_id: follow.requestId, machine_id: receipt.machineId, observed_id: machine.id });
+          }
+          if (follow.input.background === true || machine.state === "running") {
+            context.reportWait?.(undefined);
+            return machine;
+          }
+          if (machine.state === "error" || machine.state === "deleted") {
+            throw machineCreateFailed(follow, `Machine ${name} was created but is ${machine.state}.`, receipt, machine);
+          }
+          waitingFor = `machine ${name} to run`;
+        }
+      } else if (receipt.state === "prepared" && receipt.action === "retry_create" && !posted) {
+        posted = true;
+        try {
+          await client.createMachine(follow.input, follow.key, follow.requestId);
+        } catch (error) {
+          if (!machineCreateOutcomeUnobserved(error)) throw error;
+        }
+        continue;
+      }
+    }
+    const elapsedMs = poller.now() - follow.startedAt;
+    const remaining = deadline - poller.now();
+    if (remaining <= 0) throw machineCreateUnconfirmed(follow, elapsedMs, receipt, machine);
+    context.reportWait?.({ waitingFor, elapsedMs, deadlineMs: MACHINE_CREATE_FOLLOW_DEADLINE_MS });
+    await poller.sleep(Math.min(MACHINE_CREATE_FOLLOW_POLL_INTERVAL_MS, remaining));
+  }
+}
+
+function machineCreateDetails(
+  follow: MachineCreateFollow, receipt?: MachineCreateRequest, machine?: Machine,
+): SafeErrorDetails {
+  return {
+    machine_name: follow.input.name,
+    create_request_id: follow.requestId,
+    idempotency_key: follow.key,
+    ...(receipt === undefined ? {} : {
+      machine_id: receipt.machineId,
+      receipt_state: receipt.state,
+      next_action: receipt.action,
+      receipt_updated_at: receipt.updatedAt,
+    }),
+    ...(machine === undefined ? {} : { machine_state: machine.state }),
+  };
+}
+
+function machineCreateFailed(
+  follow: MachineCreateFollow, message: string, receipt: MachineCreateRequest, machine?: Machine,
+): CunaError {
+  return new CunaError({
+    code: "cuna.machine.create_failed",
+    message,
+    exitCode: EXIT_CODES.remote,
+    hint: "Read the account's machines with `cuna machines list` before creating another.",
+    details: machineCreateDetails(follow, receipt, machine),
+  });
+}
+
+function machineCreateUnconfirmed(
+  follow: MachineCreateFollow, elapsedMs: number, receipt?: MachineCreateRequest, machine?: Machine,
+): CunaError {
+  const name = follow.input.name;
+  return new CunaError({
+    code: "cuna.machine.create_unconfirmed",
+    message: machine !== undefined
+      ? `Machine ${name} exists but was not running after ${Math.round(elapsedMs / 1_000)} s.`
+      : `Cuna has not confirmed machine ${name} after ${Math.round(elapsedMs / 1_000)} s. It may still be creating.`,
+    exitCode: EXIT_CODES.network,
+    hint: `Check with \`cuna machines list\` before creating another. To keep following this same create, run it again with \`--idempotency-key ${follow.key}\`: that reads its receipt first and does not start a second one.`,
+    retryable: true,
+    details: {
+      ...machineCreateDetails(follow, receipt, machine),
+      deadline_ms: MACHINE_CREATE_FOLLOW_DEADLINE_MS,
+      elapsed_ms: elapsedMs,
+      settle_with: "cuna machines list",
+      remote_outcome: receipt === undefined ? "unobserved" : "unsettled",
+    },
+  });
 }
 
 function machineRecord(machine: Machine): Readonly<Record<string, unknown>> {
@@ -2633,7 +2815,36 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
       ...(memoryMiB === undefined ? {} : { memoryMiB }),
       ...(booleanOption(parsed, "background") ? { background: true } : {}),
     };
-    const machine = await client.createMachine(input, key);
+    // A create names a durable request before it is sent. When its answer does
+    // not arrive, that request's receipt is what the CLI reads, never a second
+    // POST; the same key given again resumes reading it.
+    const requestId = await machineCreateRequestId(context, key);
+    const poller = context.convergencePoller ?? productionConvergencePoller();
+    const startedAt = poller.now();
+    const follow = (posted: boolean): Promise<Machine> =>
+      followMachineCreate(context, { requestId, key, input, startedAt, posted });
+    let known = false;
+    if (stringOption(parsed, "idempotency-key") !== undefined) {
+      try {
+        await client.getMachineCreateRequest(requestId);
+        known = true;
+      } catch (error) {
+        if (!(error instanceof CunaError && error.details?.http_status === 404)) throw error;
+      }
+    }
+    let machine: Machine;
+    if (known) {
+      // This key already named a create. Follow it; its receipt alone decides
+      // whether the POST is ever sent again (`retry_create`).
+      machine = await follow(false);
+    } else {
+      try {
+        machine = await client.createMachine(input, key, requestId);
+      } catch (error) {
+        if (!machineCreateOutcomeUnobserved(error)) throw error;
+        machine = await follow(true);
+      }
+    }
     const observed = await client.getMachine(machine.id);
     if (
       observed.id !== machine.id || observed.name !== name ||
@@ -2647,9 +2858,12 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
         observed_name: observed.name,
       });
     }
+    if (observed.createOperation !== undefined && observed.createOperation.id !== requestId) {
+      postconditionUnverified("machine creation", { create_request_id: requestId, observed_id: observed.createOperation.id });
+    }
     return Object.freeze({
       command: "machines.create",
-      data: machineRecord(observed),
+      data: Object.freeze({ ...machineRecord(observed), create_request_id: requestId, idempotency_key: key }),
       human: `Created machine ${observed.name} (${observed.id}) in state ${observed.state}.`,
     });
   }

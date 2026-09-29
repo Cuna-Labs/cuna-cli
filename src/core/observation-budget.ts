@@ -88,6 +88,22 @@ export const DEFAULT_REQUEST_BUDGET_MS = 15_000;
 export const MACHINE_CREATE_REQUEST_BUDGET_MS = 90_000;
 
 /**
+ * How long `cuna machines create` follows one create after its POST went
+ * unanswered, re-reading the create receipt, before it stops waiting.
+ *
+ * DERIVATION. Installed 0.1.5, 2026-09-29T01:19:34Z: the POST outlived its
+ * 90 s budget and the command ended with an error, while the Machine it asked
+ * for was created at 01:19:38 and reported running at 01:21:33, about 115 s
+ * after dispatch. The create before it took 121 s. 300 000 ms is two and a
+ * half times the longest of those. The number bounds reading only; nothing is
+ * re-sent because it elapsed.
+ */
+export const MACHINE_CREATE_FOLLOW_DEADLINE_MS = 300_000;
+
+/** Interval between create-receipt reads while following a create. */
+export const MACHINE_CREATE_FOLLOW_POLL_INTERVAL_MS = 2_000;
+
+/**
  * `POST /v1/sessions/{id}/{start|resume}` boots a VM and waits for its
  * supervisor to accept control before it answers, so it is not bounded by the
  * same budget as a list either.
