@@ -189,10 +189,13 @@ test("trusted appbar removes bidi controls and truncates by terminal cell width"
   for (const character of appbar.replace(/\u001b\[[0-9;]*[mK]/gu, "").normalize("NFC")) {
     const point = character.codePointAt(0);
     width += /[\p{M}\p{Cf}]/u.test(character) ? 0
-      : /\p{Extended_Pictographic}/u.test(character) || (point >= 0x1100 && point <= 0x3fffd) ? 2
+      // General Punctuation (the cut marker "…" among it) is one cell wide.
+      : /\p{Extended_Pictographic}/u.test(character) || (point >= 0x1100 && point <= 0x3fffd && !(point >= 0x2000 && point <= 0x206f)) ? 2
       : 1;
   }
   assert.equal(width, 20);
+  // eslint-disable-next-line no-control-regex -- stripping the renderer's own SGR/erase sequences
+  assert.ok(appbar.replace(/\u001b\[[0-9;]*[mK]/gu, "").trimEnd().endsWith("…"), "a bar cut by the window says so");
 });
 
 test("small admitted terminals collapse to one truthful appbar row without fabricated progress", () => {
@@ -416,4 +419,30 @@ test("a cut observer row ends in Cuna's marker in the last cell, and a row may n
   assert.throws(() => renderWorkbenchFrame({ columns: 80, rows: 24,
     tabs: [{ ...allTabs[0], viewport: { ...viewport, cells: ["c".repeat(80), "whole"], displayWidths: [80, 5] } }, allTabs[1]],
     activeTabId: allTabs[0].id, appbar: model() }), WorkbenchRenderError, "a cut row cannot also fill the marker's cell");
+});
+
+test("a notice or status line cut by a narrow window ends in … and one that fits is untouched", () => {
+  const long = "Observing (read-only) · view is 70 columns wider than this window (›) · Press Ctrl+] then w to take control";
+  for (const rows of [24, 3]) {
+    const frame = (columns, notice) => renderWorkbenchFrame({
+      columns, rows, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false, notice,
+    });
+    const noticeRow = rows >= 5 ? 2 : 1;
+    const cut = rowText(frame(60, long), noticeRow).trimEnd();
+    assert.ok(cut.endsWith("…"), `${rows} rows: a cut notice ends in …: ${cut}`);
+    assert.ok(cut.length <= 60);
+    assert.doesNotMatch(rowText(frame(160, long), noticeRow), /…/u, `${rows} rows: a notice that fits is whole`);
+  }
+});
+
+test("OpenCode without a provider sign-in says its default model needs none; other agents still say login required", () => {
+  const [claude, codex] = tabs();
+  const openCode = { ...claude, agent: "opencode" };
+  const truth = (tab) => rowText(renderWorkbenchFrame({
+    columns: 140, rows: 24, activeTabId: tab.id, tabs: [tab, codex].filter((item, index, all) => all.findIndex((other) => other.id === item.id) === index),
+    appbar: model({ providerAuthentication: evidence("login_required") }), color: false,
+  }), 2);
+  assert.match(truth(openCode), /OpenCode default model \(no sign-in needed\)/u);
+  assert.doesNotMatch(truth(openCode), /login required/u);
+  assert.match(truth(claude), /Claude auth login required/u);
 });

@@ -155,7 +155,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
     lines = [
       tabRow.line,
       withClipboardHint(
-        input.notice === undefined ? renderTruth(input.appbar, active.agent, input.columns) : truncate(` ${safeText(input.notice)}`, input.columns),
+        input.notice === undefined ? renderTruth(input.appbar, active.agent, input.columns) : truncateMarked(` ${safeText(input.notice)}`, input.columns),
         input.columns,
         input.mouseReporting === true,
         input.remoteMouse === true,
@@ -164,7 +164,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
   } else {
     lines = [input.notice === undefined
       ? renderCompact(input.tabs, input.activeTabId, input.appbar, input.columns)
-      : truncate(` CUNA  ${safeText(input.notice)}`, input.columns)];
+      : truncateMarked(` CUNA  ${safeText(input.notice)}`, input.columns)];
   }
   const color = input.color !== false;
   let text = `${ESC}?25l${ESC}H`;
@@ -370,11 +370,11 @@ function withClipboardHint(line: string, columns: number, mouseReporting: boolea
 function renderTruth(model: AppbarModel, agent: WorkbenchTab["agent"], columns: number): string {
   const values = [
     projection("terminal", model.attachment),
-    providerAuthProjection(providerAuthLabel(agent), model.providerAuthentication),
+    providerAuthProjection(providerAuthLabel(agent), model.providerAuthentication, agent),
   ];
   if (model.cost !== undefined) values.push(metric("cost", model.cost, (value) => `$${value.toFixed(2)}`));
   if (model.tokensSaved !== undefined) values.push(metric("tokens saved", model.tokensSaved, String));
-  return truncate(` ${values.join("  \u00b7  ")}`, columns);
+  return truncateMarked(` ${values.join("  \u00b7  ")}`, columns);
 }
 
 function renderCompact(
@@ -386,10 +386,15 @@ function renderCompact(
   const active = tabs.find((tab) => tab.id === activeTabId);
   const identity = active === undefined ? "session" : `${agentLabel(active.agent)} ${safeText(active.label)}`;
   const provider = active === undefined ? "provider auth" : providerAuthLabel(active.agent);
-  return truncate(` CUNA  ${identity}  \u00b7  ${projection("terminal", model.attachment)}  \u00b7  ${providerAuthProjection(provider, model.providerAuthentication)}`, columns);
+  return truncateMarked(` CUNA  ${identity}  \u00b7  ${projection("terminal", model.attachment)}  \u00b7  ${providerAuthProjection(provider, model.providerAuthentication, active?.agent)}`, columns);
 }
 
-function providerAuthProjection(label: string, value: TruthProjection<string>): string {
+function providerAuthProjection(label: string, value: TruthProjection<string>, agent?: WorkbenchTab["agent"]): string {
+  // OpenCode's default model needs no provider credential; "login required"
+  // would send its user to a sign-in that is optional.
+  if (agent === "opencode" && value.status === "verified" && value.value === "login_required") {
+    return "OpenCode default model (no sign-in needed)";
+  }
   return value.status === "stale"
     ? `${label} status not refreshed`
     : projection(label, value);
@@ -440,6 +445,12 @@ function truncate(value: string, columns: number): string {
     width += nextWidth;
   }
   return result;
+}
+
+/** Like truncate, but a line cut short ends in "…" so the cut is never silent. */
+function truncateMarked(value: string, columns: number): string {
+  if (displayCellWidth(value) <= columns) return value;
+  return `${truncate(value, columns - 1)}…`;
 }
 
 function padLine(value: string, columns: number): string {

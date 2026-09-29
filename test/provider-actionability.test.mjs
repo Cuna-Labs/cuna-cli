@@ -189,3 +189,17 @@ test("the displayed line separates the refresh overlay from the process provenan
     assert.equal(current.canAttach, false);
   }
 });
+
+test("an OpenCode session without a provider sign-in stays attachable; Claude and Codex still need one", () => {
+  // OpenCode's default model answers with no provider credential
+  // (witnessed 2026-09-05; lead witness 2026-09-29).
+  const openCode = classifySessionActionability({
+    session: session({ agent: "opencode" }), machine: machine(), now: NOW, authState: "login_required",
+  });
+  assert.equal(openCode.baseState, "attachable");
+  assert.equal(openCode.canAttach, true);
+  const claude = classifySessionActionability({
+    session: session(), machine: machine(), now: NOW, authState: "login_required",
+  });
+  assert.equal(claude.baseState, "login-required");
+});

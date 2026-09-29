@@ -3054,7 +3054,7 @@ function scrolledBackNotice(lines: number): string {
 }
 
 function widerViewNotice(columns: number): string {
-  return `view is ${columns} column${columns === 1 ? "" : "s"} wider than this window (${CONTINUED_MARKER} marks cut rows)`;
+  return `view is ${columns} column${columns === 1 ? "" : "s"} wider than this window (${CONTINUED_MARKER})`;
 }
 
 /** Guesses belong to one exact writer attachment at one geometry. */

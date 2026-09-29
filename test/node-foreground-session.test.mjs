@@ -1071,7 +1071,7 @@ test("OpenCode direct attach reaches the PTY with live terminal and exact provid
   });
   await waitUntil(() => events.includes("wire:connected"), "OpenCode should reach the exact terminal wire");
   assert.equal(events.includes(`auth:${SESSION_A}`), true);
-  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode default model \(no sign-in needed\)/u);
   host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   assert.equal(host.restored, 1);
@@ -1109,7 +1109,7 @@ test(`OpenCode ${missingAuthCode} enters a current ready PTY for interactive log
   });
 
   await waitUntil(() => events.includes("wire:connected"), "missing auth evidence should reach the login PTY");
-  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode default model \(no sign-in needed\)/u);
   host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   assert.equal(host.restored, 1);
@@ -1154,7 +1154,7 @@ test("OpenCode auth endpoint errors enter a current ready PTY for interactive lo
       clock: () => NOW,
     });
     await waitUntil(() => events.includes("wire:connected"), `${label} should reach the login PTY`);
-    assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+    assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode default model \(no sign-in needed\)/u);
     host.emitInput(Uint8Array.of(0x1d, 0x64));
     await operation;
   }
@@ -1195,7 +1195,7 @@ test("a slow OpenCode auth observation is advisory and cannot delay a ready PTY"
 
   await waitUntil(() => events.includes(`auth-aborted:${SESSION_A}`), "the advisory auth read should be bounded");
   await waitUntil(() => events.includes("wire:connected"), "a fresh OpenCode process should reach its PTY after the bounded auth read");
-  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode default model \(no sign-in needed\)/u);
   host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   assert.equal(host.restored, 1);
@@ -1338,7 +1338,7 @@ test("OpenCode matching unavailable auth abstention enters the current PTY as lo
   });
 
   await waitUntil(() => events.includes("wire:connected"), "matching auth abstention must not block terminal authority");
-  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode auth login required/u);
+  assert.match(new TextDecoder().decode(host.writes.at(-1)), /OpenCode default model \(no sign-in needed\)/u);
   host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   assert.equal(host.restored, 1);

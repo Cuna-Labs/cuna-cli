@@ -2104,7 +2104,7 @@ test("an observer of a wider writer says how much of the view is cut and marks e
       screen = (await visibleHostText(host)).split("\n");
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
-    assert.match(screen[1], /Observing \(read-only\) · view is 14 columns wider than this window \(› marks cut rows\) · Press Ctrl\+\] then w/u);
+    assert.match(screen[1], /Observing \(read-only\) · view is 14 columns wider than this window \(›\) · Press Ctrl\+\] then w/u);
     assert.equal(screen[2], `${remoteRows[0].slice(0, 185)}›`, "a cut row ends in the marker, never in a silent cut");
     assert.equal(screen[3], remoteRows[1], "a row that fits is shown whole and unmarked");
   } finally { await coordinator.stop(); }
@@ -3495,5 +3495,26 @@ test("after a takeover shortens the screen, the lines above it stay reachable by
       if (!seen) await new Promise((resolve) => setTimeout(resolve, 5));
     }
     assert.ok(seen, "the banner is in this client's history");
+  } finally { await coordinator.stop(); }
+});
+
+test("at 120 columns the observer seat line for a 190-column writer fits whole", async () => {
+  // Lead witness 2026-09-29 (drop 7104908): at 120 columns the seat line was
+  // cut at "Press Ctrl+] then w to" with nothing saying so.
+  const { coordinator, callbacks, host, intents } = harness();
+  host.columns = 120;
+  host.rows = 34;
+  await coordinator.start(intents.slice(0, 1));
+  try {
+    const observer = { ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2, geometry: null };
+    callbacks.onTerminalState(observer);
+    await callbacks.onTerminalGeometry({ snapshot: { ...observer, geometry: { columns: 190, rows: 40, writerEpoch: 2 } }, signal: new AbortController().signal });
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("x".repeat(190))));
+    let row = "";
+    for (let attempt = 0; attempt < 200 && !/wider than this window/u.test(row); attempt += 1) {
+      row = (await visibleHostText(host)).split("\n")[1] ?? "";
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.match(row, /Observing \(read-only\) · view is 70 columns wider than this window \(›\) · Press Ctrl\+\] then w to take control/u);
   } finally { await coordinator.stop(); }
 });

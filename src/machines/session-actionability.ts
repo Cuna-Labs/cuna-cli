@@ -166,7 +166,12 @@ function classifyBase(input: SessionActionabilityInput): ClassifiedBase {
   } else if (session.agent !== "claude-code" && session.agent !== "codex" && session.agent !== "opencode") {
     return result("unsupported", "provider_unavailable");
   }
-  if (authState === "login_required") return result("login-required", "provider_authentication_required");
+  // OpenCode's default model answers with no provider credential; its
+  // sign-in (`/connect`) only adds providers. Missing credentials are not a
+  // reason to withhold the session from an OpenCode user.
+  if (authState === "login_required" && session.agent !== "opencode") {
+    return result("login-required", "provider_authentication_required");
+  }
   if (authState === "unavailable") return result("unsupported", "provider_unavailable");
   // A launch receipt is not fresh process evidence. Once an existing runtime
   // lease expires, unknown/starting must offer recovery instead of waiting forever.
