@@ -214,7 +214,9 @@ Foreground terminal attach (the server must grant terminal_connections.create):
   CUNA_PREDICTIVE_ECHO=auto to opt in to dim, underlined local guesses when
   measured echo exceeds 60 ms, or =on to opt in regardless of echo speed.
   Local guesses can expose input before a remote secret prompt suppresses echo.
-  Ctrl+C detaches locally in one press. Use Ctrl+] c to send Ctrl+C to the agent.
+  With keyboard control, Ctrl+C goes to the agent and Ctrl+] d detaches. A
+  read-only view and the plain fallback detach on Ctrl+C. Ctrl+C over a Cuna
+  selection copies it instead.
   Background daemon and local companion behavior are absent from this build.
 
 Automatic local-to-cloud journey:

@@ -185,7 +185,7 @@ test("a grant mismatch against an unchanged writer remains a terminal failure", 
   } finally { await coordinator.stop(); }
 });
 
-test("Ctrl+C flushes prior text before detaching and never batches the interrupt", async () => {
+test("a writer's Ctrl+C flushes prior text first and is never batched with it", async () => {
   const { coordinator, host, calls, intents } = harness();
   try {
     await coordinator.start(intents);
@@ -193,9 +193,9 @@ test("Ctrl+C flushes prior text before detaching and never batches the interrupt
     await waitUntil(() => calls.input.length === 1, "first key should be immediate");
     host.emitInput(encoder.encode("b"));
     host.emitInput(Uint8Array.of(0x03));
-    await waitUntil(() => calls.detach.includes(intents[0].tabId), "Ctrl+C should detach without the batch timer");
-    assert.equal(calls.input.map(item => item.text).join(""), "ab");
-    assert.equal(calls.input.some(item => item.text.includes("\x03")), false);
+    await waitUntil(() => calls.input.some(item => item.text === "\x03"), "Ctrl+C should reach the PTY without the batch timer");
+    assert.deepEqual(calls.input.map(item => item.text), ["a", "b", "\x03"]);
+    assert.deepEqual(calls.detach, []);
   } finally { await coordinator.stop(); }
 });
 
@@ -1233,9 +1233,10 @@ test("pasting the Claude sign-in URL is blocked with a corrective prompt while t
   await coordinator.stop();
 });
 
-test("one Ctrl-C detaches even when a bracketed paste never receives its end marker", async () => {
-  const { coordinator, calls, host, intents } = harness();
+test("one observer Ctrl-C detaches even when a bracketed paste never receives its end marker", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness();
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   host.emitInput(encoder.encode("\u001b[200~partial"));
   await waitUntil(() => calls.input.length === 1, "partial paste should enter the bounded terminal path");
   host.emitInput(Uint8Array.of(0x03));
@@ -1243,7 +1244,22 @@ test("one Ctrl-C detaches even when a bracketed paste never receives its end mar
   assert.deepEqual(calls.detach, ["tab-a"]);
 });
 
-test("a hanging browser opener never blocks one-Ctrl-C detach", async () => {
+test("a writer's Ctrl+C ends a paste that never received its end marker, so Ctrl+] d detaches again", async () => {
+  const { coordinator, calls, host, intents } = harness();
+  await coordinator.start(intents.slice(0, 1));
+  host.emitInput(encoder.encode("\u001b[200~partial"));
+  await waitUntil(() => calls.input.length === 1, "partial paste should enter the bounded terminal path");
+  host.emitInput(Uint8Array.of(0x03));
+  await waitUntil(() => calls.input.length === 2, "the writer's Ctrl+C reaches the PTY");
+  assert.equal(calls.input[1].text, "\u0003");
+  host.emitInput(Uint8Array.of(0x1d));
+  host.emitInput(encoder.encode("d"));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  assert.equal(calls.input.length, 2, "the chord after Ctrl+C is not pasted text");
+});
+
+test("a hanging browser opener never blocks the Ctrl+] d detach", async () => {
   let releaseBrowser;
   let browserStarted = false;
   const { coordinator, callbacks, calls, host, intents } = harness({
@@ -1261,7 +1277,7 @@ test("a hanging browser opener never blocks one-Ctrl-C detach", async () => {
   ));
   host.emitInput(Uint8Array.of(0x0d));
   await waitUntil(() => browserStarted, "browser action should start");
-  host.emitInput(Uint8Array.of(0x03));
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
   await coordinator.waitForStop();
   assert.deepEqual(calls.detach, ["tab-a"]);
   releaseBrowser?.();
@@ -1586,7 +1602,7 @@ test("TC-055-07/08 escape help and tab chords stay local while Ctrl+] c sends a 
   assert.deepEqual(calls.input[1], { tabId: "tab-a", text: "\u0003" });
 
   host.emitInput(Uint8Array.of(0x1d, 0x3f));
-  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+C detach"), "trusted appbar should show local escape help");
+  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+C to agent"), "trusted appbar should show local escape help");
 
   host.emitInput(Uint8Array.of(0x1d));
   host.emitInput(Uint8Array.of(0x32, 0x42));
@@ -1616,15 +1632,16 @@ test("Ctrl+S cannot silently XOFF the remote PTY and explicit escape chords pres
   await coordinator.stop();
 });
 
-test("Ctrl+C keeps the Cuna frame visible through deterministic disconnect feedback before restore", async () => {
+test("observer: Ctrl+C keeps the Cuna frame visible through deterministic disconnect feedback before restore", async () => {
   let releaseDetach;
   const detachGate = new Promise((resolve) => { releaseDetach = resolve; });
-  const { coordinator, calls, host, intents } = harness({
+  const { callbacks, coordinator, calls, host, intents } = harness({
     detachGate,
     detachStateSequence: ["interrupted", "detached"],
     coordinatorOptions: { disconnectFrameMs: 1 },
   });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   const baselineWrites = host.writes.length;
   host.emitInput(Uint8Array.of(0x03));
   await waitUntil(
@@ -1650,11 +1667,12 @@ test("Ctrl+C keeps the Cuna frame visible through deterministic disconnect feedb
   assert.equal(coordinator.failure, undefined);
 });
 
-test("rich no-color keeps disconnect feedback while emitting no color SGR", async () => {
-  const { coordinator, host, intents } = harness({
+test("observer: rich no-color keeps disconnect feedback while emitting no color SGR", async () => {
+  const { callbacks, coordinator, host, intents } = harness({
     coordinatorOptions: { color: false, disconnectFrameMs: 1 },
   });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   const baselineWrites = host.writes.length;
   host.emitInput(Uint8Array.of(0x03));
   await coordinator.waitForStop();
@@ -1665,13 +1683,14 @@ test("rich no-color keeps disconnect feedback while emitting no color SGR", asyn
   assert.equal(colorSgr.test(closing), false);
 });
 
-test("a detach failure never paints Disconnected or becomes a successful rich close", async () => {
+test("observer: a detach failure never paints Disconnected or becomes a successful rich close", async () => {
   const detachError = new Error("remote detach rejected");
-  const { coordinator, host, intents } = harness({
+  const { callbacks, coordinator, host, intents } = harness({
     detachError,
     coordinatorOptions: { disconnectFrameMs: 1 },
   });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   const baselineWrites = host.writes.length;
   host.emitInput(Uint8Array.of(0x03));
   await assert.rejects(coordinator.waitForStop(), /cleanup was incomplete/u);
@@ -1682,9 +1701,11 @@ test("a detach failure never paints Disconnected or becomes a successful rich cl
   assert.equal(host.restored, 1);
 });
 
-test("closing animation is best-effort when one decorative host frame fails", async () => {
-  const { coordinator, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+test("observer: closing animation is best-effort when one decorative host frame fails", async () => {
+  const { callbacks, coordinator, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+  await waitForScreen(host, /Read-only|observ/iu, "the observer frame is painted before a frame may fail");
   host.failWriteAt = host.writeAttempts + 1;
   host.emitInput(Uint8Array.of(0x03));
   await coordinator.waitForStop();
@@ -1693,7 +1714,7 @@ test("closing animation is best-effort when one decorative host frame fails", as
   assert.equal(host.writes.some((bytes) => decoder.decode(bytes).includes("Disconnected.")), true);
 });
 
-test("rich Ctrl+C intent wins a transport close before its queued detach executes", async () => {
+test("observer: rich Ctrl+C intent wins a transport close before its queued detach executes", async () => {
   let releaseInput;
   const inputGate = new Promise((resolve) => { releaseInput = resolve; });
   const { coordinator, callbacks, calls, host, intents } = harness({
@@ -1701,6 +1722,7 @@ test("rich Ctrl+C intent wins a transport close before its queued detach execute
     coordinatorOptions: { disconnectFrameMs: 1 },
   });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   host.emitInput(Uint8Array.of(0x41));
   await waitUntil(() => calls.input.length === 1, "the earlier rich input should hold the serialized tail");
 
@@ -1724,9 +1746,10 @@ test("rich Ctrl+C intent wins a transport close before its queued detach execute
   assert.equal(host.restored, 1);
 });
 
-test("Ctrl+C on one rich tab returns to its sibling without restoring the workbench", async () => {
-  const { coordinator, calls, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+test("observer: Ctrl+C on one rich tab returns to its sibling without restoring the workbench", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
   await coordinator.start(intents);
+  for (const intent of intents) callbacks.onTerminalState({ ...snapshot(intent), accessMode: "observer", writerEpoch: 2 });
   const baselineWrites = host.writes.length;
   host.emitInput(Uint8Array.of(0x03));
   await waitUntil(() => calls.switch.includes("tab-b"), "the sibling should become active after local close");
@@ -1804,7 +1827,7 @@ test("remote fullscreen output waits for VTE resize before composing a narrower 
   assert.match(frame, /provider-frame/u);
   assert.equal(coordinator.state, "active");
 
-  host.emitInput(Uint8Array.of(0x03));
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
   await coordinator.waitForStop();
   assert.equal(host.restored, 1);
   assert.equal(coordinator.failure, undefined);
@@ -3293,6 +3316,20 @@ const addressedRows = (text, columns, firstRow = 1) => {
   return bytes;
 };
 
+/** Host cells painted in inverse video, as the selection highlight is. */
+async function inverseCells(host) {
+  const terminal = new xterm.Terminal({ cols: host.columns, rows: host.rows, allowProposedApi: true });
+  try {
+    for (const bytes of host.writes) await new Promise(resolve => terminal.write(bytes, resolve));
+    let count = 0;
+    for (let row = 0; row < host.rows; row += 1) {
+      const line = terminal.buffer.active.getLine(row);
+      for (let column = 0; column < host.columns; column += 1) if (line?.getCell(column)?.isInverse()) count += 1;
+    }
+    return count;
+  } finally { terminal.dispose(); }
+}
+
 async function waitForScreen(host, pattern, message) {
   for (let attempt = 0; attempt < 200; attempt += 1) {
     if (pattern.test(await visibleHostText(host))) return;
@@ -3403,6 +3440,130 @@ test("an observer selects even when the writer's program asked for the mouse, an
     await waitUntil(() => copied.length === 1, "an observer's drag copies");
     assert.equal(copied[0], "observed text");
     assert.deepEqual(calls.input, []);
+  } finally { await coordinator.stop(); }
+});
+
+// Owner 2026-09-29: Ctrl+C detached a writer instead of interrupting the
+// agent, as in no other terminal. A writer's control keys go to the PTY; only
+// the Ctrl+] prefix detaches it. An observer, who sends nothing, detaches on
+// Ctrl+C. Over a shown Cuna selection Ctrl+C copies, in both seats.
+test("a writer's Ctrl+C, Ctrl+Z and Ctrl+\\ reach the agent's PTY; only Ctrl+] d detaches", async () => {
+  const { coordinator, calls, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+  await coordinator.start(intents.slice(0, 1));
+  for (const [label, byte] of [["Ctrl+C", 0x03], ["Ctrl+Z", 0x1a], ["Ctrl+\\", 0x1c], ["Ctrl+D", 0x04]]) {
+    const before = calls.input.length;
+    host.emitInput(Uint8Array.of(byte));
+    await waitUntil(() => calls.input.length === before + 1, `${label} reaches the PTY`);
+    assert.deepEqual(calls.input.at(-1), { tabId: "tab-a", text: String.fromCharCode(byte) }, `${label} is sent unchanged, on its own`);
+  }
+  host.emitInput(Uint8Array.of(0x03, 0x03));
+  await waitUntil(() => calls.input.length === 5, "a chunk of two Ctrl+C reaches the PTY");
+  assert.equal(calls.input.at(-1).text, "\u0003\u0003");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(calls.detach, [], "no control key detaches a writer");
+  assert.equal(coordinator.state, "active");
+  assert.equal(host.writes.some((bytes) => decoder.decode(bytes).includes("Disconnecting")), false);
+  host.emitInput(Uint8Array.of(0x1d));
+  host.emitInput(encoder.encode("d"));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  assert.equal(calls.input.length, 5, "the detach chord sends nothing");
+  assert.equal(coordinator.failure, undefined);
+  const closing = host.writes.map((bytes) => decoder.decode(bytes));
+  assert.equal(closing.some((frame) => frame.includes("✦ Disconnecting...")), true, "the chord acknowledges the detach as Ctrl+C did");
+  assert.equal(closing.some((frame) => frame.includes("✓ Disconnected.")), true);
+});
+
+test("an observer's Ctrl+C detaches and sends nothing; Ctrl+] d detaches an observer too", async () => {
+  for (const [label, keys] of [["Ctrl+C", [Uint8Array.of(0x03)]], ["Ctrl+] d", [Uint8Array.of(0x1d), encoder.encode("d")]]]) {
+    const { coordinator, callbacks, calls, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+    await coordinator.start(intents.slice(0, 1));
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+    for (const bytes of keys) host.emitInput(bytes);
+    await coordinator.waitForStop();
+    assert.deepEqual(calls.detach, ["tab-a"], `${label} detaches the observer`);
+    assert.deepEqual(calls.input, [], `${label} sends nothing`);
+    assert.equal(coordinator.failure, undefined);
+  }
+});
+
+test("Ctrl+C over a shown selection copies it, clears it and sends nothing; the next Ctrl+C is the seat's", async () => {
+  for (const accessMode of ["writer", "observer"]) {
+    const { coordinator, callbacks, host, intents, copied, calls } = await selectionHarness(
+      { disconnectFrameMs: 1 },
+      (_intents, fakeHost) => { fakeHost.columns = 140; },
+    );
+    try {
+      if (accessMode === "observer") callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode, writerEpoch: 2 });
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("\u001b[2J\u001b[Hselected words here")));
+      host.emitInput(mouse(0, 1, 3));
+      host.emitInput(mouse(32, 14, 3));
+      host.emitInput(mouse(0, 14, 3, true));
+      await waitUntil(() => copied.length === 1, `${accessMode}: release copies`);
+      await waitForScreen(host, /Drag to select · Ctrl\+C copy/u, `${accessMode}: a shown selection names its copy key`);
+      assert.equal(await inverseCells(host), 14, `${accessMode}: the selection is highlighted before Ctrl+C`);
+      const osc52Before = host.writes.filter((bytes) => decoder.decode(bytes).startsWith("\u001b]52;c;")).length;
+      host.emitInput(Uint8Array.of(0x03));
+      await waitUntil(() => copied.length === 2, `${accessMode}: Ctrl+C copies the selection`);
+      assert.equal(copied[1], "selected words");
+      await waitUntil(() => host.writes.filter((bytes) => decoder.decode(bytes).startsWith("\u001b]52;c;")).length === osc52Before + 1,
+        `${accessMode}: Ctrl+C offers the host clipboard the same text`);
+      for (let attempt = 0; attempt < 200 && await inverseCells(host) > 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(await inverseCells(host), 0, `${accessMode}: the highlight is cleared`);
+      assert.match(await visibleHostText(host), /Copied 14 characters/u, `${accessMode}: the copy is confirmed`);
+      assert.doesNotMatch(await visibleHostText(host), /Drag to select · Ctrl\+C copy/u, `${accessMode}: the hint leaves with the selection`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(calls.input, [], `${accessMode}: nothing reaches the agent`);
+      assert.deepEqual(calls.detach, [], `${accessMode}: Ctrl+C over a selection never detaches`);
+      host.emitInput(Uint8Array.of(0x03));
+      if (accessMode === "writer") {
+        await waitUntil(() => calls.input.length === 1, "without a selection a writer's Ctrl+C reaches the PTY");
+        assert.equal(calls.input[0].text, "\u0003");
+        assert.deepEqual(calls.detach, []);
+        assert.equal(copied.length, 2);
+      } else {
+        await coordinator.waitForStop();
+        assert.deepEqual(calls.detach, ["tab-a"], "without a selection an observer's Ctrl+C detaches");
+        assert.deepEqual(calls.input, []);
+      }
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("DISCRIMINATING CONTROL: a selection scrolled out of view does not take Ctrl+C", async () => {
+  const { coordinator, callbacks, host, intents, copied, calls } = await selectionHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("\u001b[2J\u001b[Hselected words here")));
+    host.emitInput(mouse(0, 1, 3));
+    host.emitInput(mouse(32, 14, 3));
+    host.emitInput(mouse(0, 14, 3, true));
+    await waitUntil(() => copied.length === 1, "release copies");
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(Array.from({ length: 40 }, (_, index) => `\r\nline ${index}`).join(""))));
+    await waitForScreen(host, /line 39/u, "the selected row scrolls out of the view");
+    host.emitInput(Uint8Array.of(0x03));
+    await waitUntil(() => calls.input.length === 1, "the unseen selection leaves Ctrl+C to the agent");
+    assert.equal(calls.input[0].text, "\u0003");
+    assert.equal(copied.length, 1);
+    assert.deepEqual(calls.detach, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("help names Ctrl+C by seat: to the agent for a writer, detach only for an observer", async () => {
+  const { coordinator, callbacks, host, intents } = harness({ host: Object.assign(new FakeHost(), { columns: 400 }) });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: "), "help opens for the writer");
+    const writerHelp = decoder.decode(host.writes.at(-1));
+    assert.match(writerHelp, /Keys: Ctrl\+C to agent \|/u);
+    assert.doesNotMatch(writerHelp, /Ctrl\+C detach/u);
+    assert.match(writerHelp, /\| d detach/u, "the writer's detach is the chord");
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => !decoder.decode(host.writes.at(-1)).includes("Keys: "), "help closes");
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: "), "help opens for the observer");
+    assert.match(decoder.decode(host.writes.at(-1)), /Keys: Ctrl\+C detach \|/u);
   } finally { await coordinator.stop(); }
 });
 

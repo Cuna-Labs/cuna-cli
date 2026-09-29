@@ -171,6 +171,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
         input.columns,
         input.mouseReporting === true,
         input.remoteMouse === true,
+        input.selection !== undefined && input.selection.length > 0,
       ),
     ];
   } else {
@@ -365,17 +366,23 @@ function renderTabRow(
   return { line, targets: Object.freeze(targets) };
 }
 
-/** Windows hosts get the copy/paste keys on the right of the second row when they fit. */
-function withClipboardHint(line: string, columns: number, mouseReporting: boolean, remoteMouse: boolean): string {
-  if (process.platform !== "win32") return line;
+/**
+ * Windows hosts get the copy/paste keys on the right of the second row when
+ * they fit. A shown Cuna selection gets its copy key on every host: that
+ * Ctrl+C is Cuna's, not the host terminal's.
+ */
+function withClipboardHint(line: string, columns: number, mouseReporting: boolean, remoteMouse: boolean, selected: boolean): string {
+  if (process.platform !== "win32" && !selected) return line;
   // Cuna reports the mouse so the bar is clickable; it then selects on a
   // plain drag itself, unless the remote program asked for the mouse. Only
   // then is the host's own Shift+drag the way to select.
-  const hint = !mouseReporting
-    ? "Select text: Ctrl+Shift+C copy | Ctrl+Shift+V paste"
-    : remoteMouse
-      ? "Agent uses the mouse: Shift+drag select | Ctrl+Shift+C copy | Ctrl+Shift+V paste"
-      : "Drag to select and copy | Ctrl+click opens a link | Ctrl+Shift+V paste";
+  const hint = selected
+    ? "Drag to select · Ctrl+C copy"
+    : !mouseReporting
+      ? "Select text: Ctrl+Shift+C copy | Ctrl+Shift+V paste"
+      : remoteMouse
+        ? "Agent uses the mouse: Shift+drag select | Ctrl+Shift+C copy | Ctrl+Shift+V paste"
+        : "Drag to select and copy | Ctrl+click opens a link | Ctrl+Shift+V paste";
   const used = displayCellWidth(line.trimEnd());
   const start = columns - 1 - hint.length;
   if (start < used + 3) return line;

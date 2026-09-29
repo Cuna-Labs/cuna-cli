@@ -435,7 +435,9 @@ function agentHelp(command: "claude" | "codex" | "opencode"): string {
       "                            --new-session, --no-sync, --auth-mode or --credential-binding.",
       "",
       "Requires an interactive terminal; JSON and redirected output fail closed.",
-      "Ctrl+C detaches locally in one press. Use Ctrl+] c to send Ctrl+C to the agent.",
+      "With keyboard control, Ctrl+C goes to the agent and Ctrl+] d detaches.",
+      "A read-only view and the plain fallback detach on Ctrl+C.",
+      "Ctrl+C over a Cuna selection copies it instead.",
     ].join("\n"),
   );
 }

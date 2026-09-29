@@ -244,7 +244,7 @@ test("attach progress hands off before terminal ownership", async () => {
     clock: () => NOW,
   });
   await waitUntil(() => host.input !== undefined, "foreground ownership should start after preflight");
-  host.emitInput(Uint8Array.of(0x03));
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   assert.ok(events.indexOf(`get:${SESSION_A}`) < events.indexOf("progress:stop"));
   assert.ok(events.indexOf("progress:stop") < events.indexOf("host:acquire"));
@@ -867,7 +867,7 @@ test("terminal-connections POST remains attach authority when the local runtime 
     agentSessionIds: [SESSION_A],
   }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW });
   await waitUntil(() => events.includes(`grant:${SESSION_A}`) && events.includes("wire:connected"), "backend-authorized attach did not reach the terminal wire");
-  host.emitInput(Uint8Array.of(0x03));
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   assert.equal(events.filter((event) => event === `grant:${SESSION_A}`).length, 1);
   assert.equal(host.restored, 1);
@@ -1522,7 +1522,7 @@ test("TC-055-11 TERM=dumb selects one-session plain fallback without appbar byte
   await operation;
 });
 
-test("one capable Windows session uses persistent Cuna chrome and Ctrl+C detaches cleanly", async () => {
+test("one capable Windows session uses persistent Cuna chrome, sends a writer's Ctrl+C and detaches cleanly on Ctrl+] d", async () => {
   const events = [];
   const host = new FakeHost(events);
   const system = terminalSystem(events);
@@ -1542,6 +1542,11 @@ test("one capable Windows session uses persistent Cuna chrome and Ctrl+C detache
   assert.deepEqual(host.acquireModes, [undefined]);
   assert.match(new TextDecoder().decode(host.writes.at(-1)), / CUNA/u);
   host.emitInput(Uint8Array.of(0x03));
+  await waitUntil(() => system.sent.some((frame) => frame.type === "input" && [...frame.payload].join() === "3"),
+    "a writer's Ctrl+C should reach the PTY as one input frame");
+  assert.equal(host.restored, 0, "Ctrl+C must not detach a writer");
+  assert.equal(events.filter((event) => event.startsWith("wire:close:")).length, 0);
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
   await operation;
   assert.equal(host.restored, 1);
   assert.equal(events.filter((event) => event.startsWith("wire:close:")).length, 1);
@@ -1633,7 +1638,7 @@ test("default Windows foreground factory offers canonical views and waits for cu
     host.emitInput(Uint8Array.of(66));
     await waitUntil(()=>system.sent.some(f=>f.type==="input"),"ready view permits user input");
     assert.deepEqual([...system.sent.find(f=>f.type==="input").payload],[66]);
-  } finally {host.emitInput(Uint8Array.of(3));await operation;}
+  } finally {host.emitInput(Uint8Array.of(0x1d,0x64));await operation;}
 });
 
 /* -------------------------------------------------------------------------- */

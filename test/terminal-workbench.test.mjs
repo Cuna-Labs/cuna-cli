@@ -361,6 +361,17 @@ test("the copy/paste hint says a plain drag selects, and Shift+drag only while t
   assert.doesNotMatch(rowText(frame(false), 1), /Ctrl\+Shift/u);
 });
 
+test("a shown selection names its Ctrl+C copy key on every host, and only while it is shown", () => {
+  const frame = (selection) => renderWorkbenchFrame({
+    columns: 140, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
+    sessions: rosterSessions, activeSessionId: "session-claude", mouseReporting: true,
+    ...(selection === undefined ? {} : { selection }),
+  });
+  assert.match(rowText(frame([{ row: 0, start: 0, end: 5 }]), 2), /Claude auth authenticated.*Drag to select · Ctrl\+C copy $/u);
+  assert.doesNotMatch(rowText(frame(undefined), 2), /Ctrl\+C copy/u);
+  assert.doesNotMatch(rowText(frame([]), 2), /Ctrl\+C copy/u);
+});
+
 test("workbench safely re-emits VTE-parsed palette and RGB styles", () => {
   const registry = new ViewportRegistry();
   registry.open("styled", binding("styled"), 80, 4);

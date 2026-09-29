@@ -44,7 +44,7 @@ try{
  await wait(()=>screen().includes('CANONICAL_VIEW_4')&&!screen().includes('Restoring terminal'),'switch back to first session');
  actions.push({inputWritesHex:['1d','31'],writeGapMs:10,phase:'switchBackToFirstSession',screen:screen()});
  await key('A','INPUT_HEX 41');assert.equal(screen().match(/INPUT_HEX ([0-9a-f]+)/)?.[1],'41');
- child.write('\x03');await wait(()=>exit!==undefined,'detach');assert.equal(exit.exitCode,0);
+ child.write('\x1dd');await wait(()=>exit!==undefined,'detach');assert.equal(exit.exitCode,0);
  assert.match(raw,/CANONICAL_SWITCH_RECEIPT /u,'the synthetic transport did not attest the native tab sequence');
 }catch(error){failure=String(error);}
 finally{

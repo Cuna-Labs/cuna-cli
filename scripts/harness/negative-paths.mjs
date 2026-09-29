@@ -157,11 +157,20 @@ function attach(args, { cols = 120, rows = 30, label = args.join(" ") } = {}) {
     }
   }
 
-  /** Ctrl-C: production's documented detach key. Must not be assumed to kill the remote. */
+  /**
+   * Ctrl+] d: production's detach chord for a writer or an observer. A screen
+   * before the terminal (progress, pickers) still closes on Ctrl-C, which a
+   * writer's terminal would send to the agent, so it is only the fallback.
+   * Neither may be assumed to kill the remote.
+   */
   async function detach(timeoutMs = 15_000) {
     if (exitInfo !== undefined) return exitInfo;
-    child.write("\x03");
-    const result = await waitForExit(timeoutMs);
+    child.write("\x1dd");
+    let result = await waitForExit(Math.min(3_000, timeoutMs));
+    if (result === undefined) {
+      child.write("\x03");
+      result = await waitForExit(timeoutMs);
+    }
     if (result === undefined) {
       try { child.kill(); } catch { /* best effort local cleanup */ }
       return undefined;

@@ -447,7 +447,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   /**
-   * AgentSessions the person detached from on purpose (Ctrl+] d or Ctrl+C),
+   * AgentSessions the person detached from on purpose (Ctrl+] d, or an observer's Ctrl+C),
    * each confirmed by the runtime. A detach never terminates the remote
    * process, so the runner tells the person how to come back once the host
    * terminal is theirs again. Tabs detached by cleanup are not listed.
@@ -1266,6 +1266,31 @@ export class ForegroundTerminalCoordinator {
   }
 
   /**
+   * Ctrl+C over a Cuna selection the viewport shows copies it and clears the
+   * highlight, as a terminal's own selection does: nothing reaches the agent
+   * and nothing detaches. Ctrl+Shift+C arrives as the same byte. A selection
+   * scrolled out of view does not take the key the person cannot see it take.
+   */
+  #copyShownSelection(): boolean {
+    const selection = this.#selection;
+    const tab = selection === undefined || selection.tabId !== this.#activeTabId ? undefined : this.#tabs.get(selection.tabId);
+    if (selection === undefined || tab === undefined) return false;
+    const rows = this.#selectionRows(tab, admitForegroundDimensions(this.#options.host.dimensions()));
+    if (rows === undefined || rows.length === 0) return false;
+    this.#selection = undefined;
+    void this.#copySelection(tab, selection).catch(() => undefined);
+    return true;
+  }
+
+  /**
+   * Ctrl+C reaches the agent only through this client's writer seat. An
+   * observer, or a tab whose PTY input cannot reach it now, detaches instead.
+   */
+  #interruptDetaches(target: ForegroundInputTarget | undefined): boolean {
+    return target === undefined || this.#tabs.get(target.tabId)?.snapshot.accessMode !== "writer";
+  }
+
+  /**
    * Ctrl+click on a link opens it in this computer's browser, resolved as
    * Ctrl+] y resolves it: the provider's OSC 8 target first, then the rows the
    * screen joins into one link, never one row of a longer link. A click on a
@@ -1359,6 +1384,7 @@ export class ForegroundTerminalCoordinator {
       if (bytes.includes(INTERRUPT)) this.#switchRequest = undefined;
       return;
     }
+    if (bytes.byteLength === 1 && bytes[0] === INTERRUPT && this.#copyShownSelection()) return;
     if (this.#selection !== undefined) {
       // As in any terminal, typing ends the selection; its copy stays copied.
       this.#selection = undefined;
@@ -1455,9 +1481,12 @@ export class ForegroundTerminalCoordinator {
       this.#lastPrintableAt = undefined;
       this.#lastPrintableTarget = undefined;
     }
+    // Decided at receipt, on the seat the person saw when pressing the key.
+    const interruptDetaches = this.#interruptDetaches(receiptTarget);
     if (
       payload.byteLength === 1 &&
       payload[0] === INTERRUPT &&
+      interruptDetaches &&
       !this.#prefixPending &&
       receiptTarget !== undefined
     ) {
@@ -1480,7 +1509,7 @@ export class ForegroundTerminalCoordinator {
     // is even queued for the network.
     if (this.#predictAtReceipt(payload, receiptTarget, barrierChunk)) void this.#render().catch(() => undefined);
     this.#enqueueInput(payload, receiptTarget, receipt, barrierChunk, false,
-      receiptBrowserActionGeneration, receiptBrowserAction);
+      receiptBrowserActionGeneration, receiptBrowserAction, interruptDetaches);
   }
 
   #enqueueInput(
@@ -1491,12 +1520,13 @@ export class ForegroundTerminalCoordinator {
     counted = false,
     browserActionGeneration = this.#browserActionGenerationFor(receiptTarget),
     browserAction = this.#browserActionFor(receiptTarget),
+    interruptDetaches = this.#interruptDetaches(receiptTarget),
   ): void {
     if (!counted) this.#pendingInputBytes += payload.byteLength;
     const operation = this.#inputTail.then(async () => {
       try {
         await this.#routeInput(payload, receiptTarget, false, receipt,
-          browserActionGeneration, browserAction);
+          browserActionGeneration, browserAction, interruptDetaches);
       } finally {
         this.#pendingInputBytes -= payload.byteLength;
         if (barrierChunk) this.#unroutedBarrierChunks -= 1;
@@ -1568,6 +1598,7 @@ export class ForegroundTerminalCoordinator {
     receipt = 0,
     browserActionGeneration = this.#browserActionGenerationFor(receiptTarget),
     browserAction = this.#browserActionFor(receiptTarget),
+    interruptDetaches = this.#interruptDetaches(receiptTarget),
   ): Promise<void> {
     // Received after a switch was chosen (a chord processed ahead of it in
     // this queue): never sent, to either session.
@@ -1609,6 +1640,13 @@ export class ForegroundTerminalCoordinator {
     bytes = guarded.bytes;
     if (this.#browserNotice !== undefined) this.#browserNotice = undefined;
     this.#arrivalNotice = undefined;
+    if (!releasedPrefix && bytes.byteLength === 1 && bytes[0] === INTERRUPT && !this.#prefixPending) {
+      // A lone Ctrl+C is a key press, never part of a paste: it ends a paste
+      // that never received its end marker, so Ctrl+] is a chord again.
+      this.#pasteActive = false;
+      this.#pasteStartMatch = 0;
+      this.#pasteEndMatch = 0;
+    }
     let target = this.#prefixPending ? this.#prefixTarget : receiptTarget;
     let remote: number[] = [];
     const flush = async (): Promise<void> => {
@@ -1644,7 +1682,7 @@ export class ForegroundTerminalCoordinator {
           await runtime.sendInput(Uint8Array.of(FLOW_RESUME), target.tabId, target.binding);
           this.#browserNotice = FLOW_CONTROL_NOTICE;
           await this.#render();
-        } else if (byte === INTERRUPT) {
+        } else if (byte === INTERRUPT && interruptDetaches) {
           await flush();
           await this.#detachTab(target?.tabId);
           return;
@@ -1708,7 +1746,13 @@ export class ForegroundTerminalCoordinator {
         target = this.#captureInputTarget();
       } else if (byte === DETACH) {
         await flush();
-        await this.#detachTab(chordTarget?.tabId);
+        // The writer's one way out acknowledges itself as Ctrl+C does.
+        const closing = chordTarget?.tabId ?? this.#activeTabId;
+        if (closing !== undefined) {
+          this.#closingTabId = closing;
+          this.#disconnectNotice = DISCONNECTING_FRAMES[0];
+        }
+        await this.#detachTab(closing);
         return;
       } else if (byte === HELP) {
         await flush();
@@ -2745,7 +2789,8 @@ export class ForegroundTerminalCoordinator {
               : (this.#tabs.get(activeTabId)?.viewport.scrollOffset ?? 0) > 0
                 ? { notice: scrolledBackNotice(this.#tabs.get(activeTabId)?.viewport.scrollOffset ?? 0) }
               : this.#helpVisible
-                ? { notice: "Keys: Ctrl+C detach | " + (remoteMouse ? "Shift+drag select | " : "Drag select + copy | Ctrl+click open link | ") + (process.platform === "win32" ? "Ctrl+Shift+V paste | " : "") + "Wheel scroll | Ctrl+S keep active | Ctrl+] c/s/q remote | " + (this.#rosterActive() ? "1-9 or click switch session" : "1-4 tab") + " | n next | r retry" +
+                ? { notice: "Keys: " + (this.#tabs.get(activeTabId)?.snapshot.accessMode === "writer" ? "Ctrl+C to agent | " : "Ctrl+C detach | ") +
+                    (remoteMouse ? "Shift+drag select | " : "Drag select, Ctrl+C copy | Ctrl+click open link | ") + (process.platform === "win32" ? "Ctrl+Shift+V paste | " : "") + "Wheel scroll | Ctrl+S keep active | Ctrl+] c/s/q remote | " + (this.#rosterActive() ? "1-9 or click switch session" : "1-4 tab") + " | n next | r retry" +
                     (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
                       ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"

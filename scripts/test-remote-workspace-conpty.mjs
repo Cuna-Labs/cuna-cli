@@ -32,7 +32,7 @@ try {
         await writeFile(gate,'ready');
         if(mode==='ready'){
           await wait(()=>screen().includes('REMOTE_MENU_ATTACHED'),'Exact session entered foreground');
-          send('\x03');
+          send('\x1dd');
         }
       }
       await Promise.race([exited,new Promise((_,reject)=>{const t=setTimeout(()=>reject(new Error('process did not exit')),10000);t.unref();})]);
