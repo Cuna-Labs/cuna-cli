@@ -109,6 +109,31 @@ test("observer host projection clips complete styled cells without reflowing the
   } finally { viewport.dispose(); }
 });
 
+test("an observer projection narrower than the writer marks every cut row and keeps fitting rows whole", async () => {
+  // Owner 2026-09-28: a writer wider than this window lost the end of every
+  // long row with nothing on screen saying so. The projection cannot show the
+  // columns (an observer never resizes the writer's PTY); it must say which
+  // rows continue, and give up exactly one cell per cut row for that marker.
+  const { viewport } = adapter({ columns: 200, rows: 6 });
+  try {
+    const long = Array.from({ length: 200 }, (_, index) => String.fromCharCode(97 + (index % 26))).join("");
+    const exact = "e".repeat(186);
+    await viewport.write(encoder.encode(`${long}\r\nshort\r\n${exact}\r\n${"w".repeat(184)}中x`), 1n, 1n);
+    const projected = viewport.snapshotForHost(186, 6);
+    assert.deepEqual(projected.continuedRows, [true, false, false, true, false, false]);
+    assert.equal(projected.cells[0], long.slice(0, 185), "a cut row gives up only its last cell, for the marker");
+    assert.equal(projected.displayWidths[0], 185);
+    assert.equal(projected.cells[1], "short");
+    assert.equal(projected.cells[2], exact, "a row that ends exactly at the window edge is whole, not marked");
+    assert.equal(projected.cells[3], "w".repeat(184), "a wide glyph that would reach the marker cell is excluded whole");
+    assert.equal(projected.renderRows[0].reduce((n, run) => n + run.width, 0), 185);
+
+    const fitting = viewport.snapshotForHost(200, 6);
+    assert.equal(fitting.continuedRows, undefined, "a window as wide as the writer projects no cut rows");
+    assert.equal(fitting.cells[0], long);
+  } finally { viewport.dispose(); }
+});
+
 test("observer host projection keeps the writer's live region visible when the host frame is shorter", async () => {
   const { viewport } = adapter({ columns: 40, rows: 30 });
   const paint = (cursorRow) => {

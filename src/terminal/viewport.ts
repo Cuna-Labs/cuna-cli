@@ -61,6 +61,12 @@ export interface ViewportSnapshot {
   readonly renderRows?: readonly (readonly ViewportRenderRun[])[];
   /** Display columns occupied by each rendered row, as measured by the VTE. */
   readonly displayWidths: readonly number[];
+  /**
+   * Host projections only: rows whose terminal content continues past the
+   * projected width. The projection keeps the last column free for a marker,
+   * so a row the host cannot show whole is never cut without saying so.
+   */
+  readonly continuedRows?: readonly boolean[];
   readonly cursorX: number;
   readonly cursorY: number;
   readonly modes: ViewportModes;

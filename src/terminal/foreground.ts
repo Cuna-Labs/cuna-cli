@@ -28,6 +28,7 @@ import { assertCanonicalUuid } from "../core/validation.js";
 import { buildAppbarModel, type AppbarModel, type StatusEvidence } from "./appbar.js";
 import { PredictiveEcho, type PredictiveEchoMode } from "./predictive-echo.js";
 import {
+  CONTINUED_MARKER,
   renderWorkbenchFrame,
   workbenchAppbarTargetAt,
   workbenchUpdate,
@@ -2429,6 +2430,10 @@ export class ForegroundTerminalCoordinator {
         this.#queueResize();
         return;
       }
+      // An observer's VTE holds the writer's geometry; whatever it has beyond
+      // this window's width is cut from every row that reaches that far.
+      const hiddenColumns = this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer"
+        ? Math.max(0, activeViewport.columns - dimensions.columns) : 0;
       const tabs = [...this.#tabs.values()].map((tab): WorkbenchTab => Object.freeze({
         id: tab.intent.tabId,
         label: tab.intent.label,
@@ -2468,7 +2473,7 @@ export class ForegroundTerminalCoordinator {
                 (this.#browserNotice === INPUT_WITHHELD_NOTICE || isReconnectFailedNotice(this.#browserNotice))
               ? `${HISTORICAL_INPUT_NOTICE} · ${this.#browserNotice}` : this.#browserNotice }
           : this.#arrivalNotice !== undefined
-            ? { notice: this.#withSeat(this.#tabs.get(activeTabId)?.snapshot, this.#arrivalNotice) }
+            ? { notice: this.#withSeat(this.#tabs.get(activeTabId)?.snapshot, this.#arrivalNotice, hiddenColumns) }
             : this.#pendingBrowserAction !== undefined && this.#pendingBrowserActionTabId === activeTabId
               ? {
                 notice: this.#pendingBrowserAction.type === "auth.device.present"
@@ -2485,8 +2490,8 @@ export class ForegroundTerminalCoordinator {
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
                       ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"
                       : "") + " | a retained sign-in link | d detach" }
-                : this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) !== undefined
-                  ? { notice: this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot) as string }
+                : this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot, hiddenColumns) !== undefined
+                  ? { notice: this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot, hiddenColumns) as string }
                   : this.#retainedBrowserCandidates.has(activeTabId)
                     ? { notice: "Sign-in link in history · Ctrl+] a to inspect · if rejected, request a new link in the provider" }
                     : {}),
@@ -2752,13 +2757,18 @@ export class ForegroundTerminalCoordinator {
   }
 
   /** The seat first, so a narrow row truncates the other line, never the seat. */
-  #withSeat(snapshot: RuntimeTerminalSnapshot | undefined, line: string): string {
-    const seat = this.#seatNoticeFor(snapshot) ??
+  #withSeat(snapshot: RuntimeTerminalSnapshot | undefined, line: string, hiddenColumns = 0): string {
+    const seat = this.#seatNoticeFor(snapshot, hiddenColumns) ??
       (snapshot?.state === "active" && snapshot.accessMode === "writer" ? "You have control" : undefined);
     return seat === undefined ? line : `${seat} · ${line}`;
   }
 
-  #seatNoticeFor(snapshot: RuntimeTerminalSnapshot | undefined): string | undefined {
+  /**
+   * `hiddenColumns` is how much wider the writer's screen is than this
+   * window. An observer never resizes the writer's PTY, so those columns are
+   * cut; say so beside the seat rather than letting the rows look complete.
+   */
+  #seatNoticeFor(snapshot: RuntimeTerminalSnapshot | undefined, hiddenColumns = 0): string | undefined {
     const historical = snapshot?.historicalInputUncertainty === true ? HISTORICAL_INPUT_NOTICE : undefined;
     const withHistory = (notice: string | undefined) => historical === undefined ? notice :
       notice === undefined ? historical : `${historical} · ${notice}`;
@@ -2766,12 +2776,13 @@ export class ForegroundTerminalCoordinator {
     if (snapshot === undefined || snapshot.state !== "active" || snapshot.accessMode !== "observer") return historical;
     const refusal = writerCapabilityRefusal(snapshot);
     if (refusal !== undefined) return withHistory(refusal);
-    if (writerCapabilityNeedsRefresh(snapshot)) return withHistory("Observing (read-only) · Press Ctrl+] then w to recheck control");
+    const cut = hiddenColumns > 0 ? ` · ${widerViewNotice(hiddenColumns)}` : "";
+    if (writerCapabilityNeedsRefresh(snapshot)) return withHistory(`Observing (read-only)${cut} · Press Ctrl+] then w to recheck control`);
     return withHistory(snapshot.reason === "writer_transferred"
-      ? "Control moved to another client · Press Ctrl+] then w to take it back"
+      ? `Control moved to another client${cut} · Press Ctrl+] then w to take it back`
       : snapshot.geometry == null
         ? "Observing (read-only) · geometry unknown · Ctrl+] then w: control"
-        : "Observing (read-only) · Press Ctrl+] then w to take control");
+        : `Observing (read-only)${cut} · Press Ctrl+] then w to take control`);
   }
 }
 
@@ -2846,6 +2857,10 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 
 function scrolledBackNotice(lines: number): string {
   return `Scrolled back ${lines} line${lines === 1 ? "" : "s"} · scroll down or type to return`;
+}
+
+function widerViewNotice(columns: number): string {
+  return `view is ${columns} column${columns === 1 ? "" : "s"} wider than this window (${CONTINUED_MARKER} marks cut rows)`;
 }
 
 /** Guesses belong to one exact writer attachment at one geometry. */

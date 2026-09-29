@@ -382,3 +382,31 @@ test("workbench safely re-emits VTE-parsed palette and RGB styles", () => {
   assert.match(plain.text, /orange rgb/u);
   assert.doesNotMatch(plain.text, /38;5;208|38;2;10;20;30/u);
 });
+
+test("a cut observer row ends in Cuna's marker in the last cell, and a row may not claim that cell", async () => {
+  const { renderBareViewport } = await import("../dist/terminal/workbench.js");
+  const render = async (bytes, columns, rows) => {
+    const terminal = new xterm.Terminal({ cols: columns, rows, allowProposedApi: true });
+    try {
+      await new Promise(resolve => terminal.write(bytes, resolve));
+      return Array.from({ length: rows }, (_, row) => terminal.buffer.active.getLine(row)?.translateToString(true) ?? "");
+    } finally { terminal.dispose(); }
+  };
+  const allTabs = tabs();
+  const cut = "c".repeat(79);
+  const viewport = { ...allTabs[0].viewport, cells: [cut, "whole"], renderRows: undefined, displayWidths: [79, 5],
+    continuedRows: [true, false], cursorX: 0, cursorY: 1 };
+  for (const color of [true, false]) {
+    const frame = renderWorkbenchFrame({ columns: 80, rows: 24, tabs: [{ ...allTabs[0], viewport }, allTabs[1]],
+      activeTabId: allTabs[0].id, appbar: model(), color });
+    const screen = await render(frame.bytes, 80, 24);
+    assert.equal(screen[2], `${cut}›`, `workbench, color ${color}`);
+    assert.equal(screen[3], "whole");
+  }
+  const bare = await render(renderBareViewport({ ...viewport, columns: 80, rows: 4 }), 80, 4);
+  assert.equal(bare[0], `${cut}›`, "the plain observer draws the same marker");
+  assert.equal(bare[1], "whole");
+  assert.throws(() => renderWorkbenchFrame({ columns: 80, rows: 24,
+    tabs: [{ ...allTabs[0], viewport: { ...viewport, cells: ["c".repeat(80), "whole"], displayWidths: [80, 5] } }, allTabs[1]],
+    activeTabId: allTabs[0].id, appbar: model() }), WorkbenchRenderError, "a cut row cannot also fill the marker's cell");
+});

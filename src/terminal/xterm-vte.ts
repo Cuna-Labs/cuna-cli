@@ -1,6 +1,6 @@
 import xtermHeadless from "@xterm/headless";
 
-import type { IBufferCell, Terminal as XtermTerminal } from "@xterm/headless";
+import type { IBufferCell, IBufferLine, Terminal as XtermTerminal } from "@xterm/headless";
 
 import { MAX_TERMINAL_FRAME_BYTES } from "./codec.js";
 import type { RemoteMouseReporting } from "./host-mouse.js";
@@ -529,6 +529,12 @@ export class XtermViewportAdapter {
     const renderRows: ViewportRenderRun[][] = [];
     const columns = Math.min(this.#terminal.cols, host?.columns ?? this.#terminal.cols);
     const rows = Math.min(this.#terminal.rows, host?.rows ?? this.#terminal.rows);
+    // A host narrower than the writer's screen cannot show every column, and
+    // an observer must not resize the writer's PTY to fit. A row whose content
+    // continues past the host edge gives up its last cell to a marker, so no
+    // character is ever hidden without saying so. Rows that fit stay whole.
+    const clipped = host !== undefined && this.#terminal.cols > host.columns;
+    const continuedRows: boolean[] = [];
     // A host frame shorter than the writer's screen shows a window onto that
     // screen, not its first rows. Terminals are bottom-anchored: the live
     // region -- prompt, status line, newest output -- sits at the cursor.
@@ -539,21 +545,11 @@ export class XtermViewportAdapter {
     const top = Math.max(0, buffer.viewportY + rowOffset - scrollOffset);
     for (let row = 0; row < rows; row += 1) {
       const line = buffer.getLine(top + row);
-      let visibleWidth = 0;
-      if (line !== undefined) {
-        for (let column = 0; column < columns; column += 1) {
-          const cell = line.getCell(column);
-          const width = cell?.getWidth() ?? 1;
-          if (width === 0) continue;
-          // Do not expose half a wide glyph at the physical host edge.
-          if (column + width > columns) break;
-          const characters = cell?.getChars() ?? "";
-          // An explicit space is content and may be the final glyph before a
-          // split UTF-8 sequence. Only untouched empty cells are invisible.
-          if (characters !== "" || cell?.isAttributeDefault() === false) {
-            visibleWidth = column + Math.max(1, cell?.getWidth() ?? 1);
-          }
-        }
+      let visibleWidth = line === undefined ? 0 : occupiedWidth(line, columns);
+      if (clipped) {
+        const continued = line !== undefined && occupiedWidth(line, this.#terminal.cols) > columns;
+        if (continued) visibleWidth = occupiedWidth(line, columns - 1);
+        continuedRows.push(continued);
       }
       // Bound the plain-text projection to the same authoritative terminal
       // columns as the styled runs. `trimRight=true` would discard a real
@@ -602,13 +598,15 @@ export class XtermViewportAdapter {
       // offset maps the real row, and a cursor outside the clipped width is
       // genuinely off this host frame and stays hidden.
       const projectedCursorY = frame.cursorY - rowOffset + (buffer.viewportY + rowOffset - top);
+      const cursorColumns = continuedRows[projectedCursorY] === true ? columns - 1 : columns;
       return Object.freeze({ ...frame, columns: host.columns, rows: host.rows,
         cells: Object.freeze(cells), displayWidths: Object.freeze(displayWidths),
         renderRows: Object.freeze(renderRows.map(row => Object.freeze(row.map(run => Object.freeze(run))))),
+        ...(clipped ? { continuedRows: Object.freeze(continuedRows) } : {}),
         cursorX: Math.min(host.columns - 1, frame.cursorX),
         cursorY: projectedCursorY < 0 || projectedCursorY >= rows ? 0 : projectedCursorY,
         modes: Object.freeze({ ...frame.modes, cursorVisible: frame.modes.cursorVisible && scrollOffset === 0 &&
-          frame.cursorX < columns && projectedCursorY >= 0 && projectedCursorY < rows }),
+          frame.cursorX < cursorColumns && projectedCursorY >= 0 && projectedCursorY < rows }),
       });
     }
     return localReflow
@@ -619,6 +617,25 @@ export class XtermViewportAdapter {
   #assertOpen(): void {
     if (this.#disposed) throw new Error("The xterm viewport adapter is disposed.");
   }
+}
+
+/** Display columns a line occupies within its first `limit` cells. */
+function occupiedWidth(line: IBufferLine, limit: number): number {
+  let visibleWidth = 0;
+  for (let column = 0; column < limit; column += 1) {
+    const cell = line.getCell(column);
+    const width = cell?.getWidth() ?? 1;
+    if (width === 0) continue;
+    // Do not expose half a wide glyph at the physical host edge.
+    if (column + width > limit) break;
+    const characters = cell?.getChars() ?? "";
+    // An explicit space is content and may be the final glyph before a
+    // split UTF-8 sequence. Only untouched empty cells are invisible.
+    if (characters !== "" || cell?.isAttributeDefault() === false) {
+      visibleWidth = column + Math.max(1, width);
+    }
+  }
+  return visibleWidth;
 }
 
 const DEFAULT_CELL_STYLE: ViewportCellStyle = Object.freeze({

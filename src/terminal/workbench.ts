@@ -6,6 +6,8 @@ const CUNA_ORANGE = "48;2;235;86;37";
 const CUNA_ORANGE_DARK = "48;2;121;48;25";
 const WHITE = "38;2;255;255;255";
 const MUTED = "38;2;224;210;203";
+/** Marks a row whose writer content continues past the right edge of this window. */
+export const CONTINUED_MARKER = "›";
 const GRAPHEME_SEGMENTER = new Intl.Segmenter("en", { granularity: "grapheme" });
 
 export interface WorkbenchTab {
@@ -102,9 +104,12 @@ export function renderBareViewport(viewport: ViewportSnapshot, notice?: string):
     const cell = viewport.cells[row] ?? "";
     const width = viewport.displayWidths[row] ?? 0;
     const runs = viewport.renderRows?.[row];
-    assertViewportCell(cell, width, viewport.columns);
-    if (runs !== undefined) assertViewportRenderRuns(runs, cell, width, viewport.columns);
-    text += `${ESC}${row + 1};1H${ESC}0m${ESC}2K${runs === undefined ? cell : renderStyledRuns(runs)}`;
+    const continued = viewport.continuedRows?.[row] === true;
+    const cellColumns = continued ? viewport.columns - 1 : viewport.columns;
+    assertViewportCell(cell, width, cellColumns);
+    if (runs !== undefined) assertViewportRenderRuns(runs, cell, width, cellColumns);
+    text += `${ESC}${row + 1};1H${ESC}0m${ESC}2K${runs === undefined ? cell : renderStyledRuns(runs)}` +
+      (continued ? continuedMarker(row + 1, viewport.columns, false) : "");
   }
   for (let index = 0; index < notices.length; index += 1) {
     text += `${ESC}${contentRows + index + 1};1H${ESC}0m${ESC}2K${notices[index]}`;
@@ -162,11 +167,14 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
   for (let row = 0; row < viewportRows; row += 1) {
     const cell = cells[row] ?? "";
     const displayWidth = active.viewport.displayWidths[row] ?? 0;
-    assertViewportCell(cell, displayWidth, input.columns);
+    const continued = active.viewport.continuedRows?.[row] === true;
+    const cellColumns = continued ? input.columns - 1 : input.columns;
+    assertViewportCell(cell, displayWidth, cellColumns);
     const renderRuns = active.viewport.renderRows?.[row];
-    if (renderRuns !== undefined) assertViewportRenderRuns(renderRuns, cell, displayWidth, input.columns);
+    if (renderRuns !== undefined) assertViewportRenderRuns(renderRuns, cell, displayWidth, cellColumns);
     const rendered = renderRuns === undefined || !color ? cell : renderStyledRuns(renderRuns);
-    rowCommands.push(`${ESC}${appbarRows + row + 1};1H${ESC}0m${ESC}2K${rendered}`);
+    rowCommands.push(`${ESC}${appbarRows + row + 1};1H${ESC}0m${ESC}2K${rendered}` +
+      (continued ? continuedMarker(appbarRows + row + 1, input.columns, color) : ""));
   }
   const cursorRow = Math.min(viewportRows - 1, Math.max(0, active.viewport.cursorY));
   const cursorColumn = Math.min(input.columns - 1, Math.max(0, active.viewport.cursorX));
@@ -497,6 +505,15 @@ function assertViewportStyle(style: ViewportCellStyle): void {
       throw new WorkbenchRenderError("binding_mismatch", "A viewport color is outside its admitted range.");
     }
   }
+}
+
+/**
+ * Trusted chrome in the last host column of a row the host cannot show whole:
+ * the writer's line continues past this window. It is drawn by Cuna, never
+ * taken from remote cells, and occupies the cell the projection left free.
+ */
+function continuedMarker(hostRow: number, columns: number, color: boolean): string {
+  return `${ESC}${hostRow};${columns}H${ESC}0m${color ? `${ESC}1;38;2;235;86;37m` : ""}${CONTINUED_MARKER}${ESC}0m`;
 }
 
 function renderStyledRuns(runs: readonly ViewportRenderRun[]): string {

@@ -2084,6 +2084,32 @@ test("observer remote geometry drives the headless viewport while host resize se
   } finally { await coordinator.stop(); }
 });
 
+test("an observer of a wider writer says how much of the view is cut and marks each cut row", async () => {
+  // Owner 2026-09-28: rows of a writer wider than this window lost their ends
+  // with nothing on screen saying so. An observer may not resize the writer's
+  // PTY; it must say the view is wider and mark the rows it cannot show whole.
+  const { coordinator, callbacks, host, intents } = harness();
+  host.columns = 186;
+  host.rows = 42;
+  await coordinator.start(intents.slice(0, 1));
+  try {
+    const observer = { ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2, geometry: null };
+    callbacks.onTerminalState(observer);
+    await callbacks.onTerminalGeometry({ snapshot: { ...observer, geometry: { columns: 200, rows: 40, writerEpoch: 2 } }, signal: new AbortController().signal });
+    const url = "https://claude.com/cai/oauth/authorize?code=true&state=" + "q".repeat(300);
+    const remoteRows = [url.slice(0, 200), url.slice(200)];
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`\u001b[1;1H${remoteRows[0]}\u001b[2;1H${remoteRows[1]}`)));
+    let screen = [];
+    for (let attempt = 0; attempt < 200 && !/wider than this window/u.test(screen[1] ?? ""); attempt += 1) {
+      screen = (await visibleHostText(host)).split("\n");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.match(screen[1], /Observing \(read-only\) · view is 14 columns wider than this window \(› marks cut rows\) · Press Ctrl\+\] then w/u);
+    assert.equal(screen[2], `${remoteRows[0].slice(0, 185)}›`, "a cut row ends in the marker, never in a silent cut");
+    assert.equal(screen[3], remoteRows[1], "a row that fits is shown whole and unmarked");
+  } finally { await coordinator.stop(); }
+});
+
 test("input backlog is bounded and restoration waits for admitted input to settle", async () => {
   const { coordinator, host, intents, runtime } = harness();
   await coordinator.start(intents.slice(0, 1));
