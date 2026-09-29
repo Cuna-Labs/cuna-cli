@@ -136,8 +136,8 @@ test("a receipt that says the create failed ends in a typed failure, not a wait"
 });
 
 /** The request id this CLI derives: a UUID from the account scope and the key. */
-function requestIdFrom(scope, key) {
-  const bytes = createHash("sha256").update("cuna.machine-create-request.v1 ").update(scope).update(" ").update(key).digest();
+function requestIdFrom(scope, idempotency) {
+  const bytes = createHash("sha256").update("cuna.machine-create-request.v1\0").update(scope).update("\0").update(idempotency).digest();
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = bytes.subarray(0, 16).toString("hex");
@@ -169,6 +169,8 @@ test("no credential material enters the create request id", async () => {
     ids.push(server.posts[0].requestId);
   }
   assert.equal(ids[0], ids[1]);
-  const keyed = requestIdFrom(`automation:${createHash("sha256").update(API_KEY).digest("hex")}`, "qa-c3-create-1");
-  assert.notEqual(ids[0], keyed, "the id is not derivable from a hash of the key");
+  // What 0.1.6 drop 7104908 sent for this fixture key and --idempotency-key,
+  // computed once outside the suite: no test hashes a credential.
+  const keyedBy7104908 = "0076abcd-eedd-4d75-b8e6-57ce5dda24a2";
+  assert.notEqual(ids[0], keyedBy7104908, "the id is not the old derivation from a hash of the key");
 });
