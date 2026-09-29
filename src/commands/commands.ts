@@ -811,6 +811,23 @@ async function supervisorReplaceRefusal(client: CunaApiClient, machine: Machine,
         message: `Cuna could not verify the stopped-machine update for ${machine.name}. Nothing was started.`,
         hint: `Run ${again} again; do not start the Machine in between.`,
       });
+    case "supervisor_upgrade_provider_boot_failed": {
+      // Decided, not unobserved: after the update's start the provider itself
+      // reported the runtime in error with its own target still running (infra
+      // 5f81d6f). Nothing was installed and control is unchanged. The update is
+      // refused until the runtime is stopped, so the next step is a stop. The
+      // provider's code and a claim the Edge could not release are named only
+      // in the server's detail.
+      const detail = error.hint ?? "";
+      const providerCode = /\(provider status error, ([A-Za-z0-9][A-Za-z0-9_.:-]{0,63})\)/u.exec(detail)?.[1];
+      const claimHeld = detail.includes("could not release this update's claim");
+      return refusal({
+        message: `${machine.name}'s runtime failed to boot when the update started it (provider status error${providerCode === undefined ? "" : `, ${providerCode}`}). Nothing was installed and its control is unchanged.`,
+        hint: `Stop it with \`cuna machines stop ${id} --yes\`, wait until \`cuna machines list\` says stopped, then run ${again}.` +
+          (claimHeld ? " Cuna could not release this update's claim, so the new update can start only after ten minutes." : ""),
+        ...(providerCode === undefined ? {} : { details: { provider_error_code: providerCode } }),
+      });
+    }
     case "supervisor_upgrade_publish_pending":
     case "supervisor_upgrade_v2_not_observed":
       // The update may already have started the Machine: an uncertain

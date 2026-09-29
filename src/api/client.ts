@@ -291,6 +291,27 @@ function malformed(cause: unknown, operation: string): CunaError {
   });
 }
 
+const MACHINE_ID_PLACEHOLDER = "<machine-id>";
+
+/**
+ * A lifecycle refusal names its Machine as the literal `<machine-id>`: the
+ * Edge's redaction boundary rewrites any UUID in a lifecycle detail (infra
+ * 2a8e0c7, a start whose runtime failed to boot). The request names the one
+ * Machine it is about, so the next step can name it too.
+ */
+function namingMachine(error: unknown, id: string): unknown {
+  if (!(error instanceof CunaError) || !(error.hint ?? "").includes(MACHINE_ID_PLACEHOLDER)) return error;
+  return new CunaError({
+    code: error.code,
+    message: error.message,
+    exitCode: error.exitCode,
+    hint: (error.hint as string).replaceAll(MACHINE_ID_PLACEHOLDER, id),
+    retryable: error.retryable,
+    ...(error.details === undefined ? {} : { details: error.details }),
+    cause: error.cause,
+  });
+}
+
 function decode<T>(decoder: (value: unknown) => T, value: unknown, operation: string): T {
   try {
     return decoder(value);
@@ -628,7 +649,12 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         budgetMs: MACHINE_LIFECYCLE_REQUEST_BUDGET_MS,
         ...(signal === undefined ? {} : { signal }),
       };
-      const machine = await fetchDecoded(request, decodeMachineItem);
+      let machine: Machine;
+      try {
+        machine = await fetchDecoded(request, decodeMachineItem);
+      } catch (error) {
+        throw namingMachine(error, id);
+      }
       if (machine.id !== id) {
         throw malformed(contractViolation("matches_requested_resource", "id"), operationLabel(request));
       }
