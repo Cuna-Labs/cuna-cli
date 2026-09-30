@@ -1460,12 +1460,21 @@ export class CunaRuntimeBoundary {
     let createdAt: number | null | undefined;
     let snapshot: CapabilitySnapshot;
     let capability: ReturnType<typeof admitCapability>;
+    // The observation leaves with the first capability read rather than after
+    // it: the two are independent reads, and in sequence they were two to four
+    // round trips of every attach (measured 2026-09-30, 1.1 s per admission on
+    // Edge v242). It is kept only when that first read admits; after any wait
+    // the observation is read again, after the capability, as before.
+    let earlyObservation: Promise<RemoteAgentSessionEvidence> | undefined =
+      this.#options.controlPlane.observeAgentSession(agentSessionId, signal);
+    earlyObservation.catch(() => undefined);
     for (;;) {
       snapshot = await this.#options.controlPlane.discoverCapabilities("agent_session", agentSessionId, signal);
       try {
         capability = admitCapability(snapshot, requirement, this.#clock());
         break;
       } catch (error) {
+        earlyObservation = undefined;
         if (!terminalAdmissionMayResolveByWaiting(error) || signal?.aborted === true) throw error;
         if (createdAt === undefined && awaitingFirstAttestation(error)) {
           createdAt = await this.#agentSessionCreatedAt(agentSessionId, signal);
@@ -1479,7 +1488,7 @@ export class CunaRuntimeBoundary {
       }
     }
     const observation = assertRemoteAgentSessionEvidence({
-      evidence: await this.#options.controlPlane.observeAgentSession(agentSessionId, signal),
+      evidence: await (earlyObservation ?? this.#options.controlPlane.observeAgentSession(agentSessionId, signal)),
       expectedAgentSessionId: agentSessionId,
       now: this.#clock(),
     });

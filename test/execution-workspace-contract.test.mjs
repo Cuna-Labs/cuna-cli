@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {decodeWorkspaceBindingAuthority,decodeAgentSessionItem} from '../dist/api/contracts.js';
 import {createApiAgentJourneyEffects} from '../dist/journey/api-effects.js';
-import {AGENT_SESSION_READY_DEADLINE_MS} from '../dist/journey/wait-policy.js';
+import {AGENT_SESSION_READY_DEADLINE_MS,AGENT_SESSION_READY_FAST_POLL_WINDOW_MS,AGENT_SESSION_READY_POLL_MAX_MS} from '../dist/journey/wait-policy.js';
 import {createOutputWriter} from '../dist/cli/output.js';
 import {createWorkspaceJourneyEffects,conservativeFilesystemCapabilities} from '../dist/journey/workspace-effects.js';
 import {inspectWorkspaceSyncPolicy,computeWorkspaceManifestRoot} from '../dist/sync/workspace-sync-product-service.js';
@@ -46,9 +46,10 @@ test('readiness timeout retains the admitted session identity and read-only reco
   // without time passing is a loop with no bound, which is what this fixture
   // used to describe. The read guard is derived from that deadline and the
   // backoff ceiling, so it stays a live check on termination instead of a number
-  // that drifts: the slowest sleep is 1 600 ms, so no more than
+  // that drifts: the slowest sleep is 1 600 ms, or the shorter fast-poll ceiling
+  // inside its window, so no more than ceil(window / fast ceiling) +
   // ceil(deadline / 1600) + 5 reads can fit inside the deadline.
-  const READ_CEILING=Math.ceil(AGENT_SESSION_READY_DEADLINE_MS/1_600)+5;
+  const READ_CEILING=Math.ceil(AGENT_SESSION_READY_FAST_POLL_WINDOW_MS/AGENT_SESSION_READY_POLL_MAX_MS)+Math.ceil(AGENT_SESSION_READY_DEADLINE_MS/1_600)+5;
   let clock=Date.parse('2026-09-22T02:33:22.723Z');
   const effects=createApiAgentJourneyEffects({now:()=>clock,client:{async getAgentSession(sessionId){
     assert.equal(sessionId,id(1));reads++;assert.ok(reads<=READ_CEILING,'readiness must stop waiting');
