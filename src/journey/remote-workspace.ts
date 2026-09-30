@@ -2,6 +2,7 @@ import type { ProviderPreset } from "../api/provider-v2.js";
 import {withProviderLaunchIntent,type RecordedLaunchContext} from "./provider-launch-intent.js";
 import { isAgentSessionGone } from "../runtime/terminal-client-identity.js";
 import { readinessFailure, sessionFailure, supervisorWaitCause } from "./session-failure.js";
+import { isDefinitiveCreateRefusal, replayedLaunchRefusal } from "./definitive-refusal.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { performance } from "node:perf_hooks";
 import { requireCapability, type CunaApiClient } from "../api/client.js";
@@ -220,6 +221,9 @@ export async function createPublishedProviderSessionV2(input:{client:CunaApiClie
     retriedUnknownOutcome=true;
     continue;
    }
+   // The re-send's refusal is final for itself, not for the unanswered first
+   // attempt; see `replayedLaunchRefusal`.
+   if(retriedUnknownOutcome&&isDefinitiveCreateRefusal(error))throw replayedLaunchRefusal(error,input.machineId,'unanswered');
    throw error;
   }
  }

@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import type { AgentAuthMode, AgentKind } from "../api/contracts.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { deriveMachineCreateIdentity } from "./derived-identity.js";
+import { isDefinitiveCreateRefusal } from "./definitive-refusal.js";
 import type { ReconciledAgentJourneyIntent } from "./intent.js";
 import {
   planAgentSessionSelection,
@@ -579,7 +580,11 @@ export async function orchestrateAgentJourney(input: {
           }),
         });
       } catch (createError) {
+        // A refusal the server made final is its answer, in its own words and
+        // with its own exit code; wrapping it as an unprovable create told the
+        // person to retry a request the server will refuse the same way.
         if (signal.aborted || isProvenAgentSessionCreateRejection(createError) ||
+            isDefinitiveCreateRefusal(createError) ||
             (createError instanceof CunaError && createError.code === "cuna.provider.launch_lease_unavailable")) {
           throw createError;
         }
