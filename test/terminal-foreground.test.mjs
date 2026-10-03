@@ -4138,3 +4138,102 @@ test("a listening relay stops listening when the terminal leaves, and settles as
     assert.equal(supervisor.streamFrames.length, 0);
   } finally { await context.coordinator.stop(); await supervisor.close(); }
 });
+
+// R7.2, BL-7 (LIVE_RUNTIME 2026-10-03): workspace sync stopped at 02:02:30Z
+// while OpenCode was attached, and the bar said nothing for 21 minutes; the
+// reason appeared only at detach. The coordinator now takes one attention line
+// from outside the terminal and paints it on the notice row on the event
+// itself, with no terminal output in between.
+const ATTENTION = "Workspace sync stopped · recovery_required (pending_local_intent_changed) · run: cuna sync recover \"C:\\Users\\x\\my proj\" --yes";
+
+function attentionSource() {
+  const listeners = new Set();
+  let line;
+  return {
+    current: () => line,
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    set(next) { line = next; for (const listener of listeners) listener(next); },
+    listeners,
+  };
+}
+
+/** The first frame written after `baseline`, within one remote poll interval (750 ms). */
+async function frameWithin(host, baseline, predicate, message) {
+  const deadline = performance.now() + 750;
+  while (performance.now() < deadline) {
+    const frame = host.writes.slice(baseline).map((bytes) => decoder.decode(bytes)).find(predicate);
+    if (frame !== undefined) return frame;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.fail(message);
+}
+
+test("R7.2: an attention event paints its line on the notice row with no terminal output in between", async () => {
+  const attention = attentionSource();
+  const { coordinator, host, intents } = harness({
+    host: Object.assign(new FakeHost(), { columns: 200 }),
+    coordinatorOptions: { attention },
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    assert.doesNotMatch(await visibleHostText(host), /recovery_required/u);
+    const baseline = host.writes.length;
+    attention.set(ATTENTION);
+    await frameWithin(host, baseline, (frame) => frame.includes(ATTENTION), "the attention line was not painted on its own event");
+    assert.ok((await visibleHostText(host)).split("\n")[1].trim().startsWith(ATTENTION), "the line is on the notice row");
+    // Cleared: the row returns to the bar's own line on the clearing event.
+    const cleared = host.writes.length;
+    attention.set(undefined);
+    await frameWithin(host, cleared, () => true, "clearing the attention painted nothing");
+    assert.doesNotMatch(await visibleHostText(host), /recovery_required/u);
+  } finally { await coordinator.stop(); }
+  assert.equal(attention.listeners.size, 0, "the coordinator unsubscribes when it stops");
+});
+
+test("R7.2 NEGATIVE CONTROL: help still wins the notice row over attention, and attention returns when help closes", async () => {
+  const attention = attentionSource();
+  const { coordinator, host, intents } = harness({
+    host: Object.assign(new FakeHost(), { columns: 400 }),
+    coordinatorOptions: { attention },
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    const baseline = host.writes.length;
+    attention.set(ATTENTION);
+    await frameWithin(host, baseline, (frame) => frame.includes(ATTENTION), "the attention line was not painted");
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: "), "help opens");
+    assert.doesNotMatch(await visibleHostText(host), /recovery_required/u, "help owns the row while open");
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => !decoder.decode(host.writes.at(-1)).includes("Keys: "), "help closes");
+    assert.match(await visibleHostText(host), /recovery_required \(pending_local_intent_changed\)/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("R7.2 NEGATIVE CONTROL: the disconnect notice wins the notice row over attention", async () => {
+  let releaseDetach;
+  const detachGate = new Promise((resolve) => { releaseDetach = resolve; });
+  const attention = attentionSource();
+  const { callbacks, coordinator, host, intents } = harness({
+    host: Object.assign(new FakeHost(), { columns: 200 }),
+    detachGate,
+    detachStateSequence: ["interrupted", "detached"],
+    coordinatorOptions: { attention, disconnectFrameMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+  const baseline = host.writes.length;
+  attention.set(ATTENTION);
+  await frameWithin(host, baseline, (frame) => frame.includes(ATTENTION), "the attention line was not painted");
+  const closing = host.writes.length;
+  host.emitInput(Uint8Array.of(0x03));
+  await waitUntil(
+    () => host.writes.slice(closing).some((bytes) => decoder.decode(bytes).includes("Disconnecting...")),
+    "Ctrl-C acknowledges closing",
+  );
+  const row = (await visibleHostText(host)).split("\n")[1];
+  assert.match(row, /Disconnecting\.\.\./u);
+  assert.doesNotMatch(row, /recovery_required/u);
+  releaseDetach();
+  await coordinator.waitForStop();
+});

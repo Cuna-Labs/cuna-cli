@@ -1201,3 +1201,128 @@ test("sync state lines name the state and reason, and a live sync says nothing",
     "Workspace sync was not live when this run ended · this folder is at generation 4 · catching_up",
   );
 });
+
+// R7.2, BL-7 (LIVE_RUNTIME 2026-10-03): with `cuna opencode <path>` attached,
+// sync entered recovery_required (remote_excluded_path) at 02:02:30Z and the
+// terminal said nothing for 21 minutes. Every line was held for detach, and
+// nothing else carried the state. The attention projection is what the
+// attached bar reads: the named reason and the exact recovery command, set on
+// the transition itself and cleared once sync is live again. The optional
+// calls keep the red honest on a build without it: the waits then time out.
+
+/** The recovery command for this folder, with its canonical root as the CLI names it. */
+async function recoverCommand(project) {
+  const { canonicalRoot } = await inspectWorkspaceSyncPolicy({ localRoot: project, filesystemCapabilities: conservativeFilesystemCapabilities("windows") });
+  return `cuna sync recover ${/[\s"'`$&|;<>()*?!#~{}[\]^%,=]/u.test(canonicalRoot) ? `"${canonicalRoot}"` : canonicalRoot} --yes`;
+}
+
+/** The refusal the supervisor classifies as `recovery_required`: a policy exit with a typed reason. */
+function recoveryRefusal(reason) {
+  return new CunaError({
+    code: "cuna.workspace_sync.continuous_failed",
+    message: "Continuous workspace synchronization could not preserve its safety contract.",
+    exitCode: EXIT_CODES.policy,
+    details: { reason },
+  });
+}
+
+test("R7.2: a sync that needs recovery while the agent owns the terminal names the reason and the recovery command at once", async (t) => {
+  const fixture = await attachedFolder(t);
+  const { attached, notices, wire } = fixture;
+  try {
+    const seen = [];
+    attached.syncAttention?.subscribe((line) => seen.push(line));
+    attached.holdNotices();
+    wire.changesFailures.push(recoveryRefusal("pending_local_intent_changed"));
+    const expected = `Workspace sync stopped · recovery_required (pending_local_intent_changed) · run: ${await recoverCommand(fixture.project)}`;
+    await waitFor(() => seen.includes(expected), `the attached run was never told: ${JSON.stringify(seen)}`, 10_000);
+    assert.equal(attached.syncAttention.current(), expected);
+    assert.deepEqual(notices, [], "the held lines still wait for detach");
+    attached.releaseNotices();
+    assert.deepEqual(notices, [
+      "Workspace sync stopped · files are not syncing between this folder and the Machine · recovery_required (pending_local_intent_changed)",
+    ], "the detach line is kept as it was");
+  } finally {
+    await attached.stopContinuousSync();
+  }
+});
+
+test("R7.2: a paused sync is attention until sync is live again, then the attention clears", async (t) => {
+  const fixture = await attachedFolder(t);
+  const { attached, wire } = fixture;
+  try {
+    const seen = [];
+    attached.syncAttention?.subscribe((line) => seen.push(line));
+    attached.holdNotices();
+    wire.changesFailures.push(new Error("offline"));
+    const paused = `Workspace sync paused · paused (dependency_unavailable) · run: ${await recoverCommand(fixture.project)}`;
+    await waitFor(() => seen.includes(paused), `the pause was never attention: ${JSON.stringify(seen)}`, 10_000);
+    // A paused supervisor skips the change feed and leaves it on the next
+    // scan or the minute's reconciliation; a local edit asks for the scan.
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(fixture.project, "main.js"), "console.log('after the pause');\n");
+    await waitFor(() => seen.at(-1) === undefined && seen.length >= 2, `live sync never cleared the attention: ${JSON.stringify(seen)}`, 10_000);
+    assert.equal(attached.syncAttention.current(), undefined);
+    assert.ok(["live_unverified", "converged"].includes(attached.continuousSyncSnapshot()?.state), "cleared only by a live snapshot");
+  } finally {
+    await attached.stopContinuousSync();
+  }
+});
+
+test("R7.2: a run whose remote sync could not start is attention for the whole run", async (t) => {
+  const { project, state } = await roots(t);
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(join(project, "main.js"), "console.log(1);\n");
+  const { computeWorkspaceManifestRoot } = await import("../dist/sync/workspace-sync-product-service.js");
+  const manifestRoot = await computeWorkspaceManifestRoot({ localRoot: project, filesystemCapabilities: conservativeFilesystemCapabilities("windows") });
+  const binding = {
+    bindingId: "40000000-0000-4000-8000-000000000072",
+    projectId: "50000000-0000-4000-8000-000000000072",
+    localInstanceId: "60000000-0000-4000-8000-000000000072",
+    executionWorkspaceId: null,
+    remoteRoot: "/workspace/projects/50000000-0000-4000-8000-000000000072",
+    createdAt: "2026-10-03T00:00:00Z",
+    updatedAt: "2026-10-03T00:00:00Z",
+    exclusionPolicyDigest: undefined,
+    activeGeneration: 7,
+    activeManifestRoot: manifestRoot,
+  };
+  const client = {
+    async createWorkspaceBinding(input) { return { ...binding, exclusionPolicyDigest: input.exclusionPolicyDigest }; },
+    async getWorkspaceBinding() { return { ...binding }; },
+  };
+  const notices = [];
+  const run = effects(client, state, { onNotice: (line) => notices.push(line) });
+  await run.synchronizeWorkspace({ machineId: MACHINE, localPath: project, syncMode: "enabled", signal: new AbortController().signal });
+  assert.deepEqual(notices, ["Remote workspace changes will not arrive this run · resume_session_unavailable"], "the start line is kept as it was");
+  assert.equal(
+    run.syncAttention?.current(),
+    `Remote workspace changes will not arrive this run · resume_session_unavailable · run: ${await recoverCommand(project)}`,
+  );
+});
+
+test("R7.2 NEGATIVE CONTROL: a sync that stays live never raises attention", async (t) => {
+  // Varies only the outcome: the same attached folder, no refusal on the wire.
+  const fixture = await attachedFolder(t);
+  const { attached } = fixture;
+  try {
+    assert.equal(typeof attached.syncAttention?.current, "function", "the build exposes the attention projection");
+    const seen = [];
+    attached.syncAttention.subscribe((line) => seen.push(line));
+    await waitFor(() => ["live_unverified", "converged"].includes(attached.continuousSyncSnapshot()?.state), "the sync never went live");
+    await new Promise((settle) => setTimeout(settle, 1_000));
+    assert.equal(attached.syncAttention.current(), undefined);
+    assert.deepEqual(seen.filter((line) => line !== undefined), []);
+  } finally {
+    await attached.stopContinuousSync();
+  }
+});
+
+test("R7.2: the recovery command quotes a folder whose path has a space, and leaves a plain one as it is", async () => {
+  const { syncRecoveryCommand } = await import("../dist/journey/workspace-effects.js");
+  assert.equal(typeof syncRecoveryCommand, "function");
+  assert.equal(syncRecoveryCommand("C:\\Users\\x\\proj"), "cuna sync recover C:\\Users\\x\\proj --yes");
+  assert.equal(syncRecoveryCommand("C:\\Users\\x\\my proj"), "cuna sync recover \"C:\\Users\\x\\my proj\" --yes");
+  assert.equal(syncRecoveryCommand("/home/x/a&b"), "cuna sync recover \"/home/x/a&b\" --yes");
+  assert.equal(syncRecoveryCommand("/home/x/proj"), "cuna sync recover /home/x/proj --yes");
+});
