@@ -155,9 +155,19 @@ export async function computeWorkspaceManifestRoot(input: {
   });
   if (input.comparedWith === undefined) return manifest.manifestRoot;
   const compared = input.comparedWith;
+  let checkpointRoot: string;
+  try {
+    checkpointRoot = await canonicalCheckpointRoot(compared.checkpointRoot, root);
+  } catch (error) {
+    // Entries are only ever carried by a state in a checkpoint root every sync
+    // path admits. A root that is absent, or that no sync path admits, holds
+    // none, and measuring must not fail where it used to succeed.
+    if (error instanceof CunaError) return manifest.manifestRoot;
+    throw error;
+  }
   const carried = await carriedEntriesAt({
     root,
-    checkpointRoot: await canonicalCheckpointRoot(compared.checkpointRoot, root),
+    checkpointRoot,
     identity: {
       workspaceId: assertCanonicalUuid(compared.workspaceId, "workspace ID"),
       workspaceBindingId: assertCanonicalUuid(compared.workspaceBindingId, "workspace binding ID"),
