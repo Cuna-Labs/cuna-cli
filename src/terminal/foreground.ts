@@ -34,6 +34,7 @@ import type { TerminalAttachStage, TerminalAttachmentAdmission } from "../runtim
 import { RuntimeBoundaryError, runtimeFailure, terminalHistoryGap } from "../runtime/errors.js";
 import type { HostTerminalLease } from "./mode.js";
 import { assertCanonicalUuid } from "../core/validation.js";
+import { CunaError } from "../core/errors.js";
 import { buildAppbarModel, type AppbarModel, type StatusEvidence } from "./appbar.js";
 import { PredictiveEcho, type PredictiveEchoMode } from "./predictive-echo.js";
 import {
@@ -122,6 +123,13 @@ const RECONNECT_FAILED_NOTICE = "Reconnect failed · Ctrl+] r retries · Ctrl+C 
 // succeeded (2026-09-15, session 7d73bf08). The bound stays explicit; a
 // non-retryable refusal still stops the loop on its first occurrence.
 const DEFAULT_RECONNECT_ATTEMPTS = 10;
+// After the quick attempts, one attempt every 30 s for 20 min. The quick ones
+// alone gave up while the CLI's own API calls were timing out: on 2026-10-03
+// (biotech lab, drop c0dc53b) the bar said "Reconnect failed" from about
+// 16:08Z until 18:29Z, and a fresh `cuna opencode` reattached at 18:31Z. Still
+// bounded, still stopped by a non-retryable refusal; Ctrl+] r tries at once.
+const DEFAULT_RECONNECT_SLOW_DELAY_MS = 30_000;
+const DEFAULT_RECONNECT_SLOW_ATTEMPTS = 40;
 const BRACKETED_PASTE_START = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e);
 const BRACKETED_PASTE_END = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e);
 const CLAUDE_LOCAL_ACTION_KINDS = Object.freeze(["browser.open"] as const);
@@ -268,6 +276,10 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly resizeCoalesceMs?: number;
   readonly reconnectAttempts?: number;
   readonly reconnectBaseDelayMs?: number;
+  /** Wait between the slow attempts that follow the quick ones. */
+  readonly reconnectSlowDelayMs?: number;
+  /** Slow attempts after the quick ones; 0 turns them off. */
+  readonly reconnectSlowAttempts?: number;
   readonly disconnectFrameMs?: number;
   /** Stable only for this foreground process; never a reusable device credential. */
   readonly deviceId?: string;
@@ -390,6 +402,8 @@ export class ForegroundTerminalCoordinator {
   readonly #lifetimeAbort = new AbortController();
   readonly #reconnectTasks = new Map<string, Promise<void>>();
   readonly #recoverableReconnectFailures = new Map<string, unknown>();
+  /** Tabs waiting for a slow attempt: the wait, and what ends it early (Ctrl+] r). */
+  readonly #slowReconnectWaits = new Map<string, { readonly delayMs: number; readonly wake: () => void }>();
   readonly #outputTails = new Map<string, Promise<void>>();
   readonly #localDetachTabIds = new Set<string>();
   readonly #detachedSessions: DetachedForegroundSession[] = [];
@@ -476,6 +490,8 @@ export class ForegroundTerminalCoordinator {
     }
     const reconnectAttempts = options.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS;
     const reconnectBaseDelayMs = options.reconnectBaseDelayMs ?? 100;
+    const reconnectSlowDelayMs = options.reconnectSlowDelayMs ?? DEFAULT_RECONNECT_SLOW_DELAY_MS;
+    const reconnectSlowAttempts = options.reconnectSlowAttempts ?? DEFAULT_RECONNECT_SLOW_ATTEMPTS;
     const disconnectFrameMs = options.disconnectFrameMs ?? DISCONNECT_FRAME_MS;
     if (!Number.isSafeInteger(reconnectAttempts) || reconnectAttempts < 1 || reconnectAttempts > 10) {
       throw new RangeError("Foreground reconnect attempts must be between 1 and 10.");
@@ -483,10 +499,19 @@ export class ForegroundTerminalCoordinator {
     if (!Number.isSafeInteger(reconnectBaseDelayMs) || reconnectBaseDelayMs < 1 || reconnectBaseDelayMs > 5_000) {
       throw new RangeError("Foreground reconnect delay must be between 1 and 5000 milliseconds.");
     }
+    if (!Number.isSafeInteger(reconnectSlowDelayMs) || reconnectSlowDelayMs < 1 || reconnectSlowDelayMs > 300_000) {
+      throw new RangeError("Foreground slow reconnect delay must be between 1 and 300000 milliseconds.");
+    }
+    if (!Number.isSafeInteger(reconnectSlowAttempts) || reconnectSlowAttempts < 0 || reconnectSlowAttempts > 120) {
+      throw new RangeError("Foreground slow reconnect attempts must be between 0 and 120.");
+    }
     if (!Number.isSafeInteger(disconnectFrameMs) || disconnectFrameMs < 1 || disconnectFrameMs > MAX_DISCONNECT_FRAME_MS) {
       throw new RangeError("Foreground disconnect frame duration must be between 1 and 250 milliseconds.");
     }
-    this.#options = Object.freeze({ ...options, resizeCoalesceMs, reconnectAttempts, reconnectBaseDelayMs, disconnectFrameMs });
+    this.#options = Object.freeze({
+      ...options, resizeCoalesceMs, reconnectAttempts, reconnectBaseDelayMs, reconnectSlowDelayMs, reconnectSlowAttempts,
+      disconnectFrameMs,
+    });
     this.#clock = options.clock ?? Date.now;
     this.#predictiveEcho = new PredictiveEcho({
       mode: options.predictiveEcho ?? "off",
@@ -1176,29 +1201,69 @@ export class ForegroundTerminalCoordinator {
       if (this.#state !== "active" || this.#lifetimeAbort.signal.aborted) return;
       await abortableDelay(Math.min(baseDelayMs * (2 ** attempt), 5_000), this.#lifetimeAbort.signal);
       if (this.#state !== "active" || this.#lifetimeAbort.signal.aborted) return;
-      try {
-        const snapshot = await this.#requireRuntime().reconnect({ tabId, signal: this.#lifetimeAbort.signal });
-        await this.#reconcileGeometry(snapshot, false);
-        this.#recoverableReconnectFailures.delete(tabId);
-        if (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === INPUT_STALLED_NOTICE ||
-          isReconnectFailedNotice(this.#browserNotice)) {
-          this.#browserNotice = undefined;
-        }
-        return;
-      } catch (error) {
-        lastFailure = error;
-        if (this.#lifetimeAbort.signal.aborted || this.#state !== "active") return;
-        if (error instanceof RuntimeBoundaryError && !error.retryable) break;
-      }
+      const outcome = await this.#attemptReconnect(tabId);
+      if (outcome === "reattached" || outcome === "stopped") return;
+      lastFailure = outcome.failure;
+      if (lastFailure instanceof RuntimeBoundaryError && !lastFailure.retryable) break;
     }
-    if (this.#state === "active") {
+    // The quick attempts are spent. Say why, and while slow attempts remain,
+    // when the next one comes; then wait for it.
+    let slowRemaining = isRetryableReconnectFailure(lastFailure)
+      ? this.#options.reconnectSlowAttempts ?? DEFAULT_RECONNECT_SLOW_ATTEMPTS
+      : 0;
+    const slowDelayMs = this.#options.reconnectSlowDelayMs ?? DEFAULT_RECONNECT_SLOW_DELAY_MS;
+    for (;;) {
+      if (this.#state !== "active") return;
       this.#recoverableReconnectFailures.set(tabId, lastFailure ?? runtimeFailure(
         "terminal_disconnected",
         "Automatic terminal reconnection was exhausted.",
         { retryable: true },
       ));
-      this.#browserNotice = reconnectFailedNotice(this.#recoverableReconnectFailures.get(tabId));
+      this.#browserNotice = reconnectFailedNotice(
+        this.#recoverableReconnectFailures.get(tabId),
+        slowRemaining > 0 ? slowDelayMs : undefined,
+      );
       await this.#render();
+      if (slowRemaining === 0) return;
+      slowRemaining -= 1;
+      await this.#slowReconnectWait(tabId, slowDelayMs);
+      if (this.#state !== "active" || this.#lifetimeAbort.signal.aborted) return;
+      // Left on purpose meanwhile (a confirmed detach forgets the failure).
+      if (!this.#recoverableReconnectFailures.has(tabId) || this.#tabs.get(tabId)?.snapshot.state !== "interrupted") return;
+      const outcome = await this.#attemptReconnect(tabId);
+      if (outcome === "reattached" || outcome === "stopped") return;
+      lastFailure = outcome.failure;
+      if (!isRetryableReconnectFailure(lastFailure)) slowRemaining = 0;
+    }
+  }
+
+  async #attemptReconnect(tabId: string): Promise<"reattached" | "stopped" | { readonly failure: unknown }> {
+    try {
+      const snapshot = await this.#requireRuntime().reconnect({ tabId, signal: this.#lifetimeAbort.signal });
+      await this.#reconcileGeometry(snapshot, false);
+      this.#recoverableReconnectFailures.delete(tabId);
+      if (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === INPUT_STALLED_NOTICE ||
+        isReconnectFailedNotice(this.#browserNotice)) {
+        this.#browserNotice = undefined;
+      }
+      return "reattached";
+    } catch (error) {
+      if (this.#lifetimeAbort.signal.aborted || this.#state !== "active") return "stopped";
+      return { failure: error };
+    }
+  }
+
+  async #slowReconnectWait(tabId: string, delayMs: number): Promise<void> {
+    const wake = new AbortController();
+    const lifetime = this.#lifetimeAbort.signal;
+    const forward = (): void => wake.abort();
+    lifetime.addEventListener("abort", forward, { once: true });
+    this.#slowReconnectWaits.set(tabId, { delayMs, wake: () => wake.abort() });
+    try {
+      await abortableDelay(delayMs, wake.signal);
+    } finally {
+      lifetime.removeEventListener("abort", forward);
+      this.#slowReconnectWaits.delete(tabId);
     }
   }
 
@@ -2884,7 +2949,9 @@ export class ForegroundTerminalCoordinator {
     const end = this.#activeTabId === undefined ? undefined : this.#endedTabs.get(this.#activeTabId);
     if (tab !== undefined && end !== undefined) return this.#endedNotice(tab, end);
     const failure = this.#activeTabId === undefined ? undefined : this.#recoverableReconnectFailures.get(this.#activeTabId);
-    return failure === undefined ? INPUT_WITHHELD_NOTICE : reconnectFailedNotice(failure);
+    return failure === undefined
+      ? INPUT_WITHHELD_NOTICE
+      : reconnectFailedNotice(failure, this.#slowReconnectWaits.get(this.#activeTabId ?? "")?.delayMs);
   }
 
   #captureInputTarget(): ForegroundInputTarget | undefined {
@@ -3394,6 +3461,12 @@ export class ForegroundTerminalCoordinator {
   #retryActiveTab(): void {
     const tabId = this.#activeTabId;
     if (tabId === undefined || this.#tabs.get(tabId)?.snapshot.state !== "interrupted") return;
+    // Waiting for a slow attempt: make it now.
+    const slowWait = this.#slowReconnectWaits.get(tabId);
+    if (slowWait !== undefined) {
+      slowWait.wake();
+      return;
+    }
     this.#startRecovery(tabId);
   }
 
@@ -3513,16 +3586,39 @@ export function admitForegroundDimensions(input: { readonly columns: number; rea
  * about whether retrying can help. Only this client's own closed error codes
  * are rendered -- never remote text.
  */
-function reconnectFailedNotice(failure: unknown): string {
-  if (!(failure instanceof RuntimeBoundaryError)) return RECONNECT_FAILED_NOTICE;
-  // The capability name is this client's own closed enum, not remote text, and
-  // it is the one word that says WHICH contract the replacement grant failed to
-  // prove. Without it "capability unknown" cannot be acted on by anyone.
-  const capability = failure.safeDetails?.capability;
-  const subject = typeof capability === "string" && /^[a-z_]{1,32}$/u.test(capability)
-    ? `${failure.code.replaceAll("_", " ")} (${capability.replaceAll("_", " ")})`
-    : failure.code.replaceAll("_", " ");
-  return `Reconnect failed: ${subject} · Ctrl+] r retries · Ctrl+C disconnects.`;
+function reconnectFailedNotice(failure: unknown, retryInMs?: number): string {
+  const subject = reconnectFailureSubject(failure);
+  if (subject === undefined && retryInMs === undefined) return RECONNECT_FAILED_NOTICE;
+  const retry = retryInMs === undefined ? "" : ` · retrying in ${Math.max(1, Math.ceil(retryInMs / 1_000))} s`;
+  return `Reconnect failed${subject === undefined ? "" : `: ${subject}`}${retry} · Ctrl+] r retries · Ctrl+C disconnects.`;
+}
+
+function reconnectFailureSubject(failure: unknown): string | undefined {
+  // A reconnect whose cleanup also failed reports both; the first is why.
+  if (failure instanceof AggregateError) return reconnectFailureSubject(failure.errors[0]);
+  if (failure instanceof RuntimeBoundaryError) {
+    // The capability name is this client's own closed enum, not remote text,
+    // and it is the one word that says WHICH contract the replacement grant
+    // failed to prove. Without it "capability unknown" cannot be acted on.
+    const capability = failure.safeDetails?.capability;
+    return typeof capability === "string" && /^[a-z_]{1,32}$/u.test(capability)
+      ? `${failure.code.replaceAll("_", " ")} (${capability.replaceAll("_", " ")})`
+      : failure.code.replaceAll("_", " ");
+  }
+  // The API calls a reconnect makes (admission, grant) fail as CunaErrors: on
+  // 2026-10-03 the bar said a bare "Reconnect failed" while they were timing
+  // out. Their codes are a closed dotted vocabulary; anything else stays unnamed.
+  if (failure instanceof CunaError && /^cuna(?:\.[a-z][a-z_]{0,47}){1,3}$/u.test(failure.code)) {
+    return failure.code.slice("cuna.".length).replaceAll(".", " ").replaceAll("_", " ");
+  }
+  return undefined;
+}
+
+/** Whether waiting can help: only a failure that says it cannot is final. */
+function isRetryableReconnectFailure(failure: unknown): boolean {
+  if (failure instanceof AggregateError) return isRetryableReconnectFailure(failure.errors[0]);
+  if (failure instanceof RuntimeBoundaryError || failure instanceof CunaError) return failure.retryable;
+  return true;
 }
 
 function isReconnectFailedNotice(value: string | undefined): boolean {
