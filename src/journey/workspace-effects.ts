@@ -412,11 +412,23 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       // The manifest is recomputed inside `synchronizeLocalWorkspace` when the
       // content HAS changed, which is the only case that pays for it. Skipping
       // returns exactly the shape the proven `--no-sync` branch above returns.
+      const checkpointRoot = join(input.stateDirectory, "workspace-sync");
+      await mkdir(checkpointRoot, { recursive: true, mode: 0o700 });
+      // Measured as the published generation holds this folder: with the paths
+      // it carries that this folder excludes. Without them a folder that
+      // reproduces it would look changed, and the commit that followed would
+      // leave those paths out and tell the Machine to delete them.
       const currentManifestRoot = await computeWorkspaceManifestRoot({
         localRoot: inspected.policy.canonicalRoot,
         filesystemCapabilities: input.filesystemCapabilities,
+        comparedWith: {
+          workspaceId: input.workspaceId,
+          workspaceBindingId: authority.bindingId,
+          machineId,
+          checkpointRoot,
+          generation: authority.activeGeneration,
+        },
       });
-      const checkpointRoot = join(input.stateDirectory, "workspace-sync");
       if (
         authority.activeGeneration >= 1 &&
         authority.activeManifestRoot === currentManifestRoot
@@ -438,7 +450,6 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         // whose content differs commits a generation, which starts the poller on
         // the proven path. The reason is said in one line rather than swallowed.
         try {
-          await mkdir(checkpointRoot, { recursive: true, mode: 0o700 });
           attachContinuousSync(await resumeContinuousWorkspaceSync({
             localRoot: inspected.policy.canonicalRoot,
             workspaceId: input.workspaceId,
@@ -465,7 +476,6 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         });
       }
 
-      await mkdir(checkpointRoot, { recursive: true, mode: 0o700 });
       // A commit names the generation its tree came from, and the server's
       // compare-and-swap can only check that claim against its head. So the
       // claim must come from this folder's own sync record, never from the

@@ -375,7 +375,7 @@ function decodeChangeItem(value: unknown): WorkspaceSyncChangeItem {
   });
 }
 
-function decodeManifestEntry(value: unknown): WorkspaceSyncManifestEntry {
+export function decodeManifestEntry(value: unknown): WorkspaceSyncManifestEntry {
   const source = exactObject(value, ["path", "kind", "byte_length", "executable", "chunks", "link_target"]);
   if (!Array.isArray(source.chunks) || typeof source.executable !== "boolean") throw protocolFailure("malformed_manifest_entry");
   const kind = enumValue(source.kind, ["directory", "file", "symlink"] as const, "entry kind");

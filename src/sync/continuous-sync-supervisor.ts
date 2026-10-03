@@ -16,7 +16,12 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import type { ExclusionPolicy } from "../workspace/exclusion.js";
-import { createWorkspaceManifest, type ManifestEntry, type WorkspaceManifest } from "../workspace/manifest.js";
+import {
+  createWorkspaceManifest,
+  withCarriedEntries,
+  type ManifestEntry,
+  type WorkspaceManifest,
+} from "../workspace/manifest.js";
 import {
   assertLexicallyInsideRoot,
   normalizeWirePath,
@@ -26,15 +31,18 @@ import { DurableSyncJournal, type JournalOperationState } from "./journal.js";
 import type {
   WorkspaceSyncChangeItem,
   WorkspaceSyncChangePage,
+  WorkspaceSyncManifestEntry,
 } from "./workspace-sync-protocol.js";
-import { decodeChangePage } from "./workspace-sync-protocol.js";
+import { decodeChangePage, decodeManifestEntry } from "./workspace-sync-protocol.js";
 
 /**
- * Schema 2 adds `last_local_commit`. A schema 1 file is still read, with that
- * fact unknown (null): it is the state a folder detached under before this
- * build, and it is exactly the state a re-attach must resume from.
+ * Schema 2 adds `last_local_commit`; schema 3 adds `remote_only`. An older
+ * file is still read, with those facts unknown (null) or empty: it is the
+ * state a folder detached under before this build, and it is exactly the
+ * state a re-attach must resume from. An older build refuses a schema 3 file
+ * rather than drop the entries it carries.
  */
-const STATE_SCHEMA = 2;
+const STATE_SCHEMA = 3;
 const ZERO_DIGEST = "0".repeat(64);
 const DEFAULT_DEBOUNCE_MS = 250;
 const DEFAULT_RECONCILE_MS = 60_000;
@@ -122,6 +130,13 @@ export interface ContinuousSyncAuthority {
   commitLocalSnapshot(input: {
     readonly baseGeneration: number;
     readonly manifest: WorkspaceManifest;
+    /**
+     * The entries of `manifest` this folder does not hold (`remote_only`).
+     * Their bytes are not in the folder; a chunk the server reports missing
+     * is read back through `syncId`, which can read the base generation.
+     */
+    readonly carried: readonly WorkspaceSyncManifestEntry[];
+    readonly syncId: string;
     readonly signal: AbortSignal;
   }): Promise<ContinuousSyncCommitReceipt>;
   listChanges(input: {
@@ -202,7 +217,7 @@ interface LocalCommitRecord {
 }
 
 interface DurableSupervisorState {
-  readonly schema_version: 2;
+  readonly schema_version: 3;
   readonly binding_id: string;
   readonly binding_generation: number;
   readonly policy_digest: string;
@@ -217,6 +232,15 @@ interface DurableSupervisorState {
   readonly pending_local: readonly PendingLocalOperation[];
   readonly pending_remote: PendingRemoteApply | null;
   readonly last_local_commit: LocalCommitRecord | null;
+  /**
+   * The entries of generation `generation` that this folder's exclusion
+   * policy excludes, sorted by path bytes: what the Machine holds there and
+   * this folder deliberately does not. Never written into the folder, never
+   * deleted from it, and carried into every commit so the Machine is not
+   * told to delete them (BL-7, 2026-10-03: a capture that predates the
+   * policy-aware guest committed `__pycache__` and `.pytest_cache`).
+   */
+  readonly remote_only: readonly WorkspaceSyncManifestEntry[];
   readonly updated_at: string;
 }
 
@@ -226,6 +250,8 @@ export interface ContinuousSyncDurableBase {
   readonly manifestRoot: string;
   readonly syncId: string;
   readonly baseline: readonly EntryProjection[];
+  /** See `remote_only` on the durable state. */
+  readonly remoteOnly: readonly WorkspaceSyncManifestEntry[];
   /** The paths this folder's own commits carried; see `LocalCommitRecord`. */
   readonly lastLocalCommit: {
     readonly generation: number;
@@ -248,6 +274,12 @@ export interface ContinuousWorkspaceSyncSupervisorInput {
   readonly filesystemCapabilities: FilesystemCapabilities;
   readonly authority: ContinuousSyncAuthority;
   readonly initialManifest?: WorkspaceManifest;
+  /**
+   * The entries of the initial generation this folder does not hold, when a
+   * fresh state is created; `initialManifestRoot` is the root of the folder
+   * plus these. A loaded state keeps its own.
+   */
+  readonly initialRemoteOnly?: readonly WorkspaceSyncManifestEntry[];
   readonly watchFactory?: WorkspaceWatchFactory;
   readonly debounceMs?: number;
   readonly reconciliationIntervalMs?: number;
@@ -320,11 +352,13 @@ export class ContinuousWorkspaceSyncSupervisor {
     const root = await canonicalPlainDirectory(input.canonicalRoot);
     const stateDirectory = await preparePrivateDirectory(input.stateDirectory, root);
     const normalizedInput = Object.freeze({ ...input, canonicalRoot: root, stateDirectory });
-    const initialManifest = input.initialManifest ?? await (input.manifestBuilder ?? createWorkspaceManifest)({
+    const localManifest = input.initialManifest ?? await (input.manifestBuilder ?? createWorkspaceManifest)({
       root,
       policy: input.policy,
       capabilities: input.filesystemCapabilities,
     });
+    const initialRemoteOnly = Object.freeze([...(input.initialRemoteOnly ?? [])]);
+    const initialManifest = withCarriedEntries(localManifest, initialRemoteOnly.map(carriedManifestEntry));
     if (
       initialManifest.policyDigest !== input.policy.digest ||
       initialManifest.manifestRoot !== input.initialManifestRoot
@@ -337,7 +371,7 @@ export class ContinuousWorkspaceSyncSupervisor {
       throw syncFailure("durable_state_missing", EXIT_CODES.conflict);
     }
     const state = loaded === undefined
-      ? createInitialState(normalizedInput, initialManifest)
+      ? createInitialState(normalizedInput, initialManifest, initialRemoteOnly)
       : admitState(loaded, normalizedInput);
     if (loaded === undefined) await atomicWriteState(statePath, state);
     const supervisor = new ContinuousWorkspaceSyncSupervisor(normalizedInput, state);
@@ -377,6 +411,7 @@ export class ContinuousWorkspaceSyncSupervisor {
       manifestRoot: state.manifest_root,
       syncId: state.sync_id,
       baseline: state.baseline,
+      remoteOnly: state.remote_only,
       lastLocalCommit: state.last_local_commit,
       updatedAt: state.updated_at,
     });
@@ -468,8 +503,16 @@ export class ContinuousWorkspaceSyncSupervisor {
     // process: every later run loaded it, skipped every pull and commit, and
     // announced the dead run's stop at start and at detach (ws-codex3 and a
     // second QA folder, 2026-09-29). This run recovers exactly as a retake does.
+    //
+    // A stop on `remote_excluded_path` was written by a build that refused a
+    // Machine generation carrying a path this folder excludes. This build
+    // carries such a path instead of refusing it, so that stop no longer
+    // describes anything and is taken up the same way: the generation it
+    // stopped in is resumed where it stopped (BL-7, 2026-10-03: the folder
+    // stayed at generation 2 through two re-attaches and a cleanup on the
+    // Machine).
     if ((this.#state.status === "conflicted" || this.#state.status === "recovery_required") &&
-        this.#state.reason === "stale_fence") {
+        (this.#state.reason === "stale_fence" || this.#state.reason === "remote_excluded_path")) {
       await this.#transition({ status: "recovering", dirty: true, reason: null });
       this.#reconcileRequested = true;
     }
@@ -655,6 +698,8 @@ export class ContinuousWorkspaceSyncSupervisor {
       receipt = await this.#input.authority.commitLocalSnapshot({
         baseGeneration: this.#state.generation,
         manifest,
+        carried: this.#state.remote_only,
+        syncId: this.#state.sync_id,
         signal,
       });
     } catch (error) {
@@ -790,12 +835,27 @@ export class ContinuousWorkspaceSyncSupervisor {
     const ownCommit = this.#state.last_local_commit?.generation === pending.generation - 1
       ? new Map(this.#state.last_local_commit.entries.map((entry) => [entry.path, entry.fingerprint]))
       : undefined;
+    // Kept beside `nextIndex` in every write below, so a resumed apply starts
+    // from the set as it stood after the last item it finished.
+    const remoteOnly = new Map(this.#state.remote_only.map((entry) => [entry.path, entry]));
     for (let index = pending.nextIndex; index < ordered.length; index += 1) {
       const item = ordered[index];
       if (item === undefined) continue;
       if (item.operation !== "revision") {
         const path = item.path;
         if (path === null) throw syncFailure("remote_change_shape", EXIT_CODES.remote);
+        if (this.#outsideFolder(item, remoteOnly, baseline)) {
+          // A path this folder's policy excludes: recorded as the Machine's,
+          // never written or removed here. Before, this stopped syncing in
+          // both directions for good (`remote_excluded_path`, BL-7).
+          if (item.operation === "upsert" && item.entry !== null) remoteOnly.set(path, item.entry);
+          else remoteOnly.delete(path);
+          await this.#replaceState({
+            pending_remote: Object.freeze({ ...pending, items: Object.freeze(ordered), nextIndex: index + 1 }),
+            remote_only: sortedRemoteOnly(remoteOnly),
+          });
+          continue;
+        }
         const prior = baseline.get(path);
         const observed = currentEntries.get(path);
         const target = projectRemoteItem(item);
@@ -1046,12 +1106,41 @@ export class ContinuousWorkspaceSyncSupervisor {
     return true;
   }
 
+  /**
+   * The generation as this folder holds it: the folder's own manifest plus
+   * `remote_only`. Every root this supervisor compares or commits is this
+   * one, because the generation it is compared with carries those entries.
+   */
   async #buildManifest(): Promise<WorkspaceManifest> {
-    return this.#manifestBuilder({
+    const local = await this.#manifestBuilder({
       root: this.#input.canonicalRoot,
       policy: this.#input.policy,
       capabilities: this.#input.filesystemCapabilities,
     });
+    return withCarriedEntries(local, this.#state.remote_only.map(carriedManifestEntry));
+  }
+
+  /**
+   * Whether an incoming change names a path this folder's policy keeps out of
+   * the folder: the path itself, or a directory above it, is excluded. The
+   * ancestor test is the manifest walk's: it never descends into an excluded
+   * directory, so a negated rule below one never brings a path back. A
+   * removal has no entry kind of its own, so it is judged by the kind it had.
+   */
+  #outsideFolder(
+    item: WorkspaceSyncChangeItem,
+    remoteOnly: ReadonlyMap<string, WorkspaceSyncManifestEntry>,
+    baseline: ReadonlyMap<string, EntryProjection>,
+  ): boolean {
+    const path = item.path;
+    if (path === null) return false;
+    if (item.operation === "delete" && remoteOnly.has(path)) return true;
+    const kind = item.entry?.kind ?? baseline.get(path)?.kind ?? "file";
+    const components = path.split("/");
+    for (let depth = 1; depth < components.length; depth += 1) {
+      if (this.#input.policy.decide(components.slice(0, depth).join("/"), "directory").excluded) return true;
+    }
+    return this.#input.policy.decide(path, kind).excluded;
   }
 
   async #transition(input: {
@@ -1070,7 +1159,7 @@ export class ContinuousWorkspaceSyncSupervisor {
     const next = Object.freeze({
       ...this.#state,
       ...patch,
-      schema_version: STATE_SCHEMA as 2,
+      schema_version: STATE_SCHEMA as 3,
       updated_at: new Date(this.#clock()).toISOString(),
     });
     this.#state = admitState(next, this.#input);
@@ -1105,10 +1194,15 @@ export class ContinuousWorkspaceSyncSupervisor {
   }
 }
 
-function createInitialState(input: ContinuousWorkspaceSyncSupervisorInput, manifest: WorkspaceManifest): DurableSupervisorState {
+function createInitialState(
+  input: ContinuousWorkspaceSyncSupervisorInput,
+  manifest: WorkspaceManifest,
+  remoteOnly: readonly WorkspaceSyncManifestEntry[],
+): DurableSupervisorState {
   const prior = input.priorBase;
   return Object.freeze({
-    schema_version: STATE_SCHEMA as 2,
+    schema_version: STATE_SCHEMA as 3,
+    remote_only: sortedRemoteOnly(new Map(remoteOnly.map((entry) => [entry.path, entry]))),
     last_local_commit: prior !== undefined && prior.generation === input.initialGeneration - 1
       ? localCommitRecord(
         input.initialGeneration,
@@ -1153,6 +1247,24 @@ function localCommitRecord(
     entries: Object.freeze([...entries]
       .sort(([left], [right]) => Buffer.from(left).compare(Buffer.from(right)))
       .map(([path, fingerprint]) => Object.freeze({ path, fingerprint }))),
+  });
+}
+
+function sortedRemoteOnly(entries: ReadonlyMap<string, WorkspaceSyncManifestEntry>): readonly WorkspaceSyncManifestEntry[] {
+  return Object.freeze([...entries.values()].sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path))));
+}
+
+/** A carried wire entry as a manifest entry, so it roots and pages exactly as the server's copy does. */
+export function carriedManifestEntry(entry: WorkspaceSyncManifestEntry): ManifestEntry {
+  return Object.freeze({
+    path: entry.path,
+    kind: entry.kind,
+    byteLength: entry.byte_length,
+    executable: entry.executable,
+    ...(entry.kind === "file"
+      ? { chunks: Object.freeze(entry.chunks.map((chunk, index) => Object.freeze({ index, byteLength: chunk.byte_length, digest: chunk.digest }))) }
+      : {}),
+    ...(entry.link_target === null ? {} : { linkTarget: entry.link_target }),
   });
 }
 
@@ -1498,10 +1610,11 @@ function admitState(
     "manifest_root", "pending_local", "pending_remote", "policy_digest", "reason",
     "schema_version", "status", "sync_id", "updated_at",
     ...(source.schema_version === 1 ? [] : ["last_local_commit"]),
+    ...(source.schema_version === 1 || source.schema_version === 2 ? [] : ["remote_only"]),
   ];
   if (
     Object.keys(source).sort().join("\0") !== keys.sort().join("\0") ||
-    (source.schema_version !== 1 && source.schema_version !== STATE_SCHEMA)
+    (source.schema_version !== 1 && source.schema_version !== 2 && source.schema_version !== STATE_SCHEMA)
   ) {
     throw syncFailure("state_schema_incompatible", EXIT_CODES.conflict);
   }
@@ -1529,8 +1642,9 @@ function admitState(
     ? null
     : decodeLocalCommitRecord(source.last_local_commit);
   return Object.freeze({
-    schema_version: STATE_SCHEMA as 2,
+    schema_version: STATE_SCHEMA as 3,
     last_local_commit: lastLocalCommit,
+    remote_only: source.remote_only === undefined ? Object.freeze([]) : decodeRemoteOnly(source.remote_only),
     binding_id: input.bindingId,
     binding_generation: input.bindingGeneration,
     policy_digest: input.policy.digest,
@@ -1546,6 +1660,20 @@ function admitState(
     pending_remote: pendingRemote,
     updated_at: source.updated_at,
   });
+}
+
+function decodeRemoteOnly(value: unknown): readonly WorkspaceSyncManifestEntry[] {
+  if (!Array.isArray(value)) throw syncFailure("state_invalid", EXIT_CODES.conflict);
+  const entries = value.map((entry: unknown) => {
+    try {
+      return decodeManifestEntry(entry);
+    } catch {
+      throw syncFailure("state_invalid", EXIT_CODES.conflict);
+    }
+  });
+  const paths = entries.map((entry) => entry.path);
+  if (new Set(paths).size !== paths.length) throw syncFailure("state_invalid", EXIT_CODES.conflict);
+  return sortedRemoteOnly(new Map(entries.map((entry) => [entry.path, entry])));
 }
 
 function decodeEntryProjection(value: unknown): EntryProjection {

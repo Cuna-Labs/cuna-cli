@@ -287,6 +287,44 @@ function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs;
 }
 
+/**
+ * This folder's manifest plus entries a generation carries that the folder
+ * deliberately does not hold, rooted exactly as the server roots them.
+ *
+ * Those entries are paths this folder's exclusion policy excludes but the
+ * Machine committed anyway (a supervisor older than the policy-aware capture,
+ * BL-7, 2026-10-03). They are carried, not dropped: a generation that left
+ * them out would tell the Machine to delete files it alone holds. A carried
+ * path the folder also holds is refused, because the two would be one path.
+ */
+export function withCarriedEntries(
+  manifest: WorkspaceManifest,
+  carried: readonly ManifestEntry[],
+): WorkspaceManifest {
+  if (carried.length === 0) return manifest;
+  const held = new Set(manifest.entries.map((entry) => entry.path));
+  for (const entry of carried) {
+    if (held.has(entry.path)) {
+      throw workspaceError(
+        "portability_conflict",
+        "A path the Machine holds outside this folder is also held by this folder.",
+        "conflict",
+        "carried_path_collision",
+      );
+    }
+    held.add(entry.path);
+  }
+  const entries = [...manifest.entries, ...carried]
+    .sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+  return Object.freeze({
+    ...manifest,
+    manifestRoot: publicProtocolManifestRoot(entries),
+    entryCount: entries.length,
+    totalBytes: manifest.totalBytes + carried.reduce((total, entry) => total + (entry.kind === "file" ? entry.byteLength : 0), 0),
+    entries: Object.freeze(entries),
+  });
+}
+
 function publicProtocolManifestRoot(entries: readonly ManifestEntry[]): string {
   const entryDigests = entries
     .map((entry) => {
