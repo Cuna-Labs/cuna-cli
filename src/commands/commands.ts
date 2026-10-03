@@ -7,6 +7,7 @@ import {
 } from "../api/client.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import { labelledLines } from "../cli/labelled-lines.js";
+import { recordLabel } from "../cli/record-labels.js";
 import type {
   AgentAuthMode,
   AgentKind,
@@ -1436,12 +1437,17 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         allowedInteractions: ["read_only"],
       });
       const records = await client.listRecords();
+      // Every row of `/v1/records` names a Machine, so that is the resource
+      // whatever its kind's prefix says. `kind` and `summary` stay in JSON as
+      // the server stored them; the person reads `label`.
+      const labelled = records.map((record) => Object.freeze({ record, label: recordLabel(record.kind, "machine") }));
       const data = Object.freeze({
-        items: records.map((record) => Object.freeze({
+        items: labelled.map(({ record, label }) => Object.freeze({
           id: record.id,
           machine_id: record.machineId,
           kind: record.kind,
           summary: record.summary,
+          label,
           detail: record.detail,
           created_at: record.createdAt,
         })),
@@ -1451,7 +1457,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         data,
         human: records.length === 0
           ? "No records found."
-          : records.map((record) => `${record.createdAt}\t${record.machineId}\t${record.kind}\t${record.summary}`).join("\n"),
+          : labelled.map(({ record, label }) => `${record.createdAt}\t${record.machineId}\t${label}`).join("\n"),
       });
     }
     case "authorizations": {
