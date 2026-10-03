@@ -4,7 +4,7 @@ import type {ProviderPreset} from "../api/provider-v2.js";
 import {createPublishedProviderSessionV2,requireMatchingPreset} from "./remote-workspace.js";
 import type { AgentSession, AgentSessionTerminalSeat, Machine } from "../api/contracts.js";
 import { readinessFailure, sessionFailure, supervisorWaitCause } from "./session-failure.js";
-import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
+import { decideCapability, refuseNamedMachineAction, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import {
   isOpenCodeRuntimeUnverifiedCapabilityRejection,
@@ -378,9 +378,13 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
     },
     async ensureMachineReady({ machineId, observedState, signal }) {
       let state = observedState;
+      // A declared provider is why this Machine was chosen, not evidence that
+      // it starts: ask the server first (PRD R1.2).
       if (state === "paused" || state === "suspended") {
+        await refuseNamedMachineAction({ client: input.client, machineId, action: "resume", now, signal });
         state = machineState((await input.client.transitionMachine(machineId, "resume", signal)).state);
       } else if (state === "stopped") {
+        await refuseNamedMachineAction({ client: input.client, machineId, action: "start", now, signal });
         state = machineState((await input.client.transitionMachine(machineId, "start", signal)).state);
       } else if (state === "deleted" || state === "error" || state === "unknown") {
         throw fail("cuna.journey.machine_not_reusable", "The selected machine is not safely reusable.", EXIT_CODES.policy);

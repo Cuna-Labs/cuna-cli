@@ -10,7 +10,13 @@ export interface MachineProviderAvailability {
   readonly displayName: string;
   readonly usability: ProviderUsability;
   readonly actionable: boolean;
-  readonly reasonCode?: "provider_not_observed" | "provider_not_supported_by_cli" | "provider_not_publicly_supported";
+  readonly reasonCode?:
+    | "provider_not_observed"
+    | "provider_not_supported_by_cli"
+    | "provider_not_publicly_supported"
+    // Set by the JSON record of a Machine that is not running, never by the
+    // declaration: see `providerRecordOn` in commands/commands.ts.
+    | "machine_not_running";
   readonly observationVersion?: string;
 }
 
