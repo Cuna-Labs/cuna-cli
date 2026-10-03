@@ -2379,6 +2379,11 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         if (!writer.structured && batchProgress !== undefined) batchProgress.note(sanitizeHumanTerminalOutput(human));
         else writer.accepted(command, data, human);
       },
+      reportNotice: (line) => {
+        if (writer.structured) return;
+        if (batchProgress !== undefined) batchProgress.note(sanitizeHumanTerminalOutput(line));
+        else streams.stderr.write(`${sanitizeHumanTerminalOutput(line)}\n`);
+      },
     });
     batchProgress?.stop();
     batchProgress = undefined;

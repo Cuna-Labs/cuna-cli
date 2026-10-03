@@ -1259,7 +1259,7 @@ export function decideCapability(
   return Object.freeze({ status: "supported", capabilityId });
 }
 
-export async function requireCapability(input: {
+interface CapabilityGate {
   readonly client: CunaApiClient;
   readonly scope: CapabilityScope;
   readonly resourceId?: string;
@@ -1268,7 +1268,10 @@ export async function requireCapability(input: {
   readonly now?: number | (() => number);
   readonly allowedInteractions?: readonly import("./contracts.js").CapabilityInteraction[];
   readonly signal?: AbortSignal;
-}): Promise<void> {
+}
+
+/** The snapshot for the gate's subject, or the typed refusal a failed read means. */
+async function readCapabilityGate(input: CapabilityGate): Promise<CapabilitySnapshot> {
   let snapshot: CapabilitySnapshot;
   try {
     snapshot = await input.client.discoverCapabilities(input.scope, input.resourceId, input.signal);
@@ -1329,9 +1332,19 @@ export async function requireCapability(input: {
       },
     });
   }
-  const receivedAt = typeof input.now === "function" ? input.now() : input.now;
-  const decision = decideCapability(snapshot, input.capabilityId, receivedAt, input.allowedInteractions);
-  if (decision.status === "supported") return;
+  return snapshot;
+}
+
+function receivedAt(input: CapabilityGate): number | undefined {
+  return typeof input.now === "function" ? input.now() : input.now;
+}
+
+/** The refusal for a decision that is not `supported`, named for `capabilityId`. */
+function capabilityRefusal(
+  input: Pick<CapabilityGate, "scope" | "resourceId">,
+  capabilityId: string,
+  decision: Exclude<CapabilityDecision, { readonly status: "supported" }>,
+): CunaError {
   // A reason the server named is the refusal, so it is the sentence, and the
   // server named no next step. This used to read "Cuna cannot currently
   // authorize the machines.lifecycle capability." with the reason only in
@@ -1340,7 +1353,7 @@ export async function requireCapability(input: {
   const subject = input.scope === "account" || input.resourceId === undefined
     ? ""
     : ` for ${input.scope === "machine" ? "Machine" : "AgentSession"} ${input.resourceId}`;
-  throw new CunaError({
+  return new CunaError({
     code:
       decision.status === "temporarily_unavailable"
         ? "cuna.capability.temporarily_unavailable"
@@ -1348,8 +1361,8 @@ export async function requireCapability(input: {
           ? "cuna.capability.unsupported"
           : "cuna.capability.unknown",
     message: decision.serverReason === true
-      ? `Cuna does not admit ${input.capabilityId}${subject}: ${decision.reason}. Nothing was sent.`
-      : `Cuna cannot currently authorize the ${input.capabilityId} capability.`,
+      ? `Cuna does not admit ${capabilityId}${subject}: ${decision.reason}. Nothing was sent.`
+      : `Cuna cannot currently authorize the ${capabilityId} capability.`,
     exitCode:
       decision.status === "temporarily_unavailable" ? EXIT_CODES.network : EXIT_CODES.unsupported,
     retryable: decision.status === "temporarily_unavailable" &&
@@ -1360,9 +1373,127 @@ export async function requireCapability(input: {
         : "Run `cuna capabilities` to inspect current server support.",
     }),
     details: {
-      capability_id: input.capabilityId,
+      capability_id: capabilityId,
       availability: decision.status,
       ...(decision.reason === undefined ? {} : { reason: decision.reason }),
     },
   });
+}
+
+export async function requireCapability(input: CapabilityGate): Promise<void> {
+  const snapshot = await readCapabilityGate(input);
+  const decision = decideCapability(snapshot, input.capabilityId, receivedAt(input), input.allowedInteractions);
+  if (decision.status !== "supported") throw capabilityRefusal(input, input.capabilityId, decision);
+}
+
+export type MachineLifecycleAction = "start" | "stop" | "pause" | "resume";
+
+/**
+ * Reasons a per-action refusal may name that do not stop the request.
+ * `provider_request_rejected` is the provider's last refusal of a wake
+ * (billing, for one): only the provider can see that it changed -- a top-up --
+ * so the Edge still sends the start, and so does this CLI, after saying so.
+ */
+const SENT_DESPITE: ReadonlySet<string> = new Set(["provider_request_rejected"]);
+
+/**
+ * What the server says about one lifecycle action on one Machine.
+ *
+ * Start-ability is the Machine's current state, which the grouped
+ * `machines.lifecycle` authority never carried: `actionable` in `machines list`
+ * was this CLI's verdict on the declared provider, and a stopped Machine whose
+ * control had expired read `actionable: true` 8 s before its start was refused
+ * (BL-1, biotech-lab 2026-10-02). The Edge names it as `machines.<action>`.
+ *
+ * `refused` -- the server names a reason it would refuse for; send nothing.
+ * `sent-despite` -- it names a reason it still sends through; say it, send.
+ * `open` -- it admits the action, names no reason, or cannot tell
+ * (`unknown`); an Edge older than the per-action ids is this case. The grouped
+ * authority still decides, so a per-action id can narrow what is admitted and
+ * never widen it.
+ */
+export type MachineActionVerdict =
+  | {
+    readonly kind: "refused";
+    readonly capabilityId: string;
+    readonly decision: Exclude<CapabilityDecision, { readonly status: "supported" }>;
+  }
+  | { readonly kind: "sent-despite"; readonly capabilityId: string; readonly reason: string }
+  | { readonly kind: "open" };
+
+export function machineActionVerdict(
+  snapshot: CapabilitySnapshot,
+  action: MachineLifecycleAction,
+  now = Date.now(),
+): MachineActionVerdict {
+  const capabilityId = `machines.${action}`;
+  const decision = decideCapability(snapshot, capabilityId, now);
+  if (decision.status === "supported" || decision.status === "unknown" || decision.serverReason !== true) {
+    return Object.freeze({ kind: "open" });
+  }
+  const reason = decision.reason as string;
+  return SENT_DESPITE.has(reason)
+    ? Object.freeze({ kind: "sent-despite", capabilityId, reason })
+    : Object.freeze({ kind: "refused", capabilityId, decision });
+}
+
+/**
+ * `requireCapability` for one lifecycle action: one snapshot, the per-action
+ * verdict first, then the grouped `machines.lifecycle` authority. Resolves to
+ * the reason to show when the server names one it still sends through.
+ *
+ * Only start, stop, pause and resume ask this. The supervisor updates keep
+ * the grouped authority alone: they are the remedy a refused start points at.
+ */
+export async function requireMachineAction(input: {
+  readonly client: CunaApiClient;
+  readonly machineId: string;
+  readonly action: MachineLifecycleAction;
+  readonly now?: number | (() => number);
+  readonly signal?: AbortSignal;
+}): Promise<{ readonly sentDespite?: string }> {
+  const gate: CapabilityGate = {
+    client: input.client,
+    scope: "machine",
+    resourceId: input.machineId,
+    capabilityId: "machines.lifecycle",
+    ...(input.now === undefined ? {} : { now: input.now }),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+  };
+  const snapshot = await readCapabilityGate(gate);
+  const at = receivedAt(gate);
+  const verdict = machineActionVerdict(snapshot, input.action, at);
+  if (verdict.kind === "refused") throw capabilityRefusal(gate, verdict.capabilityId, verdict.decision);
+  const grouped = decideCapability(snapshot, "machines.lifecycle", at);
+  if (grouped.status !== "supported") throw capabilityRefusal(gate, "machines.lifecycle", grouped);
+  return Object.freeze(verdict.kind === "sent-despite" ? { sentDespite: verdict.reason } : {});
+}
+
+/**
+ * The journey's question before it starts or resumes the Machine it chose.
+ *
+ * It chose that Machine because its declared provider fits, which says
+ * nothing about whether it can start, and it used to start it without asking.
+ * Only a refusal the server names stops it here. A read that fails, an Edge
+ * without per-action ids, or `unknown` leave the start to the server's own
+ * answer, exactly as before this question existed.
+ */
+export async function refuseNamedMachineAction(input: {
+  readonly client: CunaApiClient;
+  readonly machineId: string;
+  readonly action: MachineLifecycleAction;
+  readonly now?: () => number;
+  readonly signal?: AbortSignal;
+}): Promise<void> {
+  let snapshot: CapabilitySnapshot;
+  try {
+    snapshot = await input.client.discoverCapabilities("machine", input.machineId, input.signal);
+  } catch {
+    return;
+  }
+  if (snapshot.subjectScope !== "machine" || snapshot.subjectId !== input.machineId) return;
+  const verdict = machineActionVerdict(snapshot, input.action, (input.now ?? Date.now)());
+  if (verdict.kind === "refused") {
+    throw capabilityRefusal({ scope: "machine", resourceId: input.machineId }, verdict.capabilityId, verdict.decision);
+  }
 }

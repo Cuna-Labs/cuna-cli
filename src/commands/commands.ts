@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
   requireCapability,
+  requireMachineAction,
   type MachineCreateInput,
   type CunaApiClient,
 } from "../api/client.js";
@@ -73,6 +74,7 @@ import {
   machineSupportsProvider,
   providerDisplayName,
   providerVerdict,
+  type MachineProviderAvailability,
 } from "../machines/provider-availability.js";
 import { classifySessionActionability, displaySessionActionability } from "../machines/session-actionability.js";
 import {
@@ -150,6 +152,11 @@ export interface CommandContext {
    * the command will now wait on. See `OutputWriter.accepted`.
    */
   readonly reportAccepted?: (command: string, data: unknown, human: string) => void;
+  /**
+   * One line a person should read before the request is sent. Human output
+   * only: under `--json` stderr carries error records alone.
+   */
+  readonly reportNotice?: (line: string) => void;
 }
 
 function productionConvergencePoller(): ConvergencePoller {
@@ -670,8 +677,30 @@ function machineCreateUnconfirmed(
   });
 }
 
-function machineRecord(machine: Machine): Readonly<Record<string, unknown>> {
+/**
+ * `actionable` is this CLI's verdict on the declared provider, and a provider
+ * is something to act on only while its Machine runs. It read `true` on a
+ * stopped Machine whose start the server refused 8 s later (BL-1, 2026-10-02),
+ * because nothing here can know whether a Machine starts: that is the server's
+ * `machines.start`, asked when a start is asked for. Off a running Machine the
+ * verdict is `false` and says why; the declaration (`usability`) is unchanged.
+ */
+function providerRecordOn(machine: Machine): MachineProviderAvailability {
   const provider = machineProviderAvailability(machine);
+  if (machine.state === "running" || !provider.actionable) return provider;
+  return Object.freeze({ ...provider, actionable: false, reasonCode: "machine_not_running" as const });
+}
+
+/** The provider verdict a person reads beside a Machine, only while it runs (E13-R4). */
+function providerColumn(machine: Machine): string {
+  const provider = machineProviderAvailability(machine);
+  return machine.state === "running"
+    ? `${provider.displayName} ${providerVerdict(provider)}`
+    : provider.displayName;
+}
+
+function machineRecord(machine: Machine): Readonly<Record<string, unknown>> {
+  const provider = providerRecordOn(machine);
   return Object.freeze({
     id: machine.id,
     name: machine.name,
@@ -967,12 +996,11 @@ function renderMachineOverview(
       readonly codex: { readonly running: number; readonly total: number };
       readonly opencode: { readonly running: number; readonly total: number };
     };
-    const provider = machineProviderAvailability(machine);
     const claude = `Claude ${counts.claude.running}/${counts.claude.total} running`;
     const codex = `Codex ${counts.codex.running}/${counts.codex.total} running`;
     const opencode = `OpenCode ${counts.opencode.running}/${counts.opencode.total} running`;
     const providerCounts = `${opencode} · ${claude} · ${codex}`;
-    const header = `▾ ${machine.name}  ${machine.state}  ${provider.displayName} ${providerVerdict(provider)}  ${providerCounts}`;
+    const header = `▾ ${machine.name}  ${machine.state}  ${providerColumn(machine)}  ${providerCounts}`;
     if (sessionsError !== undefined) return [header, `  └─ AgentSessions unavailable (${sessionsError})`];
     if (sessions.length === 0) return [header, "  └─ No AgentSessions"];
     return [
@@ -2933,10 +2961,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
       human: [
         ...(items.length === 0
           ? ["No machines found."]
-          : page.items.map((machine) => {
-              const provider = machineProviderAvailability(machine);
-              return `${machine.id}\t${machine.name}\t${machine.state}\t${provider.displayName} ${providerVerdict(provider)}`;
-            })),
+          : page.items.map((machine) => `${machine.id}\t${machine.name}\t${machine.state}\t${providerColumn(machine)}`)),
         ...(page.nextCursor === undefined
           ? []
           : ["-- truncated; more machines exist beyond this page"]),
@@ -3074,11 +3099,16 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     if (parsed.operands.length !== 2) throw usageError(`machines ${action} requires exactly one machine ID.`);
     requireConfirmation(parsed, `machines.${action}`);
     const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
-    // The public capability registry deliberately groups the four reversible
-    // lifecycle transitions under one semantic authority. The operation path
-    // still binds the exact action; discovery must not invent per-action IDs
-    // that the producer never advertises.
-    await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.lifecycle", now: context.capabilityClock ?? now });
+    // The grouped `machines.lifecycle` authority still decides; the Edge's
+    // per-action `machines.<action>`, when it names one, can only narrow it,
+    // with the Machine's current state. An Edge that names none leaves the
+    // grouped answer alone.
+    const admitted = await requireMachineAction({ client, machineId: id, action, now: context.capabilityClock ?? now });
+    if (admitted.sentDespite !== undefined) {
+      context.reportNotice?.(
+        `The provider refused this Machine's last ${action} (${admitted.sentDespite}); sending this one, since only the provider can tell whether that changed.`,
+      );
+    }
     const expectedState = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
     // Read the state first so the result can say whether anything moved. The
     // transition is still requested either way: this side's idea of the state
