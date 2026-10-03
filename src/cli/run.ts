@@ -98,7 +98,7 @@ import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
 import { labelledLines } from "./labelled-lines.js";
 import { createOutputWriter, sanitizeHumanTerminalOutput, type CliStreams } from "./output.js";
-import { booleanOption, parseArgv, stringOption } from "./parser.js";
+import { booleanOption, parseArgv, resolveCliRoute, stringOption } from "./parser.js";
 import { rejectUnknownOptions } from "./parser.js";
 import type { ParsedInvocation } from "./parser.js";
 
@@ -440,13 +440,26 @@ function parseTimeout(raw: string | undefined): number | undefined {
  * into a JSON record and into whatever consumes it. The parser already knows
  * which token is the command, so ask it; if the argv is too malformed to parse,
  * there is no command to name.
+ *
+ * It then named only that first token: `machines start` failed as `machines`
+ * while it succeeded as `machines.start` (BL-4, 2026-10-02). The registry leaf
+ * carries the path its result names, so an error names the same one. `version`
+ * and `help` are answered before any leaf runs, in this order, and their
+ * results are named for them. A leaf this build does not register has no path;
+ * the typed command is the most exact name left.
  */
 function commandLabel(argv: readonly string[]): string {
+  let parsed: ParsedInvocation;
   try {
-    return parseArgv(argv).command ?? "root";
+    parsed = parseArgv(argv);
   } catch {
     return "root";
   }
+  const help = parsed.options.help === true;
+  if (!help && (parsed.options.version === true || parsed.command === "version")) return "version";
+  if (help || parsed.command === "help") return "help";
+  if (parsed.command === undefined) return "root";
+  return resolveCliRoute(parsed)?.path ?? parsed.command;
 }
 
 function menuInvocationOptions(parsed: ReturnType<typeof parseArgv>): readonly string[] {

@@ -2332,8 +2332,10 @@ async function executeLiveUpdateSupervisor(context: CommandContext): Promise<Com
       if (reading.state === "outstanding" && reading.note.operationId === operationId) {
         await notes.settle(id, operationId);
       }
+      // Named for the command that ran, as its errors are; `resumed: false`
+      // is what says it answered with a read.
       return Object.freeze({
-        command: "machines.live-update-status",
+        command: "machines.live-update-supervisor",
         data: Object.freeze({
           ...report.data,
           operation_id_source: named === undefined ? "local_record" : "named",

@@ -42,6 +42,13 @@ export interface CliRouteDefinition {
   readonly key: string;
   readonly command: string;
   readonly action?: string;
+  /**
+   * The `command` every `--json` record of this leaf carries, result and error
+   * alike (`machines.start`). Error records used to carry the first token
+   * (`machines`) while results named the leaf, so a script could not tell
+   * which command had failed (BL-4, 2026-10-02).
+   */
+  readonly path: string;
   readonly operandMode: "exact" | "free";
   readonly syntax: string;
   readonly argv: readonly string[];
@@ -55,10 +62,12 @@ const routed = (
   argv: readonly string[],
   summary: string,
   operandMode: "exact" | "free" = "exact",
+  path = key.replaceAll(" ", "."),
 ): CliRouteDefinition => Object.freeze({
   key,
   command: key.split(" ")[0]!,
   ...(key.split(" ")[1] === undefined ? {} : { action: key.split(" ")[1] }),
+  path,
   operandMode,
   syntax,
   argv: Object.freeze([...argv]),
@@ -70,6 +79,7 @@ const reserved = (key: string, summary: string): CliRouteDefinition => Object.fr
   key,
   command: key.split(" ")[0]!,
   ...(key.split(" ")[1] === undefined ? {} : { action: key.split(" ")[1] }),
+  path: key.replaceAll(" ", "."),
   operandMode: "exact",
   syntax: key,
   argv: Object.freeze(key.split(" ")),
@@ -87,7 +97,8 @@ export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
   routed("observe", "observe --project PROJECT_ID", ["observe","--project","00000000-0000-4000-8000-000000000001"], "Observe an authorized shared session read-only"),
   routed("share", "share --project PROJECT_ID [--grant GRANT_ID]", ["share","--project","00000000-0000-4000-8000-000000000001"], "Grant, inspect or revoke a member's read-only observation, and share or unshare the session itself"),
   routed("capabilities", "capabilities", ["capabilities"], "Inspect live server capability truth"),
-  routed("machines", "machines", ["machines"], "Browse machines and AgentSessions interactively"),
+  // Off a terminal, bare `machines` prints the nested inventory as `machines.overview`.
+  routed("machines", "machines", ["machines"], "Browse machines and AgentSessions interactively", "exact", "machines.overview"),
   routed("machines list", "machines list", ["machines", "list"], "List exact machine resources"),
   routed("machines create", "machines create --name NAME --yes", ["machines", "create", "--name", "fixture", "--yes"], "Create a machine"),
   routed("machines start", "machines start MACHINE_ID --yes", ["machines", "start", "00000000-0000-4000-8000-000000000001", "--yes"], "Start a machine"),

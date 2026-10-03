@@ -1796,7 +1796,10 @@ test("--resume reports a settled operation instead of re-sending it", async (t) 
   const resumed = await runJson(
     ["machines", "live-update-supervisor", MACHINE_ID, "--resume", "--json"], root, client);
   assert.equal(resumed.exit, EXIT_CODES.success, resumed.stderr);
-  assert.equal(resumed.record.command, "machines.live-update-status");
+  // The command that ran (PRD R4.1). It answered with a read, and `resumed`
+  // says so; the envelope used to name the read instead, so its error and its
+  // result named two different commands.
+  assert.equal(resumed.record.command, "machines.live-update-supervisor");
   assert.equal(resumed.record.data.resumed, false);
   assert.equal(resumed.record.data.next_action, "none");
   assert.equal(sent, before, "a settled operation is reported, never re-sent");
