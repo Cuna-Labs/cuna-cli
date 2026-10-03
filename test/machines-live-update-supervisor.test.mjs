@@ -26,7 +26,7 @@ import { VENDORED_CONTRACT_OPERATIONS } from "../dist/cli/route-contract.js";
 
 /**
  * The operations of a contract that serves the in-place update, as producer
- * `7b1b3e42` does. The vendored contract (`d3d3d3c`, the deployed producer)
+ * `7b1b3e42` does. The vendored contract (`3dfa1d1`, the deployed producer)
  * does not, so every `runCli` below names this set: these tests exercise the
  * command's logic as it runs where the route exists, and
  * `test/route-contract.test.mjs` pins the refusal where it does not.

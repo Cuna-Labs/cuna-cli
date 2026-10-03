@@ -1026,6 +1026,16 @@
               "type": "string",
               "enum": ["true"]
             }
+          },
+          {
+            "name": "include_runtime_evidence",
+            "in": "query",
+            "required": false,
+            "description": "Pass the exact value true to include runtime_evidence. Omission preserves the prior AgentSession response for installed CLI clients.",
+            "schema": {
+              "type": "string",
+              "enum": ["true"]
+            }
           }
         ],
         "responses": {
@@ -1312,6 +1322,16 @@
             "in": "query",
             "required": false,
             "description": "Pass the exact value true to include durable readiness fields. Omission preserves the prior AgentSession response for installed CLI clients.",
+            "schema": {
+              "type": "string",
+              "enum": ["true"]
+            }
+          },
+          {
+            "name": "include_runtime_evidence",
+            "in": "query",
+            "required": false,
+            "description": "Pass the exact value true to include runtime_evidence. Omission preserves the prior AgentSession response for installed CLI clients.",
             "schema": {
               "type": "string",
               "enum": ["true"]
@@ -2455,6 +2475,71 @@
         ]
       }
     },
+    "/v1/records/all": {
+      "get": {
+        "operationId": "records.pageAll",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque cursor returned as next_cursor by the preceding page of this operation. A records.page cursor is refused here, and this operation's cursor is refused by records.page.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded page of every owned record entry, newest first, in the order records.page uses. Unlike records.list and records.page it includes account-level records (for example credential.set, credential.delete and metering.reconcile), whose session_id is null.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountRecordPage"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "records:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
     "/v1/api-keys": {
       "security": [
         {
@@ -2983,7 +3068,10 @@
           "workspace_binding_idempotency_conflict",
           "workspace_binding_prerequisite_incomplete",
           "workspace_binding_invalid_request",
-          "workspace_binding_authority_unavailable"
+          "workspace_binding_authority_unavailable",
+          "machine_supervisor_control_expired",
+          "machine_supervisor_control_revoked",
+          "machine_supervisor_control_absent"
         ],
         "parameters": [
           {
@@ -3124,6 +3212,77 @@
         ],
         "x-runa-required-permissions": [
           "workspace_sync:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/workspace-bindings/{binding_id}/release": {
+      "parameters": [
+        {
+          "name": "binding_id",
+          "in": "path",
+          "required": true,
+          "description": "Opaque canonical WorkspaceBinding identifier.",
+          "schema": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "workspaceBindings.release",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "workspace_binding_unavailable",
+          "workspace_binding_in_use",
+          "workspace_binding_sync_pending",
+          "workspace_binding_prerequisite_incomplete",
+          "workspace_binding_invalid_request",
+          "workspace_binding_authority_unavailable"
+        ],
+        "description": "Release one local folder's WorkspaceBinding. Refused while an AgentSession in its Workspace has not settled (workspace_binding_in_use), or while an upload is open or an AgentSession settled within the last 120 s (workspace_binding_sync_pending, retryable). Deletes nothing; idempotent by state.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceBindingReleaseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Released, or already released, workspace binding",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceBindingRelease"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "workspace_sync:write"
         ],
         "security": [
           {
@@ -8437,6 +8596,34 @@
             "type": "string",
             "format": "date-time"
           },
+          "runtime_evidence": {
+            "description": "Supervisor evidence behind the runtime fields. Present only when GET/list uses include_runtime_evidence=true and a supervisor acknowledgement exists. process_proof says why process_observation has its value: not_stated means the last acknowledgement stated no proof either way (it is not evidence that the process is absent), other_process_epoch that the proof belongs to an earlier process, no_process_epoch that no process has been launched.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "source",
+              "observed_at",
+              "age_seconds",
+              "process_proof"
+            ],
+            "properties": {
+              "source": {
+                "const": "supervisor_ack"
+              },
+              "observed_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "age_seconds": {
+                "description": "Seconds since observed_at on the server clock when the response was produced.",
+                "type": "integer",
+                "minimum": 0
+              },
+              "process_proof": {
+                "enum": ["observed", "unproven", "not_stated", "other_process_epoch", "no_process_epoch"]
+              }
+            }
+          },
           "runtime_expires_at": {
             "description": "Authoritative expiry of the current leased supervisor observation. Omitted when no runtime lease exists.",
             "type": "string",
@@ -8893,6 +9080,44 @@
           "create_operation": {
             "$ref": "#/components/schemas/MachineCreateRequest",
             "description": "Durable creation operation when retained. Unknown requires reconciliation; it does not establish provider absence or continued creation."
+          },
+          "status_check": {
+            "description": "Present only in sessions.list, for a Machine whose status the list checked with the provider (a running, suspended or paused Machine with a runtime). confirmed: the provider's answer at list time agrees with status, or status was reconciled to it. unverified: status is the last stored value and was not confirmed on this read; reason says why. provider_read_pending means the read did not answer within the list's bound, or one is already in progress; it continues and may still reconcile the Machine.",
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "state"
+                ],
+                "properties": {
+                  "state": {
+                    "const": "confirmed"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "state",
+                  "reason"
+                ],
+                "properties": {
+                  "state": {
+                    "const": "unverified"
+                  },
+                  "reason": {
+                    "enum": [
+                      "provider_read_pending",
+                      "provider_read_failed",
+                      "provider_status_unmapped",
+                      "transition_in_progress"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         }
       },
@@ -9188,7 +9413,7 @@
           }
         }
       },
-      "SystemActivitySummary": {"type":"object","additionalProperties":false,"dependentRequired":{"retention_limited":["retention_evicted_total","retention_accounting_started_at"],"retention_evicted_total":["retention_limited","retention_accounting_started_at"],"retention_accounting_started_at":["retention_limited","retention_evicted_total"]},"required":["source","scope","session_attribution","window","window_start","window_end","bucket_seconds","scan_limited","totals","histogram","lifetimes","coverage"],"properties":{"source":{"type":"string","enum":["tetragon"]},"scope":{"type":"string","enum":["machine"]},"session_attribution":{"type":"string","enum":["unverified"]},"window":{"type":"string","enum":["1h","6h","24h"]},"kind":{"type":"string","enum":["process_started","process_ended","file_open_requested"]},"window_start":{"type":"string","format":"date-time"},"window_end":{"type":"string","format":"date-time"},"bucket_seconds":{"type":"integer","minimum":1},"scan_limited":{"type":"boolean"},"retention_limited":{"type":"boolean"},"retention_evicted_total":{"type":"integer","minimum":0,"maximum":9007199254740991},"retention_accounting_started_at":{"type":"string","format":"date-time"},"totals":{"type":"object","additionalProperties":false,"required":["process_started","process_ended","file_open_requested"],"properties":{"process_started":{"type":"integer","minimum":0,"maximum":9007199254740991},"process_ended":{"type":"integer","minimum":0,"maximum":9007199254740991},"file_open_requested":{"type":"integer","minimum":0,"maximum":9007199254740991}}},"histogram":{"type":"array","minItems":60,"maxItems":60,"items":{"type":"object","additionalProperties":false,"required":["start","process_started","process_ended","file_open_requested"],"properties":{"start":{"type":"string","format":"date-time"},"process_started":{"type":"integer","minimum":0,"maximum":9007199254740991},"process_ended":{"type":"integer","minimum":0,"maximum":9007199254740991},"file_open_requested":{"type":"integer","minimum":0,"maximum":9007199254740991}}}},"lifetimes":{"type":"object","additionalProperties":false,"required":["paired","no_end_seen","median_ms","p95_ms","buckets"],"properties":{"paired":{"type":"integer","minimum":0,"maximum":9007199254740991},"no_end_seen":{"type":"integer","minimum":0,"maximum":9007199254740991},"median_ms":{"type":["integer","null"],"minimum":0},"p95_ms":{"type":["integer","null"],"minimum":0},"buckets":{"type":"array","minItems":7,"maxItems":7,"items":{"type":"object","additionalProperties":false,"required":["le_ms","count"],"properties":{"le_ms":{"type":["integer","null"],"minimum":0},"count":{"type":"integer","minimum":0,"maximum":9007199254740991}}}}}},"coverage":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["boot_id","collector_epoch","dropped_total","counters","received_at"],"properties":{"boot_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"collector_epoch":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"dropped_total":{"type":"integer","minimum":0,"maximum":9007199254740991},"received_at":{"type":"string","format":"date-time"},"counters":{"type":"object","additionalProperties":false,"properties":{"oversized_record":{"type":"integer","minimum":0,"maximum":9007199254740991},"rejected_record":{"type":"integer","minimum":0,"maximum":9007199254740991},"source_eof":{"type":"integer","minimum":0,"maximum":9007199254740991},"source_read_error":{"type":"integer","minimum":0,"maximum":9007199254740991}}}}}}}},
+      "SystemActivitySummary": {"type":"object","additionalProperties":false,"dependentRequired":{"retention_limited":["retention_evicted_total","retention_accounting_started_at"],"retention_evicted_total":["retention_limited","retention_accounting_started_at"],"retention_accounting_started_at":["retention_limited","retention_evicted_total"]},"required":["source","scope","session_attribution","window","window_start","window_end","bucket_seconds","scan_limited","totals","histogram","lifetimes","coverage"],"properties":{"source":{"type":"string","enum":["tetragon"]},"scope":{"type":"string","enum":["machine"]},"session_attribution":{"type":"string","enum":["unverified"]},"window":{"type":"string","enum":["1h","6h","24h"]},"kind":{"type":"string","enum":["process_started","process_ended","file_open_requested"]},"window_start":{"type":"string","format":"date-time"},"window_end":{"type":"string","format":"date-time"},"bucket_seconds":{"type":"integer","minimum":1},"scan_limited":{"type":"boolean"},"retention_limited":{"type":"boolean"},"retention_evicted_total":{"type":"integer","minimum":0,"maximum":9007199254740991},"retention_accounting_started_at":{"type":"string","format":"date-time"},"totals":{"type":"object","additionalProperties":false,"required":["process_started","process_ended","file_open_requested"],"properties":{"process_started":{"type":"integer","minimum":0,"maximum":9007199254740991},"process_ended":{"type":"integer","minimum":0,"maximum":9007199254740991},"file_open_requested":{"type":"integer","minimum":0,"maximum":9007199254740991}}},"histogram":{"type":"array","minItems":60,"maxItems":60,"items":{"type":"object","additionalProperties":false,"required":["start","process_started","process_ended","file_open_requested"],"properties":{"start":{"type":"string","format":"date-time"},"process_started":{"type":"integer","minimum":0,"maximum":9007199254740991},"process_ended":{"type":"integer","minimum":0,"maximum":9007199254740991},"file_open_requested":{"type":"integer","minimum":0,"maximum":9007199254740991}}}},"lifetimes":{"type":"object","additionalProperties":false,"required":["paired","no_end_seen","median_ms","p95_ms","buckets"],"properties":{"paired":{"type":"integer","minimum":0,"maximum":9007199254740991},"no_end_seen":{"type":"integer","minimum":0,"maximum":9007199254740991},"median_ms":{"type":["integer","null"],"minimum":0},"p95_ms":{"type":["integer","null"],"minimum":0},"buckets":{"type":"array","minItems":7,"maxItems":7,"items":{"type":"object","additionalProperties":false,"required":["le_ms","count"],"properties":{"le_ms":{"type":["integer","null"],"minimum":0},"count":{"type":"integer","minimum":0,"maximum":9007199254740991}}}}}},"coverage":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["boot_id","collector_epoch","dropped_total","counters","received_at"],"properties":{"boot_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"collector_epoch":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"dropped_total":{"type":"integer","minimum":0,"maximum":9007199254740991},"received_at":{"type":"string","format":"date-time"},"counters":{"type":"object","additionalProperties":false,"properties":{"oversized_record":{"type":"integer","minimum":0,"maximum":9007199254740991},"rejected_record":{"type":"integer","minimum":0,"maximum":9007199254740991},"source_eof":{"type":"integer","minimum":0,"maximum":9007199254740991},"source_read_error":{"type":"integer","minimum":0,"maximum":9007199254740991},"provider_excluded_record":{"type":"integer","minimum":0,"maximum":9007199254740991}}}}}}}},
       "SystemActivityPrograms": {
         "type":"object","additionalProperties":false,
         "required":["source","scope","session_attribution","window","window_start","window_end","scan_limited","retention_limited","retention_evicted_total","retention_accounting_started_at","recorded_starts","unnamed_starts","programs"],
@@ -9257,6 +9482,79 @@
             "maxItems": 200,
             "items": {
               "$ref": "#/components/schemas/Record"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "AccountRecord": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "A Record, or an account-level record that names no Machine. session_id is null exactly for the latter.",
+        "required": [
+          "id",
+          "session_id",
+          "kind",
+          "summary",
+          "detail",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "detail": {},
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "AccountRecordPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "next_cursor is null exactly when has_more is false.",
+        "required": [
+          "items",
+          "has_more",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/AccountRecord"
             }
           },
           "has_more": {
@@ -9565,6 +9863,95 @@
               }
             ],
             "description": "Durable execution Workspace, independent of the account workspace_id and local binding. Null explicitly identifies an unchanged legacy Project-root binding."
+          }
+        }
+      },
+      "WorkspaceBindingReleaseRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "workspace_id",
+          "project_id",
+          "local_instance_id",
+          "machine_id",
+          "exclusion_policy_digest"
+        ],
+        "description": "The exact identity tuple of the binding being released, as the local folder records it.",
+        "properties": {
+          "workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "local_instance_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "exclusion_policy_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "WorkspaceBindingRelease": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "binding_id",
+          "workspace_id",
+          "project_id",
+          "local_instance_id",
+          "machine_id",
+          "execution_workspace_id",
+          "remote_root",
+          "state",
+          "released_at",
+          "remote_workspace_retained"
+        ],
+        "description": "A released binding. Releasing ends this folder's link only: the execution Workspace, its files on the Machine and every committed generation are kept, and the Workspace can be adopted again.",
+        "properties": {
+          "binding_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "local_instance_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "execution_workspace_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "remote_root": {
+            "type": "string",
+            "pattern": "^/workspace/(projects|workspaces)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "state": {
+            "const": "released"
+          },
+          "released_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this binding was released. Releasing again returns the same receipt."
+          },
+          "remote_workspace_retained": {
+            "const": true
           }
         }
       },

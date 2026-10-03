@@ -556,7 +556,7 @@ export function ownerObserveGrantsApi(transport:HttpTransport,owner:string,proje
    */
   async readAudience(input:ReadAudienceInput,operationId:string,signal:AbortSignal):Promise<SessionAudienceState>{
    // Projected only when the vendored contract has it (the deployed d3d3d3c
-   // does not). Absent, the question is refused here and never sent.
+   // and 3dfa1d1 do not). Absent, the question is refused here and never sent.
    const readOperation=(ownerObserveGrantOperations as Partial<Record<string,{readonly path:string}>>).readSessionAudienceStateV2;
    if(readOperation===undefined)throw new OwnerGrantError('unavailable','This Cuna API version has no sharing-state reading, so Cuna asked nothing and nothing about sharing changed.');
    assertCanonicalUuid(input.agentSessionId,'AgentSession ID');assertCanonicalUuid(operationId,'Operation ID');

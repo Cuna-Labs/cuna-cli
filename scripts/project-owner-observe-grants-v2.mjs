@@ -19,7 +19,7 @@ const bytes=readFileSync(new URL(`../${source}`,import.meta.url));
 const spec=JSON.parse(bytes),schemas={};
 function include(name){if(schemas[name])return;if(!spec.components.schemas[name])throw Error(name);schemas[name]=spec.components.schemas[name];JSON.stringify(schemas[name],(key,value)=>{if(key==='$ref')include(value.split('/').at(-1));return value;});}
 // The sharing-state reading is projected only when the vendored contract has
-// it. The deployed producer (d3d3d3c) does not, and a reading this build's API
+// it. The deployed producer (3dfa1d1, as d3d3d3c before it) does not, and a reading this build's API
 // cannot serve must be absent from the projection so the client refuses it
 // locally, rather than projected from a contract the build no longer vendors.
 const readsAudience=Object.hasOwn(spec.components.schemas,'ReadSessionAudienceStateV2Request');

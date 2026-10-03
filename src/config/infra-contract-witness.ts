@@ -3,27 +3,27 @@ export const INFRA_OPENAPI_CONTRACT_IDENTITY = Object.freeze({
   "schemaVersion": 2,
   "artifact_file": "contracts/infra/cuna-api.openapi.json",
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
-  "infra_openapi_raw_sha256": "b77b20de6e0b91a083d70d87685b0ccfd3e1d42fad41a9442b1152b1b9b8f0db",
-  "infra_openapi_canonical_sha256": "aedf6d67282cf4e790ea5de720fcc9ec09975f6fbb05a66a9ae032cdf0d93a24",
+  "infra_openapi_raw_sha256": "5f07f6a514da218d6f8409fc1accab4ed62b258863d7dccdd9328eb45394b044",
+  "infra_openapi_canonical_sha256": "7a950c6ffab805f4a04e5b32c69726affa54f39d0d6e7ba9d5e53099feb78af5",
   "producer_repository": "Cuna-Labs/infra-proxy-mvp",
   "producer_content_state": "committed",
-  "producer_revision": "d3d3d3ccff714be8fea89bada249c911d8546642",
+  "producer_revision": "3dfa1d12cdc66cc63447ceee7f3c97ae8dc8c5c3",
   "producer_full_tree": {
     "object_format": "sha1",
-    "commit": "d3d3d3ccff714be8fea89bada249c911d8546642",
-    "tree": "32118bdd44b69e1939ab5b0e53f285451a061ec3",
-    "contract_blob": "7522271ca3f94822c7cd9e711445bb98b81f5eb4"
+    "commit": "3dfa1d12cdc66cc63447ceee7f3c97ae8dc8c5c3",
+    "tree": "aa0911bcbcc88cf04d04e8a22ec851ec5dcf1cea",
+    "contract_blob": "8f023c168493b50aeb05ee7e9ab278b2a743733d"
   },
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
-  "producer_projection_sha256": "83a5fbd432a4ac0e401165008a437e7d35bfea8a9010d8a9902cb100f92c0e90",
-  "producer_runtime_manifest_sha256": "657a98faf55c32cfadfd6acade5bc7c2971e397127f64297992a332b832ccdf7",
+  "producer_projection_sha256": "fdb522241303aaae362a3df962b122a1506e00400a14487c47ac1105afefde65",
+  "producer_runtime_manifest_sha256": "0ce6a86fe877ad29f7679954e3333e184e58bddb3fb8cc4675fde2493d6b611e",
   "feature_contracts": {
     "opencode_interactive_only": {
-      "openapi_raw_sha256": "b77b20de6e0b91a083d70d87685b0ccfd3e1d42fad41a9442b1152b1b9b8f0db",
-      "openapi_canonical_sha256": "aedf6d67282cf4e790ea5de720fcc9ec09975f6fbb05a66a9ae032cdf0d93a24",
-      "producer_commit": "d3d3d3ccff714be8fea89bada249c911d8546642",
-      "producer_tree": "32118bdd44b69e1939ab5b0e53f285451a061ec3",
-      "producer_contract_blob": "7522271ca3f94822c7cd9e711445bb98b81f5eb4"
+      "openapi_raw_sha256": "5f07f6a514da218d6f8409fc1accab4ed62b258863d7dccdd9328eb45394b044",
+      "openapi_canonical_sha256": "7a950c6ffab805f4a04e5b32c69726affa54f39d0d6e7ba9d5e53099feb78af5",
+      "producer_commit": "3dfa1d12cdc66cc63447ceee7f3c97ae8dc8c5c3",
+      "producer_tree": "aa0911bcbcc88cf04d04e8a22ec851ec5dcf1cea",
+      "producer_contract_blob": "8f023c168493b50aeb05ee7e9ab278b2a743733d"
     }
   }
 } as const);
@@ -58,6 +58,7 @@ export const INFRA_OPENAPI_OPERATIONS: readonly string[] = Object.freeze([
   "GET /v1/me",
   "GET /v1/me/workspace-admission",
   "GET /v1/records",
+  "GET /v1/records/all",
   "GET /v1/records/page",
   "GET /v1/sessions",
   "GET /v1/sessions/{id}",
@@ -137,6 +138,7 @@ export const INFRA_OPENAPI_OPERATIONS: readonly string[] = Object.freeze([
   "POST /v1/teams/{id}/rename",
   "POST /v1/teams/{id}/revoke-invitation",
   "POST /v1/workspace-bindings",
+  "POST /v1/workspace-bindings/{binding_id}/release",
   "POST /v1/workspace-sync/{id}/commit",
   "POST /v1/workspace-sync/{id}/manifests",
   "POST /v1/workspaces/{id}/reconcile",

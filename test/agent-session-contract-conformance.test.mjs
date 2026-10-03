@@ -74,6 +74,14 @@ const VALUE = Object.freeze({
   readiness_outcome: "refused",
   readiness_reason: "deadline_unattested",
   readiness_settled_at: "2026-09-07T22:05:01.000+00:00",
+  // Added by the 3dfa1d1 synchronization (C4.15). Sent only to a read with
+  // `include_runtime_evidence=true`; the decoder already carries it.
+  runtime_evidence: {
+    source: "supervisor_ack",
+    observed_at: "2026-09-07T22:00:00.000+00:00",
+    age_seconds: 4,
+    process_proof: "observed",
+  },
   row_version: 7,
   created_at: "2026-09-07T20:25:41.348866+00:00",
   updated_at: "2026-09-07T22:00:00.000000+00:00",

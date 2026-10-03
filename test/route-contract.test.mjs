@@ -24,8 +24,9 @@ const identity = JSON.parse(readFileSync(new URL("../contracts/infra/cuna-api.op
 const declared = new Set(CLI_ROUTE_REGISTRY.flatMap((route) => route.operations));
 
 test("the vendored contract is the deployed producer's, and the compiled operation list is read from it", () => {
-  assert.equal(identity.producer_revision, "d3d3d3ccff714be8fea89bada249c911d8546642");
-  assert.equal(identity.infra_openapi_canonical_sha256, "aedf6d67282cf4e790ea5de720fcc9ec09975f6fbb05a66a9ae032cdf0d93a24");
+  // Live Edge C4.15 (Fly v248), /healthz contract sha256 at 2026-10-03 20:54Z.
+  assert.equal(identity.producer_revision, "3dfa1d12cdc66cc63447ceee7f3c97ae8dc8c5c3");
+  assert.equal(identity.infra_openapi_canonical_sha256, "7a950c6ffab805f4a04e5b32c69726affa54f39d0d6e7ba9d5e53099feb78af5");
   assert.equal(identity.producer_content_state, "committed");
   const fromArtifact = Object.entries(contract.paths).flatMap(([path, row]) =>
     Object.keys(row).filter((method) => ["get", "put", "post", "delete", "options", "head", "patch", "trace"].includes(method))
