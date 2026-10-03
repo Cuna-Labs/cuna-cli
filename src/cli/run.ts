@@ -2361,6 +2361,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       ...(dependencies.convergencePoller === undefined
         ? {}
         : { convergencePoller: dependencies.convergencePoller }),
+      ...(timeoutMs === undefined ? {} : { requestBudgetMs: timeoutMs }),
       ...(credentialMode === undefined ? {} : { credentialMode }),
       ...(runtimeFeatures === undefined ? {} : { runtimeFeatures }),
       // Where `agent-sessions create` looks for `.cuna/workspace.json`. Passed

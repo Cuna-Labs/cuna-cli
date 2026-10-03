@@ -20,6 +20,7 @@ import type {
 import type { EffectiveConfig } from "../config/config.js";
 import { DEFAULT_BASE_URL, environmentCredentialState, publicConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError, unsupportedError, usageError, type SafeErrorDetails } from "../core/errors.js";
+import { CredentialBoundaryError } from "../credentials/errors.js";
 import {
   MACHINE_CREATE_FOLLOW_DEADLINE_MS,
   MACHINE_CREATE_FOLLOW_POLL_INTERVAL_MS,
@@ -124,6 +125,13 @@ export interface CommandContext {
   readonly capabilityClock?: () => number;
   /** Test seam; production uses the real wall-clock wait below. */
   readonly convergencePoller?: ConvergencePoller;
+  /**
+   * The caller's EXPLICIT `--timeout-ms`, when one was typed. Absent means the
+   * caller did not decide (D1, `api/http.ts`). A command that bounds a whole
+   * read -- the sign-in renewal the transport performs before its own budget
+   * starts, and the dispatch -- reads it here.
+   */
+  readonly requestBudgetMs?: number;
   /**
    * Where to start looking for `.cuna/workspace.json`. Production passes the
    * process's working directory; tests pass a scratch folder, so no test can
@@ -536,6 +544,27 @@ function machineCreateReceiptNotYetReadable(error: unknown): boolean {
     (error instanceof CunaError && error.code === "cuna.network.failed");
 }
 
+/**
+ * The transport code of a read that did not complete, or `undefined` for any
+ * other failure.
+ *
+ * A read made after the create was sent can fail without Cuna answering at
+ * all, and that says nothing about the create. The sign-in renewal the
+ * transport performs before each request fails as a `CredentialBoundaryError`
+ * carrying its request's transport code, which `cli/run.ts` (`credentialError`)
+ * prints as "Run the command again" -- for a create, an invitation to make a
+ * second Machine (BL-6, 2026-10-03). The same test as `credentialError`'s, so
+ * the two cannot disagree about which failures are transport.
+ */
+function machineCreateReadIncomplete(error: unknown): string | undefined {
+  const isTransport = (code: string): boolean => code.startsWith("cuna.network.") || code.startsWith("cuna.client.");
+  if (error instanceof CredentialBoundaryError) {
+    const reason = error.safeDetails?.["reason"];
+    return typeof reason === "string" && isTransport(reason) ? reason : undefined;
+  }
+  return error instanceof CunaError && isTransport(error.code) ? error.code : undefined;
+}
+
 interface MachineCreateFollow {
   readonly requestId: string;
   readonly key: string;
@@ -543,6 +572,69 @@ interface MachineCreateFollow {
   readonly startedAt: number;
   /** A receipt was already read, or a POST was already sent, for this request. */
   readonly posted: boolean;
+}
+
+/**
+ * One request made after the create was sent, bounded as a whole.
+ *
+ * `--timeout-ms` bounds a request from its dispatch, and `api/http.ts` asks
+ * the sign-in for a bearer BEFORE that budget starts; only the caller's
+ * AbortSignal reaches that wait. BL-6 (2026-10-03, `--timeout-ms 120000`): the
+ * Machine was running at 00:58:25Z and the command answered at 01:20:13.8Z
+ * with a renewal that did not complete. Where those minutes went was not
+ * observed; what the source shows is that no bound covered them -- the renewal
+ * waits outside `--timeout-ms`, and the follow deadline was looked at only
+ * between reads.
+ *
+ * Each request here carries a signal that aborts at the typed `--timeout-ms`
+ * or at the follow deadline, whichever is first, and is abandoned at that
+ * instant even if something below ignores the signal. The abandoned request is
+ * reported as an elapsed response budget, so the follow treats it exactly like
+ * a dispatch that outlived its own budget: not answered yet.
+ */
+async function boundedCreateRead<T>(
+  context: CommandContext,
+  deadline: number,
+  operation: string,
+  read: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const poller = context.convergencePoller ?? productionConvergencePoller();
+  // A request made at the deadline still gets one poll interval: the follow
+  // overruns its deadline by at most that, and its last read is not lost to a
+  // bound of zero.
+  const boundMs = Math.min(
+    context.requestBudgetMs ?? Number.POSITIVE_INFINITY,
+    Math.max(deadline - poller.now(), MACHINE_CREATE_FOLLOW_POLL_INTERVAL_MS),
+  );
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const elapsed = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const refusal = observationBudgetElapsed({
+        kind: "response",
+        operation,
+        budgetMs: boundMs,
+        readOnly: operation.startsWith("GET "),
+        settleWith: "cuna machines list",
+      });
+      controller.abort(refusal);
+      reject(refusal);
+    }, boundMs);
+  });
+  const pending = read(controller.signal);
+  try {
+    return await Promise.race([pending, elapsed]);
+  } catch (error) {
+    // The abort makes the request fail in its own words -- a cancelled sign-in,
+    // a cancelled request. What happened is the bound.
+    if (controller.signal.aborted) throw controller.signal.reason;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    // An abandoned request may still settle later; nothing listens for it.
+    void pending.catch(() => undefined);
+    void elapsed.catch(() => undefined);
+  }
 }
 
 /**
@@ -554,68 +646,122 @@ interface MachineCreateFollow {
  * receipt's own `retry_create` on a `prepared` request, which says the create
  * never reached the provider; the same POST, with the same key and request,
  * is then sent once.
+ *
+ * The Machine read that shows it running is the create's observation and ends
+ * the command; the caller reads nothing after it. A further read can only
+ * fail, and in BL-6 a renewal failure was the answer for a Machine Cuna had
+ * already started.
  */
 async function followMachineCreate(context: CommandContext, follow: MachineCreateFollow): Promise<Machine> {
   const { client } = context;
   const poller = context.convergencePoller ?? productionConvergencePoller();
   const deadline = follow.startedAt + MACHINE_CREATE_FOLLOW_DEADLINE_MS;
+  const read = <T>(operation: string, call: (signal: AbortSignal) => Promise<T>): Promise<T> =>
+    boundedCreateRead(context, deadline, operation, call);
   const name = follow.input.name;
   let posted = follow.posted;
+  // The last receipt and Machine this follow read. A read that went unanswered
+  // says nothing new, so it does not erase them: the timeout used to call a
+  // Machine already read as starting one still "to be created".
   let receipt: MachineCreateRequest | undefined;
   let machine: Machine | undefined;
+  const waitingFor = (): string => machine === undefined ? `machine ${name} to be created` : `machine ${name} to run`;
+  const unconfirmed = (reason?: string, cause?: unknown): CunaError => machineCreateUnconfirmed(follow, {
+    elapsedMs: poller.now() - follow.startedAt,
+    waitingFor: waitingFor(),
+    ...(receipt === undefined ? {} : { receipt }),
+    ...(machine === undefined ? {} : { machine }),
+    ...(reason === undefined ? {} : { reason, cause }),
+  });
+  // A read that did not complete and is not one the receipt may simply be
+  // early for -- a renewal that failed -- ends the follow, naming what it knows.
+  // Polling on would exchange the login code again on every read.
+  const readFailed = (error: unknown): unknown => {
+    const reason = machineCreateReadIncomplete(error);
+    return reason === undefined ? error : unconfirmed(reason, error);
+  };
   for (;;) {
-    let waitingFor = `machine ${name} to be created`;
+    let current: MachineCreateRequest | undefined;
     try {
-      receipt = await client.getMachineCreateRequest(follow.requestId);
-      if (receipt.state === "unknown" || receipt.action === "reconcile") {
-        receipt = await client.reconcileMachineCreateRequest(follow.requestId);
+      current = await read(`GET /v1/machine-creates/${follow.requestId}`,
+        (signal) => client.getMachineCreateRequest(follow.requestId, signal));
+      if (current.state === "unknown" || current.action === "reconcile") {
+        current = await read(`POST /v1/machine-creates/${follow.requestId}/reconcile`,
+          (signal) => client.reconcileMachineCreateRequest(follow.requestId, signal));
       }
     } catch (error) {
-      if (!machineCreateReceiptNotYetReadable(error)) throw error;
-      receipt = undefined;
+      if (!machineCreateReceiptNotYetReadable(error)) throw readFailed(error);
+      current = undefined;
     }
-    if (receipt !== undefined) {
-      if (receipt.id !== follow.requestId) {
-        postconditionUnverified("machine creation", { create_request_id: follow.requestId, observed_id: receipt.id });
+    if (current !== undefined) {
+      receipt = current;
+      if (current.id !== follow.requestId) {
+        postconditionUnverified("machine creation", { create_request_id: follow.requestId, observed_id: current.id });
       }
-      if (receipt.state === "terminal_failed" || (receipt.action === "none" &&
-        receipt.state !== "settled" && receipt.state !== "provider_succeeded")) {
-        throw machineCreateFailed(follow, `Cuna reports that creating machine ${name} failed.`, receipt);
+      if (current.state === "terminal_failed" || (current.action === "none" &&
+        current.state !== "settled" && current.state !== "provider_succeeded")) {
+        throw machineCreateFailed(follow, `Cuna reports that creating machine ${name} failed.`, current);
       }
-      if (receipt.state === "settled" || receipt.state === "provider_succeeded") {
+      if (current.state === "settled" || current.state === "provider_succeeded") {
+        const machineId = current.machineId;
         try {
-          machine = await client.getMachine(receipt.machineId);
+          machine = await read(`GET /v1/sessions/${machineId}`, (signal) => client.getMachine(machineId, signal));
         } catch (error) {
-          if (!machineCreateReceiptNotYetReadable(error)) throw error;
+          if (!machineCreateReceiptNotYetReadable(error)) throw readFailed(error);
         }
         if (machine !== undefined) {
-          if (machine.id !== receipt.machineId) {
-            postconditionUnverified("machine creation", { create_request_id: follow.requestId, machine_id: receipt.machineId, observed_id: machine.id });
+          if (machine.id !== machineId) {
+            postconditionUnverified("machine creation", { create_request_id: follow.requestId, machine_id: machineId, observed_id: machine.id });
           }
           if (follow.input.background === true || machine.state === "running") {
             context.reportWait?.(undefined);
             return machine;
           }
           if (machine.state === "error" || machine.state === "deleted") {
-            throw machineCreateFailed(follow, `Machine ${name} was created but is ${machine.state}.`, receipt, machine);
+            throw machineCreateFailed(follow, `Machine ${name} was created but is ${machine.state}.`, current, machine);
           }
-          waitingFor = `machine ${name} to run`;
         }
-      } else if (receipt.state === "prepared" && receipt.action === "retry_create" && !posted) {
+      } else if (current.state === "prepared" && current.action === "retry_create" && !posted) {
         posted = true;
         try {
-          await client.createMachine(follow.input, follow.key, follow.requestId);
+          await read("POST /v1/sessions", (signal) => client.createMachine(follow.input, follow.key, follow.requestId, signal));
         } catch (error) {
-          if (!machineCreateOutcomeUnobserved(error)) throw error;
+          if (!machineCreateOutcomeUnobserved(error)) throw readFailed(error);
         }
         continue;
       }
     }
     const elapsedMs = poller.now() - follow.startedAt;
     const remaining = deadline - poller.now();
-    if (remaining <= 0) throw machineCreateUnconfirmed(follow, elapsedMs, receipt, machine);
-    context.reportWait?.({ waitingFor, elapsedMs, deadlineMs: MACHINE_CREATE_FOLLOW_DEADLINE_MS });
+    if (remaining <= 0) throw unconfirmed();
+    context.reportWait?.({ waitingFor: waitingFor(), elapsedMs, deadlineMs: MACHINE_CREATE_FOLLOW_DEADLINE_MS });
     await poller.sleep(Math.min(MACHINE_CREATE_FOLLOW_POLL_INTERVAL_MS, remaining));
+  }
+}
+
+/**
+ * Read back the Machine that the create's own answer named.
+ *
+ * The answer is the mutation's claim and this read is the observation. A read
+ * that does not complete leaves the create committed -- Cuna answered it -- so
+ * the failure names that Machine and the read that settles it, never a second
+ * create. Bounded like every read of the follow.
+ */
+async function readCreatedMachine(context: CommandContext, follow: MachineCreateFollow, answered: Machine): Promise<Machine> {
+  const poller = context.convergencePoller ?? productionConvergencePoller();
+  try {
+    return await boundedCreateRead(context, follow.startedAt + MACHINE_CREATE_FOLLOW_DEADLINE_MS,
+      `GET /v1/sessions/${answered.id}`, (signal) => context.client.getMachine(answered.id, signal));
+  } catch (error) {
+    const reason = machineCreateReadIncomplete(error);
+    if (reason === undefined) throw error;
+    throw machineCreateUnconfirmed(follow, {
+      elapsedMs: poller.now() - follow.startedAt,
+      waitingFor: `machine ${follow.input.name} to be read back`,
+      machine: answered,
+      reason,
+      cause: error,
+    });
   }
 }
 
@@ -632,7 +778,7 @@ function machineCreateDetails(
       next_action: receipt.action,
       receipt_updated_at: receipt.updatedAt,
     }),
-    ...(machine === undefined ? {} : { machine_state: machine.state }),
+    ...(machine === undefined ? {} : { machine_id: machine.id, machine_state: machine.state }),
   };
 }
 
@@ -648,25 +794,65 @@ function machineCreateFailed(
   });
 }
 
-function machineCreateUnconfirmed(
-  follow: MachineCreateFollow, elapsedMs: number, receipt?: MachineCreateRequest, machine?: Machine,
-): CunaError {
+interface MachineCreateUnconfirmedInput {
+  readonly elapsedMs: number;
+  /** What the CLI was still waiting for, in the progress row's words. */
+  readonly waitingFor: string;
+  readonly receipt?: MachineCreateRequest;
+  /** The last Machine read, or the Machine the create's own answer named. */
+  readonly machine?: Machine;
+  /** Set when a read did not complete: its transport code. Absent at the deadline. */
+  readonly reason?: string;
+  readonly cause?: unknown;
+}
+
+/**
+ * The create has not been confirmed running, and the CLI stopped waiting.
+ *
+ * Two different situations, and the advice differs. While nothing says the
+ * create took effect, following the same request again with its key is the
+ * safe step. Once Cuna has committed it -- a Machine was read or named, or the
+ * receipt says the provider succeeded -- running the create again is never the
+ * step: without that key it makes a second Machine. Then the answer names the
+ * Machine and the read that settles it, and `retryable` is false.
+ */
+function machineCreateUnconfirmed(follow: MachineCreateFollow, input: MachineCreateUnconfirmedInput): CunaError {
+  const { receipt, machine, reason } = input;
   const name = follow.input.name;
+  const seconds = Math.round(input.elapsedMs / 1_000);
+  const machineId = machine?.id ??
+    (receipt !== undefined && (receipt.state === "settled" || receipt.state === "provider_succeeded")
+      ? receipt.machineId
+      : undefined);
+  const notCompleted = input.cause instanceof CredentialBoundaryError
+    ? "renewing this session did not complete"
+    : "a request to Cuna did not complete";
+  const lastReported = machine === undefined ? "" : ` Cuna last reported it ${machine.state}.`;
+  const message = machineId !== undefined
+    ? reason !== undefined
+      ? `Machine ${name} (${machineId}) was created; the CLI was waiting for ${input.waitingFor} when ${notCompleted}.${lastReported}`
+      : `Machine ${name} (${machineId}) was created, but the CLI stopped waiting for ${input.waitingFor} after ${seconds} s.${lastReported}`
+    : reason !== undefined
+      ? `Cuna has not confirmed machine ${name}; the CLI was waiting for ${input.waitingFor} when ${notCompleted}.`
+      : `Cuna has not confirmed machine ${name} after ${seconds} s; the CLI stopped waiting for ${input.waitingFor}. It may still be creating.`;
   return new CunaError({
     code: "cuna.machine.create_unconfirmed",
-    message: machine !== undefined
-      ? `Machine ${name} exists but was not running after ${Math.round(elapsedMs / 1_000)} s.`
-      : `Cuna has not confirmed machine ${name} after ${Math.round(elapsedMs / 1_000)} s. It may still be creating.`,
+    message,
     exitCode: EXIT_CODES.network,
-    hint: `Check with \`cuna machines list\` before creating another. To keep following this same create, run it again with \`--idempotency-key ${follow.key}\`: that reads its receipt first and does not start a second one.`,
-    retryable: true,
+    hint: machineId !== undefined
+      ? `Do not create it again. Run \`cuna machines list\` to see Machine ${machineId} and its state.`
+      : `Check with \`cuna machines list\` before creating another. To keep following this same create, run it again with \`--idempotency-key ${follow.key}\`: that reads its receipt first and does not start a second one.`,
+    retryable: machineId === undefined,
     details: {
       ...machineCreateDetails(follow, receipt, machine),
+      waiting_for: input.waitingFor,
       deadline_ms: MACHINE_CREATE_FOLLOW_DEADLINE_MS,
-      elapsed_ms: elapsedMs,
+      elapsed_ms: input.elapsedMs,
       settle_with: "cuna machines list",
-      remote_outcome: receipt === undefined ? "unobserved" : "unsettled",
+      remote_outcome: machineId !== undefined ? "committed" : receipt === undefined ? "unobserved" : "unsettled",
+      ...(reason === undefined ? {} : { reason }),
     },
+    ...(input.cause === undefined ? {} : { cause: input.cause }),
   });
 }
 
@@ -2971,8 +3157,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     const requestId = await machineCreateRequestId(context, key);
     const poller = context.convergencePoller ?? productionConvergencePoller();
     const startedAt = poller.now();
-    const follow = (posted: boolean): Promise<Machine> =>
-      followMachineCreate(context, { requestId, key, input, startedAt, posted });
+    const follow = (posted: boolean): MachineCreateFollow => ({ requestId, key, input, startedAt, posted });
     let known = false;
     if (stringOption(parsed, "idempotency-key") !== undefined) {
       try {
@@ -2982,20 +3167,30 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
         if (!(error instanceof CunaError && error.details?.http_status === 404)) throw error;
       }
     }
+    // `machine` is what the create named; `observed` is a read made after it.
+    // A follow's own Machine read is that read, so nothing is read after the
+    // one that shows the Machine running: a further read can only fail (BL-6:
+    // a renewal failure was the whole answer for a Machine Cuna had started).
     let machine: Machine;
+    let observed: Machine;
     if (known) {
       // This key already named a create. Follow it; its receipt alone decides
       // whether the POST is ever sent again (`retry_create`).
-      machine = await follow(false);
+      machine = observed = await followMachineCreate(context, follow(false));
     } else {
+      let answered: Machine | undefined;
       try {
-        machine = await client.createMachine(input, key, requestId);
+        answered = await client.createMachine(input, key, requestId);
       } catch (error) {
         if (!machineCreateOutcomeUnobserved(error)) throw error;
-        machine = await follow(true);
+      }
+      if (answered === undefined) {
+        machine = observed = await followMachineCreate(context, follow(true));
+      } else {
+        machine = answered;
+        observed = await readCreatedMachine(context, follow(true), answered);
       }
     }
-    const observed = await client.getMachine(machine.id);
     if (
       observed.id !== machine.id || observed.name !== name ||
       (agent !== undefined && observed.agent !== agent) ||

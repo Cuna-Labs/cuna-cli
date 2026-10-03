@@ -246,8 +246,10 @@ test("(c) a read that never answers is bounded by --timeout-ms, and the timeout 
 });
 
 test("(c) a sign-in renewal that never answers is bounded by --timeout-ms too", async () => {
-  // The edge BL-6 crossed: the per-request budget is armed only once a bearer
-  // is in hand, so a renewal that does not finish is waited on without limit.
+  // An edge f72f391 leaves open, and one way BL-6's wait could outlive
+  // --timeout-ms (its cause was not observed): the per-request budget is armed
+  // only once a bearer is in hand, so a renewal that does not finish is waited
+  // on without limit.
   const server = fakeCuna({
     settledAt: 4_000,
     machineState: () => "starting",
