@@ -54,6 +54,7 @@ import {
   type JourneyAgentSessionDisposition,
   type JourneyWait,
   type ReconciledAgentJourneyIntent,
+  type WorkspaceJourneyEffects,
 } from "../journey/index.js";
 import {
   agentSessionDispositionLine,
@@ -87,6 +88,7 @@ import {
   selectNodeForegroundPresentation,
   sessionEndRecord,
   type ForegroundSessionRunner,
+  type ForegroundSessionRunnerInput,
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
 import { runNodeMachinesExplorer, type MachinesExplorerRunner } from "../machines/explorer.js";
@@ -1087,6 +1089,33 @@ function journeyPhaseLabel(phase: AgentJourneyPhase, agent: "claude-code" | "cod
   }
 }
 
+/**
+ * The journey's attach: the agent owns the terminal from `onBeforeTerminalOwnership`
+ * until the runner returns. Workspace lines are held for that span and the
+ * sync attention travels with the runner, so a sync that needs the person is
+ * on the attached bar, not only in the lines released at detach (BL-7,
+ * 2026-10-03: 21 silent minutes after sync stopped at 02:02:30Z).
+ */
+export async function attachJourneyForeground(
+  runner: ForegroundSessionRunner,
+  workspace: Pick<WorkspaceJourneyEffects, "holdNotices" | "releaseNotices" | "syncAttention">,
+  input: ForegroundSessionRunnerInput,
+): Promise<void> {
+  try {
+    await runner({
+      ...input,
+      syncAttention: workspace.syncAttention,
+      onBeforeTerminalOwnership: () => {
+        input.onBeforeTerminalOwnership?.();
+        // The agent's screen from here: sync lines wait for detach.
+        workspace.holdNotices();
+      },
+    });
+  } finally {
+    workspace.releaseNotices();
+  }
+}
+
 function foregroundAttachLabel(agent: string): string {
   return agent === "opencode"
     ? "Opening OpenCode terminal — use /connect there"
@@ -2033,7 +2062,6 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         });
         stopJourneyWorkspace = () => workspace.stopContinuousSync();
         const runner = runForeground;
-        const releaseWorkspaceNotices = (): void => workspace.releaseNotices();
         effects = createApiAgentJourneyEffects({
           client,
           requestedAgent: journeyAgent,
@@ -2078,7 +2106,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
               sessionCount: 1,
               ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
             });
-            await runner({
+            await attachJourneyForeground(runner, workspace, {
               client,
               baseUrl: config.baseUrl,
               browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
@@ -2091,12 +2119,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
               onBeforeTerminalOwnership: () => {
                 inlineJourneyProgress?.stop();
                 inlineJourneyProgress = undefined;
-                // The agent's screen from here: sync lines wait for detach.
-                workspace.holdNotices();
               },
               ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
               signal,
-            }).finally(releaseWorkspaceNotices);
+            });
           },
           onWait: renderJourneyWait,
           ...(dependencies.now === undefined ? {} : { now: dependencies.now }),

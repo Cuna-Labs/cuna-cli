@@ -117,6 +117,41 @@ export function continuousSyncNotice(snapshot: ContinuousSyncSnapshot): string |
   return undefined;
 }
 
+/**
+ * The command that recovers this folder's sync, named by its canonical root.
+ * Double-quoted when the path holds whitespace or a shell metacharacter; a
+ * Windows path's backslashes and drive colon are left as they are.
+ */
+export function syncRecoveryCommand(canonicalRoot: string): string {
+  const path = /[\s"'`$&|;<>()*?!#~{}[\]^%,=]/u.test(canonicalRoot) ? `"${canonicalRoot}"` : canonicalRoot;
+  return `cuna sync recover ${path} --yes`;
+}
+
+/**
+ * The attention line for a sync that needs the person: the state, its reason
+ * and the recovery command. Undefined for a live sync; `null` for a passing
+ * state (recovering, reconciling, catching up) that neither raises nor clears.
+ */
+function syncAttentionLine(snapshot: ContinuousSyncSnapshot, canonicalRoot: string): string | undefined | null {
+  if (syncIsLive(snapshot)) return undefined;
+  const headline = snapshot.state === "conflicted" || snapshot.state === "recovery_required"
+    ? "Workspace sync stopped"
+    : snapshot.state === "paused" ? "Workspace sync paused" : undefined;
+  return headline === undefined ? null : `${headline} · ${syncStateLabel(snapshot)} · run: ${syncRecoveryCommand(canonicalRoot)}`;
+}
+
+/**
+ * The one line about workspace sync that needs the person's action now, for a
+ * surface that stays on screen while an agent owns the terminal. Held notices
+ * reach the person only at detach (BL-7, 2026-10-03: a sync stopped at
+ * 02:02:30Z and the attached terminal said nothing for 21 minutes).
+ */
+export interface WorkspaceSyncAttention {
+  readonly current: () => string | undefined;
+  /** Called on every change, synchronously with the sync transition that caused it. */
+  readonly subscribe: (listener: (line: string | undefined) => void) => () => void;
+}
+
 /** The last word when a run stops a sync that was not live, or undefined when it was. */
 export function continuousSyncDetachNotice(snapshot: ContinuousSyncSnapshot): string | undefined {
   if (syncIsLive(snapshot) || snapshot.state === "stopped") return undefined;
@@ -161,6 +196,8 @@ export interface WorkspaceJourneyEffects extends Pick<AgentJourneyEffects, "insp
   readonly holdNotices: () => void;
   /** Writes every kept line, in order, and writes lines as they come again. */
   readonly releaseNotices: () => void;
+  /** What needs the person's action about sync, held or not; the attached bar shows it. */
+  readonly syncAttention: WorkspaceSyncAttention;
 }
 
 export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInput): WorkspaceJourneyEffects {
@@ -179,10 +216,26 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
   };
   const syncListeners = new Set<(snapshot: ContinuousSyncSnapshot) => void>();
   let unsubscribeSupervisor: (() => void) | undefined;
+  // Not held: the attached bar reads it while the lines above wait for detach.
+  let attention: string | undefined;
+  const attentionListeners = new Set<(line: string | undefined) => void>();
+  const setAttention = (line: string | undefined): void => {
+    if (line === attention) return;
+    attention = line;
+    for (const listener of attentionListeners) {
+      try { listener(line); } catch { /* A display observer never owns synchronization correctness. */ }
+    }
+  };
+  /** The folder this run's sync belongs to; the recovery command names it. */
+  let syncRoot: string | undefined;
   // One line per entry into a state that moves no files; a repeat of the same
   // state and reason stays silent until sync is live again, and then says so.
   let announcedState: string | undefined;
   const renderSyncState = (snapshot: ContinuousSyncSnapshot): void => {
+    if (syncRoot !== undefined) {
+      const attentionLine = syncAttentionLine(snapshot, syncRoot);
+      if (attentionLine !== null) setAttention(attentionLine);
+    }
     const line = continuousSyncNotice(snapshot);
     if (line !== undefined) {
       const key = `${snapshot.state}\0${snapshot.reason ?? ""}`;
@@ -197,8 +250,9 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
     }
   };
   /** One wiring for every admission path, so a resumed poller is as observable as a committed one. */
-  const attachContinuousSync = (started: Awaited<ReturnType<typeof startContinuousWorkspaceSync>>): void => {
+  const attachContinuousSync = (started: Awaited<ReturnType<typeof startContinuousWorkspaceSync>>, root: string): void => {
     supervisor = started;
+    syncRoot = root;
     announcedState = undefined;
     unsubscribeSupervisor = started.subscribe((snapshot) => {
       renderSyncState(snapshot);
@@ -234,6 +288,13 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       }
       return () => syncListeners.delete(listener);
     },
+    syncAttention: Object.freeze({
+      current: () => attention,
+      subscribe(listener: (line: string | undefined) => void) {
+        attentionListeners.add(listener);
+        return () => { attentionListeners.delete(listener); };
+      },
+    }),
     holdNotices() {
       heldNotices ??= [];
     },
@@ -461,11 +522,14 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             checkpointRoot,
             filesystemCapabilities: input.filesystemCapabilities,
             onConflict: renderConflict,
-          }));
+          }), inspected.policy.canonicalRoot);
         } catch (error) {
           if (!(error instanceof CunaError)) throw error;
           const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
           notice(`Remote workspace changes will not arrive this run · ${reason}${syncHolder(error)}`);
+          // Printed before the agent's screen takes over, the line above is
+          // gone under it; the bar keeps it for the whole run.
+          setAttention(`Remote workspace changes will not arrive this run · ${reason} · run: ${syncRecoveryCommand(inspected.policy.canonicalRoot)}`);
         }
         return Object.freeze({
           bindingId: authority.bindingId,
@@ -525,7 +589,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             filesystemCapabilities: input.filesystemCapabilities,
             onConflict: renderConflict,
           });
-          attachContinuousSync(started);
+          attachContinuousSync(started, inspected.policy.canonicalRoot);
           // The pull finishes before the journey goes on. Left to run beside
           // it, the pull was stopped with the run whenever a later step failed
           // (ws-c3, 2026-09-29: three runs announced generation 3; the one at
@@ -544,6 +608,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
           if (!(error instanceof CunaError)) throw error;
           const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
           notice(`Workspace changes will not sync this run · ${reason}${syncHolder(error)}`);
+          setAttention(`Workspace changes will not sync this run · ${reason} · run: ${syncRecoveryCommand(inspected.policy.canonicalRoot)}`);
         }
         return Object.freeze({
           bindingId: authority.bindingId,
@@ -614,7 +679,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         filesystemCapabilities: input.filesystemCapabilities,
         initialReceipt: receipt,
         onConflict: renderConflict,
-      }));
+      }), inspected.policy.canonicalRoot);
       return Object.freeze({ ...(persisted.executionWorkspaceId===undefined?{}:{executionWorkspaceId:persisted.executionWorkspaceId}), bindingId: persisted.bindingId, workspaceIdentity: persisted.bindingId, generation: persisted.generation, remoteCwd: persisted.remoteRoot });
     },
   };

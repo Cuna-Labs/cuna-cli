@@ -295,6 +295,20 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly sessionEndReadDelaysMs?: readonly number[];
   /** How long a relayed sign-in callback waits for the Machine's answer. */
   readonly relayAnswerTimeoutMs?: number;
+  /**
+   * One line from outside the terminal that needs the person's action (a
+   * workspace sync that stopped), shown on the notice row while it lasts.
+   */
+  readonly attention?: ForegroundAttentionSource;
+}
+
+/**
+ * A line owned outside the terminal. `subscribe` is called on every change;
+ * the bar repaints on that call, not on the next terminal output frame.
+ */
+export interface ForegroundAttentionSource {
+  readonly current: () => string | undefined;
+  readonly subscribe: (listener: (line: string | undefined) => void) => () => void;
 }
 
 /**
@@ -440,6 +454,7 @@ export class ForegroundTerminalCoordinator {
   /** Received chunks with a non-printable byte that the input tail has not routed yet. */
   #unroutedBarrierChunks = 0;
   #removeRoster: (() => void) | undefined;
+  #removeAttention: (() => void) | undefined;
   /** Host input chunks are numbered on receipt, so a switch can cut input at one. */
   #inputReceipt = 0;
   /** Set when a switch is chosen: input received after this receipt is never sent. */
@@ -636,6 +651,12 @@ export class ForegroundTerminalCoordinator {
           if (this.#state === "active") this.#queueStateRender();
         });
       }
+      // Before this, a sync that stopped while the agent was attached reached
+      // the person only at detach (BL-7, 2026-10-03: 21 silent minutes). A
+      // change before `active` is read by the first active render.
+      this.#removeAttention = this.#options.attention?.subscribe(() => {
+        if (this.#state === "active") this.#queueStateRender();
+      });
       const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
       this.#attachingStageSince = this.#clock();
       await this.#renderAttaching(intents.length, dimensions);
@@ -728,9 +749,11 @@ export class ForegroundTerminalCoordinator {
     this.#removeInput?.();
     this.#removeResize?.();
     this.#removeRoster?.();
+    this.#removeAttention?.();
     this.#removeInput = undefined;
     this.#removeResize = undefined;
     this.#removeRoster = undefined;
+    this.#removeAttention = undefined;
     this.#discardInputBatch();
     const failures: unknown[] = [];
     const runtime = this.#runtime;
@@ -3091,6 +3114,7 @@ export class ForegroundTerminalCoordinator {
       // mouse; then the host's Shift+drag is the one way to select.
       const remoteMouse = shownTab !== undefined && shownTab.snapshot.accessMode !== "observer" &&
         shownTab.viewport.mouseReporting().tracking !== "none";
+      const attention = this.#attentionLine();
       const trueFrame = renderWorkbenchFrame({
         columns: dimensions.columns,
         rows: dimensions.rows,
@@ -3144,6 +3168,8 @@ export class ForegroundTerminalCoordinator {
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
                       ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"
                       : "") + " | a retained sign-in link | d detach" }
+                : attention !== undefined
+                  ? { notice: attention }
                 : this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot, hiddenColumns) !== undefined
                   ? { notice: this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot, hiddenColumns) as string }
                   : this.#retainedBrowserCandidates.has(activeTabId)
@@ -3174,6 +3200,16 @@ export class ForegroundTerminalCoordinator {
     });
     this.#renderTail = operation.then(() => undefined, () => undefined);
     await operation;
+  }
+
+  /** The outside attention line, if any; a failing source shows nothing rather than failing the frame. */
+  #attentionLine(): string | undefined {
+    try {
+      const line = this.#options.attention?.current();
+      return line === undefined || line.length === 0 ? undefined : line;
+    } catch {
+      return undefined;
+    }
   }
 
   #findIntent(tabId: string, agentSessionId: string): ForegroundTabIntent {

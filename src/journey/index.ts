@@ -70,5 +70,6 @@ export {
 export {
   conservativeFilesystemCapabilities,
   createWorkspaceJourneyEffects,
+  type WorkspaceJourneyEffects,
   type WorkspaceJourneyEffectsInput,
 } from "./workspace-effects.js";

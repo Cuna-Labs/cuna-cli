@@ -17,6 +17,7 @@ import {
   admitForegroundDimensions,
   admitForegroundSessionIds,
   type DetachedForegroundSession,
+  type ForegroundAttentionSource,
   type EndedForegroundSession,
   type ForegroundSessionEndRecord,
   type ForegroundSwitchRequest,
@@ -96,6 +97,12 @@ export interface ForegroundSessionRunnerInput {
   readonly terminalClients?: TerminalClientScope;
   /** One durable line for the person, delivered before terminal ownership begins. */
   readonly onNotice?: (line: string) => void;
+  /**
+   * Workspace sync that needs the person's action, shown on the workbench's
+   * notice row while attached. The plain presentation owns no row of the
+   * screen, so there it waits for the held lines at detach.
+   */
+  readonly syncAttention?: ForegroundAttentionSource;
 }
 
 export type ForegroundPresentationMode = "rich" | "plain";
@@ -747,6 +754,7 @@ async function runClaimedForeground(
         mouseReporting: dependencies.mouseReporting ?? dependencies.host === undefined,
         ...(switching === undefined ? {} : { attachingTitle: switching.title }),
         ...(initialNotice.length === 0 ? {} : { initialNotice }),
+        ...(input.syncAttention === undefined ? {} : { attention: input.syncAttention }),
         readSessionEnd: async (agentSessionId, signal) => sessionEndRecord(await input.client.getAgentSession(agentSessionId, signal)),
       })
     : new PassthroughTerminalCoordinator({
