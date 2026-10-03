@@ -1216,7 +1216,13 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
 
 export type CapabilityDecision =
   | { readonly status: "supported"; readonly capabilityId: string }
-  | { readonly status: "unsupported" | "temporarily_unavailable" | "unknown"; readonly capabilityId: string; readonly reason?: string };
+  | {
+    readonly status: "unsupported" | "temporarily_unavailable" | "unknown";
+    readonly capabilityId: string;
+    readonly reason?: string;
+    /** `reason` is the server's own `reason_code`, not a verdict this CLI reached about the snapshot. */
+    readonly serverReason?: true;
+  };
 
 export function decideCapability(
   snapshot: CapabilitySnapshot,
@@ -1244,7 +1250,7 @@ export function decideCapability(
     return Object.freeze({
       status: capability?.availability ?? "unknown",
       capabilityId,
-      ...(capability?.reasonCode === undefined ? {} : { reason: capability.reasonCode }),
+      ...(capability?.reasonCode === undefined ? {} : { reason: capability.reasonCode, serverReason: true as const }),
     });
   }
   if (!capability.surfaces.includes("cli") || !allowedInteractions.includes(capability.interaction)) {
@@ -1326,6 +1332,14 @@ export async function requireCapability(input: {
   const receivedAt = typeof input.now === "function" ? input.now() : input.now;
   const decision = decideCapability(snapshot, input.capabilityId, receivedAt, input.allowedInteractions);
   if (decision.status === "supported") return;
+  // A reason the server named is the refusal, so it is the sentence, and the
+  // server named no next step. This used to read "Cuna cannot currently
+  // authorize the machines.lifecycle capability." with the reason only in
+  // `details`, and send the person to `cuna capabilities` -- a step the server
+  // never named and that repeats what was just read (PRD R1.4, 2026-10-03).
+  const subject = input.scope === "account" || input.resourceId === undefined
+    ? ""
+    : ` for ${input.scope === "machine" ? "Machine" : "AgentSession"} ${input.resourceId}`;
   throw new CunaError({
     code:
       decision.status === "temporarily_unavailable"
@@ -1333,13 +1347,18 @@ export async function requireCapability(input: {
         : decision.status === "unsupported"
           ? "cuna.capability.unsupported"
           : "cuna.capability.unknown",
-    message: `Cuna cannot currently authorize the ${input.capabilityId} capability.`,
+    message: decision.serverReason === true
+      ? `Cuna does not admit ${input.capabilityId}${subject}: ${decision.reason}. Nothing was sent.`
+      : `Cuna cannot currently authorize the ${input.capabilityId} capability.`,
     exitCode:
       decision.status === "temporarily_unavailable" ? EXIT_CODES.network : EXIT_CODES.unsupported,
-    retryable: decision.status === "temporarily_unavailable" && !isPermanentSnapshotFault(decision.reason),
-    hint: isPermanentSnapshotFault(decision.reason)
-      ? "The server sent capability evidence this CLI cannot accept. Retrying cannot help; update the Cuna server contract or this CLI."
-      : "Run `cuna capabilities` to inspect current server support.",
+    retryable: decision.status === "temporarily_unavailable" &&
+      (decision.serverReason === true || !isPermanentSnapshotFault(decision.reason)),
+    ...(decision.serverReason === true ? {} : {
+      hint: isPermanentSnapshotFault(decision.reason)
+        ? "The server sent capability evidence this CLI cannot accept. Retrying cannot help; update the Cuna server contract or this CLI."
+        : "Run `cuna capabilities` to inspect current server support.",
+    }),
     details: {
       capability_id: input.capabilityId,
       availability: decision.status,
