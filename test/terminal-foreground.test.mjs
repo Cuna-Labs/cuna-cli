@@ -9,6 +9,7 @@ import xterm from "@xterm/headless";
 import { digestLocalActionArguments, ForegroundTerminalCoordinator, MAX_FOREGROUND_PENDING_INPUT_BYTES } from "../dist/index.js";
 import { createNodeForegroundTerminalHost } from "../dist/pty/node-host-terminal.js";
 import { runtimeFailure } from "../dist/runtime/errors.js";
+import { CunaError } from "../dist/core/errors.js";
 import { XtermViewportAdapter } from "../dist/terminal/xterm-vte.js";
 
 const encoder = new TextEncoder();
@@ -4236,4 +4237,99 @@ test("R7.2 NEGATIVE CONTROL: the disconnect notice wins the notice row over atte
   assert.doesNotMatch(row, /recovery_required/u);
   releaseDetach();
   await coordinator.waitForStop();
+});
+
+// BL-15, 2026-10-03 (biotech lab, CLI drop c0dc53b): the attached terminal
+// dropped about 16:08Z, the ten quick attempts (~26 s) were spent while the
+// CLI's own API calls were timing out (the journey had just said "Workspace
+// sync paused · cuna.client.response_budget_elapsed"), and the bar said a bare
+// "Reconnect failed" until 18:29Z although a fresh `cuna opencode` reattached
+// at 18:31Z. Nothing tried again by itself, and the reason was not named
+// because it was not a runtime boundary failure.
+test("BL-15: after the quick attempts, recovery keeps trying on a slow, bounded cadence and reattaches by itself", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 2, reconnectBaseDelayMs: 1, reconnectSlowDelayMs: 20, reconnectSlowAttempts: 5 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  let failures = 4;
+  const reconnect = runtime.reconnect;
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    if (failures > 0) {
+      failures -= 1;
+      throw runtimeFailure("terminal_disconnected", "gateway still busy", { retryable: true });
+    }
+    return reconnect(input);
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && calls.reconnect.length < 5) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(calls.reconnect.length, 5, "two quick attempts, then slow ones until one succeeded");
+  await waitUntil(() => !decoder.decode(host.writes.at(-1)).includes("Reconnect failed"), "the failure notice clears once reattached");
+  assert.equal(coordinator.state, "active");
+  await coordinator.stop();
+});
+
+test("BL-15: the slow cadence is bounded and says when it will try again", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 2, reconnectBaseDelayMs: 1, reconnectSlowDelayMs: 20, reconnectSlowAttempts: 3 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw runtimeFailure("terminal_disconnected", "gateway still busy", { retryable: true });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  await waitUntil(() => /Reconnect failed: terminal disconnected · retrying in/u.test(decoder.decode(host.writes.at(-1))),
+    "while slow attempts remain the bar says so");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && calls.reconnect.length < 5) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(calls.reconnect.length, 5, "two quick and three slow attempts, then none");
+  const frame = decoder.decode(host.writes.at(-1));
+  assert.match(frame, /Reconnect failed: terminal disconnected · Ctrl\+\] r retries/u);
+  assert.doesNotMatch(frame, /retrying in/u, "a spent cadence does not promise another try");
+  await coordinator.stop();
+});
+
+test("BL-15: a failure that is not a runtime boundary error is named by its own code", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 1, reconnectBaseDelayMs: 1, reconnectSlowAttempts: 0 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw new CunaError({ code: "cuna.client.response_budget_elapsed", message: "remote words", exitCode: 5, retryable: true });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !decoder.decode(host.writes.at(-1)).includes("Reconnect failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const frame = decoder.decode(host.writes.at(-1));
+  assert.match(frame, /Reconnect failed: client response budget elapsed · Ctrl\+\] r retries/u);
+  assert.doesNotMatch(frame, /remote words/u);
+  await coordinator.stop();
+});
+
+// CONTROL: a refusal the runtime marks non-retryable still ends recovery at
+// once, with no slow cadence after it.
+test("control: a non-retryable refusal stops recovery on its first occurrence, slow cadence or not", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 3, reconnectBaseDelayMs: 1, reconnectSlowDelayMs: 20, reconnectSlowAttempts: 5 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw runtimeFailure("grant_scope_mismatch", "refused", { retryable: false });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !decoder.decode(host.writes.at(-1)).includes("Reconnect failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(calls.reconnect.length, 1);
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /retrying in/u);
+  await coordinator.stop();
 });
