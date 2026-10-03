@@ -310,6 +310,69 @@ test("BL-7: a Machine generation carrying excluded caches next to results brings
   assert.deepEqual(state.remote_only, []);
 });
 
+// A Machine whose capture predates the policy carries whatever the run left,
+// and `npm install` or `python -m venv .venv` inside the workspace leaves
+// thousands of entries. Recording each one with its own durable write grows
+// with the square of their number; the generation must still arrive in time.
+test("a Machine generation carrying thousands of excluded entries is taken in promptly", async (t) => {
+  const fx = await folder(LOCAL_FILES);
+  const gen1 = fx.manifest.entries.map(manifestEntryForPublicProtocol);
+  const server = new GenerationServer(1, gen1, fx.policy.digest);
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, server, new WatchHarness()));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  const modules = [directoryEntry("node_modules")];
+  for (let index = 0; index < 3_000; index += 1) {
+    modules.push(directoryEntry(`node_modules/pkg-${index}`), fileEntry(`node_modules/pkg-${index}/index.js`, `module.exports = ${index};\n`));
+  }
+  server.publish([...machineRun(gen1, { withCaches: false }), ...modules], RESULTS);
+  const started = Date.now();
+  await waitFor(() => supervisor.snapshot.generation === 2 && supervisor.snapshot.state === "live_unverified",
+    () => `6,001 excluded entries were not taken in within 20 s: ${JSON.stringify(supervisor.snapshot)}`, 20_000);
+  await assertResultsCameBack(fx.root);
+  assert.equal(await exists(join(fx.root, "node_modules")), false);
+  const state = JSON.parse(await readFile(join(fx.state, "continuous-sync.state.json"), "utf8"));
+  assert.equal(state.remote_only.length, 6_001);
+  t.diagnostic(`taken in after ${Date.now() - started} ms`);
+});
+
+// A generation is read over as many change pages as it takes (1,000 items a
+// page) and recorded as one list. Recording a list longer than one page made
+// the folder's own state fail admission as `malformed_change_page`, so any
+// Machine run that wrote more than about a thousand files stopped sync.
+test("a Machine generation with more changes than one change page holds is taken in", async (t) => {
+  const fx = await folder(LOCAL_FILES);
+  const gen1 = fx.manifest.entries.map(manifestEntryForPublicProtocol);
+  const server = new GenerationServer(1, gen1, fx.policy.digest);
+  const first = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, server, new WatchHarness()));
+  await first.stop();
+  const outputs = {};
+  for (let index = 0; index < 1_010; index += 1) outputs[`results/cells/cell-${String(index).padStart(4, "0")}.csv`] = `cell,${index}\n`;
+  server.publish([...gen1, directoryEntry("results"), directoryEntry("results/cells"),
+    ...Object.entries(outputs).map(([path, content]) => fileEntry(path, content))], outputs);
+  // The folder as a run leaves it while taking that generation in: every
+  // item but the last applied and the whole list recorded. (Applying 1,012
+  // items one durable write at a time is slow; that is not what this pins.)
+  const items = (await server.listChanges({ afterGeneration: 1 })).items;
+  const last = items.at(-1);
+  for (const [path, content] of Object.entries(outputs)) {
+    if (path === last.path) continue;
+    await mkdir(dirname(join(fx.root, path)), { recursive: true });
+    await writeFile(join(fx.root, path), content);
+  }
+  const statePath = join(fx.state, "continuous-sync.state.json");
+  const written = JSON.parse(await readFile(statePath, "utf8"));
+  await writeFile(statePath, `${JSON.stringify({
+    ...written,
+    status: "catching_up",
+    pending_remote: { generation: 2, manifestRoot: server.rootOf(2), cursor: null, items, nextIndex: items.length - 1 },
+  })}\n`);
+  const next = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, server, new WatchHarness()));
+  t.after(async () => { await next.stop(); await fx.cleanup(); });
+  await waitFor(() => next.snapshot.generation === 2 && next.snapshot.state === "live_unverified",
+    () => `a recorded generation of ${items.length} items was not taken in: ${JSON.stringify(next.snapshot)}`);
+  assert.equal(await readFile(join(fx.root, last.path), "utf8"), outputs[last.path]);
+});
+
 // CONTROL: the same run on the Machine without the caches. It syncs on any
 // build, so the only variable the test above adds is the excluded paths.
 test("control: the same Machine run without caches brings the results in", async (t) => {
