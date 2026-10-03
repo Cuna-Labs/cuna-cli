@@ -51,3 +51,31 @@ test('a failed profile read opens the screen with a retry, and r reads again',as
 });
 
 test('catalog discriminates native and provider profiles without cross-agent alias',()=>{for(const agent of ['codex','claude-code']){const native={...preset,kind:'native_interactive',agent};assert.deepEqual(decodeProviderPresets({version:'2',items:[native]}),[native]);assert.throws(()=>decodeProviderPresets({version:'2',items:[{...native,kind:'provider_preset'}]}));}assert.throws(()=>decodeProviderPresets({version:'2',items:[{...preset,kind:'native_interactive'}]}));});
+
+// BL-12, biotech lab 2026-10-03 07:23Z (drop c0dc53b): `--new-session` opened
+// the picker on "Your profiles could not be read. Press r to try again." and
+// r listed the profile. The same run had sync paused on
+// cuna.client.response_budget_elapsed; the Edge's catalog read mints three
+// profile revisions in the database, 5 s each, and answers a retryable 503
+// when one is slow. The first failure was neither retried nor named.
+test('BL-12: a retryable failure of the first profile read is read once more before the screen opens',async()=>{
+ const {CunaError}=await import('../dist/core/errors.js');
+ const host=new Host();let reads=0;const two=[preset,{...preset,label:'Second',profile_id:'10000000-0000-4000-8000-000000000005'}];
+ const run=runProviderScreen({getProviderPresetsV2:async()=>{if(++reads===1)throw new CunaError({code:'cuna.network.service_unavailable',message:'remote words',exitCode:7,retryable:true});return two;}},{kind:'preset',agent:'opencode'},host);
+ await see(host,'Second');assert.equal(reads,2);assert.doesNotMatch(host.screen,/could not be read/);host.key('q');await run;
+});
+test('BL-12: a profile read that keeps failing says why, in its code, never its message',async()=>{
+ const {CunaError}=await import('../dist/core/errors.js');
+ const host=new Host();let reads=0;
+ const run=runProviderScreen({getProviderPresetsV2:async()=>{reads++;throw new CunaError({code:'cuna.client.response_budget_elapsed',message:'remote words',exitCode:5,retryable:true});}},{kind:'preset',agent:'opencode'},host);
+ await see(host,'could not be read');assert.equal(reads,2);
+ assert.match(stripAnsi(host.screen),/Your profiles could not be read \(client response budget elapsed\)\. Press r to try again\./);assert.doesNotMatch(host.screen,/remote words/);
+ host.key('q');await run;
+});
+// CONTROL: a refusal that says retrying cannot help is read once.
+test('control: a non-retryable profile read failure is not read again before the screen opens',async()=>{
+ const {CunaError}=await import('../dist/core/errors.js');
+ const host=new Host();let reads=0;
+ const run=runProviderScreen({getProviderPresetsV2:async()=>{reads++;throw new CunaError({code:'cuna.auth.rejected',message:'remote words',exitCode:3,retryable:false});}},{kind:'preset',agent:'opencode'},host);
+ await see(host,'could not be read');assert.equal(reads,1);host.key('q');await run;
+});
