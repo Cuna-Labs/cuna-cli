@@ -1418,10 +1418,14 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       return Object.freeze({
         command: "capabilities",
         data,
+        // The server's reason for a refused action is printed beside it; it
+        // reached `--json` alone, so a person saw "temporarily_unavailable"
+        // and never why (PRD AC1).
         human: snapshot.capabilities.length === 0
           ? "No capabilities were advertised for this context."
           : snapshot.capabilities
-              .map((capability) => `${capability.id}\t${capability.availability}\t${capability.interaction}`)
+              .map((capability) => [capability.id, capability.availability, capability.interaction,
+                ...(capability.reasonCode === undefined ? [] : [capability.reasonCode])].join("\t"))
               .join("\n"),
       });
     }

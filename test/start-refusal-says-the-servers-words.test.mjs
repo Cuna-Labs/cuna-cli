@@ -206,6 +206,31 @@ test("a start refusal that names a reason but no next step gets no invented step
   }
 });
 
+test("cuna capabilities prints the reason the server gives for a refused action (AC1)", async () => {
+  // The Edge names start-ability per action (`machines.start`) beside the
+  // grouped `machines.lifecycle`. The human table printed id, availability and
+  // interaction only, so the reason reached JSON readers alone.
+  const now = Date.now();
+  const fetch = async () => json(200, {
+    schema_version: "1.0", subject_scope: "machine", subject_id: MACHINE_ID,
+    observed_at: new Date(now - 100).toISOString(), expires_at: new Date(now + 30_000).toISOString(), etag: "ac1",
+    capabilities: [
+      { id: "machines.lifecycle", availability: "supported", interaction: "native", mutation_class: "reversible", surfaces: ["cli"], required_permissions: ["machines:update"] },
+      { id: "machines.start", availability: "temporarily_unavailable", interaction: "native", mutation_class: "reversible", surfaces: ["cli"], required_permissions: ["machines:update"], reason_code: "control_credential_expired" },
+    ],
+  });
+  const streams = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: false });
+  const exit = await runCli(["capabilities", "--scope", "machine", "--resource-id", MACHINE_ID], {
+    streams: streams.streams, platform: PLATFORM, env: { CUNA_API_KEY: API_KEY }, fetch,
+  });
+  assert.equal(exit, EXIT_CODES.success, streams.stderr());
+  const lines = streams.stdout().trimEnd().split("\n");
+  assert.deepEqual(lines, [
+    "machines.lifecycle\tsupported\tnative",
+    "machines.start\ttemporarily_unavailable\tnative\tcontrol_credential_expired",
+  ]);
+});
+
 test("control: a start answered by something that is not the API keeps the CLI's transport guidance", async () => {
   // No server reason at all (a proxy's HTML 502): there are no server words to
   // print, so the CLI's statement about an unknown outcome is the truth.
