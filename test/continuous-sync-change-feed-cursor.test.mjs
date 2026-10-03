@@ -64,15 +64,23 @@ class EdgeLikeFeed {
     this.handleBase = handleBase;
   }
 
-  publish(path, content) {
-    const bytes = Buffer.from(content);
-    this.chunks.set(sha256(bytes), bytes);
+  /** One generation adding `files` (path -> content) and any directory they need. */
+  publish(files) {
     const previous = this.generations.get(this.head);
-    const directory = path.slice(0, path.lastIndexOf("/"));
-    const parents = previous.some((entry) => entry.path === directory)
-      ? [] : [{ path: directory, kind: "directory", byte_length: 0, executable: false, chunks: [], link_target: null }];
+    const added = [];
+    for (const [path, content] of Object.entries(files)) {
+      const bytes = Buffer.from(content);
+      this.chunks.set(sha256(bytes), bytes);
+      const parts = path.split("/");
+      for (let depth = 1; depth < parts.length; depth += 1) {
+        const directory = parts.slice(0, depth).join("/");
+        if ([...previous, ...added].some((entry) => entry.path === directory)) continue;
+        added.push({ path: directory, kind: "directory", byte_length: 0, executable: false, chunks: [], link_target: null });
+      }
+      added.push(fileEntry(path, content));
+    }
     this.head += 1;
-    this.generations.set(this.head, [...previous, ...parents, fileEntry(path, content)]);
+    this.generations.set(this.head, [...previous, ...added]);
   }
 
   /** The whole feed in the order the database pages it: generation, then path ("" for the marker). */
@@ -128,7 +136,8 @@ async function waitFor(predicate, message, timeout = 120_000) {
   assert.fail(typeof message === "function" ? message() : message);
 }
 
-async function start(t, generations) {
+/** `generations` generations after the folder's own, each adding `perGeneration` files. */
+async function start(t, generations, perGeneration = 1) {
   const base = await mkdtemp(join(tmpdir(), "cuna-feed-cursor-"));
   const root = join(base, "workspace");
   const state = join(base, "state");
@@ -138,7 +147,13 @@ async function start(t, generations) {
   const policy = compileExclusionPolicy([], capabilities);
   const manifest = await createWorkspaceManifest({ root, policy, capabilities });
   const feed = new EdgeLikeFeed(manifest.entries.map(manifestEntryForPublicProtocol), policy.digest, 0);
-  for (let generation = 2; generation <= generations; generation += 1) feed.publish(`results/r${String(generation).padStart(3, "0")}.csv`, `row ${generation}\n`);
+  for (let generation = 2; generation <= generations; generation += 1) {
+    const files = {};
+    for (let index = 0; index < perGeneration; index += 1) {
+      files[`results/g${String(generation).padStart(3, "0")}/r${String(index).padStart(3, "0")}.csv`] = `row ${generation}.${index}\n`;
+    }
+    feed.publish(files);
+  }
   const supervisor = await ContinuousWorkspaceSyncSupervisor.start({
     bindingId: BINDING, bindingGeneration: 1, syncId: SYNC, initialGeneration: 1,
     initialManifestRoot: manifest.manifestRoot, initialManifest: manifest, canonicalRoot: root, stateDirectory: state,
@@ -159,30 +174,30 @@ async function idleReads(feed, milliseconds = 3_000) {
 }
 
 test("an idle folder that caught up reads only the feed's tail on each poll, not the history since its handle's base", async (t) => {
-  const { supervisor, feed, root } = await start(t, 52);
-  await waitFor(() => supervisor.snapshot.generation === 52 && supervisor.snapshot.state === "live_unverified",
+  const { supervisor, feed, root } = await start(t, 10, 12);
+  await waitFor(() => supervisor.snapshot.generation === 10 && supervisor.snapshot.state === "live_unverified",
     () => `the folder did not catch up: ${JSON.stringify(supervisor.snapshot)}`);
-  assert.equal(await readFile(join(root, "results/r052.csv"), "utf8"), "row 52\n");
+  assert.equal(await readFile(join(root, "results/g010/r011.csv"), "utf8"), "row 10.11\n");
   const idle = await idleReads(feed);
   assert.ok(idle.calls >= 2, `the poller kept polling (${idle.calls} reads; ${feed.reads.length} in all; ${JSON.stringify(supervisor.snapshot)})`);
-  // The feed holds 52 markers, 52 files and a directory. Re-read from the
-  // base, every poll costs two pages, 105 items; resumed from the folder's own
-  // place, about one.
+  // The feed holds 10 markers, 1 + 9 * 12 files and 10 directories: 129
+  // items, more than the server's default page of 100. Re-read from the base, every poll costs two pages of them; resumed
+  // from the folder's own place, about one.
   assert.ok(idle.items / idle.calls <= 2,
     `an idle poll read ${(idle.items / idle.calls).toFixed(1)} items on average (${idle.items} over ${idle.calls} reads)`);
   t.diagnostic(`idle: ${idle.items} items over ${idle.calls} reads`);
 });
 
 test("a generation published after the folder caught up arrives, and the poll after it reads the tail again", async (t) => {
-  const { supervisor, feed, root } = await start(t, 40);
-  await waitFor(() => supervisor.snapshot.generation === 40 && supervisor.snapshot.state === "live_unverified",
+  const { supervisor, feed, root } = await start(t, 10, 12);
+  await waitFor(() => supervisor.snapshot.generation === 10 && supervisor.snapshot.state === "live_unverified",
     () => `the folder did not catch up: ${JSON.stringify(supervisor.snapshot)}`);
   await idleReads(feed, 50);
-  feed.publish("results/late.csv", "late row\n");
-  feed.publish("results/later.csv", "later row\n");
-  await waitFor(() => supervisor.snapshot.generation === 42, () => `the new generations did not arrive: ${JSON.stringify(supervisor.snapshot)}`);
-  assert.equal(await readFile(join(root, "results/late.csv"), "utf8"), "late row\n");
-  assert.equal(await readFile(join(root, "results/later.csv"), "utf8"), "later row\n");
+  feed.publish({ "results/late/late.csv": "late row\n" });
+  feed.publish({ "results/late/later.csv": "later row\n" });
+  await waitFor(() => supervisor.snapshot.generation === 12, () => `the new generations did not arrive: ${JSON.stringify(supervisor.snapshot)}`);
+  assert.equal(await readFile(join(root, "results/late/late.csv"), "utf8"), "late row\n");
+  assert.equal(await readFile(join(root, "results/late/later.csv"), "utf8"), "later row\n");
   const idle = await idleReads(feed);
   assert.ok(idle.items / idle.calls <= 2, `an idle poll read ${(idle.items / idle.calls).toFixed(1)} items on average`);
 });
@@ -192,5 +207,5 @@ test("a generation published after the folder caught up arrives, and the poll af
 test("control: the first poll of a short feed reads it whole once", async (t) => {
   const { supervisor, feed } = await start(t, 3);
   await waitFor(() => supervisor.snapshot.generation === 3, () => `no catch-up: ${JSON.stringify(supervisor.snapshot)}`);
-  assert.equal(feed.reads[0], 7, "generations 1-3: three markers, three files and the results directory");
+  assert.equal(feed.reads[0], 9, "generations 1-3: three markers, the README, two files and three directories");
 });
