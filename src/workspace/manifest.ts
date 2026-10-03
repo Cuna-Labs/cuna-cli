@@ -251,6 +251,14 @@ async function hashStableFile(
       secretCategory ??= detectHighConfidenceSecret(Buffer.concat([overlap, bytes]));
       overlap = bytes.subarray(Math.max(0, bytes.byteLength - 128));
     }
+    // An empty file is one chunk of zero bytes, as the Edge and the database
+    // require of every file entry and as the Machine's capture writes it.
+    // With no chunk, a folder holding an empty `__init__.py` was refused (422
+    // workspace_sync_invalid_request), and an empty file the Machine captured
+    // never matched this folder's copy of it.
+    if (chunks.length === 0) {
+      chunks.push(Object.freeze({ index: 0, byteLength: 0, digest: createHash("sha256").digest("hex") }));
+    }
     const after = await handle.stat({ bigint: true });
     const afterParent = await verifiedPhysicalParent(root, admittedPath);
     if (afterParent !== resolvedParent) throw unstableFailure();
