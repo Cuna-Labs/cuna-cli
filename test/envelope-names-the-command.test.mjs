@@ -65,6 +65,8 @@ const RESULT_COMMAND = Object.freeze({
   "agent-sessions terminate": "agent-sessions.terminate",
   "agent logout": "agent.logout",
   "config get": "config.get",
+  // Its result is run for real in test/sync-recover-command.test.mjs.
+  "sync recover": "sync.recover",
   doctor: "doctor",
   "self-test": "self-test",
   version: "version",

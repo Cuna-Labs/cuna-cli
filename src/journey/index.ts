@@ -73,3 +73,13 @@ export {
   type WorkspaceJourneyEffects,
   type WorkspaceJourneyEffectsInput,
 } from "./workspace-effects.js";
+export {
+  DEFAULT_WORKSPACE_RECOVERY_TIMEOUT_MS,
+  WORKSPACE_RECOVERY_COMMAND,
+  recoverWorkspaceSync,
+  workspaceRecoveryLines,
+  workspaceRecoveryRecord,
+  type WorkspaceSyncRecoveryInput,
+  type WorkspaceSyncRecoveryResult,
+  type WorkspaceSyncRecoveryState,
+} from "./workspace-recovery.js";

@@ -53,8 +53,8 @@ function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.con
  * without an API body (`operation_not_served`) says this deployment lacks the
  * route, not that the Machine is gone.
  */
-async function observeBoundMachine(
-  client: CunaApiClient,
+export async function observeBoundMachine(
+  client: Pick<CunaApiClient, "getMachine">,
   machineId: string,
   signal: AbortSignal,
 ): Promise<{ readonly kind: "present"; readonly machine: Machine } | { readonly kind: "absent" }> {
@@ -757,7 +757,7 @@ async function recordPublishedGeneration(input: {
  * frees it. A run that finds the folder's sync held cannot take it from a live
  * process, and a bare `active_writer` left no way to find the one that held it.
  */
-function syncHolder(error: CunaError): string {
+export function syncHolder(error: CunaError): string {
   const holder = error.details?.holder_pid;
   return typeof holder === "number"
     ? ` · cuna process ${holder} holds this folder's sync · if that run is no longer open, end the process and run this command again`

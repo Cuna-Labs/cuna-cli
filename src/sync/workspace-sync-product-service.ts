@@ -101,7 +101,13 @@ export interface LocalWorkspaceBaseInput {
  */
 export interface LocalWorkspaceBase {
   readonly generation: number;
-  readonly resumable?: { readonly stateGeneration: number; readonly syncId: string };
+  readonly resumable?: {
+    readonly stateGeneration: number;
+    readonly syncId: string;
+    /** Where that state's last run left the loop, and why (`ContinuousSyncDurableBase`). */
+    readonly status: ContinuousSyncDurableBase["status"];
+    readonly reason: string | null;
+  };
 }
 
 export interface WorkspaceSyncPolicyInspection {
@@ -390,7 +396,12 @@ export async function readLocalWorkspaceBase(input: LocalWorkspaceBaseInput): Pr
   if (newest !== undefined && newest.base.generation >= (committed ?? 0)) {
     return Object.freeze({
       generation: newest.base.generation,
-      resumable: Object.freeze({ stateGeneration: newest.stateGeneration, syncId: newest.base.syncId }),
+      resumable: Object.freeze({
+        stateGeneration: newest.stateGeneration,
+        syncId: newest.base.syncId,
+        status: newest.base.status,
+        reason: newest.base.reason,
+      }),
     });
   }
   return committed === undefined ? undefined : Object.freeze({ generation: committed });
@@ -410,8 +421,14 @@ export async function readLocalWorkspaceBase(input: LocalWorkspaceBaseInput): Pr
  */
 export async function resumeContinuousWorkspaceSyncFromLocalBase(
   input: Omit<SynchronizeLocalWorkspaceInput, "baseGeneration"> & {
-    readonly base: NonNullable<LocalWorkspaceBase["resumable"]>;
+    readonly base: Pick<NonNullable<LocalWorkspaceBase["resumable"]>, "stateGeneration" | "syncId">;
     readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
+    /**
+     * `cuna sync recover`: take up the stop the durable state carries. See
+     * `recoverStop` on the supervisor input; only the person's explicit
+     * command sets it, never a re-attach.
+     */
+    readonly recoverStop?: boolean;
   },
 ): Promise<ContinuousWorkspaceSyncSupervisor> {
   validateAuthority(input);
@@ -442,6 +459,7 @@ export async function resumeContinuousWorkspaceSyncFromLocalBase(
     proven: { syncId: input.base.syncId, generation: input.base.stateGeneration, manifestRoot: current.manifestRoot },
     transfer: input,
     requireDurableState: true,
+    ...(input.recoverStop === true ? { recoverStop: true } : {}),
     ...(input.onConflict === undefined ? {} : { onConflict: input.onConflict }),
   });
 }
@@ -736,6 +754,7 @@ async function startProvenContinuousSupervisor(input: {
     "transport" | "filesystemCapabilities" | "maximumConcurrentUploads" | "maximumAttempts"
   >;
   readonly requireDurableState?: boolean;
+  readonly recoverStop?: boolean;
   readonly priorBase?: ContinuousSyncDurableBase;
   readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
 }): Promise<ContinuousWorkspaceSyncSupervisor> {
@@ -854,6 +873,7 @@ async function startProvenContinuousSupervisor(input: {
     initialManifest: input.initialManifest,
     ...(input.initialRemoteOnly === undefined ? {} : { initialRemoteOnly: input.initialRemoteOnly }),
     ...(input.requireDurableState === undefined ? {} : { requireDurableState: input.requireDurableState }),
+    ...(input.recoverStop === undefined ? {} : { recoverStop: input.recoverStop }),
     ...(input.priorBase === undefined ? {} : { priorBase: input.priorBase }),
     ...(input.onConflict === undefined ? {} : { onConflict: input.onConflict }),
   });

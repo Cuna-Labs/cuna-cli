@@ -193,6 +193,8 @@ Available now:
   doctor                               Report platform, runtime, and encrypted local session-store state
   version                              Show the CLI version, build digest, and protocol range
   help [--all]                         Show primary or complete help
+  sync recover [PATH] --yes            Bring a folder whose workspace sync stopped back to syncing;
+                                       keeps both versions of every conflict, or refuses and says why
 
 Foreground terminal attach (the server must grant terminal_connections.create):
   connect SESSION_ID [SESSION_ID...]   Attach 1-4 exact cloud sessions in this terminal

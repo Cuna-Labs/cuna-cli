@@ -16,7 +16,7 @@ import { join, resolve } from "node:path";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
 import type { AgentSession } from "../api/contracts.js";
-import { createHttpTransport, type BearerRefreshRequest, type HttpRequest } from "../api/http.js";
+import { createHttpTransport, type BearerRefreshRequest, type HttpRequest, type HttpTransport } from "../api/http.js";
 import { providerDisplayName } from "../machines/provider-availability.js";
 import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import type { BrowserHandoffReporter } from "../auth/browser-handoff.js";
@@ -49,6 +49,10 @@ import {
   orchestrateAgentJourney,
   preflightAgentJourneyInvocation,
   readAccountIdentityWithin,
+  recoverWorkspaceSync,
+  workspaceRecoveryLines,
+  workspaceRecoveryRecord,
+  DEFAULT_WORKSPACE_RECOVERY_TIMEOUT_MS,
   type AgentJourneyEffects,
   type AgentJourneyPhase,
   type JourneyAgentSessionDisposition,
@@ -144,6 +148,12 @@ export interface RunCliDependencies {
   readonly managedWorkspaceMachineId?: string;
   /** Test seam for the folder a command resolves its workspace binding from. */
   readonly workspaceRoot?: string;
+  /**
+   * Test seam for the workspace-sync transport `sync recover` uses when an
+   * injected `clientFactory` leaves no HTTP transport. Production never sets
+   * it: the real authenticated transport is always used when one exists.
+   */
+  readonly workspaceSyncTransport?: Pick<HttpTransport, "request">;
   /**
    * Test seam for the stream a mid-journey question reads its answer from.
    * Production always leaves this absent and uses the real `process.stdin`.
@@ -490,7 +500,10 @@ function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>>
   });
 }
 
-function needsRemoteCredential(command: string | undefined, foreground: ForegroundSelection | undefined): boolean {
+function needsRemoteCredential(command: string | undefined, foreground: ForegroundSelection | undefined, action?: string): boolean {
+  // Bare `sync` is reserved and reads no credential; `sync recover` reads the
+  // binding authority and runs the folder's sync.
+  if (command === "sync") return action === "recover";
   return command === "observe" || command === "share" || command === "capabilities" || command === "machines" || command === "agent-sessions" ||
     command === "agent" || command === "executions" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
@@ -519,8 +532,9 @@ function managesInteractiveSession(command: string | undefined): boolean {
 function usesCredentialAuthority(
   command: string | undefined,
   foreground: ForegroundSelection | undefined,
+  action?: string,
 ): boolean {
-  return managesInteractiveSession(command) || needsRemoteCredential(command, foreground);
+  return managesInteractiveSession(command) || needsRemoteCredential(command, foreground, action);
 }
 
 interface ForegroundSelection {
@@ -1380,7 +1394,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // selects one. Empty or malformed still never means absent: an unusable
     // `*_API_KEY` refuses the command rather than silently demoting automation
     // mode to an interactive browser sign-in.
-    if (interactiveRoot || usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
+    if (interactiveRoot || usesCredentialAuthority(parsed.command, foreground, parsed.operands[0])) assertApiKeyUsable(config);
     const sessionPaths = localEncryptedSessionPaths(platform.paths.configDirectory, config.profile);
     // The last-known Machines picture belongs to one account. Only the real
     // sign-in path touches the host's state directory; see the explorer's cache.
@@ -1654,7 +1668,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
 
     let bearerTokenProvider: ((signal?: AbortSignal, refresh?: BearerRefreshRequest) => Promise<string>) | undefined;
     let credentialMode: "automation" | "interactive" | undefined = config.apiKey === undefined ? undefined : "automation";
-    if (config.apiKey === undefined && (interactiveRoot || needsRemoteCredential(parsed.command, foreground))) {
+    if (config.apiKey === undefined && (interactiveRoot || needsRemoteCredential(parsed.command, foreground, parsed.operands[0]))) {
       if (dependencies.clientFactory === undefined || dependencies.humanAuth !== undefined) {
         const humanAuth = await getHumanAuth();
         if (dependencies.clientFactory === undefined) {
@@ -1703,6 +1717,54 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // share` opens on it instead of losing the authority it may have created.
       const operations=ownerGrantOperationStore(platform,{baseUrl:config.baseUrl,profile:config.profile,ownerPrincipalId:identity.id,projectId:project});
       await runOwnerGrantsScreen(ownerObserveGrantsApi(httpTransport,identity.id,project,async()=>(await client.getIdentity(dependencies.signal)).id),sessions,operations,{project,owner:identity.id},{...(dependencies.signal===undefined?{}:{signal:dependencies.signal}),...(stringOption(parsed,"grant")===undefined?{}:{initialGrantId:stringOption(parsed,"grant")!})});
+      return EXIT_CODES.success;
+    }
+    if (parsed.command === "sync" && parsed.operands[0] === "recover") {
+      // R7.3 (BL-7, 2026-10-03): the folder, the installation's sync state and
+      // the authenticated sync transport all live here, so this is composed
+      // like the journey rather than in the generic dispatcher. It runs
+      // without a terminal and with --json: labs script it.
+      if (credentialMode === undefined) {
+        throw new CunaError({
+          code: "cuna.auth.required",
+          message: "Workspace sync recovery requires authenticated account authority.",
+          exitCode: EXIT_CODES.auth,
+          hint: `Run \`cuna login\` for interactive use, or use an automation credential. ${automationCredentialHint()}`,
+        });
+      }
+      const syncTransport = httpTransport ?? dependencies.workspaceSyncTransport;
+      if (syncTransport === undefined) {
+        throw new CunaError({
+          code: "cuna.journey.workspace_transport_unavailable",
+          message: "The injected API client did not provide authenticated workspace-sync transport authority.",
+          exitCode: EXIT_CODES.unsupported,
+          hint: INTERNAL_DEFECT_HINT,
+        });
+      }
+      if (streams.stderrIsTTY === true && !writer.structured) {
+        batchProgress = startInlineProgress(
+          streams.stderr,
+          !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+          "Recovering workspace sync",
+        );
+      }
+      const recovered = await recoverWorkspaceSync({
+        client,
+        transport: Object.freeze({
+          request: (request: HttpRequest) => syncTransport.request(request),
+          authentication: "authenticated" as const,
+          credentialAuthority: credentialMode === "interactive" ? "interactive" as const : "api_key" as const,
+        }),
+        profileId: config.profile,
+        stateDirectory: platform.paths.stateDirectory,
+        filesystemCapabilities: conservativeFilesystemCapabilities(platform.kind),
+        path: resolve(dependencies.workspaceRoot ?? process.cwd(), parsed.operands[1] ?? "."),
+        timeoutMs: timeoutMs ?? DEFAULT_WORKSPACE_RECOVERY_TIMEOUT_MS,
+        ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+      });
+      batchProgress?.stop();
+      batchProgress = undefined;
+      writer.success("sync.recover", workspaceRecoveryRecord(recovered), workspaceRecoveryLines(recovered).join("\n"));
       return EXIT_CODES.success;
     }
     if (interactiveRoot) {

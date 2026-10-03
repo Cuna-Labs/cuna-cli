@@ -257,6 +257,9 @@ export interface ContinuousSyncDurableBase {
     readonly generation: number;
     readonly entries: readonly { readonly path: string; readonly fingerprint: string }[];
   } | null;
+  /** Where the last run left the loop, and why: what an explicit recovery starts from. */
+  readonly status: Exclude<ContinuousSyncState, "stopped">;
+  readonly reason: string | null;
   readonly updatedAt: string;
 }
 
@@ -297,6 +300,23 @@ export interface ContinuousWorkspaceSyncSupervisorInput {
    * overwrite those edits as if they were unchanged.
    */
   readonly requireDurableState?: boolean;
+  /**
+   * An explicit recovery (`cuna sync recover`), asked for by the person whose
+   * folder it is. At open it takes up whatever stop the durable state carries
+   * (conflicted, recovery_required or paused) as `recovering` with a
+   * reconciliation, and drops the pending local operations that provably never
+   * left this machine (journal `queued`): their bytes are still in the folder
+   * and the next scan derives them again. An operation that may have been sent
+   * is reconciled with the server exactly as on any start.
+   *
+   * Nothing here writes or removes a file in the folder; byte safety stays with
+   * the apply rules (a pull never overwrites a path that differs from the
+   * baseline, and a path changed on both sides keeps both versions). Without
+   * this flag a stop the folder carries is kept, because nobody asked to
+   * override it (BL-7, 2026-10-03: a folder stayed at recovery_required through
+   * every re-attach, and nothing could take it up).
+   */
+  readonly recoverStop?: boolean;
   /**
    * The durable state of the generation this start directly follows, when the
    * caller has just committed the local tree on top of it. It lets the new
@@ -413,6 +433,8 @@ export class ContinuousWorkspaceSyncSupervisor {
       baseline: state.baseline,
       remoteOnly: state.remote_only,
       lastLocalCommit: state.last_local_commit,
+      status: state.status,
+      reason: state.reason,
       updatedAt: state.updated_at,
     });
   }
@@ -511,9 +533,17 @@ export class ContinuousWorkspaceSyncSupervisor {
     // stopped in is resumed where it stopped (BL-7, 2026-10-03: the folder
     // stayed at generation 2 through two re-attaches and a cleanup on the
     // Machine).
-    if ((this.#state.status === "conflicted" || this.#state.status === "recovery_required") &&
-        (this.#state.reason === "stale_fence" || this.#state.reason === "remote_excluded_path")) {
+    const stopped = this.#state.status === "conflicted" || this.#state.status === "recovery_required";
+    const recovering = this.#input.recoverStop === true;
+    if ((stopped && (this.#state.reason === "stale_fence" || this.#state.reason === "remote_excluded_path")) ||
+        (recovering && (stopped || this.#state.status === "paused"))) {
       await this.#transition({ status: "recovering", dirty: true, reason: null });
+      this.#reconcileRequested = true;
+    }
+    if (recovering) {
+      await this.#dropUnsentLocal();
+      // Whatever the state said, an explicit recovery proves the folder
+      // against the server before it moves anything.
       this.#reconcileRequested = true;
     }
     if (this.#state.pending_remote !== null) await this.#resumeRemoteApply();
@@ -1075,6 +1105,30 @@ export class ContinuousWorkspaceSyncSupervisor {
       this.#reconcileRequested = true;
       return;
     }
+    this.#scanRequested = true;
+  }
+
+  /**
+   * Drops the pending operations whose latest journal record is `queued`,
+   * recording them as conflicted so no later run sends them. An operation is
+   * moved to `sending` before any commit is attempted (`transitionIfQueued`),
+   * so `queued` proves it never left this machine. Dropping it loses nothing:
+   * it is a record of intent, its bytes are in the folder, and the next scan
+   * derives it again from the baseline. Left in place, an intent the folder
+   * has since changed stops every scan as `pending_local_intent_changed`.
+   */
+  async #dropUnsentLocal(): Promise<void> {
+    if (this.#state.pending_local.length === 0) return;
+    const latest = latestJournalStates(this.#journal?.records ?? []);
+    const unsent = new Set(this.#state.pending_local
+      .filter((operation) => latest.get(operation.operationId) === "queued")
+      .map((operation) => operation.operationId));
+    if (unsent.size === 0) return;
+    for (const operationId of unsent) await this.#journal?.transition(operationId, "conflicted");
+    await this.#replaceState({
+      pending_local: Object.freeze(this.#state.pending_local.filter((operation) => !unsent.has(operation.operationId))),
+      dirty: true,
+    });
     this.#scanRequested = true;
   }
 

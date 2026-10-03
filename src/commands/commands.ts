@@ -1333,8 +1333,19 @@ export function preflightInvocation(
       preflightAgentJourneyInvocation(parsed);
       return;
     }
-    case "shell":
     case "sync":
+      if (parsed.operands[0] === "recover") {
+        // Refused here, before configuration, credentials or any request: a
+        // script that forgot --yes learns it without touching the folder.
+        rejectUnknownOptions(parsed, ["yes"]);
+        if (parsed.operands.length > 2) throw usageError("sync recover accepts at most one PATH.");
+        requireConfirmation(parsed, "sync.recover");
+        return;
+      }
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands in this build.`);
+      return;
+    case "shell":
     case "companion":
       rejectUnknownOptions(parsed, []);
       if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands in this build.`);
@@ -2016,6 +2027,9 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     case "shell":
       throw unsupportedError("terminal workspace", "terminal_runtime_unavailable");
     case "sync":
+      // `sync recover` is composed by runCli, which owns the folder, the state
+      // directory and the authenticated sync transport; bare `sync` is reserved.
+      if (parsed.operands[0] === "recover") throw unsupportedError("workspace sync recovery", "run_cli_composition_required");
       throw unsupportedError("workspace synchronization", "workspace_sync_runtime_unavailable");
     case "companion":
       throw unsupportedError("local companion", "local_companion_unavailable");

@@ -136,9 +136,12 @@ export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
   routed("claude", "claude [PATH]", ["claude"], "Open Claude Code", "free"),
   routed("codex", "codex [PATH]", ["codex"], "Open Codex", "free"),
   routed("opencode", "opencode [PATH]", ["opencode"], "Open OpenCode", "free"),
+  // The one standalone sync action. Bare `sync` stays reserved below. PATH is
+  // validated by the command itself (at most one), like an action's ID.
+  routed("sync recover", "sync recover [PATH] --yes [--timeout-ms N]", ["sync", "recover", "--yes"], "Bring a folder whose workspace sync stopped back to syncing, keeping both versions of every conflict"),
   reserved("config set", "Reserved; configuration mutation is not implemented"),
   reserved("shell", "Reserved; no shell runtime in this build"),
-  reserved("sync", "Reserved; no standalone sync command in this build"),
+  reserved("sync", "Reserved; the one standalone sync action is `sync recover`"),
   reserved("companion", "Reserved; no local companion in this build"),
 ]);
 
