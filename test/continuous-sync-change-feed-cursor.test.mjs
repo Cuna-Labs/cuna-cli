@@ -166,10 +166,14 @@ async function start(t, generations, perGeneration = 1) {
   return { supervisor, feed, root };
 }
 
-async function idleReads(feed, milliseconds = 3_000) {
+/**
+ * The next `polls` reads. Counted, not timed: under a loaded suite a periodic
+ * reconcile can hold the loop for seconds, and a fixed window then saw none.
+ */
+async function idleReads(feed, polls = 20) {
   const before = feed.reads.length;
-  await new Promise((resolve) => setTimeout(resolve, milliseconds));
-  const reads = feed.reads.slice(before);
+  await waitFor(() => feed.reads.length - before >= polls, () => `only ${feed.reads.length - before} of ${polls} reads arrived`);
+  const reads = feed.reads.slice(before, before + polls);
   return { calls: reads.length, items: reads.reduce((total, value) => total + value, 0) };
 }
 
@@ -179,10 +183,10 @@ test("an idle folder that caught up reads only the feed's tail on each poll, not
     () => `the folder did not catch up: ${JSON.stringify(supervisor.snapshot)}`);
   assert.equal(await readFile(join(root, "results/g010/r011.csv"), "utf8"), "row 10.11\n");
   const idle = await idleReads(feed);
-  assert.ok(idle.calls >= 2, `the poller kept polling (${idle.calls} reads; ${feed.reads.length} in all; ${JSON.stringify(supervisor.snapshot)})`);
   // The feed holds 10 markers, 1 + 9 * 12 files and 10 directories: 129
-  // items, more than the server's default page of 100. Re-read from the base, every poll costs two pages of them; resumed
-  // from the folder's own place, about one.
+  // items, more than the server's default page of 100. Re-read from the base,
+  // every poll costs two pages of them; resumed from the folder's own place,
+  // about one.
   assert.ok(idle.items / idle.calls <= 2,
     `an idle poll read ${(idle.items / idle.calls).toFixed(1)} items on average (${idle.items} over ${idle.calls} reads)`);
   t.diagnostic(`idle: ${idle.items} items over ${idle.calls} reads`);
@@ -192,7 +196,7 @@ test("a generation published after the folder caught up arrives, and the poll af
   const { supervisor, feed, root } = await start(t, 10, 12);
   await waitFor(() => supervisor.snapshot.generation === 10 && supervisor.snapshot.state === "live_unverified",
     () => `the folder did not catch up: ${JSON.stringify(supervisor.snapshot)}`);
-  await idleReads(feed, 50);
+  await idleReads(feed, 3);
   feed.publish({ "results/late/late.csv": "late row\n" });
   feed.publish({ "results/late/later.csv": "later row\n" });
   await waitFor(() => supervisor.snapshot.generation === 12, () => `the new generations did not arrive: ${JSON.stringify(supervisor.snapshot)}`);

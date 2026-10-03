@@ -116,6 +116,12 @@ test("an empty file the Machine captured is held here and sync stays live", asyn
     // proposes nothing and stays live.
     supervisor.requestScan();
     await new Promise((settle) => setTimeout(settle, 300));
+    // A scan reads "catching_up" while it builds the manifest; under a loaded
+    // suite that outlasted the 300 ms above. Let it finish, bounded.
+    const settled = Date.now() + 5_000;
+    while (Date.now() < settled && supervisor.snapshot.state === "catching_up") {
+      await new Promise((settle) => setTimeout(settle, 5));
+    }
     assert.deepEqual(commits, [], "the folder re-proposed the Machine's empty file as its own change");
     assert.equal(supervisor.snapshot.state, "live_unverified", JSON.stringify(supervisor.snapshot));
     assert.equal(supervisor.snapshot.dirty, false);
