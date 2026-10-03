@@ -33,7 +33,7 @@ import type {
   WorkspaceSyncChangePage,
   WorkspaceSyncManifestEntry,
 } from "./workspace-sync-protocol.js";
-import { decodeChangePage, decodeManifestEntry } from "./workspace-sync-protocol.js";
+import { WORKSPACE_SYNC_LIMITS, decodeChangePage, decodeManifestEntry } from "./workspace-sync-protocol.js";
 
 /**
  * Schema 2 adds `last_local_commit`; schema 3 adds `remote_only`. An older
@@ -868,6 +868,19 @@ export class ContinuousWorkspaceSyncSupervisor {
     // Kept beside `nextIndex` in every write below, so a resumed apply starts
     // from the set as it stood after the last item it finished.
     const remoteOnly = new Map(this.#state.remote_only.map((entry) => [entry.path, entry]));
+    // Excluded items touch nothing here, so a run of them is recorded in one
+    // write rather than one each: a Machine whose capture predates the policy
+    // can carry a whole `node_modules` or `.venv`. Replaying a run after a
+    // crash sets the same entries again.
+    let unrecorded: number | undefined;
+    const recordExcluded = async (): Promise<void> => {
+      if (unrecorded === undefined) return;
+      await this.#replaceState({
+        pending_remote: Object.freeze({ ...pending, items: Object.freeze(ordered), nextIndex: unrecorded }),
+        remote_only: sortedRemoteOnly(remoteOnly),
+      });
+      unrecorded = undefined;
+    };
     for (let index = pending.nextIndex; index < ordered.length; index += 1) {
       const item = ordered[index];
       if (item === undefined) continue;
@@ -880,12 +893,10 @@ export class ContinuousWorkspaceSyncSupervisor {
           // both directions for good (`remote_excluded_path`, BL-7).
           if (item.operation === "upsert" && item.entry !== null) remoteOnly.set(path, item.entry);
           else remoteOnly.delete(path);
-          await this.#replaceState({
-            pending_remote: Object.freeze({ ...pending, items: Object.freeze(ordered), nextIndex: index + 1 }),
-            remote_only: sortedRemoteOnly(remoteOnly),
-          });
+          unrecorded = index + 1;
           continue;
         }
+        await recordExcluded();
         const prior = baseline.get(path);
         const observed = currentEntries.get(path);
         const target = projectRemoteItem(item);
@@ -908,6 +919,7 @@ export class ContinuousWorkspaceSyncSupervisor {
         pending_remote: Object.freeze({ ...pending, items: Object.freeze(ordered), nextIndex: index + 1 }),
       });
     }
+    await recordExcluded();
     const manifest = await this.#buildManifest();
     const adopted = remoteTargetProjection(this.#state.baseline, ordered);
     if (manifest.manifestRoot !== pending.manifestRoot) {
@@ -1786,16 +1798,24 @@ function decodePendingRemote(value: unknown): PendingRemoteApply {
     !Array.isArray(source.items) || !Number.isSafeInteger(source.nextIndex) || (source.nextIndex as number) < 0 ||
     (source.nextIndex as number) > source.items.length
   ) throw syncFailure("state_invalid", EXIT_CODES.conflict);
-  const decodedItems = decodeChangePage({
-    selected_protocol: 1,
-    items: source.items,
-    next_cursor: null,
-  }).items;
+  // A generation's items arrive over as many pages as it takes, and are kept
+  // here as one list. Each item is still decoded by the page decoder, but in
+  // page-sized slices: decoded whole, a generation of more than one page's
+  // worth of changes (1,000) failed its own admission as
+  // `malformed_change_page` the moment it was recorded, and sync stopped.
+  const decodedItems: WorkspaceSyncChangeItem[] = [];
+  for (let offset = 0; offset < source.items.length; offset += WORKSPACE_SYNC_LIMITS.changePageEntries) {
+    decodedItems.push(...decodeChangePage({
+      selected_protocol: 1,
+      items: source.items.slice(offset, offset + WORKSPACE_SYNC_LIMITS.changePageEntries),
+      next_cursor: null,
+    }).items);
+  }
   return Object.freeze({
     generation: source.generation as number,
     manifestRoot: source.manifestRoot as string,
     cursor: source.cursor as string | null,
-    items: decodedItems,
+    items: Object.freeze(decodedItems),
     nextIndex: source.nextIndex as number,
   });
 }
