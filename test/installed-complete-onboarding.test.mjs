@@ -982,7 +982,7 @@ const INSTALLED_HELP_TOPICS = Object.freeze([
   "api-keys revoke", "agent-sessions", "agent-sessions list", "agent-sessions get",
   "agent-sessions create", "agent-sessions rename", "agent-sessions terminate",
   "agent-sessions attach", "agent", "connect", "config", "config set", "doctor", "self-test",
-  "version", "claude", "codex", "opencode", "shell", "sync", "companion",
+  "version", "claude", "codex", "opencode", "shell", "sync", "sync recover", "companion",
 ]);
 
 const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
@@ -1006,6 +1006,12 @@ const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze([
   // Reads the local record of one in-place update and sends nothing; it needs
   // a Machine this computer actually updated, which the generic matrix never has.
   "machines live-update-status",
+  // Recovers a folder whose workspace sync stopped. It needs a folder this
+  // computer bound and synced, with its durable sync state, against a server
+  // that serves the workspace-sync protocol; the generic matrix has none of
+  // those. Its success and every refusal are witnessed through runCli in
+  // test/sync-recover-command.test.mjs; here only its no-request refusal runs.
+  "sync recover",
 ]);
 // Implemented, help-visible, and refused outright by this installed harness:
 // both screens require a real interactive terminal under a human login, and
@@ -1022,7 +1028,9 @@ const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze([
 // A refusal is not a success. Interactive success acceptance for `observe` and
 // `share` stays OPEN and is not claimed by this test.
 const INTERACTIVE_HUMAN_LOGIN_TOPICS = Object.freeze(["observe", "share"]);
-const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "sync", "companion"]);
+// Bare `sync` is still reserved (the `sync/reserved` row below), but it is no
+// longer a leaf topic once `sync recover` exists, exactly as `config` is not.
+const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "companion"]);
 
 const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "signup/usage", argv: ["signup", "extra", "--json"], exit: 2, code: "cuna.usage.invalid" },
@@ -1062,6 +1070,8 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "openclaw/non-tty", argv: ["openclaw", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "opencode/unavailable", argv: ["opencode", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "sync/reserved", argv: ["sync", "--json"], exit: 8, code: "cuna.capability.unsupported" },
+  // Refused in preflight, before configuration, credentials or any request.
+  { id: "sync/recover/confirmation", argv: ["sync", "recover", "--json"], exit: 4, code: "cuna.confirmation.required" },
   { id: "shell/reserved", argv: ["shell", "--json"], exit: 8, code: "cuna.capability.unsupported" },
   { id: "companion/reserved", argv: ["companion", "--json"], exit: 8, code: "cuna.capability.unsupported" },
 ]);
