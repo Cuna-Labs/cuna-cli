@@ -139,10 +139,17 @@ export interface ContinuousSyncAuthority {
     readonly syncId: string;
     readonly signal: AbortSignal;
   }): Promise<ContinuousSyncCommitReceipt>;
+  /**
+   * One page of the change feed. `afterGeneration` is advisory: the Edge reads
+   * from `cursor`, or from the read handle's base generation without one. A
+   * page's `next_cursor` continues after that page's last item; it is opaque.
+   */
   listChanges(input: {
     readonly syncId: string;
     readonly cursor?: string;
     readonly afterGeneration: number;
+    /** Items per page; the server's default (100) when absent. */
+    readonly limit?: number;
     readonly signal: AbortSignal;
   }): Promise<WorkspaceSyncChangePage>;
   readChunk(input: {
@@ -793,8 +800,20 @@ export class ContinuousWorkspaceSyncSupervisor {
   async #consumeRemote(signal: AbortSignal): Promise<void> {
     const items: WorkspaceSyncChangeItem[] = [];
     let cursor = this.#state.cursor ?? undefined;
-    let terminalCursor: string | null = null;
+    // Where the feed can be taken up again: each page's next_cursor, with the
+    // generation of the item it continues after. A cursor is kept only once
+    // that generation is this folder's, so a resumed read never skips an item
+    // the folder has not taken in.
+    //
+    // Without one the Edge starts at the read handle's base generation, and
+    // the walk's last page carries no cursor; keeping only that null made every
+    // 750 ms poll re-read the whole feed since the base (biotech lab,
+    // 2026-10-03: 85 revisions a poll, which pushed the 0060 diff past the
+    // database's 8 s timeout).
+    const resumable: { readonly cursor: string; readonly generation: number }[] = [];
+    let finalPage: { readonly from: string | undefined; readonly items: readonly WorkspaceSyncChangeItem[] } | undefined;
     for (let pageIndex = 0; pageIndex < 256; pageIndex += 1) {
+      const from = cursor;
       const page = await this.#input.authority.listChanges({
         syncId: this.#state.sync_id,
         ...(cursor === undefined ? {} : { cursor }),
@@ -802,14 +821,44 @@ export class ContinuousWorkspaceSyncSupervisor {
         signal,
       });
       items.push(...page.items.filter((item) => item.generation > this.#state.generation));
-      terminalCursor = page.next_cursor;
-      if (page.next_cursor === null) break;
+      if (page.next_cursor === null) {
+        finalPage = Object.freeze({ from, items: page.items });
+        break;
+      }
       if (page.next_cursor === cursor) throw syncFailure("remote_cursor_stalled", EXIT_CODES.conflict);
+      const last = page.items.at(-1);
+      if (last !== undefined) resumable.push(Object.freeze({ cursor: page.next_cursor, generation: last.generation }));
       cursor = page.next_cursor;
       if (pageIndex === 255) throw syncFailure("remote_page_limit", EXIT_CODES.conflict);
     }
+    // The last page ends the walk without a cursor past it. Read it once more,
+    // one item short: that page's next_cursor continues after its
+    // second-to-last item, so the next poll reads one item, not the walk again.
+    // A last page of one item is already as close as a cursor gets.
+    if (finalPage !== undefined && finalPage.items.length >= 2) {
+      const penultimate = finalPage.items[finalPage.items.length - 2];
+      const shorter = await this.#input.authority.listChanges({
+        syncId: this.#state.sync_id,
+        ...(finalPage.from === undefined ? {} : { cursor: finalPage.from }),
+        afterGeneration: this.#state.generation,
+        limit: finalPage.items.length - 1,
+        signal,
+      });
+      const last = shorter.items.at(-1);
+      if (shorter.next_cursor !== null && penultimate !== undefined && last !== undefined &&
+          last.generation === penultimate.generation && last.operation === penultimate.operation && last.path === penultimate.path) {
+        resumable.push(Object.freeze({ cursor: shorter.next_cursor, generation: last.generation }));
+      }
+    }
+    const resumeAt = (generation: number): string | null => {
+      let found: string | null = this.#state.cursor;
+      for (const point of resumable) if (point.generation <= generation) found = point.cursor;
+      return found;
+    };
     const unseen = items;
     if (unseen.length === 0) {
+      const resume = resumeAt(this.#state.generation);
+      if (resume !== this.#state.cursor) await this.#replaceState({ cursor: resume });
       if (!this.#state.dirty && this.#state.status !== "converged") {
         await this.#transition({ status: "live_unverified", reason: null });
       }
@@ -835,7 +884,7 @@ export class ContinuousWorkspaceSyncSupervisor {
         pending_remote: Object.freeze({
           generation,
           manifestRoot,
-          cursor: offset === unseen.length ? terminalCursor : this.#state.cursor,
+          cursor: resumeAt(generation),
           items: Object.freeze(items),
           nextIndex: 0,
         }),

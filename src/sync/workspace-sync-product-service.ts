@@ -811,9 +811,10 @@ async function startProvenContinuousSupervisor(input: {
         checkpoint.base_generation === baseGeneration &&
         checkpoint.exclusion_policy_digest === policy.digest;
     },
-    async listChanges({ syncId, cursor, signal }) {
+    async listChanges({ syncId, cursor, limit, signal }) {
       const response = await client.changes(syncId, {
         ...(cursor === undefined ? {} : { cursor }),
+        ...(limit === undefined ? {} : { limit }),
         readerVersion: WORKSPACE_SYNC_PROTOCOL.maximum,
         signal,
       });
