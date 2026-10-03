@@ -4254,12 +4254,12 @@ test("BL-15: after the quick attempts, recovery keeps trying on a slow, bounded 
   let failures = 4;
   const reconnect = runtime.reconnect;
   runtime.reconnect = async (input) => {
-    calls.reconnect.push(input.tabId);
     if (failures > 0) {
+      calls.reconnect.push(input.tabId);
       failures -= 1;
       throw runtimeFailure("terminal_disconnected", "gateway still busy", { retryable: true });
     }
-    return reconnect(input);
+    return reconnect(input); // records its own call
   };
   callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
   const deadline = Date.now() + 10_000;
