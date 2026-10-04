@@ -3504,7 +3504,7 @@ test("Ctrl+C over a shown selection copies it, clears it and sends nothing; the 
       host.emitInput(mouse(32, 14, 3));
       host.emitInput(mouse(0, 14, 3, true));
       await waitUntil(() => copied.length === 1, `${accessMode}: release copies`);
-      await waitForScreen(host, /Drag to select · Ctrl\+C copy/u, `${accessMode}: a shown selection names its copy key`);
+      await waitForScreen(host, /Ctrl\+C copies the selection · Ctrl\+\] d detach/u, `${accessMode}: a shown selection names its copy key`);
       assert.equal(await inverseCells(host), 14, `${accessMode}: the selection is highlighted before Ctrl+C`);
       const osc52Before = host.writes.filter((bytes) => decoder.decode(bytes).startsWith("\u001b]52;c;")).length;
       host.emitInput(Uint8Array.of(0x03));

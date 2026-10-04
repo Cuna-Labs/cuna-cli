@@ -95,6 +95,10 @@ const INPUT_BATCH_WINDOW_MS = 24;
 const INPUT_BURST_GAP_MS = INPUT_BATCH_WINDOW_MS;
 const INPUT_BATCH_MAX_BYTES = 32;
 const DISCONNECT_FRAME_MS = 30;
+// Owner 2026-10-04: a Ctrl+C meant to copy reached Claude Code and a second
+// one quit it (status 0). The key still goes to the agent; for this long the
+// bar says so, and how to leave or copy instead.
+const INTERRUPT_NOTICE_MS = 5_000;
 const DISCONNECTING_FRAMES = Object.freeze([
   "✦ Disconnecting...",
   "✧ Disconnecting...",
@@ -281,6 +285,8 @@ export interface ForegroundTerminalCoordinatorOptions {
   /** Slow attempts after the quick ones; 0 turns them off. */
   readonly reconnectSlowAttempts?: number;
   readonly disconnectFrameMs?: number;
+  /** How long the bar says where a writer's Ctrl+C went. */
+  readonly interruptNoticeMs?: number;
   /** Stable only for this foreground process; never a reusable device credential. */
   readonly deviceId?: string;
   /** Predictive local echo of typed characters; `off` unless the caller chooses. */
@@ -475,6 +481,7 @@ export class ForegroundTerminalCoordinator {
   #switchCutoff: number | undefined;
   #switchRequest: ForegroundSwitchRequest | undefined;
   #switchNotice: string | undefined;
+  #interruptNotice: { readonly tabId: string; readonly text: string; readonly timer: ReturnType<typeof setTimeout> } | undefined;
   /**
    * The one line the attach arrived with (another process holds this client,
    * or a switch had to come back). It shares row 2 with the seat instead of
@@ -802,6 +809,8 @@ export class ForegroundTerminalCoordinator {
     this.#retainedBrowserDetectors.clear();
     this.#retainedBrowserCandidates.clear();
     this.#retainedPendingRequestId = undefined;
+    if (this.#interruptNotice !== undefined) clearTimeout(this.#interruptNotice.timer);
+    this.#interruptNotice = undefined;
     this.#oauthPasteGuards.clear();
     this.#browserRequests.clear();
     this.#remoteLocalActionTabs.clear();
@@ -1870,6 +1879,7 @@ export class ForegroundTerminalCoordinator {
     }
     let target = this.#prefixPending ? this.#prefixTarget : receiptTarget;
     let remote: number[] = [];
+    let interruptSentTo: string | undefined;
     const flush = async (): Promise<void> => {
       if (remote.length === 0) return;
       if (target === undefined) throw runtimeFailure("session_unknown", "No foreground terminal tab is active.");
@@ -1907,6 +1917,11 @@ export class ForegroundTerminalCoordinator {
           await flush();
           await this.#detachTab(target?.tabId);
           return;
+        } else if (byte === INTERRUPT) {
+          // The writer's Ctrl+C with nothing selected: sent as typed, and once
+          // it is sent the bar says where it went.
+          remote.push(byte);
+          interruptSentTo = target?.tabId;
         } else if (byte === ESCAPE_PREFIX) {
           await flush();
           this.#prefixPending = true;
@@ -1998,6 +2013,27 @@ export class ForegroundTerminalCoordinator {
       }
     }
     await flush();
+    if (interruptSentTo !== undefined) await this.#showInterruptNotice(interruptSentTo);
+  }
+
+  /** Says, for a few seconds, that the writer's Ctrl+C went to the agent; holds no input back. */
+  async #showInterruptNotice(tabId: string): Promise<void> {
+    const agent = this.#tabs.get(tabId)?.intent.agent;
+    if (agent === undefined) return;
+    if (this.#interruptNotice !== undefined) clearTimeout(this.#interruptNotice.timer);
+    const name = interruptAgentName(agent);
+    const timer = setTimeout(() => {
+      if (this.#interruptNotice?.timer !== timer) return;
+      this.#interruptNotice = undefined;
+      void this.#render().catch(() => undefined);
+    }, this.#options.interruptNoticeMs ?? INTERRUPT_NOTICE_MS);
+    timer.unref?.();
+    this.#interruptNotice = Object.freeze({
+      tabId,
+      text: `Ctrl+C sent to ${name} · press it again and ${name} may quit · Ctrl+] d detaches and keeps it running · select text first to copy`,
+      timer,
+    });
+    await this.#render();
   }
 
   async #routeBrowserActionInput(bytes: Uint8Array, target: ForegroundInputTarget | undefined): Promise<boolean> {
@@ -3212,6 +3248,8 @@ export class ForegroundTerminalCoordinator {
             ? { notice: `Codex asks to receive its sign-in on 127.0.0.1:${this.#pendingRelay.exactLocalPort} · Enter allow · Esc deny` }
           : this.#tabs.get(activeTabId)?.snapshot.state === "active" && this.#tabs.get(activeTabId)?.snapshot.terminalView?.ready === false
             ? { notice: "Restoring terminal\u2026" }
+          : this.#interruptNotice !== undefined && this.#interruptNotice.tabId === activeTabId
+            ? { notice: this.#interruptNotice.text }
           : this.#browserNotice !== undefined
             ? { notice: this.#tabs.get(activeTabId)?.snapshot.historicalInputUncertainty === true &&
                 (this.#browserNotice === INPUT_WITHHELD_NOTICE || isReconnectFailedNotice(this.#browserNotice))
@@ -3751,6 +3789,17 @@ function sameInputTarget(left: ForegroundInputTarget, right: ForegroundInputTarg
 
 function padTrustedLine(value: string, columns: number): string {
   return value.slice(0, columns).padEnd(columns, " ");
+}
+
+/** The program a writer's Ctrl+C reaches, as the person knows it. */
+function interruptAgentName(agent: WorkbenchTab["agent"]): string {
+  switch (agent) {
+    case "claude-code": return "Claude Code";
+    case "codex": return "Codex";
+    case "opencode": return "OpenCode";
+    case "openclaw": return "OpenClaw";
+    case "shell": return "the shell";
+  }
 }
 
 function providerName(provider: LocalBrowserActionRequest["provider"]): string {

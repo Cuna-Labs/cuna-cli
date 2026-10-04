@@ -367,26 +367,32 @@ function renderTabRow(
 }
 
 /**
- * Windows hosts get the copy/paste keys on the right of the second row when
- * they fit. A shown Cuna selection gets its copy key on every host: that
- * Ctrl+C is Cuna's, not the host terminal's.
+ * The keys on the right of the second row, on every host, as many as fit:
+ * how to leave without quitting the agent, and how to copy. Owner 2026-10-04:
+ * a Ctrl+C meant to copy reached Claude Code and a second one quit it, so the
+ * first two keys are always these. A shown Cuna selection leads with its copy
+ * key: that Ctrl+C is Cuna's, not the agent's.
  */
 function withClipboardHint(line: string, columns: number, mouseReporting: boolean, remoteMouse: boolean, selected: boolean): string {
-  if (process.platform !== "win32" && !selected) return line;
+  const windows = process.platform === "win32";
   // Cuna reports the mouse so the bar is clickable; it then selects on a
   // plain drag itself, unless the remote program asked for the mouse. Only
   // then is the host's own Shift+drag the way to select.
-  const hint = selected
-    ? "Drag to select · Ctrl+C copy"
+  const keys = selected
+    ? ["Ctrl+C copies the selection", "Ctrl+] d detach"]
     : !mouseReporting
-      ? "Select text: Ctrl+Shift+C copy | Ctrl+Shift+V paste"
+      ? ["Ctrl+] d detach", ...(windows ? ["select + Ctrl+Shift+C copy", "Ctrl+Shift+V paste"] : [])]
       : remoteMouse
-        ? "Agent uses the mouse: Shift+drag select | Ctrl+Shift+C copy | Ctrl+Shift+V paste"
-        : "Drag to select and copy | Ctrl+click opens a link | Ctrl+Shift+V paste";
+        ? ["Ctrl+] d detach", "Shift+drag select", ...(windows ? ["Ctrl+Shift+C copy", "Ctrl+Shift+V paste"] : [])]
+        : ["Ctrl+] d detach", "select + Ctrl+C copy", "Ctrl+click opens a link", ...(windows ? ["Ctrl+Shift+V paste"] : [])];
   const used = displayCellWidth(line.trimEnd());
-  const start = columns - 1 - hint.length;
-  if (start < used + 3) return line;
-  return `${line.trimEnd()}${" ".repeat(start - used)}${hint}`;
+  // All of them, else the first two, else the first alone, else nothing.
+  for (const count of new Set([keys.length, 2, 1])) {
+    const hint = keys.slice(0, count).join(" · ");
+    const start = columns - 1 - displayCellWidth(hint);
+    if (start >= used + 3) return `${line.trimEnd()}${" ".repeat(start - used)}${hint}`;
+  }
+  return line;
 }
 
 function renderTruth(model: AppbarModel, agent: WorkbenchTab["agent"], columns: number): string {
