@@ -3420,7 +3420,7 @@ test("a remote that asked for the mouse still gets clicks and drags, in the mode
     try {
       await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${modes}text`)));
       if (process.platform === "win32") {
-        await waitForScreen(host, /Agent uses the mouse: Shift\+drag select/u, `${modes}: the hint names Shift+drag`);
+        await waitForScreen(host, /Ctrl\+\] d detach · Shift\+drag select/u, `${modes}: the hint names Shift+drag`);
       }
       host.emitInput(mouse(0, 2, 3));
       host.emitInput(mouse(32, 6, 4));
@@ -4332,4 +4332,59 @@ test("control: a non-retryable refusal stops recovery on its first occurrence, s
   assert.equal(calls.reconnect.length, 1);
   assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /retrying in/u);
   await coordinator.stop();
+});
+
+// Owner 2026-10-04: a writer's Ctrl+C with nothing selected went to Claude Code
+// as it should, but the owner expected Ctrl+C to copy, pressed it again, and
+// Claude Code exited (status 0). The key still goes to the agent unchanged;
+// the bar now says so at that moment, names the agent, and says how to leave
+// without quitting it and how to copy.
+test("a writer's Ctrl+C with no selection is sent once and the bar says it went to the agent, for a few seconds", async () => {
+  const host = new FakeHost();
+  host.columns = 200;
+  const { coordinator, host: shown, calls, intents } = harness({ host, coordinatorOptions: { interruptNoticeMs: 60 } });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    shown.emitInput(Uint8Array.of(0x03));
+    await waitUntil(() => calls.input.some((item) => item.text === "\x03"), "Ctrl+C reaches the PTY");
+    await waitUntil(() => decoder.decode(shown.writes.at(-1)).includes("Ctrl+C sent to Claude Code"), "the bar says where Ctrl+C went");
+    const frame = decoder.decode(shown.writes.at(-1));
+    assert.match(frame, /Ctrl\+C sent to Claude Code · press it again and Claude Code may quit · Ctrl\+\] d detaches and keeps it running · select text first to copy/u);
+    // Never blocking: the next key goes straight through while the notice shows.
+    shown.emitInput(encoder.encode("x"));
+    await waitUntil(() => calls.input.some((item) => item.text === "x"), "typing continues under the notice");
+    assert.deepEqual(calls.input.map((item) => item.text), ["\x03", "x"], "what is forwarded is unchanged");
+    assert.deepEqual(calls.detach, []);
+    await waitUntil(() => !decoder.decode(shown.writes.at(-1)).includes("Ctrl+C sent to"), "the notice goes away by itself");
+  } finally { await coordinator.stop(); }
+});
+
+test("the Ctrl+C notice names the agent the key went to", async () => {
+  for (const [agent, name] of [["codex", "Codex"], ["opencode", "OpenCode"]]) {
+    const host = new FakeHost();
+    host.columns = 200;
+    const { coordinator, calls, intents } = harness({ host, coordinatorOptions: { interruptNoticeMs: 5_000 } });
+    intents[0] = { ...intents[0], agent };
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      host.emitInput(Uint8Array.of(0x03));
+      await waitUntil(() => calls.input.some((item) => item.text === "\x03"), `${agent}: Ctrl+C reaches the PTY`);
+      await waitUntil(() => decoder.decode(host.writes.at(-1)).includes(`Ctrl+C sent to ${name} · press it again and ${name} may quit`), `${agent}: named`);
+    } finally { await coordinator.stop(); }
+  }
+});
+
+// CONTROL: an observer's Ctrl+C detaches, as before; nothing was sent, so the
+// bar must not say it was.
+test("control: an observer's Ctrl+C detaches and never says it was sent to the agent", async () => {
+  const host = new FakeHost();
+  host.columns = 200;
+  const { coordinator, callbacks, calls, intents } = harness({ host, coordinatorOptions: { interruptNoticeMs: 5_000, disconnectFrameMs: 1 } });
+  await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  assert.equal(calls.input.length, 0);
+  assert.ok(!host.writes.some((bytes) => decoder.decode(bytes).includes("Ctrl+C sent to")));
 });
