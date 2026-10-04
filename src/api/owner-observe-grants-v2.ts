@@ -216,6 +216,9 @@ const READING_REFUSAL:Readonly<Record<string,string>>=Object.freeze({
  audience_response_unavailable:'The session answered something Cuna would not accept, so nothing was read.',
  audience_receipt_unavailable:'The session answered, but Cuna could not record the answer, so nothing was read.',
  audience_history_unavailable:'Cuna could not look up what that earlier change is recorded to have done, so it asked the session nothing either.',
+ // C4.17: decided before anything is asked, from what the supervisor advertises,
+ // so unlike `audience_transport_unavailable` it is certain and has one remedy.
+ audience_reading_unsupported:'This Machine\'s supervisor predates this question, so Cuna asked the session nothing and nothing about sharing changed. Stop the Machine and run `cuna machines update-supervisor <machine-id>` to update it while stopped.',
 });
 /** True when resending this exact request could still settle it; false where the producer has closed that door. */
 export function audienceRefusalCanResend(reason:unknown):boolean{
