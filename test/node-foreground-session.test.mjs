@@ -362,6 +362,56 @@ test("D13 control: the same refusal at attach time still refuses the attach", as
   assert.equal(host.acquired, 0);
 });
 
+// Production 2026-10-04, AgentSession 161d6dcc: after a clean detach, two
+// `cuna connect` runs were refused terminal_owner_unrecoverable while the row
+// still read running (the Machine had not re-attested its terminal). That
+// refusal deleted this computer's record of the client holding the writer
+// seat, so the reattach that worked an hour later came back as a new client
+// and an observer. The Edge renders that code for a settled process AND for a
+// live one not yet re-attested; only the durable row tells them apart.
+async function seatClientScope(t) {
+  const home = await mkdtemp(join(tmpdir(), "cuna-seat-client-"));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
+  const env = { APPDATA: join(home, "Roaming"), LOCALAPPDATA: join(home, "Local"), XDG_STATE_HOME: join(home, "state"), XDG_CONFIG_HOME: join(home, "config") };
+  return { platform: createPlatformAdapter({ env, homeDirectory: home }), profile: "default" };
+}
+
+for (const after of ["running", "exited"]) {
+  test(`an unattested-terminal refusal keeps the seat holder's client while the row reads ${after === "running" ? "running" : "exited (CONTROL: forgets)"}`, async (t) => {
+    const events = [];
+    const host = new FakeHost(events);
+    const system = terminalSystem(events);
+    const terminalClients = await seatClientScope(t);
+    const seated = await claimTerminalClientIdentity(terminalClients, session(SESSION_A));
+    await seated.release();
+    system.controlPlane.discoverCapabilities = async (_scope, id) => {
+      const snapshot = capability(id, "temporarily_unavailable");
+      snapshot.capabilities[0].reasonCode = "terminal_owner_unrecoverable";
+      return snapshot;
+    };
+    let reads = 0;
+    await assert.rejects(
+      runSupportedForegroundSessions({
+        // The first read admits the attach; a later read is the row after the refusal.
+        client: fakeClient(events, { async getAgentSession(id) { reads++; return session(id, reads === 1 ? {} : { processState: after }); } }),
+        baseUrl: "https://api.getcuna.com",
+        agentSessionIds: [SESSION_A],
+        terminalClients,
+      }, { host, controlPlane: system.controlPlane, terminalConnector: system.terminalConnector, clock: () => NOW }),
+      (error) => error.safeDetails?.reason_code === "terminal_owner_unrecoverable",
+    );
+    const next = await claimTerminalClientIdentity(terminalClients, session(SESSION_A));
+    await next.release();
+    if (after === "running") {
+      assert.equal(next.source, "reused");
+      assert.equal(next.clientInstanceId, seated.clientInstanceId);
+    } else {
+      assert.equal(next.source, "minted");
+      assert.notEqual(next.clientInstanceId, seated.clientInstanceId);
+    }
+  });
+}
+
 // Control: a foreground that ends without a local detach prints no such line.
 test("E14-D6 control: a cancelled foreground prints no detach line", async () => {
   const events = [];

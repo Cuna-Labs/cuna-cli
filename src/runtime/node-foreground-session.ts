@@ -324,12 +324,19 @@ async function runForgettingEndedSessions(
   try {
     return await runNodeForegroundSessionsWithRetry(input, dependencies, context);
   } catch (error) {
-    // A refusal that says the session's process is gone for good ends the
-    // remembered client with it, whichever step of the run it came from.
+    // `terminal_owner_unrecoverable` is not proof the process is gone: the Edge
+    // renders it for a settled process and for a live one whose Machine has
+    // not re-attested its terminal yet. Forgetting on the code alone deleted
+    // the seat holder's client after a clean detach (production 2026-10-04,
+    // AgentSession 161d6dcc), so the next reattach was a new client and an
+    // observer. The durable row decides; an unread row keeps the record, which
+    // is at worst garbage the idle sweep removes.
     if (input.terminalClients !== undefined && sessionEndedFailure(error)) {
       for (const agentSessionId of input.agentSessionIds) {
         try {
-          await forgetTerminalClientIdentity(input.terminalClients, agentSessionId);
+          if (isAgentSessionGone(await input.client.getAgentSession(agentSessionId, input.signal))) {
+            await forgetTerminalClientIdentity(input.terminalClients, agentSessionId);
+          }
         } catch { /* the refusal is the message; a leftover record is only garbage */ }
       }
     }
