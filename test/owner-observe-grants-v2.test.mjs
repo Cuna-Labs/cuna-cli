@@ -1172,3 +1172,17 @@ test('F3: an uncertain grant change still blocks a grant change, and an uncertai
  assert.equal(records.length,1);assert.equal(records[0].kind,'audience','the uncertain publication is preserved exactly');
  h.key('\x03');await h.done;
 });
+
+// C4.17 (cdd7e9a, edge/src/api.ts): a session on a Machine whose supervisor
+// cannot answer the reading is refused before Cuna asks it anything, 503
+// `audience_reading_unsupported`, retryable false. Unlike
+// `audience_transport_unavailable` this one is certain, and it has one remedy.
+test('a reading refused because the supervisor predates it says so and names the remedy',async()=>{
+ const error=classifyTransportFailure(http(503,'audience_reading_unsupported'),false,'audience-state');
+ assert.equal(error.kind,'unavailable');assert.equal(error.effectUnknown,false);
+ assert.match(error.message,/This Machine's supervisor predates this question/u);
+ assert.match(error.message,/update it while (the Machine is )?stopped/u);
+ assert.doesNotMatch(error.message,/audience_/u);
+ // Control: the lost-answer refusal keeps its own, uncertain wording.
+ assert.match(classifyTransportFailure(http(503,'audience_transport_unavailable'),false,'audience-state').message,/indistinguishable from a lost answer/u);
+});
