@@ -135,12 +135,15 @@ test('No for a launch recorded under another Workspace version is a typed local 
  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{generation:1,profile:'profile',revision:2}};
  await withProviderLaunchIntent({...scope,create:async id=>id});
  let calls=0;
- await assert.rejects(withProviderLaunchIntent({...scope,intent:{...scope.intent,generation:8},confirmNew:async()=>false,create:async()=>{calls++;}}),error=>{
+ const asked=[];
+ await assert.rejects(withProviderLaunchIntent({...scope,intent:{...scope.intent,generation:8},confirmNew:async(context)=>{asked.push(context?.state);return false;},create:async()=>{calls++;}}),error=>{
   assert.equal(error.code,'cuna.provider.pending_intent_conflict');
   assert.equal(error.details?.reason,'recorded_launch_mismatch');
   assert.match(error.hint,/--new-session/);
   return true;
  });
+ // Owner witness 2026-10-04: the question must not offer a resume it cannot do.
+ assert.deepEqual(asked,['unresumable']);
  assert.equal(calls,0);
  }finally{await removeFixture(directory);}
 });

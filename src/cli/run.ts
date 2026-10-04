@@ -2012,9 +2012,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           },
           createLabel: journeyPhaseLabel("create-agent-session", journeyAgent),
           ended: context?.state === "ended",
+          unresumable: context?.state === "unresumable",
         });
-        // A No to the ended question resumes nothing; it ends the command.
-        recordedLaunchResumed = recordedLaunchResumed || (!another && context?.state !== "ended");
+        // A No to the ended or unresumable question resumes nothing; it ends the command.
+        recordedLaunchResumed = recordedLaunchResumed || (!another && context?.state !== "ended" && context?.state !== "unresumable");
         return another;
       };
       if (credentialMode === undefined) {

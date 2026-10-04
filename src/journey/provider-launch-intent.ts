@@ -14,7 +14,7 @@ const SESSIONS_FILE='sessions.json';
  * recorded launch produced is known to be gone, so there is nothing to
  * resume and the question may only offer a new session.
  */
-export interface RecordedLaunchContext {readonly state:'resumable'|'ended'}
+export interface RecordedLaunchContext {readonly state:'resumable'|'ended'|'unresumable'}
 
 /** Reuses the fsync journal and exclusive local writer; no provider credentials are persisted. */
 export async function withProviderLaunchIntent<T extends {readonly id:string}>(input:{stateDirectory:string;ownerId:string;workspaceId:string;machineId:string;executionWorkspaceId:string;intent:Readonly<Record<string,unknown>>;confirmNew?:(context:RecordedLaunchContext)=>Promise<boolean>;
@@ -132,7 +132,9 @@ async function decide(latest:ReadonlyMap<string,JournalRecord>,digest:string,ses
  if(pending.length===0&&resolved){
   const recordedSession=sessions.get(resolved.operationId);
   const ended=recordedSession!==undefined&&isSessionEnded!==undefined&&await isSessionEnded(recordedSession);
-  if(!(await confirmNew?.({state:ended?'ended':'resumable'}))){
+  // Known before asking, so the question never offers a resume that cannot happen.
+  const mismatched=!ended&&resolved.digest!==digest;
+  if(!(await confirmNew?.({state:ended?'ended':mismatched?'unresumable':'resumable'}))){
    // A session that ended cannot be resumed: re-sending its launch returns
    // the dead row. Say so, and send nothing.
    if(ended)throw recordedLaunchEnded(recordedSession);
@@ -140,7 +142,7 @@ async function decide(latest:ReadonlyMap<string,JournalRecord>,digest:string,ses
    // another Workspace version or preset cannot be resumed, and nothing is
    // unresolved about it: the way forward is a new session, and the refusal
    // says so rather than reading as a create of unknown outcome.
-   if(resolved.digest!==digest)throw new CunaError({code:'cuna.provider.pending_intent_conflict',message:'The recorded launch used another Workspace version or preset, so it cannot be resumed. Nothing was sent.',exitCode:EXIT_CODES.conflict,hint:'Answer y to the question, or run the same command with --new-session, to start a new session.',details:{reason:'recorded_launch_mismatch'}});
+   if(mismatched)throw new CunaError({code:'cuna.provider.pending_intent_conflict',message:'The recorded launch used another Workspace version or preset, so it cannot be resumed. Nothing was started.',exitCode:EXIT_CODES.conflict,hint:'Answer y to the question, or run the same command with --new-session, to start a new session.',details:{reason:'recorded_launch_mismatch'}});
    return {kind:'resume',operationId:resolved.operationId};
   }
  }

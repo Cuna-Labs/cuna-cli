@@ -39,6 +39,14 @@ export const RECORDED_LAUNCH_ENDED_QUESTION =
   "The last session for this folder has ended. Start a new session? [y/N; No starts nothing] ";
 
 /**
+ * Asked instead when the recorded launch used another Workspace version or
+ * preset: it cannot be resumed, so No may not promise one (owner witness
+ * 2026-10-04: the default No led straight to `recorded_launch_mismatch`).
+ */
+export const RECORDED_LAUNCH_UNRESUMABLE_QUESTION =
+  "The last launch for this folder used another Workspace version or preset and cannot be resumed. Start a new session? [y/N; No starts nothing] ";
+
+/**
  * How long the screen may stay unchanged after the answer is accepted.
  *
  * DERIVATION. Not a tuning knob: it is the bound this module exists to hold,
@@ -95,6 +103,8 @@ export interface RecordedLaunchPromptInput {
   readonly createLabel: string;
   /** The recorded launch's session has ended: ask the question that does not promise a resume. */
   readonly ended?: boolean;
+  /** The recorded launch cannot be resumed (another Workspace version or preset): same rule as `ended`. */
+  readonly unresumable?: boolean;
 }
 
 /**
@@ -109,7 +119,9 @@ export interface RecordedLaunchPromptInput {
  */
 export async function askRecordedLaunch(input: RecordedLaunchPromptInput): Promise<boolean> {
   const ended = input.ended === true;
-  const wantsNewSession = recordedLaunchWantsNewSession(await input.ask(ended ? RECORDED_LAUNCH_ENDED_QUESTION : RECORDED_LAUNCH_QUESTION));
-  input.acknowledge(recordedLaunchAcknowledgement(wantsNewSession, input.createLabel, ended));
+  const unresumable = !ended && input.unresumable === true;
+  const question = ended ? RECORDED_LAUNCH_ENDED_QUESTION : unresumable ? RECORDED_LAUNCH_UNRESUMABLE_QUESTION : RECORDED_LAUNCH_QUESTION;
+  const wantsNewSession = recordedLaunchWantsNewSession(await input.ask(question));
+  input.acknowledge(recordedLaunchAcknowledgement(wantsNewSession, input.createLabel, ended || unresumable));
   return wantsNewSession;
 }
