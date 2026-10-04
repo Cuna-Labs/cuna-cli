@@ -4,8 +4,9 @@
 // Measured 2026-09-28: `cuna help --all` listed `machines live-update-supervisor`
 // and `machines live-update-status` under "Available now", and the deployed
 // Edge (`d3d3d3c`) answered their route with 404 `operation_not_served`. The
-// vendored contract is now that producer's, which also has no sharing-state
-// reading, the question `cuna share` asks.
+// vendored contract followed the deployed producer; since C4.17 (cdd7e9a) it
+// serves the sharing-state reading again, so `cuna share` is routed and only
+// the two live-update commands stay unserved.
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -19,11 +20,9 @@ const PLATFORM = Object.freeze({
 });
 const MACHINE_ID = "11111111-1111-4111-8111-111111111111";
 const OPERATION_ID = "00000000-0000-4000-8000-000000000000";
-const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
 const UNSERVED = Object.freeze([
   ["machines", "live-update-supervisor", MACHINE_ID, "--yes"],
   ["machines", "live-update-status", MACHINE_ID, "--operation", OPERATION_ID],
-  ["share", "--project", PROJECT_ID],
 ]);
 
 function availableNow() {
@@ -33,15 +32,17 @@ function availableNow() {
 
 test("help --all lists no command the vendored API contract cannot serve under Available now", () => {
   const section = availableNow();
-  for (const command of ["machines live-update-supervisor", "machines live-update-status", "share --project"]) {
+  for (const command of ["machines live-update-supervisor", "machines live-update-status"]) {
     assert.doesNotMatch(section, new RegExp(`^ {2}${command}`, "mu"), `${command} is listed as available`);
   }
   assert.match(FULL_HELP, /^Not served by this Cuna API version/mu);
-  for (const key of ["machines live-update-supervisor", "machines live-update-status", "share"]) {
+  for (const key of ["machines live-update-supervisor", "machines live-update-status"]) {
     assert.match(FULL_HELP, new RegExp(`^ {2}\\[unserved\\] ${key} :: `, "mu"), key);
   }
-  // Control: a served command stays where it was.
+  // Control: a served command stays where it was, and `share` is back.
   assert.match(section, /^ {2}machines update-supervisor ID/mu);
+  assert.match(section, /^ {2}share --project/mu);
+  assert.match(FULL_HELP, /^ {2}\[routed\] share :: /mu);
 });
 
 test("an unserved command refuses before any configuration, credential or request", async () => {

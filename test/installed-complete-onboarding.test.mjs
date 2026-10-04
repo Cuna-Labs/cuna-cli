@@ -1035,11 +1035,12 @@ const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze([
 // A refusal is not a success. Interactive success acceptance for `observe` and
 // `share` stays OPEN and is not claimed by this test.
 const INTERACTIVE_HUMAN_LOGIN_TOPICS = Object.freeze(["observe", "share"]);
-// Routed, but the vendored contract (the deployed producer 3dfa1d1, C4.15) has
+// Routed, but the vendored contract (the deployed producer cdd7e9a, C4.17) has
 // no operation they send, so they refuse before anything else is checked. When
 // a synchronized contract serves them again, these rows fail and must be
-// re-decided, which is the point.
-const UNSERVED_TOPICS = new Set(["share", "machines live-update-supervisor", "machines live-update-status"]);
+// re-decided, which is the point. C4.17 serves `share`'s reading again, so
+// `share` is back to the redirected-terminal refusal.
+const UNSERVED_TOPICS = new Set(["machines live-update-supervisor", "machines live-update-status"]);
 // Bare `sync` is still reserved (the `sync/reserved` row below), but it is no
 // longer a leaf topic once `sync recover` exists, exactly as `config` is not.
 const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "companion"]);
@@ -1058,7 +1059,7 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   // prove the combined refusal; the no-flag invocation in the read-only phase
   // covers the redirected-terminal case on valid arguments.
   { id: "observe/non-interactive", argv: ["observe", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
-  { id: "share/non-interactive", argv: ["share", "--project", PROJECT_ID, "--json"], exit: 8, code: "cuna.contract.operation_not_served" },
+  { id: "share/non-interactive", argv: ["share", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "machines/usage", argv: ["machines", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   // Both live-update commands are refused as not served before configuration,
   // transport, confirmation or usage is checked (UNSERVED_TOPICS).

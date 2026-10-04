@@ -27,7 +27,7 @@ const http=(status,reason)=>new CunaError({code:status===403?'cuna.policy.denied
 
 /**
  * The sharing-state reading is projected only when the vendored contract has
- * it. The deployed producer (3dfa1d1, vendored 2026-10-03, as d3d3d3c before it) does not, so the
+ * it. Producers d3d3d3c and 3dfa1d1 did not (cdd7e9a, C4.17, does); without it the
  * tests of the reading's logic run only against a contract that serves it,
  * and the local refusal is pinned in their place.
  */

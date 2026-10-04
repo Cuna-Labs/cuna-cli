@@ -3,27 +3,27 @@ export const INFRA_OPENAPI_CONTRACT_IDENTITY = Object.freeze({
   "schemaVersion": 2,
   "artifact_file": "contracts/infra/cuna-api.openapi.json",
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
-  "infra_openapi_raw_sha256": "5f07f6a514da218d6f8409fc1accab4ed62b258863d7dccdd9328eb45394b044",
-  "infra_openapi_canonical_sha256": "7a950c6ffab805f4a04e5b32c69726affa54f39d0d6e7ba9d5e53099feb78af5",
+  "infra_openapi_raw_sha256": "4d24c57b6f6102e2e7a30418fcb820192b41db1bbd0099d90e2a48aad37f2fa6",
+  "infra_openapi_canonical_sha256": "7805d96c670f6b9134598e1ccbd0afff1cb3d8a6803ee2107df1fb78e6170818",
   "producer_repository": "Cuna-Labs/infra-proxy-mvp",
   "producer_content_state": "committed",
-  "producer_revision": "3dfa1d12cdc66cc63447ceee7f3c97ae8dc8c5c3",
+  "producer_revision": "cdd7e9a8743f12eac8c3be3214e6cdbf514c3786",
   "producer_full_tree": {
     "object_format": "sha1",
-    "commit": "3dfa1d12cdc66cc63447ceee7f3c97ae8dc8c5c3",
-    "tree": "aa0911bcbcc88cf04d04e8a22ec851ec5dcf1cea",
-    "contract_blob": "8f023c168493b50aeb05ee7e9ab278b2a743733d"
+    "commit": "cdd7e9a8743f12eac8c3be3214e6cdbf514c3786",
+    "tree": "0e4c6fe85b8a7cdb812b4a305e2e0e33949f710d",
+    "contract_blob": "a5e3d2d041c3274472fdeb69448eec968afb4c1f"
   },
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
   "producer_projection_sha256": "fdb522241303aaae362a3df962b122a1506e00400a14487c47ac1105afefde65",
-  "producer_runtime_manifest_sha256": "0ce6a86fe877ad29f7679954e3333e184e58bddb3fb8cc4675fde2493d6b611e",
+  "producer_runtime_manifest_sha256": "a02bcde0c4bcf290a518125ef42141466c7142deaee91f132a835281b848eb83",
   "feature_contracts": {
     "opencode_interactive_only": {
-      "openapi_raw_sha256": "5f07f6a514da218d6f8409fc1accab4ed62b258863d7dccdd9328eb45394b044",
-      "openapi_canonical_sha256": "7a950c6ffab805f4a04e5b32c69726affa54f39d0d6e7ba9d5e53099feb78af5",
-      "producer_commit": "3dfa1d12cdc66cc63447ceee7f3c97ae8dc8c5c3",
-      "producer_tree": "aa0911bcbcc88cf04d04e8a22ec851ec5dcf1cea",
-      "producer_contract_blob": "8f023c168493b50aeb05ee7e9ab278b2a743733d"
+      "openapi_raw_sha256": "4d24c57b6f6102e2e7a30418fcb820192b41db1bbd0099d90e2a48aad37f2fa6",
+      "openapi_canonical_sha256": "7805d96c670f6b9134598e1ccbd0afff1cb3d8a6803ee2107df1fb78e6170818",
+      "producer_commit": "cdd7e9a8743f12eac8c3be3214e6cdbf514c3786",
+      "producer_tree": "0e4c6fe85b8a7cdb812b4a305e2e0e33949f710d",
+      "producer_contract_blob": "a5e3d2d041c3274472fdeb69448eec968afb4c1f"
     }
   }
 } as const);
@@ -101,6 +101,7 @@ export const INFRA_OPENAPI_OPERATIONS: readonly string[] = Object.freeze([
   "POST /v1/collaboration/1/projects/{id}/invitations",
   "POST /v1/collaboration/1/projects/{projectId}/members/{subjectId}/withdraw",
   "POST /v1/collaboration/2/agent-sessions/{id}/audience",
+  "POST /v1/collaboration/2/agent-sessions/{id}/audience-state",
   "POST /v1/collaboration/2/agent-sessions/{id}/observe-grants",
   "POST /v1/collaboration/2/agent-sessions/{id}/provider-observations",
   "POST /v1/collaboration/2/invitations/{id}/accept",
