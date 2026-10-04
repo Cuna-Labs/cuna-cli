@@ -118,6 +118,15 @@ function waitForOwner(endpoint, expectedGreeting, deadline) {
         finish();
         return;
       }
+      // An owner that closes its listener before accepting a queued waiter
+      // resets that connection (Linux, 2026-10-04: 39 of 40 when the owner's
+      // loop was held across the release). The endpoint is what is free or
+      // held, so look again; a live owner still answers the next listen with
+      // EADDRINUSE. The short pause keeps a resetting stranger from spinning.
+      if (error?.code === "ECONNRESET") {
+        setTimeout(() => finish(), 25);
+        return;
+      }
       finish(new BuildLockError("build_lock_io", "Could not observe the active build lock.", { cause: error }));
     });
   });
