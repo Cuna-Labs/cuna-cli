@@ -30,11 +30,17 @@ test('exclusive journal rejects concurrent admission before a second network mut
  }finally{release?.();await removeFixture(directory);}
 });
 
+// The two tests below need a create that outlives the lease. With a 500 ms
+// lease, renewed every 166 ms, one stall of the test process of 500 ms or more
+// lost the lease every time (reproduced 6 of 6 at 500 and 700 ms, 0 of 6 at
+// 400 ms, Linux 2026-10-04); that was the suite failure at adab3b3 under load.
+// A 1500 ms lease keeps the property (the create still outlives it 2.5 times)
+// and tolerates a stall of about a second; the product's lease is 120 s.
 test('long provider preparation renews the real journal lease and applies the same operation',async()=>{
  const directory=await mkdtemp(join(tmpdir(),'cuna-provider-lease-'));
  try{
-  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{profile:'p'},leaseMs:500};
-  const result=await withProviderLaunchIntent({...scope,create:async(operationId,signal)=>{await delay(1_250,undefined,{signal});return {id:'session-1',operationId};}});
+  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{profile:'p'},leaseMs:1_500};
+  const result=await withProviderLaunchIntent({...scope,create:async(operationId,signal)=>{await delay(3_750,undefined,{signal});return {id:'session-1',operationId};}});
   const key=JSON.stringify(['provider-launch-v2','A','account','machine','execution']);
   const journalDirectory=join(directory,'provider-launch-v2',createHash('sha256').update(key).digest('hex'));
   const latest=(await inspectSyncJournal(journalDirectory)).records.filter(row=>row.operationId===result.operationId).at(-1);
@@ -46,12 +52,12 @@ test('long provider preparation renews the real journal lease and applies the sa
 test('replaying an applied launch also keeps its writer lease current throughout a slow POST',async()=>{
  const directory=await mkdtemp(join(tmpdir(),'cuna-provider-lease-'));
  try{
-  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{profile:'p'},leaseMs:500};
+  const scope={stateDirectory:directory,ownerId:'A',workspaceId:'account',machineId:'machine',executionWorkspaceId:'execution',intent:{profile:'p'},leaseMs:1_500};
   const first=await withProviderLaunchIntent({...scope,create:async operationId=>({id:'session-1',operationId})});
   const key=JSON.stringify(['provider-launch-v2','A','account','machine','execution']);
   const journalDirectory=join(directory,'provider-launch-v2',createHash('sha256').update(key).digest('hex'));
   const resumed=await withProviderLaunchIntent({...scope,confirmNew:async()=>false,create:async operationId=>{
-   await delay(900);
+   await delay(2_700);
    const lease=JSON.parse(await readFile(join(journalDirectory,'writer.lease'),'utf8'));
    assert.ok(lease.expiresAt>Date.now(),'the resume branch must still own a live writer lease after its original expiry');
    return {id:'session-1',operationId};
