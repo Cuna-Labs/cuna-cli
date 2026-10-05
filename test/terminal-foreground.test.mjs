@@ -3855,7 +3855,14 @@ test("without OSC 8, the 4-row Codex layout still resolves to the whole URL, the
     await waitUntil(() => opened.length === 2 && copied.length === 1, "two clicks open and Ctrl+] y copies");
     assert.deepEqual(opened, [target, target], "a click on the first or a middle row opens the whole link");
     assert.equal(copied[0], target, "Ctrl+] y copies the whole link, not its first row");
-    const painted = hostHyperlinks(host).filter((link) => link.uri.startsWith("https://auth.openai.com"));
+    const painted = hostHyperlinks(host).filter((link) => {
+      try {
+        const parsed = new URL(link.uri);
+        return parsed.protocol === "https:" && parsed.hostname === "auth.openai.com";
+      } catch {
+        return false;
+      }
+    });
     assert.ok(painted.length >= 4 && painted.every((link) => link.uri === target));
   } finally { await coordinator.stop(); }
 });
