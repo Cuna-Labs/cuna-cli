@@ -674,6 +674,28 @@ test("a crashed process releases kernel writer authority and the next process ad
   await recovered.close();
 });
 
+test("a busy journal names the process holding it when the holder's lease says which", async (t) => {
+  const directory = await temporaryDirectory(t);
+  const open = (ownerId) => DurableSyncJournal.open({ directory, bindingId: "binding", bindingGeneration: 1, ownerId, leaseMs: 60_000 });
+  const holder = await open("continuous-sync:4242:5c0f2d7e-0000-4000-8000-000000000001");
+  try {
+    await assert.rejects(open("next-run"), (error) =>
+      error.code === "cuna.workspace.workspace_busy" && error.details.reason === "active_writer" &&
+      error.details.holder_pid === 4242 && error.message === "Cuna process 4242 owns the workspace journal.");
+  } finally {
+    await holder.close();
+  }
+  // CONTROL: an owner id that names no process leaves the refusal as it was.
+  const anonymous = await open("writer");
+  try {
+    await assert.rejects(open("next-run"), (error) =>
+      error.code === "cuna.workspace.workspace_busy" && error.details.holder_pid === undefined &&
+      error.message === "Another process owns the workspace journal.");
+  } finally {
+    await anonymous.close();
+  }
+});
+
 test("journal lease acquisition and renewal use only the configured trusted clock", async (t) => {
   const directory = await temporaryDirectory(t);
   let now = 100;

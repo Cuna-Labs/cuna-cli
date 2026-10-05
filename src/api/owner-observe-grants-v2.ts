@@ -216,6 +216,9 @@ const READING_REFUSAL:Readonly<Record<string,string>>=Object.freeze({
  audience_response_unavailable:'The session answered something Cuna would not accept, so nothing was read.',
  audience_receipt_unavailable:'The session answered, but Cuna could not record the answer, so nothing was read.',
  audience_history_unavailable:'Cuna could not look up what that earlier change is recorded to have done, so it asked the session nothing either.',
+ // C4.17: decided before anything is asked, from what the supervisor advertises,
+ // so unlike `audience_transport_unavailable` it is certain and has one remedy.
+ audience_reading_unsupported:'This Machine\'s supervisor predates this question, so Cuna asked the session nothing and nothing about sharing changed. Stop the Machine and run `cuna machines update-supervisor <machine-id>` to update it while stopped.',
 });
 /** True when resending this exact request could still settle it; false where the producer has closed that door. */
 export function audienceRefusalCanResend(reason:unknown):boolean{
@@ -555,6 +558,10 @@ export function ownerObserveGrantsApi(transport:HttpTransport,owner:string,proje
    * history of the very change the owner is trying to finish.
    */
   async readAudience(input:ReadAudienceInput,operationId:string,signal:AbortSignal):Promise<SessionAudienceState>{
+   // Projected only when the vendored contract has it (d3d3d3c and 3dfa1d1 did
+   // not; cdd7e9a, C4.17, does). Absent, the question is refused here and never sent.
+   const readOperation=(ownerObserveGrantOperations as Partial<Record<string,{readonly path:string}>>).readSessionAudienceStateV2;
+   if(readOperation===undefined)throw new OwnerGrantError('unavailable','This Cuna API version has no sharing-state reading, so Cuna asked nothing and nothing about sharing changed.');
    assertCanonicalUuid(input.agentSessionId,'AgentSession ID');assertCanonicalUuid(operationId,'Operation ID');
    if(input.reconcile!==undefined){
     assertCanonicalUuid(input.reconcile.operationId,'Operation ID');
@@ -562,7 +569,7 @@ export function ownerObserveGrantsApi(transport:HttpTransport,owner:string,proje
    }
    const body={version:'2',operation_id:operationId,...(input.reconcile===undefined?{}:{reconcile_operation_id:input.reconcile.operationId})};
    check(body,'ReadSessionAudienceStateV2Request','sharing question');
-   const answer=await send(ownerObserveGrantOperations.readSessionAudienceStateV2.path.replace('{id}',input.agentSessionId),body,false,signal,'audience-state');
+   const answer=await send(readOperation.path.replace('{id}',input.agentSessionId),body,false,signal,'audience-state');
    check(answer,'SessionAudienceStateV2Receipt','sharing state');
    const receipt=answer as {state:'reconciled';
     current:{request_id:string;agent_session_id:string;session_incarnation:string;process_epoch:string;logical_terminal_id:string;

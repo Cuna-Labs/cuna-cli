@@ -25,16 +25,29 @@ const signal=new AbortController().signal;
 const tick=()=>new Promise(resolve=>setTimeout(resolve,25));
 const http=(status,reason)=>new CunaError({code:status===403?'cuna.policy.denied':'cuna.remote.rejected',message:'x',exitCode:EXIT_CODES.remote,details:{http_status:status,...(reason?{reason}:{})}});
 
+/**
+ * The sharing-state reading is projected only when the vendored contract has
+ * it. Producers d3d3d3c and 3dfa1d1 did not (cdd7e9a, C4.17, does); without it the
+ * tests of the reading's logic run only against a contract that serves it,
+ * and the local refusal is pinned in their place.
+ */
+const AUDIENCE_READING=Object.hasOwn(ownerObserveGrantOperations,'readSessionAudienceStateV2');
+const NEEDS_READING=AUDIENCE_READING?false:'the vendored contract has no audience-state reading; the local refusal is pinned instead';
+
 test('owner projection is generated from the vendored contract and its check passes',()=>{
  const bytes=readFileSync(new URL('../contracts/infra/cuna-api.openapi.json',import.meta.url));
  const header=readFileSync(new URL('../src/api/owner-observe-grants-v2-schema.ts',import.meta.url),'utf8').split('\n')[1];
  assert.ok(header.includes(`contracts/infra/cuna-api.openapi.json; SHA256 ${createHash('sha256').update(bytes).digest('hex')}`));
  const spec=JSON.parse(bytes);for(const [name,schema] of Object.entries(ownerObserveGrantSchemas))assert.deepEqual(schema,spec.components.schemas[name],name);
- assert.deepEqual(Object.keys(ownerObserveGrantOperations).sort(),['createSessionObserveGrantV2','inspectSessionObserveGrantV2','listProjectObserversV2','prepareSessionAudienceV2','readSessionAudienceStateV2','revokeSessionObserveGrantV2']);
- // The reading is projected beside the transition: an owner who can change the
- // audience and cannot read it has no way out of a lost acknowledgement.
- assert.equal(ownerObserveGrantOperations.readSessionAudienceStateV2.path,'/v1/collaboration/2/agent-sessions/{id}/audience-state');
- assert.equal(ownerObserveGrantSchemas.ObservedSessionAudienceStateV2.properties.action.const,'observe');
+ // The reading is projected exactly when the vendored contract has it.
+ assert.equal(AUDIENCE_READING,Object.hasOwn(spec.components.schemas,'ReadSessionAudienceStateV2Request'));
+ assert.deepEqual(Object.keys(ownerObserveGrantOperations).sort(),['createSessionObserveGrantV2','inspectSessionObserveGrantV2','listProjectObserversV2','prepareSessionAudienceV2',...(AUDIENCE_READING?['readSessionAudienceStateV2']:[]),'revokeSessionObserveGrantV2']);
+ if(AUDIENCE_READING){
+  // The reading is projected beside the transition: an owner who can change the
+  // audience and cannot read it has no way out of a lost acknowledgement.
+  assert.equal(ownerObserveGrantOperations.readSessionAudienceStateV2.path,'/v1/collaboration/2/agent-sessions/{id}/audience-state');
+  assert.equal(ownerObserveGrantSchemas.ObservedSessionAudienceStateV2.properties.action.const,'observe');
+ }
  // Both actions of the canonical enum are projected. Shipping only `publish`
  // would give an owner a way to start disclosing a terminal and no way to stop.
  assert.deepEqual(ownerObserveGrantSchemas.PrepareSessionAudienceV2Request.properties.action.enum,['publish','private']);
@@ -773,10 +786,19 @@ test('share preflight rejects non-TTY, JSON, invalid Project and invalid grant b
  let reads=0;const platform={kind:'linux',paths:{configDirectory:'/cfg',stateDirectory:'/state',runtimeDirectory:'/run'},async readSafeConfig(){reads++;throw Error('must not read configuration');}};
  for(const argv of [['share','--project',project],['share','--project',project,'--json'],['share','--project','invalid'],['share','--project',project,'--grant','nope'],['share','extra','--project',project]]){const s=memoryStreams();assert.notEqual(await runCli(argv,{streams:s.streams,platform}),0,argv.join(' '));}
  assert.equal(reads,0);const s=memoryStreams();assert.equal(await runCli(['share','--help'],{streams:s.streams,platform}),0);assert.match(s.stdout(),/share --project PROJECT_ID \[--grant GRANT_ID\]/u);assert.match(s.stdout(),/read-only/u);assert.match(s.stdout(),/keyboard control/u);
- const all=memoryStreams();assert.equal(await runCli(['help','--all'],{streams:all.streams,platform}),0);assert.match(all.stdout(),/\[routed\] share :: cuna share --project PROJECT_ID/u);
+ // Its screen asks the sharing-state question, so without that operation the
+ // command is marked unserved rather than routed.
+ const all=memoryStreams();assert.equal(await runCli(['help','--all'],{streams:all.streams,platform}),0);assert.match(all.stdout(),AUDIENCE_READING?/\[routed\] share :: cuna share --project PROJECT_ID/u:/\[unserved\] share :: cuna share --project PROJECT_ID/u);
 });
 
 /* ---- Asking what the session is sharing now: CUNA-COL-024-R3 recovery ---- */
+test('without the sharing-state operation the reading is refused here and nothing is sent',{skip:AUDIENCE_READING&&'the vendored contract serves the reading'},async()=>{
+ let sent=0;const api=ownerObserveGrantsApi({request:async()=>{sent++;return {};}},owner,project);
+ await assert.rejects(api.readAudience({agentSessionId:session,sessionIncarnation:id(6)},id(20),signal),
+  e=>e instanceof OwnerGrantError&&e.kind==='unavailable'&&/This Cuna API version has no sharing-state reading/u.test(e.message));
+ assert.equal(sent,0);
+});
+
 const reading=(result={status:'observed',state:'private',generation:'4'},patch={})=>({state:'reconciled',
  current:{type:'session_audience_response_v2',version:'2',request_id:id(21),action:'observe',agent_session_id:session,session_incarnation:id(6),process_epoch:id(71),runtime_lease_id:id(72),logical_terminal_id:id(13),process_start_identity:'123',expected_generation:'4',result,...patch}});
 const recordedPublish={type:'session_audience_response_v2',version:'2',request_id:id(22),action:'publish',agent_session_id:session,session_incarnation:id(6),process_epoch:id(71),runtime_lease_id:id(72),logical_terminal_id:id(13),process_start_identity:'123',expected_generation:'4',result:{status:'observed',state:'public',stream_id:id(23),generation:'5',first_sequence:'1'}};
@@ -785,7 +807,7 @@ const historyRow=(status,patch={})=>({version:'2',kind:'session_audience_operati
  ...(status==='unknown'?{}:{agent_session_id:session,action:'publish',request_revision:'7',issued_at_ms:1757700000000,deadline_ms:1757700020000,response:null}),...patch});
 const withHistory=(row,result)=>({...reading(result),operation:row});
 
-test('a reading is a query: its own fresh identity, no stream, and a generation Cuna never recorded',async()=>{
+test('a reading is a query: its own fresh identity, no stream, and a generation Cuna never recorded',{skip:NEEDS_READING},async()=>{
  const requests=[];const api=ownerObserveGrantsApi({request:async r=>{requests.push(r);return reading();}},owner,project);
  const answer=await api.readAudience({agentSessionId:session,sessionIncarnation:id(6)},id(20),signal);
  assert.equal(requests[0].path,`/v1/collaboration/2/agent-sessions/${session}/audience-state`);
@@ -801,7 +823,7 @@ test('a reading is a query: its own fresh identity, no stream, and a generation 
  assert.equal(requests.length,1,'a refused local precondition sends nothing');
 });
 
-test('a reading receipt must be about this session, this run and this question',async()=>{
+test('a reading receipt must be about this session, this run and this question',{skip:NEEDS_READING},async()=>{
  const cases=[
   [reading({status:'observed',state:'public',stream_id:id(23),generation:'9',first_sequence:'1'}),'malformed_receipt'],
   [reading({status:'observed',state:'public',stream_id:id(23),generation:'0'}),'malformed_receipt'],
@@ -819,7 +841,7 @@ test('a reading receipt must be about this session, this run and this question',
  assert.equal((await run.readAudience({agentSessionId:session},id(20),signal)).current.sessionIncarnation,id(96));
 });
 
-test('history is decoded as itself and never merged with the reading beside it',async()=>{
+test('history is decoded as itself and never merged with the reading beside it',{skip:NEEDS_READING},async()=>{
  const ask=answer=>ownerObserveGrantsApi({request:async()=>answer},owner,project)
   .readAudience({agentSessionId:session,reconcile:{operationId:id(30),action:'publish'}},id(20),signal);
  assert.deepEqual((await ask(withHistory(historyRow('unknown')))).operation,{status:'unknown',operationId:id(30)});
@@ -836,7 +858,7 @@ test('history is decoded as itself and never merged with the reading beside it',
  assert.equal(refused.current.state,'private');
 });
 
-test('a history half that answers a different question is refused',async()=>{
+test('a history half that answers a different question is refused',{skip:NEEDS_READING},async()=>{
  const ask=(answer,reconcile={operationId:id(30),action:'publish'})=>ownerObserveGrantsApi({request:async()=>answer},owner,project)
   .readAudience({agentSessionId:session,...(reconcile===null?{}:{reconcile})},id(20),signal);
  for(const [answer,kind] of [
@@ -851,7 +873,7 @@ test('a history half that answers a different question is refused',async()=>{
  await assert.rejects(ask(withHistory(historyRow('unknown')),null),e=>e.kind==='malformed_receipt','history nobody asked for is refused too');
 });
 
-test('a reading older than what this client already confirmed is refused, and it supersedes a journaled replay',async()=>{
+test('a reading older than what this client already confirmed is refused, and it supersedes a journaled replay',{skip:NEEDS_READING},async()=>{
  // One stored receipt, returned unchanged on the replay: that is what the
  // producer does, and a fresh request_id would hide the repeat this asserts.
  const journaled=audienceReceipt('publish',4);let answer=journaled;
@@ -887,7 +909,7 @@ test('every refusal of a reading is settled for the reading and silent about eve
 });
 
 const readRoute=r=>r.path.endsWith('/audience-state');
-test('the owner asks what a session is sharing, and the answer changes nothing',async()=>{
+test('the owner asks what a session is sharing, and the answer changes nothing',{skip:NEEDS_READING},async()=>{
  const h=await harness(r=>{if(route(r)==='observers')return memberPage;if(readRoute(r))return reading({status:'observed',state:'public',stream_id:id(23),generation:'9'});throw Error(r.path);});
  await h.wait(/Share a session/u);
  await h.press('c',/When Cuna asked, this session was sharing live/u);
@@ -900,7 +922,7 @@ test('the owner asks what a session is sharing, and the answer changes nothing',
  h.key('\x03');await h.done;
 });
 
-test('a recorded answer settles the unconfirmed publication and a fresh decision is offered again',async()=>{
+test('a recorded answer settles the unconfirmed publication and a fresh decision is offered again',{skip:NEEDS_READING},async()=>{
  const bodies=[];let lost=true;
  const h=await harness(r=>{
   if(route(r)==='observers')return memberPage;
@@ -929,7 +951,7 @@ test('a recorded answer settles the unconfirmed publication and a fresh decision
  h.key('\x03');await h.done;
 });
 
-test('an expired unrecorded change stays unknown, stops being resendable and survives an exit',async()=>{
+test('an expired unrecorded change stays unknown, stops being resendable and survives an exit',{skip:NEEDS_READING},async()=>{
  const first=await harness(r=>{if(route(r)==='audience')throw new TypeError('fetch failed');throw Error(r.path);});
  await first.wait(/Share a session/u);
  await first.press('s',/Share this session's screen live\?/u);
@@ -959,7 +981,7 @@ test('an expired unrecorded change stays unknown, stops being resendable and sur
  second.key('\x03');await second.done;
 });
 
-test('a reading that does not answer leaves the unfinished change exactly as it was',async()=>{
+test('a reading that does not answer leaves the unfinished change exactly as it was',{skip:NEEDS_READING},async()=>{
  const h=await harness(r=>{if(route(r)==='observers')return memberPage;
   if(readRoute(r))throw audienceProblem('audience_transport_unavailable');
   if(route(r)==='audience')throw new TypeError('fetch failed');throw Error(r.path);});
@@ -977,7 +999,7 @@ test('a reading that does not answer leaves the unfinished change exactly as it 
  h.key('\x03');await h.done;
 });
 
-test('an unknown operation is an answer: Cuna never issued it, so it changed nothing',async()=>{
+test('an unknown operation is an answer: Cuna never issued it, so it changed nothing',{skip:NEEDS_READING},async()=>{
  const h=await harness(r=>{if(route(r)==='observers')return memberPage;
   if(readRoute(r))return withHistory(historyRow('unknown',{operation_id:r.body.reconcile_operation_id}));
   if(route(r)==='audience')throw new TypeError('fetch failed');throw Error(r.path);});
@@ -1019,7 +1041,7 @@ async function twoProcesses({answer,confirm}){
  return {asker,other};
 }
 
-test('F1 counterexample 1: a held answer of public@1 is not painted after another process confirmed private@1',async()=>{
+test('F1 counterexample 1: a held answer of public@1 is not painted after another process confirmed private@1',{skip:NEEDS_READING},async()=>{
  const {asker,other}=await twoProcesses({answer:reading({status:'observed',state:'public',stream_id:id(23),generation:'1'}),confirm:audienceReceipt('private',1)});
  await asker.wait(/Cuna answered about an earlier moment than this computer already knows about/u);
  // The exact sentence the review saw is gone, in the direction that matters.
@@ -1031,7 +1053,7 @@ test('F1 counterexample 1: a held answer of public@1 is not painted after anothe
  asker.key('\x03');await asker.done;other.key('\x03');await other.done;
 });
 
-test('F1 counterexample 2: a held answer of private@1 is not painted after another process confirmed public@2',async()=>{
+test('F1 counterexample 2: a held answer of private@1 is not painted after another process confirmed public@2',{skip:NEEDS_READING},async()=>{
  const {asker,other}=await twoProcesses({answer:reading({status:'observed',state:'private',generation:'1'}),confirm:audienceReceipt('publish',1)});
  await asker.wait(/Cuna answered about an earlier moment than this computer already knows about/u);
  // This is the direction that tells an owner a shared terminal is private.
@@ -1040,7 +1062,7 @@ test('F1 counterexample 2: a held answer of private@1 is not painted after anoth
  asker.key('\x03');await asker.done;other.key('\x03');await other.done;
 });
 
-test('F1 control: the same answer, with no other process, IS painted',async()=>{
+test('F1 control: the same answer, with no other process, IS painted',{skip:NEEDS_READING},async()=>{
  // Same instrument, same held answer, one variable flipped: nothing else
  // confirmed anything. If this did not paint, the two tests above would prove
  // nothing about ordering.
@@ -1054,7 +1076,7 @@ test('F1 control: the same answer, with no other process, IS painted',async()=>{
  second.asker.key('\x03');await second.asker.done;
 });
 
-test('F1: a reading says what was true when it was answered, never what is true now',async()=>{
+test('F1: a reading says what was true when it was answered, never what is true now',{skip:NEEDS_READING},async()=>{
  const h=await harness(r=>{if(route(r)==='observers')return memberPage;if(readRoute(r))return reading();throw Error(r.path);});
  await h.wait(/Share a session/u);
  await h.press('c',/When Cuna asked, this session was not sharing live/u);
@@ -1149,4 +1171,18 @@ test('F3: an uncertain grant change still blocks a grant change, and an uncertai
  const records=await h.records();
  assert.equal(records.length,1);assert.equal(records[0].kind,'audience','the uncertain publication is preserved exactly');
  h.key('\x03');await h.done;
+});
+
+// C4.17 (cdd7e9a, edge/src/api.ts): a session on a Machine whose supervisor
+// cannot answer the reading is refused before Cuna asks it anything, 503
+// `audience_reading_unsupported`, retryable false. Unlike
+// `audience_transport_unavailable` this one is certain, and it has one remedy.
+test('a reading refused because the supervisor predates it says so and names the remedy',async()=>{
+ const error=classifyTransportFailure(http(503,'audience_reading_unsupported'),false,'audience-state');
+ assert.equal(error.kind,'unavailable');assert.equal(error.effectUnknown,false);
+ assert.match(error.message,/This Machine's supervisor predates this question/u);
+ assert.match(error.message,/update it while (the Machine is )?stopped/u);
+ assert.doesNotMatch(error.message,/audience_/u);
+ // Control: the lost-answer refusal keeps its own, uncertain wording.
+ assert.match(classifyTransportFailure(http(503,'audience_transport_unavailable'),false,'audience-state').message,/indistinguishable from a lost answer/u);
 });

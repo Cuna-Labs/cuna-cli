@@ -153,7 +153,15 @@ export const SUPERVISOR_LIVE_UPDATE_WIRE = Object.freeze({
     retirementOutcomes: Object.freeze(["retired", "partial", "installed"] as const),
   }),
   source: Object.freeze({
-    state: "vendored",
+    /**
+     * Pinned, no longer vendored. On 2026-09-28 the vendored contract moved to
+     * the DEPLOYED producer `d3d3d3c`, which serves no live-update operation;
+     * nor do `3dfa1d1` (C4.15) or `cdd7e9a` (C4.17), vendored 2026-10-04.
+     * The shapes below stay those read at `7b1b3e42`, where they were checked,
+     * and the two routes that send them are refused before any request as not
+     * served by this API version (`cli/route-contract.ts`).
+     */
+    state: "producer_pinned_not_vendored",
     producerRepository: "Cuna-Labs/infra",
     producerRevision: "7b1b3e425ed273986a909a68395b5272bd6a01ba",
     /**
@@ -174,8 +182,8 @@ export const SUPERVISOR_LIVE_UPDATE_WIRE = Object.freeze({
     operations: 101,
     sdkOperations: 40,
     vendoredArtifact: "contracts/infra/cuna-api.openapi.json",
-    /** Synchronized 2026-09-13. The declarations above are checked against it. */
-    vendoredCarriesOperation: true,
+    /** Synchronized 2026-09-13 at `7b1b3e42`; not carried by the vendored `d3d3d3c`, `3dfa1d1` or `cdd7e9a` contracts. */
+    vendoredCarriesOperation: false,
     synchronizeWith: "npm run contract:sync:infra",
   }),
 } as const);

@@ -42,12 +42,100 @@ export interface CliRouteDefinition {
   readonly key: string;
   readonly command: string;
   readonly action?: string;
+  /**
+   * The `command` every `--json` record of this leaf carries, result and error
+   * alike (`machines.start`). Error records used to carry the first token
+   * (`machines`) while results named the leaf, so a script could not tell
+   * which command had failed (BL-4, 2026-10-02).
+   */
+  readonly path: string;
   readonly operandMode: "exact" | "free";
   readonly syntax: string;
   readonly argv: readonly string[];
   readonly summary: string;
   readonly dispatch: CliRouteDispatch;
+  /**
+   * The producer operations this leaf sends, as `METHOD /path/template`
+   * spelled exactly as the vendored contract spells them. An operation the
+   * vendored contract lacks makes the leaf unserved: help stops listing it as
+   * available and the preflight refuses it before any request
+   * (`cli/route-contract.ts`). Empty means the leaf declares none.
+   */
+  readonly operations: readonly string[];
 }
+
+const CAPABILITIES = "GET /v1/capabilities";
+const TERMINAL_ATTACH = Object.freeze([
+  "GET /v1/agent-sessions/{id}", CAPABILITIES, "POST /v1/agent-sessions/{id}/terminal-connections",
+]);
+const API_KEYS = Object.freeze([CAPABILITIES, "GET /v1/api-keys"]);
+const transition = (action: string): readonly string[] =>
+  Object.freeze([CAPABILITIES, "GET /v1/sessions/{id}", `POST /v1/sessions/{id}/${action}`]);
+
+/**
+ * What each routed leaf sends. Written per leaf from the client calls its
+ * command makes, not derived, because a leaf reaches its operations through
+ * conditional code a table cannot follow; the one checkable claim is the
+ * reverse one, that every operation named here exists in the vendored
+ * contract, and `test/route-contract.test.mjs` checks it.
+ */
+const ROUTE_OPERATIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  "signup": ["GET /v1/cli-auth/signup-capability", "POST /v1/cli-auth/continuations", "POST /v1/cli-auth/continuations/{id}/exchange"],
+  "login": ["POST /v1/cli-auth/continuations", "POST /v1/cli-auth/continuations/{id}/exchange"],
+  "logout": ["POST /v1/cli-auth/logout"],
+  "whoami": ["GET /v1/cli-auth/context"],
+  "access status": ["GET /v1/cli-auth/context"],
+  "observe": ["POST /v1/collaboration/2/projects/{id}/observer-sessions", "POST /v1/collaboration/2/observe-grants/{id}/attachments"],
+  // The sharing-state reading is part of the one screen `share` opens.
+  "share": [
+    "POST /v1/collaboration/2/projects/{id}/observers",
+    "POST /v1/collaboration/2/agent-sessions/{id}/observe-grants",
+    "POST /v1/collaboration/2/observe-grants/{id}/inspect",
+    "POST /v1/collaboration/2/observe-grants/{id}/revoke",
+    "POST /v1/collaboration/2/agent-sessions/{id}/audience",
+    "POST /v1/collaboration/2/agent-sessions/{id}/audience-state",
+  ],
+  "capabilities": [CAPABILITIES],
+  "machines": ["GET /v1/sessions"],
+  "machines list": ["GET /v1/sessions"],
+  "machines create": [CAPABILITIES, "POST /v1/sessions", "GET /v1/sessions/{id}"],
+  "machines start": transition("start"),
+  "machines pause": transition("pause"),
+  "machines resume": transition("resume"),
+  "machines stop": transition("stop"),
+  "machines update-supervisor": transition("supervisor/replace"),
+  "machines live-update-supervisor": [
+    CAPABILITIES, "GET /v1/sessions/{id}",
+    "POST /v1/sessions/{id}/supervisor/live-update", "GET /v1/sessions/{id}/supervisor/live-update/{operationId}",
+  ],
+  "machines live-update-status": ["GET /v1/sessions/{id}/supervisor/live-update/{operationId}"],
+  "machines delete": [CAPABILITIES, "GET /v1/sessions/{id}", "DELETE /v1/sessions/{id}"],
+  "records list": [CAPABILITIES, "GET /v1/records"],
+  "executions list": ["GET /v1/sessions/{id}/executions"],
+  "executions get": ["GET /v1/sessions/{id}/executions/{operationId}"],
+  "executions cancel": ["POST /v1/sessions/{id}/executions/{operationId}/cancel"],
+  "authorizations list": [CAPABILITIES, "GET /v1/sessions/{id}/authorizations"],
+  "account show": ["GET /v1/me"],
+  "workspace show": ["GET /v1/me"],
+  "usage show": ["GET /v1/me"],
+  "api-keys list": API_KEYS,
+  "api-keys create": [...API_KEYS, "POST /v1/api-keys"],
+  "api-keys revoke": [...API_KEYS, "DELETE /v1/api-keys/{id}"],
+  "agent-sessions list": ["GET /v1/sessions/{id}/agent-sessions"],
+  "agent-sessions get": ["GET /v1/agent-sessions/{id}"],
+  "agent-sessions create": [CAPABILITIES, "GET /v1/sessions/{id}", "POST /v1/sessions/{id}/agent-sessions"],
+  "agent-sessions rename": [CAPABILITIES, "GET /v1/agent-sessions/{id}", "PATCH /v1/agent-sessions/{id}"],
+  "agent-sessions terminate": [CAPABILITIES, "GET /v1/agent-sessions/{id}", "POST /v1/agent-sessions/{id}/terminate"],
+  "agent-sessions attach": TERMINAL_ATTACH,
+  "agent logout": [
+    CAPABILITIES, "GET /v1/agent-sessions/{id}",
+    "POST /v1/agent-sessions/{id}/agent-auth/logout", "GET /v1/agent-sessions/{id}/agent-auth",
+  ],
+  "connect": TERMINAL_ATTACH,
+  "claude": TERMINAL_ATTACH,
+  "codex": TERMINAL_ATTACH,
+  "opencode": TERMINAL_ATTACH,
+});
 
 const routed = (
   key: string,
@@ -55,26 +143,34 @@ const routed = (
   argv: readonly string[],
   summary: string,
   operandMode: "exact" | "free" = "exact",
+  path = key.replaceAll(" ", "."),
 ): CliRouteDefinition => Object.freeze({
   key,
   command: key.split(" ")[0]!,
   ...(key.split(" ")[1] === undefined ? {} : { action: key.split(" ")[1] }),
+  path,
   operandMode,
   syntax,
   argv: Object.freeze([...argv]),
   summary,
   dispatch: "routed",
+  operations: Object.freeze([...(ROUTE_OPERATIONS[key] ?? [])]),
 });
+
+/** Keys that declare operations, for the test that no declaration is orphaned. */
+export const ROUTE_OPERATION_KEYS: readonly string[] = Object.freeze(Object.keys(ROUTE_OPERATIONS));
 
 const reserved = (key: string, summary: string): CliRouteDefinition => Object.freeze({
   key,
   command: key.split(" ")[0]!,
   ...(key.split(" ")[1] === undefined ? {} : { action: key.split(" ")[1] }),
+  path: key.replaceAll(" ", "."),
   operandMode: "exact",
   syntax: key,
   argv: Object.freeze(key.split(" ")),
   summary,
   dispatch: "reserved",
+  operations: Object.freeze([]),
 });
 
 /** The closed discovery projection of the command preflight switch. */
@@ -87,7 +183,8 @@ export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
   routed("observe", "observe --project PROJECT_ID", ["observe","--project","00000000-0000-4000-8000-000000000001"], "Observe an authorized shared session read-only"),
   routed("share", "share --project PROJECT_ID [--grant GRANT_ID]", ["share","--project","00000000-0000-4000-8000-000000000001"], "Grant, inspect or revoke a member's read-only observation, and share or unshare the session itself"),
   routed("capabilities", "capabilities", ["capabilities"], "Inspect live server capability truth"),
-  routed("machines", "machines", ["machines"], "Browse machines and AgentSessions interactively"),
+  // Off a terminal, bare `machines` prints the nested inventory as `machines.overview`.
+  routed("machines", "machines", ["machines"], "Browse machines and AgentSessions interactively", "exact", "machines.overview"),
   routed("machines list", "machines list", ["machines", "list"], "List exact machine resources"),
   routed("machines create", "machines create --name NAME --yes", ["machines", "create", "--name", "fixture", "--yes"], "Create a machine"),
   routed("machines start", "machines start MACHINE_ID --yes", ["machines", "start", "00000000-0000-4000-8000-000000000001", "--yes"], "Start a machine"),
@@ -125,9 +222,12 @@ export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
   routed("claude", "claude [PATH]", ["claude"], "Open Claude Code", "free"),
   routed("codex", "codex [PATH]", ["codex"], "Open Codex", "free"),
   routed("opencode", "opencode [PATH]", ["opencode"], "Open OpenCode", "free"),
+  // The one standalone sync action. Bare `sync` stays reserved below. PATH is
+  // validated by the command itself (at most one), like an action's ID.
+  routed("sync recover", "sync recover [PATH] --yes [--timeout-ms N]", ["sync", "recover", "--yes"], "Bring a folder whose workspace sync stopped back to syncing, keeping both versions of every conflict"),
   reserved("config set", "Reserved; configuration mutation is not implemented"),
   reserved("shell", "Reserved; no shell runtime in this build"),
-  reserved("sync", "Reserved; no standalone sync command in this build"),
+  reserved("sync", "Reserved; the one standalone sync action is `sync recover`"),
   reserved("companion", "Reserved; no local companion in this build"),
 ]);
 
@@ -232,6 +332,9 @@ const BOOLEAN_OPTIONS = new Set([
   // producer's own recovery: the same identity never rotates control twice.
   // Deliberately NOT spelled `--yes`, which starts a different update.
   "resume",
+  // `agent-sessions terminate --no-wait`. Returns the server's acceptance and
+  // does not read back until the process has ended.
+  "no-wait",
 ]);
 
 /**

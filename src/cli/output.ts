@@ -15,6 +15,15 @@ export interface CliStreams {
 
 export interface OutputWriter {
   readonly structured: boolean;
+  /**
+   * The server accepted a mutation whose outcome the command still waits for.
+   * Structured output gets its own line, `type: "accepted"`, before the one
+   * `type: "result"` line, so a caller learns of the acceptance when it
+   * happens rather than when the wait ends: `agent-sessions terminate --json`
+   * printed nothing for 120 s on 2026-09-29 while the server had recorded the
+   * request at +9 s. The final line is still the only `result`.
+   */
+  accepted(command: string, data: unknown, human: string): void;
   success(command: string, data: unknown, human: string): void;
   error(command: string, error: CunaError): void;
   text(value: string): void;
@@ -82,6 +91,16 @@ export function createOutputWriter(input: {
   const structured = input.json || !input.streams.stdoutIsTTY;
   const writer: OutputWriter = {
     structured,
+    accepted(command, data, human) {
+      if (structured) {
+        writeLine(
+          input.streams.stdout,
+          JSON.stringify({ schema_version: OUTPUT_SCHEMA_VERSION, type: "accepted", command, data }),
+        );
+      } else {
+        writeLine(input.streams.stdout, sanitizeHumanTerminalOutput(human));
+      }
+    },
     success(command, data, human) {
       if (structured) {
         writeLine(

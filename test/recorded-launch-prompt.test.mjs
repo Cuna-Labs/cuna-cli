@@ -5,6 +5,7 @@ import {
   RECORDED_LAUNCH_ACKNOWLEDGEMENT_BUDGET_MS,
   RECORDED_LAUNCH_ENDED_QUESTION,
   RECORDED_LAUNCH_QUESTION,
+  RECORDED_LAUNCH_UNRESUMABLE_QUESTION,
   askRecordedLaunch,
   recordedLaunchAcknowledgement,
   recordedLaunchConfirmation,
@@ -131,5 +132,23 @@ test("an ended recorded launch is asked about truthfully and No is not called a 
   assert.equal(another, false);
   assert.deepEqual(asked, [RECORDED_LAUNCH_ENDED_QUESTION]);
   assert.doesNotMatch(asked[0], /resume/iu);
+  assert.deepEqual(lines, ["Not starting a new session"]);
+});
+
+// Owner witness 2026-10-04: a launch recorded under another Workspace version
+// was offered as "No resumes the recorded launch", and the default No failed
+// with recorded_launch_mismatch. That question must not promise a resume.
+test("an unresumable recorded launch is asked without promising a resume, and No starts nothing", async () => {
+  const asked = [];
+  const lines = [];
+  const another = await askRecordedLaunch({
+    ask: async (question) => { asked.push(question); return ""; },
+    acknowledge: (line) => lines.push(line),
+    createLabel: CREATE_LABEL,
+    unresumable: true,
+  });
+  assert.equal(another, false);
+  assert.deepEqual(asked, [RECORDED_LAUNCH_UNRESUMABLE_QUESTION]);
+  assert.doesNotMatch(RECORDED_LAUNCH_UNRESUMABLE_QUESTION, /resumes/);
   assert.deepEqual(lines, ["Not starting a new session"]);
 });

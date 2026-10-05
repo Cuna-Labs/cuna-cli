@@ -1,4 +1,4 @@
-import { decideCapability, type CunaApiClient } from "../api/client.js";
+import { decideCapability, machineActionVerdict, type CunaApiClient, type MachineLifecycleAction } from "../api/client.js";
 import type { AgentSession, Machine } from "../api/contracts.js";
 import { sanitizeHumanTerminalOutput } from "../cli/output.js";
 import { CunaError } from "../core/errors.js";
@@ -80,6 +80,11 @@ interface MachineRow {
   readonly sessionsLoading?: boolean;
   readonly sessionsError?: string | undefined;
   readonly canCreateSession?: boolean;
+  /**
+   * The reason the server names for refusing a start (`machines.start`), from
+   * the snapshot read for this row. Absent when it names none or admits it.
+   */
+  readonly startRefusal?: string | undefined;
   /**
    * A missing, stale, or failed capability read is not evidence that creating
    * another session or another machine is appropriate.  Keep that distinction
@@ -425,12 +430,14 @@ export async function runNodeMachinesExplorer(
     lifecycleNotice = undefined;
     selectedKey = undefined;
     render();
-    const capabilityId = action === "delete" ? "machines.delete" : "machines.lifecycle";
-    const decision = await decideExplorerCapability(input.client, "machine", machineId, capabilityId, () => dependencies.now?.() ?? Date.now(), requestSignal);
+    const decision = await decideExplorerCapability(
+      input.client, "machine", machineId, action === "delete" ? "machines.delete" : "machines.lifecycle",
+      () => dependencies.now?.() ?? Date.now(), requestSignal, action === "delete" ? undefined : action,
+    );
     if (isClosing()) return;
     if (decision.status !== "supported") {
       settle();
-      lifecycleNotice = `${capabilityId} is not available for ${name}: ${decision.reason ?? decision.status}. Nothing was requested.`;
+      lifecycleNotice = `${decision.capabilityId} is not available for ${name}: ${decision.reason ?? decision.status}. Nothing was requested.`;
       reconcileSelection();
       return;
     }
@@ -686,6 +693,7 @@ export async function runNodeMachinesExplorer(
             isOpenCodeRuntimeUnverifiedReason(capability.reason);
           updateMachineRow(machine.id, {
             canCreateSession: capability.canCreateSession,
+            startRefusal: capability.startRefusal,
             sessionCreateCapabilityState: capability.state,
             sessionCreateCapabilityReason: capability.reason,
             sessionCreateCapabilityExpiresAt: capability.expiresAt,
@@ -1148,6 +1156,8 @@ async function observeSessionCreateCapability(
   readonly state: "verified" | "unverified";
   readonly reason?: string;
   readonly expiresAt?: number;
+  /** The reason the server names for refusing a start, from the same snapshot. */
+  readonly startRefusal?: string;
 }>> {
   if (typeof client.discoverCapabilities !== "function") {
     return Object.freeze({
@@ -1161,13 +1171,18 @@ async function observeSessionCreateCapability(
     if (snapshot.subjectScope !== "machine" || snapshot.subjectId !== machineId) {
       return Object.freeze({ canCreateSession: false, state: "unverified", reason: "subject_scope_mismatch" });
     }
-    const decision = decideCapability(snapshot, "agent_sessions.workspace.create", now(), ["native"]);
+    const at = now();
+    const decision = decideCapability(snapshot, "agent_sessions.workspace.create", at, ["native"]);
     const expiresAt = Date.parse(snapshot.expiresAt);
+    // Free: the Edge names start-ability in this snapshot. Read here, a start
+    // it would refuse is never offered as if it would work (R1.2).
+    const start = machineActionVerdict(snapshot, "start", at);
     return Object.freeze({
       canCreateSession: decision.status === "supported",
       state: decision.status === "unknown" ? "unverified" : "verified",
       ...(decision.status === "supported" ? {} : { reason: decision.reason }),
       ...(decision.status === "unknown" ? {} : { expiresAt }),
+      ...(start.kind === "refused" && start.decision.reason !== undefined ? { startRefusal: start.decision.reason } : {}),
     });
   } catch {
     return Object.freeze({
@@ -1304,7 +1319,9 @@ function renderMachinesExplorer(input: {
       ? lifecycleLabel(pending)
       : row.machine.state === "running"
         ? `${safeLine(row.machine.state)}  ${provider.displayName} ${providerVerdict(provider)}`
-        : safeLine(row.machine.state);
+        : row.startRefusal !== undefined && (row.machine.state === "stopped" || row.machine.state === "paused")
+          ? `${safeLine(row.machine.state)} · start unavailable: ${safeLine(row.startRefusal)}`
+          : safeLine(row.machine.state);
     lines.push(`${machineSelected ? "❯" : " "} ${open ? "▾" : "▸"} ${safeLine(row.machine.name)}  ${state}  ${sessions}`);
     if (!open) continue;
     if (row.sessionsLoading === true && row.sessions.length === 0) {
@@ -1429,7 +1446,9 @@ function renderContextScreen(input: {
     if (selected) selectedLine = lines.length;
     const detail = action.kind === "session"
       ? displaySessionActionability(classifySessionActionability({ session: action.session, machine: row.machine, now: input.now }))
-      : action.kind === "provider" ? "sessions" : "";
+      : action.kind === "provider"
+        ? "sessions"
+        : action.kind === "start" && row.startRefusal !== undefined ? `unavailable: ${safeLine(row.startRefusal)}` : "";
     const label = action.kind === "start" || action.kind === "stop" || action.kind === "delete" ? `${action.label} machine` : action.label;
     lines.push(`${selected ? "❯" : " "} ${label}${detail === "" ? "" : `  ${detail}`}`);
   }
@@ -1674,23 +1693,43 @@ async function decideExplorerCapability(
   capabilityId: string,
   now: () => number,
   signal?: AbortSignal,
-): Promise<Readonly<{ readonly status: "supported" | "unsupported" | "temporarily_unavailable" | "unknown"; readonly reason?: string }>> {
+  /**
+   * A lifecycle action whose per-action id (`machines.start`) is asked first,
+   * from the same snapshot, and can only narrow `capabilityId` (R1.2).
+   */
+  action?: MachineLifecycleAction,
+): Promise<Readonly<{
+  readonly status: "supported" | "unsupported" | "temporarily_unavailable" | "unknown";
+  readonly reason?: string;
+  /** The id whose answer this is, for the line that names a refusal. */
+  readonly capabilityId: string;
+}>> {
   if (typeof client.discoverCapabilities !== "function") {
-    return Object.freeze({ status: "unknown", reason: "capability_discovery_unavailable" });
+    return Object.freeze({ status: "unknown", reason: "capability_discovery_unavailable", capabilityId });
   }
   try {
     const snapshot = await client.discoverCapabilities(scope, resourceId, signal);
     if (snapshot.subjectScope !== scope || (scope !== "account" && snapshot.subjectId !== resourceId)) {
-      return Object.freeze({ status: "unknown", reason: "subject_scope_mismatch" });
+      return Object.freeze({ status: "unknown", reason: "subject_scope_mismatch", capabilityId });
     }
-    const decision = decideCapability(snapshot, capabilityId, now());
+    const at = now();
+    const verdict = action === undefined ? undefined : machineActionVerdict(snapshot, action, at);
+    if (verdict?.kind === "refused") {
+      return Object.freeze({
+        status: verdict.decision.status,
+        ...(verdict.decision.reason === undefined ? {} : { reason: verdict.decision.reason }),
+        capabilityId: verdict.capabilityId,
+      });
+    }
+    const decision = decideCapability(snapshot, capabilityId, at);
     return decision.status === "supported"
-      ? Object.freeze({ status: "supported" })
-      : Object.freeze({ status: decision.status, ...(decision.reason === undefined ? {} : { reason: decision.reason }) });
+      ? Object.freeze({ status: "supported", capabilityId })
+      : Object.freeze({ status: decision.status, ...(decision.reason === undefined ? {} : { reason: decision.reason }), capabilityId });
   } catch (error) {
     return Object.freeze({
       status: "unknown",
       reason: error instanceof CunaError ? error.code : "capability_discovery_unavailable",
+      capabilityId,
     });
   }
 }

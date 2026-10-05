@@ -16,7 +16,12 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import type { ExclusionPolicy } from "../workspace/exclusion.js";
-import { createWorkspaceManifest, type ManifestEntry, type WorkspaceManifest } from "../workspace/manifest.js";
+import {
+  createWorkspaceManifest,
+  withCarriedEntries,
+  type ManifestEntry,
+  type WorkspaceManifest,
+} from "../workspace/manifest.js";
 import {
   assertLexicallyInsideRoot,
   normalizeWirePath,
@@ -26,15 +31,18 @@ import { DurableSyncJournal, type JournalOperationState } from "./journal.js";
 import type {
   WorkspaceSyncChangeItem,
   WorkspaceSyncChangePage,
+  WorkspaceSyncManifestEntry,
 } from "./workspace-sync-protocol.js";
-import { decodeChangePage } from "./workspace-sync-protocol.js";
+import { WORKSPACE_SYNC_LIMITS, decodeChangePage, decodeManifestEntry } from "./workspace-sync-protocol.js";
 
 /**
- * Schema 2 adds `last_local_commit`. A schema 1 file is still read, with that
- * fact unknown (null): it is the state a folder detached under before this
- * build, and it is exactly the state a re-attach must resume from.
+ * Schema 2 adds `last_local_commit`; schema 3 adds `remote_only`. An older
+ * file is still read, with those facts unknown (null) or empty: it is the
+ * state a folder detached under before this build, and it is exactly the
+ * state a re-attach must resume from. An older build refuses a schema 3 file
+ * rather than drop the entries it carries.
  */
-const STATE_SCHEMA = 2;
+const STATE_SCHEMA = 3;
 const ZERO_DIGEST = "0".repeat(64);
 const DEFAULT_DEBOUNCE_MS = 250;
 const DEFAULT_RECONCILE_MS = 60_000;
@@ -48,6 +56,12 @@ const DEFAULT_BYTE_LIMIT = 256 * 1024 * 1024;
  * authorities disagree, and retrying cannot settle that.
  */
 const STALE_BASE_REFUSAL_LIMIT = 3;
+/**
+ * Times in a row the operation journal may be taken again after its lease ran
+ * out under this process, with no renewal succeeding in between. One is a
+ * sleep; a pass that keeps outlasting the lease would retake forever.
+ */
+const JOURNAL_RETAKE_LIMIT = 3;
 
 export type ContinuousSyncState =
   | "recovering"
@@ -116,12 +130,26 @@ export interface ContinuousSyncAuthority {
   commitLocalSnapshot(input: {
     readonly baseGeneration: number;
     readonly manifest: WorkspaceManifest;
+    /**
+     * The entries of `manifest` this folder does not hold (`remote_only`).
+     * Their bytes are not in the folder; a chunk the server reports missing
+     * is read back through `syncId`, which can read the base generation.
+     */
+    readonly carried: readonly WorkspaceSyncManifestEntry[];
+    readonly syncId: string;
     readonly signal: AbortSignal;
   }): Promise<ContinuousSyncCommitReceipt>;
+  /**
+   * One page of the change feed. `afterGeneration` is advisory: the Edge reads
+   * from `cursor`, or from the read handle's base generation without one. A
+   * page's `next_cursor` continues after that page's last item; it is opaque.
+   */
   listChanges(input: {
     readonly syncId: string;
     readonly cursor?: string;
     readonly afterGeneration: number;
+    /** Items per page; the server's default (100) when absent. */
+    readonly limit?: number;
     readonly signal: AbortSignal;
   }): Promise<WorkspaceSyncChangePage>;
   readChunk(input: {
@@ -196,7 +224,7 @@ interface LocalCommitRecord {
 }
 
 interface DurableSupervisorState {
-  readonly schema_version: 2;
+  readonly schema_version: 3;
   readonly binding_id: string;
   readonly binding_generation: number;
   readonly policy_digest: string;
@@ -211,6 +239,15 @@ interface DurableSupervisorState {
   readonly pending_local: readonly PendingLocalOperation[];
   readonly pending_remote: PendingRemoteApply | null;
   readonly last_local_commit: LocalCommitRecord | null;
+  /**
+   * The entries of generation `generation` that this folder's exclusion
+   * policy excludes, sorted by path bytes: what the Machine holds there and
+   * this folder deliberately does not. Never written into the folder, never
+   * deleted from it, and carried into every commit so the Machine is not
+   * told to delete them (BL-7, 2026-10-03: a capture that predates the
+   * policy-aware guest committed `__pycache__` and `.pytest_cache`).
+   */
+  readonly remote_only: readonly WorkspaceSyncManifestEntry[];
   readonly updated_at: string;
 }
 
@@ -220,11 +257,16 @@ export interface ContinuousSyncDurableBase {
   readonly manifestRoot: string;
   readonly syncId: string;
   readonly baseline: readonly EntryProjection[];
+  /** See `remote_only` on the durable state. */
+  readonly remoteOnly: readonly WorkspaceSyncManifestEntry[];
   /** The paths this folder's own commits carried; see `LocalCommitRecord`. */
   readonly lastLocalCommit: {
     readonly generation: number;
     readonly entries: readonly { readonly path: string; readonly fingerprint: string }[];
   } | null;
+  /** Where the last run left the loop, and why: what an explicit recovery starts from. */
+  readonly status: Exclude<ContinuousSyncState, "stopped">;
+  readonly reason: string | null;
   readonly updatedAt: string;
 }
 
@@ -242,6 +284,12 @@ export interface ContinuousWorkspaceSyncSupervisorInput {
   readonly filesystemCapabilities: FilesystemCapabilities;
   readonly authority: ContinuousSyncAuthority;
   readonly initialManifest?: WorkspaceManifest;
+  /**
+   * The entries of the initial generation this folder does not hold, when a
+   * fresh state is created; `initialManifestRoot` is the root of the folder
+   * plus these. A loaded state keeps its own.
+   */
+  readonly initialRemoteOnly?: readonly WorkspaceSyncManifestEntry[];
   readonly watchFactory?: WorkspaceWatchFactory;
   readonly debounceMs?: number;
   readonly reconciliationIntervalMs?: number;
@@ -259,6 +307,23 @@ export interface ContinuousWorkspaceSyncSupervisorInput {
    * overwrite those edits as if they were unchanged.
    */
   readonly requireDurableState?: boolean;
+  /**
+   * An explicit recovery (`cuna sync recover`), asked for by the person whose
+   * folder it is. At open it takes up whatever stop the durable state carries
+   * (conflicted, recovery_required or paused) as `recovering` with a
+   * reconciliation, and drops the pending local operations that provably never
+   * left this machine (journal `queued`): their bytes are still in the folder
+   * and the next scan derives them again. An operation that may have been sent
+   * is reconciled with the server exactly as on any start.
+   *
+   * Nothing here writes or removes a file in the folder; byte safety stays with
+   * the apply rules (a pull never overwrites a path that differs from the
+   * baseline, and a path changed on both sides keeps both versions). Without
+   * this flag a stop the folder carries is kept, because nobody asked to
+   * override it (BL-7, 2026-10-03: a folder stayed at recovery_required through
+   * every re-attach, and nothing could take it up).
+   */
+  readonly recoverStop?: boolean;
   /**
    * The durable state of the generation this start directly follows, when the
    * caller has just committed the local tree on top of it. It lets the new
@@ -285,8 +350,8 @@ export class ContinuousWorkspaceSyncSupervisor {
   readonly #statePath: string;
   readonly #journalDirectory: string;
   #state: DurableSupervisorState;
-  #journal?: DurableSyncJournal;
-  #writerLease?: DurableSyncJournal;
+  #journal: DurableSyncJournal | undefined;
+  #writerLease: DurableSyncJournal | undefined;
   #watcher?: WorkspaceWatchSubscription;
   #loop?: Promise<void>;
   #wake: (() => void) | undefined;
@@ -296,6 +361,8 @@ export class ContinuousWorkspaceSyncSupervisor {
   /** The base the last stale refusal named, and how many refusals it has had in a row. */
   #staleBase: number | undefined;
   #staleRefusals = 0;
+  /** Journal retakes since the last renewal that succeeded. */
+  #journalRetakes = 0;
 
   private constructor(input: ContinuousWorkspaceSyncSupervisorInput, state: DurableSupervisorState) {
     this.#input = input;
@@ -312,11 +379,13 @@ export class ContinuousWorkspaceSyncSupervisor {
     const root = await canonicalPlainDirectory(input.canonicalRoot);
     const stateDirectory = await preparePrivateDirectory(input.stateDirectory, root);
     const normalizedInput = Object.freeze({ ...input, canonicalRoot: root, stateDirectory });
-    const initialManifest = input.initialManifest ?? await (input.manifestBuilder ?? createWorkspaceManifest)({
+    const localManifest = input.initialManifest ?? await (input.manifestBuilder ?? createWorkspaceManifest)({
       root,
       policy: input.policy,
       capabilities: input.filesystemCapabilities,
     });
+    const initialRemoteOnly = Object.freeze([...(input.initialRemoteOnly ?? [])]);
+    const initialManifest = withCarriedEntries(localManifest, initialRemoteOnly.map(carriedManifestEntry));
     if (
       initialManifest.policyDigest !== input.policy.digest ||
       initialManifest.manifestRoot !== input.initialManifestRoot
@@ -329,7 +398,7 @@ export class ContinuousWorkspaceSyncSupervisor {
       throw syncFailure("durable_state_missing", EXIT_CODES.conflict);
     }
     const state = loaded === undefined
-      ? createInitialState(normalizedInput, initialManifest)
+      ? createInitialState(normalizedInput, initialManifest, initialRemoteOnly)
       : admitState(loaded, normalizedInput);
     if (loaded === undefined) await atomicWriteState(statePath, state);
     const supervisor = new ContinuousWorkspaceSyncSupervisor(normalizedInput, state);
@@ -369,7 +438,10 @@ export class ContinuousWorkspaceSyncSupervisor {
       manifestRoot: state.manifest_root,
       syncId: state.sync_id,
       baseline: state.baseline,
+      remoteOnly: state.remote_only,
       lastLocalCommit: state.last_local_commit,
+      status: state.status,
+      reason: state.reason,
       updatedAt: state.updated_at,
     });
   }
@@ -454,6 +526,33 @@ export class ContinuousWorkspaceSyncSupervisor {
       await this.#writerLease?.close();
       throw error;
     }
+    // A stop on `stale_fence` says only that the stopped process's own journal
+    // lease ran out (journal.ts `#assertLease`; no server answers it), and the
+    // journal just opened above under a new fence. Kept, that stop outlived its
+    // process: every later run loaded it, skipped every pull and commit, and
+    // announced the dead run's stop at start and at detach (ws-codex3 and a
+    // second QA folder, 2026-09-29). This run recovers exactly as a retake does.
+    //
+    // A stop on `remote_excluded_path` was written by a build that refused a
+    // Machine generation carrying a path this folder excludes. This build
+    // carries such a path instead of refusing it, so that stop no longer
+    // describes anything and is taken up the same way: the generation it
+    // stopped in is resumed where it stopped (BL-7, 2026-10-03: the folder
+    // stayed at generation 2 through two re-attaches and a cleanup on the
+    // Machine).
+    const stopped = this.#state.status === "conflicted" || this.#state.status === "recovery_required";
+    const recovering = this.#input.recoverStop === true;
+    if ((stopped && (this.#state.reason === "stale_fence" || this.#state.reason === "remote_excluded_path")) ||
+        (recovering && (stopped || this.#state.status === "paused"))) {
+      await this.#transition({ status: "recovering", dirty: true, reason: null });
+      this.#reconcileRequested = true;
+    }
+    if (recovering) {
+      await this.#dropUnsentLocal();
+      // Whatever the state said, an explicit recovery proves the folder
+      // against the server before it moves anything.
+      this.#reconcileRequested = true;
+    }
     if (this.#state.pending_remote !== null) await this.#resumeRemoteApply();
     await this.#recoverPendingLocal();
     const watchFactory = this.#input.watchFactory ?? createNodeWorkspaceWatcher;
@@ -503,18 +602,98 @@ export class ContinuousWorkspaceSyncSupervisor {
           await this.#scanAndCommit(signal);
         }
         await this.#journal?.renew();
+        this.#journalRetakes = 0;
         await this.#waitForWake(this.#input.remotePollIntervalMs ?? DEFAULT_REMOTE_POLL_MS, signal);
       } catch (error) {
         if (signal.aborted) break;
-        const classification = classifyFailure(error);
+        let failure: unknown = error;
+        let journalLost = false;
+        if (isJournalFenced(failure)) {
+          try {
+            if (await this.#retakeJournal()) continue;
+          } catch (retakeFailure) {
+            failure = retakeFailure;
+            journalLost = this.#journal === undefined;
+          }
+        }
+        // Without a journal no pass can record an operation, so a failed
+        // retake ends the loop whatever the failure would otherwise mean.
+        const classification = journalLost
+          ? { status: "recovery_required" as const, reason: classifyFailure(failure).reason }
+          : classifyFailure(failure);
         await this.#transition({
           status: classification.status,
           dirty: true,
           reason: classification.reason,
         });
-        if (classification.status === "recovery_required" || classification.status === "conflicted") break;
+        if (classification.status === "recovery_required" || classification.status === "conflicted") {
+          await this.#releaseWriterAuthority();
+          break;
+        }
         await this.#waitForWake(this.#input.remotePollIntervalMs ?? DEFAULT_REMOTE_POLL_MS, signal);
       }
+    }
+  }
+
+  /**
+   * Take the operation journal again after its lease ran out under this
+   * process, the way a restart of this process would take it.
+   *
+   * The lease is renewed once per pass, so a laptop that sleeps longer than it
+   * wakes to a lease that expired while this process still held the folder's
+   * writer authority. Nobody else can have written the journal in between:
+   * `DurableSyncJournal.open` needs that authority first. Treated as a
+   * conflict, the expiry ended sync for as long as the process lived (ws-c3,
+   * 2026-09-29: every loop on the laptop stopped at 04:20:08 with
+   * `stale_fence` after a sleep). The journal keeps refusing the old fence;
+   * this opens a new one and then recovers exactly as start-up does.
+   *
+   * False when the bound is spent: a pass that keeps outlasting the lease is
+   * not a sleep, and retaking it again would repeat it forever.
+   */
+  async #retakeJournal(): Promise<boolean> {
+    if (this.#journalRetakes >= JOURNAL_RETAKE_LIMIT) return false;
+    this.#journalRetakes += 1;
+    const expired = this.#journal;
+    this.#journal = undefined;
+    // Releases the directory authority; the stale lease file is removed only
+    // while it still names this owner and fence.
+    await expired?.close();
+    this.#journal = await DurableSyncJournal.open({
+      directory: this.#journalDirectory,
+      bindingId: this.#input.bindingId,
+      bindingGeneration: this.#input.bindingGeneration,
+      ownerId: `continuous-sync:${process.pid}:${randomUUID()}`,
+      clock: this.#clock,
+    });
+    if (this.#state.pending_remote !== null) await this.#resumeRemoteApply();
+    await this.#recoverPendingLocal();
+    this.#scanRequested = true;
+    this.#reconcileRequested = true;
+    return true;
+  }
+
+  /**
+   * Give the folder's writer authority back once the loop has stopped for
+   * good. Nothing in this process writes the folder's sync state again, and a
+   * later run of the CLI is the only thing that can resume from what this
+   * stop left; held, the authority refused every such run as `active_writer`
+   * for as long as this process lived (ws-c3, 2026-09-29: the 01:23 run's loop
+   * stopped at 04:20:08 and its process still held the lock at 10:04). A
+   * close that fails keeps its handle, so `stop` tries it again.
+   */
+  async #releaseWriterAuthority(): Promise<void> {
+    try {
+      await this.#journal?.close();
+      this.#journal = undefined;
+    } catch {
+      // stop() retries and reports it.
+    }
+    try {
+      await this.#writerLease?.close();
+      this.#writerLease = undefined;
+    } catch {
+      // stop() retries and reports it.
     }
   }
 
@@ -556,6 +735,8 @@ export class ContinuousWorkspaceSyncSupervisor {
       receipt = await this.#input.authority.commitLocalSnapshot({
         baseGeneration: this.#state.generation,
         manifest,
+        carried: this.#state.remote_only,
+        syncId: this.#state.sync_id,
         signal,
       });
     } catch (error) {
@@ -619,8 +800,20 @@ export class ContinuousWorkspaceSyncSupervisor {
   async #consumeRemote(signal: AbortSignal): Promise<void> {
     const items: WorkspaceSyncChangeItem[] = [];
     let cursor = this.#state.cursor ?? undefined;
-    let terminalCursor: string | null = null;
+    // Where the feed can be taken up again: each page's next_cursor, with the
+    // generation of the item it continues after. A cursor is kept only once
+    // that generation is this folder's, so a resumed read never skips an item
+    // the folder has not taken in.
+    //
+    // Without one the Edge starts at the read handle's base generation, and
+    // the walk's last page carries no cursor; keeping only that null made every
+    // 750 ms poll re-read the whole feed since the base (biotech lab,
+    // 2026-10-03: 85 revisions a poll, which pushed the 0060 diff past the
+    // database's 8 s timeout).
+    const resumable: { readonly cursor: string; readonly generation: number }[] = [];
+    let finalPage: { readonly from: string | undefined; readonly items: readonly WorkspaceSyncChangeItem[] } | undefined;
     for (let pageIndex = 0; pageIndex < 256; pageIndex += 1) {
+      const from = cursor;
       const page = await this.#input.authority.listChanges({
         syncId: this.#state.sync_id,
         ...(cursor === undefined ? {} : { cursor }),
@@ -628,14 +821,44 @@ export class ContinuousWorkspaceSyncSupervisor {
         signal,
       });
       items.push(...page.items.filter((item) => item.generation > this.#state.generation));
-      terminalCursor = page.next_cursor;
-      if (page.next_cursor === null) break;
+      if (page.next_cursor === null) {
+        finalPage = Object.freeze({ from, items: page.items });
+        break;
+      }
       if (page.next_cursor === cursor) throw syncFailure("remote_cursor_stalled", EXIT_CODES.conflict);
+      const last = page.items.at(-1);
+      if (last !== undefined) resumable.push(Object.freeze({ cursor: page.next_cursor, generation: last.generation }));
       cursor = page.next_cursor;
       if (pageIndex === 255) throw syncFailure("remote_page_limit", EXIT_CODES.conflict);
     }
+    // The last page ends the walk without a cursor past it. Read it once more,
+    // one item short: that page's next_cursor continues after its
+    // second-to-last item, so the next poll reads one item, not the walk again.
+    // A last page of one item is already as close as a cursor gets.
+    if (finalPage !== undefined && finalPage.items.length >= 2) {
+      const penultimate = finalPage.items[finalPage.items.length - 2];
+      const shorter = await this.#input.authority.listChanges({
+        syncId: this.#state.sync_id,
+        ...(finalPage.from === undefined ? {} : { cursor: finalPage.from }),
+        afterGeneration: this.#state.generation,
+        limit: finalPage.items.length - 1,
+        signal,
+      });
+      const last = shorter.items.at(-1);
+      if (shorter.next_cursor !== null && penultimate !== undefined && last !== undefined &&
+          last.generation === penultimate.generation && last.operation === penultimate.operation && last.path === penultimate.path) {
+        resumable.push(Object.freeze({ cursor: shorter.next_cursor, generation: last.generation }));
+      }
+    }
+    const resumeAt = (generation: number): string | null => {
+      let found: string | null = this.#state.cursor;
+      for (const point of resumable) if (point.generation <= generation) found = point.cursor;
+      return found;
+    };
     const unseen = items;
     if (unseen.length === 0) {
+      const resume = resumeAt(this.#state.generation);
+      if (resume !== this.#state.cursor) await this.#replaceState({ cursor: resume });
       if (!this.#state.dirty && this.#state.status !== "converged") {
         await this.#transition({ status: "live_unverified", reason: null });
       }
@@ -661,7 +884,7 @@ export class ContinuousWorkspaceSyncSupervisor {
         pending_remote: Object.freeze({
           generation,
           manifestRoot,
-          cursor: offset === unseen.length ? terminalCursor : this.#state.cursor,
+          cursor: resumeAt(generation),
           items: Object.freeze(items),
           nextIndex: 0,
         }),
@@ -678,7 +901,10 @@ export class ContinuousWorkspaceSyncSupervisor {
     const current = await this.#buildManifest();
     const currentEntries = new Map(projectManifest(current).map((entry) => [entry.path, entry]));
     const baseline = new Map(this.#state.baseline.map((entry) => [entry.path, entry]));
-    const ordered = orderRemoteItems(pending.items);
+    // Ordered once, when the apply starts. A resumed apply keeps the order it
+    // recorded, so `nextIndex` still names the same item, including one an
+    // older CLI recorded in its own order.
+    const ordered = pending.nextIndex === 0 ? orderRemoteItems(pending.items, baseline) : pending.items;
     // The paths this folder's own commits carried since the last generation
     // it took in, when the incoming generation directly follows the newest of
     // them. The Machine applies every one of those commits before it can
@@ -688,12 +914,38 @@ export class ContinuousWorkspaceSyncSupervisor {
     const ownCommit = this.#state.last_local_commit?.generation === pending.generation - 1
       ? new Map(this.#state.last_local_commit.entries.map((entry) => [entry.path, entry.fingerprint]))
       : undefined;
+    // Kept beside `nextIndex` in every write below, so a resumed apply starts
+    // from the set as it stood after the last item it finished.
+    const remoteOnly = new Map(this.#state.remote_only.map((entry) => [entry.path, entry]));
+    // Excluded items touch nothing here, so a run of them is recorded in one
+    // write rather than one each: a Machine whose capture predates the policy
+    // can carry a whole `node_modules` or `.venv`. Replaying a run after a
+    // crash sets the same entries again.
+    let unrecorded: number | undefined;
+    const recordExcluded = async (): Promise<void> => {
+      if (unrecorded === undefined) return;
+      await this.#replaceState({
+        pending_remote: Object.freeze({ ...pending, items: Object.freeze(ordered), nextIndex: unrecorded }),
+        remote_only: sortedRemoteOnly(remoteOnly),
+      });
+      unrecorded = undefined;
+    };
     for (let index = pending.nextIndex; index < ordered.length; index += 1) {
       const item = ordered[index];
       if (item === undefined) continue;
       if (item.operation !== "revision") {
         const path = item.path;
         if (path === null) throw syncFailure("remote_change_shape", EXIT_CODES.remote);
+        if (this.#outsideFolder(item, remoteOnly, baseline)) {
+          // A path this folder's policy excludes: recorded as the Machine's,
+          // never written or removed here. Before, this stopped syncing in
+          // both directions for good (`remote_excluded_path`, BL-7).
+          if (item.operation === "upsert" && item.entry !== null) remoteOnly.set(path, item.entry);
+          else remoteOnly.delete(path);
+          unrecorded = index + 1;
+          continue;
+        }
+        await recordExcluded();
         const prior = baseline.get(path);
         const observed = currentEntries.get(path);
         const target = projectRemoteItem(item);
@@ -716,6 +968,7 @@ export class ContinuousWorkspaceSyncSupervisor {
         pending_remote: Object.freeze({ ...pending, items: Object.freeze(ordered), nextIndex: index + 1 }),
       });
     }
+    await recordExcluded();
     const manifest = await this.#buildManifest();
     const adopted = remoteTargetProjection(this.#state.baseline, ordered);
     if (manifest.manifestRoot !== pending.manifestRoot) {
@@ -917,6 +1170,30 @@ export class ContinuousWorkspaceSyncSupervisor {
   }
 
   /**
+   * Drops the pending operations whose latest journal record is `queued`,
+   * recording them as conflicted so no later run sends them. An operation is
+   * moved to `sending` before any commit is attempted (`transitionIfQueued`),
+   * so `queued` proves it never left this machine. Dropping it loses nothing:
+   * it is a record of intent, its bytes are in the folder, and the next scan
+   * derives it again from the baseline. Left in place, an intent the folder
+   * has since changed stops every scan as `pending_local_intent_changed`.
+   */
+  async #dropUnsentLocal(): Promise<void> {
+    if (this.#state.pending_local.length === 0) return;
+    const latest = latestJournalStates(this.#journal?.records ?? []);
+    const unsent = new Set(this.#state.pending_local
+      .filter((operation) => latest.get(operation.operationId) === "queued")
+      .map((operation) => operation.operationId));
+    if (unsent.size === 0) return;
+    for (const operationId of unsent) await this.#journal?.transition(operationId, "conflicted");
+    await this.#replaceState({
+      pending_local: Object.freeze(this.#state.pending_local.filter((operation) => !unsent.has(operation.operationId))),
+      dirty: true,
+    });
+    this.#scanRequested = true;
+  }
+
+  /**
    * Drops the pending operations whose commit the authority refused, recording
    * them as refused. True when any were dropped. Dropping loses nothing: an
    * operation is a record of intent, its bytes are in the folder, and a pull
@@ -944,12 +1221,41 @@ export class ContinuousWorkspaceSyncSupervisor {
     return true;
   }
 
+  /**
+   * The generation as this folder holds it: the folder's own manifest plus
+   * `remote_only`. Every root this supervisor compares or commits is this
+   * one, because the generation it is compared with carries those entries.
+   */
   async #buildManifest(): Promise<WorkspaceManifest> {
-    return this.#manifestBuilder({
+    const local = await this.#manifestBuilder({
       root: this.#input.canonicalRoot,
       policy: this.#input.policy,
       capabilities: this.#input.filesystemCapabilities,
     });
+    return withCarriedEntries(local, this.#state.remote_only.map(carriedManifestEntry));
+  }
+
+  /**
+   * Whether an incoming change names a path this folder's policy keeps out of
+   * the folder: the path itself, or a directory above it, is excluded. The
+   * ancestor test is the manifest walk's: it never descends into an excluded
+   * directory, so a negated rule below one never brings a path back. A
+   * removal has no entry kind of its own, so it is judged by the kind it had.
+   */
+  #outsideFolder(
+    item: WorkspaceSyncChangeItem,
+    remoteOnly: ReadonlyMap<string, WorkspaceSyncManifestEntry>,
+    baseline: ReadonlyMap<string, EntryProjection>,
+  ): boolean {
+    const path = item.path;
+    if (path === null) return false;
+    if (item.operation === "delete" && remoteOnly.has(path)) return true;
+    const kind = item.entry?.kind ?? baseline.get(path)?.kind ?? "file";
+    const components = path.split("/");
+    for (let depth = 1; depth < components.length; depth += 1) {
+      if (this.#input.policy.decide(components.slice(0, depth).join("/"), "directory").excluded) return true;
+    }
+    return this.#input.policy.decide(path, kind).excluded;
   }
 
   async #transition(input: {
@@ -968,7 +1274,7 @@ export class ContinuousWorkspaceSyncSupervisor {
     const next = Object.freeze({
       ...this.#state,
       ...patch,
-      schema_version: STATE_SCHEMA as 2,
+      schema_version: STATE_SCHEMA as 3,
       updated_at: new Date(this.#clock()).toISOString(),
     });
     this.#state = admitState(next, this.#input);
@@ -1003,10 +1309,15 @@ export class ContinuousWorkspaceSyncSupervisor {
   }
 }
 
-function createInitialState(input: ContinuousWorkspaceSyncSupervisorInput, manifest: WorkspaceManifest): DurableSupervisorState {
+function createInitialState(
+  input: ContinuousWorkspaceSyncSupervisorInput,
+  manifest: WorkspaceManifest,
+  remoteOnly: readonly WorkspaceSyncManifestEntry[],
+): DurableSupervisorState {
   const prior = input.priorBase;
   return Object.freeze({
-    schema_version: STATE_SCHEMA as 2,
+    schema_version: STATE_SCHEMA as 3,
+    remote_only: sortedRemoteOnly(new Map(remoteOnly.map((entry) => [entry.path, entry]))),
     last_local_commit: prior !== undefined && prior.generation === input.initialGeneration - 1
       ? localCommitRecord(
         input.initialGeneration,
@@ -1051,6 +1362,24 @@ function localCommitRecord(
     entries: Object.freeze([...entries]
       .sort(([left], [right]) => Buffer.from(left).compare(Buffer.from(right)))
       .map(([path, fingerprint]) => Object.freeze({ path, fingerprint }))),
+  });
+}
+
+function sortedRemoteOnly(entries: ReadonlyMap<string, WorkspaceSyncManifestEntry>): readonly WorkspaceSyncManifestEntry[] {
+  return Object.freeze([...entries.values()].sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path))));
+}
+
+/** A carried wire entry as a manifest entry, so it roots and pages exactly as the server's copy does. */
+export function carriedManifestEntry(entry: WorkspaceSyncManifestEntry): ManifestEntry {
+  return Object.freeze({
+    path: entry.path,
+    kind: entry.kind,
+    byteLength: entry.byte_length,
+    executable: entry.executable,
+    ...(entry.kind === "file"
+      ? { chunks: Object.freeze(entry.chunks.map((chunk, index) => Object.freeze({ index, byteLength: chunk.byte_length, digest: chunk.digest }))) }
+      : {}),
+    ...(entry.link_target === null ? {} : { linkTarget: entry.link_target }),
   });
 }
 
@@ -1185,14 +1514,32 @@ function sameProjection(left: EntryProjection | undefined, right: EntryProjectio
   return left === undefined ? right === undefined : right !== undefined && left.fingerprint === right.fingerprint && left.kind === right.kind;
 }
 
-function orderRemoteItems(items: readonly WorkspaceSyncChangeItem[]): readonly WorkspaceSyncChangeItem[] {
+/**
+ * Directories first, then files the folder does not have yet, then files it
+ * replaces, then removals. New files go before replacements so that a copy the
+ * generation carries of bytes it replaces is written first: stopped between
+ * the two in path order, the folder held neither the copy nor its own version
+ * (ws-c3, 2026-09-29, 10:12:01: conflict.txt replaced, its
+ * conflict.txt.cuna-conflict-2-… copy not yet written).
+ */
+function orderRemoteItems(
+  items: readonly WorkspaceSyncChangeItem[],
+  baseline: ReadonlyMap<string, unknown>,
+): readonly WorkspaceSyncChangeItem[] {
   const revisions = items.filter((item) => item.operation === "revision");
   const directoryCreates = items.filter((item) => item.operation === "upsert" && item.entry?.kind === "directory")
     .sort((left, right) => depth(left.path) - depth(right.path));
   const upserts = items.filter((item) => item.operation === "upsert" && item.entry?.kind !== "directory");
+  const isNew = (item: WorkspaceSyncChangeItem): boolean => item.path !== null && !baseline.has(item.path);
   const deletes = items.filter((item) => item.operation === "delete")
     .sort((left, right) => depth(right.path) - depth(left.path));
-  return Object.freeze([...revisions, ...directoryCreates, ...upserts, ...deletes]);
+  return Object.freeze([
+    ...revisions,
+    ...directoryCreates,
+    ...upserts.filter(isNew),
+    ...upserts.filter((item) => !isNew(item)),
+    ...deletes,
+  ]);
 }
 
 function depth(path: string | null): number {
@@ -1378,10 +1725,11 @@ function admitState(
     "manifest_root", "pending_local", "pending_remote", "policy_digest", "reason",
     "schema_version", "status", "sync_id", "updated_at",
     ...(source.schema_version === 1 ? [] : ["last_local_commit"]),
+    ...(source.schema_version === 1 || source.schema_version === 2 ? [] : ["remote_only"]),
   ];
   if (
     Object.keys(source).sort().join("\0") !== keys.sort().join("\0") ||
-    (source.schema_version !== 1 && source.schema_version !== STATE_SCHEMA)
+    (source.schema_version !== 1 && source.schema_version !== 2 && source.schema_version !== STATE_SCHEMA)
   ) {
     throw syncFailure("state_schema_incompatible", EXIT_CODES.conflict);
   }
@@ -1409,8 +1757,9 @@ function admitState(
     ? null
     : decodeLocalCommitRecord(source.last_local_commit);
   return Object.freeze({
-    schema_version: STATE_SCHEMA as 2,
+    schema_version: STATE_SCHEMA as 3,
     last_local_commit: lastLocalCommit,
+    remote_only: source.remote_only === undefined ? Object.freeze([]) : decodeRemoteOnly(source.remote_only),
     binding_id: input.bindingId,
     binding_generation: input.bindingGeneration,
     policy_digest: input.policy.digest,
@@ -1426,6 +1775,20 @@ function admitState(
     pending_remote: pendingRemote,
     updated_at: source.updated_at,
   });
+}
+
+function decodeRemoteOnly(value: unknown): readonly WorkspaceSyncManifestEntry[] {
+  if (!Array.isArray(value)) throw syncFailure("state_invalid", EXIT_CODES.conflict);
+  const entries = value.map((entry: unknown) => {
+    try {
+      return decodeManifestEntry(entry);
+    } catch {
+      throw syncFailure("state_invalid", EXIT_CODES.conflict);
+    }
+  });
+  const paths = entries.map((entry) => entry.path);
+  if (new Set(paths).size !== paths.length) throw syncFailure("state_invalid", EXIT_CODES.conflict);
+  return sortedRemoteOnly(new Map(entries.map((entry) => [entry.path, entry])));
 }
 
 function decodeEntryProjection(value: unknown): EntryProjection {
@@ -1484,16 +1847,24 @@ function decodePendingRemote(value: unknown): PendingRemoteApply {
     !Array.isArray(source.items) || !Number.isSafeInteger(source.nextIndex) || (source.nextIndex as number) < 0 ||
     (source.nextIndex as number) > source.items.length
   ) throw syncFailure("state_invalid", EXIT_CODES.conflict);
-  const decodedItems = decodeChangePage({
-    selected_protocol: 1,
-    items: source.items,
-    next_cursor: null,
-  }).items;
+  // A generation's items arrive over as many pages as it takes, and are kept
+  // here as one list. Each item is still decoded by the page decoder, but in
+  // page-sized slices: decoded whole, a generation of more than one page's
+  // worth of changes (1,000) failed its own admission as
+  // `malformed_change_page` the moment it was recorded, and sync stopped.
+  const decodedItems: WorkspaceSyncChangeItem[] = [];
+  for (let offset = 0; offset < source.items.length; offset += WORKSPACE_SYNC_LIMITS.changePageEntries) {
+    decodedItems.push(...decodeChangePage({
+      selected_protocol: 1,
+      items: source.items.slice(offset, offset + WORKSPACE_SYNC_LIMITS.changePageEntries),
+      next_cursor: null,
+    }).items);
+  }
   return Object.freeze({
     generation: source.generation as number,
     manifestRoot: source.manifestRoot as string,
     cursor: source.cursor as string | null,
-    items: decodedItems,
+    items: Object.freeze(decodedItems),
     nextIndex: source.nextIndex as number,
   });
 }
@@ -1598,6 +1969,11 @@ function isStaleBaseRefusal(error: unknown, refusedOnThisBase: boolean): boolean
   const reason = error.details?.reason;
   if (reason === "workspace_sync_generation_conflict") return true;
   return refusedOnThisBase && (reason === "checkpoint_conflicted" || reason === "checkpoint_intent_mismatch");
+}
+
+/** The operation journal refused this process's lease: expired, or superseded (journal.ts `#assertLease`). */
+function isJournalFenced(error: unknown): boolean {
+  return error instanceof CunaError && error.code === "cuna.workspace.writer_fenced";
 }
 
 function classifyFailure(error: unknown): { readonly status: "paused" | "reconciling" | "conflicted" | "recovery_required"; readonly reason: string } {

@@ -140,10 +140,11 @@ try {
   }
   const resizedScreen = screen();
 
-  child.write("\u0003");
+  // A writer's Ctrl+C goes to the agent in the rich terminal; the chord detaches.
+  child.write(presentationMode === "rich" ? "\u001dd" : "\u0003");
   await Promise.race([
     exited,
-    new Promise((_, reject) => setTimeout(() => reject(new Error("One Ctrl-C did not detach within fifteen seconds.")), 15_000)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("The detach key did not detach within fifteen seconds.")), 15_000)),
   ]);
   await writeTail;
   assert.equal(exitResult?.exitCode, 0);

@@ -1,4 +1,4 @@
-export const CLI_VERSION = "0.1.6" as const;
+export const CLI_VERSION = "0.1.7" as const;
 /** The published npm package, as `package.json` names it; help prints its install line. */
 export const CLI_PACKAGE_NAME = "@cuna_labs/cli" as const;
 export const OUTPUT_SCHEMA_VERSION = "1" as const;

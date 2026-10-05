@@ -3,7 +3,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { CunaApiClient } from "../api/client.js";
-import type { Machine } from "../api/contracts.js";
+import type { Machine, WorkspaceBindingAuthority } from "../api/contracts.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import type { ContinuousSyncConflict, ContinuousSyncSnapshot } from "../sync/continuous-sync-supervisor.js";
 import {
@@ -53,8 +53,8 @@ function fail(code: string, message: string, exitCode: ExitCode = EXIT_CODES.con
  * without an API body (`operation_not_served`) says this deployment lacks the
  * route, not that the Machine is gone.
  */
-async function observeBoundMachine(
-  client: CunaApiClient,
+export async function observeBoundMachine(
+  client: Pick<CunaApiClient, "getMachine">,
   machineId: string,
   signal: AbortSignal,
 ): Promise<{ readonly kind: "present"; readonly machine: Machine } | { readonly kind: "absent" }> {
@@ -117,6 +117,41 @@ export function continuousSyncNotice(snapshot: ContinuousSyncSnapshot): string |
   return undefined;
 }
 
+/**
+ * The command that recovers this folder's sync, named by its canonical root.
+ * Double-quoted when the path holds whitespace or a shell metacharacter; a
+ * Windows path's backslashes and drive colon are left as they are.
+ */
+export function syncRecoveryCommand(canonicalRoot: string): string {
+  const path = /[\s"'`$&|;<>()*?!#~{}[\]^%,=]/u.test(canonicalRoot) ? `"${canonicalRoot}"` : canonicalRoot;
+  return `cuna sync recover ${path} --yes`;
+}
+
+/**
+ * The attention line for a sync that needs the person: the state, its reason
+ * and the recovery command. Undefined for a live sync; `null` for a passing
+ * state (recovering, reconciling, catching up) that neither raises nor clears.
+ */
+function syncAttentionLine(snapshot: ContinuousSyncSnapshot, canonicalRoot: string): string | undefined | null {
+  if (syncIsLive(snapshot)) return undefined;
+  const headline = snapshot.state === "conflicted" || snapshot.state === "recovery_required"
+    ? "Workspace sync stopped"
+    : snapshot.state === "paused" ? "Workspace sync paused" : undefined;
+  return headline === undefined ? null : `${headline} · ${syncStateLabel(snapshot)} · run: ${syncRecoveryCommand(canonicalRoot)}`;
+}
+
+/**
+ * The one line about workspace sync that needs the person's action now, for a
+ * surface that stays on screen while an agent owns the terminal. Held notices
+ * reach the person only at detach (BL-7, 2026-10-03: a sync stopped at
+ * 02:02:30Z and the attached terminal said nothing for 21 minutes).
+ */
+export interface WorkspaceSyncAttention {
+  readonly current: () => string | undefined;
+  /** Called on every change, synchronously with the sync transition that caused it. */
+  readonly subscribe: (listener: (line: string | undefined) => void) => () => void;
+}
+
 /** The last word when a run stops a sync that was not live, or undefined when it was. */
 export function continuousSyncDetachNotice(snapshot: ContinuousSyncSnapshot): string | undefined {
   if (syncIsLive(snapshot) || snapshot.state === "stopped") return undefined;
@@ -157,32 +192,67 @@ export interface WorkspaceJourneyEffects extends Pick<AgentJourneyEffects, "insp
   readonly continuousSyncSnapshot: () => ContinuousSyncSnapshot | undefined;
   readonly subscribeContinuousSync: (listener: (snapshot: ContinuousSyncSnapshot) => void) => () => void;
   readonly stopContinuousSync: () => Promise<void>;
+  /** From here until `releaseNotices`, lines are kept instead of written: an agent owns the terminal. */
+  readonly holdNotices: () => void;
+  /** Writes every kept line, in order, and writes lines as they come again. */
+  readonly releaseNotices: () => void;
+  /** What needs the person's action about sync, held or not; the attached bar shows it. */
+  readonly syncAttention: WorkspaceSyncAttention;
 }
 
 export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInput): WorkspaceJourneyEffects {
   let supervisor: Awaited<ReturnType<typeof startContinuousWorkspaceSync>> | undefined;
+  // Lines said while an agent owns the terminal wait until it gives the
+  // terminal back. Written as they came, they landed on top of the agent's full
+  // screen (0.1.5 and 0.1.6: the sync lines over rows 29-32 of OpenCode, ws-c3
+  // 2026-09-29). Bounded: a sync that says more than this keeps the first lines
+  // and counts the rest.
+  let heldNotices: string[] | undefined;
+  let droppedNotices = 0;
+  const notice = (line: string): void => {
+    if (heldNotices === undefined) input.onNotice?.(line);
+    else if (heldNotices.length < HELD_NOTICE_LIMIT) heldNotices.push(line);
+    else droppedNotices += 1;
+  };
   const syncListeners = new Set<(snapshot: ContinuousSyncSnapshot) => void>();
   let unsubscribeSupervisor: (() => void) | undefined;
+  // Not held: the attached bar reads it while the lines above wait for detach.
+  let attention: string | undefined;
+  const attentionListeners = new Set<(line: string | undefined) => void>();
+  const setAttention = (line: string | undefined): void => {
+    if (line === attention) return;
+    attention = line;
+    for (const listener of attentionListeners) {
+      try { listener(line); } catch { /* A display observer never owns synchronization correctness. */ }
+    }
+  };
+  /** The folder this run's sync belongs to; the recovery command names it. */
+  let syncRoot: string | undefined;
   // One line per entry into a state that moves no files; a repeat of the same
   // state and reason stays silent until sync is live again, and then says so.
   let announcedState: string | undefined;
   const renderSyncState = (snapshot: ContinuousSyncSnapshot): void => {
+    if (syncRoot !== undefined) {
+      const attentionLine = syncAttentionLine(snapshot, syncRoot);
+      if (attentionLine !== null) setAttention(attentionLine);
+    }
     const line = continuousSyncNotice(snapshot);
     if (line !== undefined) {
       const key = `${snapshot.state}\0${snapshot.reason ?? ""}`;
       if (key === announcedState) return;
       announcedState = key;
-      input.onNotice?.(line);
+      notice(line);
       return;
     }
     if (announcedState !== undefined && syncIsLive(snapshot)) {
       announcedState = undefined;
-      input.onNotice?.(`Workspace sync resumed · this folder is at generation ${snapshot.generation}`);
+      notice(`Workspace sync resumed · this folder is at generation ${snapshot.generation}`);
     }
   };
   /** One wiring for every admission path, so a resumed poller is as observable as a committed one. */
-  const attachContinuousSync = (started: Awaited<ReturnType<typeof startContinuousWorkspaceSync>>): void => {
+  const attachContinuousSync = (started: Awaited<ReturnType<typeof startContinuousWorkspaceSync>>, root: string): void => {
     supervisor = started;
+    syncRoot = root;
     announcedState = undefined;
     unsubscribeSupervisor = started.subscribe((snapshot) => {
       renderSyncState(snapshot);
@@ -192,7 +262,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
     });
   };
   const renderConflict = (conflict: ContinuousSyncConflict): void => {
-    input.onNotice?.(conflictNotice(conflict));
+    notice(conflictNotice(conflict));
   };
   const inspect = async (localPath: string): Promise<{
     readonly policy: Awaited<ReturnType<typeof inspectWorkspaceSyncPolicy>>;
@@ -218,6 +288,24 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       }
       return () => syncListeners.delete(listener);
     },
+    syncAttention: Object.freeze({
+      current: () => attention,
+      subscribe(listener: (line: string | undefined) => void) {
+        attentionListeners.add(listener);
+        return () => { attentionListeners.delete(listener); };
+      },
+    }),
+    holdNotices() {
+      heldNotices ??= [];
+    },
+    releaseNotices() {
+      const lines = heldNotices ?? [];
+      const dropped = droppedNotices;
+      heldNotices = undefined;
+      droppedNotices = 0;
+      for (const line of lines) input.onNotice?.(line);
+      if (dropped > 0) input.onNotice?.(`${dropped} more workspace lines were said while the agent had the terminal`);
+    },
     async stopContinuousSync() {
       const current = supervisor;
       supervisor = undefined;
@@ -229,7 +317,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       // Lines written while a terminal owned the screen may be gone once it
       // is released, so a sync that was not live gets the last word here.
       const line = last === undefined ? undefined : continuousSyncDetachNotice(last);
-      if (line !== undefined) input.onNotice?.(line);
+      if (line !== undefined) notice(line);
     },
     async inspectWorkspace({ localPath, syncMode, signal }) {
       signal.throwIfAborted();
@@ -323,7 +411,7 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             expected: workspaceBindingCompareAndSwap(record),
             rebind: true,
           });
-          input.onNotice?.(`Rebound this folder to ${await machineDisplayName(input.client, machineId, signal)} · the previous Machine no longer exists`);
+          notice(`Rebound this folder to ${await machineDisplayName(input.client, machineId, signal)} · the previous Machine no longer exists`);
         } else {
           authority = await input.client.getWorkspaceBinding(record.bindingId, {
             ...(record.executionWorkspaceId === undefined ? {} : { executionWorkspaceId: record.executionWorkspaceId }),
@@ -385,29 +473,27 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
       // The manifest is recomputed inside `synchronizeLocalWorkspace` when the
       // content HAS changed, which is the only case that pays for it. Skipping
       // returns exactly the shape the proven `--no-sync` branch above returns.
+      const checkpointRoot = join(input.stateDirectory, "workspace-sync");
+      // Measured as the published generation holds this folder: with the paths
+      // it carries that this folder excludes. Without them a folder that
+      // reproduces it would look changed, and the commit that followed would
+      // leave those paths out and tell the Machine to delete them.
       const currentManifestRoot = await computeWorkspaceManifestRoot({
         localRoot: inspected.policy.canonicalRoot,
         filesystemCapabilities: input.filesystemCapabilities,
+        comparedWith: {
+          workspaceId: input.workspaceId,
+          workspaceBindingId: authority.bindingId,
+          machineId,
+          checkpointRoot,
+          generation: authority.activeGeneration,
+        },
       });
-      const checkpointRoot = join(input.stateDirectory, "workspace-sync");
       if (
         authority.activeGeneration >= 1 &&
         authority.activeManifestRoot === currentManifestRoot
       ) {
-        if (localRecord === undefined || localRecord.generation !== authority.activeGeneration) {
-          await persistWorkspaceBinding({
-            root: inspected.policy.canonicalRoot,
-            binding: {
-              profileId: input.profileId, userId: input.userId, workspaceId: input.workspaceId,
-              bindingId: authority.bindingId, projectId: authority.projectId,
-              ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
-              localInstanceId: authority.localInstanceId, machineId, remoteRoot: authority.remoteRoot,
-              policyDigest: authority.exclusionPolicyDigest, generation: authority.activeGeneration,
-              bindingCreatedAt: authority.createdAt, bindingUpdatedAt: authority.updatedAt,
-            },
-            expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
-          });
-        }
+        await recordPublishedGeneration({ input, root: inspected.policy.canonicalRoot, authority, machineId, localRecord });
         // Skipping the commit must not also skip remote delivery. The
         // supervisor is the only reader of `GET …/changes` the product runs, so
         // with none running a generation produced on the Machine can never
@@ -436,11 +522,14 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             checkpointRoot,
             filesystemCapabilities: input.filesystemCapabilities,
             onConflict: renderConflict,
-          }));
+          }), inspected.policy.canonicalRoot);
         } catch (error) {
           if (!(error instanceof CunaError)) throw error;
           const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
-          input.onNotice?.(`Remote workspace changes will not arrive this run · ${reason}`);
+          notice(`Remote workspace changes will not arrive this run · ${reason}${syncHolder(error)}`);
+          // Printed before the agent's screen takes over, the line above is
+          // gone under it; the bar keeps it for the whole run.
+          setAttention(`Remote workspace changes will not arrive this run · ${reason} · run: ${syncRecoveryCommand(inspected.policy.canonicalRoot)}`);
         }
         return Object.freeze({
           bindingId: authority.bindingId,
@@ -487,9 +576,9 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             details: { local_generation: baseGeneration, remote_generation: authority.activeGeneration },
           });
         }
-        input.onNotice?.(`The Machine changed this workspace while you were away · bringing generation ${authority.activeGeneration} into this folder before sending local changes`);
+        notice(`The Machine changed this workspace while you were away · bringing generation ${authority.activeGeneration} into this folder before sending local changes`);
         try {
-          attachContinuousSync(await resumeContinuousWorkspaceSyncFromLocalBase({
+          const started = await resumeContinuousWorkspaceSyncFromLocalBase({
             localRoot: inspected.policy.canonicalRoot,
             workspaceId: input.workspaceId,
             workspaceBindingId: authority.bindingId,
@@ -499,11 +588,27 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
             checkpointRoot,
             filesystemCapabilities: input.filesystemCapabilities,
             onConflict: renderConflict,
-          }));
+          });
+          attachContinuousSync(started, inspected.policy.canonicalRoot);
+          // The pull finishes before the journey goes on. Left to run beside
+          // it, the pull was stopped with the run whenever a later step failed
+          // (ws-c3, 2026-09-29: three runs announced generation 3; the one at
+          // 10:12 was stopped by session selection with conflict.txt replaced
+          // and the copy of the local version not yet written, and the folder
+          // stayed at generation 2).
+          const reached = await waitForGeneration(started, authority.activeGeneration, signal);
+          if (reached.generation >= authority.activeGeneration && reached.pendingRemoteChanges === 0) {
+            // What `.cuna/workspace.json` names is now true of the folder.
+            await recordPublishedGeneration({ input, root: inspected.policy.canonicalRoot, authority, machineId, localRecord });
+          } else {
+            const why = reached.reason === undefined ? "" : ` (${reached.reason})`;
+            notice(`Generation ${authority.activeGeneration} has not reached this folder yet · ${reached.state}${why} · it keeps arriving while this run is open`);
+          }
         } catch (error) {
           if (!(error instanceof CunaError)) throw error;
           const reason = typeof error.details?.reason === "string" ? error.details.reason : error.code;
-          input.onNotice?.(`Workspace changes will not sync this run · ${reason}`);
+          notice(`Workspace changes will not sync this run · ${reason}${syncHolder(error)}`);
+          setAttention(`Workspace changes will not sync this run · ${reason} · run: ${syncRecoveryCommand(inspected.policy.canonicalRoot)}`);
         }
         return Object.freeze({
           bindingId: authority.bindingId,
@@ -574,11 +679,89 @@ export function createWorkspaceJourneyEffects(input: WorkspaceJourneyEffectsInpu
         filesystemCapabilities: input.filesystemCapabilities,
         initialReceipt: receipt,
         onConflict: renderConflict,
-      }));
+      }), inspected.policy.canonicalRoot);
       return Object.freeze({ ...(persisted.executionWorkspaceId===undefined?{}:{executionWorkspaceId:persisted.executionWorkspaceId}), bindingId: persisted.bindingId, workspaceIdentity: persisted.bindingId, generation: persisted.generation, remoteCwd: persisted.remoteRoot });
     },
   };
   return Object.freeze(effects);
+}
+
+/** Lines kept while an agent owns the terminal; past this they are only counted. */
+const HELD_NOTICE_LIMIT = 100;
+
+/** How long a run waits for a newer Machine generation to land before it goes on. */
+const CATCH_UP_MS = 60_000;
+
+/**
+ * The supervisor's snapshot once it holds `generation` with nothing of it left
+ * to apply, once it stops for good, or when the wait is over or cancelled.
+ */
+async function waitForGeneration(
+  supervisor: {
+    readonly snapshot: ContinuousSyncSnapshot;
+    subscribe(listener: (snapshot: ContinuousSyncSnapshot) => void): () => void;
+  },
+  generation: number,
+  signal: AbortSignal,
+  timeoutMs = CATCH_UP_MS,
+): Promise<ContinuousSyncSnapshot> {
+  return await new Promise((resolve) => {
+    let unsubscribe: (() => void) | undefined;
+    let settled = false;
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", settle);
+      unsubscribe?.();
+      resolve(supervisor.snapshot);
+    };
+    const timer = setTimeout(settle, timeoutMs);
+    signal.addEventListener("abort", settle, { once: true });
+    unsubscribe = supervisor.subscribe((snapshot) => {
+      if ((snapshot.generation >= generation && snapshot.pendingRemoteChanges === 0) ||
+        snapshot.state === "conflicted" || snapshot.state === "recovery_required" || snapshot.state === "stopped") {
+        settle();
+      }
+    });
+    if (settled) unsubscribe();
+  });
+}
+
+/** Names the published generation in this folder's binding record, when it does not already. */
+async function recordPublishedGeneration(input: {
+  readonly input: WorkspaceJourneyEffectsInput;
+  readonly root: string;
+  readonly authority: WorkspaceBindingAuthority;
+  readonly machineId: string;
+  readonly localRecord: LoadedWorkspaceBinding["record"] | undefined;
+}): Promise<void> {
+  const { authority, localRecord } = input;
+  if (localRecord !== undefined && localRecord.generation === authority.activeGeneration) return;
+  await persistWorkspaceBinding({
+    root: input.root,
+    binding: {
+      profileId: input.input.profileId, userId: input.input.userId, workspaceId: input.input.workspaceId,
+      bindingId: authority.bindingId, projectId: authority.projectId,
+      ...(authority.executionWorkspaceId == null ? {} : { executionWorkspaceId: authority.executionWorkspaceId }),
+      localInstanceId: authority.localInstanceId, machineId: input.machineId, remoteRoot: authority.remoteRoot,
+      policyDigest: authority.exclusionPolicyDigest, generation: authority.activeGeneration,
+      bindingCreatedAt: authority.createdAt, bindingUpdatedAt: authority.updatedAt,
+    },
+    expected: localRecord === undefined ? null : workspaceBindingCompareAndSwap(localRecord),
+  });
+}
+
+/**
+ * Which process keeps this folder's sync, when the refusal names one, and what
+ * frees it. A run that finds the folder's sync held cannot take it from a live
+ * process, and a bare `active_writer` left no way to find the one that held it.
+ */
+export function syncHolder(error: CunaError): string {
+  const holder = error.details?.holder_pid;
+  return typeof holder === "number"
+    ? ` · cuna process ${holder} holds this folder's sync · if that run is no longer open, end the process and run this command again`
+    : "";
 }
 
 /** Safe under-claims never become guessed remote capabilities. */

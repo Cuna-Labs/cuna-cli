@@ -2,9 +2,9 @@ import {withProviderLaunchIntent,type RecordedLaunchContext} from "./provider-la
 import { isAgentSessionGone } from "../runtime/terminal-client-identity.js";
 import type {ProviderPreset} from "../api/provider-v2.js";
 import {createPublishedProviderSessionV2,requireMatchingPreset} from "./remote-workspace.js";
-import type { AgentSession, AgentSessionTerminalSeat, Machine } from "../api/contracts.js";
-import { sessionFailure } from "./session-failure.js";
-import { decideCapability, requireCapability, type CunaApiClient } from "../api/client.js";
+import type { AgentSession, AgentSessionTerminalSeat, CapabilitySnapshot, Machine } from "../api/contracts.js";
+import { readinessFailure, sessionFailure, supervisorWaitCause } from "./session-failure.js";
+import { decideCapability, refuseNamedMachineAction, requireCapability, type CunaApiClient } from "../api/client.js";
 import { EXIT_CODES, CunaError, type ExitCode } from "../core/errors.js";
 import {
   isOpenCodeRuntimeUnverifiedCapabilityRejection,
@@ -22,6 +22,8 @@ import type {
 } from "./orchestrator.js";
 import {
   AGENT_SESSION_READY_DEADLINE_MS,
+  AGENT_SESSION_READY_FAST_POLL_WINDOW_MS,
+  AGENT_SESSION_READY_POLL_MAX_MS,
   MACHINE_READY_DEADLINE_MS,
   readinessBackoffMs,
   reissueIdempotentRead,
@@ -32,6 +34,9 @@ import {
 } from "./wait-policy.js";
 
 const MACHINE_POLL_LIMIT = 60;
+
+/** A readiness poll asks for the server's own verdict and its supervisor evidence. */
+const SERVER_TRUTH_READ = Object.freeze({ readiness: true, runtimeEvidence: true });
 
 /**
  * The noun phrases the readiness loops put on screen, as one vocabulary.
@@ -210,6 +215,7 @@ function sessionObservation(session: AgentSession, seat: SeatAttachment) {
     ...seat,
     freshness: "fresh" as const,
     createdAt: session.createdAt,
+    ...(session.requestState === "failed" || session.requestState === "terminal" ? { ended: true } : {}),
   });
 }
 
@@ -245,9 +251,10 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
     deadlineFailure: context.deadlineFailure,
     ...(input.onWait === undefined ? {} : { onWait: input.onWait }),
   });
-  const reportWait = (deadline: JourneyDeadline, waitingFor: string): void => {
+  const reportWait = (deadline: JourneyDeadline, waitingFor: string, cause?: string): void => {
     input.onWait?.(Object.freeze({
       waitingFor,
+      ...(cause === undefined ? {} : { cause }),
       elapsedMs: deadline.elapsedMs(),
       deadlineMs: deadline.deadlineMs,
     }));
@@ -255,6 +262,16 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
   // Names this journey has read, for the one line a person sees before a
   // session starts. Display only: every decision is made by id.
   const machineNames = new Map<string, string>();
+  /*
+   * The Machine capability snapshot selection already read, kept for the
+   * create gate. Reading it again was a second provider round trip for the
+   * same answer: measured 2026-09-30 15:57Z (Edge v242, Machine cd0696a7), the
+   * create's capability read took 2 367 ms (its provider runtime read 2 106 ms)
+   * three seconds after selection had read the same snapshot. Only a snapshot
+   * still inside its own lease that says `supported` is reused; any other
+   * answer is asked for again, so every refusal keeps its fresh-read path.
+   */
+  const machineCapabilities = new Map<string, CapabilitySnapshot>();
   const effects: AgentJourneyEffects = {
     inspectWorkspace: input.inspectWorkspace,
     async observeMachines({ signal }) {
@@ -300,6 +317,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
               costStatus: "unknown" as const,
             });
           }
+          machineCapabilities.set(machine.id, snapshot);
           const decision = decideCapability(snapshot, "agent_sessions.create", now());
           support = decision.status === "supported"
             ? "supported"
@@ -373,9 +391,13 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
     },
     async ensureMachineReady({ machineId, observedState, signal }) {
       let state = observedState;
+      // A declared provider is why this Machine was chosen, not evidence that
+      // it starts: ask the server first (PRD R1.2).
       if (state === "paused" || state === "suspended") {
+        await refuseNamedMachineAction({ client: input.client, machineId, action: "resume", now, signal });
         state = machineState((await input.client.transitionMachine(machineId, "resume", signal)).state);
       } else if (state === "stopped") {
+        await refuseNamedMachineAction({ client: input.client, machineId, action: "start", now, signal });
         state = machineState((await input.client.transitionMachine(machineId, "start", signal)).state);
       } else if (state === "deleted" || state === "error" || state === "unknown") {
         throw fail("cuna.journey.machine_not_reusable", "The selected machine is not safely reusable.", EXIT_CODES.policy);
@@ -446,31 +468,36 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       })));
     },
     async createAgentSession({ machineId, agent, authMode, credentialBindingId, workspace, signal }) {
-      try {
-        await requireCapability({
-          client: input.client,
-          scope: "machine",
-          resourceId: machineId,
-          capabilityId: "agent_sessions.create",
-          now,
-          signal,
-        });
-      } catch (error) {
-        if (agent === "opencode" && isOpenCodeSupervisorUpgradeCapabilityRejection(error)) {
-          throw openCodeSupervisorUpgradeRequired({
-            ...(error.details === undefined ? {} : { details: error.details }),
-            machineId,
-            cause: error,
+      const selected = machineCapabilities.get(machineId);
+      const selectionStillSupports = selected !== undefined &&
+        decideCapability(selected, "agent_sessions.create", now()).status === "supported";
+      if (!selectionStillSupports) {
+        try {
+          await requireCapability({
+            client: input.client,
+            scope: "machine",
+            resourceId: machineId,
+            capabilityId: "agent_sessions.create",
+            now,
+            signal,
           });
+        } catch (error) {
+          if (agent === "opencode" && isOpenCodeSupervisorUpgradeCapabilityRejection(error)) {
+            throw openCodeSupervisorUpgradeRequired({
+              ...(error.details === undefined ? {} : { details: error.details }),
+              machineId,
+              cause: error,
+            });
+          }
+          if (agent === "opencode" && isOpenCodeRuntimeUnverifiedCapabilityRejection(error)) {
+            throw openCodeRuntimeUnverified({
+              ...(error.details === undefined ? {} : { details: error.details }),
+              machineId,
+              cause: error,
+            });
+          }
+          throw error;
         }
-        if (agent === "opencode" && isOpenCodeRuntimeUnverifiedCapabilityRejection(error)) {
-          throw openCodeRuntimeUnverified({
-            ...(error.details === undefined ? {} : { details: error.details }),
-            machineId,
-            cause: error,
-          });
-        }
-        throw error;
       }
       if(agent==='opencode'||agent==='codex'||agent==='claude-code'){
         if(authMode!=='interactive_login'||credentialBindingId!==undefined||!workspace.executionWorkspaceId||workspace.generation<1||!input.selectProviderPreset)throw fail('cuna.provider.v2_unavailable','The agent requires a selected V2 profile and a published execution Workspace.');
@@ -497,6 +524,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           // The three numbers the screen was already showing, so a transcript
           // and an error record cannot disagree about what was waited for.
           waiting_for: elapsed.waitingFor,
+          ...(waitCause === undefined ? {} : { wait_cause: waitCause }),
           deadline_ms: elapsed.deadlineMs,
           elapsed_ms: elapsed.elapsedMs,
           read_reissues: elapsed.readReissues,
@@ -507,6 +535,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       // observations, so the deadline failure names the last real blocker
       // instead of the phase.
       let waitingFor: string = WAITING_FOR.processStart;
+      let waitCause: string | undefined;
       for (let attempt = 0; !deadline.elapsed(); attempt += 1) {
         if (signal?.aborted) throw signal.reason;
         const session = await readWithin({
@@ -514,12 +543,17 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           deadline,
           signal,
           deadlineFailure,
-          read: () => input.client.getAgentSession(agentSessionId, signal),
+          read: () => input.client.getAgentSession(agentSessionId, signal, SERVER_TRUTH_READ),
         });
         if (session.requestState === "failed") {
           if (session.workspaceFailureCode !== undefined) {
             const messages: Record<string, string> = {
-              "workspace.remote_edits": "Remote edits prevent synchronization. Preserve and reconcile those edits before retrying.",
+              // No command reconciles a Machine's tree, so "preserve and
+              // reconcile" named nothing a person could do. What does work: the
+              // refused request leaves a settled session, the Machine's capture
+              // lane saves the edits as the next generation (ws-c3, 2026-09-29:
+              // 21 s after cbde8586 was refused), and the next run adopts it.
+              "workspace.remote_edits": "This Workspace has remote edits on the Machine that no generation carries yet. They were kept and nothing was replaced. The Machine saves them as a new generation shortly; run the same command again in a minute to continue with both versions.",
               "workspace.in_use": "This workspace is still in use or waiting for a previous session to finish. Inspect its sessions before retrying.",
               "workspace.replacement_requires_fence": "This Workspace cannot replace its files while writer exclusion is unverified. Its existing files were preserved.",
               "workspace.materialization_manifest_limit": "This Workspace exceeds the runtime file manifest limit. Reduce the synchronized file set before retrying.",
@@ -564,8 +598,17 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         if (["exited", "failed", "terminated"].includes(session.processState)) {
           throw sessionFailure(session, "The AgentSession reached a terminal state before attach.");
         }
-        reportWait(deadline, waitingFor);
-        await sleep(readinessBackoffMs(attempt), signal);
+        // After the terminal-authority check on purpose: a session the server
+        // gave up on can still be attached if its terminal authority says so,
+        // and a late attestation promotes it. Anything else it already
+        // settled ends the wait here, on the read that carried it.
+        const settled = readinessFailure(session);
+        if (settled !== undefined) throw settled;
+        waitCause = supervisorWaitCause(session);
+        reportWait(deadline, waitingFor, waitCause);
+        await sleep(deadline.elapsedMs() < AGENT_SESSION_READY_FAST_POLL_WINDOW_MS
+          ? Math.min(readinessBackoffMs(attempt), AGENT_SESSION_READY_POLL_MAX_MS)
+          : readinessBackoffMs(attempt), signal);
       }
       throw deadlineFailure(Object.freeze({
         waitingFor,

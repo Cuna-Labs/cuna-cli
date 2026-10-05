@@ -1729,6 +1729,70 @@ test("E13-R4: the provider verdict appears only on a running Machine", async () 
   assert.equal(await operation, undefined);
 });
 
+// PRD cuna-truthful-machine-surfaces R1.2 (BL-1): Start was offered on every
+// stopped Machine and gated on the grouped `machines.lifecycle` alone, so a
+// start the server already knew it would refuse was sent. The Edge names
+// start-ability as `machines.start` in the same snapshot this screen already
+// reads for each Machine.
+function refused(id, reasonCode, availability = "temporarily_unavailable") {
+  return { ...supported(id), availability, reasonCode };
+}
+
+test("R1.2: a Start the server would refuse shows its reason on the Machine and sends nothing", async () => {
+  const host = new FakeHost();
+  const transitions = [];
+  const operation = runNodeMachinesExplorer({
+    client: {
+      async listMachines() { return { items: [{ id: MACHINE_ID, name: "biotech-lab", state: "stopped", agent: "claude-code" }] }; },
+      async listAgentSessions() { return { items: [] }; },
+      async discoverCapabilities(scope, resourceId) {
+        return capabilitySnapshot(scope, resourceId, [
+          supported("machines.lifecycle"), supported("agent_sessions.workspace.create"),
+          refused("machines.start", "control_credential_expired"),
+        ]);
+      },
+      async transitionMachine(id, action) { transitions.push(action); return { id, name: "biotech-lab", state: "running", agent: "claude-code" }; },
+      async getMachine(id) { return { id, name: "biotech-lab", state: "stopped", agent: "claude-code" }; },
+    },
+  }, { host, convergence: { pollIntervalMs: 1, budgetMs: 100 } });
+  await waitUntil(() => lastFrame(host).includes("start unavailable: control_credential_expired"), "the overview must say the Machine cannot start, and why");
+  host.emitInput([0x0d]);
+  await waitUntil(() => lastFrame(host).includes("❯ Start machine  unavailable: control_credential_expired"), "the Start action must carry the server's reason");
+  host.emitInput([0x0d]);
+  await waitUntil(() => lastFrame(host).includes("machines.start is not available for biotech-lab: control_credential_expired. Nothing was requested."), "Enter must name the refusal");
+  assert.deepEqual(transitions, [], "nothing was sent");
+  host.emitInput([0x03]);
+  assert.equal(await operation, undefined);
+});
+
+test("R1.2 control: without a per-action id, or with one the provider refused last time, Start is sent", async () => {
+  for (const [label, extra] of [["absent", []], ["send-through", [refused("machines.start", "provider_request_rejected")]]]) {
+    const host = new FakeHost();
+    const transitions = [];
+    let state = "stopped";
+    const operation = runNodeMachinesExplorer({
+      client: {
+        async listMachines() { return { items: [{ id: MACHINE_ID, name: "biotech-lab", state, agent: "claude-code" }] }; },
+        async listAgentSessions() { return { items: [] }; },
+        async discoverCapabilities(scope, resourceId) {
+          return capabilitySnapshot(scope, resourceId, [supported("machines.lifecycle"), supported("agent_sessions.workspace.create"), ...extra]);
+        },
+        async transitionMachine(id, action) { transitions.push(action); state = "running"; return { id, name: "biotech-lab", state, agent: "claude-code" }; },
+        async getMachine(id) { return { id, name: "biotech-lab", state, agent: "claude-code" }; },
+      },
+    }, { host, convergence: { pollIntervalMs: 1, budgetMs: 1_000 } });
+    await waitUntil(() => lastFrame(host).includes("biotech-lab  stopped") && !lastFrame(host).includes("…"), `${label}: inventory should render`);
+    assert.doesNotMatch(lastFrame(host), /start unavailable/u, label);
+    host.emitInput([0x0d]);
+    await waitUntil(() => lastFrame(host).includes("❯ Start machine"), `${label}: Start should be offered`);
+    host.emitInput([0x0d]);
+    await waitUntil(() => transitions.length === 1, `${label}: Start should be sent`);
+    host.emitInput([0x03]);
+    assert.equal(await operation, undefined);
+    assert.deepEqual(transitions, ["start"], label);
+  }
+});
+
 test("E13-R5: ├─ appears only when a sibling line follows", async () => {
   const host = new FakeHost();
   const operation = runNodeMachinesExplorer({

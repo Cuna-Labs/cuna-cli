@@ -49,8 +49,10 @@ Your files sync to a cloud machine, the agent runs on that machine, and the
 terminal in front of you is a view of it. Close the lid and the session keeps
 going.
 
-Detach with `Ctrl+C` — it leaves your terminal, it does not stop the agent. To
-come back:
+Detach with `Ctrl+]` then `d` — it leaves your terminal, it does not stop the
+agent. While you have keyboard control, `Ctrl+C` goes to the agent (over a
+selection it copies instead); a read-only view detaches on `Ctrl+C`. To come
+back:
 
 ```sh
 cuna machines

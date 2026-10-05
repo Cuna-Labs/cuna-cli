@@ -22,6 +22,20 @@ import {
   readLiveSupervisorUpdateOperation,
   runCli,
 } from "../dist/index.js";
+import { VENDORED_CONTRACT_OPERATIONS } from "../dist/cli/route-contract.js";
+
+/**
+ * The operations of a contract that serves the in-place update, as producer
+ * `7b1b3e42` does. The vendored contract (`cdd7e9a`, the deployed producer)
+ * does not, so every `runCli` below names this set: these tests exercise the
+ * command's logic as it runs where the route exists, and
+ * `test/route-contract.test.mjs` pins the refusal where it does not.
+ */
+const LIVE_UPDATE_SERVED = new Set([
+  ...VENDORED_CONTRACT_OPERATIONS,
+  "POST /v1/sessions/{id}/supervisor/live-update",
+  "GET /v1/sessions/{id}/supervisor/live-update/{operationId}",
+]);
 
 const API_KEY = "cuna_sk_abcdefghijklmnop";
 const MACHINE_ID = "44444444-4444-4444-8444-444444444444";
@@ -127,6 +141,7 @@ async function runJson(argv, root, client) {
     streams: streams.streams,
     platform: filePlatform(root),
     env: { CUNA_API_KEY: API_KEY },
+    contractOperations: LIVE_UPDATE_SERVED,
     now: () => NOW,
     clientFactory: () => client,
   });
@@ -592,7 +607,15 @@ test("the wire declaration names the exact producer commit its shapes were read 
       ? "the vendored contract carries sessions.updateSupervisorInPlace"
       : "the vendored contract no longer carries sessions.updateSupervisorInPlace: a sync went backwards",
   );
-  assert.equal(vendored, true, "run `npm run contract:sync:infra` against the 7b1 reference worktree");
+  if (!vendored) {
+    // Pinned, not vendored: nothing here can be compared against the vendored
+    // bytes, so the two routes that send these shapes must be refused as
+    // unserved instead. `test/route-contract.test.mjs` pins that refusal.
+    assert.equal(SUPERVISOR_LIVE_UPDATE_WIRE.source.vendoredCarriesOperation, false);
+    assert.equal(VENDORED_CONTRACT_OPERATIONS.has(`POST ${SUPERVISOR_LIVE_UPDATE_WIRE.pathTemplate}`), false);
+    assert.equal(VENDORED_CONTRACT_OPERATIONS.has(`GET ${SUPERVISOR_LIVE_UPDATE_WIRE.recovery.pathTemplate}`), false);
+    return;
+  }
   assert.equal(operations.length, SUPERVISOR_LIVE_UPDATE_WIRE.source.operations);
   assert.equal(
     (await readFile(new URL("../contracts/infra/cuna-api.openapi.sha256", import.meta.url), "utf8")).trim().split(/\s+/u)[0],
@@ -752,6 +775,7 @@ test("a partially preserved 200 is never described as a completed update", async
     streams: streams.streams,
     platform: filePlatform(root),
     env: { CUNA_API_KEY: API_KEY },
+    contractOperations: LIVE_UPDATE_SERVED,
     now: () => NOW,
     clientFactory: () => client,
   });
@@ -1158,6 +1182,7 @@ test("UR1-A: a host without exclusive reservation refuses instead of dispatching
     streams: streams.streams,
     platform: withoutExclusion,
     env: { CUNA_API_KEY: API_KEY },
+    contractOperations: LIVE_UPDATE_SERVED,
     now: () => NOW,
     clientFactory: () => fakeClient({
       async updateMachineSupervisorInPlace() { dispatched += 1; return undefined; },
@@ -1406,6 +1431,7 @@ test("starting a new update requires explicit confirmation; reading requires non
       streams: streams.streams,
       platform: filePlatform(root),
       env: { CUNA_API_KEY: API_KEY },
+      contractOperations: LIVE_UPDATE_SERVED,
       now: () => NOW,
       clientFactory: () => reader,
     });
@@ -1429,6 +1455,7 @@ test("live-update-status carries the fence into the ordinary printed answer", as
         streams: streams.streams,
         platform: filePlatform(root),
         env: { CUNA_API_KEY: API_KEY },
+        contractOperations: LIVE_UPDATE_SERVED,
         now: () => NOW,
         clientFactory: () => client,
       });
@@ -1796,7 +1823,10 @@ test("--resume reports a settled operation instead of re-sending it", async (t) 
   const resumed = await runJson(
     ["machines", "live-update-supervisor", MACHINE_ID, "--resume", "--json"], root, client);
   assert.equal(resumed.exit, EXIT_CODES.success, resumed.stderr);
-  assert.equal(resumed.record.command, "machines.live-update-status");
+  // The command that ran (PRD R4.1). It answered with a read, and `resumed`
+  // says so; the envelope used to name the read instead, so its error and its
+  // result named two different commands.
+  assert.equal(resumed.record.command, "machines.live-update-supervisor");
   assert.equal(resumed.record.data.resumed, false);
   assert.equal(resumed.record.data.next_action, "none");
   assert.equal(sent, before, "a settled operation is reported, never re-sent");

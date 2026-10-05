@@ -626,9 +626,16 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     for (const topic of INTERACTIVE_HUMAN_LOGIN_TOPICS) {
       const before = authority.state.servedRequests;
       const refused = await invokeInstalled(installedEntrypoint, [topic, "--project", PROJECT_ID], env, sandbox);
-      assert.equal(refused.code, 2, `installed ${topic} must refuse a redirected terminal`);
-      assert.equal(JSON.parse(refused.stderr).error.code, "cuna.usage.invalid", topic);
-      assert.match(JSON.parse(refused.stderr).error.message, /interactive terminal/u, topic);
+      if (UNSERVED_TOPICS.has(topic)) {
+        // Refused earlier still: the API version this build speaks cannot
+        // serve it, which is decided before the terminal is even looked at.
+        assert.equal(refused.code, 8, `installed ${topic} must refuse as not served`);
+        assert.equal(JSON.parse(refused.stderr).error.code, "cuna.contract.operation_not_served", topic);
+      } else {
+        assert.equal(refused.code, 2, `installed ${topic} must refuse a redirected terminal`);
+        assert.equal(JSON.parse(refused.stderr).error.code, "cuna.usage.invalid", topic);
+        assert.match(JSON.parse(refused.stderr).error.message, /interactive terminal/u, topic);
+      }
       assert.equal(authority.state.servedRequests, before, `installed ${topic} reached the producer before refusing`);
     }
     await runBoundedConcurrent(INSTALLED_FAILURE_MATRIX, READ_ONLY_MATRIX_CONCURRENCY, async (entry) => {
@@ -982,7 +989,7 @@ const INSTALLED_HELP_TOPICS = Object.freeze([
   "api-keys revoke", "agent-sessions", "agent-sessions list", "agent-sessions get",
   "agent-sessions create", "agent-sessions rename", "agent-sessions terminate",
   "agent-sessions attach", "agent", "connect", "config", "config set", "doctor", "self-test",
-  "version", "claude", "codex", "opencode", "shell", "sync", "companion",
+  "version", "claude", "codex", "opencode", "shell", "sync", "sync recover", "companion",
 ]);
 
 const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
@@ -1006,6 +1013,12 @@ const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze([
   // Reads the local record of one in-place update and sends nothing; it needs
   // a Machine this computer actually updated, which the generic matrix never has.
   "machines live-update-status",
+  // Recovers a folder whose workspace sync stopped. It needs a folder this
+  // computer bound and synced, with its durable sync state, against a server
+  // that serves the workspace-sync protocol; the generic matrix has none of
+  // those. Its success and every refusal are witnessed through runCli in
+  // test/sync-recover-command.test.mjs; here only its no-request refusal runs.
+  "sync recover",
 ]);
 // Implemented, help-visible, and refused outright by this installed harness:
 // both screens require a real interactive terminal under a human login, and
@@ -1022,7 +1035,15 @@ const CONDITIONALLY_AVAILABLE_TOPICS = Object.freeze([
 // A refusal is not a success. Interactive success acceptance for `observe` and
 // `share` stays OPEN and is not claimed by this test.
 const INTERACTIVE_HUMAN_LOGIN_TOPICS = Object.freeze(["observe", "share"]);
-const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "sync", "companion"]);
+// Routed, but the vendored contract (the deployed producer cdd7e9a, C4.17) has
+// no operation they send, so they refuse before anything else is checked. When
+// a synchronized contract serves them again, these rows fail and must be
+// re-decided, which is the point. C4.17 serves `share`'s reading again, so
+// `share` is back to the redirected-terminal refusal.
+const UNSERVED_TOPICS = new Set(["machines live-update-supervisor", "machines live-update-status"]);
+// Bare `sync` is still reserved (the `sync/reserved` row below), but it is no
+// longer a leaf topic once `sync recover` exists, exactly as `config` is not.
+const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "companion"]);
 
 const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "signup/usage", argv: ["signup", "extra", "--json"], exit: 2, code: "cuna.usage.invalid" },
@@ -1040,10 +1061,11 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "observe/non-interactive", argv: ["observe", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "share/non-interactive", argv: ["share", "--project", PROJECT_ID, "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "machines/usage", argv: ["machines", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
-  // Both live-update refusals are decided before configuration or transport.
-  { id: "machines/live-update-supervisor/confirmation", argv: ["machines", "live-update-supervisor", ID, "--json"], exit: 4, code: "cuna.confirmation.required" },
-  { id: "machines/live-update-status/usage", argv: ["machines", "live-update-status", "--json"], exit: 2, code: "cuna.usage.invalid" },
-  { id: "machines/live-update-supervisor/usage", argv: ["machines", "live-update-supervisor", ID, "--yes", "--forget-unknown", "--json"], exit: 2, code: "cuna.usage.invalid" },
+  // Both live-update commands are refused as not served before configuration,
+  // transport, confirmation or usage is checked (UNSERVED_TOPICS).
+  { id: "machines/live-update-supervisor/not-served", argv: ["machines", "live-update-supervisor", ID, "--json"], exit: 8, code: "cuna.contract.operation_not_served" },
+  { id: "machines/live-update-status/not-served", argv: ["machines", "live-update-status", "--json"], exit: 8, code: "cuna.contract.operation_not_served" },
+  { id: "machines/live-update-supervisor/not-served-with-usage-error", argv: ["machines", "live-update-supervisor", ID, "--yes", "--forget-unknown", "--json"], exit: 8, code: "cuna.contract.operation_not_served" },
   { id: "records/usage", argv: ["records", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "authorizations/usage", argv: ["authorizations", "list", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "account/usage", argv: ["account", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
@@ -1062,6 +1084,8 @@ const INSTALLED_FAILURE_MATRIX = Object.freeze([
   { id: "openclaw/non-tty", argv: ["openclaw", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "opencode/unavailable", argv: ["opencode", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "sync/reserved", argv: ["sync", "--json"], exit: 8, code: "cuna.capability.unsupported" },
+  // Refused in preflight, before configuration, credentials or any request.
+  { id: "sync/recover/confirmation", argv: ["sync", "recover", "--json"], exit: 4, code: "cuna.confirmation.required" },
   { id: "shell/reserved", argv: ["shell", "--json"], exit: 8, code: "cuna.capability.unsupported" },
   { id: "companion/reserved", argv: ["companion", "--json"], exit: 8, code: "cuna.capability.unsupported" },
 ]);

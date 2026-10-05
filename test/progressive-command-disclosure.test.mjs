@@ -12,6 +12,7 @@ import {
 } from "../dist/cli/help.js";
 import { CLI_ROUTE_REGISTRY, parseArgv, resolveCliRoute } from "../dist/cli/parser.js";
 import { preflightInvocation } from "../dist/commands/commands.js";
+import { isRouteServedByContract } from "../dist/cli/route-contract.js";
 import { EXIT_CODES, memoryStreams, runCli } from "../dist/index.js";
 
 const UUID_HEAVY = /(?:MACHINE_ID|SESSION_ID|workspace-binding-id|workspace-generation|idempotency-key)/u;
@@ -19,7 +20,7 @@ const UUID_HEAVY = /(?:MACHINE_ID|SESSION_ID|workspace-binding-id|workspace-gene
 function documentedRouteKeys(help) {
   return help
     .split("\n")
-    .map((line) => /^  \[(?:routed|reserved)\] (.+?) :: cuna /u.exec(line)?.[1])
+    .map((line) => /^  \[(?:routed|reserved|unserved)\] (.+?) :: cuna /u.exec(line)?.[1])
     .filter((key) => key !== undefined);
 }
 
@@ -212,7 +213,7 @@ test("complete help and parser discovery have an empty bidirectional difference"
   assert.deepEqual(helpKeys, parserKeys);
   // Anchored on the whole reference shape, not just the marker: the legend
   // above the reference opens two lines with the same brackets on purpose.
-  assert.equal((FULL_HELP.match(/^  \[(?:routed|reserved)\] .+ :: cuna /gmu) ?? []).length, parserKeys.length);
+  assert.equal((FULL_HELP.match(/^  \[(?:routed|reserved|unserved)\] .+ :: cuna /gmu) ?? []).length, parserKeys.length);
   assert.deepEqual(documentedRouteKeys(FULL_HELP), parserKeys);
 
   for (const route of CLI_ROUTE_REGISTRY) {
@@ -257,13 +258,19 @@ test("CONTRADICTION DETECTOR: no static command declaration speaks the server's 
   // what it used to do.
   const markers = [...COMPLETE_COMMAND_REFERENCE.matchAll(/^ {2}\[([a-z-]+)\]/gmu)].map((match) => match[1]);
   assert.equal(markers.length, CLI_ROUTE_REGISTRY.length, "one marker per route");
-  assert.deepEqual([...new Set(markers)].sort(), [...labels].sort());
+  // `unserved` is printed for a routed leaf the vendored contract cannot
+  // serve. It is a claim about this build's contract, never about the server.
+  assert.deepEqual(
+    [...new Set(markers)].sort(),
+    [...new Set(CLI_ROUTE_REGISTRY.map((route) =>
+      route.dispatch === "routed" && !isRouteServedByContract(route) ? "unserved" : route.dispatch))].sort(),
+  );
   for (const marker of new Set(markers)) {
     assert.ok(!server.has(marker), `help --all prints [${marker}], a server availability value`);
   }
   // And the legend must name the authority in the same view, so the marker
   // cannot be read as a status at all.
-  assert.match(FULL_HELP, /Neither marker is a server answer/u);
+  assert.match(FULL_HELP, /None of these markers is a server answer/u);
   assert.match(FULL_HELP, /Run `cuna capabilities` for what the\s+server currently proves/u);
 
   // (3) The prose of every static declaration and every per-command help topic.
@@ -337,7 +344,11 @@ test("preflight admission is closed over the shared command/action registry", ()
   for (const route of CLI_ROUTE_REGISTRY.filter((candidate) => candidate.dispatch === "routed")) {
     const parsed = parseArgv(route.argv);
     assert.equal(resolveCliRoute(parsed)?.key, route.key, route.key);
-    assert.doesNotThrow(() => preflightInvocation(parsed), route.key);
+    if (isRouteServedByContract(route)) assert.doesNotThrow(() => preflightInvocation(parsed), route.key);
+    else {
+      assert.throws(() => preflightInvocation(parsed),
+        (error) => error.code === "cuna.contract.operation_not_served", route.key);
+    }
   }
 
   for (const argv of [

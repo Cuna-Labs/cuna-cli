@@ -328,13 +328,13 @@ try {
       context.observations.resize = "64x16 host / 64x14 provider";
       const closingOffset = context.transcript().length;
       const interruptAt = Date.now();
-      context.child.write("\u0003");
+      context.child.write("\u001dd");
       await context.waitUntil(
         () => context.screen().includes("CUNA") && /[✦✧] Disconnecting\.\.\./u.test(context.screen()),
-        "Ctrl-C did not render immediate closing feedback inside the Cuna appbar",
+        "Ctrl+] d did not render immediate closing feedback inside the Cuna appbar",
       );
-      context.observations.ctrlCToClosingMs = Date.now() - interruptAt;
-      assert.ok(context.observations.ctrlCToClosingMs < 500, "closing feedback was not immediate");
+      context.observations.detachToClosingMs = Date.now() - interruptAt;
+      assert.ok(context.observations.detachToClosingMs < 500, "closing feedback was not immediate");
       await context.waitUntil(
         () => context.screen().includes("CUNA") && context.screen().includes("✓ Disconnected."),
         "successful detach did not render its brief Cuna confirmation",
@@ -346,13 +346,13 @@ try {
       const confirmation = closingTranscript.indexOf("✓ Disconnected.", finalFrame + 1);
       assert.ok(firstFrame >= 0 && middleFrame > firstFrame && finalFrame > middleFrame, "disconnect animation frames were not emitted in order");
       assert.ok(confirmation > finalFrame, "disconnect confirmation preceded the completed animation");
-      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("one Ctrl-C did not exit the rich composition within two seconds")), 2_000))]);
-      context.observations.singleCtrlC = true;
+      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("Ctrl+] d did not exit the rich composition within two seconds")), 2_000))]);
+      context.observations.singleDetachChord = true;
       context.observations.closingAnimation = "✦ → ✧ → ✦";
       context.observations.confirmation = "✓ Disconnected.";
     },
     async oracle({ finalState, transcript }) {
-      assert.equal(finalState.exitCode, 0, "rich composition Ctrl-C exit was nonzero");
+      assert.equal(finalState.exitCode, 0, "rich composition detach exit was nonzero");
       assert.equal(finalState.activeScreen, "normal", "rich composition did not restore the normal screen");
       assert.match(transcript(), /\u001b\[\?1049h/u, "rich composition never entered the alternate screen");
       assert.match(transcript(), /\u001b\[\?1049l/u, "rich composition did not leave the alternate screen");
@@ -369,10 +369,10 @@ try {
         "no-color rich foreground did not compose its appbar and provider viewport",
       );
       assert.doesNotMatch(context.transcript(), /\u001b\[(?:38|48);(?:2|5);/u, "--no-color emitted an SGR foreground or background color");
-      context.child.write("\u0003");
+      context.child.write("\u001dd");
       await context.waitUntil(
         () => context.screen().includes("CUNA") && /[✦✧] Disconnecting\.\.\./u.test(context.screen()),
-        "--no-color Ctrl-C did not render closing feedback",
+        "--no-color Ctrl+] d did not render closing feedback",
       );
       await context.waitUntil(
         () => context.screen().includes("CUNA") && context.screen().includes("✓ Disconnected."),
@@ -383,7 +383,7 @@ try {
       context.observations.closingVisible = true;
       context.observations.confirmationVisible = true;
       context.observations.colorSgrCount = 0;
-      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("one Ctrl-C did not exit no-color rich foreground within two seconds")), 2_000))]);
+      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("Ctrl+] d did not exit no-color rich foreground within two seconds")), 2_000))]);
     },
     async oracle({ finalState, transcript }) {
       assert.equal(finalState.exitCode, 0, "no-color rich closing exited nonzero");
@@ -399,10 +399,10 @@ try {
         () => context.screen().includes("CUNA") && context.screen().includes("REMOTE_ANSI256"),
         "detach-failure rich foreground did not reach its active frame",
       );
-      context.child.write("\u0003");
+      context.child.write("\u001dd");
       await context.waitUntil(
         () => context.screen().includes("CUNA") && /[✦✧] Disconnecting\.\.\./u.test(context.screen()),
-        "detach failure did not acknowledge Ctrl-C with closing feedback",
+        "detach failure did not acknowledge Ctrl+] d with closing feedback",
       );
       await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("detach failure did not restore and exit within three seconds")), 3_000))]);
       context.observations.closingVisible = true;
@@ -453,8 +453,8 @@ try {
       context.observations.arrowSelectedAgentSession = CLAUDE_SESSION_ID;
       context.observations.skippedMachineMenu = true;
       context.observations.enteredForeground = true;
-      context.child.write("\u0003");
-      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("one Ctrl-C did not exit the direct attach flow within two seconds")), 2_000))]);
+      context.child.write("\u001dd");
+      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("Ctrl+] d did not exit the direct attach flow within two seconds")), 2_000))]);
     },
     async oracle({ finalState, transcript }) {
       assert.equal(finalState.exitCode, 0, "machines direct attach flow exited nonzero");
@@ -534,19 +534,19 @@ try {
       assert.match(context.screen(), /OpenCode cloud session 界 🦊/u, "OpenCode Unicode output was corrupted after resize");
       context.observations.resize = "64x16 host / 64x14 provider";
       const interruptAt = Date.now();
-      context.child.write("\u0003");
+      context.child.write("\u001dd");
       await context.waitUntil(
         () => context.screen().includes("CUNA") && /[✦✧] Disconnecting\.\.\./u.test(context.screen()),
-        "one Ctrl-C did not render OpenCode closing feedback",
+        "Ctrl+] d did not render OpenCode closing feedback",
       );
-      context.observations.ctrlCToClosingMs = Date.now() - interruptAt;
-      assert.ok(context.observations.ctrlCToClosingMs < 500, "OpenCode closing feedback was not immediate");
+      context.observations.detachToClosingMs = Date.now() - interruptAt;
+      assert.ok(context.observations.detachToClosingMs < 500, "OpenCode closing feedback was not immediate");
       await context.waitUntil(
         () => context.screen().includes("CUNA") && context.screen().includes("✓ Disconnected."),
         "OpenCode detach did not render confirmation",
       );
-      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("one Ctrl-C did not exit cuna opencode within two seconds")), 2_000))]);
-      context.observations.singleCtrlC = true;
+      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("Ctrl+] d did not exit cuna opencode within two seconds")), 2_000))]);
+      context.observations.singleDetachChord = true;
       context.observations.colors = "Cuna truecolor + provider ANSI-256";
       context.observations.unicode = "界 🦊";
     },
@@ -617,8 +617,8 @@ try {
         context.observations.discoveryProgress = true;
         context.observations.attachFrames = "◐ → ◓";
         context.observations.cleanOwnershipHandoff = true;
-        context.child.write("\u0003");
-        await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("one Ctrl-C did not exit bare cuna within two seconds")), 2_000))]);
+        context.child.write("\u001dd");
+        await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("Ctrl+] d did not exit bare cuna within two seconds")), 2_000))]);
       },
       async oracle({ finalState }) {
         assert.equal(finalState.exitCode, 0, "bare cuna loading journey exited nonzero");
@@ -715,8 +715,8 @@ try {
         context.observations.openableSessions = 1;
         context.observations.terminatedSessions = 2;
         context.observations.inputBeforeAttach = "Enter, down, Enter";
-        context.child.write("\u0003");
-        await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("one Ctrl-C did not exit the exact-session attach flow within two seconds")), 2_000))]);
+        context.child.write("\u001dd");
+        await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("Ctrl+] d did not exit the exact-session attach flow within two seconds")), 2_000))]);
       },
       async oracle({ finalState, transcript }) {
         assert.equal(finalState.exitCode, 0, "exact-session attach flow exited nonzero");
@@ -750,8 +750,8 @@ try {
       context.child.write("input-ok\r");
       await context.waitUntil(() => /PASTED [0-9]+/u.test(context.screen()), "native input disappeared after the Executions return");
       context.observations.inputReceipt = context.screen();
-      context.child.write("\u0003");
-      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("Ctrl-C did not detach after Executions return")), 2_000))]);
+      context.child.write("\u001dd");
+      await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("Ctrl+] d did not detach after Executions return")), 2_000))]);
     },
     async oracle({ finalState, transcript }) {
       assert.equal(finalState.exitCode, 0, "Executions return attach exited nonzero");
@@ -779,8 +779,8 @@ try {
           await context.waitUntil(() => context.screen().includes("Control unavailable: supervisor_writer_operation_unavailable"), "observer input did not retain its control refusal");
           assert.doesNotMatch(context.transcript(), /ACCEPTED /u, "observer input reached the provider fixture");
         }
-        context.child.write("\u0003");
-        await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("writer refresh Ctrl-C did not detach")), 2_000))]);
+        context.child.write(mode === "supported" ? "\u001dd" : "\u0003");
+        await Promise.race([context.exited, new Promise((_, reject) => setTimeout(() => reject(new Error(mode === "supported" ? "writer refresh Ctrl+] d did not detach" : "observer Ctrl-C did not detach")), 2_000))]);
       },
       async oracle({ finalState, transcript }) {
         assert.equal(finalState.exitCode, 0);

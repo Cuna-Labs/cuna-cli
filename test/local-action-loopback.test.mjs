@@ -24,9 +24,9 @@ async function unusedPort() {
   return address.port;
 }
 
-function get(port, path) {
+function get(port, path, host) {
   return new Promise((resolve, reject) => {
-    const request = httpRequest({ host: "127.0.0.1", port, path, method: "GET" }, (response) => {
+    const request = httpRequest({ host: "127.0.0.1", port, path, method: "GET", ...(host === undefined ? {} : { headers: { host } }) }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
       response.on("end", () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks).toString("utf8") }));
@@ -57,7 +57,7 @@ test("callback relay rejects duplicate query keys and consumes valid authority b
     deadlineMs: Date.now() + 10_000,
     maxAttempts: 4,
     maxConnections: 3,
-    relay: async (callback) => { seen.push(callback); await relayGate.promise; },
+    relay: async (callback) => { seen.push(callback); return await relayGate.promise; },
   });
 
   const duplicate = await get(port, "/oauth/callback?code=one&code=two&state=expected-state");
@@ -65,8 +65,9 @@ test("callback relay rejects duplicate query keys and consumes valid authority b
   assert.equal(duplicate.headers.location, undefined, "the local relay never redirects");
   assert.equal(seen.length, 0);
 
-  const accepted = await get(port, "/oauth/callback?code=opaque-code&state=expected-state");
-  assert.equal(accepted.status, 202);
+  // The browser is answered only after the Machine answered the relay.
+  const accepted = get(port, "/oauth/callback?code=opaque-code&state=expected-state");
+  for (let attempt = 0; attempt < 200 && seen.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(seen.length, 1);
   assert.deepEqual(seen[0], { provider: "codex", code: "opaque-code", state: "expected-state" });
 
@@ -77,8 +78,38 @@ test("callback relay rejects duplicate query keys and consumes valid authority b
   handle.completion.then(() => { completed = true; });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(completed, false, "opening the callback is not relay success");
-  relayGate.resolve();
-  assert.equal((await handle.completion).outcome, "relayed");
+  relayGate.resolve("delivered");
+  const answered = await accepted;
+  assert.equal(answered.status, 200);
+  assert.match(answered.body, /Sent to Codex on your Machine/u);
+  const receipt = await handle.completion;
+  assert.equal(receipt.outcome, "relayed");
+  assert.equal(receipt.answer, "delivered");
+});
+
+test("callback relay accepts the redirect's own Host, localhost, and no other name", async () => {
+  const port = await unusedPort();
+  const seen = [];
+  const handle = await startCallbackRelay({
+    provider: "codex",
+    localHost: "127.0.0.1",
+    exactLocalPort: port,
+    localPath: "/auth/callback",
+    expectedStateDigest: digest("state"),
+    expectedNonceDigest: digest("nonce"),
+    requestNonce: "nonce",
+    deadlineMs: Date.now() + 10_000,
+    maxAttempts: 4,
+    maxConnections: 4,
+    relay: async (callback) => { seen.push(callback); return "refused"; },
+  });
+  assert.equal((await get(port, "/auth/callback?code=c&state=state", `example.test:${port}`)).status, 400);
+  assert.equal((await get(port, "/auth/callback?code=c&state=state", "localhost:1")).status, 400);
+  assert.equal(seen.length, 0);
+  const refused = await get(port, "/auth/callback?code=c&state=state", `localhost:${port}`);
+  assert.equal(refused.status, 502, "the Machine's refusal reaches the browser");
+  assert.match(refused.body, /Codex on your Machine refused this sign-in/u);
+  assert.equal((await handle.completion).answer, "refused");
 });
 
 test("callback relay binds the exact port and fails closed after its attempt budget", async () => {
@@ -127,10 +158,10 @@ test("callback nonce is envelope authority, never a browser query parameter", as
   const handle = await startCallbackRelay({
     ...common,
     requestNonce: "envelope-nonce",
-    relay: async (callback) => { seen.push(callback); },
+    relay: async (callback) => { seen.push(callback); return "delivered"; },
   });
   const response = await get(port, "/oauth/callback?state=state&error=access_denied");
-  assert.equal(response.status, 202);
+  assert.equal(response.status, 200);
   await handle.completion;
   assert.deepEqual(seen, [{ provider: "codex", state: "state", error: "access_denied" }]);
 });

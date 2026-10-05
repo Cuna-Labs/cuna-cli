@@ -19,6 +19,608 @@
     }
   ],
   "paths": {
+    "/v1/teams": {
+      "get": {
+        "operationId": "teams.list",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "x-runa-error-model": "problem"
+      },
+      "post": {
+        "operationId": "teams.create",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "operation_id",
+                  "expected_account_id",
+                  "name"
+                ],
+                "properties": {
+                  "operation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_account_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-runa-error-model": "problem"
+      }
+    },
+    "/v1/teams/{id}": {
+      "get": {
+        "operationId": "teams.detail",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "x-runa-error-model": "problem"
+      }
+    },
+    "/v1/teams/{id}/invitations": {
+      "post": {
+        "operationId": "teams.invite",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "operation_id",
+                  "expected_account_id",
+                  "email"
+                ],
+                "properties": {
+                  "operation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_account_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "email": {
+                    "type": "string",
+                    "format": "email",
+                    "maxLength": 254
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-runa-error-model": "problem"
+      }
+    },
+    "/v1/teams/{id}/accept": {
+      "post": {
+        "operationId": "teams.accept",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "operation_id",
+                  "expected_account_id",
+                  "invitation_id"
+                ],
+                "properties": {
+                  "operation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_account_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "invitation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-runa-error-model": "problem"
+      }
+    },
+    "/v1/teams/{id}/revoke-invitation": {
+      "post": {
+        "operationId": "teams.revoke",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "operation_id",
+                  "expected_account_id",
+                  "invitation_id"
+                ],
+                "properties": {
+                  "operation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_account_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "invitation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-runa-error-model": "problem"
+      }
+    },
+    "/v1/teams/{id}/remove-member": {
+      "post": {
+        "operationId": "teams.remove",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "operation_id",
+                  "expected_account_id",
+                  "principal_id",
+                  "revision"
+                ],
+                "properties": {
+                  "operation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_account_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "principal_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-runa-error-model": "problem"
+      }
+    },
+    "/v1/teams/{id}/rename": {
+      "post": {
+        "operationId": "teams.rename",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "operation_id",
+                  "expected_account_id",
+                  "name"
+                ],
+                "properties": {
+                  "operation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_account_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-runa-error-model": "problem"
+      }
+    },
+    "/v1/teams/{id}/projects": {
+      "get": {
+        "operationId": "teams.projects",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "x-runa-error-model": "problem"
+      },
+      "post": {
+        "operationId": "teams.link",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "operation_id",
+                  "expected_account_id",
+                  "project_id"
+                ],
+                "properties": {
+                  "operation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_account_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "project_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-runa-error-model": "problem"
+      }
+    },
     "/v1/me": {
       "get": {
         "operationId": "me.get",
@@ -414,6 +1016,26 @@
               "minLength": 1,
               "maxLength": 512
             }
+          },
+          {
+            "name": "include_readiness",
+            "in": "query",
+            "required": false,
+            "description": "Pass the exact value true to include durable readiness fields. Omission preserves the prior AgentSession response for installed CLI clients.",
+            "schema": {
+              "type": "string",
+              "enum": ["true"]
+            }
+          },
+          {
+            "name": "include_runtime_evidence",
+            "in": "query",
+            "required": false,
+            "description": "Pass the exact value true to include runtime_evidence. Omission preserves the prior AgentSession response for installed CLI clients.",
+            "schema": {
+              "type": "string",
+              "enum": ["true"]
+            }
           }
         ],
         "responses": {
@@ -694,6 +1316,28 @@
         "operationId": "agentSessions.get",
         "x-sdk-exposed": true,
         "x-runa-error-model": "problem",
+        "parameters": [
+          {
+            "name": "include_readiness",
+            "in": "query",
+            "required": false,
+            "description": "Pass the exact value true to include durable readiness fields. Omission preserves the prior AgentSession response for installed CLI clients.",
+            "schema": {
+              "type": "string",
+              "enum": ["true"]
+            }
+          },
+          {
+            "name": "include_runtime_evidence",
+            "in": "query",
+            "required": false,
+            "description": "Pass the exact value true to include runtime_evidence. Omission preserves the prior AgentSession response for installed CLI clients.",
+            "schema": {
+              "type": "string",
+              "enum": ["true"]
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Owned AgentSession intent and runtime observation.",
@@ -1547,104 +2191,6 @@
         ]
       }
     },
-    "/v1/sessions/{id}/supervisor/live-update": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/SessionId"
-        }
-      ],
-      "post": {
-        "operationId": "sessions.updateSupervisorInPlace",
-        "x-sdk-exposed": false,
-        "x-runa-error-model": "problem",
-        "description": "Replace a running Machine's supervisor in place, preserving its live AgentSessions through the unit's descriptor store. Distinct from the stopped-boundary replacement: Cuna measures this Machine's boot, unit incarnation, installed artifact digests and every live session's process, PTY and stored master before the installer runs, the installer re-measures all of them under the provider-install lock before it writes, and the operation refuses before any artifact or unit change when they do not hold. A 200 reports the exact new control generation, the installed artifact digest and one custody outcome per AgentSession that existed before the update. The caller chooses operation_id before sending: Cuna records that identity durably before it issues any enrollment, so repeating the SAME operation_id never rotates control a second time. Repeating it is the recovery path for a lost response -- it resumes what was never sent, reconciles what may have been, and returns the recorded answer once there is one. A DIFFERENT operation_id for a Machine whose update has not settled is refused.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json; charset=utf-8": {
-              "schema": {
-                "$ref": "#/components/schemas/SupervisorLiveUpdateRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "$ref": "#/components/responses/SupervisorLiveUpdateResult"
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-runa-auth-classes": [
-          "browser_jwt",
-          "programmatic_api_key",
-          "cli_human"
-        ],
-        "x-runa-required-permissions": [
-          "machines:update"
-        ],
-        "security": [
-          {
-            "SupabaseJwt": []
-          },
-          {
-            "RunaApiKey": []
-          },
-          {
-            "CunaHumanBearer": []
-          }
-        ]
-      }
-    },
-    "/v1/sessions/{id}/supervisor/live-update/{operationId}": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/SessionId"
-        },
-        {
-          "name": "operationId",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "$ref": "#/components/schemas/Uuid"
-          }
-        }
-      ],
-      "get": {
-        "operationId": "sessions.readSupervisorInPlaceUpdate",
-        "x-sdk-exposed": false,
-        "x-runa-error-model": "problem",
-        "description": "Authoritative phase and known result of one owned in-place supervisor update. A read only: it dispatches no installer, sends nothing to the Machine and changes no state. The phase distinguishes the four outcomes the operation itself distinguishes -- nothing was sent, this Machine's control rotated and the installer's outcome is unknown, the artifact is installed and its acknowledgement or the fate of the AgentSessions is not yet established, and settled. agent_sessions carries the per-AgentSession account only once the operation settled with one; declared_sessions names the AgentSessions the attempt was about. A running Machine is not evidence that an update did or did not apply, and this read is the only thing that is. An operation that is not settled reports next_action repeat_same_operation: reissuing the same operation_id to the POST route is what resolves it.",
-        "responses": {
-          "200": {
-            "$ref": "#/components/responses/SupervisorLiveUpdateOperation"
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-runa-auth-classes": [
-          "browser_jwt",
-          "programmatic_api_key",
-          "cli_human"
-        ],
-        "x-runa-required-permissions": [
-          "machines:read"
-        ],
-        "security": [
-          {
-            "SupabaseJwt": []
-          },
-          {
-            "RunaApiKey": []
-          },
-          {
-            "CunaHumanBearer": []
-          }
-        ]
-      }
-    },
     "/v1/sessions/{id}/exec": {
       "parameters": [
         {
@@ -1824,6 +2370,7 @@
       "get": {
         "operationId": "records.list",
         "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
         "responses": {
           "200": {
             "description": "Owned record entries",
@@ -1839,7 +2386,137 @@
             }
           },
           "default": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "records:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/records/page": {
+      "get": {
+        "operationId": "records.page",
+        "x-sdk-exposed": true,
+        "x-runa-error-model": "problem",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque cursor returned as next_cursor by the preceding page.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded page of owned record entries, newest first. Without a cursor it is the first page; records.list is the first 200 rows of the same order.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordPage"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "records:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/records/all": {
+      "get": {
+        "operationId": "records.pageAll",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque cursor returned as next_cursor by the preceding page of this operation. A records.page cursor is refused here, and this operation's cursor is refused by records.page.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded page of every owned record entry, newest first, in the order records.page uses. Unlike records.list and records.page it includes account-level records (for example credential.set, credential.delete and metering.reconcile), whose session_id is null.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountRecordPage"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
           }
         },
         "x-runa-auth-classes": [
@@ -2135,6 +2812,62 @@
         ]
       }
     },
+    "/v1/sessions/{id}/observations": {
+      "parameters": [{"$ref":"#/components/parameters/SessionId"}],
+      "get": {
+        "operationId":"console.machineObservations",
+        "description":"Most recent 100 retained independently collected system events. Machine-scoped; no verified AgentSession attribution. Empty events do not establish collector readiness or complete history. Consult the summary endpoint's retention fields for known server eviction and the collector coverage counters; this history response has no standalone completeness marker.",
+        "x-sdk-exposed":false,
+        "responses":{
+          "200":{"$ref":"#/components/responses/Json"},
+          "default":{"$ref":"#/components/responses/Error"}
+        },
+        "x-runa-auth-classes":["browser_jwt","programmatic_api_key","cli_human"],
+        "x-runa-required-permissions":["run_inspector:read"],
+        "security":[{"SupabaseJwt":[]},{"RunaApiKey":[]},{"CunaHumanBearer":[]}]
+      }
+    },
+    "/v1/sessions/{id}/observations/summary": {
+      "parameters": [{"$ref":"#/components/parameters/SessionId"}],
+      "get": {
+        "operationId":"console.machineObservationSummary",
+        "description":"Counts over the last hour, six hours or day, computed from retained events: a 60-bucket histogram by kind, process lifetimes from start/end pairs (by boot and process fingerprint), starts with no end seen, and collector-reported losses. scan_limited reports the 100,000-row read bound. retention_limited reports known server eviction or a window predating retention accounting; retention_evicted_total counts only deletions since accounting began. These fields are absent until the retention migration and compatible Edge are active; absence means unknown, not false or zero. Collector coverage.dropped_total counts local discards before confirmed receipt and can include an in-flight event that reached the server; it is not an exact count of database-missing rows. Neither flag proves complete Tetragon source capture. Machine-scoped; no AgentSession attribution; no program identity is stored.",
+        "x-sdk-exposed":false,
+        "parameters":[{"name":"window","in":"query","required":false,"schema":{"type":"string","enum":["1h","6h","24h"],"default":"1h"}},{"name":"kind","in":"query","required":false,"schema":{"type":"string","enum":["process_started","process_ended","file_open_requested"]}}],
+        "responses":{
+          "200":{"description":"UTF-8 JSON response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SystemActivitySummary"}}}},
+          "default":{"$ref":"#/components/responses/Error"}
+        },
+        "x-runa-auth-classes":["browser_jwt","programmatic_api_key","cli_human"],
+        "x-runa-required-permissions":["run_inspector:read"],
+        "security":[{"SupabaseJwt":[]},{"RunaApiKey":[]},{"CunaHumanBearer":[]}]
+      }
+    },
+    "/v1/sessions/{id}/observations/programs": {
+      "parameters":[{"$ref":"#/components/parameters/SessionId"}],
+      "get":{
+        "operationId":"console.machineObservationPrograms",
+        "description":"Top ten observed program basenames over the selected retained window, bounded to the newest 100000 rows. scan_limited marks the scan bound; retention_limited marks a window predating retention accounting or a known oldest-first eviction. retention_evicted_total counts only deletions since accounting began. Counts describe retained rows, not complete process activity. Unknown names remain uncounted by program; no path, arguments, raw UID or parent identity is exposed. Machine-scoped without AgentSession attribution.",
+        "x-sdk-exposed":false,
+        "parameters":[{"name":"window","in":"query","required":false,"schema":{"type":"string","enum":["1h","6h","24h"],"default":"1h"}}],
+        "responses":{"200":{"description":"UTF-8 JSON response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SystemActivityPrograms"}}}},"default":{"$ref":"#/components/responses/Error"}},
+        "x-runa-auth-classes":["browser_jwt","programmatic_api_key","cli_human"],
+        "x-runa-required-permissions":["run_inspector:read"],
+        "security":[{"SupabaseJwt":[]},{"RunaApiKey":[]},{"CunaHumanBearer":[]}]
+      }
+    },
+    "/v1/sessions/{id}/observations/programs/events": {
+      "parameters":[{"$ref":"#/components/parameters/SessionId"}],
+      "get":{
+        "operationId":"console.machineObservationProgramEvents",
+        "description":"Most recent 100 retained machine events with optional bounded program basenames, account class and exit outcome. The original observations endpoint keeps its Phase A response shape.",
+        "x-sdk-exposed":false,
+        "responses":{"200":{"description":"UTF-8 JSON response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SystemActivityProgramHistory"}}}},"default":{"$ref":"#/components/responses/Error"}},
+        "x-runa-auth-classes":["browser_jwt","programmatic_api_key","cli_human"],
+        "x-runa-required-permissions":["run_inspector:read"],
+        "security":[{"SupabaseJwt":[]},{"RunaApiKey":[]},{"CunaHumanBearer":[]}]
+      }
+    },
     "/v1/sessions/{id}/token-analyze": {
       "parameters": [
         {
@@ -2202,6 +2935,18 @@
           },
           {
             "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "call",
+            "in": "query",
+            "required": false,
+            "description": "Load a captured call owned by the current user using its public analysis ID.",
+            "schema": {
+              "type": "string",
+              "pattern": "^call-[a-f0-9]{16}$"
+            }
           }
         ]
       }
@@ -2323,7 +3068,10 @@
           "workspace_binding_idempotency_conflict",
           "workspace_binding_prerequisite_incomplete",
           "workspace_binding_invalid_request",
-          "workspace_binding_authority_unavailable"
+          "workspace_binding_authority_unavailable",
+          "machine_supervisor_control_expired",
+          "machine_supervisor_control_revoked",
+          "machine_supervisor_control_absent"
         ],
         "parameters": [
           {
@@ -2464,6 +3212,77 @@
         ],
         "x-runa-required-permissions": [
           "workspace_sync:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/workspace-bindings/{binding_id}/release": {
+      "parameters": [
+        {
+          "name": "binding_id",
+          "in": "path",
+          "required": true,
+          "description": "Opaque canonical WorkspaceBinding identifier.",
+          "schema": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "workspaceBindings.release",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "workspace_binding_unavailable",
+          "workspace_binding_in_use",
+          "workspace_binding_sync_pending",
+          "workspace_binding_prerequisite_incomplete",
+          "workspace_binding_invalid_request",
+          "workspace_binding_authority_unavailable"
+        ],
+        "description": "Release one local folder's WorkspaceBinding. Refused while an AgentSession in its Workspace has not settled (workspace_binding_in_use), or while an upload is open or an AgentSession settled within the last 120 s (workspace_binding_sync_pending, retryable). Deletes nothing; idempotent by state.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceBindingReleaseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Released, or already released, workspace binding",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceBindingRelease"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "workspace_sync:write"
         ],
         "security": [
           {
@@ -2955,6 +3774,72 @@
             "CunaHumanBearer": []
           }
         ]
+      }
+    },
+    "/v1/machine-creates": {
+      "post": {
+        "operationId": "machineCreates.admitV2",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/MachineCreateRequestIdV2" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": { "$ref": "#/components/schemas/MachineCreateV2Admission" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Durable owner-scoped Machine identity committed before provider work. The response does not assert runtime readiness.",
+            "headers": {
+              "Location": { "schema": { "type": "string" } },
+              "Cache-Control": { "schema": { "const": "no-store" } },
+              "Retry-After": { "schema": { "const": "5" } }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MachineCreateV2Receipt" }
+              }
+            }
+          },
+          "default": { "$ref": "#/components/responses/Problem" }
+        },
+        "x-runa-auth-classes": ["browser_jwt"],
+        "x-runa-required-permissions": ["machines:create"],
+        "security": [{ "SupabaseJwt": [] }]
+      }
+    },
+    "/v1/machine-creates/v2/{id}": {
+      "parameters": [{
+        "name": "id", "in": "path", "required": true,
+        "schema": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+      }],
+      "get": {
+        "operationId": "machineCreates.getV2",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "responses": {
+          "200": {
+            "description": "Current owner-scoped V2 operation state; no provider effect or reconciliation is initiated by this read.",
+            "headers": {
+              "Cache-Control": { "schema": { "const": "no-store" } }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MachineCreateV2Receipt" }
+              }
+            }
+          },
+          "default": { "$ref": "#/components/responses/Problem" }
+        },
+        "x-runa-auth-classes": ["browser_jwt"],
+        "x-runa-required-permissions": ["machines:read"],
+        "security": [{ "SupabaseJwt": [] }]
       }
     },
     "/v1/machine-creates/{id}": {
@@ -6186,6 +7071,162 @@
         }
       }
     },
+    "/v1/credentials/activity": {
+      "get": {
+        "operationId": "console.credentials.activity",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "description": "Recent configuration events",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "events",
+                    "limit",
+                    "coverage"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "coverage": {
+                      "const": "configuration_changes"
+                    },
+                    "limit": {
+                      "const": 200
+                    },
+                    "events": {
+                      "type": "array",
+                      "maxItems": 200,
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "id",
+                          "kind",
+                          "created_at"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "enum": [
+                              "credential.set",
+                              "credential.delete",
+                              "credential_rule.create",
+                              "credential_rule.delete"
+                            ]
+                          },
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "credentials:manage"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "description": "Latest 200 account-owned credential configuration audit events. Does not imply runtime usage or per-secret attribution. No content-bearing audit fields are returned."
+      }
+    },
+    "/v1/teams/{id}/decline": {
+      "post": {
+        "operationId": "teams.decline",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "collaboration:accept"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "operation_id",
+                  "expected_account_id",
+                  "invitation_id"
+                ],
+                "properties": {
+                  "operation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_account_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "invitation_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-runa-error-model": "problem"
+      }
+    },
     "/v1/collaboration/2/agent-sessions/{id}/audience-state": {
       "post": {
         "operationId": "readSessionAudienceStateV2",
@@ -6314,6 +7355,16 @@
           "$ref": "#/components/schemas/Uuid"
         }
       },
+      "MachineCreateRequestIdV2": {
+        "name": "X-Cuna-Machine-Create-Request-Id",
+        "in": "header",
+        "required": true,
+        "description": "Caller-generated canonical UUIDv4 retained before the first V2 attempt and reused after an uncertain response.",
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        }
+      },
       "CliContinuationId": {
         "name": "id",
         "in": "path",
@@ -6384,26 +7435,6 @@
         "content": {
           "application/json": {
             "schema": {}
-          }
-        }
-      },
-      "SupervisorLiveUpdateResult": {
-        "description": "In-place supervisor update result with per-AgentSession custody",
-        "content": {
-          "application/json": {
-            "schema": {
-              "$ref": "#/components/schemas/SupervisorLiveUpdateResult"
-            }
-          }
-        }
-      },
-      "SupervisorLiveUpdateOperation": {
-        "description": "Authoritative phase and known result of one in-place supervisor update",
-        "content": {
-          "application/json": {
-            "schema": {
-              "$ref": "#/components/schemas/SupervisorLiveUpdateOperation"
-            }
           }
         }
       }
@@ -7517,7 +8548,6 @@
           ]
         },
         "required": [
-          "process_observation",
           "id",
           "machine_id",
           "name",
@@ -7605,12 +8635,61 @@
               "terminated"
             ]
           },
+          "process_observation": {
+            "description": "Whether the supervisor established this process fact for the current epoch. Unknown includes pre-provenance writers and epoch mismatch; unproven means a lease settled without a child observation. This is separate from lease freshness.",
+            "enum": ["observed", "unproven", "unknown"]
+          },
+          "readiness_deadline_at": {
+            "description": "Immutable deadline for an attested process and retained PTY. Present only when GET/list uses include_readiness=true. Expiry alone never proves process absence.",
+            "type": "string",
+            "format": "date-time"
+          },
+          "readiness_outcome": {
+            "description": "Durable startup outcome returned only by opted GET/list. Reconciliation required preserves a possibly live child and its identity.",
+            "enum": ["pending", "attested", "refused", "reconciliation_required"]
+          },
+          "readiness_reason": {
+            "description": "Typed reason for refusal or reconciliation. Omitted for pending and attested.",
+            "enum": ["deadline_unattested", "runtime_ended_unattested", "request_settled_unattested", "workspace_materialization_failed", "cancelled_before_dispatch", "session_executable_allowlist", "session_executable_unavailable", "session_executable_permissions", "session_executable_owner", "session_executable_location", "session_capacity_memory"]
+          },
+          "readiness_settled_at": {
+            "type": "string",
+            "format": "date-time"
+          },
           "process_epoch": {
             "$ref": "#/components/schemas/Uuid"
           },
           "runtime_observed_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "runtime_evidence": {
+            "description": "Supervisor evidence behind the runtime fields. Present only when GET/list uses include_runtime_evidence=true and a supervisor acknowledgement exists. process_proof says why process_observation has its value: not_stated means the last acknowledgement stated no proof either way (it is not evidence that the process is absent), other_process_epoch that the proof belongs to an earlier process, no_process_epoch that no process has been launched.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "source",
+              "observed_at",
+              "age_seconds",
+              "process_proof"
+            ],
+            "properties": {
+              "source": {
+                "const": "supervisor_ack"
+              },
+              "observed_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "age_seconds": {
+                "description": "Seconds since observed_at on the server clock when the response was produced.",
+                "type": "integer",
+                "minimum": 0
+              },
+              "process_proof": {
+                "enum": ["observed", "unproven", "not_stated", "other_process_epoch", "no_process_epoch"]
+              }
+            }
           },
           "runtime_expires_at": {
             "description": "Authoritative expiry of the current leased supervisor observation. Omitted when no runtime lease exists.",
@@ -7651,18 +8730,11 @@
               "session_executable_permissions",
               "session_executable_owner",
               "session_executable_location",
+              "session_capacity_memory",
               "canonical_launch_interrupted",
               "machine_restarted"
             ],
             "description": "Optional safe reason from an accepted terminal process observation; emitted only for exited, failed or terminated. Absent for legacy or unrecognized reasons. This is not provider output or an exit status."
-          },
-          "process_observation": {
-            "description": "Whether a supervisor ESTABLISHED process_state and runtime_observed_at for the CURRENT process_epoch. observed: it did. unproven: it settled a runtime-lease renewal without being able to observe the child, so process_state and runtime_observed_at are the last values anybody established and the lease moved without them. unknown: no provenance is recorded for this epoch, which includes every observation older than the release that began recording it and every epoch that has since been relaunched. Absence of provenance is never proof of observation, and runtime_expires_at is lease authority, never observation freshness. Cuna states no staleness threshold; a client must not invent one.",
-            "enum": [
-              "observed",
-              "unproven",
-              "unknown"
-            ]
           }
         }
       },
@@ -8075,6 +9147,44 @@
           "create_operation": {
             "$ref": "#/components/schemas/MachineCreateRequest",
             "description": "Durable creation operation when retained. Unknown requires reconciliation; it does not establish provider absence or continued creation."
+          },
+          "status_check": {
+            "description": "Present only in sessions.list, for a Machine whose status the list checked with the provider (a running, suspended or paused Machine with a runtime). confirmed: the provider's answer at list time agrees with status, or status was reconciled to it. unverified: status is the last stored value and was not confirmed on this read; reason says why. provider_read_pending means the read did not answer within the list's bound, or one is already in progress; it continues and may still reconcile the Machine.",
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "state"
+                ],
+                "properties": {
+                  "state": {
+                    "const": "confirmed"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "state",
+                  "reason"
+                ],
+                "properties": {
+                  "state": {
+                    "const": "unverified"
+                  },
+                  "reason": {
+                    "enum": [
+                      "provider_read_pending",
+                      "provider_read_failed",
+                      "provider_status_unmapped",
+                      "transition_in_progress"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         }
       },
@@ -8370,6 +9480,167 @@
           }
         }
       },
+      "SystemActivitySummary": {"type":"object","additionalProperties":false,"dependentRequired":{"retention_limited":["retention_evicted_total","retention_accounting_started_at"],"retention_evicted_total":["retention_limited","retention_accounting_started_at"],"retention_accounting_started_at":["retention_limited","retention_evicted_total"]},"required":["source","scope","session_attribution","window","window_start","window_end","bucket_seconds","scan_limited","totals","histogram","lifetimes","coverage"],"properties":{"source":{"type":"string","enum":["tetragon"]},"scope":{"type":"string","enum":["machine"]},"session_attribution":{"type":"string","enum":["unverified"]},"window":{"type":"string","enum":["1h","6h","24h"]},"kind":{"type":"string","enum":["process_started","process_ended","file_open_requested"]},"window_start":{"type":"string","format":"date-time"},"window_end":{"type":"string","format":"date-time"},"bucket_seconds":{"type":"integer","minimum":1},"scan_limited":{"type":"boolean"},"retention_limited":{"type":"boolean"},"retention_evicted_total":{"type":"integer","minimum":0,"maximum":9007199254740991},"retention_accounting_started_at":{"type":"string","format":"date-time"},"totals":{"type":"object","additionalProperties":false,"required":["process_started","process_ended","file_open_requested"],"properties":{"process_started":{"type":"integer","minimum":0,"maximum":9007199254740991},"process_ended":{"type":"integer","minimum":0,"maximum":9007199254740991},"file_open_requested":{"type":"integer","minimum":0,"maximum":9007199254740991}}},"histogram":{"type":"array","minItems":60,"maxItems":60,"items":{"type":"object","additionalProperties":false,"required":["start","process_started","process_ended","file_open_requested"],"properties":{"start":{"type":"string","format":"date-time"},"process_started":{"type":"integer","minimum":0,"maximum":9007199254740991},"process_ended":{"type":"integer","minimum":0,"maximum":9007199254740991},"file_open_requested":{"type":"integer","minimum":0,"maximum":9007199254740991}}}},"lifetimes":{"type":"object","additionalProperties":false,"required":["paired","no_end_seen","median_ms","p95_ms","buckets"],"properties":{"paired":{"type":"integer","minimum":0,"maximum":9007199254740991},"no_end_seen":{"type":"integer","minimum":0,"maximum":9007199254740991},"median_ms":{"type":["integer","null"],"minimum":0},"p95_ms":{"type":["integer","null"],"minimum":0},"buckets":{"type":"array","minItems":7,"maxItems":7,"items":{"type":"object","additionalProperties":false,"required":["le_ms","count"],"properties":{"le_ms":{"type":["integer","null"],"minimum":0},"count":{"type":"integer","minimum":0,"maximum":9007199254740991}}}}}},"coverage":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["boot_id","collector_epoch","dropped_total","counters","received_at"],"properties":{"boot_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"collector_epoch":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"dropped_total":{"type":"integer","minimum":0,"maximum":9007199254740991},"received_at":{"type":"string","format":"date-time"},"counters":{"type":"object","additionalProperties":false,"properties":{"oversized_record":{"type":"integer","minimum":0,"maximum":9007199254740991},"rejected_record":{"type":"integer","minimum":0,"maximum":9007199254740991},"source_eof":{"type":"integer","minimum":0,"maximum":9007199254740991},"source_read_error":{"type":"integer","minimum":0,"maximum":9007199254740991},"provider_excluded_record":{"type":"integer","minimum":0,"maximum":9007199254740991}}}}}}}},
+      "SystemActivityPrograms": {
+        "type":"object","additionalProperties":false,
+        "required":["source","scope","session_attribution","window","window_start","window_end","scan_limited","retention_limited","retention_evicted_total","retention_accounting_started_at","recorded_starts","unnamed_starts","programs"],
+        "properties":{
+          "source":{"type":"string","enum":["tetragon"]},"scope":{"type":"string","enum":["machine"]},
+          "session_attribution":{"type":"string","enum":["unverified"]},
+          "window":{"type":"string","enum":["1h","6h","24h"]},
+          "window_start":{"type":"string","format":"date-time"},"window_end":{"type":"string","format":"date-time"},
+          "scan_limited":{"type":"boolean"},
+          "retention_limited":{"type":"boolean"},
+          "retention_evicted_total":{"type":"integer","minimum":0,"maximum":9007199254740991},
+          "retention_accounting_started_at":{"type":"string","format":"date-time"},
+          "recorded_starts":{"type":"integer","minimum":0,"maximum":9007199254740991},
+          "unnamed_starts":{"type":"integer","minimum":0,"maximum":9007199254740991},
+          "programs":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,
+            "required":["name","starts","ends","outcomes_limited","outcomes"],"properties":{
+              "name":{"type":"string","minLength":1,"maxLength":128,"pattern":"^(?![\\s\\S]*[\\r\\n])(?!\\.{1,2}$)[A-Za-z0-9_+@.-]+$"},
+              "starts":{"type":"integer","minimum":0,"maximum":9007199254740991},
+              "ends":{"type":"integer","minimum":0,"maximum":9007199254740991},
+              "outcomes_limited":{"type":"boolean"},
+              "outcomes":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":false,
+                "required":["exit_code","signal","count"],"properties":{
+                  "exit_code":{"type":["integer","null"],"minimum":0,"maximum":255},
+                  "signal":{"type":["string","null"],"pattern":"^SIG[A-Z0-9]{1,12}$"},
+                  "count":{"type":"integer","minimum":0,"maximum":9007199254740991}
+                }}}
+            }}}
+        }
+      },
+      "SystemActivityProgramHistory": {
+        "type":"object","additionalProperties":false,
+        "required":["source","scope","session_attribution","has_more","events"],
+        "properties":{
+          "source":{"type":"string","enum":["tetragon"]},"scope":{"type":"string","enum":["machine"]},
+          "session_attribution":{"type":"string","enum":["unverified"]},"has_more":{"type":"boolean"},
+          "events":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,
+            "required":["id","boot_id","collector_epoch","sequence","kind","pid","occurred_at","received_at"],
+            "properties":{
+              "id":{"type":"string","format":"uuid"},"boot_id":{"type":"string","format":"uuid"},
+              "collector_epoch":{"type":"string","format":"uuid"},
+              "sequence":{"type":"integer","minimum":1,"maximum":9007199254740991},
+              "kind":{"type":"string","enum":["process_started","process_ended","file_open_requested"]},
+              "pid":{"type":"integer","minimum":1,"maximum":4294967295},
+              "occurred_at":{"type":"string","format":"date-time"},
+              "received_at":{"type":"string","format":"date-time"},
+              "program_name":{"type":"string","minLength":1,"maxLength":128,"pattern":"^(?![\\s\\S]*[\\r\\n])(?!\\.{1,2}$)[A-Za-z0-9_+@.-]+$"},
+              "parent_program_name":{"type":"string","minLength":1,"maxLength":128,"pattern":"^(?![\\s\\S]*[\\r\\n])(?!\\.{1,2}$)[A-Za-z0-9_+@.-]+$"},
+              "uid_class":{"type":"string","enum":["root","service","user"]},
+              "exit_code":{"type":"integer","minimum":0,"maximum":255},
+              "signal":{"type":"string","pattern":"^SIG[A-Z0-9]{1,12}$"}
+            }}}
+        }
+      },
+      "RecordPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "next_cursor is null exactly when has_more is false.",
+        "required": [
+          "items",
+          "has_more",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/Record"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "AccountRecord": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "A Record, or an account-level record that names no Machine. session_id is null exactly for the latter.",
+        "required": [
+          "id",
+          "session_id",
+          "kind",
+          "summary",
+          "detail",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "detail": {},
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "AccountRecordPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "next_cursor is null exactly when has_more is false.",
+        "required": [
+          "items",
+          "has_more",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/AccountRecord"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "Me": {
         "type": "object",
         "additionalProperties": false,
@@ -8659,6 +9930,95 @@
               }
             ],
             "description": "Durable execution Workspace, independent of the account workspace_id and local binding. Null explicitly identifies an unchanged legacy Project-root binding."
+          }
+        }
+      },
+      "WorkspaceBindingReleaseRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "workspace_id",
+          "project_id",
+          "local_instance_id",
+          "machine_id",
+          "exclusion_policy_digest"
+        ],
+        "description": "The exact identity tuple of the binding being released, as the local folder records it.",
+        "properties": {
+          "workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "local_instance_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "exclusion_policy_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "WorkspaceBindingRelease": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "binding_id",
+          "workspace_id",
+          "project_id",
+          "local_instance_id",
+          "machine_id",
+          "execution_workspace_id",
+          "remote_root",
+          "state",
+          "released_at",
+          "remote_workspace_retained"
+        ],
+        "description": "A released binding. Releasing ends this folder's link only: the execution Workspace, its files on the Machine and every committed generation are kept, and the Workspace can be adopted again.",
+        "properties": {
+          "binding_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "local_instance_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "execution_workspace_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "remote_root": {
+            "type": "string",
+            "pattern": "^/workspace/(projects|workspaces)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "state": {
+            "const": "released"
+          },
+          "released_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this binding was released. Releasing again returns the same receipt."
+          },
+          "remote_workspace_retained": {
+            "const": true
           }
         }
       },
@@ -9575,6 +10935,46 @@
           "data": {
             "$ref": "#/components/schemas/WorkspaceSyncReconcileReceipt"
           }
+        }
+      },
+      "MachineCreateV2Admission": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["protocol_version", "name", "agent", "vcpus", "memory_mib", "terminal", "runtime_port", "outbound_policy", "token_saving", "capture_tool_io"],
+        "properties": {
+          "protocol_version": { "const": 2 },
+          "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "agent": { "type": ["string", "null"], "enum": ["opencode", "claude-code", "codex", null] },
+          "vcpus": { "type": "integer", "minimum": 1, "maximum": 8 },
+          "memory_mib": { "type": "integer", "minimum": 512, "maximum": 16384 },
+          "terminal": { "const": false, "description": "V2 terminal checkpoint creation is unavailable until shell and PTY custody can be attested; use the existing V1 terminal create contract." },
+          "runtime_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+          "outbound_policy": { "anyOf": [{ "$ref": "#/components/schemas/OutboundPolicy" }, { "type": "null" }] },
+          "token_saving": {
+            "type": "object", "additionalProperties": false,
+            "required": ["json_array", "logs", "search_results", "git_diff"],
+            "properties": {
+              "json_array": { "type": "boolean" },
+              "logs": { "type": "boolean" },
+              "search_results": { "type": "boolean" },
+              "git_diff": { "type": "boolean" }
+            }
+          },
+          "capture_tool_io": { "type": "boolean" }
+        }
+      },
+      "MachineCreateV2Receipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["protocol_version", "id", "machine_id", "status", "phase", "reason_code", "updated_at"],
+        "properties": {
+          "protocol_version": { "const": 2 },
+          "id": { "$ref": "#/components/schemas/Uuid" },
+          "machine_id": { "$ref": "#/components/schemas/Uuid" },
+          "status": { "enum": ["pending", "blocked", "succeeded", "failed"] },
+          "phase": { "enum": ["queued", "creating_runtime", "reconciling_runtime", "provisioning_queued", "provisioning", "cleanup_pending", "machine_running", "failed"], "description": "Authoritative Machine creation phase. machine_running does not assert AgentSession or PTY readiness." },
+          "reason_code": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+          "updated_at": { "type": "string", "format": "date-time" }
         }
       },
       "MachineCreateRequest": {
@@ -14338,296 +15738,6 @@
             }
           }
         }
-      },
-      "SupervisorLiveUpdateSession": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "agent_session_id",
-          "process_epoch",
-          "outcome"
-        ],
-        "properties": {
-          "agent_session_id": {
-            "$ref": "#/components/schemas/Uuid"
-          },
-          "process_epoch": {
-            "$ref": "#/components/schemas/Uuid"
-          },
-          "outcome": {
-            "enum": [
-              "preserved",
-              "exited",
-              "ended",
-              "unknown"
-            ]
-          }
-        }
-      },
-      "SupervisorLiveUpdateResult": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "machine",
-          "operation_id",
-          "control_generation",
-          "artifact_sha256",
-          "installed_at",
-          "agent_sessions"
-        ],
-        "properties": {
-          "machine": {
-            "$ref": "#/components/schemas/Session"
-          },
-          "operation_id": {
-            "$ref": "#/components/schemas/Uuid"
-          },
-          "control_generation": {
-            "type": "integer",
-            "minimum": 1
-          },
-          "artifact_sha256": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
-          },
-          "installed_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "agent_sessions": {
-            "type": "array",
-            "maxItems": 64,
-            "items": {
-              "$ref": "#/components/schemas/SupervisorLiveUpdateSession"
-            }
-          }
-        }
-      },
-      "SupervisorLiveUpdateRequest": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "operation_id"
-        ],
-        "properties": {
-          "operation_id": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/Uuid"
-              }
-            ],
-            "description": "Chosen by the caller before sending, so a lost response still leaves it holding the identity of what it asked for. Cuna records it durably before it issues any supervisor enrollment, so repeating the same value never rotates this Machine's control a second time: it resumes an attempt that spent nothing, reconciles one that may have spent something, and returns the recorded answer once the operation has settled. A different value for a Machine whose update has not settled is refused."
-          }
-        }
-      },
-      "SupervisorLiveUpdateDeclaredSession": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "agent_session_id",
-          "process_epoch"
-        ],
-        "properties": {
-          "agent_session_id": {
-            "$ref": "#/components/schemas/Uuid"
-          },
-          "process_epoch": {
-            "$ref": "#/components/schemas/Uuid"
-          }
-        }
-      },
-      "SupervisorLiveUpdateFailure": {
-        "type": "object",
-        "additionalProperties": false,
-        "description": "The refusal this operation settled with, in the fields the mutation returned. Recorded rather than re-derived, so a later read of a settled operation answers with what happened and not with a fresh opinion about a Machine that has moved on since.",
-        "required": [
-          "status",
-          "code",
-          "title",
-          "detail",
-          "retryable",
-          "action"
-        ],
-        "properties": {
-          "status": {
-            "type": "integer",
-            "minimum": 400,
-            "maximum": 599
-          },
-          "code": {
-            "type": "string",
-            "pattern": "^[a-z][a-z0-9_]{2,63}$"
-          },
-          "title": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 120
-          },
-          "detail": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
-          },
-          "retryable": {
-            "type": "boolean"
-          },
-          "action": {
-            "enum": [
-              "retry",
-              "none"
-            ]
-          }
-        }
-      },
-      "SupervisorLiveUpdateOperation": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "operation_id",
-          "machine_id",
-          "phase",
-          "control_rotated",
-          "installer_outcome",
-          "control_generation",
-          "artifact_sha256",
-          "installed_at",
-          "installation_evidence",
-          "declared_sessions",
-          "agent_sessions",
-          "failure",
-          "next_action",
-          "claimed_at",
-          "updated_at",
-          "settled_at",
-          "retired_at",
-          "retirement_outcome"
-        ],
-        "properties": {
-          "operation_id": {
-            "$ref": "#/components/schemas/Uuid"
-          },
-          "machine_id": {
-            "$ref": "#/components/schemas/Uuid"
-          },
-          "phase": {
-            "description": "claimed: the operation is durably admitted and no enrollment, installer or control change has left Cuna. control_rotated: this Machine's supervisor control HAS rotated for this operation and what the installer did is unknown. installed: the artifact this operation selected is on the Machine; its acknowledgement and the fate of the AgentSessions may still be unestablished. settled: terminal, and the recorded answer is what every repeat of this identity receives.",
-            "enum": [
-              "claimed",
-              "control_rotated",
-              "installed",
-              "settled"
-            ]
-          },
-          "control_rotated": {
-            "type": "boolean",
-            "description": "Whether this operation issued a supervisor enrollment. True is irreversible and stays true in every later phase, including a settled failure: the Machine's previous control was superseded even if nothing was installed."
-          },
-          "installer_outcome": {
-            "description": "not_sent: no installer request left Cuna, which is also the honest answer after a rotation whose request the provider client refused to construct. unknown: a request was sent and nothing observed what it did. refused: the installer answered and refused, which it does before it writes. installed: the selected artifact is on the Machine.",
-            "enum": [
-              "not_sent",
-              "unknown",
-              "refused",
-              "installed"
-            ]
-          },
-          "control_generation": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "minimum": 1
-          },
-          "artifact_sha256": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "pattern": "^[0-9a-f]{64}$",
-            "description": "The supervisor artifact this operation is bound to install. Null until the operation has bound a target, which it must do before it may rotate anything."
-          },
-          "installed_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time",
-            "description": "When Cuna established the installation, which is the installation time only when installation_evidence is installer_exit."
-          },
-          "installation_evidence": {
-            "description": "installer_exit: the installer's own zero exit, observed in this operation's own request. reconciled: a later read-only observation found the artifact on the Machine. The second establishes that it is installed and never when it was installed.",
-            "enum": [
-              "installer_exit",
-              "reconciled",
-              null
-            ]
-          },
-          "declared_sessions": {
-            "type": "array",
-            "maxItems": 64,
-            "description": "The AgentSessions this attempt measured and is accountable for. Empty until the operation binds its prestate. It is a statement of scope, never of outcome.",
-            "items": {
-              "$ref": "#/components/schemas/SupervisorLiveUpdateDeclaredSession"
-            }
-          },
-          "agent_sessions": {
-            "type": "array",
-            "maxItems": 64,
-            "description": "The per-AgentSession account. Empty unless the operation settled with one; an absent account is never rendered as a set of unknown outcomes.",
-            "items": {
-              "$ref": "#/components/schemas/SupervisorLiveUpdateSession"
-            }
-          },
-          "failure": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/SupervisorLiveUpdateFailure"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "next_action": {
-            "description": "none: the operation is settled and nothing further will change it. repeat_same_operation: reissuing this same operation_id to the POST route is the supported way to resolve it, and is the only safe repetition -- a new identity would rotate this Machine's control again.",
-            "enum": [
-              "none",
-              "repeat_same_operation"
-            ]
-          },
-          "claimed_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "updated_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "settled_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time"
-          },
-          "retired_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time",
-            "description": "When Cuna advanced this Machine's install fence past this operation's control generation. After it, the installer this operation authorized cannot perform any configuration write, binary replacement or service restart, however long it was delayed. Null until that happens. This is what distinguishes a settled installer_outcome of unknown, which means Cuna never observed that installer and it can no longer act, from an unsettled one, which means an authorized installer may still arrive."
-          },
-          "retirement_outcome": {
-            "description": "What this Machine's install fence had recorded for this operation's control generation when it was retired. retired: no admission existed, so the installer never reached the fence and the fence precedes every write it could perform. partial: it was admitted and did not finish. installed: it was admitted and finished. Null until the retirement happens, and never a substitute for installer_outcome, which reports what Cuna itself observed.",
-            "enum": [
-              "retired",
-              "partial",
-              "installed",
-              null
-            ]
-          }
-        }
       }
     }
   },
@@ -14651,6 +15761,6 @@
     "responseEncoding": "utf-8",
     "maxResponseBytes": 16777216,
     "followRedirects": false,
-    "sdkOperationCount": 40
+    "sdkOperationCount": 41
   }
 }

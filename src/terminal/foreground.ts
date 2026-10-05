@@ -1,3 +1,11 @@
+import { createHash } from "node:crypto";
+
+import {
+  startCallbackRelay,
+  type AcceptedProviderCallback,
+  type CallbackRelayAnswer,
+  type CallbackRelayHandle,
+} from "../local-actions/callback-relay.js";
 import { copyLocalText } from "../local-actions/clipboard.js";
 import { AGENT_SESSION_AUTH_MAX_FUTURE_SKEW_MS, AGENT_SESSION_AUTH_MAX_TTL_MS } from "../api/contracts.js";
 import type {
@@ -18,6 +26,7 @@ import {
   digestLocalActionArguments,
   sameLocalActionIdentity,
   type LocalActionRequest,
+  type LocalActionSafeReason,
   type LocalActionSessionIdentity,
   type LocalActionSnapshot,
 } from "../local-actions/index.js";
@@ -25,6 +34,7 @@ import type { TerminalAttachStage, TerminalAttachmentAdmission } from "../runtim
 import { RuntimeBoundaryError, runtimeFailure, terminalHistoryGap } from "../runtime/errors.js";
 import type { HostTerminalLease } from "./mode.js";
 import { assertCanonicalUuid } from "../core/validation.js";
+import { CunaError } from "../core/errors.js";
 import { buildAppbarModel, type AppbarModel, type StatusEvidence } from "./appbar.js";
 import { PredictiveEcho, type PredictiveEchoMode } from "./predictive-echo.js";
 import {
@@ -34,12 +44,13 @@ import {
   workbenchUpdate,
   withPredictionOverlay,
   type WorkbenchFrame,
+  type WorkbenchLinkSpan,
   type WorkbenchSelectionRow,
   type WorkbenchTab,
 } from "./workbench.js";
 import type { SessionRoster, SessionRosterEntry } from "./session-roster.js";
-import { ViewportRegistry } from "./viewport.js";
-import { orderBufferPoints, XtermViewportAdapter, type BufferPoint } from "./xterm-vte.js";
+import { ViewportRegistry, type ViewportSnapshot } from "./viewport.js";
+import { orderBufferPoints, XtermViewportAdapter, type BufferLink, type BufferPoint } from "./xterm-vte.js";
 import { encodeRemoteMouse, HOST_MOUSE_REPORTING_ON, HostMouseDecoder, wheelDirection, type HostMouseEvent } from "./host-mouse.js";
 
 /** Lines one wheel notch moves the local view, the common terminal default. */
@@ -84,6 +95,10 @@ const INPUT_BATCH_WINDOW_MS = 24;
 const INPUT_BURST_GAP_MS = INPUT_BATCH_WINDOW_MS;
 const INPUT_BATCH_MAX_BYTES = 32;
 const DISCONNECT_FRAME_MS = 30;
+// Owner 2026-10-04: a Ctrl+C meant to copy reached Claude Code and a second
+// one quit it (status 0). The key still goes to the agent; for this long the
+// bar says so, and how to leave or copy instead.
+const INTERRUPT_NOTICE_MS = 5_000;
 const DISCONNECTING_FRAMES = Object.freeze([
   "✦ Disconnecting...",
   "✧ Disconnecting...",
@@ -112,10 +127,20 @@ const RECONNECT_FAILED_NOTICE = "Reconnect failed · Ctrl+] r retries · Ctrl+C 
 // succeeded (2026-09-15, session 7d73bf08). The bound stays explicit; a
 // non-retryable refusal still stops the loop on its first occurrence.
 const DEFAULT_RECONNECT_ATTEMPTS = 10;
+// After the quick attempts, one attempt every 30 s for 20 min. The quick ones
+// alone gave up while the CLI's own API calls were timing out: on 2026-10-03
+// (biotech lab, drop c0dc53b) the bar said "Reconnect failed" from about
+// 16:08Z until 18:29Z, and a fresh `cuna opencode` reattached at 18:31Z. Still
+// bounded, still stopped by a non-retryable refusal; Ctrl+] r tries at once.
+const DEFAULT_RECONNECT_SLOW_DELAY_MS = 30_000;
+const DEFAULT_RECONNECT_SLOW_ATTEMPTS = 40;
 const BRACKETED_PASTE_START = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e);
 const BRACKETED_PASTE_END = Uint8Array.of(0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e);
 const CLAUDE_LOCAL_ACTION_KINDS = Object.freeze(["browser.open"] as const);
-const CODEX_LOCAL_ACTION_KINDS = Object.freeze(["browser.open", "auth.device.present"] as const);
+const CODEX_LOCAL_ACTION_KINDS = Object.freeze(["browser.open", "auth.device.present", "auth.callback.relay"] as const);
+/** How long the Machine has to answer a relayed sign-in callback. */
+const RELAY_ANSWER_TIMEOUT_MS = 15_000;
+const RELAY_STREAM_CREDIT_BYTES = 16_384;
 const NO_LOCAL_ACTION_KINDS = Object.freeze([] as const);
 export const MAX_FOREGROUND_PENDING_INPUT_BYTES = 1_048_576;
 
@@ -203,6 +228,26 @@ export interface DetachedForegroundSession {
   readonly label: string;
 }
 
+/** One AgentSession whose process ended while it was on screen. */
+export interface EndedForegroundSession {
+  readonly agentSessionId: string;
+  readonly label: string;
+  readonly agent: WorkbenchTab["agent"];
+  /** "status 0" or "signal 9", when the terminal said. */
+  readonly status?: string;
+}
+
+/** The server's record that an AgentSession's process has ended. */
+export interface ForegroundSessionEndRecord {
+  /** When the server observed the end (ISO 8601), when it recorded one. */
+  readonly observedAt?: string;
+}
+
+interface TabEnd {
+  readonly status?: string;
+  readonly observedAt?: string;
+}
+
 /**
  * A completed local effect is retained until the remote MCP bridge confirms
  * the exact request digest.  Keeping the immutable broker snapshot—not just a
@@ -235,7 +280,13 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly resizeCoalesceMs?: number;
   readonly reconnectAttempts?: number;
   readonly reconnectBaseDelayMs?: number;
+  /** Wait between the slow attempts that follow the quick ones. */
+  readonly reconnectSlowDelayMs?: number;
+  /** Slow attempts after the quick ones; 0 turns them off. */
+  readonly reconnectSlowAttempts?: number;
   readonly disconnectFrameMs?: number;
+  /** How long the bar says where a writer's Ctrl+C went. */
+  readonly interruptNoticeMs?: number;
   /** Stable only for this foreground process; never a reusable device credential. */
   readonly deviceId?: string;
   /** Predictive local echo of typed characters; `off` unless the caller chooses. */
@@ -252,6 +303,48 @@ export interface ForegroundTerminalCoordinatorOptions {
   readonly attachingTitle?: string;
   /** One line shown once the terminal is on screen, until the next key. */
   readonly initialNotice?: string;
+  /**
+   * Reads the server's record of how an AgentSession's process ended, when
+   * its screen shows the terminal's pane-dead line. Undefined while the record
+   * does not say it ended: the screen alone never ends a tab.
+   */
+  readonly readSessionEnd?: (agentSessionId: string, signal: AbortSignal) => Promise<ForegroundSessionEndRecord | undefined>;
+  /** Waits before each read of that record; the supervisor records an exit a moment after it. */
+  readonly sessionEndReadDelaysMs?: readonly number[];
+  /** How long a relayed sign-in callback waits for the Machine's answer. */
+  readonly relayAnswerTimeoutMs?: number;
+  /**
+   * One line from outside the terminal that needs the person's action (a
+   * workspace sync that stopped), shown on the notice row while it lasts.
+   */
+  readonly attention?: ForegroundAttentionSource;
+}
+
+/**
+ * A line owned outside the terminal. `subscribe` is called on every change;
+ * the bar repaints on that call, not on the next terminal output frame.
+ */
+export interface ForegroundAttentionSource {
+  readonly current: () => string | undefined;
+  readonly subscribe: (listener: (line: string | undefined) => void) => () => void;
+}
+
+/**
+ * A provider's request to receive its sign-in callback on this computer:
+ * Codex redirects the browser to http://localhost:1455/… while its callback
+ * server listens on the Machine's loopback. The supervisor originates it.
+ */
+interface CallbackRelayConsent {
+  readonly tabId: string;
+  readonly request: LocalActionRequest;
+  readonly localPath: string;
+  readonly exactLocalPort: number;
+}
+
+interface RelayStreamWait {
+  readonly tabId: string;
+  readonly length: number;
+  readonly resolve: (answer: CallbackRelayAnswer) => void;
 }
 
 /** The session the person chose on the bar; the runner attaches it next. */
@@ -315,9 +408,21 @@ export class ForegroundTerminalCoordinator {
   readonly #lifetimeAbort = new AbortController();
   readonly #reconnectTasks = new Map<string, Promise<void>>();
   readonly #recoverableReconnectFailures = new Map<string, unknown>();
+  /** Tabs waiting for a slow attempt: the wait, and what ends it early (Ctrl+] r). */
+  readonly #slowReconnectWaits = new Map<string, { readonly delayMs: number; readonly wake: () => void }>();
   readonly #outputTails = new Map<string, Promise<void>>();
   readonly #localDetachTabIds = new Set<string>();
   readonly #detachedSessions: DetachedForegroundSession[] = [];
+  readonly #endedSessions: EndedForegroundSession[] = [];
+  /** Tabs whose process the server says ended; their last screen stays, labelled ended. */
+  readonly #endedTabs = new Map<string, TabEnd>();
+  readonly #endReads = new Set<string>();
+  /** Sign-in relay requests by id, from arrival until their outcome. */
+  readonly #relayRequests = new Map<string, CallbackRelayConsent>();
+  /** The relay request at the head of the local-action queue, awaiting Enter or Esc. */
+  #pendingRelay: CallbackRelayConsent | undefined;
+  readonly #relayHandles = new Map<string, CallbackRelayHandle>();
+  readonly #relayStreams = new Map<string, RelayStreamWait>();
   readonly #browserDetectors = new Map<string, ProviderBrowserActionDetector>();
   readonly #retainedBrowserDetectors = new Map<string, ProviderBrowserActionDetector>();
   readonly #retainedBrowserCandidates = new Map<string, LocalBrowserActionRequest>();
@@ -369,12 +474,14 @@ export class ForegroundTerminalCoordinator {
   /** Received chunks with a non-printable byte that the input tail has not routed yet. */
   #unroutedBarrierChunks = 0;
   #removeRoster: (() => void) | undefined;
+  #removeAttention: (() => void) | undefined;
   /** Host input chunks are numbered on receipt, so a switch can cut input at one. */
   #inputReceipt = 0;
   /** Set when a switch is chosen: input received after this receipt is never sent. */
   #switchCutoff: number | undefined;
   #switchRequest: ForegroundSwitchRequest | undefined;
   #switchNotice: string | undefined;
+  #interruptNotice: { readonly tabId: string; readonly text: string; readonly timer: ReturnType<typeof setTimeout> } | undefined;
   /**
    * The one line the attach arrived with (another process holds this client,
    * or a switch had to come back). It shares row 2 with the seat instead of
@@ -390,6 +497,8 @@ export class ForegroundTerminalCoordinator {
     }
     const reconnectAttempts = options.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS;
     const reconnectBaseDelayMs = options.reconnectBaseDelayMs ?? 100;
+    const reconnectSlowDelayMs = options.reconnectSlowDelayMs ?? DEFAULT_RECONNECT_SLOW_DELAY_MS;
+    const reconnectSlowAttempts = options.reconnectSlowAttempts ?? DEFAULT_RECONNECT_SLOW_ATTEMPTS;
     const disconnectFrameMs = options.disconnectFrameMs ?? DISCONNECT_FRAME_MS;
     if (!Number.isSafeInteger(reconnectAttempts) || reconnectAttempts < 1 || reconnectAttempts > 10) {
       throw new RangeError("Foreground reconnect attempts must be between 1 and 10.");
@@ -397,10 +506,19 @@ export class ForegroundTerminalCoordinator {
     if (!Number.isSafeInteger(reconnectBaseDelayMs) || reconnectBaseDelayMs < 1 || reconnectBaseDelayMs > 5_000) {
       throw new RangeError("Foreground reconnect delay must be between 1 and 5000 milliseconds.");
     }
+    if (!Number.isSafeInteger(reconnectSlowDelayMs) || reconnectSlowDelayMs < 1 || reconnectSlowDelayMs > 300_000) {
+      throw new RangeError("Foreground slow reconnect delay must be between 1 and 300000 milliseconds.");
+    }
+    if (!Number.isSafeInteger(reconnectSlowAttempts) || reconnectSlowAttempts < 0 || reconnectSlowAttempts > 120) {
+      throw new RangeError("Foreground slow reconnect attempts must be between 0 and 120.");
+    }
     if (!Number.isSafeInteger(disconnectFrameMs) || disconnectFrameMs < 1 || disconnectFrameMs > MAX_DISCONNECT_FRAME_MS) {
       throw new RangeError("Foreground disconnect frame duration must be between 1 and 250 milliseconds.");
     }
-    this.#options = Object.freeze({ ...options, resizeCoalesceMs, reconnectAttempts, reconnectBaseDelayMs, disconnectFrameMs });
+    this.#options = Object.freeze({
+      ...options, resizeCoalesceMs, reconnectAttempts, reconnectBaseDelayMs, reconnectSlowDelayMs, reconnectSlowAttempts,
+      disconnectFrameMs,
+    });
     this.#clock = options.clock ?? Date.now;
     this.#predictiveEcho = new PredictiveEcho({
       mode: options.predictiveEcho ?? "off",
@@ -415,6 +533,7 @@ export class ForegroundTerminalCoordinator {
       onChange: (snapshot) => {
         if (["succeeded", "failed", "denied", "expired", "cancelled"].includes(snapshot.state)) {
           this.#browserRequests.delete(snapshot.request.id);
+          this.#endRelay(snapshot.request.id);
           this.#queueRemoteLocalActionResult(snapshot);
         }
         void this.#render().catch(() => undefined);
@@ -446,13 +565,18 @@ export class ForegroundTerminalCoordinator {
   }
 
   /**
-   * AgentSessions the person detached from on purpose (Ctrl+] d or Ctrl+C),
+   * AgentSessions the person detached from on purpose (Ctrl+] d, or an observer's Ctrl+C),
    * each confirmed by the runtime. A detach never terminates the remote
    * process, so the runner tells the person how to come back once the host
    * terminal is theirs again. Tabs detached by cleanup are not listed.
    */
   get detachedSessions(): readonly DetachedForegroundSession[] {
     return Object.freeze([...this.#detachedSessions]);
+  }
+
+  /** AgentSessions whose process ended while on screen; none of them keeps running. */
+  get endedSessions(): readonly EndedForegroundSession[] {
+    return Object.freeze([...this.#endedSessions]);
   }
 
   bindRuntime(runtime: ForegroundTerminalRuntime): void {
@@ -559,6 +683,12 @@ export class ForegroundTerminalCoordinator {
           if (this.#state === "active") this.#queueStateRender();
         });
       }
+      // Before this, a sync that stopped while the agent was attached reached
+      // the person only at detach (BL-7, 2026-10-03: 21 silent minutes). A
+      // change before `active` is read by the first active render.
+      this.#removeAttention = this.#options.attention?.subscribe(() => {
+        if (this.#state === "active") this.#queueStateRender();
+      });
       const dimensions = admitForegroundDimensions(this.#options.host.dimensions());
       this.#attachingStageSince = this.#clock();
       await this.#renderAttaching(intents.length, dimensions);
@@ -651,9 +781,11 @@ export class ForegroundTerminalCoordinator {
     this.#removeInput?.();
     this.#removeResize?.();
     this.#removeRoster?.();
+    this.#removeAttention?.();
     this.#removeInput = undefined;
     this.#removeResize = undefined;
     this.#removeRoster = undefined;
+    this.#removeAttention = undefined;
     this.#discardInputBatch();
     const failures: unknown[] = [];
     const runtime = this.#runtime;
@@ -677,6 +809,8 @@ export class ForegroundTerminalCoordinator {
     this.#retainedBrowserDetectors.clear();
     this.#retainedBrowserCandidates.clear();
     this.#retainedPendingRequestId = undefined;
+    if (this.#interruptNotice !== undefined) clearTimeout(this.#interruptNotice.timer);
+    this.#interruptNotice = undefined;
     this.#oauthPasteGuards.clear();
     this.#browserRequests.clear();
     this.#remoteLocalActionTabs.clear();
@@ -922,9 +1056,55 @@ export class ForegroundTerminalCoordinator {
       const view = tab.viewport.snapshot();
       this.#predictiveEcho.reconcile(view, predictionKey(tab, view));
     }
+    if (event.provenance === "live") this.#noticePaneDeath(tab);
     // Parsing preserves every ordered byte; painting may skip intermediate
     // screens. A slow host must not hold up ingestion of newer remote output.
     this.#queueStateRender();
+  }
+
+  /**
+   * tmux keeps a dead pane on screen and writes one line of its own under it
+   * (remain-on-exit): "Pane is dead (status 0, Tue Sep 29 17:41:10 2026)". A
+   * program can print the same words, so the line only starts a bounded read
+   * of the server's record, and the tab ends only when that record says so.
+   * The supervisor records the exit a moment after tmux draws the line.
+   */
+  #noticePaneDeath(tab: ForegroundTab): void {
+    const tabId = tab.intent.tabId;
+    const read = this.#options.readSessionEnd;
+    if (read === undefined || this.#endReads.has(tabId) || this.#endedTabs.has(tabId)) return;
+    const death = paneDeathRow(tab.viewport.snapshot().cells);
+    if (death === undefined) return;
+    this.#endReads.add(tabId);
+    void (async () => {
+      for (const delay of this.#options.sessionEndReadDelaysMs ?? SESSION_END_READ_DELAYS_MS) {
+        await abortableDelay(delay, this.#lifetimeAbort.signal);
+        if (this.#tabs.get(tabId) !== tab || this.#state !== "active") return;
+        const end = await read(tab.intent.agentSessionId, this.#lifetimeAbort.signal).catch(() => undefined);
+        if (end === undefined) continue;
+        if (this.#tabs.get(tabId) !== tab) return;
+        this.#endedTabs.set(tabId, Object.freeze({
+          status: death.status,
+          ...(end.observedAt === undefined ? {} : { observedAt: end.observedAt }),
+        }));
+        if (this.#pendingBrowserActionTabId === tabId) {
+          this.#pendingBrowserAction = undefined;
+          this.#pendingBrowserActionTabId = undefined;
+        }
+        await this.#render();
+        return;
+      }
+    })().catch(() => undefined).finally(() => this.#endReads.delete(tabId));
+  }
+
+  /** What an ended tab's bar says, and what its keys are answered with. */
+  #endedNotice(tab: ForegroundTab, end: TabEnd): string {
+    const provider = sessionProviderName(tab.intent.agent);
+    const at = end.observedAt === undefined || Number.isNaN(Date.parse(end.observedAt))
+      ? "" : ` at ${new Date(end.observedAt).toISOString().slice(11, 16)} UTC`;
+    const journey = journeyCommand(tab.intent.agent);
+    return `${provider} exited${end.status === undefined ? "" : ` (${end.status})`}${at} · this session has ended · ` +
+      (journey === undefined ? "start a new one with `cuna` (from its folder)" : `start a new one: \`${journey} --new-session\` (from its folder)`);
   }
 
   #terminalState(snapshot: RuntimeTerminalSnapshot): void {
@@ -986,6 +1166,17 @@ export class ForegroundTerminalCoordinator {
               })
               : runtimeFailure("terminal_disconnected", "A foreground AgentSession terminal failed."));
         }
+        if (snapshot.state === "closed" && snapshot.reason === "remote_process_exit") {
+          // The supervisor's EXIT frame: the process ended and the wire is
+          // closed. The runner says so once the host is restored.
+          this.#endedSessions.push(Object.freeze({
+            agentSessionId: tab.intent.agentSessionId,
+            label: tab.intent.label,
+            agent: tab.intent.agent,
+            ...(typeof snapshot.exitCode === "number" ? { status: `status ${snapshot.exitCode}` } : {}),
+          }));
+        }
+        this.#endedTabs.delete(snapshot.tabId);
         this.#localActionBroker.cancelBinding(this.#localActionIdentity(tab.intent, tab.snapshot), "terminal_detached");
         tab.viewport.dispose();
         this.#tabs.delete(snapshot.tabId);
@@ -1019,29 +1210,69 @@ export class ForegroundTerminalCoordinator {
       if (this.#state !== "active" || this.#lifetimeAbort.signal.aborted) return;
       await abortableDelay(Math.min(baseDelayMs * (2 ** attempt), 5_000), this.#lifetimeAbort.signal);
       if (this.#state !== "active" || this.#lifetimeAbort.signal.aborted) return;
-      try {
-        const snapshot = await this.#requireRuntime().reconnect({ tabId, signal: this.#lifetimeAbort.signal });
-        await this.#reconcileGeometry(snapshot, false);
-        this.#recoverableReconnectFailures.delete(tabId);
-        if (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === INPUT_STALLED_NOTICE ||
-          isReconnectFailedNotice(this.#browserNotice)) {
-          this.#browserNotice = undefined;
-        }
-        return;
-      } catch (error) {
-        lastFailure = error;
-        if (this.#lifetimeAbort.signal.aborted || this.#state !== "active") return;
-        if (error instanceof RuntimeBoundaryError && !error.retryable) break;
-      }
+      const outcome = await this.#attemptReconnect(tabId);
+      if (outcome === "reattached" || outcome === "stopped") return;
+      lastFailure = outcome.failure;
+      if (lastFailure instanceof RuntimeBoundaryError && !lastFailure.retryable) break;
     }
-    if (this.#state === "active") {
+    // The quick attempts are spent. Say why, and while slow attempts remain,
+    // when the next one comes; then wait for it.
+    let slowRemaining = isRetryableReconnectFailure(lastFailure)
+      ? this.#options.reconnectSlowAttempts ?? DEFAULT_RECONNECT_SLOW_ATTEMPTS
+      : 0;
+    const slowDelayMs = this.#options.reconnectSlowDelayMs ?? DEFAULT_RECONNECT_SLOW_DELAY_MS;
+    for (;;) {
+      if (this.#state !== "active") return;
       this.#recoverableReconnectFailures.set(tabId, lastFailure ?? runtimeFailure(
         "terminal_disconnected",
         "Automatic terminal reconnection was exhausted.",
         { retryable: true },
       ));
-      this.#browserNotice = reconnectFailedNotice(this.#recoverableReconnectFailures.get(tabId));
+      this.#browserNotice = reconnectFailedNotice(
+        this.#recoverableReconnectFailures.get(tabId),
+        slowRemaining > 0 ? slowDelayMs : undefined,
+      );
       await this.#render();
+      if (slowRemaining === 0) return;
+      slowRemaining -= 1;
+      await this.#slowReconnectWait(tabId, slowDelayMs);
+      if (this.#state !== "active" || this.#lifetimeAbort.signal.aborted) return;
+      // Left on purpose meanwhile (a confirmed detach forgets the failure).
+      if (!this.#recoverableReconnectFailures.has(tabId) || this.#tabs.get(tabId)?.snapshot.state !== "interrupted") return;
+      const outcome = await this.#attemptReconnect(tabId);
+      if (outcome === "reattached" || outcome === "stopped") return;
+      lastFailure = outcome.failure;
+      if (!isRetryableReconnectFailure(lastFailure)) slowRemaining = 0;
+    }
+  }
+
+  async #attemptReconnect(tabId: string): Promise<"reattached" | "stopped" | { readonly failure: unknown }> {
+    try {
+      const snapshot = await this.#requireRuntime().reconnect({ tabId, signal: this.#lifetimeAbort.signal });
+      await this.#reconcileGeometry(snapshot, false);
+      this.#recoverableReconnectFailures.delete(tabId);
+      if (this.#browserNotice === INPUT_WITHHELD_NOTICE || this.#browserNotice === INPUT_STALLED_NOTICE ||
+        isReconnectFailedNotice(this.#browserNotice)) {
+        this.#browserNotice = undefined;
+      }
+      return "reattached";
+    } catch (error) {
+      if (this.#lifetimeAbort.signal.aborted || this.#state !== "active") return "stopped";
+      return { failure: error };
+    }
+  }
+
+  async #slowReconnectWait(tabId: string, delayMs: number): Promise<void> {
+    const wake = new AbortController();
+    const lifetime = this.#lifetimeAbort.signal;
+    const forward = (): void => wake.abort();
+    lifetime.addEventListener("abort", forward, { once: true });
+    this.#slowReconnectWaits.set(tabId, { delayMs, wake: () => wake.abort() });
+    try {
+      await abortableDelay(delayMs, wake.signal);
+    } finally {
+      lifetime.removeEventListener("abort", forward);
+      this.#slowReconnectWaits.delete(tabId);
     }
   }
 
@@ -1265,28 +1496,101 @@ export class ForegroundTerminalCoordinator {
   }
 
   /**
-   * Ctrl+click on a link opens it in this computer's browser. What was
-   * clicked is the URL as drawn; when the provider also published the exact
-   * link (an OSC 8 target Ctrl+] y copies) and the drawn text is a piece of
-   * it, the exact link is opened, never the cut or wrapped screen text.
+   * Ctrl+C over a Cuna selection the viewport shows copies it and clears the
+   * highlight, as a terminal's own selection does: nothing reaches the agent
+   * and nothing detaches. Ctrl+Shift+C arrives as the same byte. A selection
+   * scrolled out of view does not take the key the person cannot see it take.
+   */
+  #copyShownSelection(): boolean {
+    const selection = this.#selection;
+    const tab = selection === undefined || selection.tabId !== this.#activeTabId ? undefined : this.#tabs.get(selection.tabId);
+    if (selection === undefined || tab === undefined) return false;
+    const rows = this.#selectionRows(tab, admitForegroundDimensions(this.#options.host.dimensions()));
+    if (rows === undefined || rows.length === 0) return false;
+    this.#selection = undefined;
+    void this.#copySelection(tab, selection).catch(() => undefined);
+    return true;
+  }
+
+  /**
+   * Ctrl+C reaches the agent only through this client's writer seat. An
+   * observer, or a tab whose PTY input cannot reach it now, detaches instead.
+   */
+  #interruptDetaches(target: ForegroundInputTarget | undefined): boolean {
+    return target === undefined || this.#tabs.get(target.tabId)?.snapshot.accessMode !== "writer";
+  }
+
+  /**
+   * Ctrl+click on a link opens it in this computer's browser, resolved as
+   * Ctrl+] y resolves it: the provider's OSC 8 target first, then the rows the
+   * screen joins into one link, never one row of a longer link. A click on a
+   * continuation row that the screen cannot join names the link it is part of.
    */
   async #openLinkAt(tab: ForegroundTab, point: BufferPoint): Promise<void> {
-    const word = tab.viewport.wordAt(point);
-    const drawn = word === undefined ? "" : tab.viewport.textBetween(word.start, word.end).replace(/[.,;:!?)\]}]+$/u, "");
+    const link = tab.viewport.linkAt(point);
+    let target = link === undefined ? undefined : this.#exactLink(tab, link.url, false);
+    if (target === undefined) {
+      const word = tab.viewport.wordAt(point);
+      const fragment = word === undefined ? "" : tab.viewport.textBetween(word.start, word.end);
+      target = this.#linkContaining(tab, fragment);
+    }
     let url: URL | undefined;
-    try { url = /^https?:\/\//u.test(drawn) ? new URL(drawn) : undefined; } catch { url = undefined; }
-    if (url === undefined) return;
-    const exact = this.#copyLinks.get(tab.intent.tabId);
-    const target = exact !== undefined && exact.url !== url.href && exact.url.startsWith(drawn) ? exact.url : url.href;
+    try { url = target === undefined ? undefined : new URL(target); } catch { url = undefined; }
+    if (url === undefined || (url.protocol !== "https:" && url.protocol !== "http:")) return;
     try {
       const browser = this.#options.browser;
       if (browser === undefined) throw new Error("browser unavailable");
-      await browser.open(target);
-      this.#browserNotice = `Opened ${new URL(target).origin} in your browser`;
+      await browser.open(target as string);
+      this.#browserNotice = `Opened ${url.origin} in your browser`;
     } catch {
       this.#browserNotice = "Could not open the link. Drag to select and copy it instead.";
     }
     await this.#render();
+  }
+
+  /**
+   * The exact target for a link read from the screen or from the byte stream.
+   * A provider OSC 8 target that is this link or continues it comes first.
+   * A link a byte stream read is then extended by the rows the screen still
+   * holds after it, because a program that wraps its own lines puts a row
+   * break inside the URL. The link itself is the fallback.
+   */
+  #exactLink(tab: ForegroundTab, url: string, fromStream: boolean): string {
+    const targets = (this.#copyDetectors.get(tab.intent.tabId) ?? []).flatMap((detector) => detector.hyperlinkTargets);
+    const target = [...targets].reverse().find((candidate) => candidate === url || candidate.startsWith(url));
+    if (target !== undefined) return target;
+    return fromStream ? tab.viewport.extendLink(url) ?? url : url;
+  }
+
+  /** A known exact link that a piece of screen text is part of (16 characters or more). */
+  #linkContaining(tab: ForegroundTab, fragment: string): string | undefined {
+    if (fragment.length < 16 || /\s/u.test(fragment)) return undefined;
+    const known = [
+      ...(this.#copyDetectors.get(tab.intent.tabId) ?? []).flatMap((detector) => detector.hyperlinkTargets),
+      ...[this.#copyLinks.get(tab.intent.tabId)?.url].filter((url): url is string => url !== undefined),
+    ];
+    return [...known].reverse().find((candidate) => candidate.includes(fragment));
+  }
+
+  /**
+   * Link cells of the painted viewport, each with its exact target, so the
+   * host terminal's own Ctrl+click (Windows Terminal opens a hovered link
+   * before it reports the click) opens the whole link, not one row of it. A
+   * target is the text drawn, joined across rows, or a provider's OSC 8
+   * target that begins with it: never a destination the screen does not show.
+   */
+  #linkSpans(tab: ForegroundTab, dimensions: { readonly columns: number; readonly rows: number }): readonly WorkbenchLinkSpan[] {
+    const projection = this.#viewProjection(tab, dimensions);
+    const top = tab.viewport.viewTop(projection);
+    const rows = remoteRows(dimensions.rows);
+    const width = Math.min(tab.viewport.columns, dimensions.columns);
+    const spans: WorkbenchLinkSpan[] = [];
+    for (const link of tab.viewport.linksInView(projection)) {
+      const uri = this.#exactLink(tab, link.url, false);
+      if (!paintableLink(uri)) continue;
+      spans.push(...linkRows(link, top, rows, width, tab.viewport.columns).map((span) => Object.freeze({ ...span, uri })));
+    }
+    return Object.freeze(spans);
   }
 
   #sendRemote(bytes: Uint8Array, target: ForegroundInputTarget): void {
@@ -1310,6 +1614,7 @@ export class ForegroundTerminalCoordinator {
       if (bytes.includes(INTERRUPT)) this.#switchRequest = undefined;
       return;
     }
+    if (bytes.byteLength === 1 && bytes[0] === INTERRUPT && this.#copyShownSelection()) return;
     if (this.#selection !== undefined) {
       // As in any terminal, typing ends the selection; its copy stays copied.
       this.#selection = undefined;
@@ -1406,9 +1711,12 @@ export class ForegroundTerminalCoordinator {
       this.#lastPrintableAt = undefined;
       this.#lastPrintableTarget = undefined;
     }
+    // Decided at receipt, on the seat the person saw when pressing the key.
+    const interruptDetaches = this.#interruptDetaches(receiptTarget);
     if (
       payload.byteLength === 1 &&
       payload[0] === INTERRUPT &&
+      interruptDetaches &&
       !this.#prefixPending &&
       receiptTarget !== undefined
     ) {
@@ -1431,7 +1739,7 @@ export class ForegroundTerminalCoordinator {
     // is even queued for the network.
     if (this.#predictAtReceipt(payload, receiptTarget, barrierChunk)) void this.#render().catch(() => undefined);
     this.#enqueueInput(payload, receiptTarget, receipt, barrierChunk, false,
-      receiptBrowserActionGeneration, receiptBrowserAction);
+      receiptBrowserActionGeneration, receiptBrowserAction, interruptDetaches);
   }
 
   #enqueueInput(
@@ -1442,12 +1750,13 @@ export class ForegroundTerminalCoordinator {
     counted = false,
     browserActionGeneration = this.#browserActionGenerationFor(receiptTarget),
     browserAction = this.#browserActionFor(receiptTarget),
+    interruptDetaches = this.#interruptDetaches(receiptTarget),
   ): void {
     if (!counted) this.#pendingInputBytes += payload.byteLength;
     const operation = this.#inputTail.then(async () => {
       try {
         await this.#routeInput(payload, receiptTarget, false, receipt,
-          browserActionGeneration, browserAction);
+          browserActionGeneration, browserAction, interruptDetaches);
       } finally {
         this.#pendingInputBytes -= payload.byteLength;
         if (barrierChunk) this.#unroutedBarrierChunks -= 1;
@@ -1519,6 +1828,7 @@ export class ForegroundTerminalCoordinator {
     receipt = 0,
     browserActionGeneration = this.#browserActionGenerationFor(receiptTarget),
     browserAction = this.#browserActionFor(receiptTarget),
+    interruptDetaches = this.#interruptDetaches(receiptTarget),
   ): Promise<void> {
     // Received after a switch was chosen (a chord processed ahead of it in
     // this queue): never sent, to either session.
@@ -1547,7 +1857,7 @@ export class ForegroundTerminalCoordinator {
       }
       this.#browserNotice = undefined;
     } else if (!releasedPrefix && !this.#prefixPending && !bytes.includes(ESCAPE_PREFIX) &&
-      await this.#routeBrowserActionInput(bytes, receiptTarget)) {
+      (await this.#routeRelayConsent(bytes, receiptTarget) || await this.#routeBrowserActionInput(bytes, receiptTarget))) {
       return;
     }
     const guarded = releasedPrefix ? { bytes, blocked: false } : this.#guardProviderOAuthPaste(bytes, receiptTarget);
@@ -1560,8 +1870,16 @@ export class ForegroundTerminalCoordinator {
     bytes = guarded.bytes;
     if (this.#browserNotice !== undefined) this.#browserNotice = undefined;
     this.#arrivalNotice = undefined;
+    if (!releasedPrefix && bytes.byteLength === 1 && bytes[0] === INTERRUPT && !this.#prefixPending) {
+      // A lone Ctrl+C is a key press, never part of a paste: it ends a paste
+      // that never received its end marker, so Ctrl+] is a chord again.
+      this.#pasteActive = false;
+      this.#pasteStartMatch = 0;
+      this.#pasteEndMatch = 0;
+    }
     let target = this.#prefixPending ? this.#prefixTarget : receiptTarget;
     let remote: number[] = [];
+    let interruptSentTo: string | undefined;
     const flush = async (): Promise<void> => {
       if (remote.length === 0) return;
       if (target === undefined) throw runtimeFailure("session_unknown", "No foreground terminal tab is active.");
@@ -1595,10 +1913,15 @@ export class ForegroundTerminalCoordinator {
           await runtime.sendInput(Uint8Array.of(FLOW_RESUME), target.tabId, target.binding);
           this.#browserNotice = FLOW_CONTROL_NOTICE;
           await this.#render();
-        } else if (byte === INTERRUPT) {
+        } else if (byte === INTERRUPT && interruptDetaches) {
           await flush();
           await this.#detachTab(target?.tabId);
           return;
+        } else if (byte === INTERRUPT) {
+          // The writer's Ctrl+C with nothing selected: sent as typed, and once
+          // it is sent the bar says where it went.
+          remote.push(byte);
+          interruptSentTo = target?.tabId;
         } else if (byte === ESCAPE_PREFIX) {
           await flush();
           this.#prefixPending = true;
@@ -1659,7 +1982,13 @@ export class ForegroundTerminalCoordinator {
         target = this.#captureInputTarget();
       } else if (byte === DETACH) {
         await flush();
-        await this.#detachTab(chordTarget?.tabId);
+        // The writer's one way out acknowledges itself as Ctrl+C does.
+        const closing = chordTarget?.tabId ?? this.#activeTabId;
+        if (closing !== undefined) {
+          this.#closingTabId = closing;
+          this.#disconnectNotice = DISCONNECTING_FRAMES[0];
+        }
+        await this.#detachTab(closing);
         return;
       } else if (byte === HELP) {
         await flush();
@@ -1684,6 +2013,27 @@ export class ForegroundTerminalCoordinator {
       }
     }
     await flush();
+    if (interruptSentTo !== undefined) await this.#showInterruptNotice(interruptSentTo);
+  }
+
+  /** Says, for a few seconds, that the writer's Ctrl+C went to the agent; holds no input back. */
+  async #showInterruptNotice(tabId: string): Promise<void> {
+    const agent = this.#tabs.get(tabId)?.intent.agent;
+    if (agent === undefined) return;
+    if (this.#interruptNotice !== undefined) clearTimeout(this.#interruptNotice.timer);
+    const name = interruptAgentName(agent);
+    const timer = setTimeout(() => {
+      if (this.#interruptNotice?.timer !== timer) return;
+      this.#interruptNotice = undefined;
+      void this.#render().catch(() => undefined);
+    }, this.#options.interruptNoticeMs ?? INTERRUPT_NOTICE_MS);
+    timer.unref?.();
+    this.#interruptNotice = Object.freeze({
+      tabId,
+      text: `Ctrl+C sent to ${name} · press it again and ${name} may quit · Ctrl+] d detaches and keeps it running · select text first to copy`,
+      timer,
+    });
+    await this.#render();
   }
 
   async #routeBrowserActionInput(bytes: Uint8Array, target: ForegroundInputTarget | undefined): Promise<boolean> {
@@ -1750,11 +2100,26 @@ export class ForegroundTerminalCoordinator {
     return true;
   }
 
+  /**
+   * A sign-in request read from the byte stream may be one row of a URL the
+   * provider wrapped itself. Open the whole link the screen holds, only when
+   * it continues the approved request and passes the same provider check.
+   * Requests the remote bridge sent carry their exact URL already.
+   */
+  #exactRequestUrl(request: LocalBrowserActionRequest): string {
+    if (request.type !== "browser.open" || this.#remoteLocalActionTabs.has(request.id)) return request.url;
+    const tab = [...this.#tabs.values()].find((candidate) => candidate.snapshot.agentSessionId === request.agentSessionId &&
+      candidate.snapshot.fencingGeneration === request.fencingGeneration);
+    if (tab === undefined) return request.url;
+    const exact = this.#exactLink(tab, request.url, true);
+    return exact.startsWith(request.url) && admitProviderAuthUrl(request.provider, exact) !== undefined ? exact : request.url;
+  }
+
   async #openBrowser(request: LocalBrowserActionRequest): Promise<void> {
     try {
       const browser = this.#options.browser;
       if (browser === undefined) throw new Error("browser unavailable");
-      await browser.open(request.url);
+      await browser.open(this.#exactRequestUrl(request));
       const tracked = this.#localActionBroker.get(request.id);
       if (tracked?.state !== "executing") return;
       this.#pendingBrowserAction = undefined;
@@ -1808,7 +2173,7 @@ export class ForegroundTerminalCoordinator {
       this.#browserNotice = "No sign-in link available. Request a new link in the agent.";
     } else {
       try {
-        await (this.#options.copyText ?? copyLocalText)(link.url);
+        await (this.#options.copyText ?? copyLocalText)(this.#exactLink(tab, link.url, true));
         this.#browserNotice = "Full link copied. Paste it into your browser.";
       } catch {
         this.#browserNotice = "Could not copy the link. Try again.";
@@ -1895,6 +2260,10 @@ export class ForegroundTerminalCoordinator {
       this.#acknowledgeRemoteLocalActionResult(event.tabId, event.payload);
       return;
     }
+    if (event.frame.type === "local_stream_close") {
+      this.#relayStreamClosed(event.tabId, event.payload);
+      return;
+    }
     if (event.frame.type !== "local_action_request") return;
     const raw = event.payload.request;
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -1955,6 +2324,9 @@ export class ForegroundTerminalCoordinator {
         expiresAt: request.expiresAt,
         state: "pending_permission",
       });
+    } else if (request.kind === "auth.callback.relay" && request.provider === "codex") {
+      await this.#admitCallbackRelay(event.tabId, request);
+      return;
     } else {
       throw runtimeFailure("capability_unsupported", "This local action kind was not negotiated by the foreground.");
     }
@@ -2085,9 +2457,193 @@ export class ForegroundTerminalCoordinator {
     }
   }
 
+  /** Admits the supervisor's sign-in relay request and asks the person first. */
+  async #admitCallbackRelay(tabId: string, request: LocalActionRequest): Promise<void> {
+    const localPath = request.arguments.localPath;
+    const exactLocalPort = request.arguments.exactLocalPort;
+    if (typeof localPath !== "string" || typeof exactLocalPort !== "number" || exactLocalPort < 1_024) {
+      throw runtimeFailure("terminal_protocol_error", "The sign-in relay request is malformed.");
+    }
+    this.#remoteLocalActionTabs.set(request.id, tabId);
+    const consent: CallbackRelayConsent = Object.freeze({ tabId, request, localPath, exactLocalPort });
+    this.#relayRequests.set(request.id, consent);
+    let admitted: LocalActionSnapshot;
+    try {
+      admitted = this.#localActionBroker.submit(request);
+    } catch (error) {
+      this.#remoteLocalActionTabs.delete(request.id);
+      this.#relayRequests.delete(request.id);
+      throw error;
+    }
+    if (["succeeded", "failed", "denied", "expired", "cancelled"].includes(admitted.state)) {
+      this.#relayRequests.delete(request.id);
+      this.#queueRemoteLocalActionResult(admitted);
+      return;
+    }
+    this.#promoteBrowserAction();
+    await this.#render();
+  }
+
+  /** Enter allows the relay at the head of the queue, Esc denies it; any other key is the program's. */
+  async #routeRelayConsent(bytes: Uint8Array, target: ForegroundInputTarget | undefined): Promise<boolean> {
+    const consent = this.#pendingRelay;
+    if (consent === undefined || target === undefined || target.tabId !== consent.tabId || target.tabId !== this.#activeTabId) return false;
+    if (bytes.byteLength !== 1 || (bytes[0] !== 0x0d && bytes[0] !== 0x1b)) return false;
+    const allow = bytes[0] === 0x0d;
+    this.#pendingRelay = undefined;
+    let decided: LocalActionSnapshot | undefined;
+    try {
+      decided = this.#localActionBroker.decide(consent.request.id, allow);
+    } catch {
+      decided = undefined;
+    }
+    if (!allow || decided?.state !== "executing") {
+      this.#browserNotice = allow
+        ? "The sign-in request expired · start the sign-in again in Codex"
+        : `Codex's sign-in callback will not be received on this computer · Sign in with Device Code works without it`;
+      this.#promoteBrowserAction();
+      await this.#render();
+      return true;
+    }
+    this.#browserNotice = `Waiting for Codex's sign-in on 127.0.0.1:${consent.exactLocalPort} · open the sign-in link in your browser`;
+    await this.#render();
+    void this.#runCallbackRelay(consent).catch(() => undefined);
+    return true;
+  }
+
+  /**
+   * Listens on 127.0.0.1:<port> for exactly one callback until the request's
+   * deadline, hands it to the Machine, and settles the request with what the
+   * Machine answered. The code and state are never shown or logged.
+   */
+  async #runCallbackRelay(consent: CallbackRelayConsent): Promise<void> {
+    const { request } = consent;
+    const port = consent.exactLocalPort;
+    const deadline = request.arguments.deadlineMs;
+    let handle: CallbackRelayHandle;
+    try {
+      handle = await startCallbackRelay({
+        provider: "codex",
+        localHost: "127.0.0.1",
+        exactLocalPort: port,
+        localPath: consent.localPath,
+        expectedStateDigest: request.arguments.expectedStateDigest as `sha256:${string}`,
+        expectedNonceDigest: request.arguments.expectedNonceDigest as `sha256:${string}`,
+        requestNonce: request.nonce,
+        deadlineMs: Math.min(typeof deadline === "number" ? deadline : request.expiresAt, request.expiresAt),
+        maxAttempts: 8,
+        maxConnections: 16,
+        relay: async (callback, signal) => await this.#sendCallbackToMachine(consent, callback, signal),
+        signal: this.#lifetimeAbort.signal,
+        now: this.#clock,
+      });
+    } catch (error) {
+      this.#browserNotice = (error as NodeJS.ErrnoException | undefined)?.code === "EADDRINUSE"
+        ? `Port ${port} is in use on this computer · close what uses it, or choose Sign in with Device Code in Codex`
+        : `Cuna could not listen on 127.0.0.1:${port} for Codex's sign-in`;
+      this.#settleRelay(consent, "failed", "adapter_failed");
+      await this.#render().catch(() => undefined);
+      return;
+    }
+    this.#relayHandles.set(request.id, handle);
+    try {
+      const receipt = await handle.completion;
+      this.#browserNotice = receipt.answer === "delivered"
+        ? "Sent to Codex on your Machine · finish the sign-in in the terminal"
+        : receipt.answer === "refused"
+          ? "Codex on your Machine refused this sign-in · start the sign-in again in Codex"
+          : "Your Machine did not answer this sign-in in time · start the sign-in again in Codex";
+      this.#settleRelay(consent, receipt.answer === "delivered" ? "succeeded" : "failed",
+        receipt.answer === "delivered" ? undefined : receipt.answer === "refused" ? "adapter_failed" : "execution_timeout");
+    } catch {
+      if (this.#localActionBroker.get(request.id)?.result === undefined) {
+        this.#browserNotice = "Codex's sign-in did not arrive in time · start the sign-in again in Codex";
+        this.#settleRelay(consent, "failed", "request_expired");
+      }
+    } finally {
+      this.#relayHandles.delete(request.id);
+      await this.#render().catch(() => undefined);
+    }
+  }
+
+  /**
+   * One local_to_remote stream carries exactly `GET <path>?<query>`; the
+   * supervisor makes that request on the Machine's loopback and answers by
+   * closing the stream: completed, failed or expired.
+   */
+  async #sendCallbackToMachine(
+    consent: CallbackRelayConsent,
+    callback: AcceptedProviderCallback,
+    signal: AbortSignal,
+  ): Promise<CallbackRelayAnswer> {
+    const query = `state=${encodeURIComponent(callback.state)}&` + (callback.code === undefined
+      ? `error=${encodeURIComponent(callback.error ?? "")}`
+      : `code=${encodeURIComponent(callback.code)}`);
+    const line = Buffer.from(`GET ${consent.localPath}?${query}`, "utf8");
+    const streamId = `relay:${consent.request.id}`;
+    const answered = new Promise<CallbackRelayAnswer>((resolve) => {
+      this.#relayStreams.set(streamId, Object.freeze({ tabId: consent.tabId, length: line.byteLength, resolve }));
+    });
+    const runtime = this.#requireRuntime();
+    try {
+      await runtime.sendLocalActionControl("local_stream_open", {
+        streamId, requestId: consent.request.id, direction: "local_to_remote", initialCreditBytes: RELAY_STREAM_CREDIT_BYTES,
+      }, consent.tabId);
+      await runtime.sendLocalActionControl("local_stream_data", {
+        streamId, offset: 0, bytesBase64url: line.toString("base64url"), decodedLength: line.byteLength,
+        chunkSha256: createHash("sha256").update(line).digest("hex"),
+      }, consent.tabId);
+    } catch {
+      this.#relayStreams.delete(streamId);
+      return "no_answer";
+    }
+    const timedOut = abortableDelay(this.#options.relayAnswerTimeoutMs ?? RELAY_ANSWER_TIMEOUT_MS, signal)
+      .then(() => undefined, () => undefined);
+    const answer = await Promise.race([answered, timedOut]);
+    if (answer !== undefined) return answer;
+    // No answer: the stream is closed from this side so the request can settle.
+    this.#relayStreams.delete(streamId);
+    await runtime.sendLocalActionControl("local_stream_close", {
+      streamId, finalOffset: line.byteLength, reason: "expired",
+    }, consent.tabId).catch(() => undefined);
+    return "no_answer";
+  }
+
+  /** The supervisor's answer to a relayed callback: how it closed the stream. */
+  #relayStreamClosed(tabId: string, payload: Readonly<Record<string, unknown>>): void {
+    const streamId = String(payload.streamId);
+    const wait = this.#relayStreams.get(streamId);
+    if (wait === undefined || wait.tabId !== tabId) return;
+    this.#relayStreams.delete(streamId);
+    wait.resolve(payload.finalOffset !== wait.length ? "no_answer"
+      : payload.reason === "completed" ? "delivered"
+        : payload.reason === "failed" ? "refused" : "no_answer");
+  }
+
+  #settleRelay(consent: CallbackRelayConsent, status: "succeeded" | "failed", safeReason?: LocalActionSafeReason): void {
+    try {
+      this.#localActionBroker.complete(consent.request.id, consent.request.identity, status,
+        status === "succeeded" ? { awaitingProvider: true } : undefined, safeReason);
+    } catch {
+      // A request the broker already ended (expired, cancelled) keeps that result.
+    }
+  }
+
+  /** A relay request that ended for any reason stops listening at once. */
+  #endRelay(requestId: string): void {
+    if (!this.#relayRequests.delete(requestId)) return;
+    if (this.#pendingRelay?.request.id === requestId) this.#pendingRelay = undefined;
+    const handle = this.#relayHandles.get(requestId);
+    this.#relayHandles.delete(requestId);
+    void handle?.close("ended").catch(() => undefined);
+  }
+
   #promoteBrowserAction(): void {
     const current = this.#localActionBroker.current();
-    if (current?.state !== "pending_user") {
+    // The queue answers one request at a time; a sign-in relay at its head
+    // gets the bar's question instead of a browser action.
+    this.#pendingRelay = current?.state === "pending_user" ? this.#relayRequests.get(current.request.id) : undefined;
+    if (current?.state !== "pending_user" || this.#pendingRelay !== undefined) {
       if (this.#pendingBrowserActionTabId !== undefined) {
         this.#advanceBrowserActionGeneration(this.#pendingBrowserActionTabId);
       }
@@ -2335,8 +2891,18 @@ export class ForegroundTerminalCoordinator {
       throw outcome.error;
     }
     // Recorded only once the runtime confirmed the detach: a failed detach
-    // above must never be announced as a session that keeps running.
-    if (departing !== undefined) {
+    // above must never be announced as a session that keeps running, and
+    // neither may one whose process the server says ended.
+    const ended = this.#endedTabs.get(tabId);
+    this.#endedTabs.delete(tabId);
+    if (departing !== undefined && ended !== undefined) {
+      this.#endedSessions.push(Object.freeze({
+        agentSessionId: departing.intent.agentSessionId,
+        label: departing.intent.label,
+        agent: departing.intent.agent,
+        ...(ended.status === undefined ? {} : { status: ended.status }),
+      }));
+    } else if (departing !== undefined) {
       this.#detachedSessions.push(Object.freeze({
         agentSessionId: departing.intent.agentSessionId,
         label: departing.intent.label,
@@ -2415,15 +2981,23 @@ export class ForegroundTerminalCoordinator {
   }
 
   #unavailableInputNotice(): string {
+    const tab = this.#activeTabId === undefined ? undefined : this.#tabs.get(this.#activeTabId);
+    const end = this.#activeTabId === undefined ? undefined : this.#endedTabs.get(this.#activeTabId);
+    if (tab !== undefined && end !== undefined) return this.#endedNotice(tab, end);
     const failure = this.#activeTabId === undefined ? undefined : this.#recoverableReconnectFailures.get(this.#activeTabId);
-    return failure === undefined ? INPUT_WITHHELD_NOTICE : reconnectFailedNotice(failure);
+    return failure === undefined
+      ? INPUT_WITHHELD_NOTICE
+      : reconnectFailedNotice(failure, this.#slowReconnectWaits.get(this.#activeTabId ?? "")?.delayMs);
   }
 
   #captureInputTarget(): ForegroundInputTarget | undefined {
     const tabId = this.#activeTabId;
     if (tabId === undefined) return undefined;
     const tab = this.#tabs.get(tabId);
-    if (tab === undefined || tab.snapshot.state !== "active" || tab.snapshot.terminalView?.ready === false) return undefined;
+    // An ended tab has no process to send to: its keys get the ended notice,
+    // and Ctrl+C leaves it.
+    if (tab === undefined || tab.snapshot.state !== "active" || tab.snapshot.terminalView?.ready === false ||
+      this.#endedTabs.has(tabId)) return undefined;
     return Object.freeze({
       tabId,
       binding: Object.freeze({
@@ -2620,23 +3194,30 @@ export class ForegroundTerminalCoordinator {
       // this window's width is cut from every row that reaches that far.
       const hiddenColumns = this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer"
         ? Math.max(0, activeViewport.columns - dimensions.columns) : 0;
-      const tabs = [...this.#tabs.values()].map((tab): WorkbenchTab => Object.freeze({
-        id: tab.intent.tabId,
-        label: tab.intent.label,
-        agent: tab.intent.agent,
+      const tabs = [...this.#tabs.values()].map((tab): WorkbenchTab => {
+        const ended = this.#endedTabs.has(tab.intent.tabId);
         // Hidden tabs contribute labels only; projecting their cells would
         // recapture a full terminal on every visible output frame. A view the
         // person scrolled back is projected from local history.
-        viewport: tab.intent.tabId === activeTabId && this.#viewProjection(tab, dimensions) !== undefined
+        const viewport = tab.intent.tabId === activeTabId && this.#viewProjection(tab, dimensions) !== undefined
           ? tab.viewport.snapshotForHost(dimensions.columns, remoteRows(dimensions.rows))
-          : tab.viewport.snapshot(),
-      }));
+          : tab.viewport.snapshot();
+        return Object.freeze({
+          id: tab.intent.tabId,
+          label: ended ? `${tab.intent.label} · ended` : tab.intent.label,
+          agent: tab.intent.agent,
+          // The bar says the process ended; tmux's own line for it is not shown.
+          viewport: ended ? withoutPaneDeathRow(viewport) : viewport,
+        });
+      });
       const shownTab = this.#tabs.get(activeTabId);
       const selection = shownTab === undefined ? undefined : this.#selectionRows(shownTab, dimensions);
+      const links = shownTab === undefined ? undefined : this.#linkSpans(shownTab, dimensions);
       // Drags go to the remote only for a writer whose program asked for the
       // mouse; then the host's Shift+drag is the one way to select.
       const remoteMouse = shownTab !== undefined && shownTab.snapshot.accessMode !== "observer" &&
         shownTab.viewport.mouseReporting().tracking !== "none";
+      const attention = this.#attentionLine();
       const trueFrame = renderWorkbenchFrame({
         columns: dimensions.columns,
         rows: dimensions.rows,
@@ -2649,6 +3230,7 @@ export class ForegroundTerminalCoordinator {
         ...(this.#options.mouseReporting === true ? { mouseReporting: true } : {}),
         ...(remoteMouse ? { remoteMouse: true } : {}),
         ...(selection === undefined || selection.length === 0 ? {} : { selection }),
+        ...(links === undefined || links.length === 0 ? {} : { links }),
         appbar: this.#options.appbar?.() ?? runtimeAppbar(
           this.#clock(),
           this.#tabs.get(activeTabId)?.snapshot,
@@ -2660,8 +3242,14 @@ export class ForegroundTerminalCoordinator {
           ? { notice: this.#disconnectNotice }
           : this.#switchNotice !== undefined
             ? { notice: this.#switchNotice }
+          : this.#endedTabs.has(activeTabId) && this.#tabs.has(activeTabId)
+            ? { notice: this.#endedNotice(this.#tabs.get(activeTabId)!, this.#endedTabs.get(activeTabId)!) }
+          : this.#pendingRelay !== undefined && this.#pendingRelay.tabId === activeTabId
+            ? { notice: `Codex asks to receive its sign-in on 127.0.0.1:${this.#pendingRelay.exactLocalPort} · Enter allow · Esc deny` }
           : this.#tabs.get(activeTabId)?.snapshot.state === "active" && this.#tabs.get(activeTabId)?.snapshot.terminalView?.ready === false
             ? { notice: "Restoring terminal\u2026" }
+          : this.#interruptNotice !== undefined && this.#interruptNotice.tabId === activeTabId
+            ? { notice: this.#interruptNotice.text }
           : this.#browserNotice !== undefined
             ? { notice: this.#tabs.get(activeTabId)?.snapshot.historicalInputUncertainty === true &&
                 (this.#browserNotice === INPUT_WITHHELD_NOTICE || isReconnectFailedNotice(this.#browserNotice))
@@ -2679,11 +3267,14 @@ export class ForegroundTerminalCoordinator {
               : (this.#tabs.get(activeTabId)?.viewport.scrollOffset ?? 0) > 0
                 ? { notice: scrolledBackNotice(this.#tabs.get(activeTabId)?.viewport.scrollOffset ?? 0) }
               : this.#helpVisible
-                ? { notice: "Keys: Ctrl+C detach | " + (remoteMouse ? "Shift+drag select | " : "Drag select + copy | Ctrl+click open link | ") + (process.platform === "win32" ? "Ctrl+Shift+V paste | " : "") + "Wheel scroll | Ctrl+S keep active | Ctrl+] c/s/q remote | " + (this.#rosterActive() ? "1-9 or click switch session" : "1-4 tab") + " | n next | r retry" +
+                ? { notice: "Keys: " + (this.#tabs.get(activeTabId)?.snapshot.accessMode === "writer" ? "Ctrl+C to agent | " : "Ctrl+C detach | ") +
+                    (remoteMouse ? "Shift+drag select | " : "Drag select, Ctrl+C copy | Ctrl+click open link | ") + (process.platform === "win32" ? "Ctrl+Shift+V paste | " : "") + "Wheel scroll | Ctrl+S keep active | Ctrl+] c/s/q remote | " + (this.#rosterActive() ? "1-9 or click switch session" : "1-4 tab") + " | n next | r retry" +
                     (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined
                       ? writerCapabilityNeedsRefresh(this.#tabs.get(activeTabId)!.snapshot) ? " | w recheck control" : " | w take control"
                       : "") + " | a retained sign-in link | d detach" }
+                : attention !== undefined
+                  ? { notice: attention }
                 : this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot, hiddenColumns) !== undefined
                   ? { notice: this.#seatNoticeFor(this.#tabs.get(activeTabId)?.snapshot, hiddenColumns) as string }
                   : this.#retainedBrowserCandidates.has(activeTabId)
@@ -2714,6 +3305,16 @@ export class ForegroundTerminalCoordinator {
     });
     this.#renderTail = operation.then(() => undefined, () => undefined);
     await operation;
+  }
+
+  /** The outside attention line, if any; a failing source shows nothing rather than failing the frame. */
+  #attentionLine(): string | undefined {
+    try {
+      const line = this.#options.attention?.current();
+      return line === undefined || line.length === 0 ? undefined : line;
+    } catch {
+      return undefined;
+    }
   }
 
   #findIntent(tabId: string, agentSessionId: string): ForegroundTabIntent {
@@ -2898,6 +3499,12 @@ export class ForegroundTerminalCoordinator {
   #retryActiveTab(): void {
     const tabId = this.#activeTabId;
     if (tabId === undefined || this.#tabs.get(tabId)?.snapshot.state !== "interrupted") return;
+    // Waiting for a slow attempt: make it now.
+    const slowWait = this.#slowReconnectWaits.get(tabId);
+    if (slowWait !== undefined) {
+      slowWait.wake();
+      return;
+    }
     this.#startRecovery(tabId);
   }
 
@@ -3017,16 +3624,39 @@ export function admitForegroundDimensions(input: { readonly columns: number; rea
  * about whether retrying can help. Only this client's own closed error codes
  * are rendered -- never remote text.
  */
-function reconnectFailedNotice(failure: unknown): string {
-  if (!(failure instanceof RuntimeBoundaryError)) return RECONNECT_FAILED_NOTICE;
-  // The capability name is this client's own closed enum, not remote text, and
-  // it is the one word that says WHICH contract the replacement grant failed to
-  // prove. Without it "capability unknown" cannot be acted on by anyone.
-  const capability = failure.safeDetails?.capability;
-  const subject = typeof capability === "string" && /^[a-z_]{1,32}$/u.test(capability)
-    ? `${failure.code.replaceAll("_", " ")} (${capability.replaceAll("_", " ")})`
-    : failure.code.replaceAll("_", " ");
-  return `Reconnect failed: ${subject} · Ctrl+] r retries · Ctrl+C disconnects.`;
+function reconnectFailedNotice(failure: unknown, retryInMs?: number): string {
+  const subject = reconnectFailureSubject(failure);
+  if (subject === undefined && retryInMs === undefined) return RECONNECT_FAILED_NOTICE;
+  const retry = retryInMs === undefined ? "" : ` · retrying in ${Math.max(1, Math.ceil(retryInMs / 1_000))} s`;
+  return `Reconnect failed${subject === undefined ? "" : `: ${subject}`}${retry} · Ctrl+] r retries · Ctrl+C disconnects.`;
+}
+
+function reconnectFailureSubject(failure: unknown): string | undefined {
+  // A reconnect whose cleanup also failed reports both; the first is why.
+  if (failure instanceof AggregateError) return reconnectFailureSubject(failure.errors[0]);
+  if (failure instanceof RuntimeBoundaryError) {
+    // The capability name is this client's own closed enum, not remote text,
+    // and it is the one word that says WHICH contract the replacement grant
+    // failed to prove. Without it "capability unknown" cannot be acted on.
+    const capability = failure.safeDetails?.capability;
+    return typeof capability === "string" && /^[a-z_]{1,32}$/u.test(capability)
+      ? `${failure.code.replaceAll("_", " ")} (${capability.replaceAll("_", " ")})`
+      : failure.code.replaceAll("_", " ");
+  }
+  // The API calls a reconnect makes (admission, grant) fail as CunaErrors: on
+  // 2026-10-03 the bar said a bare "Reconnect failed" while they were timing
+  // out. Their codes are a closed dotted vocabulary; anything else stays unnamed.
+  if (failure instanceof CunaError && /^cuna(?:\.[a-z][a-z_]{0,47}){1,3}$/u.test(failure.code)) {
+    return failure.code.slice("cuna.".length).replaceAll(".", " ").replaceAll("_", " ");
+  }
+  return undefined;
+}
+
+/** Whether waiting can help: only a failure that says it cannot is final. */
+function isRetryableReconnectFailure(failure: unknown): boolean {
+  if (failure instanceof AggregateError) return isRetryableReconnectFailure(failure.errors[0]);
+  if (failure instanceof RuntimeBoundaryError || failure instanceof CunaError) return failure.retryable;
+  return true;
 }
 
 function isReconnectFailedNotice(value: string | undefined): boolean {
@@ -3051,6 +3681,29 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 
 function scrolledBackNotice(lines: number): string {
   return `Scrolled back ${lines} line${lines === 1 ? "" : "s"} · scroll down or type to return`;
+}
+
+/** Only a bounded http(s) URL of printable characters may enter a host hyperlink. */
+function paintableLink(uri: string): boolean {
+  if (uri.length > 2_048 || /[\p{Cc}\s]/u.test(uri)) return false;
+  try {
+    const url = new URL(uri);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/** The viewport rows a link covers, as cell ranges [start, end) within the painted width. */
+function linkRows(link: BufferLink, top: number, rows: number, width: number, columns: number):
+  readonly { readonly row: number; readonly start: number; readonly end: number }[] {
+  const spans: { row: number; start: number; end: number }[] = [];
+  for (let line = Math.max(link.start.line, top); line <= link.end.line && line < top + rows; line += 1) {
+    const start = line === link.start.line ? link.start.column : 0;
+    const end = Math.min(width, line === link.end.line ? link.end.column + 1 : columns);
+    if (end > start) spans.push({ row: line - top, start, end });
+  }
+  return spans;
 }
 
 function widerViewNotice(columns: number): string {
@@ -3138,9 +3791,63 @@ function padTrustedLine(value: string, columns: number): string {
   return value.slice(0, columns).padEnd(columns, " ");
 }
 
+/** The program a writer's Ctrl+C reaches, as the person knows it. */
+function interruptAgentName(agent: WorkbenchTab["agent"]): string {
+  switch (agent) {
+    case "claude-code": return "Claude Code";
+    case "codex": return "Codex";
+    case "opencode": return "OpenCode";
+    case "openclaw": return "OpenClaw";
+    case "shell": return "the shell";
+  }
+}
+
 function providerName(provider: LocalBrowserActionRequest["provider"]): string {
   if (provider === "claude-code") return "Claude Code";
   return "Codex";
+}
+
+const SESSION_END_READ_DELAYS_MS = Object.freeze([0, 1_500, 3_000, 6_000]);
+/**
+ * tmux's default remain-on-exit-format:
+ * "Pane is dead (status 0, Tue Sep 29 17:41:10 2026)", or "(signal 9, …)".
+ */
+const PANE_DEAD = /^Pane is dead \((status \d{1,3}|signal \d{1,2})(?:, [A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4})?\)$/u;
+
+/** tmux's pane-dead line, when it is the screen's last written row. */
+function paneDeathRow(cells: readonly string[]): { readonly row: number; readonly status: string } | undefined {
+  for (let row = cells.length - 1; row >= 0; row -= 1) {
+    const text = (cells[row] ?? "").trim();
+    if (text.length === 0) continue;
+    const match = PANE_DEAD.exec(text);
+    return match === null ? undefined : Object.freeze({ row, status: match[1] as string });
+  }
+  return undefined;
+}
+
+/** The same screen with tmux's pane-dead line blank. */
+function withoutPaneDeathRow(view: ViewportSnapshot): ViewportSnapshot {
+  const death = paneDeathRow(view.cells);
+  if (death === undefined) return view;
+  const blank = <T>(rows: readonly T[], value: T): readonly T[] =>
+    Object.freeze(rows.map((row, index) => index === death.row ? value : row));
+  return Object.freeze({
+    ...view,
+    cells: blank(view.cells, ""),
+    displayWidths: blank(view.displayWidths, 0),
+    ...(view.renderRows === undefined ? {} : { renderRows: blank(view.renderRows, Object.freeze([])) }),
+    ...(view.continuedRows === undefined ? {} : { continuedRows: blank(view.continuedRows, false) }),
+  });
+}
+
+function sessionProviderName(agent: WorkbenchTab["agent"]): string {
+  return agent === "claude-code" ? "Claude Code" : agent === "codex" ? "Codex" : agent === "opencode" ? "OpenCode" :
+    agent === "openclaw" ? "OpenClaw" : "The shell";
+}
+
+/** The journey that starts a new session of this provider, when there is one. */
+function journeyCommand(agent: WorkbenchTab["agent"]): string | undefined {
+  return agent === "claude-code" ? "cuna claude" : agent === "codex" ? "cuna codex" : agent === "opencode" ? "cuna opencode" : undefined;
 }
 
 async function raceAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {

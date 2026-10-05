@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import { connect as netConnect, createServer as createNetServer } from "node:net";
 import test from "node:test";
 import xterm from "@xterm/headless";
 
 import { digestLocalActionArguments, ForegroundTerminalCoordinator, MAX_FOREGROUND_PENDING_INPUT_BYTES } from "../dist/index.js";
 import { createNodeForegroundTerminalHost } from "../dist/pty/node-host-terminal.js";
 import { runtimeFailure } from "../dist/runtime/errors.js";
+import { CunaError } from "../dist/core/errors.js";
 import { XtermViewportAdapter } from "../dist/terminal/xterm-vte.js";
 
 const encoder = new TextEncoder();
@@ -185,7 +189,7 @@ test("a grant mismatch against an unchanged writer remains a terminal failure", 
   } finally { await coordinator.stop(); }
 });
 
-test("Ctrl+C flushes prior text before detaching and never batches the interrupt", async () => {
+test("a writer's Ctrl+C flushes prior text first and is never batched with it", async () => {
   const { coordinator, host, calls, intents } = harness();
   try {
     await coordinator.start(intents);
@@ -193,9 +197,9 @@ test("Ctrl+C flushes prior text before detaching and never batches the interrupt
     await waitUntil(() => calls.input.length === 1, "first key should be immediate");
     host.emitInput(encoder.encode("b"));
     host.emitInput(Uint8Array.of(0x03));
-    await waitUntil(() => calls.detach.includes(intents[0].tabId), "Ctrl+C should detach without the batch timer");
-    assert.equal(calls.input.map(item => item.text).join(""), "ab");
-    assert.equal(calls.input.some(item => item.text.includes("\x03")), false);
+    await waitUntil(() => calls.input.some(item => item.text === "\x03"), "Ctrl+C should reach the PTY without the batch timer");
+    assert.deepEqual(calls.input.map(item => item.text), ["a", "b", "\x03"]);
+    assert.deepEqual(calls.detach, []);
   } finally { await coordinator.stop(); }
 });
 
@@ -1104,7 +1108,7 @@ test("RTP local-action negotiation is scoped to the attached provider", async ()
   intents[0].agent = "opencode";
   await coordinator.start(intents);
   assert.deepEqual(callbacks.localActionKinds(SESSION_A), []);
-  assert.deepEqual(callbacks.localActionKinds(SESSION_B), ["browser.open", "auth.device.present"]);
+  assert.deepEqual(callbacks.localActionKinds(SESSION_B), ["browser.open", "auth.device.present", "auth.callback.relay"]);
   await coordinator.stop();
 });
 
@@ -1233,9 +1237,10 @@ test("pasting the Claude sign-in URL is blocked with a corrective prompt while t
   await coordinator.stop();
 });
 
-test("one Ctrl-C detaches even when a bracketed paste never receives its end marker", async () => {
-  const { coordinator, calls, host, intents } = harness();
+test("one observer Ctrl-C detaches even when a bracketed paste never receives its end marker", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness();
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   host.emitInput(encoder.encode("\u001b[200~partial"));
   await waitUntil(() => calls.input.length === 1, "partial paste should enter the bounded terminal path");
   host.emitInput(Uint8Array.of(0x03));
@@ -1243,7 +1248,22 @@ test("one Ctrl-C detaches even when a bracketed paste never receives its end mar
   assert.deepEqual(calls.detach, ["tab-a"]);
 });
 
-test("a hanging browser opener never blocks one-Ctrl-C detach", async () => {
+test("a writer's Ctrl+C ends a paste that never received its end marker, so Ctrl+] d detaches again", async () => {
+  const { coordinator, calls, host, intents } = harness();
+  await coordinator.start(intents.slice(0, 1));
+  host.emitInput(encoder.encode("\u001b[200~partial"));
+  await waitUntil(() => calls.input.length === 1, "partial paste should enter the bounded terminal path");
+  host.emitInput(Uint8Array.of(0x03));
+  await waitUntil(() => calls.input.length === 2, "the writer's Ctrl+C reaches the PTY");
+  assert.equal(calls.input[1].text, "\u0003");
+  host.emitInput(Uint8Array.of(0x1d));
+  host.emitInput(encoder.encode("d"));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  assert.equal(calls.input.length, 2, "the chord after Ctrl+C is not pasted text");
+});
+
+test("a hanging browser opener never blocks the Ctrl+] d detach", async () => {
   let releaseBrowser;
   let browserStarted = false;
   const { coordinator, callbacks, calls, host, intents } = harness({
@@ -1261,7 +1281,7 @@ test("a hanging browser opener never blocks one-Ctrl-C detach", async () => {
   ));
   host.emitInput(Uint8Array.of(0x0d));
   await waitUntil(() => browserStarted, "browser action should start");
-  host.emitInput(Uint8Array.of(0x03));
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
   await coordinator.waitForStop();
   assert.deepEqual(calls.detach, ["tab-a"]);
   releaseBrowser?.();
@@ -1586,7 +1606,7 @@ test("TC-055-07/08 escape help and tab chords stay local while Ctrl+] c sends a 
   assert.deepEqual(calls.input[1], { tabId: "tab-a", text: "\u0003" });
 
   host.emitInput(Uint8Array.of(0x1d, 0x3f));
-  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+C detach"), "trusted appbar should show local escape help");
+  await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+C to agent"), "trusted appbar should show local escape help");
 
   host.emitInput(Uint8Array.of(0x1d));
   host.emitInput(Uint8Array.of(0x32, 0x42));
@@ -1616,15 +1636,16 @@ test("Ctrl+S cannot silently XOFF the remote PTY and explicit escape chords pres
   await coordinator.stop();
 });
 
-test("Ctrl+C keeps the Cuna frame visible through deterministic disconnect feedback before restore", async () => {
+test("observer: Ctrl+C keeps the Cuna frame visible through deterministic disconnect feedback before restore", async () => {
   let releaseDetach;
   const detachGate = new Promise((resolve) => { releaseDetach = resolve; });
-  const { coordinator, calls, host, intents } = harness({
+  const { callbacks, coordinator, calls, host, intents } = harness({
     detachGate,
     detachStateSequence: ["interrupted", "detached"],
     coordinatorOptions: { disconnectFrameMs: 1 },
   });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   const baselineWrites = host.writes.length;
   host.emitInput(Uint8Array.of(0x03));
   await waitUntil(
@@ -1650,11 +1671,12 @@ test("Ctrl+C keeps the Cuna frame visible through deterministic disconnect feedb
   assert.equal(coordinator.failure, undefined);
 });
 
-test("rich no-color keeps disconnect feedback while emitting no color SGR", async () => {
-  const { coordinator, host, intents } = harness({
+test("observer: rich no-color keeps disconnect feedback while emitting no color SGR", async () => {
+  const { callbacks, coordinator, host, intents } = harness({
     coordinatorOptions: { color: false, disconnectFrameMs: 1 },
   });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   const baselineWrites = host.writes.length;
   host.emitInput(Uint8Array.of(0x03));
   await coordinator.waitForStop();
@@ -1665,13 +1687,14 @@ test("rich no-color keeps disconnect feedback while emitting no color SGR", asyn
   assert.equal(colorSgr.test(closing), false);
 });
 
-test("a detach failure never paints Disconnected or becomes a successful rich close", async () => {
+test("observer: a detach failure never paints Disconnected or becomes a successful rich close", async () => {
   const detachError = new Error("remote detach rejected");
-  const { coordinator, host, intents } = harness({
+  const { callbacks, coordinator, host, intents } = harness({
     detachError,
     coordinatorOptions: { disconnectFrameMs: 1 },
   });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   const baselineWrites = host.writes.length;
   host.emitInput(Uint8Array.of(0x03));
   await assert.rejects(coordinator.waitForStop(), /cleanup was incomplete/u);
@@ -1682,9 +1705,11 @@ test("a detach failure never paints Disconnected or becomes a successful rich cl
   assert.equal(host.restored, 1);
 });
 
-test("closing animation is best-effort when one decorative host frame fails", async () => {
-  const { coordinator, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+test("observer: closing animation is best-effort when one decorative host frame fails", async () => {
+  const { callbacks, coordinator, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+  await waitForScreen(host, /Read-only|observ/iu, "the observer frame is painted before a frame may fail");
   host.failWriteAt = host.writeAttempts + 1;
   host.emitInput(Uint8Array.of(0x03));
   await coordinator.waitForStop();
@@ -1693,7 +1718,7 @@ test("closing animation is best-effort when one decorative host frame fails", as
   assert.equal(host.writes.some((bytes) => decoder.decode(bytes).includes("Disconnected.")), true);
 });
 
-test("rich Ctrl+C intent wins a transport close before its queued detach executes", async () => {
+test("observer: rich Ctrl+C intent wins a transport close before its queued detach executes", async () => {
   let releaseInput;
   const inputGate = new Promise((resolve) => { releaseInput = resolve; });
   const { coordinator, callbacks, calls, host, intents } = harness({
@@ -1701,6 +1726,7 @@ test("rich Ctrl+C intent wins a transport close before its queued detach execute
     coordinatorOptions: { disconnectFrameMs: 1 },
   });
   await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
   host.emitInput(Uint8Array.of(0x41));
   await waitUntil(() => calls.input.length === 1, "the earlier rich input should hold the serialized tail");
 
@@ -1724,9 +1750,10 @@ test("rich Ctrl+C intent wins a transport close before its queued detach execute
   assert.equal(host.restored, 1);
 });
 
-test("Ctrl+C on one rich tab returns to its sibling without restoring the workbench", async () => {
-  const { coordinator, calls, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+test("observer: Ctrl+C on one rich tab returns to its sibling without restoring the workbench", async () => {
+  const { coordinator, callbacks, calls, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
   await coordinator.start(intents);
+  for (const intent of intents) callbacks.onTerminalState({ ...snapshot(intent), accessMode: "observer", writerEpoch: 2 });
   const baselineWrites = host.writes.length;
   host.emitInput(Uint8Array.of(0x03));
   await waitUntil(() => calls.switch.includes("tab-b"), "the sibling should become active after local close");
@@ -1804,7 +1831,7 @@ test("remote fullscreen output waits for VTE resize before composing a narrower 
   assert.match(frame, /provider-frame/u);
   assert.equal(coordinator.state, "active");
 
-  host.emitInput(Uint8Array.of(0x03));
+  host.emitInput(Uint8Array.of(0x1d, 0x64));
   await coordinator.waitForStop();
   assert.equal(host.restored, 1);
   assert.equal(coordinator.failure, undefined);
@@ -3293,6 +3320,20 @@ const addressedRows = (text, columns, firstRow = 1) => {
   return bytes;
 };
 
+/** Host cells painted in inverse video, as the selection highlight is. */
+async function inverseCells(host) {
+  const terminal = new xterm.Terminal({ cols: host.columns, rows: host.rows, allowProposedApi: true });
+  try {
+    for (const bytes of host.writes) await new Promise(resolve => terminal.write(bytes, resolve));
+    let count = 0;
+    for (let row = 0; row < host.rows; row += 1) {
+      const line = terminal.buffer.active.getLine(row);
+      for (let column = 0; column < host.columns; column += 1) if (line?.getCell(column)?.isInverse()) count += 1;
+    }
+    return count;
+  } finally { terminal.dispose(); }
+}
+
 async function waitForScreen(host, pattern, message) {
   for (let attempt = 0; attempt < 200; attempt += 1) {
     if (pattern.test(await visibleHostText(host))) return;
@@ -3379,7 +3420,7 @@ test("a remote that asked for the mouse still gets clicks and drags, in the mode
     try {
       await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`${modes}text`)));
       if (process.platform === "win32") {
-        await waitForScreen(host, /Agent uses the mouse: Shift\+drag select/u, `${modes}: the hint names Shift+drag`);
+        await waitForScreen(host, /Ctrl\+\] d detach · Shift\+drag select/u, `${modes}: the hint names Shift+drag`);
       }
       host.emitInput(mouse(0, 2, 3));
       host.emitInput(mouse(32, 6, 4));
@@ -3404,6 +3445,212 @@ test("an observer selects even when the writer's program asked for the mouse, an
     assert.equal(copied[0], "observed text");
     assert.deepEqual(calls.input, []);
   } finally { await coordinator.stop(); }
+});
+
+// Owner 2026-09-29: Ctrl+C detached a writer instead of interrupting the
+// agent, as in no other terminal. A writer's control keys go to the PTY; only
+// the Ctrl+] prefix detaches it. An observer, who sends nothing, detaches on
+// Ctrl+C. Over a shown Cuna selection Ctrl+C copies, in both seats.
+test("a writer's Ctrl+C, Ctrl+Z and Ctrl+\\ reach the agent's PTY; only Ctrl+] d detaches", async () => {
+  const { coordinator, calls, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+  await coordinator.start(intents.slice(0, 1));
+  for (const [label, byte] of [["Ctrl+C", 0x03], ["Ctrl+Z", 0x1a], ["Ctrl+\\", 0x1c], ["Ctrl+D", 0x04]]) {
+    const before = calls.input.length;
+    host.emitInput(Uint8Array.of(byte));
+    await waitUntil(() => calls.input.length === before + 1, `${label} reaches the PTY`);
+    assert.deepEqual(calls.input.at(-1), { tabId: "tab-a", text: String.fromCharCode(byte) }, `${label} is sent unchanged, on its own`);
+  }
+  host.emitInput(Uint8Array.of(0x03, 0x03));
+  await waitUntil(() => calls.input.length === 5, "a chunk of two Ctrl+C reaches the PTY");
+  assert.equal(calls.input.at(-1).text, "\u0003\u0003");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(calls.detach, [], "no control key detaches a writer");
+  assert.equal(coordinator.state, "active");
+  assert.equal(host.writes.some((bytes) => decoder.decode(bytes).includes("Disconnecting")), false);
+  host.emitInput(Uint8Array.of(0x1d));
+  host.emitInput(encoder.encode("d"));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  assert.equal(calls.input.length, 5, "the detach chord sends nothing");
+  assert.equal(coordinator.failure, undefined);
+  const closing = host.writes.map((bytes) => decoder.decode(bytes));
+  assert.equal(closing.some((frame) => frame.includes("✦ Disconnecting...")), true, "the chord acknowledges the detach as Ctrl+C did");
+  assert.equal(closing.some((frame) => frame.includes("✓ Disconnected.")), true);
+});
+
+test("an observer's Ctrl+C detaches and sends nothing; Ctrl+] d detaches an observer too", async () => {
+  for (const [label, keys] of [["Ctrl+C", [Uint8Array.of(0x03)]], ["Ctrl+] d", [Uint8Array.of(0x1d), encoder.encode("d")]]]) {
+    const { coordinator, callbacks, calls, host, intents } = harness({ coordinatorOptions: { disconnectFrameMs: 1 } });
+    await coordinator.start(intents.slice(0, 1));
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+    for (const bytes of keys) host.emitInput(bytes);
+    await coordinator.waitForStop();
+    assert.deepEqual(calls.detach, ["tab-a"], `${label} detaches the observer`);
+    assert.deepEqual(calls.input, [], `${label} sends nothing`);
+    assert.equal(coordinator.failure, undefined);
+  }
+});
+
+test("Ctrl+C over a shown selection copies it, clears it and sends nothing; the next Ctrl+C is the seat's", async () => {
+  for (const accessMode of ["writer", "observer"]) {
+    const { coordinator, callbacks, host, intents, copied, calls } = await selectionHarness(
+      { disconnectFrameMs: 1 },
+      (_intents, fakeHost) => { fakeHost.columns = 140; },
+    );
+    try {
+      if (accessMode === "observer") callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode, writerEpoch: 2 });
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("\u001b[2J\u001b[Hselected words here")));
+      host.emitInput(mouse(0, 1, 3));
+      host.emitInput(mouse(32, 14, 3));
+      host.emitInput(mouse(0, 14, 3, true));
+      await waitUntil(() => copied.length === 1, `${accessMode}: release copies`);
+      await waitForScreen(host, /Ctrl\+C copies the selection · Ctrl\+\] d detach/u, `${accessMode}: a shown selection names its copy key`);
+      assert.equal(await inverseCells(host), 14, `${accessMode}: the selection is highlighted before Ctrl+C`);
+      const osc52Before = host.writes.filter((bytes) => decoder.decode(bytes).startsWith("\u001b]52;c;")).length;
+      host.emitInput(Uint8Array.of(0x03));
+      await waitUntil(() => copied.length === 2, `${accessMode}: Ctrl+C copies the selection`);
+      assert.equal(copied[1], "selected words");
+      await waitUntil(() => host.writes.filter((bytes) => decoder.decode(bytes).startsWith("\u001b]52;c;")).length === osc52Before + 1,
+        `${accessMode}: Ctrl+C offers the host clipboard the same text`);
+      for (let attempt = 0; attempt < 200 && await inverseCells(host) > 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(await inverseCells(host), 0, `${accessMode}: the highlight is cleared`);
+      assert.match(await visibleHostText(host), /Copied 14 characters/u, `${accessMode}: the copy is confirmed`);
+      assert.doesNotMatch(await visibleHostText(host), /Drag to select · Ctrl\+C copy/u, `${accessMode}: the hint leaves with the selection`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(calls.input, [], `${accessMode}: nothing reaches the agent`);
+      assert.deepEqual(calls.detach, [], `${accessMode}: Ctrl+C over a selection never detaches`);
+      host.emitInput(Uint8Array.of(0x03));
+      if (accessMode === "writer") {
+        await waitUntil(() => calls.input.length === 1, "without a selection a writer's Ctrl+C reaches the PTY");
+        assert.equal(calls.input[0].text, "\u0003");
+        assert.deepEqual(calls.detach, []);
+        assert.equal(copied.length, 2);
+      } else {
+        await coordinator.waitForStop();
+        assert.deepEqual(calls.detach, ["tab-a"], "without a selection an observer's Ctrl+C detaches");
+        assert.deepEqual(calls.input, []);
+      }
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("DISCRIMINATING CONTROL: a selection scrolled out of view does not take Ctrl+C", async () => {
+  const { coordinator, callbacks, host, intents, copied, calls } = await selectionHarness();
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("\u001b[2J\u001b[Hselected words here")));
+    host.emitInput(mouse(0, 1, 3));
+    host.emitInput(mouse(32, 14, 3));
+    host.emitInput(mouse(0, 14, 3, true));
+    await waitUntil(() => copied.length === 1, "release copies");
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 2n, encoder.encode(Array.from({ length: 40 }, (_, index) => `\r\nline ${index}`).join(""))));
+    await waitForScreen(host, /line 39/u, "the selected row scrolls out of the view");
+    host.emitInput(Uint8Array.of(0x03));
+    await waitUntil(() => calls.input.length === 1, "the unseen selection leaves Ctrl+C to the agent");
+    assert.equal(calls.input[0].text, "\u0003");
+    assert.equal(copied.length, 1);
+    assert.deepEqual(calls.detach, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("help names Ctrl+C by seat: to the agent for a writer, detach only for an observer", async () => {
+  const { coordinator, callbacks, host, intents } = harness({ host: Object.assign(new FakeHost(), { columns: 400 }) });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: "), "help opens for the writer");
+    const writerHelp = decoder.decode(host.writes.at(-1));
+    assert.match(writerHelp, /Keys: Ctrl\+C to agent \|/u);
+    assert.doesNotMatch(writerHelp, /Ctrl\+C detach/u);
+    assert.match(writerHelp, /\| d detach/u, "the writer's detach is the chord");
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => !decoder.decode(host.writes.at(-1)).includes("Keys: "), "help closes");
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: "), "help opens for the observer");
+    assert.match(decoder.decode(host.writes.at(-1)), /Keys: Ctrl\+C detach \|/u);
+  } finally { await coordinator.stop(); }
+});
+
+// Owner 2026-09-29 17:41Z: Codex 0.147 quit at its sign-in screen, and the
+// terminal showed tmux's own "Pane is dead (status 0, …)" under it. The
+// supervisor recorded process_exited 1.5 s later; no EXIT frame reached the CLI.
+const PANE_DEAD_LINE = "Pane is dead (status 0, Tue Sep 29 17:41:10 2026)";
+/** A canonical view after its pane died: the last screen, then tmux's line on the view's last row. */
+const paneDeadView = (rows) => `\u001b[2J\u001b[H  Welcome to Codex\r\n  1. Sign in with ChatGPT\u001b[${rows};1H${PANE_DEAD_LINE}`;
+
+function endingHarness(recorded) {
+  const reads = [];
+  const context = harness({
+    host: Object.assign(new FakeHost(), { columns: 200 }),
+    coordinatorOptions: {
+      disconnectFrameMs: 1,
+      sessionEndReadDelaysMs: [0, 5, 5],
+      async readSessionEnd(agentSessionId) { reads.push(agentSessionId); return recorded(reads.length); },
+    },
+  });
+  return { ...context, reads };
+}
+
+test("a pane the server records as ended is labelled ended, and tmux's pane-dead line is not shown", async () => {
+  // The first read races the supervisor's record; the second finds it.
+  const { coordinator, callbacks, calls, host, intents, reads } = endingHarness((count) => count < 2 ? undefined : { observedAt: "2026-09-29T17:41:11.500Z" });
+  const codex = intents[1];
+  await coordinator.start([codex]);
+  await callbacks.onTerminalOutput(outputEvent(codex, 1n, encoder.encode(paneDeadView(22))));
+  await waitForScreen(host, /Codex exited \(status 0\) at 17:41 UTC · this session has ended · start a new one: `cuna codex --new-session` \(from its folder\)/u,
+    "the bar says the process ended, how, when and what to do");
+  const screen = await visibleHostText(host);
+  assert.doesNotMatch(screen, /Pane is dead/u, "tmux's own line is not shown");
+  assert.match(screen, /Welcome to Codex/u, "the last screen stays");
+  assert.match(screen, /review · ended/u, "the tab is labelled ended");
+  assert.deepEqual(reads, [codex.agentSessionId, codex.agentSessionId]);
+  host.emitInput(encoder.encode("x"));
+  host.emitInput(Uint8Array.of(0x0d));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(calls.input, [], "keys are not sent to an ended process");
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, [codex.tabId], "Ctrl+C leaves an ended tab");
+  assert.deepEqual(coordinator.detachedSessions, [], "an ended session is never said to keep running");
+  assert.deepEqual(coordinator.endedSessions, [{ agentSessionId: codex.agentSessionId, label: "review", agent: "codex", status: "status 0" }]);
+});
+
+test("DISCRIMINATING CONTROL: pane-dead words the server does not confirm are only screen text", async () => {
+  const { coordinator, callbacks, calls, host, intents, reads } = endingHarness(() => undefined);
+  const codex = intents[1];
+  try {
+    await coordinator.start([codex]);
+    await callbacks.onTerminalOutput(outputEvent(codex, 1n, encoder.encode(paneDeadView(22))));
+    await waitUntil(() => reads.length === 3, "every bounded read is made");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const screen = await visibleHostText(host);
+    assert.match(screen, /Pane is dead \(status 0/u, "unconfirmed, the screen is shown as it is");
+    assert.doesNotMatch(screen, /has ended|· ended/u);
+    host.emitInput(Uint8Array.of(0x03));
+    await waitUntil(() => calls.input.length === 1, "the writer's Ctrl+C still reaches the PTY");
+    assert.deepEqual(calls.detach, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("CONTROL: the words above later output are not tmux's line, and nothing is read", async () => {
+  const { coordinator, callbacks, intents, reads } = endingHarness(() => ({ observedAt: "2026-09-29T17:41:11.500Z" }));
+  const codex = intents[1];
+  try {
+    await coordinator.start([codex]);
+    await callbacks.onTerminalOutput(outputEvent(codex, 1n, encoder.encode(`\u001b[2J\u001b[H${PANE_DEAD_LINE}\r\n$ still typing`)));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(reads, []);
+  } finally { await coordinator.stop(); }
+});
+
+test("an EXIT frame ends the tab as ended, with its status, never as detached", async () => {
+  const { coordinator, callbacks, intents } = harness();
+  const codex = intents[1];
+  await coordinator.start([codex]);
+  callbacks.onTerminalState({ ...snapshot(codex), state: "closed", reason: "remote_process_exit", exitCode: 0 });
+  await coordinator.waitForStop();
+  assert.deepEqual(coordinator.detachedSessions, []);
+  assert.deepEqual(coordinator.endedSessions, [{ agentSessionId: codex.agentSessionId, label: "review", agent: "codex", status: "status 0" }]);
 });
 
 test("Ctrl+click opens a drawn link; the exact OSC 8 link wins over a cut row", async () => {
@@ -3517,4 +3764,641 @@ test("at 120 columns the observer seat line for a 190-column writer fits whole",
     }
     assert.match(row, /Observing \(read-only\) · view is 70 columns wider than this window \(›\) · Press Ctrl\+\] then w to take control/u);
   } finally { await coordinator.stop(); }
+});
+
+/* -------------------------------------------------------------------------- */
+/* One exact target per link: Ctrl+click, Ctrl+] y, Enter/o and the host's own */
+/* hyperlink (owner 2026-09-29: Codex sign-in opened one row of its URL)       */
+/* -------------------------------------------------------------------------- */
+
+/** The host frame's OSC 8 hyperlinks: each opened link's target and the text it covers. */
+function hostHyperlinks(host) {
+  const text = host.writes.map((bytes) => decoder.decode(bytes)).join("");
+  const links = [];
+  // eslint-disable-next-line no-control-regex -- reading the host frame's own OSC 8 hyperlinks
+  for (const match of text.matchAll(/\u001b\]8;id=([^;\u001b]*);([^\u001b]+)\u001b\\(.*?)\u001b\]8;;\u001b\\/gsu)) {
+    // eslint-disable-next-line no-control-regex -- stripping the renderer's own SGR sequences
+    links.push({ id: match[1], uri: match[2], text: match[3].replace(/\u001b\[[0-9;]*m/gu, "") });
+  }
+  return links;
+}
+
+async function codexSignIn() {
+  const fixture = JSON.parse(await import("node:fs/promises").then((fs) => fs.readFile(new URL("./fixtures/codex-0.147-signin-view-145x40.json", import.meta.url), "utf8")));
+  const bytes = Buffer.from(fixture.base64, "base64");
+  // eslint-disable-next-line no-control-regex -- reading the fixture's OSC 8 target
+  const target = /\u001b\]8;[^;\u0007\u001b]*;(https:\/\/auth\.openai\.com[^\u0007\u001b]*)/u.exec(bytes.toString("utf8"))[1];
+  return { bytes, target };
+}
+
+async function linkHarness({ columns, rows, agent = "codex", localBrowserActions = false }) {
+  const copied = [];
+  const opened = [];
+  const context = harness({ coordinatorOptions: {
+    mouseReporting: true, clock: () => 1_000,
+    copyText: async (text) => { copied.push(text); },
+    browser: { async open(url) { opened.push(url); } },
+  } });
+  context.intents[0] = { ...context.intents[0], agent, localBrowserActions };
+  context.host.columns = columns;
+  context.host.rows = rows;
+  await context.coordinator.start(context.intents.slice(0, 1));
+  return { ...context, copied, opened };
+}
+
+async function rowOf(host, needle) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const index = (await visibleHostText(host)).split("\n").findIndex((line) => line.includes(needle));
+    if (index >= 0) return index + 1;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.fail(`never painted: ${needle}`);
+}
+
+test("the real Codex 0.147 sign-in screen gives Ctrl+click, Ctrl+] y and the host's own hyperlink the whole URL", async () => {
+  // The bytes a C4 canonical view sends at 145 columns (tmux 3.7c, hyperlinks
+  // forwarded). Windows Terminal opens a hovered link on Ctrl+click before it
+  // reports the click, so the painted rows must carry the whole link too.
+  const { bytes, target } = await codexSignIn();
+  assert.equal(target.length, 472);
+  const { coordinator, callbacks, host, intents, copied, opened } = await linkHarness({ columns: 145, rows: 42 });
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, bytes));
+    const row = await rowOf(host, "https://auth.openai.com");
+    host.emitInput(encoder.encode(`\u001b[<16;10;${row}M`));
+    host.emitInput(Uint8Array.of(0x1d, 0x79));
+    await waitUntil(() => opened.length === 1 && copied.length === 1, "Ctrl+click opens and Ctrl+] y copies");
+    assert.equal(opened[0], target);
+    assert.equal(copied[0], target);
+    const painted = hostHyperlinks(host).filter((link) => {
+      try {
+        const parsed = new URL(link.uri);
+        return parsed.protocol === "https:" && parsed.hostname === "auth.openai.com";
+      } catch {
+        return false;
+      }
+    });
+    assert.ok(painted.length >= 4, `every row of the link is a host hyperlink (${painted.length})`);
+    assert.ok(painted.every((link) => link.uri === target), "each row's hyperlink is the whole URL");
+    assert.equal(new Set(painted.map((link) => link.id)).size, 1, "the rows share one hyperlink id");
+    assert.equal(painted.slice(-4).map((link) => link.text).join(""), target, "the four rows are the URL, row by row");
+  } finally { await coordinator.stop(); }
+});
+
+test("without OSC 8, the 4-row Codex layout still resolves to the whole URL, the same for every action", async () => {
+  // Owner layout: row 1 indented two cells and ending mid-escape, rows 2-4
+  // starting at column 0, each row placed by the cursor at the writer's 145.
+  const { target } = await codexSignIn();
+  const cut = 143;
+  let screen = `\u001b[2J\u001b[5;1H  If the link doesn't open automatically:\u001b[7;1H  ${target.slice(0, cut)}`;
+  for (let offset = cut, row = 8; offset < target.length; offset += 145, row += 1) screen += `\u001b[${row};1H${target.slice(offset, offset + 145)}`;
+  screen += "\u001b[12;1H  Press Esc to cancel\r\n";
+  const { coordinator, callbacks, host, intents, copied, opened } = await linkHarness({ columns: 145, rows: 42 });
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(screen)));
+    const first = await rowOf(host, "https://auth.openai.com");
+    for (const row of [first, first + 2]) host.emitInput(encoder.encode(`\u001b[<16;10;${row}M`));
+    host.emitInput(Uint8Array.of(0x1d, 0x79));
+    await waitUntil(() => opened.length === 2 && copied.length === 1, "two clicks open and Ctrl+] y copies");
+    assert.deepEqual(opened, [target, target], "a click on the first or a middle row opens the whole link");
+    assert.equal(copied[0], target, "Ctrl+] y copies the whole link, not its first row");
+    const painted = hostHyperlinks(host).filter((link) => {
+      try {
+        const parsed = new URL(link.uri);
+        return parsed.protocol === "https:" && parsed.hostname === "auth.openai.com";
+      } catch {
+        return false;
+      }
+    });
+    assert.ok(painted.length >= 4 && painted.every((link) => link.uri === target));
+  } finally { await coordinator.stop(); }
+});
+
+test("Enter/o opens a sign-in link the provider wrapped over rows, not its first row", async () => {
+  const url = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" +
+    "&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&state=" + "s".repeat(40);
+  let screen = "\u001b[2J";
+  for (let offset = 0, row = 3; offset < url.length; offset += 80, row += 1) screen += `\u001b[${row};1H${url.slice(offset, offset + 80)}`;
+  screen += "\u001b[9;1H Paste code here if prompted > ";
+  const { coordinator, callbacks, host, intents, opened } = await linkHarness({ columns: 80, rows: 24, agent: "claude-code", localBrowserActions: true });
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(screen)));
+    await rowOf(host, "requests browser authentication");
+    host.emitInput(Uint8Array.of(0x0d));
+    await waitUntil(() => opened.length === 1, "Enter opens");
+    assert.equal(opened[0], url);
+  } finally { await coordinator.stop(); }
+});
+
+test("CONTROL: two different URLs on adjacent full rows stay two links", async () => {
+  const first = `https://example.com/first/${"a".repeat(80 - 26)}`;
+  const second = "https://example.org/second";
+  assert.equal(first.length, 80);
+  const { coordinator, callbacks, host, intents, opened } = await linkHarness({ columns: 80, rows: 24, agent: "claude-code" });
+  try {
+    await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode(`\u001b[2J\u001b[3;1H${first}\u001b[4;1H${second}\r\n`)));
+    const row = await rowOf(host, "https://example.com/first");
+    host.emitInput(encoder.encode(`\u001b[<16;10;${row}M`));
+    host.emitInput(encoder.encode(`\u001b[<16;10;${row + 1}M`));
+    await waitUntil(() => opened.length === 2, "both clicks open");
+    assert.deepEqual(opened, [first, second]);
+    const painted = hostHyperlinks(host);
+    assert.ok(painted.some((link) => link.uri === first && link.text === first));
+    assert.ok(painted.some((link) => link.uri === second && link.text === second));
+    assert.ok(painted.every((link) => link.uri === first || link.uri === second), "no joined link is painted");
+  } finally { await coordinator.stop(); }
+});
+
+/* -------------------------------------------------------------------------- */
+/* Codex "Sign in with ChatGPT" from a Machine: the callback relay             */
+/* -------------------------------------------------------------------------- */
+
+// OpenAI redirects the browser to http://localhost:1455/auth/callback?code=…
+// on this computer, while Codex's callback server listens on the Machine's
+// loopback. The supervisor originates `auth.callback.relay`; the CLI listens on
+// 127.0.0.1:<port> only after Enter, relays exactly one callback over one
+// local_to_remote stream, and answers the browser with what the Machine said.
+const RELAY_STATE = "state-9f2c";
+const RELAY_CODE = "ac_secret-code-value";
+const sha256 = (value) => `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+
+async function freePort() {
+  const server = createNetServer();
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen({ host: "127.0.0.1", port: 0 }, resolve); });
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+function browserGet(port, path, host = `localhost:${port}`) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ host: "127.0.0.1", port, path, method: "GET", headers: { host } }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+function refused(port) {
+  return new Promise((resolve) => {
+    const socket = netConnect({ host: "127.0.0.1", port });
+    socket.once("connect", () => { socket.destroy(); resolve(false); });
+    socket.once("error", () => resolve(true));
+  });
+}
+
+/**
+ * The supervisor side, faked: it originates the request and consumes the
+ * stream, making the GET against a stand-in for Codex's loopback server.
+ */
+function fakeSupervisor({ callbacks, runtime, calls }, { port, codexStatus = 200, answer = true }) {
+  const codexRequests = [];
+  const streamFrames = [];
+  let codex;
+  const originate = async () => {
+    codex = createHttpServer((request, response) => {
+      codexRequests.push({ url: request.url, host: request.headers.host });
+      response.writeHead(codexStatus, { "content-type": "text/html" });
+      response.end("<p>Signed in</p>");
+    });
+    await new Promise((resolve) => codex.listen({ host: "127.0.0.1", port: 0 }, resolve));
+    const createdAt = Date.now();
+    const nonce = "relay-nonce-1";
+    const args = Object.freeze({
+      provider: "codex",
+      localPath: "/auth/callback",
+      expectedStateDigest: sha256(RELAY_STATE),
+      expectedNonceDigest: sha256(nonce),
+      exactLocalPort: port,
+      remoteLoopbackPort: 1455,
+      deadlineMs: createdAt + 120_000,
+    });
+    const request = Object.freeze({
+      version: 1,
+      id: "relay-request-1",
+      identity: Object.freeze({
+        userId: "user-1", deviceId: "device-1", machineId: "machine-1",
+        workspaceBindingId: null, workspaceBindingGeneration: null,
+        agentSessionId: SESSION_B, processEpoch: `epoch-${SESSION_B}`, fencingGeneration: 1,
+      }),
+      provider: "codex",
+      kind: "auth.callback.relay",
+      arguments: args,
+      argumentsDigest: digestLocalActionArguments(args),
+      requestedScope: "provider-auth",
+      createdAt,
+      expiresAt: createdAt + 120_000,
+      nonce,
+    });
+    await callbacks.onLocalActionFrame({ tabId: "tab-b", frame: { type: "local_action_request" }, payload: { request } });
+  };
+  const recorded = runtime.sendLocalActionControl.bind(runtime);
+  runtime.sendLocalActionControl = async (type, payload, tabId) => {
+    await recorded(type, payload, tabId);
+    if (type === "local_stream_open" || type === "local_stream_close") streamFrames.push({ type, payload });
+    if (type !== "local_stream_data") return;
+    const line = Buffer.from(payload.bytesBase64url, "base64url").toString("utf8");
+    streamFrames.push({ type, payload, line });
+    assert.equal(payload.chunkSha256, createHash("sha256").update(Buffer.from(payload.bytesBase64url, "base64url")).digest("hex"));
+    if (!answer) return;
+    const match = /^GET (\/auth\/callback\?[^ ]+)$/u.exec(line);
+    const address = codex.address();
+    const status = match === null ? 0 : await new Promise((resolve) => {
+      const outbound = httpRequest({ host: "127.0.0.1", port: address.port, path: match[1], headers: { host: "localhost:1455" } }, (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      });
+      outbound.once("error", () => resolve(0));
+      outbound.end();
+    });
+    setImmediate(() => void callbacks.onLocalActionFrame({
+      tabId,
+      frame: { type: "local_stream_close" },
+      payload: { streamId: payload.streamId, finalOffset: payload.decodedLength, reason: status >= 200 && status < 400 ? "completed" : "failed" },
+    }));
+  };
+  const outcomes = () => calls.localActionControls.filter((item) => item.type === "local_action_result").map((item) => item.payload.result);
+  return { originate, codexRequests, streamFrames, outcomes, close: () => new Promise((resolve) => codex?.close(resolve) ?? resolve()) };
+}
+
+function relayHarness(options = {}) {
+  const context = harness({ host: Object.assign(new FakeHost(), { columns: 200 }), coordinatorOptions: { deviceId: "device-1", ...options } });
+  return context;
+}
+
+test("Codex's sign-in callback reaches the Machine only after Enter, once, and the browser hears the Machine's answer", async () => {
+  const port = await freePort();
+  const context = relayHarness();
+  const { coordinator, host, intents } = context;
+  const supervisor = fakeSupervisor(context, { port });
+  try {
+    await coordinator.start([intents[1]]);
+    await supervisor.originate();
+    await waitForScreen(host, new RegExp(`Codex asks to receive its sign-in on 127\\.0\\.0\\.1:${port} · Enter allow · Esc deny`, "u"), "the bar asks first");
+    assert.equal(await refused(port), true, "nothing listens before the person allows it");
+    host.emitInput(Uint8Array.of(0x0d));
+    await waitForScreen(host, new RegExp(`Waiting for Codex's sign-in on 127\\.0\\.0\\.1:${port}`, "u"), "allowed, it waits for the browser");
+    assert.equal(context.calls.input.length, 0, "the consent key is not sent to Codex");
+
+    const wrong = await browserGet(port, `/auth/callback?code=${RELAY_CODE}&state=someone-else`);
+    assert.equal(wrong.status, 400, "a callback for another sign-in is refused");
+    assert.equal(supervisor.streamFrames.length, 0);
+
+    const answer = await browserGet(port, `/auth/callback?code=${RELAY_CODE}&state=${RELAY_STATE}`);
+    assert.equal(answer.status, 200);
+    assert.match(answer.body, /Sent to Codex on your Machine/u);
+    assert.deepEqual(supervisor.streamFrames.map((frame) => frame.type), ["local_stream_open", "local_stream_data"]);
+    assert.equal(supervisor.streamFrames[0].payload.direction, "local_to_remote");
+    assert.equal(supervisor.streamFrames[1].line, `GET /auth/callback?state=${RELAY_STATE}&code=${RELAY_CODE}`);
+    assert.deepEqual(supervisor.codexRequests, [{ url: `/auth/callback?state=${RELAY_STATE}&code=${RELAY_CODE}`, host: "localhost:1455" }]);
+
+    await waitUntil(() => supervisor.outcomes().length === 1, "the request settles once");
+    assert.equal(supervisor.outcomes()[0].status, "succeeded");
+    assert.deepEqual(supervisor.outcomes()[0].safeData, { awaitingProvider: true });
+    await waitForScreen(host, /Sent to Codex on your Machine · finish the sign-in in the terminal/u, "the bar says where it went");
+    assert.equal(await refused(port), true, "the listener is gone after one callback");
+    const shown = host.writes.map((bytes) => decoder.decode(bytes)).join("");
+    assert.equal(shown.includes(RELAY_CODE), false, "the code is never painted");
+    assert.equal(shown.includes(RELAY_STATE), false, "the state is never painted");
+  } finally { await coordinator.stop(); await supervisor.close(); }
+});
+
+test("a sign-in the Machine refuses, or never answers, is told to the browser as such", async () => {
+  for (const [label, options, relayOptions, status, body, reason] of [
+    ["refused", { codexStatus: 400 }, {}, 502, /refused this sign-in/u, "adapter_failed"],
+    ["no answer", { answer: false }, { relayAnswerTimeoutMs: 50 }, 504, /did not answer this sign-in in time/u, "execution_timeout"],
+  ]) {
+    const port = await freePort();
+    const context = relayHarness(relayOptions);
+    const { coordinator, host, intents } = context;
+    const supervisor = fakeSupervisor(context, { port, ...options });
+    try {
+      await coordinator.start([intents[1]]);
+      await supervisor.originate();
+      await waitForScreen(host, /Enter allow · Esc deny/u, `${label}: the bar asks first`);
+      host.emitInput(Uint8Array.of(0x0d));
+      await waitForScreen(host, /Waiting for Codex's sign-in/u, `${label}: listening`);
+      const answer = await browserGet(port, `/auth/callback?code=${RELAY_CODE}&state=${RELAY_STATE}`);
+      assert.equal(answer.status, status, label);
+      assert.match(answer.body, body, label);
+      await waitUntil(() => supervisor.outcomes().length === 1, `${label}: settles once`);
+      assert.equal(supervisor.outcomes()[0].status, "failed", label);
+      assert.equal(supervisor.outcomes()[0].safeReason, reason, label);
+      if (label === "no answer") {
+        const closed = supervisor.streamFrames.find((frame) => frame.type === "local_stream_close");
+        assert.deepEqual(closed?.payload, { streamId: "relay:relay-request-1", finalOffset: supervisor.streamFrames[1].payload.decodedLength, reason: "expired" },
+          "an unanswered stream is closed from this side before the request settles");
+      }
+    } finally { await coordinator.stop(); await supervisor.close(); }
+  }
+});
+
+test("Esc denies the relay and a busy port is named; neither opens a stream", async () => {
+  {
+    const port = await freePort();
+    const context = relayHarness();
+    const supervisor = fakeSupervisor(context, { port });
+    try {
+      await context.coordinator.start([context.intents[1]]);
+      await supervisor.originate();
+      await waitForScreen(context.host, /Enter allow · Esc deny/u, "the bar asks first");
+      context.host.emitInput(Uint8Array.of(0x1b));
+      await waitUntil(() => supervisor.outcomes().length === 1, "a denial settles the request");
+      assert.equal(supervisor.outcomes()[0].status, "denied");
+      assert.equal(await refused(port), true, "a denied relay never listens");
+      assert.equal(context.calls.input.length, 0, "Esc was the answer, not a key for Codex");
+    } finally { await context.coordinator.stop(); await supervisor.close(); }
+  }
+  {
+    const port = await freePort();
+    const occupant = createNetServer();
+    await new Promise((resolve) => occupant.listen({ host: "127.0.0.1", port }, resolve));
+    const context = relayHarness();
+    const supervisor = fakeSupervisor(context, { port });
+    try {
+      await context.coordinator.start([context.intents[1]]);
+      await supervisor.originate();
+      await waitForScreen(context.host, /Enter allow · Esc deny/u, "the bar asks first");
+      context.host.emitInput(Uint8Array.of(0x0d));
+      await waitForScreen(context.host, new RegExp(`Port ${port} is in use on this computer · close what uses it, or choose Sign in with Device Code in Codex`, "u"),
+        "a busy port is named");
+      await waitUntil(() => supervisor.outcomes().length === 1, "the request settles");
+      assert.equal(supervisor.outcomes()[0].status, "failed");
+      assert.equal(supervisor.streamFrames.length, 0);
+    } finally {
+      await context.coordinator.stop();
+      await supervisor.close();
+      await new Promise((resolve) => occupant.close(resolve));
+    }
+  }
+});
+
+test("a listening relay stops listening when the terminal leaves, and settles as cancelled", async () => {
+  const port = await freePort();
+  const context = relayHarness();
+  const supervisor = fakeSupervisor(context, { port });
+  try {
+    await context.coordinator.start([context.intents[1]]);
+    await supervisor.originate();
+    await waitForScreen(context.host, /Enter allow · Esc deny/u, "the bar asks first");
+    context.host.emitInput(Uint8Array.of(0x0d));
+    await waitForScreen(context.host, /Waiting for Codex's sign-in/u, "listening");
+    assert.equal(await refused(port), false, "the listener is up");
+    await context.coordinator.stop();
+    assert.equal(await refused(port), true, "leaving closes the listener");
+    assert.equal(supervisor.outcomes().at(-1)?.status, "cancelled");
+    assert.equal(supervisor.streamFrames.length, 0);
+  } finally { await context.coordinator.stop(); await supervisor.close(); }
+});
+
+// R7.2, BL-7 (LIVE_RUNTIME 2026-10-03): workspace sync stopped at 02:02:30Z
+// while OpenCode was attached, and the bar said nothing for 21 minutes; the
+// reason appeared only at detach. The coordinator now takes one attention line
+// from outside the terminal and paints it on the notice row on the event
+// itself, with no terminal output in between.
+const ATTENTION = "Workspace sync stopped · recovery_required (pending_local_intent_changed) · run: cuna sync recover \"C:\\Users\\x\\my proj\" --yes";
+
+function attentionSource() {
+  const listeners = new Set();
+  let line;
+  return {
+    current: () => line,
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    set(next) { line = next; for (const listener of listeners) listener(next); },
+    listeners,
+  };
+}
+
+/** The first frame written after `baseline`, within one remote poll interval (750 ms). */
+async function frameWithin(host, baseline, predicate, message) {
+  const deadline = performance.now() + 750;
+  while (performance.now() < deadline) {
+    const frame = host.writes.slice(baseline).map((bytes) => decoder.decode(bytes)).find(predicate);
+    if (frame !== undefined) return frame;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.fail(message);
+}
+
+test("R7.2: an attention event paints its line on the notice row with no terminal output in between", async () => {
+  const attention = attentionSource();
+  const { coordinator, host, intents } = harness({
+    host: Object.assign(new FakeHost(), { columns: 200 }),
+    coordinatorOptions: { attention },
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    assert.doesNotMatch(await visibleHostText(host), /recovery_required/u);
+    const baseline = host.writes.length;
+    attention.set(ATTENTION);
+    await frameWithin(host, baseline, (frame) => frame.includes(ATTENTION), "the attention line was not painted on its own event");
+    assert.ok((await visibleHostText(host)).split("\n")[1].trim().startsWith(ATTENTION), "the line is on the notice row");
+    // Cleared: the row returns to the bar's own line on the clearing event.
+    const cleared = host.writes.length;
+    attention.set(undefined);
+    await frameWithin(host, cleared, () => true, "clearing the attention painted nothing");
+    assert.doesNotMatch(await visibleHostText(host), /recovery_required/u);
+  } finally { await coordinator.stop(); }
+  assert.equal(attention.listeners.size, 0, "the coordinator unsubscribes when it stops");
+});
+
+test("R7.2 NEGATIVE CONTROL: help still wins the notice row over attention, and attention returns when help closes", async () => {
+  const attention = attentionSource();
+  const { coordinator, host, intents } = harness({
+    host: Object.assign(new FakeHost(), { columns: 400 }),
+    coordinatorOptions: { attention },
+  });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    const baseline = host.writes.length;
+    attention.set(ATTENTION);
+    await frameWithin(host, baseline, (frame) => frame.includes(ATTENTION), "the attention line was not painted");
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Keys: "), "help opens");
+    assert.doesNotMatch(await visibleHostText(host), /recovery_required/u, "help owns the row while open");
+    host.emitInput(Uint8Array.of(0x1d, 0x3f));
+    await waitUntil(() => !decoder.decode(host.writes.at(-1)).includes("Keys: "), "help closes");
+    assert.match(await visibleHostText(host), /recovery_required \(pending_local_intent_changed\)/u);
+  } finally { await coordinator.stop(); }
+});
+
+test("R7.2 NEGATIVE CONTROL: the disconnect notice wins the notice row over attention", async () => {
+  let releaseDetach;
+  const detachGate = new Promise((resolve) => { releaseDetach = resolve; });
+  const attention = attentionSource();
+  const { callbacks, coordinator, host, intents } = harness({
+    host: Object.assign(new FakeHost(), { columns: 200 }),
+    detachGate,
+    detachStateSequence: ["interrupted", "detached"],
+    coordinatorOptions: { attention, disconnectFrameMs: 1 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+  const baseline = host.writes.length;
+  attention.set(ATTENTION);
+  await frameWithin(host, baseline, (frame) => frame.includes(ATTENTION), "the attention line was not painted");
+  const closing = host.writes.length;
+  host.emitInput(Uint8Array.of(0x03));
+  await waitUntil(
+    () => host.writes.slice(closing).some((bytes) => decoder.decode(bytes).includes("Disconnecting...")),
+    "Ctrl-C acknowledges closing",
+  );
+  const row = (await visibleHostText(host)).split("\n")[1];
+  assert.match(row, /Disconnecting\.\.\./u);
+  assert.doesNotMatch(row, /recovery_required/u);
+  releaseDetach();
+  await coordinator.waitForStop();
+});
+
+// BL-15, 2026-10-03 (biotech lab, CLI drop c0dc53b): the attached terminal
+// dropped about 16:08Z, the ten quick attempts (~26 s) were spent while the
+// CLI's own API calls were timing out (the journey had just said "Workspace
+// sync paused · cuna.client.response_budget_elapsed"), and the bar said a bare
+// "Reconnect failed" until 18:29Z although a fresh `cuna opencode` reattached
+// at 18:31Z. Nothing tried again by itself, and the reason was not named
+// because it was not a runtime boundary failure.
+test("BL-15: after the quick attempts, recovery keeps trying on a slow, bounded cadence and reattaches by itself", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 2, reconnectBaseDelayMs: 1, reconnectSlowDelayMs: 20, reconnectSlowAttempts: 5 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  let failures = 4;
+  const reconnect = runtime.reconnect;
+  runtime.reconnect = async (input) => {
+    if (failures > 0) {
+      calls.reconnect.push(input.tabId);
+      failures -= 1;
+      throw runtimeFailure("terminal_disconnected", "gateway still busy", { retryable: true });
+    }
+    return reconnect(input); // records its own call
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && calls.reconnect.length < 5) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(calls.reconnect.length, 5, "two quick attempts, then slow ones until one succeeded");
+  await waitUntil(() => !decoder.decode(host.writes.at(-1)).includes("Reconnect failed"), "the failure notice clears once reattached");
+  assert.equal(coordinator.state, "active");
+  await coordinator.stop();
+});
+
+test("BL-15: the slow cadence is bounded and says when it will try again", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 2, reconnectBaseDelayMs: 1, reconnectSlowDelayMs: 20, reconnectSlowAttempts: 3 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw runtimeFailure("terminal_disconnected", "gateway still busy", { retryable: true });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  await waitUntil(() => /Reconnect failed: terminal disconnected · retrying in/u.test(decoder.decode(host.writes.at(-1))),
+    "while slow attempts remain the bar says so");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && calls.reconnect.length < 5) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(calls.reconnect.length, 5, "two quick and three slow attempts, then none");
+  const frame = decoder.decode(host.writes.at(-1));
+  assert.match(frame, /Reconnect failed: terminal disconnected · Ctrl\+\] r retries/u);
+  assert.doesNotMatch(frame, /retrying in/u, "a spent cadence does not promise another try");
+  await coordinator.stop();
+});
+
+test("BL-15: a failure that is not a runtime boundary error is named by its own code", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 1, reconnectBaseDelayMs: 1, reconnectSlowAttempts: 0 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw new CunaError({ code: "cuna.client.response_budget_elapsed", message: "remote words", exitCode: 5, retryable: true });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !decoder.decode(host.writes.at(-1)).includes("Reconnect failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const frame = decoder.decode(host.writes.at(-1));
+  assert.match(frame, /Reconnect failed: client response budget elapsed · Ctrl\+\] r retries/u);
+  assert.doesNotMatch(frame, /remote words/u);
+  await coordinator.stop();
+});
+
+// CONTROL: a refusal the runtime marks non-retryable still ends recovery at
+// once, with no slow cadence after it.
+test("control: a non-retryable refusal stops recovery on its first occurrence, slow cadence or not", async () => {
+  const { coordinator, callbacks, calls, host, intents, runtime } = harness({
+    coordinatorOptions: { reconnectAttempts: 3, reconnectBaseDelayMs: 1, reconnectSlowDelayMs: 20, reconnectSlowAttempts: 5 },
+  });
+  await coordinator.start(intents.slice(0, 1));
+  runtime.reconnect = async (input) => {
+    calls.reconnect.push(input.tabId);
+    throw runtimeFailure("grant_scope_mismatch", "refused", { retryable: false });
+  };
+  callbacks.onTerminalState({ ...snapshot(intents[0]), state: "interrupted", reason: "transport_closed" });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !decoder.decode(host.writes.at(-1)).includes("Reconnect failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(calls.reconnect.length, 1);
+  assert.doesNotMatch(decoder.decode(host.writes.at(-1)), /retrying in/u);
+  await coordinator.stop();
+});
+
+// Owner 2026-10-04: a writer's Ctrl+C with nothing selected went to Claude Code
+// as it should, but the owner expected Ctrl+C to copy, pressed it again, and
+// Claude Code exited (status 0). The key still goes to the agent unchanged;
+// the bar now says so at that moment, names the agent, and says how to leave
+// without quitting it and how to copy.
+test("a writer's Ctrl+C with no selection is sent once and the bar says it went to the agent, for a few seconds", async () => {
+  const host = new FakeHost();
+  host.columns = 200;
+  const { coordinator, host: shown, calls, intents } = harness({ host, coordinatorOptions: { interruptNoticeMs: 60 } });
+  try {
+    await coordinator.start(intents.slice(0, 1));
+    shown.emitInput(Uint8Array.of(0x03));
+    await waitUntil(() => calls.input.some((item) => item.text === "\x03"), "Ctrl+C reaches the PTY");
+    await waitUntil(() => decoder.decode(shown.writes.at(-1)).includes("Ctrl+C sent to Claude Code"), "the bar says where Ctrl+C went");
+    const frame = decoder.decode(shown.writes.at(-1));
+    assert.match(frame, /Ctrl\+C sent to Claude Code · press it again and Claude Code may quit · Ctrl\+\] d detaches and keeps it running · select text first to copy/u);
+    // Never blocking: the next key goes straight through while the notice shows.
+    shown.emitInput(encoder.encode("x"));
+    await waitUntil(() => calls.input.some((item) => item.text === "x"), "typing continues under the notice");
+    assert.deepEqual(calls.input.map((item) => item.text), ["\x03", "x"], "what is forwarded is unchanged");
+    assert.deepEqual(calls.detach, []);
+    await waitUntil(() => !decoder.decode(shown.writes.at(-1)).includes("Ctrl+C sent to"), "the notice goes away by itself");
+  } finally { await coordinator.stop(); }
+});
+
+test("the Ctrl+C notice names the agent the key went to", async () => {
+  for (const [agent, name] of [["codex", "Codex"], ["opencode", "OpenCode"]]) {
+    const host = new FakeHost();
+    host.columns = 200;
+    const { coordinator, calls, intents } = harness({ host, coordinatorOptions: { interruptNoticeMs: 5_000 } });
+    intents[0] = { ...intents[0], agent };
+    try {
+      await coordinator.start(intents.slice(0, 1));
+      host.emitInput(Uint8Array.of(0x03));
+      await waitUntil(() => calls.input.some((item) => item.text === "\x03"), `${agent}: Ctrl+C reaches the PTY`);
+      await waitUntil(() => decoder.decode(host.writes.at(-1)).includes(`Ctrl+C sent to ${name} · press it again and ${name} may quit`), `${agent}: named`);
+    } finally { await coordinator.stop(); }
+  }
+});
+
+// CONTROL: an observer's Ctrl+C detaches, as before; nothing was sent, so the
+// bar must not say it was.
+test("control: an observer's Ctrl+C detaches and never says it was sent to the agent", async () => {
+  const host = new FakeHost();
+  host.columns = 200;
+  const { coordinator, callbacks, calls, intents } = harness({ host, coordinatorOptions: { interruptNoticeMs: 5_000, disconnectFrameMs: 1 } });
+  await coordinator.start(intents.slice(0, 1));
+  callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+  host.emitInput(Uint8Array.of(0x03));
+  await coordinator.waitForStop();
+  assert.deepEqual(calls.detach, ["tab-a"]);
+  assert.equal(calls.input.length, 0);
+  assert.ok(!host.writes.some((bytes) => decoder.decode(bytes).includes("Ctrl+C sent to")));
 });

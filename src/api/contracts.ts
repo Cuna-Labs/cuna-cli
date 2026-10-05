@@ -511,6 +511,51 @@ export type AgentSessionProcessState =
  * .process_observation`.
  */
 export type AgentSessionProcessObservation = "observed" | "unproven" | "unknown";
+/**
+ * The server's own verdict on whether this session STARTED, which is a
+ * different question from `processState`.
+ *
+ * Read from producer infra commit `2e4e1a2` (Edge v240):
+ * `components.schemas.AgentSession.readiness_*`,
+ * returned only when `GET /v1/agent-sessions/{id}` is asked with
+ * `include_readiness=true`, and settled by migration 0233's deadline sweep.
+ * The vendored contract (`7b1b3e42`) predates it, so the conformance test for
+ * these fields cites the producer revision instead.
+ *
+ *   `pending`                  the deadline has not passed and nothing settled.
+ *   `attested`                 an exact supervisor attested the process and PTY.
+ *   `refused`                  the start was refused; `reason` says why.
+ *   `reconciliation_required`  the server stopped waiting without an
+ *                              attestation. The child MAY still be alive, and
+ *                              a late attestation can still promote it.
+ *
+ * Absent means this server did not answer the question, never `pending`.
+ */
+export type AgentSessionReadinessOutcome = "pending" | "attested" | "refused" | "reconciliation_required";
+export interface AgentSessionReadiness {
+  readonly outcome: AgentSessionReadinessOutcome;
+  readonly deadlineAt: string;
+  /**
+   * Present exactly when `outcome` is `refused` or `reconciliation_required`.
+   * Shape-checked rather than enum-checked: the producer's set is closed, but a
+   * reason this build has not met must still end the wait, not the read.
+   */
+  readonly reason?: string;
+  /** Present exactly when `outcome` is not `pending`. */
+  readonly settledAt?: string;
+}
+/**
+ * The supervisor acknowledgement behind the runtime fields, returned only with
+ * `include_runtime_evidence=true` and only when an acknowledgement exists
+ * (producer `e5aefe8`, carried by `2e4e1a2`). `ageSeconds` is measured on the
+ * server's clock when it answered, so a skewed local clock cannot distort it.
+ */
+export interface AgentSessionRuntimeEvidence {
+  readonly source: "supervisor_ack";
+  readonly observedAt: string;
+  readonly ageSeconds: number;
+  readonly processProof: "observed" | "unproven" | "not_stated" | "other_process_epoch" | "no_process_epoch";
+}
 export interface AgentSession {
   readonly id: string;
   readonly machineId: string;
@@ -560,8 +605,10 @@ export interface AgentSession {
   readonly processObservation?: AgentSessionProcessObservation;
   readonly processEpoch?: string;
   readonly runtimeObservedAt?: string;
+  readonly runtimeEvidence?: AgentSessionRuntimeEvidence;
   readonly runtimeExpiresAt?: string;
   readonly terminationRequestedAt?: string;
+  readonly readiness?: AgentSessionReadiness;
   readonly rowVersion: number;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -611,6 +658,70 @@ const PROCESS_STATES = new Set<AgentSessionProcessState>([
 const PROCESS_OBSERVATIONS: ReadonlySet<string> = new Set<AgentSessionProcessObservation>([
   "observed", "unproven", "unknown",
 ]);
+const READINESS_OUTCOMES: ReadonlySet<string> = new Set<AgentSessionReadinessOutcome>([
+  "pending", "attested", "refused", "reconciliation_required",
+]);
+const PROCESS_PROOFS: ReadonlySet<string> = new Set<AgentSessionRuntimeEvidence["processProof"]>([
+  "observed", "unproven", "not_stated", "other_process_epoch", "no_process_epoch",
+]);
+const READINESS_REASON = /^[a-z][a-z0-9_]{0,63}$/u;
+
+function timestampField(value: Record<string, unknown>, key: string): string {
+  const decoded = requiredString(value, key);
+  if (!Number.isFinite(Date.parse(decoded))) throw contractViolation("date_time", key);
+  return decoded;
+}
+
+/**
+ * The four readiness fields travel together or not at all, in the shapes
+ * migration 0233's check constraint allows. A row that breaks them is refused:
+ * a `refused` with no reason, or a `pending` with a settlement time, would
+ * make the wait below either stop for nothing or never stop.
+ */
+function decodeReadiness(value: Record<string, unknown>): AgentSessionReadiness | undefined {
+  const given = (key: string): boolean => value[key] !== undefined && value[key] !== null;
+  if (!["readiness_deadline_at", "readiness_outcome", "readiness_reason", "readiness_settled_at"].some(given)) {
+    return undefined;
+  }
+  const outcome = requiredString(value, "readiness_outcome");
+  if (!READINESS_OUTCOMES.has(outcome)) throw contractViolation("known_enum_value", "readiness_outcome");
+  const deadlineAt = timestampField(value, "readiness_deadline_at");
+  const settled = outcome !== "pending";
+  const explained = outcome === "refused" || outcome === "reconciliation_required";
+  const reason = optionalString(value, "readiness_reason");
+  if ((reason !== undefined) !== explained || (reason !== undefined && !READINESS_REASON.test(reason))) {
+    throw contractViolation("readiness_reason_matches_outcome", "readiness_reason");
+  }
+  if (given("readiness_settled_at") !== settled) {
+    throw contractViolation("readiness_settled_at_matches_outcome", "readiness_settled_at");
+  }
+  return Object.freeze({
+    outcome: outcome as AgentSessionReadinessOutcome,
+    deadlineAt,
+    ...(reason === undefined ? {} : { reason }),
+    ...(settled ? { settledAt: timestampField(value, "readiness_settled_at") } : {}),
+  });
+}
+
+function decodeRuntimeEvidence(value: unknown): AgentSessionRuntimeEvidence {
+  if (!isObject(value)) throw contractViolation("object", "runtime_evidence");
+  if (Object.keys(value).some((key) => !["source", "observed_at", "age_seconds", "process_proof"].includes(key))) {
+    throw contractViolation("no_unknown_fields", "runtime_evidence");
+  }
+  if (value.source !== "supervisor_ack") throw contractViolation("known_enum_value", "runtime_evidence.source");
+  const ageSeconds = value.age_seconds;
+  if (typeof ageSeconds !== "number" || !Number.isSafeInteger(ageSeconds) || ageSeconds < 0) {
+    throw contractViolation("safe_non_negative_integer", "runtime_evidence.age_seconds");
+  }
+  const processProof = underField("runtime_evidence", () => requiredString(value, "process_proof"));
+  if (!PROCESS_PROOFS.has(processProof)) throw contractViolation("known_enum_value", "runtime_evidence.process_proof");
+  return Object.freeze({
+    source: "supervisor_ack",
+    observedAt: underField("runtime_evidence", () => timestampField(value, "observed_at")),
+    ageSeconds,
+    processProof: processProof as AgentSessionRuntimeEvidence["processProof"],
+  });
+}
 const AGENT_AUTH_STATES = new Set<AgentSessionAuthState>([
   "login_required", "authenticated", "configured", "unavailable",
 ]);
@@ -647,13 +758,34 @@ function decodeAgentSession(value: unknown): AgentSession {
     "runtime_observed_at",
     "runtime_expires_at",
     "termination_requested_at",
+    // Opt-in fields: the server sends them only to a read that asked, which
+    // `getAgentSession` does with `include_readiness` / `include_runtime_evidence`.
+    "readiness_deadline_at",
+    "readiness_outcome",
+    "readiness_reason",
+    "readiness_settled_at",
+    "runtime_evidence",
     "row_version",
     "created_at",
     "updated_at",
+    // Declared by producer d3d3d3c and sent only to a read that asks with
+    // `include_readiness=true`, which this CLI never does. Accepted, checked
+    // for shape and not carried, so a row that carries them anyway stays
+    // readable instead of making its whole page `no_unknown_fields`.
+    "readiness_deadline_at",
+    "readiness_outcome",
+    "readiness_reason",
+    "readiness_settled_at",
   ]);
   if (Object.keys(value).some((key) => !allowed.has(key))) {
     throw contractViolation("no_unknown_fields");
   }
+  for (const key of ["readiness_outcome", "readiness_reason"]) {
+    const token = optionalString(value, key);
+    if (token !== undefined && !/^[a-z][a-z0-9_]{0,63}$/u.test(token)) throw contractViolation("safe_token", key);
+  }
+  optionalString(value, "readiness_deadline_at");
+  optionalString(value, "readiness_settled_at");
   const agent = enumField(value, "agent", AGENTS);
   const authMode = enumField(value, "auth_mode", AUTH_MODES);
   // Read paths intentionally remain tolerant of legacy OpenCode rows.  The
@@ -712,6 +844,10 @@ function decodeAgentSession(value: unknown): AgentSession {
   if (rowVersion === undefined || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
     throw contractViolation("safe_non_negative_integer", "row_version");
   }
+  const readiness = decodeReadiness(value);
+  const runtimeEvidence = value.runtime_evidence === undefined || value.runtime_evidence === null
+    ? undefined
+    : decodeRuntimeEvidence(value.runtime_evidence);
   return Object.freeze({
     id: canonicalUuid(value, "id"),
     machineId: canonicalUuid(value, "machine_id"),
@@ -737,8 +873,10 @@ function decodeAgentSession(value: unknown): AgentSession {
         ? { processEpoch }
         : (() => { throw contractViolation("canonical_uuid", "process_epoch"); })()),
     ...(runtimeObservedAt === undefined ? {} : { runtimeObservedAt }),
+    ...(runtimeEvidence === undefined ? {} : { runtimeEvidence }),
     ...(runtimeExpiresAt === undefined ? {} : { runtimeExpiresAt }),
     ...(terminationRequestedAt === undefined ? {} : { terminationRequestedAt }),
+    ...(readiness === undefined ? {} : { readiness }),
     rowVersion,
     createdAt: requiredString(value, "created_at"),
     updatedAt: requiredString(value, "updated_at"),

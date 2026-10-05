@@ -345,20 +345,47 @@ test("the copy/paste hint says a plain drag selects, and Shift+drag only while t
   // Cuna reported the mouse only for its clickable bar. Cuna selects on a
   // plain drag itself unless the remote program asked for the mouse.
   const frame = (remoteMouse) => renderWorkbenchFrame({
-    columns: 140, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
+    columns: 160, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
     sessions: rosterSessions, activeSessionId: "session-claude", mouseReporting: true, remoteMouse,
   });
   const own = rowText(frame(false), 2);
   const agent = rowText(frame(true), 2);
+  assert.doesNotMatch(own, /Shift\+drag/u);
+  assert.match(agent, /Shift\+drag select/u);
   if (process.platform === "win32") {
-    assert.match(own, /Claude auth authenticated.*Drag to select and copy \| Ctrl\+click opens a link \| Ctrl\+Shift\+V paste $/u);
-    assert.doesNotMatch(own, /Shift\+drag/u);
-    assert.match(agent, /Claude auth authenticated.*Agent uses the mouse: Shift\+drag select \| Ctrl\+Shift\+C copy \| Ctrl\+Shift\+V paste $/u);
+    assert.match(own, /Claude auth authenticated.*Ctrl\+\] d detach · select \+ Ctrl\+C copy · Ctrl\+click opens a link · Ctrl\+Shift\+V paste $/u);
+    assert.match(agent, /Claude auth authenticated.*Ctrl\+\] d detach · Shift\+drag select · Ctrl\+Shift\+C copy · Ctrl\+Shift\+V paste $/u);
   } else {
     assert.doesNotMatch(own, /Ctrl\+Shift\+C/u);
     assert.doesNotMatch(agent, /Ctrl\+Shift\+C/u);
   }
   assert.doesNotMatch(rowText(frame(false), 1), /Ctrl\+Shift/u);
+});
+
+// Owner 2026-10-04: a Ctrl+C meant to copy quit Claude Code. The attached bar
+// now names the two keys on every host: how to leave without quitting the
+// agent, and that a Ctrl+C copies only once text is selected.
+test("the attached bar states the detach and copy keys in English on every host", () => {
+  const frame = (columns, extra = {}) => renderWorkbenchFrame({
+    columns, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
+    sessions: rosterSessions, activeSessionId: "session-claude", mouseReporting: true, ...extra,
+  });
+  assert.match(rowText(frame(160), 2), /Claude auth authenticated.*Ctrl\+\] d detach · select \+ Ctrl\+C copy/u);
+  // Narrower: the two keys survive when the extras do not fit.
+  assert.match(rowText(frame(100), 2), /Ctrl\+\] d detach · select \+ Ctrl\+C copy $/u);
+  // A notice keeps the row's left side; the keys still follow when they fit.
+  assert.match(rowText(frame(160, { notice: "Restoring terminal" }), 2), /Restoring terminal.*Ctrl\+\] d detach · select \+ Ctrl\+C copy/u);
+});
+
+test("a shown selection names its Ctrl+C copy key on every host, and only while it is shown", () => {
+  const frame = (selection) => renderWorkbenchFrame({
+    columns: 140, rows: 24, activeTabId: "tab-claude", tabs: tabs(), appbar: model(), color: false,
+    sessions: rosterSessions, activeSessionId: "session-claude", mouseReporting: true,
+    ...(selection === undefined ? {} : { selection }),
+  });
+  assert.match(rowText(frame([{ row: 0, start: 0, end: 5 }]), 2), /Claude auth authenticated.*Ctrl\+C copies the selection · Ctrl\+\] d detach $/u);
+  assert.doesNotMatch(rowText(frame(undefined), 2), /Ctrl\+C copies the selection/u);
+  assert.doesNotMatch(rowText(frame([]), 2), /Ctrl\+C copies the selection/u);
 });
 
 test("workbench safely re-emits VTE-parsed palette and RGB styles", () => {

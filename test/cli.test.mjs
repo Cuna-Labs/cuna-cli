@@ -791,6 +791,50 @@ test("foreground Cuna renders an unrecoverable terminal with exact-session recov
   assert.doesNotMatch(visible, /again in a moment|Wait for a fresh runtime observation|reconnecting its terminal control|Error \[/u);
 });
 
+// Owner 2026-09-29 17:41Z, AgentSession 950501a4: Codex 0.147 quit at its
+// sign-in screen, and `connect` said the process "may have ended" while the
+// session's own record already read process_exited.
+test("an unreachable terminal whose session records its process exited says it ended and how to start anew", async () => {
+  const unreachable = async () => {
+    throw new CunaError({
+      code: "cuna.runtime.capability_unavailable",
+      message: "The terminal owner cannot be recovered.",
+      exitCode: EXIT_CODES.policy,
+      details: { capability_id: "terminal_connections.create", reason_code: "terminal_owner_unrecoverable" },
+    });
+  };
+  const connect = async (session) => {
+    const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+    const reads = [];
+    const exit = await runCli([], {
+      streams: interactive.streams,
+      platform,
+      env: { CUNA_API_KEY: API_KEY },
+      clientFactory: () => fakeClient({ async getAgentSession(id) { reads.push(id); return session(id); } }),
+      rootJourneyRunner: async () => ({ kind: "attach", agentSessionId: FOREGROUND_SESSION_A, agent: "codex" }),
+      foregroundTerminalRunner: unreachable,
+    });
+    return { exit, reads, visible: stripAnsi(interactive.stderr()) };
+  };
+  const ended = await connect((id) => agentSession({
+    id, agent: "codex", desiredState: "running", requestState: "terminal", processState: "exited",
+    terminalReason: "process_exited", runtimeObservedAt: "2026-09-29T17:41:11.500Z",
+  }));
+  assert.equal(ended.exit, EXIT_CODES.policy);
+  assert.deepEqual(ended.reads, [FOREGROUND_SESSION_A]);
+  assert.match(ended.visible, /CUNA  Codex exited at 17:41 UTC · this session has ended/u);
+  assert.match(ended.visible, /records its process as exited \(process_exited\)/u);
+  assert.match(ended.visible, /Start a new one from its folder: `cuna codex --new-session`/u);
+  assert.ok(ended.visible.includes(`cuna agent-sessions get ${FOREGROUND_SESSION_A}`));
+  assert.doesNotMatch(ended.visible, /may have ended|not reachable right now/u);
+
+  // Control: a record that still reads running keeps the words that claim nothing.
+  const running = await connect((id) => agentSession({ id, agent: "codex", requestState: "launched", processState: "running" }));
+  assert.match(running.visible, /This AgentSession's terminal is not reachable right now/u);
+  assert.match(running.visible, /may have ended, or the Machine has not re-announced it yet/u);
+  assert.doesNotMatch(running.visible, /Codex exited/u);
+});
+
 test("foreground Cuna recognizes the OpenCode supervisor-upgrade reason without claiming a session changed", async () => {
   const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
   const exit = await runCli([], {
@@ -960,7 +1004,7 @@ test("non-TTY help and version are versioned JSON records", async () => {
   assert.match(allRecord.data.help, /Use --agent-session SESSION_ID to bypass reconciliation/u);
   const version = memoryStreams();
   assert.equal(await runCli(["--version"], { streams: version.streams }), EXIT_CODES.success);
-  assert.equal(JSON.parse(version.stdout()).data.version, "0.1.6");
+  assert.equal(JSON.parse(version.stdout()).data.version, "0.1.7");
 });
 
 test("missing automation auth fails before a remote call and emits no prompt", async () => {
@@ -2055,6 +2099,85 @@ test("an AgentSession blocker is named from this person's own session list", asy
   assert.match(error.hint, /cuna agent-sessions terminate SESSION_ID --yes/u);
 });
 
+// Production 2026-09-29, cd0696a7: the provider read `error` with its target
+// still `running` after the update's start, and the answer was "pending, do
+// not repeat" while nothing would ever settle. Infra 2a8e0c7 answers that case
+// with its own decided refusal.
+test("an update whose runtime failed to boot says to stop and update again, never 'do not repeat'", async () => {
+  const detail = (code, released) => "The provider started this Machine for the supervisor update and its runtime failed to boot " +
+    `(provider status error${code === undefined ? "" : `, ${code}`}). Nothing was installed and its control is unchanged. ` +
+    `Stop it with \`cuna machines stop ${MACHINE_ID} --yes\`, then run the update again.` +
+    (released ? "" : " Cuna could not release this update's claim, so a new update can start only after ten minutes.");
+  for (const [code, released] of [["boot_timeout", true], ["boot_timeout", false], [undefined, true]]) {
+    const label = `${code ?? "no provider code"}, claim ${released ? "released" : "held"}`;
+    const wire = replaceAnswering(409, "supervisor_upgrade_provider_boot_failed", "The Machine failed to boot", detail(code, released));
+    const result = await updateSupervisor({
+      async getMachine(id) { return { id, name: "qa-c3", state: "stopped", agent: "opencode" }; },
+      async replaceMachineSupervisor(id) { return await wire.replaceMachineSupervisor(id); },
+    });
+    assert.equal(result.exit, EXIT_CODES.conflict, label);
+    const error = JSON.parse(result.stderr).error;
+    assert.equal(error.code, "cuna.machine.supervisor_upgrade_provider_boot_failed", label);
+    assert.equal(error.details.reason, "supervisor_upgrade_provider_boot_failed", label);
+    assert.equal(error.details.machine_id, MACHINE_ID, label);
+    assert.equal(error.retryable, false, label);
+    assert.equal(error.details.provider_error_code, code, label);
+    assert.equal(error.message, `qa-c3's runtime failed to boot when the update started it (provider status error${code === undefined ? "" : `, ${code}`}). Nothing was installed and its control is unchanged.`, label);
+    assert.ok(error.hint.startsWith(`Stop it with \`cuna machines stop ${MACHINE_ID} --yes\`, wait until \`cuna machines list\` says stopped, then run \`cuna machines update-supervisor ${MACHINE_ID} --yes\`.`), `${label}: ${error.hint}`);
+    assert.equal(error.hint.includes("can start only after ten minutes"), !released, label);
+    assert.doesNotMatch(error.hint, /Do not repeat/u, label);
+  }
+  // Control: the outcome nobody observed keeps "do not repeat".
+  const pending = replaceAnswering(503, "supervisor_upgrade_publish_pending", "Supervisor update is pending confirmation",
+    "Cuna started the Machine but cannot yet publish the compatible supervisor.", true);
+  const result = await updateSupervisor({
+    async getMachine(id) { return { id, name: "qa-c3", state: "stopped", agent: "opencode" }; },
+    async replaceMachineSupervisor(id) { return await pending.replaceMachineSupervisor(id); },
+  });
+  const error = JSON.parse(result.stderr).error;
+  assert.equal(error.code, "cuna.machine.supervisor_upgrade_publish_pending");
+  assert.match(error.hint, /Do not repeat the update/u);
+});
+
+/** `cuna machines <action>` against a stopped Machine whose transition answers through `wire`. */
+async function transitionThrough(action, wire) {
+  const streams = memoryStreams();
+  const exit = await runCli(["machines", action, MACHINE_ID, "--yes", "--json"], {
+    streams: streams.streams,
+    platform,
+    env: { CUNA_API_KEY: API_KEY },
+    now: () => Date.parse("2026-08-08T00:00:00Z"),
+    clientFactory: () => fakeClient({
+      async discoverCapabilities(scope, resourceId) { return capabilitySnapshot([LIFECYCLE], scope, resourceId); },
+      async getMachine(id) { return { id, name: "qa-c3", state: "stopped", agent: "opencode" }; },
+      async transitionMachine(id, requested) { return await wire.transitionMachine(id, requested); },
+    }),
+  });
+  return { exit, error: JSON.parse(streams.stderr()).error };
+}
+
+test("a start or resume whose runtime failed to boot names this Machine in the stop it asks for", async () => {
+  // Infra 2a8e0c7: every lifecycle detail passes a redaction boundary that
+  // rewrites any UUID, so the Edge spells the id as `<machine-id>`.
+  for (const action of ["start", "resume"]) {
+    const wire = replaceAnswering(502, "provider_request_rejected", "Provider request rejected",
+      `The provider accepted this Machine's ${action} and its runtime failed to boot (provider status error, boot_timeout). ` +
+      "Stop it with `cuna machines stop <machine-id> --yes`, then start it again.");
+    const { exit, error } = await transitionThrough(action, wire);
+    assert.equal(exit, EXIT_CODES.remote, action);
+    assert.equal(error.code, "cuna.remote.rejected", action);
+    assert.equal(error.details.reason, "provider_request_rejected", action);
+    assert.equal(error.retryable, false, action);
+    assert.ok(error.hint.endsWith(`Stop it with \`cuna machines stop ${MACHINE_ID} --yes\`, then start it again.`), `${action}: ${error.hint}`);
+    assert.doesNotMatch(error.hint, /<machine-id>/u, action);
+    assert.match(error.hint, /\(provider status error, boot_timeout\)/u, `${action}: the provider's words stay`);
+  }
+  // Control: a refusal without the placeholder reaches the person unchanged.
+  const other = "The provider refused this Machine's start.";
+  const { error } = await transitionThrough("start", replaceAnswering(502, "provider_request_rejected", "Provider request rejected", other));
+  assert.equal(error.hint, other);
+});
+
 test("mutations fail closed when independent readback contradicts the write response", async () => {
   // TWO ANSWERS, DELIBERATELY DIFFERENT, and the difference is the fix.
   //
@@ -2207,7 +2330,12 @@ test("AgentSession termination waits for a fenced supervisor terminal observatio
   assert.equal(terminations, 1);
   assert.equal(reads, 2);
   assert.equal(sleeps, 1);
-  const record = JSON.parse(streams.stdout());
+  // The acceptance is its own line, printed before the wait; the settled row
+  // is still the one `result`, and still the last line.
+  const records = streams.stdout().trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(records.map((record) => record.type), ["accepted", "result"]);
+  assert.equal(records[0].data.request_state, "termination_pending");
+  const record = records.at(-1);
   assert.equal(record.data.request_state, "terminal");
   assert.equal(record.data.process_state, "terminated");
 });
@@ -3697,7 +3825,7 @@ test("cuna version prints the build digest that separates two installations repo
   const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
   assert.equal(await runCli(["version"], { streams: human.streams, platform, env: {} }), EXIT_CODES.success);
   const printed = human.stdout().trim();
-  assert.match(printed, /^0\.1\.6\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
+  assert.match(printed, /^0\.1\.7\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
 
   // The digest printed is the exact 12-hex prefix of the one the JSON record
   // carries, so the two surfaces can never name different builds.

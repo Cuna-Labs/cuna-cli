@@ -3,6 +3,7 @@ import type { ProviderAgent, ProviderPreset, ProviderObservation } from '../api/
 import { createNodeForegroundTerminalHost } from '../pty/node-host-terminal.js';
 import type { ForegroundTerminalHost } from '../terminal/foreground.js';
 import { sanitizeHumanTerminalOutput } from '../cli/output.js';
+import { CunaError } from '../core/errors.js';
 import { truncateTerminalLine } from '../terminal/cell-width.js';
 import { machineHeader, paintMachinesExplorer } from './explorer.js';
 
@@ -40,11 +41,23 @@ export async function runProviderScreen(
   let notice = '';
   let loaded = false;
   if (mode.kind === 'preset') {
-    try {
-      items = (await client.getProviderPresetsV2(signal)).filter((preset) => preset.agent === mode.agent);
-      loaded = true;
-    } catch {
-      // Shown on the screen below, where `r` can try again.
+    let failure: unknown;
+    // BL-12 (2026-10-03): the Edge's catalog read writes three profile
+    // revisions in the database, 5 s each, and answers a retryable 503 when one
+    // is slow. A failure that says retrying can help is read once more before
+    // the screen opens; anything else, or a second failure, is shown below.
+    for (let attempt = 0; attempt < 2 && !loaded; attempt += 1) {
+      if (attempt > 0) {
+        if (!(failure instanceof CunaError && failure.retryable)) break;
+        await abortableDelay(PROFILE_REREAD_DELAY_MS, signal);
+        if (signal?.aborted) break;
+      }
+      try {
+        items = (await client.getProviderPresetsV2(signal)).filter((preset) => preset.agent === mode.agent);
+        loaded = true;
+      } catch (error) {
+        failure = error;
+      }
     }
     if (signal?.aborted) return undefined;
     if (loaded && items.length === 1) {
@@ -52,7 +65,7 @@ export async function runProviderScreen(
       return items[0];
     }
     if (loaded && items.length === 0) notice = ' No profiles are available for this agent yet. Press r to check again.';
-    if (!loaded) notice = ' Your profiles could not be read. Press r to try again.';
+    if (!loaded) notice = profilesUnreadNotice(failure);
   }
 
   options.onBeforeTerminalOwnership?.();
@@ -107,9 +120,9 @@ export async function runProviderScreen(
             Math.max(0, result.valid_until_ms - Date.now()));
         }
       }
-    } catch {
+    } catch (error) {
       items = []; observation = undefined;
-      notice = mode.kind === 'preset' ? ' Your profiles could not be read. Press r to try again.' : ' Provider information unavailable. Press r to try again.';
+      notice = mode.kind === 'preset' ? profilesUnreadNotice(error) : ' Provider information unavailable. Press r to try again.';
     } finally {
       busy = false; render();
     }
@@ -151,6 +164,34 @@ export async function runProviderScreen(
     await writes;
     await lease.restore();
   }
+}
+
+const PROFILE_REREAD_DELAY_MS = 250;
+
+/**
+ * Why the profiles could not be read, named by this client's closed dotted
+ * error code, never by a message: an unnamed failure cannot be told from
+ * another (BL-12).
+ */
+function profilesUnreadNotice(failure: unknown): string {
+  const reason = failure instanceof CunaError && /^cuna(?:\.[a-z][a-z_]{0,47}){1,3}$/u.test(failure.code)
+    ? ` (${failure.code.slice('cuna.'.length).replaceAll('.', ' ').replaceAll('_', ' ')})`
+    : '';
+  return ` Your profiles could not be read${reason}. Press r to try again.`;
+}
+
+async function abortableDelay(milliseconds: number, signal: AbortSignal | undefined): Promise<void> {
+  if (signal?.aborted) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(done, milliseconds);
+    const onAbort = (): void => done();
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /** The one line for R6: what opens, where, and what the person does next. */

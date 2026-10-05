@@ -15,7 +15,9 @@ import { launchRemoteWorkspaceSession } from "../journey/remote-workspace.js";
 import { join, resolve } from "node:path";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
-import { createHttpTransport, type BearerRefreshRequest, type HttpRequest } from "../api/http.js";
+import type { AgentSession } from "../api/contracts.js";
+import { createHttpTransport, type BearerRefreshRequest, type HttpRequest, type HttpTransport } from "../api/http.js";
+import { providerDisplayName } from "../machines/provider-availability.js";
 import { createBrowserOpener, type BrowserOpener } from "../auth/browser.js";
 import type { BrowserHandoffReporter } from "../auth/browser-handoff.js";
 import { createHumanAuthClient } from "../auth/human-client.js";
@@ -47,11 +49,16 @@ import {
   orchestrateAgentJourney,
   preflightAgentJourneyInvocation,
   readAccountIdentityWithin,
+  recoverWorkspaceSync,
+  workspaceRecoveryLines,
+  workspaceRecoveryRecord,
+  DEFAULT_WORKSPACE_RECOVERY_TIMEOUT_MS,
   type AgentJourneyEffects,
   type AgentJourneyPhase,
   type JourneyAgentSessionDisposition,
   type JourneyWait,
   type ReconciledAgentJourneyIntent,
+  type WorkspaceJourneyEffects,
 } from "../journey/index.js";
 import {
   agentSessionDispositionLine,
@@ -83,7 +90,9 @@ import type { TerminalClientScope } from "../runtime/terminal-client-identity.js
 import {
   runNodeForegroundSessions,
   selectNodeForegroundPresentation,
+  sessionEndRecord,
   type ForegroundSessionRunner,
+  type ForegroundSessionRunnerInput,
   type ForegroundPresentationMode,
 } from "../runtime/node-foreground-session.js";
 import { runNodeMachinesExplorer, type MachinesExplorerRunner } from "../machines/explorer.js";
@@ -95,7 +104,7 @@ import { commandHelp, helpTopicName } from "./command-help.js";
 import { FULL_HELP, ROOT_HELP } from "./help.js";
 import { labelledLines } from "./labelled-lines.js";
 import { createOutputWriter, sanitizeHumanTerminalOutput, type CliStreams } from "./output.js";
-import { booleanOption, parseArgv, stringOption } from "./parser.js";
+import { booleanOption, parseArgv, resolveCliRoute, stringOption } from "./parser.js";
 import { rejectUnknownOptions } from "./parser.js";
 import type { ParsedInvocation } from "./parser.js";
 
@@ -111,6 +120,12 @@ export interface RunCliDependencies {
    */
   readonly convergencePoller?: ConvergencePoller;
   readonly clientFactory?: (config: EffectiveConfig, timeoutMs: number) => CunaApiClient;
+  /**
+   * The API operations this invocation may send. Defaults to the vendored
+   * contract's; a test that exercises a command the vendored contract cannot
+   * serve names the operations of the contract it stands for.
+   */
+  readonly contractOperations?: ReadonlySet<string>;
   readonly humanAuth?: HumanAuthService;
   readonly credentialVault?: CredentialVault;
   readonly browser?: BrowserOpener;
@@ -139,6 +154,12 @@ export interface RunCliDependencies {
   readonly managedWorkspaceMachineId?: string;
   /** Test seam for the folder a command resolves its workspace binding from. */
   readonly workspaceRoot?: string;
+  /**
+   * Test seam for the workspace-sync transport `sync recover` uses when an
+   * injected `clientFactory` leaves no HTTP transport. Production never sets
+   * it: the real authenticated transport is always used when one exists.
+   */
+  readonly workspaceSyncTransport?: Pick<HttpTransport, "request">;
   /**
    * Test seam for the stream a mid-journey question reads its answer from.
    * Production always leaves this absent and uses the real `process.stdin`.
@@ -437,13 +458,26 @@ function parseTimeout(raw: string | undefined): number | undefined {
  * into a JSON record and into whatever consumes it. The parser already knows
  * which token is the command, so ask it; if the argv is too malformed to parse,
  * there is no command to name.
+ *
+ * It then named only that first token: `machines start` failed as `machines`
+ * while it succeeded as `machines.start` (BL-4, 2026-10-02). The registry leaf
+ * carries the path its result names, so an error names the same one. `version`
+ * and `help` are answered before any leaf runs, in this order, and their
+ * results are named for them. A leaf this build does not register has no path;
+ * the typed command is the most exact name left.
  */
 function commandLabel(argv: readonly string[]): string {
+  let parsed: ParsedInvocation;
   try {
-    return parseArgv(argv).command ?? "root";
+    parsed = parseArgv(argv);
   } catch {
     return "root";
   }
+  const help = parsed.options.help === true;
+  if (!help && (parsed.options.version === true || parsed.command === "version")) return "version";
+  if (help || parsed.command === "help") return "help";
+  if (parsed.command === undefined) return "root";
+  return resolveCliRoute(parsed)?.path ?? parsed.command;
 }
 
 function menuInvocationOptions(parsed: ReturnType<typeof parseArgv>): readonly string[] {
@@ -472,7 +506,10 @@ function humanResult(result: HumanAuthResult): Readonly<Record<string, unknown>>
   });
 }
 
-function needsRemoteCredential(command: string | undefined, foreground: ForegroundSelection | undefined): boolean {
+function needsRemoteCredential(command: string | undefined, foreground: ForegroundSelection | undefined, action?: string): boolean {
+  // Bare `sync` is reserved and reads no credential; `sync recover` reads the
+  // binding authority and runs the folder's sync.
+  if (command === "sync") return action === "recover";
   return command === "observe" || command === "share" || command === "capabilities" || command === "machines" || command === "agent-sessions" ||
     command === "agent" || command === "executions" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
@@ -501,8 +538,9 @@ function managesInteractiveSession(command: string | undefined): boolean {
 function usesCredentialAuthority(
   command: string | undefined,
   foreground: ForegroundSelection | undefined,
+  action?: string,
 ): boolean {
-  return managesInteractiveSession(command) || needsRemoteCredential(command, foreground);
+  return managesInteractiveSession(command) || needsRemoteCredential(command, foreground, action);
 }
 
 interface ForegroundSelection {
@@ -747,11 +785,38 @@ function writeTerminalReconnectConflict(stream: Writable, color: boolean): void 
   stream.write("Run `cuna` again to reconnect.\n");
 }
 
+/** A refused session whose process the server records as ended. */
+interface RecordedSessionEnd {
+  readonly session: AgentSession;
+  readonly observedAt?: string;
+}
+
+/**
+ * `terminal_owner_unrecoverable` names two facts the refusal cannot tell
+ * apart; the session's own record can. Read it once, bounded, and use it only
+ * when it says the process ended. A failed or slow read keeps the general text.
+ */
+async function recordedSessionEnd(
+  client: CunaApiClient | undefined,
+  sessionIds: readonly string[],
+): Promise<RecordedSessionEnd | undefined> {
+  const id = sessionIds[0];
+  if (client === undefined || id === undefined || sessionIds.length !== 1) return undefined;
+  try {
+    const session = await client.getAgentSession(id, AbortSignal.timeout(5_000));
+    const end = session.id === id ? sessionEndRecord(session) : undefined;
+    return end === undefined ? undefined : Object.freeze({ session, ...end });
+  } catch {
+    return undefined;
+  }
+}
+
 function writeTerminalSupervisorReadiness(
   stream: Writable,
   color: boolean,
   state: TerminalSupervisorReadiness,
   sessionIds: readonly string[],
+  recordedEnd?: RecordedSessionEnd,
 ): void {
   const accent = (value: string): string => color ? `\u001b[38;5;202m\u001b[1m${value}\u001b[0m` : value;
   const inspection = (): void => {
@@ -761,6 +826,20 @@ function writeTerminalSupervisorReadiness(
       }
     }
   };
+  if (state === "ended" && recordedEnd !== undefined) {
+    const { session, observedAt } = recordedEnd;
+    const provider = providerDisplayName(session.agent);
+    const at = observedAt === undefined || Number.isNaN(Date.parse(observedAt))
+      ? "" : ` at ${new Date(observedAt).toISOString().slice(11, 16)} UTC`;
+    const journey = session.agent === "claude-code" ? "claude" : session.agent === "opencode" ? "opencode" : session.agent === "codex" ? "codex" : undefined;
+    stream.write(`${accent("◆ CUNA")}  ${provider} exited${at} · this session has ended\n`);
+    stream.write(`Cuna records its process as ${session.processState}${session.terminalReason === undefined ? "" : ` (${session.terminalReason})`}; it cannot be opened again.\n`);
+    inspection();
+    stream.write(journey === undefined
+      ? "Start a new one from its folder with `cuna`.\n"
+      : `Start a new one from its folder: \`cuna ${journey} --new-session\`\n`);
+    return;
+  }
   if (state === "ended") {
     // The Edge answers `terminal_owner_unrecoverable` for two different facts:
     // a process the durable row says has settled, and a live process whose
@@ -837,6 +916,7 @@ function startInlineProgress(
       ...(waiting === undefined ? {} : {
         waiting: {
           waitingFor: waiting.notice.waitingFor,
+          ...(waiting.notice.cause === undefined ? {} : { cause: waiting.notice.cause }),
           // Re-derived per repaint: the reporter speaks once per poll, up to
           // 1 600 ms apart, and a number that only moves when the poll does
           // reproduces the dwell it is meant to cure.
@@ -1029,6 +1109,33 @@ function journeyPhaseLabel(phase: AgentJourneyPhase, agent: "claude-code" | "cod
   }
 }
 
+/**
+ * The journey's attach: the agent owns the terminal from `onBeforeTerminalOwnership`
+ * until the runner returns. Workspace lines are held for that span and the
+ * sync attention travels with the runner, so a sync that needs the person is
+ * on the attached bar, not only in the lines released at detach (BL-7,
+ * 2026-10-03: 21 silent minutes after sync stopped at 02:02:30Z).
+ */
+export async function attachJourneyForeground(
+  runner: ForegroundSessionRunner,
+  workspace: Pick<WorkspaceJourneyEffects, "holdNotices" | "releaseNotices" | "syncAttention">,
+  input: ForegroundSessionRunnerInput,
+): Promise<void> {
+  try {
+    await runner({
+      ...input,
+      syncAttention: workspace.syncAttention,
+      onBeforeTerminalOwnership: () => {
+        input.onBeforeTerminalOwnership?.();
+        // The agent's screen from here: sync lines wait for detach.
+        workspace.holdNotices();
+      },
+    });
+  } finally {
+    workspace.releaseNotices();
+  }
+}
+
 function foregroundAttachLabel(agent: string): string {
   return agent === "opencode"
     ? "Opening OpenCode terminal — use /connect there"
@@ -1054,6 +1161,8 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
   let interactiveCloseUi = false;
   let interactiveCloseColor = false;
   let terminalSessionIds: readonly string[] = [];
+  // Reads what the server recorded about a session whose terminal was refused.
+  let refusalReader: CunaApiClient | undefined;
   // Known once configuration is read; every attach happens after that.
   let terminalClients: TerminalClientScope | undefined;
   const runForeground: ForegroundSessionRunner = async (input) => {
@@ -1186,7 +1295,9 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // Preflight gates and configuration must read the same invocation
     // environment. This keeps credential and profile selection deterministic
     // across embedded invocations.
-    if (parsed.command !== undefined) preflightInvocation(parsed, (dependencies.now ?? Date.now)());
+    if (parsed.command !== undefined) {
+      preflightInvocation(parsed, (dependencies.now ?? Date.now)(), dependencies.contractOperations);
+    }
     if(parsed.command==="observe"&&(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true))throw usageError("observe requires an interactive terminal; JSON and redirected output are unsupported.");
     if(parsed.command==="share"&&(writer.structured||streams.stdinIsTTY!==true||streams.stdoutIsTTY!==true))throw usageError("share requires an interactive terminal; JSON and redirected output are unsupported.");
 
@@ -1291,7 +1402,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // selects one. Empty or malformed still never means absent: an unusable
     // `*_API_KEY` refuses the command rather than silently demoting automation
     // mode to an interactive browser sign-in.
-    if (interactiveRoot || usesCredentialAuthority(parsed.command, foreground)) assertApiKeyUsable(config);
+    if (interactiveRoot || usesCredentialAuthority(parsed.command, foreground, parsed.operands[0])) assertApiKeyUsable(config);
     const sessionPaths = localEncryptedSessionPaths(platform.paths.configDirectory, config.profile);
     // The last-known Machines picture belongs to one account. Only the real
     // sign-in path touches the host's state directory; see the explorer's cache.
@@ -1565,7 +1676,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
 
     let bearerTokenProvider: ((signal?: AbortSignal, refresh?: BearerRefreshRequest) => Promise<string>) | undefined;
     let credentialMode: "automation" | "interactive" | undefined = config.apiKey === undefined ? undefined : "automation";
-    if (config.apiKey === undefined && (interactiveRoot || needsRemoteCredential(parsed.command, foreground))) {
+    if (config.apiKey === undefined && (interactiveRoot || needsRemoteCredential(parsed.command, foreground, parsed.operands[0]))) {
       if (dependencies.clientFactory === undefined || dependencies.humanAuth !== undefined) {
         const humanAuth = await getHumanAuth();
         if (dependencies.clientFactory === undefined) {
@@ -1586,6 +1697,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
     }) : undefined;
     const client = dependencies.clientFactory?.(config, effectiveTimeoutMs) ?? createCunaApiClient(httpTransport!);
+    refusalReader = client;
     const inventoryCache = dependencies.machineInventoryCache ??
       (credentialMode === "interactive" && dependencies.clientFactory === undefined
         ? machineInventoryCache(platform, { baseUrl: config.baseUrl, profile: config.profile })
@@ -1613,6 +1725,54 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // share` opens on it instead of losing the authority it may have created.
       const operations=ownerGrantOperationStore(platform,{baseUrl:config.baseUrl,profile:config.profile,ownerPrincipalId:identity.id,projectId:project});
       await runOwnerGrantsScreen(ownerObserveGrantsApi(httpTransport,identity.id,project,async()=>(await client.getIdentity(dependencies.signal)).id),sessions,operations,{project,owner:identity.id},{...(dependencies.signal===undefined?{}:{signal:dependencies.signal}),...(stringOption(parsed,"grant")===undefined?{}:{initialGrantId:stringOption(parsed,"grant")!})});
+      return EXIT_CODES.success;
+    }
+    if (parsed.command === "sync" && parsed.operands[0] === "recover") {
+      // R7.3 (BL-7, 2026-10-03): the folder, the installation's sync state and
+      // the authenticated sync transport all live here, so this is composed
+      // like the journey rather than in the generic dispatcher. It runs
+      // without a terminal and with --json: labs script it.
+      if (credentialMode === undefined) {
+        throw new CunaError({
+          code: "cuna.auth.required",
+          message: "Workspace sync recovery requires authenticated account authority.",
+          exitCode: EXIT_CODES.auth,
+          hint: `Run \`cuna login\` for interactive use, or use an automation credential. ${automationCredentialHint()}`,
+        });
+      }
+      const syncTransport = httpTransport ?? dependencies.workspaceSyncTransport;
+      if (syncTransport === undefined) {
+        throw new CunaError({
+          code: "cuna.journey.workspace_transport_unavailable",
+          message: "The injected API client did not provide authenticated workspace-sync transport authority.",
+          exitCode: EXIT_CODES.unsupported,
+          hint: INTERNAL_DEFECT_HINT,
+        });
+      }
+      if (streams.stderrIsTTY === true && !writer.structured) {
+        batchProgress = startInlineProgress(
+          streams.stderr,
+          !booleanOption(parsed, "no-color") && !Object.hasOwn(effectiveEnvironment, "NO_COLOR"),
+          "Recovering workspace sync",
+        );
+      }
+      const recovered = await recoverWorkspaceSync({
+        client,
+        transport: Object.freeze({
+          request: (request: HttpRequest) => syncTransport.request(request),
+          authentication: "authenticated" as const,
+          credentialAuthority: credentialMode === "interactive" ? "interactive" as const : "api_key" as const,
+        }),
+        profileId: config.profile,
+        stateDirectory: platform.paths.stateDirectory,
+        filesystemCapabilities: conservativeFilesystemCapabilities(platform.kind),
+        path: resolve(dependencies.workspaceRoot ?? process.cwd(), parsed.operands[1] ?? "."),
+        timeoutMs: timeoutMs ?? DEFAULT_WORKSPACE_RECOVERY_TIMEOUT_MS,
+        ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+      });
+      batchProgress?.stop();
+      batchProgress = undefined;
+      writer.success("sync.recover", workspaceRecoveryRecord(recovered), workspaceRecoveryLines(recovered).join("\n"));
       return EXIT_CODES.success;
     }
     if (interactiveRoot) {
@@ -1852,9 +2012,10 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           },
           createLabel: journeyPhaseLabel("create-agent-session", journeyAgent),
           ended: context?.state === "ended",
+          unresumable: context?.state === "unresumable",
         });
-        // A No to the ended question resumes nothing; it ends the command.
-        recordedLaunchResumed = recordedLaunchResumed || (!another && context?.state !== "ended");
+        // A No to the ended or unresumable question resumes nothing; it ends the command.
+        recordedLaunchResumed = recordedLaunchResumed || (!another && context?.state !== "ended" && context?.state !== "unresumable");
         return another;
       };
       if (credentialMode === undefined) {
@@ -2016,7 +2177,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
               sessionCount: 1,
               ...(effectiveEnvironment.TERM === undefined ? {} : { terminalKind: effectiveEnvironment.TERM }),
             });
-            await runner({
+            await attachJourneyForeground(runner, workspace, {
               client,
               baseUrl: config.baseUrl,
               browser: dependencies.browser ?? createBrowserOpener(nodePlatform(platform.kind), effectiveEnvironment),
@@ -2297,6 +2458,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       ...(dependencies.convergencePoller === undefined
         ? {}
         : { convergencePoller: dependencies.convergencePoller }),
+      ...(timeoutMs === undefined ? {} : { requestBudgetMs: timeoutMs }),
       ...(credentialMode === undefined ? {} : { credentialMode }),
       ...(runtimeFeatures === undefined ? {} : { runtimeFeatures }),
       // Where `agent-sessions create` looks for `.cuna/workspace.json`. Passed
@@ -2309,6 +2471,17 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       // A command that follows a long remote operation says what it is still
       // waiting for on the same progress row.
       reportWait: (wait) => batchProgress?.wait(wait),
+      // Human output keeps the spinner row coherent by printing above it; with
+      // no row the line goes to stdout like the result that follows it.
+      reportAccepted: (command, data, human) => {
+        if (!writer.structured && batchProgress !== undefined) batchProgress.note(sanitizeHumanTerminalOutput(human));
+        else writer.accepted(command, data, human);
+      },
+      reportNotice: (line) => {
+        if (writer.structured) return;
+        if (batchProgress !== undefined) batchProgress.note(sanitizeHumanTerminalOutput(line));
+        else streams.stderr.write(`${sanitizeHumanTerminalOutput(line)}\n`);
+      },
     });
     batchProgress?.stop();
     batchProgress = undefined;
@@ -2351,6 +2524,7 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         interactiveCloseColor && streams.stderrIsTTY === true,
         supervisorReadiness,
         terminalSessionIds,
+        supervisorReadiness === "ended" ? await recordedSessionEnd(refusalReader, terminalSessionIds) : undefined,
       );
       // An unattested owner is a refusal of this attempt, not a network
       // condition: an automatic retry cannot change it, so the exit code must

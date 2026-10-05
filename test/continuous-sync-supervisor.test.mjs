@@ -8,6 +8,7 @@ import test from "node:test";
 import { CunaError, EXIT_CODES } from "../dist/core/errors.js";
 import {
   ContinuousWorkspaceSyncSupervisor,
+  DurableSyncJournal,
 } from "../dist/sync/index.js";
 import {
   compileExclusionPolicy,
@@ -503,6 +504,157 @@ test("stale refusals with no newer generation in sight stop after three attempts
   watcher.change("shared.txt");
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(attempts, 3, "a stopped supervisor sends nothing more");
+});
+
+// ws-c3, 2026-09-29: the laptop slept from about 02:23 to 04:20. On waking,
+// every sync loop found its own journal lease (30 s) expired, stopped as
+// conflicted/stale_fence, and never synced again while its process lived.
+test("a journal lease that ran out while the machine slept is taken again and sync keeps running", async (t) => {
+  const fx = await fixture(t);
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  const watcher = new WatchHarness();
+  let now = Date.parse("2026-09-29T02:23:00.000Z");
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(
+    supervisorInput(fx, authority, watcher, { clock: () => now }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await waitFor(() => supervisor.snapshot.state === "live_unverified", () => `never live: ${JSON.stringify(supervisor.snapshot)}`);
+  // Asleep for two hours; the passes after this run on the woken clock.
+  now += 2 * 60 * 60 * 1_000;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await writeFile(join(fx.root, "after-sleep.txt"), "written after the sleep");
+  watcher.change("after-sleep.txt");
+  await waitFor(() => supervisor.snapshot.generation === 2,
+    () => `sync did not survive the sleep: ${JSON.stringify(supervisor.snapshot)}`);
+  assert.deepEqual(authority.commits.at(-1).entries.map((entry) => entry.path), ["after-sleep.txt"]);
+  assert.notEqual(supervisor.snapshot.state, "conflicted");
+});
+
+// The same laptop: a CLI whose loop had stopped kept the folder's writer
+// authority until 10:04, so every later run of the CLI in that folder was told
+// `active_writer` and could not deliver the Machine's generation 3.
+test("a loop that stops for good gives the folder's writer authority back to the next run", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "base" });
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  authority.commitLocalSnapshot = async ({ baseGeneration }) => {
+    authority.refusedBases.add(baseGeneration);
+    throw conflict("workspace_sync_generation_conflict");
+  };
+  const watcher = new WatchHarness();
+  const writerLeaseDirectory = join(fx.state, "writer-authority");
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(
+    supervisorInput(fx, authority, watcher, { writerLeaseDirectory }));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  const directories = [writerLeaseDirectory, join(fx.state, "operation-journal")];
+  const nextRun = (directory) => DurableSyncJournal.open({
+    directory, bindingId: BINDING, bindingGeneration: 1, ownerId: `continuous-sync:${process.pid}:next-run`,
+  });
+  // CONTROL: while the loop runs, the next run is refused. Without this the
+  // assertion below could pass on a lock that was never held.
+  for (const directory of directories) {
+    await assert.rejects(nextRun(directory), (error) => error.code === "cuna.workspace.workspace_busy");
+  }
+  await writeFile(join(fx.root, "shared.txt"), "local");
+  watcher.change("shared.txt");
+  await waitFor(() => supervisor.snapshot.state === "conflicted", () => `never stopped: ${JSON.stringify(supervisor.snapshot)}`);
+  // The stop is published before the authority is given back, so the next run
+  // may have to try again for a moment -- never for as long as this process lives.
+  for (const directory of directories) {
+    let refusal;
+    await waitFor(async () => {
+      try {
+        await (await nextRun(directory)).close();
+        return true;
+      } catch (error) {
+        refusal = error;
+        return false;
+      }
+    }, () => `the stopped loop still holds ${directory}: ${refusal?.message}`, 2_000);
+  }
+});
+
+/**
+ * A folder whose last run synced and then stopped for `reason`, as that run's
+ * loop records a stop (`#transition` in the catch of `#runLoop`), and ended.
+ */
+async function folderLeftStoppedBy(fx, authority, reason) {
+  const run = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness()));
+  try {
+    await waitFor(() => run.snapshot.state === "live_unverified", () => `never live: ${JSON.stringify(run.snapshot)}`);
+  } finally {
+    await run.stop();
+  }
+  const path = join(fx.state, "continuous-sync.state.json");
+  const state = JSON.parse(await readFile(path, "utf8"));
+  await writeFile(path, `${JSON.stringify({ ...state, status: "conflicted", dirty: true, reason })}\n`);
+}
+
+// ws-codex3 and a second QA folder, 2026-09-29: a run before 0.1.7 (no journal retake)
+// stopped when a sleep let its own journal lease run out, and left
+// `conflicted (stale_fence)` in the folder's durable state. Every later run
+// loaded that stop, synced nothing, and printed "Workspace sync stopped · ...
+// conflicted (stale_fence)" at start and at detach.
+test("a new run takes up a folder whose last run stopped on its own expired journal lease", async (t) => {
+  const fx = await fixture(t);
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  await folderLeftStoppedBy(fx, authority, "stale_fence");
+  const watcher = new WatchHarness();
+  const next = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher));
+  t.after(async () => { await next.stop(); await fx.cleanup(); });
+  const seen = [];
+  next.subscribe((snapshot) => seen.push(snapshot.state));
+  assert.notEqual(seen[0], "conflicted", "the new run announced the last run's stop as its own");
+  await writeFile(join(fx.root, "after-restart.txt"), "written in the new run");
+  watcher.change("after-restart.txt");
+  await waitFor(() => next.snapshot.generation === 2, () => `the new run never synced: ${JSON.stringify(next.snapshot)}`);
+  assert.deepEqual(authority.commits.at(-1).entries.map((entry) => entry.path), ["after-restart.txt"]);
+});
+
+// CONTROL: the same folder, with the last run stopped by the Machine's refusal
+// instead of its own lease. That stop is about the folder, not the process,
+// and still holds for the next run.
+test("control: a new run keeps a stop the Machine's refusal left", async (t) => {
+  const fx = await fixture(t);
+  const authority = new MemoryAuthority(1, fx.manifest.manifestRoot);
+  await folderLeftStoppedBy(fx, authority, "workspace_sync_generation_conflict");
+  const watcher = new WatchHarness();
+  const next = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, watcher));
+  t.after(async () => { await next.stop(); await fx.cleanup(); });
+  await writeFile(join(fx.root, "after-restart.txt"), "written in the new run");
+  watcher.change("after-restart.txt");
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(next.snapshot.state, "conflicted");
+  assert.equal(next.snapshot.reason, "workspace_sync_generation_conflict");
+  assert.equal(authority.commits.length, 0);
+});
+
+// ws-c3, 2026-09-29, 10:12:01: a pull of the Machine's generation 3 was
+// stopped after conflict.txt was replaced and before the copy of the folder's
+// version was written, so for five minutes the folder held neither.
+test("a pull stopped between two files never leaves the folder without its own version", async (t) => {
+  const fx = await fixture(t, { "shared.txt": "local" });
+  const copy = "shared.txt.cuna-conflict-2-318d12700a4c";
+  const desiredFiles = { "shared.txt": "remote", [copy]: "local" };
+  const desired = await desiredManifest(fx, desiredFiles);
+  const authority = new MemoryAuthority(2, desired.manifestRoot);
+  loadChunks(authority, desired, desiredFiles);
+  authority.pages = [remotePage(2, fx.manifest, desired)];
+  // The first file of the generation lands; every read after it fails.
+  authority.readFailures = [undefined, ...Array.from({ length: 10_000 }, networkFailure)];
+  const supervisor = await ContinuousWorkspaceSyncSupervisor.start(supervisorInput(fx, authority, new WatchHarness()));
+  t.after(async () => { await supervisor.stop(); await fx.cleanup(); });
+  await waitFor(() => supervisor.snapshot.state === "paused" && supervisor.snapshot.pendingRemoteChanges === 1,
+    () => `the pull did not stop between the two files: ${JSON.stringify(supervisor.snapshot)}`);
+  const held = [
+    await readFile(join(fx.root, "shared.txt"), "utf8"),
+    await readFile(join(fx.root, copy), "utf8").catch(() => undefined),
+  ];
+  assert.ok(held.includes("local"), `the folder's own version is gone: ${JSON.stringify(held)}`);
+  // And the pull still completes once the reads come back.
+  authority.readFailures = [];
+  supervisor.requestReconciliation("network_restored");
+  await waitFor(() => supervisor.snapshot.generation === 2, () => `the pull never completed: ${JSON.stringify(supervisor.snapshot)}`);
+  assert.equal(await readFile(join(fx.root, "shared.txt"), "utf8"), "remote");
+  assert.equal(await readFile(join(fx.root, copy), "utf8"), "local");
 });
 
 // A sibling is written once: a replay that finds the same name holding the

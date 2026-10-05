@@ -6,6 +6,9 @@ const CUNA_ORANGE = "48;2;235;86;37";
 const CUNA_ORANGE_DARK = "48;2;121;48;25";
 const WHITE = "38;2;255;255;255";
 const MUTED = "38;2;224;210;203";
+const OSC = "\u001b]";
+const ST = "\u001b\\";
+const HYPERLINK_CLOSE = `${OSC}8;;${ST}`;
 /** Marks a row whose writer content continues past the right edge of this window. */
 export const CONTINUED_MARKER = "›";
 const GRAPHEME_SEGMENTER = new Intl.Segmenter("en", { granularity: "grapheme" });
@@ -50,6 +53,15 @@ export interface WorkbenchFrameInput {
   readonly remoteMouse?: boolean;
   /** Cuna's own selection, as cell ranges [start, end) of viewport rows. */
   readonly selection?: readonly WorkbenchSelectionRow[];
+  /** Link cells of viewport rows with their exact targets, painted as OSC 8 hyperlinks. */
+  readonly links?: readonly WorkbenchLinkSpan[];
+}
+
+export interface WorkbenchLinkSpan {
+  readonly row: number;
+  readonly start: number;
+  readonly end: number;
+  readonly uri: string;
 }
 
 export interface WorkbenchSelectionRow {
@@ -159,6 +171,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
         input.columns,
         input.mouseReporting === true,
         input.remoteMouse === true,
+        input.selection !== undefined && input.selection.length > 0,
       ),
     ];
   } else {
@@ -186,7 +199,10 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
     assertViewportCell(cell, displayWidth, cellColumns);
     const renderRuns = active.viewport.renderRows?.[row];
     if (renderRuns !== undefined) assertViewportRenderRuns(renderRuns, cell, displayWidth, cellColumns);
-    const rendered = renderRuns === undefined || !color ? cell : renderStyledRuns(renderRuns);
+    const rowLinks = input.links?.filter((span) => span.row === row && linkUriIsSafe(span.uri));
+    const rendered = rowLinks !== undefined && rowLinks.length > 0
+      ? renderLinkedRow(cell, color ? renderRuns : undefined, rowLinks, input.links as readonly WorkbenchLinkSpan[])
+      : renderRuns === undefined || !color ? cell : renderStyledRuns(renderRuns);
     const selected = input.selection?.find((range) => range.row === row);
     rowCommands.push(`${ESC}${appbarRows + row + 1};1H${ESC}0m${ESC}2K${rendered}` +
       (continued ? continuedMarker(appbarRows + row + 1, input.columns, color) : "") +
@@ -350,21 +366,33 @@ function renderTabRow(
   return { line, targets: Object.freeze(targets) };
 }
 
-/** Windows hosts get the copy/paste keys on the right of the second row when they fit. */
-function withClipboardHint(line: string, columns: number, mouseReporting: boolean, remoteMouse: boolean): string {
-  if (process.platform !== "win32") return line;
+/**
+ * The keys on the right of the second row, on every host, as many as fit:
+ * how to leave without quitting the agent, and how to copy. Owner 2026-10-04:
+ * a Ctrl+C meant to copy reached Claude Code and a second one quit it, so the
+ * first two keys are always these. A shown Cuna selection leads with its copy
+ * key: that Ctrl+C is Cuna's, not the agent's.
+ */
+function withClipboardHint(line: string, columns: number, mouseReporting: boolean, remoteMouse: boolean, selected: boolean): string {
+  const windows = process.platform === "win32";
   // Cuna reports the mouse so the bar is clickable; it then selects on a
   // plain drag itself, unless the remote program asked for the mouse. Only
   // then is the host's own Shift+drag the way to select.
-  const hint = !mouseReporting
-    ? "Select text: Ctrl+Shift+C copy | Ctrl+Shift+V paste"
-    : remoteMouse
-      ? "Agent uses the mouse: Shift+drag select | Ctrl+Shift+C copy | Ctrl+Shift+V paste"
-      : "Drag to select and copy | Ctrl+click opens a link | Ctrl+Shift+V paste";
+  const keys = selected
+    ? ["Ctrl+C copies the selection", "Ctrl+] d detach"]
+    : !mouseReporting
+      ? ["Ctrl+] d detach", ...(windows ? ["select + Ctrl+Shift+C copy", "Ctrl+Shift+V paste"] : [])]
+      : remoteMouse
+        ? ["Ctrl+] d detach", "Shift+drag select", ...(windows ? ["Ctrl+Shift+C copy", "Ctrl+Shift+V paste"] : [])]
+        : ["Ctrl+] d detach", "select + Ctrl+C copy", "Ctrl+click opens a link", ...(windows ? ["Ctrl+Shift+V paste"] : [])];
   const used = displayCellWidth(line.trimEnd());
-  const start = columns - 1 - hint.length;
-  if (start < used + 3) return line;
-  return `${line.trimEnd()}${" ".repeat(start - used)}${hint}`;
+  // All of them, else the first two, else the first alone, else nothing.
+  for (const count of new Set([keys.length, 2, 1])) {
+    const hint = keys.slice(0, count).join(" · ");
+    const start = columns - 1 - displayCellWidth(hint);
+    if (start >= used + 3) return `${line.trimEnd()}${" ".repeat(start - used)}${hint}`;
+  }
+  return line;
 }
 
 function renderTruth(model: AppbarModel, agent: WorkbenchTab["agent"], columns: number): string {
@@ -537,6 +565,58 @@ function assertViewportStyle(style: ViewportCellStyle): void {
       throw new WorkbenchRenderError("binding_mismatch", "A viewport color is outside its admitted range.");
     }
   }
+}
+
+/**
+ * One viewport row with its link cells wrapped in OSC 8 hyperlinks. Rows of
+ * one link share an id so the host treats them as one link. Cell text and
+ * styles are the row's own; only the hyperlink attribute is added.
+ */
+function renderLinkedRow(
+  cell: string,
+  runs: readonly ViewportRenderRun[] | undefined,
+  links: readonly WorkbenchLinkSpan[],
+  frameLinks: readonly WorkbenchLinkSpan[],
+): string {
+  const pieces: { column: number; text: string; style: ViewportCellStyle | undefined }[] = [];
+  let column = 0;
+  for (const run of runs ?? [{ text: cell, width: displayCellWidth(cell), style: undefined }]) {
+    for (const item of GRAPHEME_SEGMENTER.segment(run.text)) {
+      const width = graphemeCellWidth(item.segment);
+      const previous = pieces.at(-1);
+      if (width === 0 && previous !== undefined) {
+        previous.text += item.segment;
+        continue;
+      }
+      pieces.push({ column, text: item.segment, style: run.style });
+      column += width;
+    }
+  }
+  const uris = [...new Set(frameLinks.map((span) => span.uri))];
+  let text = "";
+  let style: ViewportCellStyle | undefined;
+  let open: WorkbenchLinkSpan | undefined;
+  for (const piece of pieces) {
+    const span = links.find((candidate) => piece.column >= candidate.start && piece.column < candidate.end);
+    if (span?.uri !== open?.uri) {
+      if (open !== undefined) text += HYPERLINK_CLOSE;
+      if (span !== undefined) text += `${OSC}8;id=cuna-${uris.indexOf(span.uri)};${span.uri}${ST}`;
+      open = span;
+    }
+    if (piece.style !== undefined && (style === undefined || !sameViewportStyle(style, piece.style))) {
+      const parameters = styleParameters(piece.style);
+      text += `${ESC}0${parameters.length === 0 ? "" : `;${parameters.join(";")}`}m`;
+      style = piece.style;
+    }
+    text += piece.text;
+  }
+  if (open !== undefined) text += HYPERLINK_CLOSE;
+  return text;
+}
+
+/** A host hyperlink carries only a bounded http(s) URL of printable characters. */
+function linkUriIsSafe(uri: string): boolean {
+  return uri.length <= 2_048 && /^https?:\/\/[^\p{Cc}\s]+$/u.test(uri);
 }
 
 /**

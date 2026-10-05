@@ -2,11 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
   requireCapability,
+  requireMachineAction,
   type MachineCreateInput,
   type CunaApiClient,
 } from "../api/client.js";
 import { ARTIFACT_CHANNEL, packageBuildDigest, PROTOCOL_RANGE } from "../build-identity.js";
 import { labelledLines } from "../cli/labelled-lines.js";
+import { recordLabel } from "../cli/record-labels.js";
+import { assertRouteServedByContract } from "../cli/route-contract.js";
 import type {
   AgentAuthMode,
   AgentKind,
@@ -19,6 +22,7 @@ import type {
 import type { EffectiveConfig } from "../config/config.js";
 import { DEFAULT_BASE_URL, environmentCredentialState, publicConfig } from "../config/config.js";
 import { EXIT_CODES, CunaError, unsupportedError, usageError, type SafeErrorDetails } from "../core/errors.js";
+import { CredentialBoundaryError } from "../credentials/errors.js";
 import {
   MACHINE_CREATE_FOLLOW_DEADLINE_MS,
   MACHINE_CREATE_FOLLOW_POLL_INTERVAL_MS,
@@ -38,6 +42,7 @@ import {
 } from "../core/validation.js";
 import { preflightAgentJourneyInvocation } from "../journey/intent.js";
 import type { JourneyWait } from "../journey/wait-policy.js";
+import { supervisorWaitCause } from "../journey/session-failure.js";
 import type { ManagedExecution } from "../api/managed-executions.js";
 import { listAllMachines } from "../machines/pagination.js";
 import {
@@ -71,6 +76,7 @@ import {
   machineSupportsProvider,
   providerDisplayName,
   providerVerdict,
+  type MachineProviderAvailability,
 } from "../machines/provider-availability.js";
 import { classifySessionActionability, displaySessionActionability } from "../machines/session-actionability.js";
 import {
@@ -123,6 +129,13 @@ export interface CommandContext {
   /** Test seam; production uses the real wall-clock wait below. */
   readonly convergencePoller?: ConvergencePoller;
   /**
+   * The caller's EXPLICIT `--timeout-ms`, when one was typed. Absent means the
+   * caller did not decide (D1, `api/http.ts`). A command that bounds a whole
+   * read -- the sign-in renewal the transport performs before its own budget
+   * starts, and the dispatch -- reads it here.
+   */
+  readonly requestBudgetMs?: number;
+  /**
    * Where to start looking for `.cuna/workspace.json`. Production passes the
    * process's working directory; tests pass a scratch folder, so no test can
    * accidentally read the developer's own binding.
@@ -143,6 +156,16 @@ export interface CommandContext {
    * deadline; `undefined` ends the wait. Only a painted progress row listens.
    */
   readonly reportWait?: (wait: JourneyWait | undefined) => void;
+  /**
+   * Says, once and as soon as it is true, that the server accepted a mutation
+   * the command will now wait on. See `OutputWriter.accepted`.
+   */
+  readonly reportAccepted?: (command: string, data: unknown, human: string) => void;
+  /**
+   * One line a person should read before the request is sent. Human output
+   * only: under `--json` stderr carries error records alone.
+   */
+  readonly reportNotice?: (line: string) => void;
 }
 
 function productionConvergencePoller(): ConvergencePoller {
@@ -180,10 +203,16 @@ async function convergeOnRemoteState<T>(
     readonly operation: string;
     readonly settleWith: string;
     readonly probe: () => Promise<ConvergenceProbe<T>>;
+    /**
+     * What an unsettled observation is waiting for, for the progress row.
+     * Absent, the wait stays silent as it always was.
+     */
+    readonly describeWait?: (observation: T) => Pick<JourneyWait, "waitingFor" | "cause">;
   },
 ): Promise<T> {
   const poller = context.convergencePoller ?? productionConvergencePoller();
-  const deadline = poller.now() + REMOTE_CONVERGENCE_BUDGET_MS;
+  const startedAt = poller.now();
+  const deadline = startedAt + REMOTE_CONVERGENCE_BUDGET_MS;
   let probe = await input.probe();
   while (!probe.settled) {
     const remaining = deadline - poller.now();
@@ -195,6 +224,13 @@ async function convergeOnRemoteState<T>(
         budgetMs: REMOTE_CONVERGENCE_BUDGET_MS,
         details: probe.details,
       });
+    }
+    if (input.describeWait !== undefined) {
+      context.reportWait?.(Object.freeze({
+        ...input.describeWait(probe.observation),
+        elapsedMs: poller.now() - startedAt,
+        deadlineMs: REMOTE_CONVERGENCE_BUDGET_MS,
+      }));
     }
     await poller.sleep(Math.min(REMOTE_CONVERGENCE_POLL_INTERVAL_MS, remaining));
     probe = await input.probe();
@@ -516,6 +552,27 @@ function machineCreateReceiptNotYetReadable(error: unknown): boolean {
     (error instanceof CunaError && error.code === "cuna.network.failed");
 }
 
+/**
+ * The transport code of a read that did not complete, or `undefined` for any
+ * other failure.
+ *
+ * A read made after the create was sent can fail without Cuna answering at
+ * all, and that says nothing about the create. The sign-in renewal the
+ * transport performs before each request fails as a `CredentialBoundaryError`
+ * carrying its request's transport code, which `cli/run.ts` (`credentialError`)
+ * prints as "Run the command again" -- for a create, an invitation to make a
+ * second Machine (BL-6, 2026-10-03). The same test as `credentialError`'s, so
+ * the two cannot disagree about which failures are transport.
+ */
+function machineCreateReadIncomplete(error: unknown): string | undefined {
+  const isTransport = (code: string): boolean => code.startsWith("cuna.network.") || code.startsWith("cuna.client.");
+  if (error instanceof CredentialBoundaryError) {
+    const reason = error.safeDetails?.["reason"];
+    return typeof reason === "string" && isTransport(reason) ? reason : undefined;
+  }
+  return error instanceof CunaError && isTransport(error.code) ? error.code : undefined;
+}
+
 interface MachineCreateFollow {
   readonly requestId: string;
   readonly key: string;
@@ -523,6 +580,69 @@ interface MachineCreateFollow {
   readonly startedAt: number;
   /** A receipt was already read, or a POST was already sent, for this request. */
   readonly posted: boolean;
+}
+
+/**
+ * One request made after the create was sent, bounded as a whole.
+ *
+ * `--timeout-ms` bounds a request from its dispatch, and `api/http.ts` asks
+ * the sign-in for a bearer BEFORE that budget starts; only the caller's
+ * AbortSignal reaches that wait. BL-6 (2026-10-03, `--timeout-ms 120000`): the
+ * Machine was running at 00:58:25Z and the command answered at 01:20:13.8Z
+ * with a renewal that did not complete. Where those minutes went was not
+ * observed; what the source shows is that no bound covered them -- the renewal
+ * waits outside `--timeout-ms`, and the follow deadline was looked at only
+ * between reads.
+ *
+ * Each request here carries a signal that aborts at the typed `--timeout-ms`
+ * or at the follow deadline, whichever is first, and is abandoned at that
+ * instant even if something below ignores the signal. The abandoned request is
+ * reported as an elapsed response budget, so the follow treats it exactly like
+ * a dispatch that outlived its own budget: not answered yet.
+ */
+async function boundedCreateRead<T>(
+  context: CommandContext,
+  deadline: number,
+  operation: string,
+  read: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const poller = context.convergencePoller ?? productionConvergencePoller();
+  // A request made at the deadline still gets one poll interval: the follow
+  // overruns its deadline by at most that, and its last read is not lost to a
+  // bound of zero.
+  const boundMs = Math.min(
+    context.requestBudgetMs ?? Number.POSITIVE_INFINITY,
+    Math.max(deadline - poller.now(), MACHINE_CREATE_FOLLOW_POLL_INTERVAL_MS),
+  );
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const elapsed = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const refusal = observationBudgetElapsed({
+        kind: "response",
+        operation,
+        budgetMs: boundMs,
+        readOnly: operation.startsWith("GET "),
+        settleWith: "cuna machines list",
+      });
+      controller.abort(refusal);
+      reject(refusal);
+    }, boundMs);
+  });
+  const pending = read(controller.signal);
+  try {
+    return await Promise.race([pending, elapsed]);
+  } catch (error) {
+    // The abort makes the request fail in its own words -- a cancelled sign-in,
+    // a cancelled request. What happened is the bound.
+    if (controller.signal.aborted) throw controller.signal.reason;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    // An abandoned request may still settle later; nothing listens for it.
+    void pending.catch(() => undefined);
+    void elapsed.catch(() => undefined);
+  }
 }
 
 /**
@@ -534,68 +654,122 @@ interface MachineCreateFollow {
  * receipt's own `retry_create` on a `prepared` request, which says the create
  * never reached the provider; the same POST, with the same key and request,
  * is then sent once.
+ *
+ * The Machine read that shows it running is the create's observation and ends
+ * the command; the caller reads nothing after it. A further read can only
+ * fail, and in BL-6 a renewal failure was the answer for a Machine Cuna had
+ * already started.
  */
 async function followMachineCreate(context: CommandContext, follow: MachineCreateFollow): Promise<Machine> {
   const { client } = context;
   const poller = context.convergencePoller ?? productionConvergencePoller();
   const deadline = follow.startedAt + MACHINE_CREATE_FOLLOW_DEADLINE_MS;
+  const read = <T>(operation: string, call: (signal: AbortSignal) => Promise<T>): Promise<T> =>
+    boundedCreateRead(context, deadline, operation, call);
   const name = follow.input.name;
   let posted = follow.posted;
+  // The last receipt and Machine this follow read. A read that went unanswered
+  // says nothing new, so it does not erase them: the timeout used to call a
+  // Machine already read as starting one still "to be created".
   let receipt: MachineCreateRequest | undefined;
   let machine: Machine | undefined;
+  const waitingFor = (): string => machine === undefined ? `machine ${name} to be created` : `machine ${name} to run`;
+  const unconfirmed = (reason?: string, cause?: unknown): CunaError => machineCreateUnconfirmed(follow, {
+    elapsedMs: poller.now() - follow.startedAt,
+    waitingFor: waitingFor(),
+    ...(receipt === undefined ? {} : { receipt }),
+    ...(machine === undefined ? {} : { machine }),
+    ...(reason === undefined ? {} : { reason, cause }),
+  });
+  // A read that did not complete and is not one the receipt may simply be
+  // early for -- a renewal that failed -- ends the follow, naming what it knows.
+  // Polling on would exchange the login code again on every read.
+  const readFailed = (error: unknown): unknown => {
+    const reason = machineCreateReadIncomplete(error);
+    return reason === undefined ? error : unconfirmed(reason, error);
+  };
   for (;;) {
-    let waitingFor = `machine ${name} to be created`;
+    let current: MachineCreateRequest | undefined;
     try {
-      receipt = await client.getMachineCreateRequest(follow.requestId);
-      if (receipt.state === "unknown" || receipt.action === "reconcile") {
-        receipt = await client.reconcileMachineCreateRequest(follow.requestId);
+      current = await read(`GET /v1/machine-creates/${follow.requestId}`,
+        (signal) => client.getMachineCreateRequest(follow.requestId, signal));
+      if (current.state === "unknown" || current.action === "reconcile") {
+        current = await read(`POST /v1/machine-creates/${follow.requestId}/reconcile`,
+          (signal) => client.reconcileMachineCreateRequest(follow.requestId, signal));
       }
     } catch (error) {
-      if (!machineCreateReceiptNotYetReadable(error)) throw error;
-      receipt = undefined;
+      if (!machineCreateReceiptNotYetReadable(error)) throw readFailed(error);
+      current = undefined;
     }
-    if (receipt !== undefined) {
-      if (receipt.id !== follow.requestId) {
-        postconditionUnverified("machine creation", { create_request_id: follow.requestId, observed_id: receipt.id });
+    if (current !== undefined) {
+      receipt = current;
+      if (current.id !== follow.requestId) {
+        postconditionUnverified("machine creation", { create_request_id: follow.requestId, observed_id: current.id });
       }
-      if (receipt.state === "terminal_failed" || (receipt.action === "none" &&
-        receipt.state !== "settled" && receipt.state !== "provider_succeeded")) {
-        throw machineCreateFailed(follow, `Cuna reports that creating machine ${name} failed.`, receipt);
+      if (current.state === "terminal_failed" || (current.action === "none" &&
+        current.state !== "settled" && current.state !== "provider_succeeded")) {
+        throw machineCreateFailed(follow, `Cuna reports that creating machine ${name} failed.`, current);
       }
-      if (receipt.state === "settled" || receipt.state === "provider_succeeded") {
+      if (current.state === "settled" || current.state === "provider_succeeded") {
+        const machineId = current.machineId;
         try {
-          machine = await client.getMachine(receipt.machineId);
+          machine = await read(`GET /v1/sessions/${machineId}`, (signal) => client.getMachine(machineId, signal));
         } catch (error) {
-          if (!machineCreateReceiptNotYetReadable(error)) throw error;
+          if (!machineCreateReceiptNotYetReadable(error)) throw readFailed(error);
         }
         if (machine !== undefined) {
-          if (machine.id !== receipt.machineId) {
-            postconditionUnverified("machine creation", { create_request_id: follow.requestId, machine_id: receipt.machineId, observed_id: machine.id });
+          if (machine.id !== machineId) {
+            postconditionUnverified("machine creation", { create_request_id: follow.requestId, machine_id: machineId, observed_id: machine.id });
           }
           if (follow.input.background === true || machine.state === "running") {
             context.reportWait?.(undefined);
             return machine;
           }
           if (machine.state === "error" || machine.state === "deleted") {
-            throw machineCreateFailed(follow, `Machine ${name} was created but is ${machine.state}.`, receipt, machine);
+            throw machineCreateFailed(follow, `Machine ${name} was created but is ${machine.state}.`, current, machine);
           }
-          waitingFor = `machine ${name} to run`;
         }
-      } else if (receipt.state === "prepared" && receipt.action === "retry_create" && !posted) {
+      } else if (current.state === "prepared" && current.action === "retry_create" && !posted) {
         posted = true;
         try {
-          await client.createMachine(follow.input, follow.key, follow.requestId);
+          await read("POST /v1/sessions", (signal) => client.createMachine(follow.input, follow.key, follow.requestId, signal));
         } catch (error) {
-          if (!machineCreateOutcomeUnobserved(error)) throw error;
+          if (!machineCreateOutcomeUnobserved(error)) throw readFailed(error);
         }
         continue;
       }
     }
     const elapsedMs = poller.now() - follow.startedAt;
     const remaining = deadline - poller.now();
-    if (remaining <= 0) throw machineCreateUnconfirmed(follow, elapsedMs, receipt, machine);
-    context.reportWait?.({ waitingFor, elapsedMs, deadlineMs: MACHINE_CREATE_FOLLOW_DEADLINE_MS });
+    if (remaining <= 0) throw unconfirmed();
+    context.reportWait?.({ waitingFor: waitingFor(), elapsedMs, deadlineMs: MACHINE_CREATE_FOLLOW_DEADLINE_MS });
     await poller.sleep(Math.min(MACHINE_CREATE_FOLLOW_POLL_INTERVAL_MS, remaining));
+  }
+}
+
+/**
+ * Read back the Machine that the create's own answer named.
+ *
+ * The answer is the mutation's claim and this read is the observation. A read
+ * that does not complete leaves the create committed -- Cuna answered it -- so
+ * the failure names that Machine and the read that settles it, never a second
+ * create. Bounded like every read of the follow.
+ */
+async function readCreatedMachine(context: CommandContext, follow: MachineCreateFollow, answered: Machine): Promise<Machine> {
+  const poller = context.convergencePoller ?? productionConvergencePoller();
+  try {
+    return await boundedCreateRead(context, follow.startedAt + MACHINE_CREATE_FOLLOW_DEADLINE_MS,
+      `GET /v1/sessions/${answered.id}`, (signal) => context.client.getMachine(answered.id, signal));
+  } catch (error) {
+    const reason = machineCreateReadIncomplete(error);
+    if (reason === undefined) throw error;
+    throw machineCreateUnconfirmed(follow, {
+      elapsedMs: poller.now() - follow.startedAt,
+      waitingFor: `machine ${follow.input.name} to be read back`,
+      machine: answered,
+      reason,
+      cause: error,
+    });
   }
 }
 
@@ -612,7 +786,7 @@ function machineCreateDetails(
       next_action: receipt.action,
       receipt_updated_at: receipt.updatedAt,
     }),
-    ...(machine === undefined ? {} : { machine_state: machine.state }),
+    ...(machine === undefined ? {} : { machine_id: machine.id, machine_state: machine.state }),
   };
 }
 
@@ -628,30 +802,92 @@ function machineCreateFailed(
   });
 }
 
-function machineCreateUnconfirmed(
-  follow: MachineCreateFollow, elapsedMs: number, receipt?: MachineCreateRequest, machine?: Machine,
-): CunaError {
+interface MachineCreateUnconfirmedInput {
+  readonly elapsedMs: number;
+  /** What the CLI was still waiting for, in the progress row's words. */
+  readonly waitingFor: string;
+  readonly receipt?: MachineCreateRequest;
+  /** The last Machine read, or the Machine the create's own answer named. */
+  readonly machine?: Machine;
+  /** Set when a read did not complete: its transport code. Absent at the deadline. */
+  readonly reason?: string;
+  readonly cause?: unknown;
+}
+
+/**
+ * The create has not been confirmed running, and the CLI stopped waiting.
+ *
+ * Two different situations, and the advice differs. While nothing says the
+ * create took effect, following the same request again with its key is the
+ * safe step. Once Cuna has committed it -- a Machine was read or named, or the
+ * receipt says the provider succeeded -- running the create again is never the
+ * step: without that key it makes a second Machine. Then the answer names the
+ * Machine and the read that settles it, and `retryable` is false.
+ */
+function machineCreateUnconfirmed(follow: MachineCreateFollow, input: MachineCreateUnconfirmedInput): CunaError {
+  const { receipt, machine, reason } = input;
   const name = follow.input.name;
+  const seconds = Math.round(input.elapsedMs / 1_000);
+  const machineId = machine?.id ??
+    (receipt !== undefined && (receipt.state === "settled" || receipt.state === "provider_succeeded")
+      ? receipt.machineId
+      : undefined);
+  const notCompleted = input.cause instanceof CredentialBoundaryError
+    ? "renewing this session did not complete"
+    : "a request to Cuna did not complete";
+  const lastReported = machine === undefined ? "" : ` Cuna last reported it ${machine.state}.`;
+  const message = machineId !== undefined
+    ? reason !== undefined
+      ? `Machine ${name} (${machineId}) was created; the CLI was waiting for ${input.waitingFor} when ${notCompleted}.${lastReported}`
+      : `Machine ${name} (${machineId}) was created, but the CLI stopped waiting for ${input.waitingFor} after ${seconds} s.${lastReported}`
+    : reason !== undefined
+      ? `Cuna has not confirmed machine ${name}; the CLI was waiting for ${input.waitingFor} when ${notCompleted}.`
+      : `Cuna has not confirmed machine ${name} after ${seconds} s; the CLI stopped waiting for ${input.waitingFor}. It may still be creating.`;
   return new CunaError({
     code: "cuna.machine.create_unconfirmed",
-    message: machine !== undefined
-      ? `Machine ${name} exists but was not running after ${Math.round(elapsedMs / 1_000)} s.`
-      : `Cuna has not confirmed machine ${name} after ${Math.round(elapsedMs / 1_000)} s. It may still be creating.`,
+    message,
     exitCode: EXIT_CODES.network,
-    hint: `Check with \`cuna machines list\` before creating another. To keep following this same create, run it again with \`--idempotency-key ${follow.key}\`: that reads its receipt first and does not start a second one.`,
-    retryable: true,
+    hint: machineId !== undefined
+      ? `Do not create it again. Run \`cuna machines list\` to see Machine ${machineId} and its state.`
+      : `Check with \`cuna machines list\` before creating another. To keep following this same create, run it again with \`--idempotency-key ${follow.key}\`: that reads its receipt first and does not start a second one.`,
+    retryable: machineId === undefined,
     details: {
       ...machineCreateDetails(follow, receipt, machine),
+      waiting_for: input.waitingFor,
       deadline_ms: MACHINE_CREATE_FOLLOW_DEADLINE_MS,
-      elapsed_ms: elapsedMs,
+      elapsed_ms: input.elapsedMs,
       settle_with: "cuna machines list",
-      remote_outcome: receipt === undefined ? "unobserved" : "unsettled",
+      remote_outcome: machineId !== undefined ? "committed" : receipt === undefined ? "unobserved" : "unsettled",
+      ...(reason === undefined ? {} : { reason }),
     },
+    ...(input.cause === undefined ? {} : { cause: input.cause }),
   });
 }
 
-function machineRecord(machine: Machine): Readonly<Record<string, unknown>> {
+/**
+ * `actionable` is this CLI's verdict on the declared provider, and a provider
+ * is something to act on only while its Machine runs. It read `true` on a
+ * stopped Machine whose start the server refused 8 s later (BL-1, 2026-10-02),
+ * because nothing here can know whether a Machine starts: that is the server's
+ * `machines.start`, asked when a start is asked for. Off a running Machine the
+ * verdict is `false` and says why; the declaration (`usability`) is unchanged.
+ */
+function providerRecordOn(machine: Machine): MachineProviderAvailability {
   const provider = machineProviderAvailability(machine);
+  if (machine.state === "running" || !provider.actionable) return provider;
+  return Object.freeze({ ...provider, actionable: false, reasonCode: "machine_not_running" as const });
+}
+
+/** The provider verdict a person reads beside a Machine, only while it runs (E13-R4). */
+function providerColumn(machine: Machine): string {
+  const provider = machineProviderAvailability(machine);
+  return machine.state === "running"
+    ? `${provider.displayName} ${providerVerdict(provider)}`
+    : provider.displayName;
+}
+
+function machineRecord(machine: Machine): Readonly<Record<string, unknown>> {
+  const provider = providerRecordOn(machine);
   return Object.freeze({
     id: machine.id,
     name: machine.name,
@@ -704,6 +940,21 @@ function agentSessionRecord(session: AgentSession, machine?: Machine, now?: numb
     ...(session.terminationRequestedAt === undefined
       ? {}
       : { termination_requested_at: session.terminationRequestedAt }),
+    // Present only when the read asked for them and the server answered.
+    ...(session.readiness === undefined ? {} : {
+      readiness_outcome: session.readiness.outcome,
+      readiness_deadline_at: session.readiness.deadlineAt,
+      ...(session.readiness.reason === undefined ? {} : { readiness_reason: session.readiness.reason }),
+      ...(session.readiness.settledAt === undefined ? {} : { readiness_settled_at: session.readiness.settledAt }),
+    }),
+    ...(session.runtimeEvidence === undefined ? {} : {
+      runtime_evidence: Object.freeze({
+        source: session.runtimeEvidence.source,
+        observed_at: session.runtimeEvidence.observedAt,
+        age_seconds: session.runtimeEvidence.ageSeconds,
+        process_proof: session.runtimeEvidence.processProof,
+      }),
+    }),
     row_version: session.rowVersion,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
@@ -811,6 +1062,23 @@ async function supervisorReplaceRefusal(client: CunaApiClient, machine: Machine,
         message: `Cuna could not verify the stopped-machine update for ${machine.name}. Nothing was started.`,
         hint: `Run ${again} again; do not start the Machine in between.`,
       });
+    case "supervisor_upgrade_provider_boot_failed": {
+      // Decided, not unobserved: after the update's start the provider itself
+      // reported the runtime in error with its own target still running (infra
+      // 5f81d6f). Nothing was installed and control is unchanged. The update is
+      // refused until the runtime is stopped, so the next step is a stop. The
+      // provider's code and a claim the Edge could not release are named only
+      // in the server's detail.
+      const detail = error.hint ?? "";
+      const providerCode = /\(provider status error, ([A-Za-z0-9][A-Za-z0-9_.:-]{0,63})\)/u.exec(detail)?.[1];
+      const claimHeld = detail.includes("could not release this update's claim");
+      return refusal({
+        message: `${machine.name}'s runtime failed to boot when the update started it (provider status error${providerCode === undefined ? "" : `, ${providerCode}`}). Nothing was installed and its control is unchanged.`,
+        hint: `Stop it with \`cuna machines stop ${id} --yes\`, wait until \`cuna machines list\` says stopped, then run ${again}.` +
+          (claimHeld ? " Cuna could not release this update's claim, so the new update can start only after ten minutes." : ""),
+        ...(providerCode === undefined ? {} : { details: { provider_error_code: providerCode } }),
+      });
+    }
     case "supervisor_upgrade_publish_pending":
     case "supervisor_upgrade_v2_not_observed":
       // The update may already have started the Machine: an uncertain
@@ -915,12 +1183,11 @@ function renderMachineOverview(
       readonly codex: { readonly running: number; readonly total: number };
       readonly opencode: { readonly running: number; readonly total: number };
     };
-    const provider = machineProviderAvailability(machine);
     const claude = `Claude ${counts.claude.running}/${counts.claude.total} running`;
     const codex = `Codex ${counts.codex.running}/${counts.codex.total} running`;
     const opencode = `OpenCode ${counts.opencode.running}/${counts.opencode.total} running`;
     const providerCounts = `${opencode} · ${claude} · ${codex}`;
-    const header = `▾ ${machine.name}  ${machine.state}  ${provider.displayName} ${providerVerdict(provider)}  ${providerCounts}`;
+    const header = `▾ ${machine.name}  ${machine.state}  ${providerColumn(machine)}  ${providerCounts}`;
     if (sessionsError !== undefined) return [header, `  └─ AgentSessions unavailable (${sessionsError})`];
     if (sessions.length === 0) return [header, "  └─ No AgentSessions"];
     return [
@@ -957,8 +1224,9 @@ function capabilityRecord(snapshot: CapabilitySnapshot): Readonly<Record<string,
 export function preflightInvocation(
   parsed: ParsedInvocation,
   now: number = Date.now(),
+  contractOperations?: ReadonlySet<string>,
 ): void {
-  assertRegisteredCliRoute(parsed);
+  assertRouteServedByContract(assertRegisteredCliRoute(parsed), contractOperations);
   switch (parsed.command) {
     case "config":
       rejectUnknownOptions(parsed, []);
@@ -1095,8 +1363,19 @@ export function preflightInvocation(
       preflightAgentJourneyInvocation(parsed);
       return;
     }
-    case "shell":
     case "sync":
+      if (parsed.operands[0] === "recover") {
+        // Refused here, before configuration, credentials or any request: a
+        // script that forgot --yes learns it without touching the folder.
+        rejectUnknownOptions(parsed, ["yes"]);
+        if (parsed.operands.length > 2) throw usageError("sync recover accepts at most one PATH.");
+        requireConfirmation(parsed, "sync.recover");
+        return;
+      }
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands in this build.`);
+      return;
+    case "shell":
     case "companion":
       rejectUnknownOptions(parsed, []);
       if (parsed.operands.length !== 0) throw usageError(`${parsed.command} accepts no operands in this build.`);
@@ -1318,7 +1597,7 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
     return;
   }
   if (action === "terminate" || action === "rename") {
-    rejectUnknownOptions(parsed, action === "rename" ? ["name", "yes"] : ["yes"]);
+    rejectUnknownOptions(parsed, action === "rename" ? ["name", "yes"] : ["yes", "no-wait"]);
     if (parsed.operands.length !== 2) throw usageError(`agent-sessions ${action} requires exactly one AgentSession ID.`);
     requireConfirmation(parsed, `agent-sessions.${action}`);
     assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
@@ -1366,10 +1645,14 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
       return Object.freeze({
         command: "capabilities",
         data,
+        // The server's reason for a refused action is printed beside it; it
+        // reached `--json` alone, so a person saw "temporarily_unavailable"
+        // and never why (PRD AC1).
         human: snapshot.capabilities.length === 0
           ? "No capabilities were advertised for this context."
           : snapshot.capabilities
-              .map((capability) => `${capability.id}\t${capability.availability}\t${capability.interaction}`)
+              .map((capability) => [capability.id, capability.availability, capability.interaction,
+                ...(capability.reasonCode === undefined ? [] : [capability.reasonCode])].join("\t"))
               .join("\n"),
       });
     }
@@ -1385,12 +1668,17 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         allowedInteractions: ["read_only"],
       });
       const records = await client.listRecords();
+      // Every row of `/v1/records` names a Machine, so that is the resource
+      // whatever its kind's prefix says. `kind` and `summary` stay in JSON as
+      // the server stored them; the person reads `label`.
+      const labelled = records.map((record) => Object.freeze({ record, label: recordLabel(record.kind, "machine") }));
       const data = Object.freeze({
-        items: records.map((record) => Object.freeze({
+        items: labelled.map(({ record, label }) => Object.freeze({
           id: record.id,
           machine_id: record.machineId,
           kind: record.kind,
           summary: record.summary,
+          label,
           detail: record.detail,
           created_at: record.createdAt,
         })),
@@ -1400,7 +1688,7 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
         data,
         human: records.length === 0
           ? "No records found."
-          : records.map((record) => `${record.createdAt}\t${record.machineId}\t${record.kind}\t${record.summary}`).join("\n"),
+          : labelled.map(({ record, label }) => `${record.createdAt}\t${record.machineId}\t${label}`).join("\n"),
       });
     }
     case "authorizations": {
@@ -1769,6 +2057,9 @@ export async function executeCommand(context: CommandContext): Promise<CommandRe
     case "shell":
       throw unsupportedError("terminal workspace", "terminal_runtime_unavailable");
     case "sync":
+      // `sync recover` is composed by runCli, which owns the folder, the state
+      // directory and the authenticated sync transport; bare `sync` is reserved.
+      if (parsed.operands[0] === "recover") throw unsupportedError("workspace sync recovery", "run_cli_composition_required");
       throw unsupportedError("workspace synchronization", "workspace_sync_runtime_unavailable");
     case "companion":
       throw unsupportedError("local companion", "local_companion_unavailable");
@@ -2281,8 +2572,10 @@ async function executeLiveUpdateSupervisor(context: CommandContext): Promise<Com
       if (reading.state === "outstanding" && reading.note.operationId === operationId) {
         await notes.settle(id, operationId);
       }
+      // Named for the command that ran, as its errors are; `resumed: false`
+      // is what says it answered with a read.
       return Object.freeze({
-        command: "machines.live-update-status",
+        command: "machines.live-update-supervisor",
         data: Object.freeze({
           ...report.data,
           operation_id_source: named === undefined ? "local_record" : "named",
@@ -2870,10 +3163,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
       human: [
         ...(items.length === 0
           ? ["No machines found."]
-          : page.items.map((machine) => {
-              const provider = machineProviderAvailability(machine);
-              return `${machine.id}\t${machine.name}\t${machine.state}\t${provider.displayName} ${providerVerdict(provider)}`;
-            })),
+          : page.items.map((machine) => `${machine.id}\t${machine.name}\t${machine.state}\t${providerColumn(machine)}`)),
         ...(page.nextCursor === undefined
           ? []
           : ["-- truncated; more machines exist beyond this page"]),
@@ -2908,8 +3198,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     const requestId = await machineCreateRequestId(context, key);
     const poller = context.convergencePoller ?? productionConvergencePoller();
     const startedAt = poller.now();
-    const follow = (posted: boolean): Promise<Machine> =>
-      followMachineCreate(context, { requestId, key, input, startedAt, posted });
+    const follow = (posted: boolean): MachineCreateFollow => ({ requestId, key, input, startedAt, posted });
     let known = false;
     if (stringOption(parsed, "idempotency-key") !== undefined) {
       try {
@@ -2919,20 +3208,30 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
         if (!(error instanceof CunaError && error.details?.http_status === 404)) throw error;
       }
     }
+    // `machine` is what the create named; `observed` is a read made after it.
+    // A follow's own Machine read is that read, so nothing is read after the
+    // one that shows the Machine running: a further read can only fail (BL-6:
+    // a renewal failure was the whole answer for a Machine Cuna had started).
     let machine: Machine;
+    let observed: Machine;
     if (known) {
       // This key already named a create. Follow it; its receipt alone decides
       // whether the POST is ever sent again (`retry_create`).
-      machine = await follow(false);
+      machine = observed = await followMachineCreate(context, follow(false));
     } else {
+      let answered: Machine | undefined;
       try {
-        machine = await client.createMachine(input, key, requestId);
+        answered = await client.createMachine(input, key, requestId);
       } catch (error) {
         if (!machineCreateOutcomeUnobserved(error)) throw error;
-        machine = await follow(true);
+      }
+      if (answered === undefined) {
+        machine = observed = await followMachineCreate(context, follow(true));
+      } else {
+        machine = answered;
+        observed = await readCreatedMachine(context, follow(true), answered);
       }
     }
-    const observed = await client.getMachine(machine.id);
     if (
       observed.id !== machine.id || observed.name !== name ||
       (agent !== undefined && observed.agent !== agent) ||
@@ -3011,11 +3310,16 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     if (parsed.operands.length !== 2) throw usageError(`machines ${action} requires exactly one machine ID.`);
     requireConfirmation(parsed, `machines.${action}`);
     const id = assertMachineId(requireOperand(parsed.operands, 1, "machine ID"));
-    // The public capability registry deliberately groups the four reversible
-    // lifecycle transitions under one semantic authority. The operation path
-    // still binds the exact action; discovery must not invent per-action IDs
-    // that the producer never advertises.
-    await requireCapability({ client, scope: "machine", resourceId: id, capabilityId: "machines.lifecycle", now: context.capabilityClock ?? now });
+    // The grouped `machines.lifecycle` authority still decides; the Edge's
+    // per-action `machines.<action>`, when it names one, can only narrow it,
+    // with the Machine's current state. An Edge that names none leaves the
+    // grouped answer alone.
+    const admitted = await requireMachineAction({ client, machineId: id, action, now: context.capabilityClock ?? now });
+    if (admitted.sentDespite !== undefined) {
+      context.reportNotice?.(
+        `The provider refused this Machine's last ${action} (${admitted.sentDespite}); sending this one, since only the provider can tell whether that changed.`,
+      );
+    }
     const expectedState = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
     // Read the state first so the result can say whether anything moved. The
     // transition is still requested either way: this side's idea of the state
@@ -3238,8 +3542,13 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     rejectUnknownOptions(parsed, []);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions get requires exactly one AgentSession ID.");
     const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
-    const session = await client.getAgentSession(id);
-    return Object.freeze({ command: "agent-sessions.get", data: agentSessionRecord(session), human: `${session.id}\t${session.name}\t${session.agent}\t${agentSessionStateLabel(session)}\t${session.cwd}` });
+    // This is the command every startup failure names as its next step, so it
+    // shows the server's startup verdict and supervisor evidence when served.
+    const session = await client.getAgentSession(id, undefined, { readiness: true, runtimeEvidence: true });
+    const startup = session.readiness?.reason === undefined
+      ? ""
+      : `\tstartup ${session.readiness.outcome} (${session.readiness.reason})`;
+    return Object.freeze({ command: "agent-sessions.get", data: agentSessionRecord(session), human: `${session.id}\t${session.name}\t${session.agent}\t${agentSessionStateLabel(session)}\t${session.cwd}${startup}` });
   }
   if (action === "create") {
     rejectUnknownOptions(parsed, [
@@ -3386,17 +3695,33 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
     return Object.freeze({ command: "agent-sessions.create", data: agentSessionRecord(observed), human: `Created ${observed.agent} AgentSession ${observed.id}.` });
   }
   if (action === "terminate") {
-    rejectUnknownOptions(parsed, ["yes"]);
+    rejectUnknownOptions(parsed, ["yes", "no-wait"]);
     if (parsed.operands.length !== 2) throw usageError("agent-sessions terminate requires exactly one AgentSession ID.");
     requireConfirmation(parsed, "agent-sessions.terminate");
     const id = assertCanonicalUuid(requireOperand(parsed.operands, 1, "AgentSession ID"), "AgentSession ID");
+    const wait = !booleanOption(parsed, "no-wait");
     await requireCapability({ client, scope: "agent_session", resourceId: id, capabilityId: "agent_sessions.terminate", now: context.capabilityClock ?? now });
-    await client.terminateAgentSession(id);
+    const accepted = await client.terminateAgentSession(id);
+    // The acceptance is the server's answer to this command, so it is said
+    // the moment it arrives; the settlement below is a second, slower fact.
+    const acceptedRecord = agentSessionRecord(accepted);
+    const acceptedLine = `Termination requested for AgentSession ${accepted.id}${accepted.terminationRequestedAt === undefined ? "" : ` at ${accepted.terminationRequestedAt}`}.`;
+    if (!wait) {
+      return Object.freeze({ command: "agent-sessions.terminate", data: acceptedRecord, human: acceptedLine });
+    }
+    context.reportAccepted?.("agent-sessions.terminate", acceptedRecord, acceptedLine);
     const observed = await convergeOnRemoteState(context, {
       operation: "AgentSession termination",
       settleWith: `cuna agent-sessions get ${id}`,
+      describeWait: (session) => {
+        const cause = supervisorWaitCause(session);
+        return Object.freeze({
+          waitingFor: "the machine's supervisor to end the session process",
+          ...(cause === undefined ? {} : { cause }),
+        });
+      },
       probe: async () => {
-        const session = await client.getAgentSession(id);
+        const session = await client.getAgentSession(id, undefined, { runtimeEvidence: true });
         return Object.freeze({
           settled: session.id === id && agentSessionTerminationConfirmed(session),
           observation: session,
@@ -3405,6 +3730,7 @@ async function executeAgentSessions(context: CommandContext): Promise<CommandRes
             observed_desired_state: session.desiredState,
             observed_request_state: session.requestState,
             observed_process_state: session.processState,
+            ...(supervisorWaitCause(session) === undefined ? {} : { wait_cause: supervisorWaitCause(session) as string }),
           }),
         });
       },

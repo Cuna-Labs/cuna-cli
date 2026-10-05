@@ -300,6 +300,11 @@ export class ProviderBrowserActionDetector {
     this.#options = Object.freeze({ ...options, ttlMs });
   }
 
+  /** The exact URLs recent OSC 8 hyperlinks named, newest last. */
+  get hyperlinkTargets(): readonly string[] {
+    return Object.freeze([...this.#hyperlinkTargets]);
+  }
+
   push(bytes: Uint8Array): readonly LocalBrowserActionRequest[] {
     if (bytes.byteLength === 0) return Object.freeze([]);
     this.#buffer += this.#decoder.decode(bytes, { stream: true });

@@ -15,8 +15,12 @@ export interface AcceptedProviderCallback {
   readonly error?: string;
 }
 
+/** What the Machine said once the callback reached it. */
+export type CallbackRelayAnswer = "delivered" | "refused" | "no_answer";
+
 export interface CallbackRelayReceipt {
   readonly outcome: "relayed";
+  readonly answer: CallbackRelayAnswer;
   readonly acceptedAt: number;
 }
 
@@ -43,7 +47,8 @@ export interface CallbackRelayOptions {
   readonly deadlineMs: number;
   readonly maxAttempts: number;
   readonly maxConnections: number;
-  readonly relay: (callback: AcceptedProviderCallback, signal: AbortSignal) => Promise<void>;
+  /** Hands the callback to the Machine; the browser is answered with what it said. */
+  readonly relay: (callback: AcceptedProviderCallback, signal: AbortSignal) => Promise<CallbackRelayAnswer>;
   readonly signal?: AbortSignal;
   readonly now?: () => number;
   readonly serverFactory?: CallbackRelayServerFactory;
@@ -101,12 +106,20 @@ export async function startCallbackRelay(options: CallbackRelayOptions): Promise
 
     // The one-shot authority is consumed synchronously, before the first await.
     // This prevents two requests in the same event-loop turn from both relaying.
+    // The browser is answered only with what the Machine said: "received"
+    // before that would claim a sign-in nobody has seen arrive.
     consumed = true;
-    fixedResponse(response, 202, "Callback received. You can return to Cuna.");
     server.close();
+    // Cleanup closes every connection, so it waits for the page to be sent.
     void options.relay(admitted, controller.signal).then(
-      () => succeed(),
-      () => fail("relay_failed", "The provider callback could not be relayed."),
+      async (answer) => {
+        await answerBrowser(response, options.provider, answer);
+        succeed(answer);
+      },
+      async () => {
+        await answerBrowser(response, options.provider, "no_answer");
+        await fail("relay_failed", "The provider callback could not be relayed.");
+      },
     );
   });
   server.on("connection", (socket) => {
@@ -135,11 +148,11 @@ export async function startCallbackRelay(options: CallbackRelayOptions): Promise
     rejectCompletion(new CallbackRelayError(code, message));
   }
 
-  function succeed(): void {
+  function succeed(answer: CallbackRelayAnswer): void {
     if (settled) return;
     settled = true;
     const acceptedAt = now();
-    void cleanup().then(() => resolveCompletion(Object.freeze({ outcome: "relayed", acceptedAt })));
+    void cleanup().then(() => resolveCompletion(Object.freeze({ outcome: "relayed", answer, acceptedAt })));
   }
 
   try {
@@ -158,7 +171,8 @@ export async function startCallbackRelay(options: CallbackRelayOptions): Promise
     throw new CallbackRelayError(isAborted(options.signal) ? "cancelled" : "expired", "Callback relay authority ended while binding.");
   }
   deadlineTimer = setTimeout(() => {
-    void fail("expired", "Callback relay deadline elapsed.");
+    // A callback already on its way to the Machine is bounded by its relay.
+    if (!consumed) void fail("expired", "Callback relay deadline elapsed.");
   }, Math.max(1, options.deadlineMs - now()));
   deadlineTimer.unref();
   options.signal?.addEventListener("abort", abortListener, { once: true });
@@ -262,13 +276,30 @@ function strictPercentEncoding(value: string): boolean {
   return true;
 }
 
+/**
+ * The provider's redirect names `localhost` (Codex: http://localhost:1455/…),
+ * so a browser sends `Host: localhost:<port>`; the literal address is the
+ * other form a loopback request can carry.
+ */
 function exactHostHeader(request: IncomingMessage, host: LoopbackHost, port: number): boolean {
   let hostCount = 0;
   for (let index = 0; index < request.rawHeaders.length; index += 2) {
     if (request.rawHeaders[index]?.toLowerCase() === "host") hostCount += 1;
   }
-  const expected = `${host === "::1" ? "[::1]" : host}:${port}`;
-  return hostCount === 1 && request.headers.host === expected;
+  const expected = [`${host === "::1" ? "[::1]" : host}:${port}`, `localhost:${port}`];
+  return hostCount === 1 && expected.includes(request.headers.host ?? "");
+}
+
+function answerBrowser(response: ServerResponse, provider: CallbackRelayProvider, answer: CallbackRelayAnswer): Promise<void> {
+  const name = provider === "codex" ? "Codex" : "OpenCode";
+  const sent = new Promise<void>((resolve) => {
+    response.once("finish", () => resolve());
+    response.once("close", () => resolve());
+  });
+  if (answer === "delivered") fixedResponse(response, 200, `Sent to ${name} on your Machine. You can close this tab and return to the terminal.`);
+  else if (answer === "refused") fixedResponse(response, 502, `${name} on your Machine refused this sign-in. Return to the terminal and start the sign-in again.`);
+  else fixedResponse(response, 504, "Your Machine did not answer this sign-in in time. Return to the terminal and start the sign-in again.");
+  return sent;
 }
 
 function sameBoundLoopback(actual: string | undefined, expected: LoopbackHost): boolean {

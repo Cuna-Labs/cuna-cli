@@ -7,11 +7,17 @@ import type { HttpTransport } from "../api/http.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { assertCanonicalUuid } from "../core/validation.js";
 import { compileExclusionPolicy, type ExclusionPolicy, type ExclusionRuleSource } from "../workspace/exclusion.js";
-import { createWorkspaceManifest, type ManifestLimits, type WorkspaceManifest } from "../workspace/manifest.js";
+import {
+  createWorkspaceManifest,
+  withCarriedEntries,
+  type ManifestLimits,
+  type WorkspaceManifest,
+} from "../workspace/manifest.js";
 import type { FilesystemCapabilities } from "../workspace/paths.js";
 import { createWorkspaceSyncClient } from "./workspace-sync-client.js";
 import {
   ContinuousWorkspaceSyncSupervisor,
+  carriedManifestEntry,
   type ContinuousSyncAuthority,
   type ContinuousSyncConflict,
   type ContinuousSyncDurableBase,
@@ -20,8 +26,9 @@ import {
   FileWorkspaceSyncCheckpointStore,
   WorkspaceSyncCoordinator,
   createFilesystemChunkSource,
+  type WorkspaceChunkSource,
 } from "./workspace-sync-coordinator.js";
-import { WORKSPACE_SYNC_PROTOCOL } from "./workspace-sync-protocol.js";
+import { WORKSPACE_SYNC_PROTOCOL, type WorkspaceSyncManifestEntry } from "./workspace-sync-protocol.js";
 
 const MAX_POLICY_BYTES = 1_048_576;
 
@@ -94,7 +101,13 @@ export interface LocalWorkspaceBaseInput {
  */
 export interface LocalWorkspaceBase {
   readonly generation: number;
-  readonly resumable?: { readonly stateGeneration: number; readonly syncId: string };
+  readonly resumable?: {
+    readonly stateGeneration: number;
+    readonly syncId: string;
+    /** Where that state's last run left the loop, and why (`ContinuousSyncDurableBase`). */
+    readonly status: ContinuousSyncDurableBase["status"];
+    readonly reason: string | null;
+  };
 }
 
 export interface WorkspaceSyncPolicyInspection {
@@ -116,6 +129,19 @@ export async function computeWorkspaceManifestRoot(input: {
   readonly manifestLimits?: SynchronizeLocalWorkspaceInput["manifestLimits"];
   readonly allowSafeRelativeSymlinks?: boolean;
   readonly signal?: AbortSignal;
+  /**
+   * The generation the root is compared with, when this installation may hold
+   * a sync state for it. Its carried entries (paths this folder excludes that
+   * the Machine committed) belong to that generation's root, so a folder that
+   * reproduces the generation must be measured with them.
+   */
+  readonly comparedWith?: {
+    readonly workspaceId: string;
+    readonly workspaceBindingId: string;
+    readonly machineId: string;
+    readonly checkpointRoot: string;
+    readonly generation: number;
+  };
 }): Promise<string> {
   input.signal?.throwIfAborted();
   const root = await canonicalWorkspaceRoot(input.localRoot);
@@ -133,7 +159,30 @@ export async function computeWorkspaceManifestRoot(input: {
       ? {}
       : { allowSafeRelativeSymlinks: input.allowSafeRelativeSymlinks }),
   });
-  return manifest.manifestRoot;
+  if (input.comparedWith === undefined) return manifest.manifestRoot;
+  const compared = input.comparedWith;
+  let checkpointRoot: string;
+  try {
+    checkpointRoot = await canonicalCheckpointRoot(compared.checkpointRoot, root);
+  } catch (error) {
+    // Entries are only ever carried by a state in a checkpoint root every sync
+    // path admits. A root that is absent, or that no sync path admits, holds
+    // none, and measuring must not fail where it used to succeed.
+    if (error instanceof CunaError) return manifest.manifestRoot;
+    throw error;
+  }
+  const carried = await carriedEntriesAt({
+    root,
+    checkpointRoot,
+    identity: {
+      workspaceId: assertCanonicalUuid(compared.workspaceId, "workspace ID"),
+      workspaceBindingId: assertCanonicalUuid(compared.workspaceBindingId, "workspace binding ID"),
+      machineId: assertCanonicalUuid(compared.machineId, "machine ID"),
+    },
+    policyDigest: policy.digest,
+    generation: compared.generation,
+  });
+  return withCarriedEntries(manifest, carried.entries.map(carriedManifestEntry)).manifestRoot;
 }
 
 /** Safe policy-only preflight used to bind the exact policy before transfer. */
@@ -178,7 +227,7 @@ export async function synchronizeLocalWorkspace(
       await readProjectExclusionPolicy(root),
       input.filesystemCapabilities,
     );
-    const manifest = await createWorkspaceManifest({
+    const local = await createWorkspaceManifest({
       root,
       policy,
       capabilities: input.filesystemCapabilities,
@@ -187,11 +236,23 @@ export async function synchronizeLocalWorkspace(
         ? {}
         : { allowSafeRelativeSymlinks: input.allowSafeRelativeSymlinks }),
     });
+    // A commit on a generation that carries paths this folder excludes keeps
+    // them; leaving them out would tell the Machine to delete files only it
+    // holds (see `withCarriedEntries`).
+    const carried = await carriedEntriesAt({
+      root, checkpointRoot, identity: { workspaceId, workspaceBindingId, machineId },
+      policyDigest: policy.digest, generation: input.baseGeneration,
+    });
+    const manifest = withCarriedEntries(local, carried.entries.map(carriedManifestEntry));
+    const client = createWorkspaceSyncClient(input.transport);
     const checkpointStore = new FileWorkspaceSyncCheckpointStore(checkpointDirectory);
     const coordinator = new WorkspaceSyncCoordinator({
-      client: createWorkspaceSyncClient(input.transport),
+      client,
       checkpointStore,
-      chunkSource: await createFilesystemChunkSource(root, manifest),
+      chunkSource: await commitChunkSource({
+        root, manifest, carried: carried.entries, client, ...(carried.syncId === undefined ? {} : { syncId: carried.syncId }),
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+      }),
       ...(input.maximumConcurrentUploads === undefined
         ? {}
         : { maximumConcurrentUploads: input.maximumConcurrentUploads }),
@@ -257,8 +318,14 @@ export async function startContinuousWorkspaceSync(
       ? {}
       : { allowSafeRelativeSymlinks: input.allowSafeRelativeSymlinks }),
   });
+  // The commit this start follows carried what its base carried.
+  const carried = await carriedEntriesAt({
+    root, checkpointRoot, identity: { workspaceId, workspaceBindingId, machineId },
+    policyDigest: policy.digest, generation: input.baseGeneration,
+  });
+  const committedView = withCarriedEntries(initialManifest, carried.entries.map(carriedManifestEntry));
   if (
-    initialManifest.manifestRoot !== input.initialReceipt.manifest_root ||
+    committedView.manifestRoot !== input.initialReceipt.manifest_root ||
     initialManifest.policyDigest !== input.initialReceipt.exclusion_policy_digest ||
     input.initialReceipt.generation < 1
   ) {
@@ -298,6 +365,7 @@ export async function startContinuousWorkspaceSync(
     checkpointRoot,
     policy,
     initialManifest,
+    initialRemoteOnly: carried.entries,
     proven: {
       syncId: initialCheckpoint.sync_id,
       generation: input.initialReceipt.generation,
@@ -328,7 +396,12 @@ export async function readLocalWorkspaceBase(input: LocalWorkspaceBaseInput): Pr
   if (newest !== undefined && newest.base.generation >= (committed ?? 0)) {
     return Object.freeze({
       generation: newest.base.generation,
-      resumable: Object.freeze({ stateGeneration: newest.stateGeneration, syncId: newest.base.syncId }),
+      resumable: Object.freeze({
+        stateGeneration: newest.stateGeneration,
+        syncId: newest.base.syncId,
+        status: newest.base.status,
+        reason: newest.base.reason,
+      }),
     });
   }
   return committed === undefined ? undefined : Object.freeze({ generation: committed });
@@ -348,8 +421,14 @@ export async function readLocalWorkspaceBase(input: LocalWorkspaceBaseInput): Pr
  */
 export async function resumeContinuousWorkspaceSyncFromLocalBase(
   input: Omit<SynchronizeLocalWorkspaceInput, "baseGeneration"> & {
-    readonly base: NonNullable<LocalWorkspaceBase["resumable"]>;
+    readonly base: Pick<NonNullable<LocalWorkspaceBase["resumable"]>, "stateGeneration" | "syncId">;
     readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
+    /**
+     * `cuna sync recover`: take up the stop the durable state carries. See
+     * `recoverStop` on the supervisor input; only the person's explicit
+     * command sets it, never a re-attach.
+     */
+    readonly recoverStop?: boolean;
   },
 ): Promise<ContinuousWorkspaceSyncSupervisor> {
   validateAuthority(input);
@@ -380,7 +459,54 @@ export async function resumeContinuousWorkspaceSyncFromLocalBase(
     proven: { syncId: input.base.syncId, generation: input.base.stateGeneration, manifestRoot: current.manifestRoot },
     transfer: input,
     requireDurableState: true,
+    ...(input.recoverStop === true ? { recoverStop: true } : {}),
     ...(input.onConflict === undefined ? {} : { onConflict: input.onConflict }),
+  });
+}
+
+/**
+ * The entries of `generation` this folder does not hold, from a durable sync
+ * state that adopted it, with that state's read handle. None when no state of
+ * this installation holds that generation: then nothing was carried.
+ */
+async function carriedEntriesAt(input: {
+  readonly root: string;
+  readonly checkpointRoot: string;
+  readonly identity: { readonly workspaceId: string; readonly workspaceBindingId: string; readonly machineId: string };
+  readonly policyDigest: string;
+  readonly generation: number;
+}): Promise<{ readonly entries: readonly WorkspaceSyncManifestEntry[]; readonly syncId?: string }> {
+  const found = (await findDurableBases(input)).find((candidate) => candidate.base.generation === input.generation);
+  return found === undefined
+    ? Object.freeze({ entries: Object.freeze([]) })
+    : Object.freeze({ entries: found.base.remoteOnly, syncId: found.base.syncId });
+}
+
+/**
+ * Chunks for a commit: the folder's own bytes from the folder, and a carried
+ * entry's bytes, which the folder never held, read back from the server
+ * through a handle that reads the generation carrying them. The server
+ * normally reports those as already stored; this only matters when it does not.
+ */
+async function commitChunkSource(input: {
+  readonly root: string;
+  readonly manifest: WorkspaceManifest;
+  readonly carried: readonly WorkspaceSyncManifestEntry[];
+  readonly client: ReturnType<typeof createWorkspaceSyncClient>;
+  readonly syncId?: string;
+  readonly signal?: AbortSignal;
+}): Promise<WorkspaceChunkSource> {
+  if (input.carried.length === 0) return createFilesystemChunkSource(input.root, input.manifest);
+  const carriedPaths = new Set(input.carried.map((entry) => entry.path));
+  const local = Object.freeze({ ...input.manifest, entries: input.manifest.entries.filter((entry) => !carriedPaths.has(entry.path)) });
+  const files = await createFilesystemChunkSource(input.root, local);
+  const held = new Set(local.entries.flatMap((entry) => (entry.chunks ?? []).map((chunk) => chunk.digest)));
+  return Object.freeze({
+    async read(digest: string, expectedLength: number): Promise<Uint8Array> {
+      if (held.has(digest) || input.syncId === undefined) return files.read(digest, expectedLength);
+      const response = await input.client.downloadChunk(input.syncId, digest, WORKSPACE_SYNC_PROTOCOL.maximum, input.signal);
+      return Buffer.from(response.data.content_base64, "base64");
+    },
   });
 }
 
@@ -515,7 +641,11 @@ export async function resumeContinuousWorkspaceSync(
       ? {}
       : { allowSafeRelativeSymlinks: input.allowSafeRelativeSymlinks }),
   });
-  if (initialManifest.manifestRoot !== input.activeManifestRoot) {
+  const carried = await carriedEntriesAt({
+    root, checkpointRoot, identity: { workspaceId, workspaceBindingId, machineId },
+    policyDigest: policy.digest, generation: input.activeGeneration,
+  });
+  if (withCarriedEntries(initialManifest, carried.entries.map(carriedManifestEntry)).manifestRoot !== input.activeManifestRoot) {
     throw resumeUnavailable("resume_manifest_unproven");
   }
   const session = await findDurableSyncSession({
@@ -533,6 +663,7 @@ export async function resumeContinuousWorkspaceSync(
     checkpointRoot,
     policy,
     initialManifest,
+    initialRemoteOnly: carried.entries,
     proven: {
       syncId: session,
       generation: input.activeGeneration,
@@ -612,6 +743,7 @@ async function startProvenContinuousSupervisor(input: {
   readonly checkpointRoot: string;
   readonly policy: ExclusionPolicy;
   readonly initialManifest: WorkspaceManifest;
+  readonly initialRemoteOnly?: readonly WorkspaceSyncManifestEntry[];
   readonly proven: {
     readonly syncId: string;
     readonly generation: number;
@@ -622,6 +754,7 @@ async function startProvenContinuousSupervisor(input: {
     "transport" | "filesystemCapabilities" | "maximumConcurrentUploads" | "maximumAttempts"
   >;
   readonly requireDurableState?: boolean;
+  readonly recoverStop?: boolean;
   readonly priorBase?: ContinuousSyncDurableBase;
   readonly onConflict?: (conflict: ContinuousSyncConflict) => void;
 }): Promise<ContinuousWorkspaceSyncSupervisor> {
@@ -629,7 +762,7 @@ async function startProvenContinuousSupervisor(input: {
   const { root, checkpointRoot, policy } = input;
   const client = createWorkspaceSyncClient(input.transfer.transport);
   const authority: ContinuousSyncAuthority = {
-    async commitLocalSnapshot({ baseGeneration, manifest, signal }) {
+    async commitLocalSnapshot({ baseGeneration, manifest, carried, syncId, signal }) {
       const directory = join(checkpointRoot, checkpointIntentDigest(
         workspaceId, workspaceBindingId, machineId, baseGeneration,
       ));
@@ -638,7 +771,7 @@ async function startProvenContinuousSupervisor(input: {
       const coordinator = new WorkspaceSyncCoordinator({
         client,
         checkpointStore,
-        chunkSource: await createFilesystemChunkSource(root, manifest),
+        chunkSource: await commitChunkSource({ root, manifest, carried, client, syncId, signal }),
         ...(input.transfer.maximumConcurrentUploads === undefined
           ? {}
           : { maximumConcurrentUploads: input.transfer.maximumConcurrentUploads }),
@@ -678,9 +811,10 @@ async function startProvenContinuousSupervisor(input: {
         checkpoint.base_generation === baseGeneration &&
         checkpoint.exclusion_policy_digest === policy.digest;
     },
-    async listChanges({ syncId, cursor, signal }) {
+    async listChanges({ syncId, cursor, limit, signal }) {
       const response = await client.changes(syncId, {
         ...(cursor === undefined ? {} : { cursor }),
+        ...(limit === undefined ? {} : { limit }),
         readerVersion: WORKSPACE_SYNC_PROTOCOL.maximum,
         signal,
       });
@@ -738,7 +872,9 @@ async function startProvenContinuousSupervisor(input: {
     filesystemCapabilities: input.transfer.filesystemCapabilities,
     authority,
     initialManifest: input.initialManifest,
+    ...(input.initialRemoteOnly === undefined ? {} : { initialRemoteOnly: input.initialRemoteOnly }),
     ...(input.requireDurableState === undefined ? {} : { requireDurableState: input.requireDurableState }),
+    ...(input.recoverStop === undefined ? {} : { recoverStop: input.recoverStop }),
     ...(input.priorBase === undefined ? {} : { priorBase: input.priorBase }),
     ...(input.onConflict === undefined ? {} : { onConflict: input.onConflict }),
   });

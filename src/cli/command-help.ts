@@ -1,5 +1,6 @@
-import { ROOT_HELP } from "./help.js";
+import { ROOT_HELP, routeMarker } from "./help.js";
 import { CLI_ROUTE_REGISTRY } from "./parser.js";
+import { missingContractOperations } from "./route-contract.js";
 
 /**
  * Help for one command, and for one action within a command.
@@ -347,8 +348,8 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "Rename one child process.\n\nRequired:\n  --name NAME         1 through 80 characters\n  --yes               Confirm this mutating operation",
   ),
   "agent-sessions terminate": topic(
-    "Usage:\n  cuna agent-sessions terminate SESSION_ID --yes",
-    "Terminate one child process when server-advertised.\n\nRequired:\n  --yes               Confirm this destructive operation",
+    "Usage:\n  cuna agent-sessions terminate SESSION_ID --yes [--no-wait]",
+    "Terminate one child process when server-advertised.\n\nRequired:\n  --yes               Confirm this destructive operation\n\nOptions:\n  --no-wait           Return once Cuna accepts the request; do not wait for\n                      the process to end\n\nThe acceptance is printed as soon as Cuna records it. With --json it is a\n`type: \"accepted\"` line, and the last line is the `type: \"result\"`.\nExit 0 means the process ended (or, with --no-wait, that Cuna accepted).\nExit 5 means Cuna accepted but the process had not ended within 120 s;\nthe termination stays requested. Read it with `cuna agent-sessions get ID`.",
   ),
   "agent-sessions attach": topic(
     "Usage:\n  cuna agent-sessions attach SESSION_ID",
@@ -387,8 +388,46 @@ const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
     "Compatibility-reserved command. This build has no standalone shell runtime; use a provider terminal through `cuna`, `cuna claude`, `cuna codex`, or `cuna opencode`.",
   ),
   sync: topic(
-    "Usage:\n  cuna sync",
-    "Compatibility-reserved command. Workspace synchronization is composed into the provider journeys and is not exposed as a standalone command.",
+    "Usage:\n  cuna sync recover [PATH] --yes [--timeout-ms N]",
+    "Compatibility-reserved command. Workspace synchronization is composed into the provider journeys; bare `cuna sync` refuses. The one standalone action is `cuna sync recover`, for a folder whose sync stopped. See `cuna sync recover --help`.",
+  ),
+  "sync recover": topic(
+    "Usage:\n  cuna sync recover [PATH] --yes [--timeout-ms N] [--json]",
+    [
+      "Bring a folder whose workspace sync stopped back to syncing with its Machine.",
+      "PATH is the folder, or any path inside it (default: the current directory).",
+      "",
+      "Recovery starts from this computer's sync state for the folder, takes in what",
+      "the Machine changed, and sends what the folder changed. No bytes are lost on",
+      "either side: a file changed here and on the Machine keeps both versions, yours",
+      "in place and the Machine's beside it as <path>.cuna-conflict-<generation>-<id>.",
+      "Each kept conflict is listed. A file here is replaced or removed only when",
+      "this folder had not changed it.",
+      "",
+      "It refuses, changing nothing, when recovery would be unsafe, and says why",
+      "(cuna.workspace_sync.recovery_refused, details.reason):",
+      "  binding_missing         The folder was never bound to a Machine",
+      "  policy_changed          .gitignore or .cunaignore differs from the binding's",
+      "  machine_gone            The bound Machine no longer exists",
+      "  binding_changed         The server's Workspace is not the one recorded here",
+      "  recovery_state_missing  No sync state proves which local files are edits",
+      "  generation_rollback     This folder is newer than the server's generation",
+      "  active_writer           Another cuna run holds the folder's sync (its pid is named)",
+      "",
+      "If sync stops again or does not finish in time, it says where it stopped",
+      "(cuna.workspace_sync.recovery_incomplete: stopped_again or recovery_timeout)",
+      "and retries nothing.",
+      "",
+      "Required:",
+      "  --yes               Confirm this operation on the folder",
+      "",
+      "Options:",
+      "  --timeout-ms N      Bound the whole wait and each request in it",
+      "                      (100..120000, default 120000)",
+      "",
+      "With --json the result is one `sync.recover` record with the state before and",
+      "after (generation, status, reason) and every kept conflict.",
+    ].join("\n"),
   ),
   companion: topic(
     "Usage:\n  cuna companion",
@@ -435,7 +474,9 @@ function agentHelp(command: "claude" | "codex" | "opencode"): string {
       "                            --new-session, --no-sync, --auth-mode or --credential-binding.",
       "",
       "Requires an interactive terminal; JSON and redirected output fail closed.",
-      "Ctrl+C detaches locally in one press. Use Ctrl+] c to send Ctrl+C to the agent.",
+      "With keyboard control, Ctrl+C goes to the agent and Ctrl+] d detaches.",
+      "A read-only view and the plain fallback detach on Ctrl+C.",
+      "Ctrl+C over a Cuna selection copies it instead.",
     ].join("\n"),
   );
 }
@@ -453,6 +494,23 @@ export const HELP_ROUTE_KEYS: readonly string[] = Object.freeze(
   CLI_ROUTE_REGISTRY.map((route) => route.key),
 );
 
+/**
+ * The line that opens a topic whose command, or some of whose actions, the API
+ * version this build speaks cannot serve (`cli/route-contract.ts`). Help for
+ * such a command stays readable; it just never reads as available.
+ */
+function unservedNotice(command: string, action: string | undefined): string {
+  const unserved = CLI_ROUTE_REGISTRY.filter((route) =>
+    route.command === command && (action === undefined || route.action === action) && routeMarker(route) === "unserved");
+  if (unserved.length === 0) return "";
+  if (action !== undefined || (unserved.length === 1 && unserved[0]?.action === undefined)) {
+    return `Not served by this Cuna API version: it has no ${missingContractOperations(unserved[0]!).join(", ")}.\n` +
+      "This command refuses before sending anything.\n\n";
+  }
+  return `Not served by this Cuna API version, and refused before sending anything: ${
+    unserved.map((route) => route.action ?? route.command).join(", ")}.\n\n`;
+}
+
 /** Help for `command` plus its action operands, falling back to the root help. */
 export function commandHelp(command: string | undefined, operands: readonly string[]): string {
   if (command === undefined) return ROOT_HELP;
@@ -460,9 +518,10 @@ export function commandHelp(command: string | undefined, operands: readonly stri
   const action = operands[0];
   if (action !== undefined) {
     const specific = COMMAND_HELP[`${command} ${action}`];
-    if (specific !== undefined) return specific;
+    if (specific !== undefined) return `${unservedNotice(command, action)}${specific}`;
   }
-  return COMMAND_HELP[command] ?? ROOT_HELP;
+  const topic = COMMAND_HELP[command];
+  return topic === undefined ? ROOT_HELP : `${unservedNotice(command, undefined)}${topic}`;
 }
 
 /** The exact topic `commandHelp` resolved, for the `--json` record. */

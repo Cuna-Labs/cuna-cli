@@ -397,19 +397,25 @@ function apiError(input: {
       retryable: problem.retryable,
     });
   }
+  // Whether the server said why. When it did, its `detail` is the only next
+  // step there is: with no detail it named none, and a step of the CLI's own
+  // beside the server's reason reads as the server's (PRD R1.4, 2026-10-03).
+  const serverNamedReason = problem !== undefined || legacyReason !== undefined;
   if (status === 409) {
     // The server names which state conflicts; this used to answer every 409
     // with one fixed sentence and throw that away, so the user was told a
     // conflict exists but never which one. Prefer the server's own words and
     // keep the generic sentence only as the fallback for a refusal that
     // carried none.
+    const hint = serverNamedReason
+      ? problem?.detail
+      : "Re-read the resource and decide again from its current state. Repeating this request unchanged repeats this answer.";
     return new CunaError({
       code: "cuna.remote.conflict",
       message: problem?.title ?? legacyReason ??
         "Cuna could not apply the operation because current state conflicts with it.",
       exitCode: EXIT_CODES.conflict,
-      hint: problem?.detail ??
-        "Re-read the resource and decide again from its current state. Repeating this request unchanged repeats this answer.",
+      ...(hint === undefined ? {} : { hint }),
       ...(problem === undefined ? {} : { retryable: problem.retryable }),
       details,
     });
@@ -426,7 +432,9 @@ function apiError(input: {
       code: "cuna.remote.rejected",
       message: problem.title ?? "Cuna rejected the request.",
       exitCode: EXIT_CODES.remote,
-      hint: problem.detail ?? OFF_CONTRACT_RESPONSE_HINT,
+      // `detail` is optional in the Problem contract, so its absence is not
+      // the API falling behind it; it is a refusal that names no next step.
+      ...(problem.detail === undefined ? {} : { hint: problem.detail }),
       retryable: false,
       details,
     });
@@ -437,16 +445,20 @@ function apiError(input: {
     // show it: nine identical "temporarily unavailable" answers in a row on
     // 2026-09-02 hid a reason the server had named every time.
     const serverSentence = status === 429 ? undefined : problem?.title ?? legacyReason;
+    // A Problem is an authoritative answer, so "no authoritative answer was
+    // received" would be false beside it; its `detail`, if any, is the step.
+    const hint = status === 429
+      ? "Wait before retrying. No change was applied by this request."
+      : problem !== undefined
+        ? problem.detail
+        : "No authoritative answer was received. Retry a read; do not assume a write was applied.";
     return new CunaError({
       code: status === 429 ? "cuna.network.rate_limited" : "cuna.network.service_unavailable",
       message: status === 429
         ? "Cuna is rate limiting this request."
         : serverSentence ?? "The Cuna service is temporarily unavailable.",
       exitCode: EXIT_CODES.network,
-      hint: status === 429
-        ? "Wait before retrying. No change was applied by this request."
-        : problem?.detail ??
-          "No authoritative answer was received. Retry a read; do not assume a write was applied.",
+      ...(hint === undefined ? {} : { hint }),
       retryable: problem?.retryable ?? true,
       details: {
         ...details,

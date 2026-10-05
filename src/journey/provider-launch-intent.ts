@@ -4,6 +4,7 @@ import {join} from 'node:path';
 import {DurableSyncJournal,inspectSyncJournal,type JournalRecord} from '../sync/journal.js';
 import {CunaError,EXIT_CODES} from '../core/errors.js';
 import {stableUuid} from './derived-identity.js';
+import {isDefinitiveCreateRefusal,replayedLaunchRefusal} from './definitive-refusal.js';
 
 const LEASE_MS=120000;
 const SESSIONS_FILE='sessions.json';
@@ -13,7 +14,7 @@ const SESSIONS_FILE='sessions.json';
  * recorded launch produced is known to be gone, so there is nothing to
  * resume and the question may only offer a new session.
  */
-export interface RecordedLaunchContext {readonly state:'resumable'|'ended'}
+export interface RecordedLaunchContext {readonly state:'resumable'|'ended'|'unresumable'}
 
 /** Reuses the fsync journal and exclusive local writer; no provider credentials are persisted. */
 export async function withProviderLaunchIntent<T extends {readonly id:string}>(input:{stateDirectory:string;ownerId:string;workspaceId:string;machineId:string;executionWorkspaceId:string;intent:Readonly<Record<string,unknown>>;confirmNew?:(context:RecordedLaunchContext)=>Promise<boolean>;
@@ -59,7 +60,9 @@ export async function withProviderLaunchIntent<T extends {readonly id:string}>(i
   const current=await readLaunchRecords(directory);
   if(current.fingerprint!==observed.fingerprint)throw new CunaError({code:'cuna.provider.pending_intent_conflict',message:'Another launch changed the local launch record while this one was deciding. Nothing was sent. Run the command again.',exitCode:EXIT_CODES.conflict});
   if(decision.kind==='resume'){
-   const session=await createUnderRenewedLease(journal,decision.operationId,leaseMs,input.create);
+   let session:T;
+   try{session=await createUnderRenewedLease(journal,decision.operationId,leaseMs,input.create);}
+   catch(error){throw isDefinitiveCreateRefusal(error)?replayedLaunchRefusal(error,input.machineId,'recorded'):error;}
    await journal.renew();
    await rememberLaunchSession(directory,decision.operationId,session.id);
    // A record kept before session ids were stored is only identified by the
@@ -70,7 +73,23 @@ export async function withProviderLaunchIntent<T extends {readonly id:string}>(i
   }
   let record=decision.pending??await journal.append({operationId:randomUUID(),baseGeneration:1,digest,byteLength:Buffer.byteLength(serialized)});
   if(record.state==='queued')record=await journal.transition(record.operationId,'sending');
-  const result=await createUnderRenewedLease(journal,record.operationId,leaseMs,input.create);
+  let result:T;
+  try{result=await createUnderRenewedLease(journal,record.operationId,leaseMs,input.create);}
+  catch(error){
+   if(!isDefinitiveCreateRefusal(error))throw error;
+   // A pending record was sent by an earlier run that never learned the
+   // outcome; this refusal does not settle that. Keep it, and say where to look.
+   if(decision.pending!==undefined)throw replayedLaunchRefusal(error,input.machineId,'unanswered');
+   // First send, final refusal: nothing was created, so the record is settled
+   // and the next run starts a new launch instead of re-sending this one, or
+   // refusing a changed Workspace as "a previous launch is unresolved". A
+   // re-send inside this attempt (its first try unanswered) is not settled.
+   if(error.details?.replayed_launch!==true){
+    try{await journal.transition(record.operationId,'conflicted');}
+    catch{/* The refusal is the answer; an unsettled record only means the next run re-sends this identity. */}
+   }
+   throw error;
+  }
   await journal.renew();
   if(record.state==='sending'||record.state==='uncertain')await journal.transition(record.operationId,'acknowledged');
   await journal.transition(record.operationId,'applied');
@@ -113,7 +132,9 @@ async function decide(latest:ReadonlyMap<string,JournalRecord>,digest:string,ses
  if(pending.length===0&&resolved){
   const recordedSession=sessions.get(resolved.operationId);
   const ended=recordedSession!==undefined&&isSessionEnded!==undefined&&await isSessionEnded(recordedSession);
-  if(!(await confirmNew?.({state:ended?'ended':'resumable'}))){
+  // Known before asking, so the question never offers a resume that cannot happen.
+  const mismatched=!ended&&resolved.digest!==digest;
+  if(!(await confirmNew?.({state:ended?'ended':mismatched?'unresumable':'resumable'}))){
    // A session that ended cannot be resumed: re-sending its launch returns
    // the dead row. Say so, and send nothing.
    if(ended)throw recordedLaunchEnded(recordedSession);
@@ -121,7 +142,7 @@ async function decide(latest:ReadonlyMap<string,JournalRecord>,digest:string,ses
    // another Workspace version or preset cannot be resumed, and nothing is
    // unresolved about it: the way forward is a new session, and the refusal
    // says so rather than reading as a create of unknown outcome.
-   if(resolved.digest!==digest)throw new CunaError({code:'cuna.provider.pending_intent_conflict',message:'The recorded launch used another Workspace version or preset, so it cannot be resumed. Nothing was sent.',exitCode:EXIT_CODES.conflict,hint:'Answer y to the question, or run the same command with --new-session, to start a new session.',details:{reason:'recorded_launch_mismatch'}});
+   if(mismatched)throw new CunaError({code:'cuna.provider.pending_intent_conflict',message:'The recorded launch used another Workspace version or preset, so it cannot be resumed. Nothing was started.',exitCode:EXIT_CODES.conflict,hint:'Answer y to the question, or run the same command with --new-session, to start a new session.',details:{reason:'recorded_launch_mismatch'}});
    return {kind:'resume',operationId:resolved.operationId};
   }
  }

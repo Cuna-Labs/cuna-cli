@@ -74,6 +74,12 @@ export interface AgentSessionSelectionObservation {
   readonly attachmentHolder?: string;
   readonly freshness: AuthorityFreshness;
   readonly createdAt: string;
+  /**
+   * The request is over: it failed, or the session reached its terminal
+   * state. Its process state can never become known or reusable, so it is not
+   * an observation still to arrive. Absent means not ended.
+   */
+  readonly ended?: boolean;
 }
 
 export interface SafeMachineCandidate {
@@ -653,7 +659,8 @@ function validAgentSession(session: AgentSessionSelectionObservation): boolean {
       ? true
       : session.attachment === "attached" && isSafeDisplay(session.attachmentHolder)) &&
     (session.freshness === "fresh" || session.freshness === "stale" || session.freshness === "unknown") &&
-    Number.isFinite(Date.parse(session.createdAt))
+    Number.isFinite(Date.parse(session.createdAt)) &&
+    (session.ended === undefined || typeof session.ended === "boolean")
   );
 }
 
@@ -747,6 +754,7 @@ function incompatibleSession(
 function sessionAvailabilityRejection(
   session: AgentSessionSelectionObservation,
 ): UnavailablePlan | undefined {
+  if (session.ended === true) return unavailable("agent-session", "state-not-reusable", session.id);
   if (session.freshness !== "fresh") {
     return unavailable("agent-session", "authority-observation-stale", session.id);
   }
@@ -810,7 +818,12 @@ export function planAgentSessionSelection(
     return rejection ?? selectedAgentSession(session, "explicit");
   }
 
-  const exact = input.agentSessions.filter((session) => isExactSessionKey(session, input));
+  // An ended request is never a candidate, and its `unknown` process state is
+  // not an observation still to arrive. Counted, one failed launch refused
+  // every later run in its workspace as authority-observation-stale, with a
+  // live session beside it (ws-c3, 2026-09-29: cbde8586 failed at 09:58 with
+  // process `unknown`; every run after it was refused, 482714e0 running).
+  const exact = input.agentSessions.filter((session) => session.ended !== true && isExactSessionKey(session, input));
   /*
    * Separate "the observation is old" from "this fact is not published".
    *

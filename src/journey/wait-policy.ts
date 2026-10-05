@@ -87,6 +87,28 @@ export function readinessBackoffTotalMs(attempts: number): number {
 export const AGENT_SESSION_READY_DEADLINE_MS = 180_000;
 
 /**
+ * The longest pause between two readiness reads of one AgentSession, while a
+ * launch is still expected to land (`AGENT_SESSION_READY_FAST_POLL_WINDOW_MS`).
+ *
+ * The shared curve settles at 1 600 ms, so a session the server attested just
+ * after a read was seen up to 1.6 s later, 0.8 s on average. Measured
+ * 2026-09-30 15:57Z (Edge v242): reads 1 809 ms apart, the attestation landing
+ * 0.3 s before the next one. The read is one indexed row (~200 ms at the
+ * Edge), so a 500 ms ceiling cuts that tail to 0.25 s on average for a few more
+ * reads. The deadline above is a wall bound and does not move with it.
+ */
+export const AGENT_SESSION_READY_POLL_MAX_MS = 500;
+
+/**
+ * How long into the readiness phase the shorter ceiling applies. Launches seen
+ * on 2026-09-30 were attested 17-19 s after their create, with most of that
+ * the Edge waiting for supervisor heartbeats; past 30 s the wait is a slow or
+ * failing launch, and the loop returns to the shared curve so a launch that
+ * never lands costs no more reads than it did.
+ */
+export const AGENT_SESSION_READY_FAST_POLL_WINDOW_MS = 30_000;
+
+/**
  * How long `ready-machine` is worth. Same derivation from the loop it replaces:
  * 60 attempts on the same curve is `readinessBackoffTotalMs(60)` = 91 100 ms of
  * sleeping. 120 000 ms is that rounded up to two minutes. Deliberately lower
@@ -186,6 +208,12 @@ export interface JourneyWait {
    * for ___", so it never repeats the verb and never names a transport path.
    */
   readonly waitingFor: string;
+  /**
+   * What the server says is holding it up, e.g. `no supervisor has claimed the
+   * launch`, when the last read said anything. A countdown alone was all
+   * 8df1553 showed for 180 s on 2026-09-29 while the row said why.
+   */
+  readonly cause?: string;
   readonly elapsedMs: number;
   readonly deadlineMs: number;
 }
@@ -204,7 +232,10 @@ function wholeSeconds(milliseconds: number): number {
  * exactly the overshoot `startJourneyDeadline` documents.
  */
 export function journeyWaitLine(wait: JourneyWait): string {
-  return `Still waiting for ${wait.waitingFor} · ${wholeSeconds(wait.elapsedMs)}s of ${wholeSeconds(wait.deadlineMs)}s`;
+  // The cause goes before the countdown: a narrow terminal truncates from the
+  // right, and the clause is the part a person cannot work out for themselves.
+  const cause = wait.cause === undefined ? "" : ` · ${wait.cause}`;
+  return `Still waiting for ${wait.waitingFor}${cause} · ${wholeSeconds(wait.elapsedMs)}s of ${wholeSeconds(wait.deadlineMs)}s`;
 }
 
 /* -------------------------------------------------------------------------- */
