@@ -3830,7 +3830,14 @@ test("the real Codex 0.147 sign-in screen gives Ctrl+click, Ctrl+] y and the hos
     await waitUntil(() => opened.length === 1 && copied.length === 1, "Ctrl+click opens and Ctrl+] y copies");
     assert.equal(opened[0], target);
     assert.equal(copied[0], target);
-    const painted = hostHyperlinks(host).filter((link) => link.uri.startsWith("https://auth.openai.com"));
+    const painted = hostHyperlinks(host).filter((link) => {
+      try {
+        const parsed = new URL(link.uri);
+        return parsed.protocol === "https:" && parsed.hostname === "auth.openai.com";
+      } catch {
+        return false;
+      }
+    });
     assert.ok(painted.length >= 4, `every row of the link is a host hyperlink (${painted.length})`);
     assert.ok(painted.every((link) => link.uri === target), "each row's hyperlink is the whole URL");
     assert.equal(new Set(painted.map((link) => link.id)).size, 1, "the rows share one hyperlink id");
