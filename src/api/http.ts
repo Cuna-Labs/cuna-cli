@@ -23,6 +23,7 @@ import {
   observationBudgetElapsed,
 } from "../core/observation-budget.js";
 import { CLI_VERSION } from "../version.js";
+import { NamedSecretRequestError } from "./named-secrets.js";
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 // A 16 MiB body is never a legitimate answer on this contract, so the remedy is
@@ -142,6 +143,8 @@ interface ProblemMetadata {
 }
 
 export interface HttpRequest {
+  /** Named-secret traffic must never use generic server-prose/cause diagnostics. */
+  readonly sensitive?: "named-secret";
   readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   readonly path: string;
   readonly query?: Readonly<Record<string, string | undefined>>;
@@ -912,6 +915,14 @@ export function createHttpTransport(input: {
             redirect: "error",
           });
           const bytes = await readLimited(response);
+          if (request.sensitive === "named-secret") {
+            try {
+              if (!response.ok && response.status !== 409) throw new NamedSecretRequestError(response.status);
+              const decoded = decodeJson(bytes);
+              if (!decoded.decoded) throw new NamedSecretRequestError();
+              return decoded.value;
+            } finally { bytes.fill(0); }
+          }
           if (!response.ok) {
             const decoded = decodeJson(bytes);
             throw apiError({
@@ -939,6 +950,7 @@ export function createHttpTransport(input: {
           try {
             return await dispatch(bearer);
           } catch (error) {
+            if (request.sensitive === "named-secret") throw error instanceof NamedSecretRequestError ? error : new NamedSecretRequestError();
             if (error instanceof CunaError || error instanceof CredentialBoundaryError) throw error;
             if (controller.signal.aborted) throw error;
             // Checked BEFORE the phase classification, deliberately. For an
@@ -955,6 +967,7 @@ export function createHttpTransport(input: {
           return await dispatchWithConnectRetry(requestCredential);
         } catch (error) {
           const canRetryUnauthorized = error instanceof CunaError &&
+            request.sensitive !== "named-secret" &&
             error.code === "cuna.auth.rejected" &&
             input.bearerTokenProvider !== undefined &&
             requestCredential !== undefined &&
@@ -980,6 +993,7 @@ export function createHttpTransport(input: {
           return await dispatchWithConnectRetry(refreshedCredential);
         }
       } catch (error) {
+        if (request.sensitive === "named-secret") throw error instanceof NamedSecretRequestError ? error : new NamedSecretRequestError();
         if (error instanceof CunaError) throw error;
         // Token acquisition is a local credential boundary, not a network
         // dispatch. Preserve its typed failure so the CLI can name the exact

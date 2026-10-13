@@ -3,27 +3,27 @@ export const INFRA_OPENAPI_CONTRACT_IDENTITY = Object.freeze({
   "schemaVersion": 2,
   "artifact_file": "contracts/infra/cuna-api.openapi.json",
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
-  "infra_openapi_raw_sha256": "4d24c57b6f6102e2e7a30418fcb820192b41db1bbd0099d90e2a48aad37f2fa6",
-  "infra_openapi_canonical_sha256": "7805d96c670f6b9134598e1ccbd0afff1cb3d8a6803ee2107df1fb78e6170818",
+  "infra_openapi_raw_sha256": "7e6506c0ea88a3ee94b46cde94c0cd551efa54d6a546f50c47f45ddef98f58bc",
+  "infra_openapi_canonical_sha256": "c6eaefd6205c10ff19e39eb1911f30c54e47980530476782ee87696a8d50ce8e",
   "producer_repository": "Cuna-Labs/infra-proxy-mvp",
   "producer_content_state": "committed",
-  "producer_revision": "cdd7e9a8743f12eac8c3be3214e6cdbf514c3786",
+  "producer_revision": "0cb84d1cfe2412f431f44b73fcb4f3e226f3b190",
   "producer_full_tree": {
     "object_format": "sha1",
-    "commit": "cdd7e9a8743f12eac8c3be3214e6cdbf514c3786",
-    "tree": "0e4c6fe85b8a7cdb812b4a305e2e0e33949f710d",
-    "contract_blob": "a5e3d2d041c3274472fdeb69448eec968afb4c1f"
+    "commit": "0cb84d1cfe2412f431f44b73fcb4f3e226f3b190",
+    "tree": "99e4004e29c31be92a1e973cc4a9aea50c9ebbf3",
+    "contract_blob": "c1632141165436817c4ef89f968477f96190fc11"
   },
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
   "producer_projection_sha256": "fdb522241303aaae362a3df962b122a1506e00400a14487c47ac1105afefde65",
-  "producer_runtime_manifest_sha256": "a02bcde0c4bcf290a518125ef42141466c7142deaee91f132a835281b848eb83",
+  "producer_runtime_manifest_sha256": "3d8f43fdba38537d700d8cc88f158e8c4e7a9b1f7e42782294c97cbd753dfce0",
   "feature_contracts": {
     "opencode_interactive_only": {
-      "openapi_raw_sha256": "4d24c57b6f6102e2e7a30418fcb820192b41db1bbd0099d90e2a48aad37f2fa6",
-      "openapi_canonical_sha256": "7805d96c670f6b9134598e1ccbd0afff1cb3d8a6803ee2107df1fb78e6170818",
-      "producer_commit": "cdd7e9a8743f12eac8c3be3214e6cdbf514c3786",
-      "producer_tree": "0e4c6fe85b8a7cdb812b4a305e2e0e33949f710d",
-      "producer_contract_blob": "a5e3d2d041c3274472fdeb69448eec968afb4c1f"
+      "openapi_raw_sha256": "7e6506c0ea88a3ee94b46cde94c0cd551efa54d6a546f50c47f45ddef98f58bc",
+      "openapi_canonical_sha256": "c6eaefd6205c10ff19e39eb1911f30c54e47980530476782ee87696a8d50ce8e",
+      "producer_commit": "0cb84d1cfe2412f431f44b73fcb4f3e226f3b190",
+      "producer_tree": "99e4004e29c31be92a1e973cc4a9aea50c9ebbf3",
+      "producer_contract_blob": "c1632141165436817c4ef89f968477f96190fc11"
     }
   }
 } as const);
@@ -57,6 +57,10 @@ export const INFRA_OPENAPI_OPERATIONS: readonly string[] = Object.freeze([
   "GET /v1/machine-creates/{id}",
   "GET /v1/me",
   "GET /v1/me/workspace-admission",
+  "GET /v1/named-secrets",
+  "GET /v1/named-secrets/operations/{operation_id}",
+  "GET /v1/notifications",
+  "GET /v1/notifications/summary",
   "GET /v1/records",
   "GET /v1/records/all",
   "GET /v1/records/page",
@@ -65,6 +69,7 @@ export const INFRA_OPENAPI_OPERATIONS: readonly string[] = Object.freeze([
   "GET /v1/sessions/{id}/agent-auth",
   "GET /v1/sessions/{id}/agent-sessions",
   "GET /v1/sessions/{id}/authorizations",
+  "GET /v1/sessions/{id}/create-progress",
   "GET /v1/sessions/{id}/default-workspace",
   "GET /v1/sessions/{id}/executions",
   "GET /v1/sessions/{id}/executions/{operationId}",
@@ -118,6 +123,10 @@ export const INFRA_OPENAPI_OPERATIONS: readonly string[] = Object.freeze([
   "POST /v1/machine-creates",
   "POST /v1/machine-creates/{id}/reconcile",
   "POST /v1/me/workspace-admission",
+  "POST /v1/named-secrets",
+  "POST /v1/notifications/read",
+  "POST /v1/notifications/read-all",
+  "POST /v1/notifications/{id}/dismiss",
   "POST /v1/sessions",
   "POST /v1/sessions/{id}/agent-sessions",
   "POST /v1/sessions/{id}/checkpoint",

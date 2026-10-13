@@ -511,7 +511,7 @@ function needsRemoteCredential(command: string | undefined, foreground: Foregrou
   // binding authority and runs the folder's sync.
   if (command === "sync") return action === "recover";
   return command === "observe" || command === "share" || command === "capabilities" || command === "machines" || command === "agent-sessions" ||
-    command === "agent" || command === "executions" ||
+    command === "agent" || command === "executions" || command === "secrets" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
     command === "account" || command === "workspace" || command === "usage" ||
     command === "claude" || command === "codex" || command === "opencode" || foreground !== undefined;
@@ -1052,6 +1052,7 @@ function batchProgressLabel(parsed: ParsedInvocation): string | undefined {
         : action === "revoke"
           ? "Revoking API key"
           : "Reading your API keys";
+    case "secrets": return "Checking the named-secret operation";
     case "capabilities":
       return "Reading what this account can do";
     case "records":

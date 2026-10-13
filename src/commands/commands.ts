@@ -1228,6 +1228,10 @@ export function preflightInvocation(
 ): void {
   assertRouteServedByContract(assertRegisteredCliRoute(parsed), contractOperations);
   switch (parsed.command) {
+    case "secrets":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 2 || parsed.operands[0] !== "operation") throw usageError("Use secrets operation OPERATION_ID.");
+      assertCanonicalUuid(parsed.operands[1]!, "named-secret operation ID"); return;
     case "config":
       rejectUnknownOptions(parsed, []);
       if (parsed.operands.length !== 1 || parsed.operands[0] !== "get") {
@@ -1621,6 +1625,19 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
 export async function executeCommand(context: CommandContext): Promise<CommandResult> {
   const { parsed, config, client } = context;
   switch (parsed.command) {
+    case "secrets": {
+      requireCredential(context);
+      const operationId = assertCanonicalUuid(parsed.operands[1]!, "named-secret operation ID");
+      try {
+        const receipt = await context.client.getNamedSecretOperation(operationId);
+        if (receipt.operation_id !== operationId) throw new Error("mismatch");
+        return Object.freeze({ command: "secrets.operation", data: { ...receipt },
+          human: receipt.state === "committed" ? `Secret ${receipt.name} is durably stored in Cuna Workspace ${receipt.workspace_id}. No agent access was granted.` : "The operation was rejected; nothing was stored." });
+      } catch {
+        throw new CunaError({ code: "cuna.secrets.outcome_unknown", message: "The named-secret operation outcome remains unknown.", exitCode: EXIT_CODES.network,
+          hint: `Check the same operation without writing again: cuna secrets operation ${operationId}` });
+      }
+    }
     case "config": {
       rejectUnknownOptions(parsed, []);
       if (parsed.operands.length !== 1 || parsed.operands[0] !== "get") {

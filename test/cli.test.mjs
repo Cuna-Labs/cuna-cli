@@ -79,6 +79,14 @@ function fakeClient(overrides = {}) {
   };
 }
 
+test("named-secret outcome is an authenticated metadata-only command after a process exits", async () => {
+  const operation = "99999999-9999-4999-8999-999999999999";
+  const output = memoryStreams(); let reads = 0;
+  const client = fakeClient({ async getNamedSecretOperation(id) { reads++; assert.equal(id, operation); return { operation_id: operation, state: "committed", secret_id: FOREGROUND_SESSION_A, name: "Database", workspace_id: FOREGROUND_SESSION_B, committed_at: "2026-10-12T12:00:00Z" }; }, async createNamedSecret() { assert.fail("recovery must never POST"); }, async getMachine() { assert.fail("recovery must not require Machine"); } });
+  assert.equal(await runCli(["secrets", "operation", operation, "--json"], { streams: output.streams, platform, env: { CUNA_API_KEY: API_KEY }, clientFactory: () => client }), EXIT_CODES.success);
+  assert.equal(reads, 1); assert.equal(JSON.parse(output.stdout()).command, "secrets.operation");
+});
+
 test("parser keeps subcommands separate from options and rejects duplicates", () => {
   const parsed = parseArgv(["machines", "create", "--name", "dev", "--yes", "--json"]);
   assert.equal(parsed.command, "machines");

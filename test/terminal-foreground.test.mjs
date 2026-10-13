@@ -638,6 +638,91 @@ function outputEvent(intent, sequence, bytes, generation = 1, signal = new Abort
   };
 }
 
+test("named-secret popout consumes decoded chord bytes and masks while all three provider viewports advance", async () => {
+  for (const agent of ["claude-code", "codex", "opencode"]) {
+    const writes = [], reads = []; let receipt;
+    const namedSecrets = {
+      async prepare() { return "66666666-6666-4666-8666-666666666666"; },
+      async create(op, name, secret) { writes.push(secret.withBytes((bytes) => decoder.decode(bytes))); receipt = { operation_id: op, state: "committed", secret_id: "77777777-7777-4777-8777-777777777777", name, workspace_id: "66666666-6666-4666-8666-666666666666", committed_at: "2026-10-12T12:00:00Z" }; return receipt; },
+      async read(op) { reads.push(op); return receipt; },
+    };
+    const { coordinator, callbacks, host, intents, runtime, calls } = harness({ coordinatorOptions: { namedSecrets, predictiveEcho: "experimental" } });
+    intents[0].agent = agent;
+    runtime.namedSecretContext = () => ({ agent_session_id: intents[0].agentSessionId, machine_id: "machine-1", workspace_binding_id: "binding-1", process_epoch: `epoch-${intents[0].agentSessionId}`, terminal_connection_id: "connection-1", connect_token: "private-proof", writer_epoch: 1 });
+    try {
+      await coordinator.start([intents[0]]);
+      host.emitInput(encoder.encode("\x11Database\tCANARY_PASSWORD"));
+      await waitUntil(() => host.writes.some((bytes) => decoder.decode(bytes).includes("Password: ********")), "masked popout renders");
+      await callbacks.onTerminalOutput(outputEvent(intents[0], 1n, encoder.encode("\x1b[2J\x1b[HLATEST_REMOTE_VIEW")));
+      assert.ok(host.writes.some((bytes) => decoder.decode(bytes).includes("LATEST_REMOTE_VIEW")), "remote viewport advances under overlay");
+      host.columns = 62; host.emitResize();
+      await waitUntil(() => calls.resize.some((call) => call.columns === 62), "resize continues under overlay");
+      host.emitInput(encoder.encode("\r\r"));
+      await waitUntil(() => host.writes.some((bytes) => decoder.decode(bytes).includes("Saved in Cuna")), "durable GET confirmation renders");
+      assert.deepEqual(writes, ["CANARY_PASSWORD"]); assert.equal(reads.length, 1);
+      assert.doesNotMatch(host.writes.map((bytes) => decoder.decode(bytes)).join(""), /CANARY_PASSWORD|private-proof/);
+      assert.deepEqual(calls.input, []);
+      host.emitInput(encoder.encode("\x1bPRIVATE_TAIL"));
+      await waitUntil(() => !decoder.decode(host.writes.at(-1)).includes("Secret Name:"), "close restores latest viewport");
+      assert.match(decoder.decode(host.writes.at(-1)), /LATEST_REMOTE_VIEW/); assert.deepEqual(calls.input, []);
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("writer proof refresh consumes input before collecting fields and opens only on the same fresh writer", async () => {
+  let release; let receipt; const creates = [];
+  const namedSecrets = { async prepare() { return "66666666-6666-4666-8666-666666666666"; }, async create(op, name, secret, context) { creates.push({ value: secret.withBytes((bytes) => decoder.decode(bytes)), proof: context.connect_token }); receipt = { operation_id: op, state: "committed", secret_id: "77777777-7777-4777-8777-777777777777", name, workspace_id: "66666666-6666-4666-8666-666666666666", committed_at: "2026-10-12T12:00:00Z" }; return receipt; }, async read() { return receipt; } };
+  const { coordinator, callbacks, host, intents, runtime, calls } = harness({ coordinatorOptions: { namedSecrets } });
+  let stale = true;
+  runtime.needsNamedSecretAuthorityRefresh = () => stale;
+  runtime.namedSecretContext = () => { if (stale) throw new Error("stale issued proof"); return { agent_session_id: SESSION_A, machine_id: "machine-1", workspace_binding_id: "binding-1", process_epoch: `epoch-${SESSION_A}`, terminal_connection_id: "fresh-connection", connect_token: "fresh-proof", writer_epoch: 1 }; };
+  runtime.refreshNamedSecretAuthority = async () => { await new Promise((resolve) => { release = resolve; }); stale = false; await callbacks.onTerminalReady(snapshot(intents[0], 2)); callbacks.onTerminalState(snapshot(intents[0], 2)); return runtime.namedSecretContext(); };
+  try {
+    await coordinator.start([intents[0]]); host.emitInput(encoder.encode("\x11PRIVATE_INITIATING_TAIL")); host.emitInput(encoder.encode("PRIVATE_DURING_REFRESH"));
+    await waitUntil(() => host.writes.some((bytes) => decoder.decode(bytes).includes("Preparing a fresh writer proof")), "refresh feedback is immediate");
+    assert.deepEqual(calls.input, []); assert.deepEqual(creates, []);
+    release(); await waitUntil(() => host.writes.some((bytes) => decoder.decode(bytes).includes("Secret Name:")), "only fresh proof opens fields");
+    host.emitInput(encoder.encode("Database\tREAL_NEW_VALUE\r")); await waitUntil(() => creates.length === 1, "fresh writer can store");
+    assert.deepEqual(creates, [{ value: "REAL_NEW_VALUE", proof: "fresh-proof" }]); assert.deepEqual(calls.input, []);
+    assert.doesNotMatch(host.writes.map((bytes) => decoder.decode(bytes)).join(""), /PRIVATE_INITIATING_TAIL|PRIVATE_DURING_REFRESH|REAL_NEW_VALUE|fresh-proof/);
+  } finally { await coordinator.stop(); }
+});
+
+test("delayed fragments of every paste-marker boundary cannot escape the actual foreground sink after Escape ambiguity", async () => {
+  const namedSecrets = { async prepare() { throw new Error("not expected"); }, async create() { throw new Error("not expected"); }, async read() { throw new Error("not expected"); } };
+  for (let split = 1; split < 6; split++) {
+    const { coordinator, host, intents, runtime, calls } = harness({ coordinatorOptions: { namedSecrets } });
+    runtime.namedSecretContext = () => ({ agent_session_id: SESSION_A, machine_id: "machine-1", workspace_binding_id: "binding-1", process_epoch: `epoch-${SESSION_A}`, terminal_connection_id: "connection-1", connect_token: "private-proof", writer_epoch: 1 });
+    try {
+      await coordinator.start([intents[0]]); host.emitInput(encoder.encode("\x11Database\t"));
+      host.emitInput(encoder.encode("\x1b[200~".slice(0, split))); await new Promise((resolve) => setTimeout(resolve, 60));
+      host.emitInput(encoder.encode("\x1b[200~".slice(split) + "CANARY_DELAYED_SECRET\nmore\x1b[201~TAIL"));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.deepEqual(calls.input, [], `split ${split}: delayed paste never reaches PTY`);
+      assert.doesNotMatch(host.writes.map((bytes) => decoder.decode(bytes)).join(""), /CANARY_DELAYED_SECRET/);
+    } finally { await coordinator.stop(); }
+  }
+});
+
+test("secret popout rejects observer, mouse switches remain local, and authority loss never forwards a password tail", async () => {
+  const namedSecrets = { async prepare() { throw new Error("not expected"); }, async create() { throw new Error("not expected"); }, async read() { throw new Error("not expected"); } };
+  const { coordinator, callbacks, host, intents, runtime, calls } = harness({ coordinatorOptions: { namedSecrets } });
+  runtime.namedSecretContext = () => ({ agent_session_id: SESSION_A, machine_id: "machine-1", workspace_binding_id: "binding-1", process_epoch: `epoch-${SESSION_A}`, terminal_connection_id: "connection-1", connect_token: "private-proof", writer_epoch: 1 });
+  try {
+    await coordinator.start(intents); host.emitInput(encoder.encode("\x11Database\tPRIVATE"));
+    host.emitInput(encoder.encode("\x1b[<0;25;1M"));
+    assert.deepEqual(calls.switch, []);
+    callbacks.onTerminalState({ ...snapshot(intents[0]), accessMode: "observer", writerEpoch: 2 });
+    host.emitInput(encoder.encode("PRIVATE_AFTER_SEAT_LOSS"));
+    await waitUntil(() => host.writes.some((bytes) => decoder.decode(bytes).includes("Connection changed")), "material cleared and safe notice remains");
+    assert.deepEqual(calls.input, []); assert.doesNotMatch(host.writes.map((bytes) => decoder.decode(bytes)).join(""), /PRIVATE/);
+    host.emitInput(encoder.encode("\x1b")); await new Promise((resolve) => setTimeout(resolve, 40));
+    host.emitInput(encoder.encode("\x11PRIVATE_REFUSED_TAIL"));
+    await waitUntil(() => host.writes.some((bytes) => decoder.decode(bytes).includes("Secrets require")), "observer refuses collection");
+    assert.deepEqual(calls.input, []);
+  } finally { await coordinator.stop(); }
+});
+
 function harness(options = {}) {
   const host = options.host ?? new FakeHost();
   const coordinator = new ForegroundTerminalCoordinator({

@@ -32,6 +32,8 @@ function topic(usage: string, body: string): string {
 }
 
 const COMMAND_HELP: Readonly<Record<string, string>> = Object.freeze({
+  secrets: topic("Usage:\n  cuna secrets operation OPERATION_ID [--json]", "Read a named-secret write outcome with the current authenticated account. No writer seat or running Machine is required; this command never creates a secret."),
+  "secrets operation": topic("Usage:\n  cuna secrets operation OPERATION_ID [--json]", "Read metadata for the same operation after a lost response, detach or process exit. A missing answer leaves the outcome unknown; never save again with a new operation."),
   executions: topic(
     "Usage:\n  cuna executions <list|get|cancel> --machine MACHINE_ID [options]",
     "Inspect remote commands by their durable execution IDs. Leader state and\nprocess ownership are separate: exited can still have live descendants.\nThese commands do not launch or repeat a command. Use an action's --help.",
@@ -477,6 +479,8 @@ function agentHelp(command: "claude" | "codex" | "opencode"): string {
       "With keyboard control, Ctrl+C goes to the agent and Ctrl+] d detaches.",
       "A read-only view and the plain fallback detach on Ctrl+C.",
       "Ctrl+C over a Cuna selection copies it instead.",
+      "Ctrl+Q opens the local named-secret popout in an attached rich writer view.",
+      "Tab changes its field, Enter saves, Escape cancels. Saving grants no agent access.",
     ].join("\n"),
   );
 }

@@ -261,6 +261,46 @@ const viewStart = (id = VIEW_ID) => encodeTerminalControl("view_started", 0n, { 
 const viewReady = (sequence = "1", id = VIEW_ID) => encodeTerminalControl("view_ready", 0n, { viewId: id, afterOutputSequence: sequence });
 const viewOutput = (sequence = 1n) => encodeTerminalFrame({ type: "output", critical: true, sequence, payload: new TextEncoder().encode("CURRENT") });
 
+test("an observer promoted in place needs a fresh issued writer proof without changing its process or owner", async () => {
+  const system = new FakeTerminalSystem(); system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  system.controlPlane.observeAgentSession = async (agentSessionId) => ({ ...observation(agentSessionId), workspaceBindingId: "33333333-3333-4333-8333-333333333333", workspaceBindingGeneration: 1 });
+  const { runtime } = createRuntime(system);
+  try {
+    const initial = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    const firstToken = [...system.grants.keys()][0];
+    system.connections[0].incoming.push(encodeTerminalControl("writer_epoch", 1n, { writerEpoch: 2, writerClientInstanceId: "client-1", accessMode: "writer" }));
+    await waitUntil(() => runtime.listTerminals()[0]?.accessMode === "writer", "server transfer arrived");
+    assert.equal(runtime.needsNamedSecretAuthorityRefresh("tab-a"), true); assert.throws(() => runtime.namedSecretContext("tab-a"), /fresh writer/);
+    system.seatOnReady.set("agent-a", { accessMode: "writer", writerEpoch: 2 });
+    const proof = await runtime.refreshNamedSecretAuthority("tab-a", new AbortController().signal);
+    assert.notEqual(proof.connect_token, firstToken); assert.equal(system.grants.has(proof.connect_token), true);
+    assert.equal(proof.writer_epoch, 2); assert.equal(proof.agent_session_id, initial.agentSessionId); assert.equal(proof.process_epoch, initial.processEpoch);
+    assert.equal(runtime.needsNamedSecretAuthorityRefresh("tab-a"), false); assert.equal(system.createCalls.length, 2);
+  } finally { await runtime.shutdown(); }
+});
+
+test("named-secret proof is redeemed-writer only, privately inspected, absent from snapshots, and refreshed on reconnect", async () => {
+  const system = new FakeTerminalSystem();
+  system.controlPlane.observeAgentSession = async (agentSessionId) => ({ ...observation(agentSessionId), workspaceBindingId: "33333333-3333-4333-8333-333333333333", workspaceBindingGeneration: 1 });
+  const { runtime } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    const first = runtime.namedSecretContext("tab-a");
+    assert.equal(system.grants.has(first.connect_token), true, "proof came from the grant authority, not a diagnostic placeholder");
+    assert.doesNotMatch(JSON.stringify(runtime.listTerminals(), (_key, value) => typeof value === "bigint" ? String(value) : value), /connect_token|runa_tc|resumeHandle/);
+    assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(first)), "connect_token"), false);
+    system.connections[0].incoming.close();
+    await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted");
+    await runtime.reconnect({ tabId: "tab-a" });
+    const second = runtime.namedSecretContext("tab-a"); assert.notEqual(first.connect_token, second.connect_token);
+    await runtime.detach("tab-a"); assert.throws(() => runtime.namedSecretContext("tab-a"));
+  } finally { await runtime.shutdown(); }
+  const observerSystem = new FakeTerminalSystem(); observerSystem.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 2 });
+  const { runtime: observer } = createRuntime(observerSystem);
+  try { await observer.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 }); assert.throws(() => observer.namedSecretContext("tab-a"), /observes/); }
+  finally { await observer.shutdown(); }
+});
+
 test("canonical view waits for reset and rendered boundary, then reconnect starts at one", async () => {
   const system = new FakeTerminalSystem(); system.canonicalViews = true;
   let release; let resetEntered = false;

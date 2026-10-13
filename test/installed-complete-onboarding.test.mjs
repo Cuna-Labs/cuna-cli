@@ -719,6 +719,7 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
     const successMatrix = [
       ["access", ["access", "status", "--json"]],
       ["capabilities", ["capabilities", "--json"]],
+      ["secrets.operation", ["secrets", "operation", ID, "--json"]],
       ["machines.list", ["machines", "list", "--json"]],
       ["records.list", ["records", "list", "--json"]],
       ["authorizations.list", ["authorizations", "list", "--machine", ID, "--json"]],
@@ -735,6 +736,12 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
         throw installedCommandFailure(id, result.stderr, sessionState.diagnostic);
       }
       assert.equal(sessionState.valid, true, `installed success matrix damaged the encrypted session pair for ${id}: ${sessionState.diagnostic}`);
+      if (id === "secrets.operation") {
+        const recovered = JSON.parse(result.stdout);
+        assert.equal(recovered.command, "secrets.operation"); assert.equal(recovered.data.operation_id, ID);
+        assert.equal(recovered.data.workspace_id, WORKSPACE_ID); assert.equal(recovered.data.state, "committed");
+        assert.equal(Object.hasOwn(recovered.data, "password"), false);
+      }
     }
     });
 
@@ -980,6 +987,7 @@ test("the candidate-bound installed CLI completes signup/login/API-key/logout ag
 });
 
 const INSTALLED_HELP_TOPICS = Object.freeze([
+  "secrets", "secrets operation",
   "executions", "executions list", "executions get", "executions cancel",
   "signup", "login", "logout", "whoami", "access", "capabilities", "observe", "share",
   "machines", "machines list", "machines create", "machines start", "machines pause",
@@ -993,6 +1001,7 @@ const INSTALLED_HELP_TOPICS = Object.freeze([
 ]);
 
 const SUPPORTED_SUCCESS_TOPICS = Object.freeze([
+  "secrets operation",
   "executions list", "executions get", "executions cancel",
   "signup", "login", "logout", "whoami", "access", "capabilities",
   "machines list", "machines create", "machines start", "machines pause", "machines resume", "machines stop", "machines delete",
@@ -1046,6 +1055,7 @@ const UNSERVED_TOPICS = new Set(["machines live-update-supervisor", "machines li
 const DELIBERATE_UNSUPPORTED_TOPICS = Object.freeze(["config set", "shell", "companion"]);
 
 const INSTALLED_FAILURE_MATRIX = Object.freeze([
+  { id: "secrets/usage", argv: ["secrets", "operation", "wrong", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "signup/usage", argv: ["signup", "extra", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "login/usage", argv: ["login", "extra", "--json"], exit: 2, code: "cuna.usage.invalid" },
   { id: "logout/usage", argv: ["logout", "extra", "--json"], exit: 2, code: "cuna.usage.invalid" },
@@ -1290,6 +1300,8 @@ function createContractAuthority() {
           executionCancelled = true; return send(200, execution());
         }
         if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/authorizations`) return send(200, { revision: 1, secret_configuration: [] });
+        if (request.method === "GET" && url.pathname === `/v1/named-secrets/operations/${ID}`) return send(200, { operation_id: ID, state: "committed", secret_id: AGENT_SESSION_ID,
+          name: "Database", workspace_id: WORKSPACE_ID, committed_at: "2026-10-12T12:00:00Z" });
         if (request.method === "POST" && url.pathname === `/v1/sessions/${ID}/agent-sessions`) { state.agentTerminated = false; state.agentName = body.name ?? "matrix-agent"; return send(201, agentSession()); }
         if (request.method === "GET" && url.pathname === `/v1/sessions/${ID}/agent-sessions`) return send(200, { items: state.agentTerminated ? [] : [agentSession()] });
         const foregroundSession = /^\/v1\/agent-sessions\/(5[0123456]000000-0000-4000-8000-000000000005)$/u.exec(url.pathname);

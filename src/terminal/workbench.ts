@@ -1,5 +1,6 @@
 import type { AppbarModel, TruthProjection } from "./appbar.js";
 import type { ViewportCellColor, ViewportCellStyle, ViewportRenderRun, ViewportSnapshot } from "./viewport.js";
+import type { SecretOverlayView } from "../named-secrets/overlay.js";
 
 const ESC = "\u001b[";
 const CUNA_ORANGE = "48;2;235;86;37";
@@ -90,6 +91,21 @@ export interface WorkbenchFrame {
   readonly appbarRows: number;
   readonly viewportRows: number;
   readonly appbarTargets: readonly WorkbenchAppbarTarget[];
+}
+
+/** Only field metadata and a constant mask enter the rendered frame. */
+export function withNamedSecretOverlay(frame: WorkbenchFrame, view: SecretOverlayView): WorkbenchFrame {
+  const rows = [...frame.rowCommands];
+  const width = Math.min(frame.columns, 64);
+  const left = Math.max(1, Math.floor((frame.columns - width) / 2) + 1);
+  const top = Math.max(frame.appbarRows + 1, Math.floor((frame.rows - 4) / 2) + 1);
+  const lines = [` ${view.focus === "name" ? ">" : " "} Secret Name: ${view.name}`, ` ${view.focus === "secret" ? ">" : " "} Password: ${view.masked}`, ` ${view.feedback}`];
+  for (let index = 0; index < lines.length && top + index <= frame.rows; index += 1) {
+    rows[top + index - 1] = `${rows[top + index - 1] ?? ""}${ESC}${top + index};${left}H${ESC}0;7m${padLine(truncateMarked(lines[index]!, width), width)}${ESC}0m`;
+  }
+  const cursorCommand = `${ESC}?25l`;
+  const text = `${ESC}?25l${ESC}H${rows.join("")}${cursorCommand}`;
+  return Object.freeze({ ...frame, rowCommands: Object.freeze(rows), cursorCommand, text, bytes: new TextEncoder().encode(text), appbarTargets: Object.freeze([]) });
 }
 
 /** The tab under a host cell, if the frame drew one there. */

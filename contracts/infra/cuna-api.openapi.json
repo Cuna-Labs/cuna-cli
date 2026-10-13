@@ -1024,7 +1024,9 @@
             "description": "Pass the exact value true to include durable readiness fields. Omission preserves the prior AgentSession response for installed CLI clients.",
             "schema": {
               "type": "string",
-              "enum": ["true"]
+              "enum": [
+                "true"
+              ]
             }
           },
           {
@@ -1034,7 +1036,9 @@
             "description": "Pass the exact value true to include runtime_evidence. Omission preserves the prior AgentSession response for installed CLI clients.",
             "schema": {
               "type": "string",
-              "enum": ["true"]
+              "enum": [
+                "true"
+              ]
             }
           }
         ],
@@ -1324,7 +1328,9 @@
             "description": "Pass the exact value true to include durable readiness fields. Omission preserves the prior AgentSession response for installed CLI clients.",
             "schema": {
               "type": "string",
-              "enum": ["true"]
+              "enum": [
+                "true"
+              ]
             }
           },
           {
@@ -1334,7 +1340,9 @@
             "description": "Pass the exact value true to include runtime_evidence. Omission preserves the prior AgentSession response for installed CLI clients.",
             "schema": {
               "type": "string",
-              "enum": ["true"]
+              "enum": [
+                "true"
+              ]
             }
           }
         ],
@@ -2003,7 +2011,8 @@
           "machine_control_not_ready",
           "control_credential_expired",
           "machine_wake_in_progress",
-          "machine_wake_pending"
+          "machine_wake_pending",
+          "machine_wake_capacity_unavailable"
         ],
         "responses": {
           "200": {
@@ -2111,6 +2120,7 @@
           "machine_control_not_ready",
           "machine_wake_in_progress",
           "machine_wake_pending",
+          "machine_wake_capacity_unavailable",
           "supervisor_upgrade_required",
           "supervisor_upgrade_machine_not_stopped",
           "supervisor_upgrade_runtime_unavailable",
@@ -2120,7 +2130,8 @@
           "supervisor_upgrade_in_progress",
           "supervisor_upgrade_authority_unavailable",
           "supervisor_upgrade_v2_not_observed",
-          "supervisor_upgrade_publish_pending"
+          "supervisor_upgrade_publish_pending",
+          "supervisor_upgrade_capacity_unavailable"
         ],
         "responses": {
           "200": {
@@ -2813,59 +2824,225 @@
       }
     },
     "/v1/sessions/{id}/observations": {
-      "parameters": [{"$ref":"#/components/parameters/SessionId"}],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
       "get": {
-        "operationId":"console.machineObservations",
-        "description":"Most recent 100 retained independently collected system events. Machine-scoped; no verified AgentSession attribution. Empty events do not establish collector readiness or complete history. Consult the summary endpoint's retention fields for known server eviction and the collector coverage counters; this history response has no standalone completeness marker.",
-        "x-sdk-exposed":false,
-        "responses":{
-          "200":{"$ref":"#/components/responses/Json"},
-          "default":{"$ref":"#/components/responses/Error"}
+        "operationId": "console.machineObservations",
+        "description": "Most recent 100 retained independently collected system events. Machine-scoped; no verified AgentSession attribution. Empty events do not establish collector readiness or complete history. Consult the summary endpoint's retention fields for known server eviction and the collector coverage counters; this history response has no standalone completeness marker.",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Json"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
         },
-        "x-runa-auth-classes":["browser_jwt","programmatic_api_key","cli_human"],
-        "x-runa-required-permissions":["run_inspector:read"],
-        "security":[{"SupabaseJwt":[]},{"RunaApiKey":[]},{"CunaHumanBearer":[]}]
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "run_inspector:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
       }
     },
     "/v1/sessions/{id}/observations/summary": {
-      "parameters": [{"$ref":"#/components/parameters/SessionId"}],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
       "get": {
-        "operationId":"console.machineObservationSummary",
-        "description":"Counts over the last hour, six hours or day, computed from retained events: a 60-bucket histogram by kind, process lifetimes from start/end pairs (by boot and process fingerprint), starts with no end seen, and collector-reported losses. scan_limited reports the 100,000-row read bound. retention_limited reports known server eviction or a window predating retention accounting; retention_evicted_total counts only deletions since accounting began. These fields are absent until the retention migration and compatible Edge are active; absence means unknown, not false or zero. Collector coverage.dropped_total counts local discards before confirmed receipt and can include an in-flight event that reached the server; it is not an exact count of database-missing rows. Neither flag proves complete Tetragon source capture. Machine-scoped; no AgentSession attribution; no program identity is stored.",
-        "x-sdk-exposed":false,
-        "parameters":[{"name":"window","in":"query","required":false,"schema":{"type":"string","enum":["1h","6h","24h"],"default":"1h"}},{"name":"kind","in":"query","required":false,"schema":{"type":"string","enum":["process_started","process_ended","file_open_requested"]}}],
-        "responses":{
-          "200":{"description":"UTF-8 JSON response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SystemActivitySummary"}}}},
-          "default":{"$ref":"#/components/responses/Error"}
+        "operationId": "console.machineObservationSummary",
+        "description": "Counts over the last hour, six hours or day, computed from retained events: a 60-bucket histogram by kind, process lifetimes from start/end pairs (by boot and process fingerprint), starts with no end seen, and collector-reported losses. scan_limited reports the 100,000-row read bound. retention_limited reports known server eviction or a window predating retention accounting; retention_evicted_total counts only deletions since accounting began. These fields are absent until the retention migration and compatible Edge are active; absence means unknown, not false or zero. Collector coverage.dropped_total counts local discards before confirmed receipt and can include an in-flight event that reached the server; it is not an exact count of database-missing rows. Neither flag proves complete Tetragon source capture. Machine-scoped; no AgentSession attribution; no program identity is stored.",
+        "x-sdk-exposed": false,
+        "parameters": [
+          {
+            "name": "window",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1h",
+                "6h",
+                "24h"
+              ],
+              "default": "1h"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "process_started",
+                "process_ended",
+                "file_open_requested"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "UTF-8 JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemActivitySummary"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
         },
-        "x-runa-auth-classes":["browser_jwt","programmatic_api_key","cli_human"],
-        "x-runa-required-permissions":["run_inspector:read"],
-        "security":[{"SupabaseJwt":[]},{"RunaApiKey":[]},{"CunaHumanBearer":[]}]
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "run_inspector:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
       }
     },
     "/v1/sessions/{id}/observations/programs": {
-      "parameters":[{"$ref":"#/components/parameters/SessionId"}],
-      "get":{
-        "operationId":"console.machineObservationPrograms",
-        "description":"Top ten observed program basenames over the selected retained window, bounded to the newest 100000 rows. scan_limited marks the scan bound; retention_limited marks a window predating retention accounting or a known oldest-first eviction. retention_evicted_total counts only deletions since accounting began. Counts describe retained rows, not complete process activity. Unknown names remain uncounted by program; no path, arguments, raw UID or parent identity is exposed. Machine-scoped without AgentSession attribution.",
-        "x-sdk-exposed":false,
-        "parameters":[{"name":"window","in":"query","required":false,"schema":{"type":"string","enum":["1h","6h","24h"],"default":"1h"}}],
-        "responses":{"200":{"description":"UTF-8 JSON response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SystemActivityPrograms"}}}},"default":{"$ref":"#/components/responses/Error"}},
-        "x-runa-auth-classes":["browser_jwt","programmatic_api_key","cli_human"],
-        "x-runa-required-permissions":["run_inspector:read"],
-        "security":[{"SupabaseJwt":[]},{"RunaApiKey":[]},{"CunaHumanBearer":[]}]
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "get": {
+        "operationId": "console.machineObservationPrograms",
+        "description": "Top ten observed program basenames over the selected retained window, bounded to the newest 100000 rows. scan_limited marks the scan bound; retention_limited marks a window predating retention accounting or a known oldest-first eviction. retention_evicted_total counts only deletions since accounting began. Counts describe retained rows, not complete process activity. Unknown names remain uncounted by program; no path, arguments, raw UID or parent identity is exposed. Machine-scoped without AgentSession attribution.",
+        "x-sdk-exposed": false,
+        "parameters": [
+          {
+            "name": "window",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1h",
+                "6h",
+                "24h"
+              ],
+              "default": "1h"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "UTF-8 JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemActivityPrograms"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "run_inspector:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
       }
     },
     "/v1/sessions/{id}/observations/programs/events": {
-      "parameters":[{"$ref":"#/components/parameters/SessionId"}],
-      "get":{
-        "operationId":"console.machineObservationProgramEvents",
-        "description":"Most recent 100 retained machine events with optional bounded program basenames, account class and exit outcome. The original observations endpoint keeps its Phase A response shape.",
-        "x-sdk-exposed":false,
-        "responses":{"200":{"description":"UTF-8 JSON response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SystemActivityProgramHistory"}}}},"default":{"$ref":"#/components/responses/Error"}},
-        "x-runa-auth-classes":["browser_jwt","programmatic_api_key","cli_human"],
-        "x-runa-required-permissions":["run_inspector:read"],
-        "security":[{"SupabaseJwt":[]},{"RunaApiKey":[]},{"CunaHumanBearer":[]}]
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "get": {
+        "operationId": "console.machineObservationProgramEvents",
+        "description": "Most recent 100 retained machine events with optional bounded program basenames, account class and exit outcome. The original observations endpoint keeps its Phase A response shape.",
+        "x-sdk-exposed": false,
+        "responses": {
+          "200": {
+            "description": "UTF-8 JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemActivityProgramHistory"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "programmatic_api_key",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "run_inspector:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "RunaApiKey": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
       }
     },
     "/v1/sessions/{id}/token-analyze": {
@@ -3782,14 +3959,20 @@
         "x-sdk-exposed": false,
         "x-runa-error-model": "problem",
         "parameters": [
-          { "$ref": "#/components/parameters/IdempotencyKey" },
-          { "$ref": "#/components/parameters/MachineCreateRequestIdV2" }
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/MachineCreateRequestIdV2"
+          }
         ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json; charset=utf-8": {
-              "schema": { "$ref": "#/components/schemas/MachineCreateV2Admission" }
+              "schema": {
+                "$ref": "#/components/schemas/MachineCreateV2Admission"
+              }
             }
           }
         },
@@ -3797,28 +3980,59 @@
           "202": {
             "description": "Durable owner-scoped Machine identity committed before provider work. The response does not assert runtime readiness.",
             "headers": {
-              "Location": { "schema": { "type": "string" } },
-              "Cache-Control": { "schema": { "const": "no-store" } },
-              "Retry-After": { "schema": { "const": "5" } }
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "const": "5"
+                }
+              }
             },
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/MachineCreateV2Receipt" }
+                "schema": {
+                  "$ref": "#/components/schemas/MachineCreateV2Receipt"
+                }
               }
             }
           },
-          "default": { "$ref": "#/components/responses/Problem" }
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
         },
-        "x-runa-auth-classes": ["browser_jwt"],
-        "x-runa-required-permissions": ["machines:create"],
-        "security": [{ "SupabaseJwt": [] }]
+        "x-runa-auth-classes": [
+          "browser_jwt"
+        ],
+        "x-runa-required-permissions": [
+          "machines:create"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          }
+        ]
       }
     },
     "/v1/machine-creates/v2/{id}": {
-      "parameters": [{
-        "name": "id", "in": "path", "required": true,
-        "schema": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
-      }],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          }
+        }
+      ],
       "get": {
         "operationId": "machineCreates.getV2",
         "x-sdk-exposed": false,
@@ -3827,19 +4041,35 @@
           "200": {
             "description": "Current owner-scoped V2 operation state; no provider effect or reconciliation is initiated by this read.",
             "headers": {
-              "Cache-Control": { "schema": { "const": "no-store" } }
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
             },
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/MachineCreateV2Receipt" }
+                "schema": {
+                  "$ref": "#/components/schemas/MachineCreateV2Receipt"
+                }
               }
             }
           },
-          "default": { "$ref": "#/components/responses/Problem" }
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
         },
-        "x-runa-auth-classes": ["browser_jwt"],
-        "x-runa-required-permissions": ["machines:read"],
-        "security": [{ "SupabaseJwt": [] }]
+        "x-runa-auth-classes": [
+          "browser_jwt"
+        ],
+        "x-runa-required-permissions": [
+          "machines:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          }
+        ]
       }
     },
     "/v1/machine-creates/{id}": {
@@ -4171,7 +4401,10 @@
           "credential_runtime_unavailable",
           "credential_provider_rejected",
           "credential_authority_unavailable",
-          "credential_outcome_unknown"
+          "credential_outcome_unknown",
+          "named_secret_grant_required",
+          "named_secret_metadata_unavailable",
+          "named_secret_outcome_unknown"
         ],
         "requestBody": {
           "required": true,
@@ -4298,7 +4531,10 @@
           "credential_runtime_unavailable",
           "credential_provider_rejected",
           "credential_authority_unavailable",
-          "credential_outcome_unknown"
+          "credential_outcome_unknown",
+          "named_secret_grant_required",
+          "named_secret_metadata_unavailable",
+          "named_secret_outcome_unknown"
         ],
         "requestBody": {
           "required": true,
@@ -4694,6 +4930,54 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MachineDefaultWorkspace"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/create-progress": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "get": {
+        "operationId": "sessions.createProgress.get",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "resource_not_found",
+          "machine_create_progress_unavailable"
+        ],
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "machines:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "summary": "Read where an owned Machine create is",
+        "description": "Current create phase, when it began, and download bytes when measurable. Process-local: after an Edge restart a creating Machine reads creating_vm with phase_started_at null. A running Machine reads ready and a failed one failed; any other status answers machine_create_progress_unavailable.",
+        "responses": {
+          "200": {
+            "description": "Create progress of the owned Machine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineCreateProgress"
                 }
               }
             }
@@ -7293,6 +7577,494 @@
           }
         ]
       }
+    },
+    "/v1/notifications": {
+      "get": {
+        "operationId": "notifications.list",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "resolved",
+                "dismissed"
+              ]
+            }
+          },
+          {
+            "name": "severity",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "error",
+                "warning",
+                "info"
+              ]
+            }
+          },
+          {
+            "name": "machine_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Uuid"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "Only notifications last raised at or after this instant.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "description": "Only notifications last raised before this instant.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque cursor returned as next_cursor by the preceding page under the same filters.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded page of the account's notifications, newest first, narrowed by the given filters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationPage"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "notifications:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/notifications/summary": {
+      "get": {
+        "operationId": "notifications.summary",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "responses": {
+          "200": {
+            "description": "Unread and open counts and the latest notifications, for the console's bell.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationSummary"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "notifications:read"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/notifications/read": {
+      "post": {
+        "operationId": "notifications.markRead",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationReadRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Marks the given open, unread notifications read. Ids the account does not own are ignored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationUpdateResult"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "notifications:write"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/notifications/read-all": {
+      "post": {
+        "operationId": "notifications.markAllRead",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "responses": {
+          "200": {
+            "description": "Marks every open, unread notification of the account read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationUpdateResult"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "notifications:write"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/notifications/{id}/dismiss": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/NotificationId"
+        }
+      ],
+      "post": {
+        "operationId": "notifications.dismiss",
+        "x-sdk-exposed": false,
+        "x-runa-error-model": "problem",
+        "responses": {
+          "200": {
+            "description": "The notification after dismissal. Dismissing a row that is already dismissed or resolved returns it unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountNotification"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "notifications:write"
+        ],
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/named-secrets": {
+      "get": {
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "x-sdk-exposed": false,
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "credentials:manage"
+        ],
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "unauthenticated",
+          "forbidden",
+          "request_body_too_large",
+          "named_secret_invalid",
+          "named_secret_context_denied",
+          "named_secret_scope_denied",
+          "named_secret_idempotency_conflict",
+          "named_secret_limit",
+          "named_secret_outcome_unknown",
+          "named_secret_operation_not_found",
+          "named_secret_metadata_unavailable"
+        ],
+        "operationId": "namedSecrets.list",
+        "summary": "List Cuna stored-only secret metadata",
+        "responses": {
+          "200": {
+            "description": "Metadata only; no delivery authority",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedSecretList"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      },
+      "post": {
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "x-sdk-exposed": false,
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "credentials:manage"
+        ],
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "unauthenticated",
+          "forbidden",
+          "request_body_too_large",
+          "named_secret_invalid",
+          "named_secret_context_denied",
+          "named_secret_scope_denied",
+          "named_secret_idempotency_conflict",
+          "named_secret_limit",
+          "named_secret_outcome_unknown",
+          "named_secret_operation_not_found",
+          "named_secret_metadata_unavailable"
+        ],
+        "operationId": "namedSecrets.create",
+        "summary": "Create a Cuna stored-only secret without overwrite",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/NamedSecretCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stable replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedSecretReceipt"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Atomic durable commit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedSecretReceipt"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Authoritative rejected receipt or admission problem",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/NamedSecretReceipt"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/named-secrets/operations/{operation_id}": {
+      "get": {
+        "security": [
+          {
+            "SupabaseJwt": []
+          },
+          {
+            "CunaHumanBearer": []
+          }
+        ],
+        "x-sdk-exposed": false,
+        "x-runa-auth-classes": [
+          "browser_jwt",
+          "cli_human"
+        ],
+        "x-runa-required-permissions": [
+          "credentials:manage"
+        ],
+        "x-runa-error-model": "problem",
+        "x-runa-problem-codes": [
+          "unauthenticated",
+          "forbidden",
+          "request_body_too_large",
+          "named_secret_invalid",
+          "named_secret_context_denied",
+          "named_secret_scope_denied",
+          "named_secret_idempotency_conflict",
+          "named_secret_limit",
+          "named_secret_outcome_unknown",
+          "named_secret_operation_not_found",
+          "named_secret_metadata_unavailable"
+        ],
+        "operationId": "namedSecrets.operation",
+        "summary": "Reconcile a Cuna secret operation",
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Owner-authenticated durable outcome; absence is not rejection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedSecretReceipt"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -7372,6 +8144,15 @@
         "schema": {
           "$ref": "#/components/schemas/Uuid"
         }
+      },
+      "NotificationId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Opaque notification identifier.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
       }
     },
     "responses": {
@@ -7440,6 +8221,101 @@
       }
     },
     "schemas": {
+      "MachineCreateProgress": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "machine_id",
+          "phase",
+          "phase_index",
+          "phase_count",
+          "phase_started_at",
+          "progress",
+          "failure_code",
+          "updated_at"
+        ],
+        "properties": {
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "creating_vm",
+              "preparing_kernel",
+              "switching_kernel",
+              "installing_supervisor",
+              "connecting",
+              "ready",
+              "failed"
+            ]
+          },
+          "phase_index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 5
+          },
+          "phase_count": {
+            "type": "integer",
+            "const": 6
+          },
+          "phase_started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "progress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "done",
+                  "total",
+                  "unit"
+                ],
+                "properties": {
+                  "done": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "total": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  "unit": {
+                    "type": "string",
+                    "enum": [
+                      "bytes"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "failure_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[a-z][a-z0-9_]{2,63}$"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "Uuid": {
         "type": "string",
         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -8637,7 +9513,11 @@
           },
           "process_observation": {
             "description": "Whether the supervisor established this process fact for the current epoch. Unknown includes pre-provenance writers and epoch mismatch; unproven means a lease settled without a child observation. This is separate from lease freshness.",
-            "enum": ["observed", "unproven", "unknown"]
+            "enum": [
+              "observed",
+              "unproven",
+              "unknown"
+            ]
           },
           "readiness_deadline_at": {
             "description": "Immutable deadline for an attested process and retained PTY. Present only when GET/list uses include_readiness=true. Expiry alone never proves process absence.",
@@ -8646,11 +9526,28 @@
           },
           "readiness_outcome": {
             "description": "Durable startup outcome returned only by opted GET/list. Reconciliation required preserves a possibly live child and its identity.",
-            "enum": ["pending", "attested", "refused", "reconciliation_required"]
+            "enum": [
+              "pending",
+              "attested",
+              "refused",
+              "reconciliation_required"
+            ]
           },
           "readiness_reason": {
             "description": "Typed reason for refusal or reconciliation. Omitted for pending and attested.",
-            "enum": ["deadline_unattested", "runtime_ended_unattested", "request_settled_unattested", "workspace_materialization_failed", "cancelled_before_dispatch", "session_executable_allowlist", "session_executable_unavailable", "session_executable_permissions", "session_executable_owner", "session_executable_location", "session_capacity_memory"]
+            "enum": [
+              "deadline_unattested",
+              "runtime_ended_unattested",
+              "request_settled_unattested",
+              "workspace_materialization_failed",
+              "cancelled_before_dispatch",
+              "session_executable_allowlist",
+              "session_executable_unavailable",
+              "session_executable_permissions",
+              "session_executable_owner",
+              "session_executable_location",
+              "session_capacity_memory"
+            ]
           },
           "readiness_settled_at": {
             "type": "string",
@@ -8687,7 +9584,13 @@
                 "minimum": 0
               },
               "process_proof": {
-                "enum": ["observed", "unproven", "not_stated", "other_process_epoch", "no_process_epoch"]
+                "enum": [
+                  "observed",
+                  "unproven",
+                  "not_stated",
+                  "other_process_epoch",
+                  "no_process_epoch"
+                ]
               }
             }
           },
@@ -9480,58 +10383,562 @@
           }
         }
       },
-      "SystemActivitySummary": {"type":"object","additionalProperties":false,"dependentRequired":{"retention_limited":["retention_evicted_total","retention_accounting_started_at"],"retention_evicted_total":["retention_limited","retention_accounting_started_at"],"retention_accounting_started_at":["retention_limited","retention_evicted_total"]},"required":["source","scope","session_attribution","window","window_start","window_end","bucket_seconds","scan_limited","totals","histogram","lifetimes","coverage"],"properties":{"source":{"type":"string","enum":["tetragon"]},"scope":{"type":"string","enum":["machine"]},"session_attribution":{"type":"string","enum":["unverified"]},"window":{"type":"string","enum":["1h","6h","24h"]},"kind":{"type":"string","enum":["process_started","process_ended","file_open_requested"]},"window_start":{"type":"string","format":"date-time"},"window_end":{"type":"string","format":"date-time"},"bucket_seconds":{"type":"integer","minimum":1},"scan_limited":{"type":"boolean"},"retention_limited":{"type":"boolean"},"retention_evicted_total":{"type":"integer","minimum":0,"maximum":9007199254740991},"retention_accounting_started_at":{"type":"string","format":"date-time"},"totals":{"type":"object","additionalProperties":false,"required":["process_started","process_ended","file_open_requested"],"properties":{"process_started":{"type":"integer","minimum":0,"maximum":9007199254740991},"process_ended":{"type":"integer","minimum":0,"maximum":9007199254740991},"file_open_requested":{"type":"integer","minimum":0,"maximum":9007199254740991}}},"histogram":{"type":"array","minItems":60,"maxItems":60,"items":{"type":"object","additionalProperties":false,"required":["start","process_started","process_ended","file_open_requested"],"properties":{"start":{"type":"string","format":"date-time"},"process_started":{"type":"integer","minimum":0,"maximum":9007199254740991},"process_ended":{"type":"integer","minimum":0,"maximum":9007199254740991},"file_open_requested":{"type":"integer","minimum":0,"maximum":9007199254740991}}}},"lifetimes":{"type":"object","additionalProperties":false,"required":["paired","no_end_seen","median_ms","p95_ms","buckets"],"properties":{"paired":{"type":"integer","minimum":0,"maximum":9007199254740991},"no_end_seen":{"type":"integer","minimum":0,"maximum":9007199254740991},"median_ms":{"type":["integer","null"],"minimum":0},"p95_ms":{"type":["integer","null"],"minimum":0},"buckets":{"type":"array","minItems":7,"maxItems":7,"items":{"type":"object","additionalProperties":false,"required":["le_ms","count"],"properties":{"le_ms":{"type":["integer","null"],"minimum":0},"count":{"type":"integer","minimum":0,"maximum":9007199254740991}}}}}},"coverage":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["boot_id","collector_epoch","dropped_total","counters","received_at"],"properties":{"boot_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"collector_epoch":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"dropped_total":{"type":"integer","minimum":0,"maximum":9007199254740991},"received_at":{"type":"string","format":"date-time"},"counters":{"type":"object","additionalProperties":false,"properties":{"oversized_record":{"type":"integer","minimum":0,"maximum":9007199254740991},"rejected_record":{"type":"integer","minimum":0,"maximum":9007199254740991},"source_eof":{"type":"integer","minimum":0,"maximum":9007199254740991},"source_read_error":{"type":"integer","minimum":0,"maximum":9007199254740991},"provider_excluded_record":{"type":"integer","minimum":0,"maximum":9007199254740991}}}}}}}},
+      "SystemActivitySummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "dependentRequired": {
+          "retention_limited": [
+            "retention_evicted_total",
+            "retention_accounting_started_at"
+          ],
+          "retention_evicted_total": [
+            "retention_limited",
+            "retention_accounting_started_at"
+          ],
+          "retention_accounting_started_at": [
+            "retention_limited",
+            "retention_evicted_total"
+          ]
+        },
+        "required": [
+          "source",
+          "scope",
+          "session_attribution",
+          "window",
+          "window_start",
+          "window_end",
+          "bucket_seconds",
+          "scan_limited",
+          "totals",
+          "histogram",
+          "lifetimes",
+          "coverage"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "tetragon"
+            ]
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "machine"
+            ]
+          },
+          "session_attribution": {
+            "type": "string",
+            "enum": [
+              "unverified"
+            ]
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "process_started",
+              "process_ended",
+              "file_open_requested"
+            ]
+          },
+          "window_start": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window_end": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "bucket_seconds": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "scan_limited": {
+            "type": "boolean"
+          },
+          "retention_limited": {
+            "type": "boolean"
+          },
+          "retention_evicted_total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "retention_accounting_started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "totals": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "process_started",
+              "process_ended",
+              "file_open_requested"
+            ],
+            "properties": {
+              "process_started": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "process_ended": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "file_open_requested": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            }
+          },
+          "histogram": {
+            "type": "array",
+            "minItems": 60,
+            "maxItems": 60,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "start",
+                "process_started",
+                "process_ended",
+                "file_open_requested"
+              ],
+              "properties": {
+                "start": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "process_started": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "process_ended": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "file_open_requested": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          },
+          "lifetimes": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "paired",
+              "no_end_seen",
+              "median_ms",
+              "p95_ms",
+              "buckets"
+            ],
+            "properties": {
+              "paired": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "no_end_seen": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "median_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "p95_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "buckets": {
+                "type": "array",
+                "minItems": 7,
+                "maxItems": 7,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "le_ms",
+                    "count"
+                  ],
+                  "properties": {
+                    "le_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 0
+                    },
+                    "count": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "coverage": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "boot_id",
+                "collector_epoch",
+                "dropped_total",
+                "counters",
+                "received_at"
+              ],
+              "properties": {
+                "boot_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "collector_epoch": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "dropped_total": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "received_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "counters": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "oversized_record": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "rejected_record": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "source_eof": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "source_read_error": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "provider_excluded_record": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
       "SystemActivityPrograms": {
-        "type":"object","additionalProperties":false,
-        "required":["source","scope","session_attribution","window","window_start","window_end","scan_limited","retention_limited","retention_evicted_total","retention_accounting_started_at","recorded_starts","unnamed_starts","programs"],
-        "properties":{
-          "source":{"type":"string","enum":["tetragon"]},"scope":{"type":"string","enum":["machine"]},
-          "session_attribution":{"type":"string","enum":["unverified"]},
-          "window":{"type":"string","enum":["1h","6h","24h"]},
-          "window_start":{"type":"string","format":"date-time"},"window_end":{"type":"string","format":"date-time"},
-          "scan_limited":{"type":"boolean"},
-          "retention_limited":{"type":"boolean"},
-          "retention_evicted_total":{"type":"integer","minimum":0,"maximum":9007199254740991},
-          "retention_accounting_started_at":{"type":"string","format":"date-time"},
-          "recorded_starts":{"type":"integer","minimum":0,"maximum":9007199254740991},
-          "unnamed_starts":{"type":"integer","minimum":0,"maximum":9007199254740991},
-          "programs":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,
-            "required":["name","starts","ends","outcomes_limited","outcomes"],"properties":{
-              "name":{"type":"string","minLength":1,"maxLength":128,"pattern":"^(?![\\s\\S]*[\\r\\n])(?!\\.{1,2}$)[A-Za-z0-9_+@.-]+$"},
-              "starts":{"type":"integer","minimum":0,"maximum":9007199254740991},
-              "ends":{"type":"integer","minimum":0,"maximum":9007199254740991},
-              "outcomes_limited":{"type":"boolean"},
-              "outcomes":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":false,
-                "required":["exit_code","signal","count"],"properties":{
-                  "exit_code":{"type":["integer","null"],"minimum":0,"maximum":255},
-                  "signal":{"type":["string","null"],"pattern":"^SIG[A-Z0-9]{1,12}$"},
-                  "count":{"type":"integer","minimum":0,"maximum":9007199254740991}
-                }}}
-            }}}
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "scope",
+          "session_attribution",
+          "window",
+          "window_start",
+          "window_end",
+          "scan_limited",
+          "retention_limited",
+          "retention_evicted_total",
+          "retention_accounting_started_at",
+          "recorded_starts",
+          "unnamed_starts",
+          "programs"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "tetragon"
+            ]
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "machine"
+            ]
+          },
+          "session_attribution": {
+            "type": "string",
+            "enum": [
+              "unverified"
+            ]
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h"
+            ]
+          },
+          "window_start": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window_end": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "scan_limited": {
+            "type": "boolean"
+          },
+          "retention_limited": {
+            "type": "boolean"
+          },
+          "retention_evicted_total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "retention_accounting_started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "recorded_starts": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "unnamed_starts": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "programs": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "starts",
+                "ends",
+                "outcomes_limited",
+                "outcomes"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^(?![\\s\\S]*[\\r\\n])(?!\\.{1,2}$)[A-Za-z0-9_+@.-]+$"
+                },
+                "starts": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "ends": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "outcomes_limited": {
+                  "type": "boolean"
+                },
+                "outcomes": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "exit_code",
+                      "signal",
+                      "count"
+                    ],
+                    "properties": {
+                      "exit_code": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0,
+                        "maximum": 255
+                      },
+                      "signal": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "pattern": "^SIG[A-Z0-9]{1,12}$"
+                      },
+                      "count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       },
       "SystemActivityProgramHistory": {
-        "type":"object","additionalProperties":false,
-        "required":["source","scope","session_attribution","has_more","events"],
-        "properties":{
-          "source":{"type":"string","enum":["tetragon"]},"scope":{"type":"string","enum":["machine"]},
-          "session_attribution":{"type":"string","enum":["unverified"]},"has_more":{"type":"boolean"},
-          "events":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,
-            "required":["id","boot_id","collector_epoch","sequence","kind","pid","occurred_at","received_at"],
-            "properties":{
-              "id":{"type":"string","format":"uuid"},"boot_id":{"type":"string","format":"uuid"},
-              "collector_epoch":{"type":"string","format":"uuid"},
-              "sequence":{"type":"integer","minimum":1,"maximum":9007199254740991},
-              "kind":{"type":"string","enum":["process_started","process_ended","file_open_requested"]},
-              "pid":{"type":"integer","minimum":1,"maximum":4294967295},
-              "occurred_at":{"type":"string","format":"date-time"},
-              "received_at":{"type":"string","format":"date-time"},
-              "program_name":{"type":"string","minLength":1,"maxLength":128,"pattern":"^(?![\\s\\S]*[\\r\\n])(?!\\.{1,2}$)[A-Za-z0-9_+@.-]+$"},
-              "parent_program_name":{"type":"string","minLength":1,"maxLength":128,"pattern":"^(?![\\s\\S]*[\\r\\n])(?!\\.{1,2}$)[A-Za-z0-9_+@.-]+$"},
-              "uid_class":{"type":"string","enum":["root","service","user"]},
-              "exit_code":{"type":"integer","minimum":0,"maximum":255},
-              "signal":{"type":"string","pattern":"^SIG[A-Z0-9]{1,12}$"}
-            }}}
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "scope",
+          "session_attribution",
+          "has_more",
+          "events"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "tetragon"
+            ]
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "machine"
+            ]
+          },
+          "session_attribution": {
+            "type": "string",
+            "enum": [
+              "unverified"
+            ]
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "events": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "boot_id",
+                "collector_epoch",
+                "sequence",
+                "kind",
+                "pid",
+                "occurred_at",
+                "received_at"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "boot_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "collector_epoch": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "sequence": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "process_started",
+                    "process_ended",
+                    "file_open_requested"
+                  ]
+                },
+                "pid": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295
+                },
+                "occurred_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "received_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "program_name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^(?![\\s\\S]*[\\r\\n])(?!\\.{1,2}$)[A-Za-z0-9_+@.-]+$"
+                },
+                "parent_program_name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^(?![\\s\\S]*[\\r\\n])(?!\\.{1,2}$)[A-Za-z0-9_+@.-]+$"
+                },
+                "uid_class": {
+                  "type": "string",
+                  "enum": [
+                    "root",
+                    "service",
+                    "user"
+                  ]
+                },
+                "exit_code": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255
+                },
+                "signal": {
+                  "type": "string",
+                  "pattern": "^SIG[A-Z0-9]{1,12}$"
+                }
+              }
+            }
+          }
         }
       },
       "RecordPage": {
@@ -10940,41 +12347,154 @@
       "MachineCreateV2Admission": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["protocol_version", "name", "agent", "vcpus", "memory_mib", "terminal", "runtime_port", "outbound_policy", "token_saving", "capture_tool_io"],
+        "required": [
+          "protocol_version",
+          "name",
+          "agent",
+          "vcpus",
+          "memory_mib",
+          "terminal",
+          "runtime_port",
+          "outbound_policy",
+          "token_saving",
+          "capture_tool_io"
+        ],
         "properties": {
-          "protocol_version": { "const": 2 },
-          "name": { "type": "string", "minLength": 1, "maxLength": 80 },
-          "agent": { "type": ["string", "null"], "enum": ["opencode", "claude-code", "codex", null] },
-          "vcpus": { "type": "integer", "minimum": 1, "maximum": 8 },
-          "memory_mib": { "type": "integer", "minimum": 512, "maximum": 16384 },
-          "terminal": { "const": false, "description": "V2 terminal checkpoint creation is unavailable until shell and PTY custody can be attested; use the existing V1 terminal create contract." },
-          "runtime_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
-          "outbound_policy": { "anyOf": [{ "$ref": "#/components/schemas/OutboundPolicy" }, { "type": "null" }] },
+          "protocol_version": {
+            "const": 2
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "opencode",
+              "claude-code",
+              "codex",
+              null
+            ]
+          },
+          "vcpus": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8
+          },
+          "memory_mib": {
+            "type": "integer",
+            "minimum": 512,
+            "maximum": 16384
+          },
+          "terminal": {
+            "const": false,
+            "description": "V2 terminal checkpoint creation is unavailable until shell and PTY custody can be attested; use the existing V1 terminal create contract."
+          },
+          "runtime_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "outbound_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OutboundPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "token_saving": {
-            "type": "object", "additionalProperties": false,
-            "required": ["json_array", "logs", "search_results", "git_diff"],
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "json_array",
+              "logs",
+              "search_results",
+              "git_diff"
+            ],
             "properties": {
-              "json_array": { "type": "boolean" },
-              "logs": { "type": "boolean" },
-              "search_results": { "type": "boolean" },
-              "git_diff": { "type": "boolean" }
+              "json_array": {
+                "type": "boolean"
+              },
+              "logs": {
+                "type": "boolean"
+              },
+              "search_results": {
+                "type": "boolean"
+              },
+              "git_diff": {
+                "type": "boolean"
+              }
             }
           },
-          "capture_tool_io": { "type": "boolean" }
+          "capture_tool_io": {
+            "type": "boolean"
+          }
         }
       },
       "MachineCreateV2Receipt": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["protocol_version", "id", "machine_id", "status", "phase", "reason_code", "updated_at"],
+        "required": [
+          "protocol_version",
+          "id",
+          "machine_id",
+          "status",
+          "phase",
+          "reason_code",
+          "updated_at"
+        ],
         "properties": {
-          "protocol_version": { "const": 2 },
-          "id": { "$ref": "#/components/schemas/Uuid" },
-          "machine_id": { "$ref": "#/components/schemas/Uuid" },
-          "status": { "enum": ["pending", "blocked", "succeeded", "failed"] },
-          "phase": { "enum": ["queued", "creating_runtime", "reconciling_runtime", "provisioning_queued", "provisioning", "cleanup_pending", "machine_running", "failed"], "description": "Authoritative Machine creation phase. machine_running does not assert AgentSession or PTY readiness." },
-          "reason_code": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
-          "updated_at": { "type": "string", "format": "date-time" }
+          "protocol_version": {
+            "const": 2
+          },
+          "id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "machine_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "blocked",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "phase": {
+            "enum": [
+              "queued",
+              "creating_runtime",
+              "reconciling_runtime",
+              "provisioning_queued",
+              "provisioning",
+              "cleanup_pending",
+              "machine_running",
+              "failed"
+            ],
+            "description": "Authoritative Machine creation phase. machine_running does not assert AgentSession or PTY readiness."
+          },
+          "reason_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[a-z][a-z0-9_.-]{0,127}$"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "MachineCreateRequest": {
@@ -15738,6 +17258,479 @@
             }
           }
         }
+      },
+      "AccountNotification": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "One durable account notification. The database writes it when the fact it reports is recorded (a refused launch, a restart, an invitation, an agent sign-in); one row per dedup key while the condition is current. status=open until the person dismisses it or the condition clears (status=resolved). A dismissed row may also carry resolved_at when its condition cleared later. A row is never reopened; a condition that returns after resolution is a new row.",
+        "required": [
+          "id",
+          "kind",
+          "severity",
+          "status",
+          "reason_code",
+          "machine_id",
+          "machine_name",
+          "agent_session_id",
+          "occurrences",
+          "first_raised_at",
+          "last_raised_at",
+          "seen_at",
+          "resolved_at",
+          "dismissed_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "agent_session.launch_refused",
+              "agent_session.start_unconfirmed",
+              "agent_session.ended_by_restart",
+              "machine.supervisor_update_required",
+              "machine.start_refused",
+              "machine.action_refused",
+              "machine.action_unconfirmed",
+              "invitation.received",
+              "invitation.accepted",
+              "invitation.declined",
+              "invitation.revoked",
+              "agent_login.captured",
+              "agent_login.revoked"
+            ]
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "error",
+              "warning",
+              "info"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "resolved",
+              "dismissed"
+            ]
+          },
+          "reason_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_.]{0,127}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "machine_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "machine_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "agent_session_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "occurrences": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "first_raised_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_raised_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "seen_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolved_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dismissed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "NotificationPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Newest first by last_raised_at, then id. next_cursor is null exactly when has_more is false.",
+        "required": [
+          "items",
+          "has_more",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/AccountNotification"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "NotificationSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Counts over open notifications, and the five most recently raised notifications of any status.",
+        "required": [
+          "unread_count",
+          "open_count",
+          "latest"
+        ],
+        "properties": {
+          "unread_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "open_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "latest": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "$ref": "#/components/schemas/AccountNotification"
+            }
+          }
+        }
+      },
+      "NotificationReadRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ids"
+        ],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/Uuid"
+            }
+          }
+        }
+      },
+      "NotificationUpdateResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "How many notifications this request changed. Repeating it changes nothing and answers 0.",
+        "required": [
+          "updated"
+        ],
+        "properties": {
+          "updated": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "NamedSecretMetadata": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "storage": {
+            "const": "cuna"
+          },
+          "access": {
+            "const": "none"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "workspace_id",
+          "created_at",
+          "storage",
+          "access"
+        ]
+      },
+      "NamedSecretList": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "secrets": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/NamedSecretMetadata"
+            }
+          }
+        },
+        "required": [
+          "secrets"
+        ]
+      },
+      "NamedSecretReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "state": {
+            "enum": [
+              "committed",
+              "rejected"
+            ]
+          },
+          "secret_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "committed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "reason": {
+            "type": "string",
+            "pattern": "^named_secret_[a-z_]+$"
+          }
+        },
+        "required": [
+          "operation_id",
+          "state",
+          "secret_id",
+          "name",
+          "workspace_id",
+          "committed_at"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "committed"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "secret_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "committed_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "not": {
+                "required": [
+                  "reason"
+                ]
+              }
+            },
+            "else": {
+              "required": [
+                "reason"
+              ],
+              "properties": {
+                "secret_id": {
+                  "type": "null"
+                },
+                "name": {
+                  "type": "null"
+                },
+                "workspace_id": {
+                  "type": "null"
+                },
+                "committed_at": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "NamedSecretCreate": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$",
+            "maxLength": 64
+          },
+          "password": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "writeOnly": true
+          },
+          "context": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "agent_session_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "machine_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "workspace_binding_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "process_epoch": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "terminal_connection_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "connect_token": {
+                "type": "string",
+                "pattern": "^runa_tc_[A-Za-z0-9_-]{43}$",
+                "writeOnly": true
+              },
+              "writer_epoch": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "agent_session_id",
+              "machine_id",
+              "workspace_binding_id",
+              "process_epoch",
+              "terminal_connection_id",
+              "connect_token",
+              "writer_epoch"
+            ]
+          }
+        },
+        "required": [
+          "operation_id",
+          "name",
+          "password",
+          "context"
+        ]
       }
     }
   },

@@ -58,6 +58,7 @@ const RESULT_COMMAND = Object.freeze({
   "api-keys list": "api-keys.list",
   "api-keys create": "api-keys.create",
   "api-keys revoke": "api-keys.revoke",
+  "secrets operation": "secrets.operation",
   "agent-sessions list": "agent-sessions.list",
   "agent-sessions get": "agent-sessions.get",
   "agent-sessions create": "agent-sessions.create",

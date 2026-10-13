@@ -185,6 +185,7 @@ const AVAILABLE_NOW_ENTRIES = `  signup                               Create a w
   authorizations list --machine ID     List active credential injection rules
   api-keys create --name NAME --yes    Create an API key and print its secret once
   api-keys list                        List API-key metadata without secret values
+  secrets operation ID                Check a named-secret outcome without another write
   api-keys revoke ID --yes             Revoke one API key when server-advertised
   agent-sessions list --machine ID     List child agent processes
   agent-sessions create --machine ID --workspace-binding-id ID --workspace-generation N

@@ -4,6 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 import { EXIT_CODES, memoryStreams, runCli } from "../dist/index.js";
 import { renderFullHelp } from "../dist/cli/help.js";
@@ -23,11 +24,21 @@ const contract = JSON.parse(readFileSync(new URL("../contracts/infra/cuna-api.op
 const identity = JSON.parse(readFileSync(new URL("../contracts/infra/cuna-api.openapi.identity.json", import.meta.url), "utf8"));
 const declared = new Set(CLI_ROUTE_REGISTRY.flatMap((route) => route.operations));
 
-test("the vendored contract is the deployed producer's, and the compiled operation list is read from it", () => {
-  // Live Edge C4.17 (Fly v249), /healthz contract sha256 at 2026-10-04 02:43Z.
-  assert.equal(identity.producer_revision, "cdd7e9a8743f12eac8c3be3214e6cdbf514c3786");
-  assert.equal(identity.infra_openapi_canonical_sha256, "7805d96c670f6b9134598e1ccbd0afff1cb3d8a6803ee2107df1fb78e6170818");
-  assert.equal(identity.producer_content_state, "committed");
+test("vendored contract identity binds its actual bytes and content state without claiming deployment", () => {
+  const bytes = readFileSync(new URL("../contracts/infra/cuna-api.openapi.json", import.meta.url));
+  const canonical = (value) => Array.isArray(value) ? value.map(canonical) : value !== null && typeof value === "object"
+    ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])])) : value;
+  assert.equal(identity.infra_openapi_raw_sha256, createHash("sha256").update(bytes).digest("hex"));
+  assert.equal(identity.infra_openapi_canonical_sha256, createHash("sha256").update(JSON.stringify(canonical(contract))).digest("hex"));
+  assert.equal(identity.producer_repository, "Cuna-Labs/infra-proxy-mvp");
+  if (identity.producer_content_state === "working_tree_product_delta") {
+    assert.match(identity.producer_base_revision, /^[a-f0-9]{40}$/u);
+    assert.equal(identity.producer_full_tree, null);
+    assert.equal(identity.producer_revision, undefined, "dirty source must not claim an immutable revision");
+  } else {
+    assert.equal(identity.producer_content_state, "committed");
+    assert.match(identity.producer_revision, /^[a-f0-9]{40}$/u);
+  }
   const fromArtifact = Object.entries(contract.paths).flatMap(([path, row]) =>
     Object.keys(row).filter((method) => ["get", "put", "post", "delete", "options", "head", "patch", "trace"].includes(method))
       .map((method) => `${method.toUpperCase()} ${path}`)).sort();
