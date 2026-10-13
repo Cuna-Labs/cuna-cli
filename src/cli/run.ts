@@ -196,7 +196,7 @@ async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw" 
   if (signal.aborted) return false;
   const prompt = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
   try {
-    const answer = await prompt.question(`No compatible machine is available. Create one for ${agent}? [y/N] `, { signal });
+    const answer = await prompt.question(`No compatible machine is available. Create one for ${agent}? [y/n] `, { signal });
     return answer.trim().toLocaleLowerCase("en-US") === "y" || answer.trim().toLocaleLowerCase("en-US") === "yes";
   } catch {
     return false;
@@ -219,10 +219,10 @@ export async function selectInstallTetragon(signal: AbortSignal, io: {
   const onClose=():void=>closed.abort(); prompt.once("close",onClose);
   try {
     for (;;) {
-      const answer = (await prompt.question("Install Tetragon? Yes/No: ", { signal:questionSignal })).trim().toLocaleLowerCase("en-US");
+      const answer = (await prompt.question("Install Tetragon? [y/n] ", { signal:questionSignal })).trim().toLocaleLowerCase("en-US");
       if (answer === "yes" || answer === "y") return { kind: "choice", installTetragon: true };
       if (answer === "no" || answer === "n") return { kind: "choice", installTetragon: false };
-      output.write("Choose Yes or No. This does not change the mandatory sandbox.\n");
+      output.write("Please answer y/yes or n/no.\n");
     }
   } catch { return { kind: "cancel" }; } finally {
     prompt.removeListener("close",onClose); prompt.close();

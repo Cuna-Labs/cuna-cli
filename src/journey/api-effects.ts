@@ -316,7 +316,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
           }
           if (input.selectInstallTetragon === undefined) throw fail("cuna.journey.machine_create_choice_required", "Choose whether to install Tetragon before creating this Machine.", EXIT_CODES.usage);
           const answer = await input.selectInstallTetragon(signal); signal.throwIfAborted();
-          if (answer.kind === "choice" && typeof answer.installTetragon !== "boolean") throw fail("cuna.journey.machine_create_choice_required","Choose Yes or No before creating this Machine.",EXIT_CODES.usage);
+          if (answer.kind === "choice" && typeof answer.installTetragon !== "boolean") throw fail("cuna.journey.machine_create_choice_required","Choose y/yes or n/no before creating this Machine.",EXIT_CODES.usage);
           return answer;
         }, { releaseCompleted });
         preparedCreates.set(prepared.requestId, { scope, prepared }); return prepared;

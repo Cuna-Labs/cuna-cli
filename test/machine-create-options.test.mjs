@@ -151,6 +151,18 @@ test("normal first create/readiness then first explicit new or changed template 
  const next=await restarted.prepareMachineCreate({identity:nextIdentity,signal});assert.equal(next.createAttempt,2);await restarted.createMachine({requestedAgent:nextIdentity.agent,...next,onDispatch(){},signal});assert.equal(posts,2);assert.equal(prompts,2);assert.ok(readIds.length>=1);
  }
 });
+test("Tetragon readline accepts complete case-insensitive answers and reprompts partial words",async()=>{
+ for(const answer of ["y","Y","yes","Yes","YES","yEs","  Yes  ","n","N","no","No","NO","nO","  No  "]){
+  const input=new PassThrough(), output=new PassThrough();input.isTTY=true;let text="";output.on("data",chunk=>{text+=chunk;});
+  const pending=selectInstallTetragon(signal,{input,output});input.write(answer+"\n");
+  assert.deepEqual(await pending,{kind:"choice",installTetragon:answer.trim().toLowerCase().startsWith("y")});
+  assert.match(text,/Install Tetragon\? \[y\/n\]/u);input.destroy();output.destroy();
+ }
+ const input=new PassThrough(), output=new PassThrough();input.isTTY=true;let text="";output.on("data",chunk=>{text+=chunk;});
+ const pending=selectInstallTetragon(signal,{input,output});input.write("yesterday\n");
+ await new Promise(resolve=>setImmediate(resolve));assert.match(text,/Please answer y\/yes or n\/no/u);
+ input.write("NO\n");assert.deepEqual(await pending,{kind:"choice",installTetragon:false});input.destroy();output.destroy();
+});
 test("built-in prompt rejects nonTTY before output and cancels EOF without waiting for external abort",async()=>{
  const input=new PassThrough(), output=new PassThrough();let text="";output.on("data",chunk=>{text+=chunk;});
  await assert.rejects(selectInstallTetragon(signal,{input,output}),error=>error.code==="cuna.journey.machine_create_choice_required"&&error.exitCode===2&&error.hint.includes("--install-tetragon true|false"));assert.equal(text,"");

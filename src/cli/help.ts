@@ -290,7 +290,7 @@ Automatic local-to-cloud journey:
   choosing a target or retrying with a second identity.
   --credential-binding ID is required exactly when --auth-mode is credential_binding.
   --install-tetragon true|false selects Tetragon only when creating a Machine.
-  Without this option, supported servers ask Install Tetragon? Yes/No before creation.
+  Without this option, supported servers ask Install Tetragon? [y/n] before creation.
   This choice does not change the mandatory sandbox or promise cold-start readiness.
   OpenCode is interactive-only: after Cuna attaches its remote terminal, use
   /connect to choose and sign in to a provider, then /models to choose a model.
