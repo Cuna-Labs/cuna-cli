@@ -620,6 +620,93 @@ test("bare cuna explains a replaced terminal link without exposing resume-handle
   assert.doesNotMatch(visible, /terminal_connection_resume_handle_conflict|request_id|Re-read the resource/u);
 });
 
+test("a waiting terminal refusal rereads the exact selected session after refusal and renders its recorded end", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  const reads = [], mutations = [];
+  let refused = false, attachments = 0;
+  const client = fakeClient({ async getAgentSession(id, signal) {
+    assert.equal(refused, true, "the reread must follow the refused attach, not reuse its earlier readiness");
+    assert.ok(signal instanceof AbortSignal, "the refusal reread must stay bounded");
+    reads.push(id);
+    return agentSession({ id, agent: "claude-code", machineId: MACHINE_ID,
+      requestState: "terminal", processState: "exited", terminalReason: "process_exited",
+      runtimeObservedAt: "2026-09-29T17:41:11.500Z" });
+  } });
+  for (const name of ["createMachine", "transitionMachine", "replaceMachineSupervisor", "deleteMachine",
+    "createAgentSession", "createTerminalConnection", "terminateAgentSession", "renameAgentSession"]) {
+    client[name] = async () => { mutations.push(name); throw new Error("unexpected mutation"); };
+  }
+  const exit = await runCli([], {
+    streams: interactive.streams, platform, env: { CUNA_API_KEY: API_KEY }, clientFactory: () => client,
+    rootJourneyRunner: async () => ({ kind: "attach", agentSessionId: FOREGROUND_SESSION_A, agent: "claude-code" }),
+    foregroundTerminalRunner: async () => { attachments++; refused = true; throw new CunaError({
+      code: "cuna.runtime.capability_unknown", message: "The server cannot currently prove this capability.",
+      exitCode: EXIT_CODES.policy, details: { capability_id: "terminal_connections.create", reason_code: "supervisor_registry_unavailable" },
+    }); },
+  });
+  assert.equal(exit, EXIT_CODES.policy);
+  assert.deepEqual(reads, [FOREGROUND_SESSION_A]);
+  assert.deepEqual(mutations, []);
+  assert.equal(attachments, 1, "a recorded end must not cause an automatic retry");
+  const visible = stripAnsi(interactive.stderr());
+  assert.match(visible, /CUNA  Claude exited at 17:41 UTC · this session has ended/u);
+  assert.match(visible, /records its process as exited \(process_exited\)/u);
+  assert.match(visible, /cuna claude --new-session/u);
+  assert.ok(visible.includes(`cuna agent-sessions get ${FOREGROUND_SESSION_A}`));
+  assert.doesNotMatch(visible, /Machine terminal supervisor unavailable|current state before retrying|No terminal connection was created|remote AgentSession was not changed/u);
+});
+
+test("a waiting terminal refusal preserves unknown when its bounded exact-session reread fails or cannot prove an end", async () => {
+  for (const outcome of ["error", "mismatched", "unavailable", "running"]) {
+    const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+    const reads = [], mutations = [];
+    let attachments = 0;
+    const client = fakeClient({ async getAgentSession(id, signal) {
+      reads.push(id); assert.ok(signal instanceof AbortSignal);
+      if (outcome === "error") throw new Error("synthetic read failure");
+      if (outcome === "unavailable") return undefined;
+      return agentSession({ id: outcome === "mismatched" ? FOREGROUND_SESSION_B : id,
+        requestState: outcome === "running" ? "launched" : "terminal",
+        processState: outcome === "running" ? "running" : "exited", agent: "claude-code" });
+    } });
+    for (const name of ["createMachine", "transitionMachine", "replaceMachineSupervisor", "deleteMachine",
+      "createAgentSession", "createTerminalConnection", "terminateAgentSession", "renameAgentSession"]) {
+      client[name] = async () => { mutations.push(name); throw new Error("unexpected mutation"); };
+    }
+    const exit = await runCli([], {
+      streams: interactive.streams, platform, env: { CUNA_API_KEY: API_KEY }, clientFactory: () => client,
+      rootJourneyRunner: async () => ({ kind: "attach", agentSessionId: FOREGROUND_SESSION_A, agent: "claude-code" }),
+      foregroundTerminalRunner: async () => { attachments++; throw new CunaError({
+        code: "cuna.runtime.capability_unknown", message: "The server cannot currently prove this capability.",
+        exitCode: EXIT_CODES.policy, details: { capability_id: "terminal_connections.create", reason_code: "supervisor_registry_unavailable" },
+      }); },
+    });
+    assert.equal(exit, EXIT_CODES.policy, outcome);
+    assert.deepEqual(reads, [FOREGROUND_SESSION_A], outcome);
+    assert.deepEqual(mutations, [], outcome);
+    assert.equal(attachments, 1, outcome);
+    const visible = stripAnsi(interactive.stderr());
+    assert.match(visible, /This AgentSession's terminal control is unavailable/u, outcome);
+    assert.match(visible, /Check this AgentSession's current state before retrying; it may have ended/u, outcome);
+    assert.ok(visible.includes(`cuna agent-sessions get ${FOREGROUND_SESSION_A}`), outcome);
+    assert.doesNotMatch(visible, /Claude exited|this session has ended|Machine terminal supervisor unavailable|No terminal connection was created|remote AgentSession was not changed/u, outcome);
+  }
+});
+
+test("a successful foreground attachment does not reread the session for refusal recovery", async () => {
+  const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
+  let reads = 0, attachments = 0;
+  const exit = await runCli([], {
+    streams: interactive.streams, platform, env: { CUNA_API_KEY: API_KEY },
+    clientFactory: () => fakeClient({ async getAgentSession() { reads++; throw new Error("unexpected recovery read"); } }),
+    rootJourneyRunner: async () => ({ kind: "attach", agentSessionId: FOREGROUND_SESSION_A, agent: "claude-code" }),
+    foregroundTerminalRunner: async () => { attachments++; },
+  });
+  assert.equal(exit, EXIT_CODES.success);
+  assert.equal(attachments, 1);
+  assert.equal(reads, 0);
+});
+
 test("foreground Cuna explains unavailable terminal control without asserting unobserved effects", async () => {
   const interactive = memoryStreams({ stdoutIsTTY: true, stdinIsTTY: true, stderrIsTTY: true });
   const exit = await runCli([], {
@@ -647,7 +734,7 @@ test("foreground Cuna explains unavailable terminal control without asserting un
 
   assert.equal(exit, EXIT_CODES.policy);
   const visible = stripAnsi(interactive.stderr());
-  assert.match(visible, /CUNA  Machine terminal supervisor unavailable/u);
+  assert.match(visible, /CUNA  This AgentSession's terminal control is unavailable/u);
   assert.doesNotMatch(visible, /No terminal connection was created|remote AgentSession was not changed/u);
   assert.match(visible, /Check this AgentSession's current state before retrying; it may have ended/u);
   assert.doesNotMatch(visible, /Error \[/u);

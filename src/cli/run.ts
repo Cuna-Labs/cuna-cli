@@ -807,9 +807,9 @@ interface RecordedSessionEnd {
 }
 
 /**
- * `terminal_owner_unrecoverable` names two facts the refusal cannot tell
- * apart; the session's own record can. Read it once, bounded, and use it only
- * when it says the process ended. A failed or slow read keeps the general text.
+ * A terminal refusal can race the selected process ending; the session's own
+ * record can distinguish it. Read once, bounded, and use it only when the
+ * selected AgentSession records an ended process. A failed or slow read keeps uncertainty.
  */
 async function recordedSessionEnd(
   client: CunaApiClient | undefined,
@@ -878,7 +878,7 @@ function writeTerminalSupervisorReadiness(
     stream.write(`${accent("◆ CUNA")}  Terminal connection not ready\n`);
     stream.write("Cuna could not verify this machine's terminal authority yet.\n");
   } else {
-    stream.write(`${accent("◆ CUNA")}  Machine terminal supervisor unavailable\n`);
+    stream.write(`${accent("◆ CUNA")}  This AgentSession's terminal control is unavailable\n`);
     stream.write("Cuna could not verify live terminal control for this AgentSession.\n");
   }
   // This error can follow a redeemed connection and an automatic retry. Its
@@ -2532,12 +2532,15 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // that host classification is conservative; render the same plain-language
     // recovery instead.
     if (interactiveCloseUi && supervisorReadiness !== undefined) {
+      const recordedEnd = supervisorReadiness === "ended" || supervisorReadiness === "waiting"
+        ? await recordedSessionEnd(refusalReader, terminalSessionIds)
+        : undefined;
       writeTerminalSupervisorReadiness(
         streams.stderr,
         interactiveCloseColor && streams.stderrIsTTY === true,
-        supervisorReadiness,
+        recordedEnd === undefined ? supervisorReadiness : "ended",
         terminalSessionIds,
-        supervisorReadiness === "ended" ? await recordedSessionEnd(refusalReader, terminalSessionIds) : undefined,
+        recordedEnd,
       );
       // An unattested owner is a refusal of this attempt, not a network
       // condition: an automatic retry cannot change it, so the exit code must
