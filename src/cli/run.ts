@@ -9,10 +9,9 @@ import { Writable } from "node:stream";
 import { terminalCellWidth } from "../terminal/cell-width.js";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { mkdir } from "node:fs/promises";
-import { createHash } from "node:crypto";
 import { launchRemoteWorkspaceSession } from "../journey/remote-workspace.js";
-import { join, resolve } from "node:path";
+import { selectManagedWorkspaceRoot } from "../journey/managed-workspace-root.js";
+import { resolve } from "node:path";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
 import type { AgentSession } from "../api/contracts.js";
@@ -588,18 +587,6 @@ function sameHostPath(left: string, right: string, platform: NodeJS.Platform): b
   return platform === "win32"
     ? canonicalLeft.toLocaleLowerCase("en-US") === canonicalRight.toLocaleLowerCase("en-US")
     : canonicalLeft === canonicalRight;
-}
-
-function managedWorkspaceScope(intent: ReconciledAgentJourneyIntent, machineId?: string): string {
-  if (machineId !== undefined) {
-    const digest = createHash("sha256").update(machineId, "utf8").digest("hex").slice(0, 16);
-    return `machine-${digest}`;
-  }
-  if (intent.machine.kind === "exact-name") {
-    const digest = createHash("sha256").update(intent.machine.name, "utf8").digest("hex").slice(0, 16);
-    return `machine-${digest}`;
-  }
-  return `${intent.agent}-${intent.machine.kind}`;
 }
 
 type BrowserLoginRemoteProbe = Readonly<{
@@ -1307,26 +1294,6 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       : undefined;
     const remoteMenuLaunch = journeyIntent?.target === "reconcile" && journeyIntent.newSession &&
       dependencies.managedWorkspaceMachineId !== undefined && journeyIntent.localPath === undefined;
-    if (journeyIntent?.target === "reconcile" && journeyIntent.localPath === undefined && !remoteMenuLaunch) {
-      const homeDirectory = platformHomeDirectory(effectiveEnvironment, process.platform);
-      if (homeDirectory !== undefined && sameHostPath(process.cwd(), homeDirectory, process.platform)) {
-        // Keep HOME safe without forcing every machine to share one local
-        // binding. Exact machine selections get a stable private root; the
-        // automatic root remains stable so its committed binding can guide
-        // later automatic selection.
-        // Do not nest these roots under the former single-root `~/Cuna`.
-        // Workspace binding discovery intentionally walks ancestors, so a
-        // child below that already-bound root would inherit its record and
-        // then fail the child-root compare-and-swap.
-        const managedWorkspace = join(
-          homeDirectory,
-          "Cuna Workspaces",
-          managedWorkspaceScope(journeyIntent, dependencies.managedWorkspaceMachineId),
-        );
-        await mkdir(managedWorkspace, { recursive: true });
-        journeyIntent = Object.freeze({ ...journeyIntent, localPath: managedWorkspace });
-      }
-    }
 
     const foreground = foregroundSelection(parsed);
     if ((foreground !== undefined || journeyIntent?.target === "reconcile") &&
@@ -2065,6 +2032,15 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         });
       }
       const journeyScope = Object.freeze({ userId: identity.id, workspaceId });
+      if (journeyIntent.localPath === undefined && !remoteMenuLaunch) {
+        const homeDirectory = platformHomeDirectory(effectiveEnvironment, process.platform);
+        if (homeDirectory !== undefined && sameHostPath(process.cwd(), homeDirectory, process.platform)) {
+          const localPath = await selectManagedWorkspaceRoot({ homeDirectory, baseUrl: config.baseUrl, profileId: config.profile,
+            userId: identity.id, workspaceId, intent: journeyIntent,
+            ...(dependencies.managedWorkspaceMachineId === undefined ? {} : { machineId: dependencies.managedWorkspaceMachineId }) });
+          journeyIntent = Object.freeze({ ...journeyIntent, localPath });
+        }
+      }
       if (remoteMenuLaunch && dependencies.managedWorkspaceMachineId !== undefined) {
         const picked = await pickProviderPreset(dependencies.signal);
         if (picked === undefined) {
