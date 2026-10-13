@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { lstat, readdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import test from "node:test";
+import { createOwnedTempDirectory, removeOwnedTempDirectory } from "../scripts/lib/owned-temp.mjs";
 
 import { EXIT_CODES, CunaError } from "../dist/index.js";
 import { deriveMachineCreateIdentity } from "../dist/journey/derived-identity.js";
 import { createApiAgentJourneyEffects } from "../dist/journey/api-effects.js";
 import { orchestrateAgentJourney } from "../dist/journey/orchestrator.js";
+import { DurableSyncJournal, inspectSyncJournal } from "../dist/sync/journal.js";
 
 const USER = "11111111-1111-4111-8111-111111111111";
 const WORKSPACE = "22222222-2222-4222-8222-222222222222";
@@ -291,8 +293,8 @@ function journey(client, attached, stateDirectory, workspace = workspaceReceipt(
  * created a duplicate would also return a perfectly good machine.
  */
 test("an interrupted journey re-run reconciles its own create instead of creating a second machine", async (t) => {
-  const stateDirectory = await mkdtemp(join(tmpdir(), "cuna-create-identity-"));
-  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const stateDirectory = await createOwnedTempDirectory("cuna-create-identity-");
+  t.after(() => removeOwnedTempDirectory(stateDirectory));
   const client = producer();
   const attached = [];
 
@@ -341,6 +343,23 @@ test("an interrupted journey re-run reconciles its own create instead of creatin
     profileRevision: 2,
   });
   assert.match(childCreates[0][1].operationId, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u);
+  // Deletion retries cannot hide a producer that returned while still owning
+  // the journal. Reacquire its actual native writer before temporary cleanup.
+  const parent = join(stateDirectory, "provider-launch-v2");
+  const entries = await readdir(parent);
+  assert.equal(entries.length, 1);
+  const directory = join(parent, entries[0]);
+  await assert.rejects(lstat(join(directory, "writer.lease")), { code: "ENOENT" });
+  const view = await inspectSyncJournal(directory);
+  assert.equal(view.records.at(-1).state, "applied");
+  const openWriter = () => DurableSyncJournal.open({ directory, bindingId: view.metadata.bindingId,
+    bindingGeneration: view.metadata.bindingGeneration, ownerId: randomUUID(), leaseMs: 10_000 });
+  const probe = await openWriter();
+  try {
+    // NEGATIVE CONTROL: an actually held writer must reject the same probe.
+    await assert.rejects(openWriter(), error => error.code === "cuna.workspace.workspace_busy");
+  } finally { await probe.close(); }
+  await assert.rejects(lstat(join(directory, "writer.lease")), { code: "ENOENT" });
 });
 
 /**
@@ -351,8 +370,8 @@ test("an interrupted journey re-run reconciles its own create instead of creatin
  * too, before dispatch, and leaves no second machine and no child behind.
  */
 test("a recovered journey without a published execution Workspace still refuses before dispatch", async (t) => {
-  const stateDirectory = await mkdtemp(join(tmpdir(), "cuna-create-identity-refused-"));
-  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const stateDirectory = await createOwnedTempDirectory("cuna-create-identity-refused-");
+  t.after(() => removeOwnedTempDirectory(stateDirectory));
   const client = producer();
   const attached = [];
   const workspaceless = workspaceReceipt({ executionWorkspaceId: undefined });

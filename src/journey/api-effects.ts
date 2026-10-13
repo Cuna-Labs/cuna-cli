@@ -1,4 +1,5 @@
 import {withProviderLaunchIntent,type RecordedLaunchContext} from "./provider-launch-intent.js";
+import { prepareMachineCreateChoice, performMachineCreateChoice, machineCreateChoiceState, machineCreateChoiceOutcome, finalizeMachineCreateChoice, cancelQueuedMachineCreate, type MachineCreateChoiceScope, type PreparedMachineCreate, type MachineCreateChoiceAnswer } from "./machine-create-options.js";
 import { isAgentSessionGone } from "../runtime/terminal-client-identity.js";
 import type {ProviderPreset} from "../api/provider-v2.js";
 import {createPublishedProviderSessionV2,requireMatchingPreset} from "./remote-workspace.js";
@@ -72,6 +73,8 @@ const TERMINAL_AUTHORITY_WAIT: Readonly<Record<string, string>> = Object.freeze(
 
 export interface ApiAgentJourneyEffectsInput {
   readonly client: CunaApiClient;
+  readonly machineCreateState?: { readonly stateDirectory: string; readonly apiOrigin: string; readonly profileId: string };
+  readonly selectInstallTetragon?: (signal: AbortSignal) => Promise<MachineCreateChoiceAnswer>;
   readonly confirmNewProviderLaunch?: (signal:AbortSignal, context:RecordedLaunchContext)=>Promise<boolean>;
   readonly providerLaunchState?: {readonly stateDirectory:string;readonly ownerId:string;readonly workspaceId:string};
   /** `machineName` names the Machine in the one-line notice when nothing is asked. */
@@ -272,7 +275,53 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
    * answer is asked for again, so every refusal keeps its fresh-read path.
    */
   const machineCapabilities = new Map<string, CapabilitySnapshot>();
+  const preparedCreates = new Map<string, { scope: MachineCreateChoiceScope; prepared: PreparedMachineCreate }>();
+  const performPrepared = async (record: { scope: MachineCreateChoiceScope; prepared: PreparedMachineCreate }, signal: AbortSignal,
+    create: (signal: AbortSignal) => Promise<Machine>): Promise<Machine> => await performMachineCreateChoice(record.scope, record.prepared, {
+      signal, create, readReceipt: signal => input.client.getMachineCreateRequest(record.prepared.requestId, signal),
+      readMachine: (id, signal) => input.client.getMachine(id, signal),
+    });
   const effects: AgentJourneyEffects = {
+    ...(input.machineCreateState === undefined ? {} : {
+      async prepareMachineCreate({ identity, signal }) {
+        const scope: MachineCreateChoiceScope = { ...identity, ...input.machineCreateState! };
+        let previous = await machineCreateChoiceOutcome(scope);
+        if(previous!==undefined && ["sending","uncertain","acknowledged"].includes(previous.state)) {
+          const receipt=await input.client.getMachineCreateRequest(previous.operationId,signal);
+          signal.throwIfAborted();
+          await finalizeMachineCreateChoice(scope,previous,receipt);
+          previous=await machineCreateChoiceOutcome(scope);
+        }
+        let releaseCompleted = previous?.state === "applied" && identity.machine.kind === "new";
+        if (previous?.state === "applied" && !releaseCompleted) {
+          const receipt = await input.client.getMachineCreateRequest(previous.operationId,signal);
+          if (receipt.id !== previous.operationId || receipt.state !== "settled") throw fail("cuna.journey.machine_create_choice_unresolved","The completed original creation no longer has a matching settled receipt.",EXIT_CODES.conflict);
+          const machine = await input.client.getMachine(receipt.machineId,signal);
+          if (machine.id !== receipt.machineId) throw fail("cuna.journey.machine_create_choice_unresolved","The original Machine identity could not be confirmed.",EXIT_CODES.conflict);
+          releaseCompleted = machine.state === "deleted";
+        }
+        const prepared = await prepareMachineCreateChoice(scope, async () => {
+          signal.throwIfAborted();
+          await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create", now, signal });
+          const snapshot = await input.client.discoverCapabilities("account", undefined, signal);
+          if (snapshot.subjectScope !== "account" || decideCapability(snapshot,"machines.create",now()).status !== "supported") throw fail("cuna.capability.unknown","Fresh account capability evidence could not authorize Machine creation.",EXIT_CODES.unsupported);
+          const decision = snapshot.subjectScope === "account" ? decideCapability(snapshot, "machines.create.install_tetragon", now(), ["native"]) : { status: "unknown" };
+          if (identity.installTetragon !== undefined) {
+            await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create.install_tetragon", allowedInteractions: ["native"], now, signal });
+            return { kind: "choice", installTetragon: identity.installTetragon };
+          }
+          if (decision.status !== "supported") {
+            if (!snapshot.capabilities.some(capability=>capability.id === "machines.create.install_tetragon")) return { kind: "choice" };
+            await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create.install_tetragon", allowedInteractions: ["native"], now, signal });
+          }
+          if (input.selectInstallTetragon === undefined) throw fail("cuna.journey.machine_create_choice_required", "Choose whether to install Tetragon before creating this Machine.", EXIT_CODES.usage);
+          const answer = await input.selectInstallTetragon(signal); signal.throwIfAborted();
+          if (answer.kind === "choice" && typeof answer.installTetragon !== "boolean") throw fail("cuna.journey.machine_create_choice_required","Choose Yes or No before creating this Machine.",EXIT_CODES.usage);
+          return answer;
+        }, { releaseCompleted });
+        preparedCreates.set(prepared.requestId, { scope, prepared }); return prepared;
+      },
+    } satisfies Pick<AgentJourneyEffects, "prepareMachineCreate">),
     inspectWorkspace: input.inspectWorkspace,
     async observeMachines({ signal }) {
       const page = await input.client.listMachines(signal);
@@ -351,9 +400,16 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         });
       }));
     },
-    async createMachine({ requestedAgent, idempotencyKey, requestId, onDispatch, signal }) {
+    async createMachine({ requestedAgent, idempotencyKey, requestId, installTetragon, onDispatch, signal }) {
+      const recorded = preparedCreates.get(requestId);
+      if (recorded !== undefined && await machineCreateChoiceState(recorded.scope, recorded.prepared) !== "queued") {
+        const machine = await performPrepared(recorded, signal, async () => { throw fail("cuna.journey.machine_create_choice_unresolved", "Recovery cannot create another Machine."); });
+        machineNames.set(machine.id, machine.name); return Object.freeze({ id: machine.id, state: machineState(machine.state) });
+      }
       await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create", now, signal });
+      if (installTetragon !== undefined) await requireCapability({ client: input.client, scope: "account", capabilityId: "machines.create.install_tetragon", allowedInteractions: ["native"], now, signal });
       if (!await input.authorizeMachineCreate({ requestedAgent, signal })) {
+        if (recorded !== undefined) await cancelQueuedMachineCreate(recorded.scope, recorded.prepared);
         throw fail(
           "cuna.journey.machine_create_not_authorized",
           "Machine creation was not authorized.",
@@ -362,16 +418,25 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
       }
       // Everything above this line fails before anything is sent: the
       // capability check and the person's own confirmation.
-      onDispatch();
-      const machine = await input.client.createMachine({
+      const create = async (dispatchSignal: AbortSignal): Promise<Machine> => {
+      dispatchSignal.throwIfAborted(); onDispatch();
+      return await input.client.createMachine({
         name: `cuna-${requestedAgent}-${requestId.slice(0, 8)}`,
         agent: requestedAgent,
         background: true,
-      }, idempotencyKey, requestId, signal);
+        ...(installTetragon === undefined ? {} : { installTetragon }),
+      }, idempotencyKey, requestId, dispatchSignal);
+      };
+      const machine = recorded === undefined ? await create(signal) : await performPrepared(recorded, signal, create);
       machineNames.set(machine.id, machine.name);
       return Object.freeze({ id: machine.id, state: machineState(machine.state) });
     },
     async reconcileMachineCreate({ requestId, signal }) {
+      const recorded = preparedCreates.get(requestId);
+      if (recorded !== undefined) {
+        const machine = await performPrepared(recorded, signal, async () => { throw fail("cuna.journey.machine_create_choice_unresolved", "Recovery cannot create another Machine."); });
+        return Object.freeze({ id: machine.id, state: machineState(machine.state) });
+      }
       for (let attempt = 0; attempt < MACHINE_POLL_LIMIT; attempt += 1) {
         let request = await input.client.getMachineCreateRequest(requestId, signal);
         if (request.state === "unknown" || request.action === "reconcile") {
@@ -635,7 +700,7 @@ export function createApiAgentJourneyEffects(input: ApiAgentJourneyEffectsInput)
         const requestId = ledger.machineCreateRequestId;
         try {
           let request = await input.client.getMachineCreateRequest(requestId, signal);
-          if (request.state === "unknown" || request.action === "reconcile") {
+          if (!preparedCreates.has(requestId) && (request.state === "unknown" || request.action === "reconcile")) {
             request = await input.client.reconcileMachineCreateRequest(requestId, signal);
           }
           if (request.state === "settled" || request.state === "provider_succeeded") {

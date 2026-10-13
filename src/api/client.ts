@@ -79,6 +79,7 @@ export interface MachineCreateInput {
   readonly vcpus?: number;
   readonly memoryMiB?: number;
   readonly background?: boolean;
+  readonly installTetragon?: boolean;
 }
 
 export interface AgentSessionCreateInput {
@@ -457,6 +458,7 @@ function validateAgentSessionCreate(input: Omit<AgentSessionCreateInput, "worksp
 }
 
 function validateMachineCreate(input: MachineCreateInput, idempotencyKey: string): void {
+  if (input.installTetragon !== undefined && typeof input.installTetragon !== "boolean") throw usageError("install_tetragon must be a boolean.");
   assertIdempotencyKey(idempotencyKey);
   assertSafeDisplayText(input.name, "machine name");
   if (input.name.length < 1 || input.name.length > 80) {
@@ -627,6 +629,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
     },
     async createMachine(input, idempotencyKey, requestId, signal) {
       validateMachineCreate(input, idempotencyKey);
+      if (input.installTetragon !== undefined) await requireCapability({ client, scope: "account", capabilityId: "machines.create.install_tetragon", allowedInteractions: ["native"], ...(signal === undefined ? {} : { signal }) });
       if (requestId !== undefined) assertCanonicalUuid(requestId, "machine create request ID");
       const body = {
         name: input.name,
@@ -634,6 +637,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         ...(input.vcpus === undefined ? {} : { vcpus: input.vcpus }),
         ...(input.memoryMiB === undefined ? {} : { memory_mib: input.memoryMiB }),
         ...(input.background === undefined ? {} : { background: input.background }),
+        ...(input.installTetragon === undefined ? {} : { install_tetragon: input.installTetragon }),
       };
       return fetchDecoded(
         {

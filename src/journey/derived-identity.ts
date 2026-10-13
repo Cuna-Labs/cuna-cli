@@ -33,9 +33,12 @@ export interface MachineCreateIdentityInput {
   readonly agent: AgentKind;
   /** The machine the invocation asked for. */
   readonly machine: MachineJourneySelection;
+  readonly installTetragon?: boolean;
+  readonly createAttempt?: number;
 }
 
 export interface MachineCreateIdentity {
+  readonly installTetragon?: boolean;
   /** The producer-side create-request identity, and the reconciliation key. */
   readonly requestId: string;
   /** The transport idempotency key carried by the same create. */
@@ -129,6 +132,9 @@ function selectionComponent(machine: MachineJourneySelection): string {
  * that nothing can name is not.
  */
 export function deriveMachineCreateIdentity(input: MachineCreateIdentityInput): MachineCreateIdentity {
+  if (input.installTetragon !== undefined && typeof input.installTetragon !== "boolean") throw invalidComponent("install_tetragon");
+  const attempt = input.createAttempt ?? 1;
+  if (!Number.isSafeInteger(attempt) || attempt < 1) throw invalidComponent("create_attempt");
   const serialized = [
     component(input.userId, "user_id"),
     component(input.workspaceId, "workspace_id"),
@@ -136,9 +142,12 @@ export function deriveMachineCreateIdentity(input: MachineCreateIdentityInput): 
     component(input.agent, "agent"),
     selectionComponent(input.machine),
   ].join("\0");
-  const intentDigest = createHash("sha256").update(serialized, "utf8").digest("hex");
+  const legacy = input.installTetragon === undefined && attempt === 1;
+  const complete = legacy ? serialized : `${serialized}\0machine-create-options-v1\0${attempt}\0${input.installTetragon === undefined ? "legacy" : String(input.installTetragon)}`;
+  const intentDigest = createHash("sha256").update(complete, "utf8").digest("hex");
   return Object.freeze({
-    requestId: stableUuid("cuna.machine-create-request.v1", intentDigest),
+    ...(input.installTetragon === undefined ? {} : { installTetragon: input.installTetragon }),
+    requestId: stableUuid(legacy ? "cuna.machine-create-request.v1" : "cuna.machine-create-request.options.v1", intentDigest),
     // The producer accepts both a create-request identity and a transport
     // idempotency key. Deriving only the first would leave a cross-process
     // replay carrying a fresh key, which is a duplicate create under any

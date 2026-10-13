@@ -2,27 +2,27 @@
   "schemaVersion": 2,
   "artifact_file": "contracts/infra/cuna-api.openapi.json",
   "canonical_digest_file": "contracts/infra/cuna-api.openapi.sha256",
-  "infra_openapi_raw_sha256": "7e6506c0ea88a3ee94b46cde94c0cd551efa54d6a546f50c47f45ddef98f58bc",
-  "infra_openapi_canonical_sha256": "c6eaefd6205c10ff19e39eb1911f30c54e47980530476782ee87696a8d50ce8e",
+  "infra_openapi_raw_sha256": "d0b0a8af11e7a3ecaceb9f2961c12b6550113e7f656b14774583b04559865a01",
+  "infra_openapi_canonical_sha256": "61f5f908c0570b1c0849c0423d8eb86cd072004a4357a3ce9b651bb7857f8066",
   "producer_repository": "Cuna-Labs/infra-proxy-mvp",
   "producer_content_state": "committed",
-  "producer_revision": "0cb84d1cfe2412f431f44b73fcb4f3e226f3b190",
+  "producer_revision": "843aba13d9ec0225ee59565e086709814675d265",
   "producer_full_tree": {
     "object_format": "sha1",
-    "commit": "0cb84d1cfe2412f431f44b73fcb4f3e226f3b190",
-    "tree": "99e4004e29c31be92a1e973cc4a9aea50c9ebbf3",
-    "contract_blob": "c1632141165436817c4ef89f968477f96190fc11"
+    "commit": "843aba13d9ec0225ee59565e086709814675d265",
+    "tree": "85d7004dbd19f6912e6582313b10f39ad07c41c0",
+    "contract_blob": "91408b925b177b123915c4f567815894ce522b93"
   },
   "producer_contract_verifier": "contracts/tools/verify-contract.mjs",
-  "producer_projection_sha256": "fdb522241303aaae362a3df962b122a1506e00400a14487c47ac1105afefde65",
-  "producer_runtime_manifest_sha256": "3d8f43fdba38537d700d8cc88f158e8c4e7a9b1f7e42782294c97cbd753dfce0",
+  "producer_projection_sha256": "aff9751f5e896f12beca604080bfc4c2c8047d6768e1d4ea11afc86a01bf14bb",
+  "producer_runtime_manifest_sha256": "4fde9d53adbaff80ca42593fd062286f3049e950b0031eb43e230d1010923170",
   "feature_contracts": {
     "opencode_interactive_only": {
-      "openapi_raw_sha256": "7e6506c0ea88a3ee94b46cde94c0cd551efa54d6a546f50c47f45ddef98f58bc",
-      "openapi_canonical_sha256": "c6eaefd6205c10ff19e39eb1911f30c54e47980530476782ee87696a8d50ce8e",
-      "producer_commit": "0cb84d1cfe2412f431f44b73fcb4f3e226f3b190",
-      "producer_tree": "99e4004e29c31be92a1e973cc4a9aea50c9ebbf3",
-      "producer_contract_blob": "c1632141165436817c4ef89f968477f96190fc11"
+      "openapi_raw_sha256": "d0b0a8af11e7a3ecaceb9f2961c12b6550113e7f656b14774583b04559865a01",
+      "openapi_canonical_sha256": "61f5f908c0570b1c0849c0423d8eb86cd072004a4357a3ce9b651bb7857f8066",
+      "producer_commit": "843aba13d9ec0225ee59565e086709814675d265",
+      "producer_tree": "85d7004dbd19f6912e6582313b10f39ad07c41c0",
+      "producer_contract_blob": "91408b925b177b123915c4f567815894ce522b93"
     }
   }
 }

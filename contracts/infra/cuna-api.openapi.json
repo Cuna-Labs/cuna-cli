@@ -10140,6 +10140,10 @@
           "background": {
             "type": "boolean",
             "description": "When true, provisioning may continue asynchronously and the 201 response may contain status creating. Omission or false preserves synchronous creation."
+          },
+          "install_tetragon": {
+            "type": "boolean",
+            "description": "Optional immutable observation choice. Omission preserves legacy policy. False skips Tetragon and its BTF kernel preparation; mandatory process isolation and custody admission remain required. True requests observation installation and requires observation availability; admission does not prove installation succeeded."
           }
         }
       },
@@ -10232,6 +10236,10 @@
           },
           "capture_tool_io": {
             "type": "boolean"
+          },
+          "install_tetragon": {
+            "type": "boolean",
+            "description": "Optional immutable observation choice. Omission preserves legacy policy. False skips Tetragon and its BTF kernel preparation; mandatory process isolation and custody admission remain required. True requests observation installation and requires observation availability; admission does not prove installation succeeded."
           }
         },
         "description": "The deployed console accepts additional non-SDK fields; x-sdk-request-schema is authoritative for SDK generation."
@@ -12438,6 +12446,10 @@
           },
           "capture_tool_io": {
             "type": "boolean"
+          },
+          "install_tetragon": {
+            "type": "boolean",
+            "description": "Optional immutable observation choice. Omission preserves legacy policy. False skips Tetragon and its BTF kernel preparation; mandatory process isolation and custody admission remain required. True requests observation installation and requires observation availability; admission does not prove installation succeeded."
           }
         }
       },

@@ -75,6 +75,7 @@ import {
 import { askRecordedLaunch, recordedLaunchConfirmation } from "./recorded-launch-prompt.js";
 import type { RecordedLaunchContext } from "../journey/provider-launch-intent.js";
 import { settledAgentSessionDisposition } from "../journey/session-disposition.js";
+import type { MachineCreateChoiceAnswer } from "../journey/machine-create-options.js";
 import {
   agentJourneyCommand,
   rootJourneyArgv,
@@ -186,6 +187,7 @@ export interface RunCliDependencies {
     readonly signal?: AbortSignal;
   }) => AgentJourneyEffects;
   readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal) => Promise<boolean>;
+  readonly selectInstallTetragon?: (signal: AbortSignal) => Promise<MachineCreateChoiceAnswer>;
   /** Internal navigation context; direct command refusals retain their exit code. */
   readonly returnToMachinesOnCreateDeclined?: boolean;
 }
@@ -200,6 +202,32 @@ async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw" 
     return false;
   } finally {
     prompt.close();
+  }
+}
+
+export async function selectInstallTetragon(signal: AbortSignal, io: {
+  readonly input?: NodeJS.ReadableStream & { readonly isTTY?: boolean; readonly isRaw?: boolean; readonly readableEnded?: boolean; isPaused?(): boolean; setRawMode?(raw: boolean): unknown };
+  readonly output?: NodeJS.WritableStream;
+} = {}): Promise<MachineCreateChoiceAnswer> {
+  if (signal.aborted) return { kind: "cancel" };
+  const input=io.input??process.stdin, output=io.output??process.stderr;
+  if(input.isTTY!==true) throw new CunaError({code:"cuna.journey.machine_create_choice_required",message:"Choose the Tetragon policy explicitly when input is not an interactive terminal.",exitCode:EXIT_CODES.usage,hint:"Use --install-tetragon true|false. For `machines create`, include --yes to authorize the financial action."});
+  if(input.readableEnded===true) return {kind:"cancel"};
+  const wasRaw=input.isRaw, wasPaused=input.isPaused?.();
+  const prompt = createInterface({ input, output, terminal: true });
+  const closed=new AbortController(), questionSignal=AbortSignal.any([signal,closed.signal]);
+  const onClose=():void=>closed.abort(); prompt.once("close",onClose);
+  try {
+    for (;;) {
+      const answer = (await prompt.question("Install Tetragon? Yes/No: ", { signal:questionSignal })).trim().toLocaleLowerCase("en-US");
+      if (answer === "yes" || answer === "y") return { kind: "choice", installTetragon: true };
+      if (answer === "no" || answer === "n") return { kind: "choice", installTetragon: false };
+      output.write("Choose Yes or No. This does not change the mandatory sandbox.\n");
+    }
+  } catch { return { kind: "cancel" }; } finally {
+    prompt.removeListener("close",onClose); prompt.close();
+    if(typeof wasRaw==="boolean") input.setRawMode?.(wasRaw);
+    if(wasPaused===true) input.pause(); else if(wasPaused===false) input.resume();
   }
 }
 
@@ -2115,6 +2143,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           requestedAgent: journeyAgent,
           confirmNewProviderLaunch: recordedLaunchConfirmation(journeyIntent.newSession, askCreateAnotherSession),
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
+          machineCreateState:{stateDirectory:platform.paths.stateDirectory,apiOrigin:config.baseUrl,profileId:config.profile},
+          selectInstallTetragon: async signal => {
+            const resume = inlineJourneyProgress;
+            inlineJourneyProgress?.stop(); inlineJourneyProgress = undefined;
+            try { return await (dependencies.selectInstallTetragon ?? selectInstallTetragon)(signal); }
+            finally { if (resume !== undefined && streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr,
+              !booleanOption(parsed,"no-color") && !Object.hasOwn(effectiveEnvironment,"NO_COLOR"), journeyPhaseLabel("create-machine",journeyAgent)); }
+          },
           selectProviderPreset: async (signal, context) => {
             const preset = await pickProviderPreset(signal, context?.machineName);
             if (!preset) {

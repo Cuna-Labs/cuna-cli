@@ -354,6 +354,7 @@ const BOOLEAN_OPTIONS = new Set([
  * decides the shape of the parse.
  */
 const VALUE_OPTIONS = new Set([
+  "install-tetragon",
   "project",
   "grant",
   "after",
