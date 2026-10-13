@@ -8,6 +8,7 @@ import { ContractViolation, createCunaApiClient, createHttpTransport, CunaError,
 import { CREDENTIAL_BACKEND_PROTOCOL } from "../dist/credentials/contracts.js";
 
 const API_KEY = "cuna_sk_abcdefghijklmnop";
+const PACKAGE_VERSION = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
 // A machine ID in the one shape the product accepts. This fixture used to be
 // "m_1", which the command layer waved through and the transport would have
 // rejected -- so the test asserted a success the real client cannot produce.
@@ -1012,7 +1013,7 @@ test("non-TTY help and version are versioned JSON records", async () => {
   assert.match(allRecord.data.help, /Use --agent-session SESSION_ID to bypass reconciliation/u);
   const version = memoryStreams();
   assert.equal(await runCli(["--version"], { streams: version.streams }), EXIT_CODES.success);
-  assert.equal(JSON.parse(version.stdout()).data.version, "0.1.7");
+  assert.equal(JSON.parse(version.stdout()).data.version, PACKAGE_VERSION);
 });
 
 test("missing automation auth fails before a remote call and emits no prompt", async () => {
@@ -3833,7 +3834,8 @@ test("cuna version prints the build digest that separates two installations repo
   const human = memoryStreams({ stdoutIsTTY: true, stderrIsTTY: true });
   assert.equal(await runCli(["version"], { streams: human.streams, platform, env: {} }), EXIT_CODES.success);
   const printed = human.stdout().trim();
-  assert.match(printed, /^0\.1\.7\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
+  assert.equal(printed.split("\t")[0], PACKAGE_VERSION);
+  assert.match(printed.slice(PACKAGE_VERSION.length), /^\tbuild [0-9a-f]{12}…\t\S+\/\S+\tprotocol 1\.\.1$/u, printed);
 
   // The digest printed is the exact 12-hex prefix of the one the JSON record
   // carries, so the two surfaces can never name different builds.
