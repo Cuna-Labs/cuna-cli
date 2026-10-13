@@ -5,7 +5,7 @@ import type { NamedSecretService } from "./service.js";
 
 export type SecretUiState = "CLOSED" | "EDIT_NAME" | "EDIT_SECRET" | "VALIDATING" | "SUBMITTING" | "RECONCILING" | "SUCCESS" | "ERROR" | "CLOSING";
 export type SecretPersistence = "NOT_SENT" | "IN_FLIGHT" | "COMMITTED" | "REJECTED" | "UNKNOWN";
-export interface SecretOverlayView { readonly name: string; readonly masked: string; readonly focus: "name" | "secret"; readonly feedback: string; }
+export interface SecretOverlayView { readonly name: string; readonly masked: string; readonly focus: "name" | "secret"; readonly feedback: string; readonly resizeRequired?: boolean; }
 export interface SecretAuthority { readonly context: NamedSecretContext; readonly userId: string; }
 const START = [27, 91, 50, 48, 48, 126];
 const END = [27, 91, 50, 48, 49, 126];
@@ -37,14 +37,27 @@ export class NamedSecretOverlay {
   #task: Promise<void> | undefined;
   #disposed = false;
   #expired = false;
+  #small = false;
   #plaintextTimer: ReturnType<typeof setTimeout> | undefined;
   readonly #lifetimeMs: number;
   readonly #requestBudgetMs: number;
   constructor(readonly service: NamedSecretService, readonly authority: () => SecretAuthority | undefined, readonly changed: () => void,
-    options: { plaintextLifetimeMs?: number; requestBudgetMs?: number } = {}) {
+    options: { plaintextLifetimeMs?: number; requestBudgetMs?: number; canEdit?: () => boolean } = {}) {
     this.#lifetimeMs = options.plaintextLifetimeMs ?? 120_000;
     this.#requestBudgetMs = options.requestBudgetMs ?? 10_000;
+    this.#canEdit = options.canEdit ?? (() => true);
     if (![this.#lifetimeMs, this.#requestBudgetMs].every((value) => Number.isSafeInteger(value) && value >= 1 && value <= 300_000)) throw new RangeError("Named-secret lifetime budget is invalid.");
+  }
+  readonly #canEdit: () => boolean;
+  geometryChanged(available: boolean, retainCapture = false): void {
+    const changed = this.#small !== !available; this.#small = !available;
+    if (this.#small && (this.active || retainCapture) && (this.#persistence === "NOT_SENT" && !this.#expired || retainCapture && !this.active)) {
+      this.#generation += 1; this.#abort.abort(); this.#abort = new AbortController();
+      this.#secret.fill(0); this.#length = 0; this.#name = ""; this.#expired = true;
+      if (this.#plaintextTimer !== undefined) clearTimeout(this.#plaintextTimer);
+      this.#plaintextTimer = undefined; this.#state = "ERROR"; this.#feedback = "Input cleared · Esc closes";
+      this.changed();
+    } else if (changed && this.active) this.changed();
   }
   get active(): boolean { return this.#state !== "CLOSED"; }
   get state(): SecretUiState { return this.#state; }
@@ -54,10 +67,13 @@ export class NamedSecretOverlay {
       ? `Named-secret outcome unknown. Check without writing again: cuna secrets operation ${this.#operation.id}` : undefined;
   }
   get view(): SecretOverlayView | undefined {
-    return this.active ? Object.freeze({ name: this.#name, masked: this.#length > 0 ? "********" : "", focus: this.#focus, feedback: this.#feedback }) : undefined;
+    const feedback = this.#small ? this.#persistence === "COMMITTED" ? "Saved · resize30x8" : this.#persistence === "UNKNOWN" ? "Unknown · resize30x8" : this.#persistence === "IN_FLIGHT" ? "Saving · resize30x8" : "Resize 30x8 · Esc" : this.#feedback;
+    return this.active ? Object.freeze({ name: this.#name, masked: this.#length > 0 ? "********" : "", focus: this.#focus, feedback, ...(this.#small ? { resizeRequired: true } : {}) }) : undefined;
   }
   open(): boolean {
     if (this.#disposed || this.active) return this.active;
+    if (!this.#canEdit()) return false;
+    this.#small = false;
     const authority = this.authority();
     const recovery = this.#operation !== undefined && (this.#persistence === "UNKNOWN" || this.#persistence === "IN_FLIGHT");
     if (authority === undefined && !recovery) return false;
@@ -106,6 +122,7 @@ export class NamedSecretOverlay {
   }
   /** A raw callback remains captured even if Escape closes midway through it. */
   input(bytes: Uint8Array): void {
+    this.geometryChanged(this.#canEdit());
     for (const [index, byte] of bytes.entries()) {
       if (!this.active) break;
       if (this.#ignoredControl) {
@@ -158,6 +175,7 @@ export class NamedSecretOverlay {
         this.#focus = this.#focus === "name" ? "secret" : "name";
         this.#state = this.#focus === "name" ? "EDIT_NAME" : "EDIT_SECRET";
       } else if (byte === 13 || byte === 10) {
+        if (this.#small) continue;
         if (this.#state === "SUCCESS" || this.#persistence === "REJECTED") { this.close(); break; }
         if (this.#task === undefined) {
           const task = this.#persistence === "UNKNOWN" ? this.#reconcile() : this.#submit();
@@ -190,7 +208,8 @@ export class NamedSecretOverlay {
     }
   }
   async #submit(): Promise<void> {
-    if (this.#expired || this.#persistence !== "NOT_SENT" || !this.active) return;
+    this.geometryChanged(this.#canEdit());
+    if (this.#expired || this.#small || this.#persistence !== "NOT_SENT" || !this.active) return;
     if (!validNamedSecretName(this.#name) || this.#length < 1 || this.#overflow || this.#invalidContent || this.#unsupportedContent) {
       this.#state = "ERROR"; this.#feedback = this.#unsupportedContent ? "Terminal control sequences are unsupported · cancel and re-enter" : this.#overflow ? "Password exceeded 4096 bytes · cancel and re-enter" : this.#invalidContent ? "Paste boundary ambiguous · cancel and re-enter" : "Enter a valid name and a nonempty password";
       this.#secret.fill(0); this.#length = 0; this.changed(); return;
@@ -205,7 +224,8 @@ export class NamedSecretOverlay {
     let workspaceId: string;
     try { workspaceId = await this.#bounded((boundedSignal) => this.service.prepare(current.context, current.userId, boundedSignal), signal); }
     catch { if (generation === this.#generation) { this.#secret.fill(0); this.#length = 0; this.#state = "ERROR"; this.#feedback = "Vault authority unavailable · no write sent"; this.changed(); } return; }
-    if (generation !== this.#generation || signal.aborted) return;
+    this.geometryChanged(this.#canEdit());
+    if (generation !== this.#generation || signal.aborted || this.#small) return;
     const admitted = this.authority();
     if (admitted === undefined || authorityKey(admitted) !== this.#authorityKey) { this.close(); return; }
     const operation: { id: string; name: string; workspaceId: string; userId: string; secretId?: string } = { id: randomUUID(), name: this.#name, workspaceId, userId: admitted.userId };

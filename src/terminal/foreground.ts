@@ -601,7 +601,7 @@ export class ForegroundTerminalCoordinator {
             tab.snapshot.state !== "active" || this.#endedTabs.has(tabId) || tab.snapshot.terminalView?.ready === false) return undefined;
         try { const context = runtime.namedSecretContext?.(tabId); return context === undefined ? undefined : { context, userId: tab.snapshot.userId }; }
         catch { return undefined; }
-      }, () => { this.#lastHostFrame = undefined; void this.#render().catch(() => undefined); });
+      }, () => { this.#lastHostFrame = undefined; void this.#render().catch(() => undefined); }, { canEdit: () => { const size = this.#options.host.dimensions(); return size.columns >= 30 && size.rows >= 8; } });
     }
     if (this.#runtime !== undefined) throw runtimeFailure("session_conflict", "The foreground runtime is already bound.");
     if (this.#state !== "idle") throw runtimeFailure("session_conflict", "The foreground runtime must be bound before startup.");
@@ -1313,6 +1313,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   #queueInput(bytes: Uint8Array): void {
+    this.#fenceSecretGeometry();
     this.#secretInput.process(bytes, () => this.#secretPreparing || this.#secretOverlay?.active === true, () => this.#openSecretOverlay(),
       (local) => {
         try {
@@ -1324,6 +1325,12 @@ export class ForegroundTerminalCoordinator {
       this.#browserNotice = "Paste boundary pending · input withheld locally";
       void this.#render().catch(() => undefined);
     }
+  }
+
+  #fenceSecretGeometry(): void {
+    const size = this.#options.host.dimensions(); const available = size.columns >= 30 && size.rows >= 8;
+    this.#secretOverlay?.geometryChanged(available, this.#secretPreparing);
+    if (!available && this.#secretPreparing) this.#secretPrepareAbort?.abort();
   }
 
   #openSecretOverlay(): void {
@@ -1362,6 +1369,7 @@ export class ForegroundTerminalCoordinator {
     const lifetime = () => abort.abort(); this.#lifetimeAbort.signal.addEventListener("abort", lifetime, { once: true });
     const cancelled = new Promise<never>((_resolve, reject) => abort.signal.addEventListener("abort", () => reject(new Error("Writer proof preparation cancelled.")), { once: true }));
     void Promise.race([Promise.resolve().then(() => refresh.call(this.#runtime, tabId, abort.signal)), cancelled]).then(() => {
+      this.#fenceSecretGeometry();
       const current = this.#tabs.get(tabId)?.snapshot;
       if (abort.signal.aborted || this.#state !== "active" || this.#activeTabId !== tabId || current === undefined ||
           current.accessMode !== "writer" || current.userId !== before.userId || current.machineId !== before.machineId ||
@@ -3135,6 +3143,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   #queueResize(): void {
+    this.#fenceSecretGeometry();
     if (this.#state !== "active") return;
     this.#flushInputBatch();
     this.#resizeInputBarrier = this.#inputTail;

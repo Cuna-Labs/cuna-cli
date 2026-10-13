@@ -98,8 +98,14 @@ export function withNamedSecretOverlay(frame: WorkbenchFrame, view: SecretOverla
   const rows = [...frame.rowCommands];
   const width = Math.min(frame.columns, 64);
   const left = Math.max(1, Math.floor((frame.columns - width) / 2) + 1);
-  const top = Math.max(frame.appbarRows + 1, Math.floor((frame.rows - 4) / 2) + 1);
-  const lines = [` ${view.focus === "name" ? ">" : " "} Secret Name: ${view.name}`, ` ${view.focus === "secret" ? ">" : " "} Password: ${view.masked}`, ` ${view.feedback}`];
+  const feedback: string[] = []; let line = "";
+  for (const word of view.feedback.split(" ")) {
+    if (line && displayCellWidth(`${line} ${word}`) > width - 1) { feedback.push(` ${line}`); line = word; }
+    else line = line ? `${line} ${word}` : word;
+  }
+  if (line) feedback.push(` ${line}`);
+  const lines = view.resizeRequired ? [view.feedback] : [` ${view.focus === "name" ? ">" : " "} Secret Name: ${view.name}`, ` ${view.focus === "secret" ? ">" : " "} Password: ${view.masked}`, ...feedback];
+  const top = Math.max(frame.appbarRows + 1, Math.floor((frame.rows - lines.length - 1) / 2) + 1);
   for (let index = 0; index < lines.length && top + index <= frame.rows; index += 1) {
     rows[top + index - 1] = `${rows[top + index - 1] ?? ""}${ESC}${top + index};${left}H${ESC}0;7m${padLine(truncateMarked(lines[index]!, width), width)}${ESC}0m`;
   }

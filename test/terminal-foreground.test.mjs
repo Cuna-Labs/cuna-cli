@@ -669,6 +669,26 @@ test("named-secret popout consumes decoded chord bytes and masks while all three
   }
 });
 
+test("a resized secret modal keeps local capture and visible feedback without sending an unsent value", async () => {
+  const writes = [];
+  const namedSecrets = { async prepare() { return "66666666-6666-4666-8666-666666666666"; }, async create() { writes.push(true); throw new Error("no write expected"); }, async read() { throw new Error("no read expected"); } };
+  const { coordinator, callbacks, host, intents, runtime, calls } = harness({ coordinatorOptions: { namedSecrets } });
+  runtime.namedSecretContext = () => ({ agent_session_id: SESSION_A, machine_id: "machine-1", workspace_binding_id: "binding-1", process_epoch: `epoch-${SESSION_A}`, terminal_connection_id: "connection-1", connect_token: "private-proof", writer_epoch: 1 });
+  try {
+    await coordinator.start([intents[0]]); host.emitInput(encoder.encode("\x11Database\tPRIVATE"));
+    await waitUntil(() => host.writes.some((bytes) => decoder.decode(bytes).includes("Password: ********")), "initial mask");
+    host.rows=3; host.emitResize(); host.emitInput(encoder.encode("\rPRIVATE_TAIL"));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Resize 30x8"), "small admitted viewport contains resize feedback");
+    assert.deepEqual(writes,[]); assert.deepEqual(calls.input,[]);
+    await callbacks.onTerminalOutput(outputEvent(intents[0],1n,encoder.encode("\x1b[2J\x1b[HLATEST_RESIZED_VIEW")));
+    host.rows=8; host.columns=30; host.emitResize(); host.emitInput(encoder.encode("\r"));
+    await waitUntil(() => decoder.decode(host.writes.at(-1)).includes("Input cleared"), "minimum admitted modal boundary still needs fresh input");
+    assert.deepEqual(writes,[]); assert.deepEqual(calls.input,[]);
+    host.emitInput(encoder.encode("\x1b")); await new Promise((resolve) => setTimeout(resolve,45));
+    assert.ok(host.writes.some((bytes) => decoder.decode(bytes).includes("LATEST_RESIZED_VIEW"))); assert.deepEqual(calls.detach,[]);
+  } finally { await coordinator.stop(); }
+});
+
 test("writer proof refresh consumes input before collecting fields and opens only on the same fresh writer", async () => {
   let release; let receipt; const creates = [];
   const namedSecrets = { async prepare() { return "66666666-6666-4666-8666-666666666666"; }, async create(op, name, secret, context) { creates.push({ value: secret.withBytes((bytes) => decoder.decode(bytes)), proof: context.connect_token }); receipt = { operation_id: op, state: "committed", secret_id: "77777777-7777-4777-8777-777777777777", name, workspace_id: "66666666-6666-4666-8666-666666666666", committed_at: "2026-10-12T12:00:00Z" }; return receipt; }, async read() { return receipt; } };

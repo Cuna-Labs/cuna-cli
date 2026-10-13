@@ -22,6 +22,23 @@ test("plaintext lifetime expiry clears edit buffers and still captures late past
   await until(() => f.overlay.view?.feedback.includes("expired")); assert.equal(f.overlay.view.masked, ""); f.input("\x1b[200~PRIVATE_LATE\x1b[201~\r");
   assert.deepEqual(f.remote, []); assert.equal(f.calls.create.length, 0); f.overlay.dispose();
 });
+test("small geometry fences pending validation, clears plaintext and never retries after enlarging", async () => {
+  let release; let available = true;
+  const f = fixture({ prepare: () => new Promise((resolve) => { release = resolve; }) }, { canEdit: () => available });
+  f.input("\x11Database\tPRIVATE\r"); assert.equal(f.overlay.state, "VALIDATING");
+  available = false; f.overlay.geometryChanged(false); assert.equal(f.overlay.active, true); assert.equal(f.overlay.view.masked, "");
+  assert.match(f.overlay.view.feedback, /Resize/); release(id("6")); await new Promise((resolve) => setImmediate(resolve));
+  available = true; f.overlay.geometryChanged(true); f.input("\rPRIVATE_LATE\r");
+  assert.equal(f.calls.create.length, 0); assert.deepEqual(f.remote, []); f.overlay.dispose();
+});
+test("resize after dispatch preserves the operation and confirmed commit", async () => {
+  let release; let available = true; let committed;
+  const f = fixture({ create: async (op,name) => { f.calls.create.push({op}); committed = receipt(op,name); await new Promise((resolve) => { release=resolve; }); return committed; }, read: async () => committed }, { canEdit: () => available });
+  f.input("\x11Database\tPRIVATE\r"); await until(() => f.overlay.persistence === "IN_FLIGHT");
+  available=false; f.overlay.geometryChanged(false); assert.equal(f.overlay.persistence, "IN_FLIGHT"); assert.match(f.overlay.recoveryNotice, /secrets operation/);
+  release(); await until(() => f.overlay.persistence === "COMMITTED"); assert.match(f.overlay.view.feedback, /Saved/);
+  available=true; f.overlay.geometryChanged(true); assert.equal(f.overlay.persistence,"COMMITTED"); assert.equal(f.calls.create.length,1); f.overlay.dispose();
+});
 test("an uncooperative dispatched request has a bound, clears mutable material, and retains UNKNOWN recovery identity", async () => {
   let material;
   const f = fixture({ create(op, _name, secret) { f.calls.create.push({ op }); material = secret; return new Promise(() => {}); }, read() { throw new NamedSecretRequestError(404); } }, { requestBudgetMs: 5 });
