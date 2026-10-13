@@ -17692,48 +17692,103 @@
             "writeOnly": true
           },
           "context": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "agent_session_id": {
-                "type": "string",
-                "format": "uuid"
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "agent_session_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "machine_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "process_epoch": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "terminal_connection_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "connect_token": {
+                    "type": "string",
+                    "pattern": "^runa_tc_[A-Za-z0-9_-]{43}$",
+                    "writeOnly": true
+                  },
+                  "writer_epoch": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  "workspace_binding_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "agent_session_id",
+                  "machine_id",
+                  "process_epoch",
+                  "terminal_connection_id",
+                  "connect_token",
+                  "writer_epoch",
+                  "workspace_binding_id"
+                ]
               },
-              "machine_id": {
-                "type": "string",
-                "format": "uuid"
-              },
-              "workspace_binding_id": {
-                "type": "string",
-                "format": "uuid"
-              },
-              "process_epoch": {
-                "type": "string",
-                "format": "uuid"
-              },
-              "terminal_connection_id": {
-                "type": "string",
-                "format": "uuid"
-              },
-              "connect_token": {
-                "type": "string",
-                "pattern": "^runa_tc_[A-Za-z0-9_-]{43}$",
-                "writeOnly": true
-              },
-              "writer_epoch": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 9007199254740991
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "agent_session_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "machine_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "process_epoch": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "terminal_connection_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "connect_token": {
+                    "type": "string",
+                    "pattern": "^runa_tc_[A-Za-z0-9_-]{43}$",
+                    "writeOnly": true
+                  },
+                  "writer_epoch": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  "execution_workspace_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "execution_workspace_generation": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "agent_session_id",
+                  "machine_id",
+                  "process_epoch",
+                  "terminal_connection_id",
+                  "connect_token",
+                  "writer_epoch",
+                  "execution_workspace_id",
+                  "execution_workspace_generation"
+                ]
               }
-            },
-            "required": [
-              "agent_session_id",
-              "machine_id",
-              "workspace_binding_id",
-              "process_epoch",
-              "terminal_connection_id",
-              "connect_token",
-              "writer_epoch"
             ]
           }
         },

@@ -11,7 +11,8 @@ const START = [27, 91, 50, 48, 48, 126];
 const END = [27, 91, 50, 48, 49, 126];
 function authorityKey(authority: SecretAuthority): string {
   const c = authority.context;
-  return `${authority.userId}:${c.agent_session_id}:${c.machine_id}:${c.workspace_binding_id}:${c.process_epoch}:${c.terminal_connection_id}:${c.writer_epoch}`;
+  const scope=c.workspace_binding_id===undefined?`execution:${c.execution_workspace_id}:${c.execution_workspace_generation}`:`binding:${c.workspace_binding_id}`;
+  return `${authority.userId}:${c.agent_session_id}:${c.machine_id}:${scope}:${c.process_epoch}:${c.terminal_connection_id}:${c.writer_epoch}`;
 }
 /** Value storage is mutable and bounded; immutable JS/network copies cannot be guaranteed erased. */
 export class NamedSecretOverlay {

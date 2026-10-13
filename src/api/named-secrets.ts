@@ -1,14 +1,17 @@
 import { isReservedSecretName } from "../core/namespace.js";
 /** Metadata-only authority; values and terminal connection proofs never enter errors. */
-export interface NamedSecretContext {
+interface NamedSecretTerminalContext {
   readonly agent_session_id: string;
   readonly machine_id: string;
-  readonly workspace_binding_id: string;
   readonly process_epoch: string;
   readonly terminal_connection_id: string;
   readonly connect_token: string;
   readonly writer_epoch: number;
 }
+export type NamedSecretContext = NamedSecretTerminalContext & (
+  | Readonly<{ workspace_binding_id: string; execution_workspace_id?: never; execution_workspace_generation?: never }>
+  | Readonly<{ execution_workspace_id: string; execution_workspace_generation: number; workspace_binding_id?: never }>
+);
 export interface NamedSecretReceipt {
   readonly operation_id: string;
   readonly state: "committed" | "rejected";
@@ -33,6 +36,12 @@ export function validNamedSecretName(name: string): boolean {
 }
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 export function isNamedSecretUuid(value: unknown): value is string { return typeof value === "string" && UUID.test(value); }
+export function validNamedSecretScope(value: unknown): boolean {
+  if(value===null || typeof value!=="object" || Array.isArray(value)) return false;
+  const row=value as Record<string,unknown>, binding=Object.hasOwn(row,"workspace_binding_id"), execution=Object.hasOwn(row,"execution_workspace_id"), generation=Object.hasOwn(row,"execution_workspace_generation");
+  return binding ? !execution && !generation && isNamedSecretUuid(row.workspace_binding_id)
+    : execution && generation && isNamedSecretUuid(row.execution_workspace_id) && Number.isSafeInteger(row.execution_workspace_generation) && Number(row.execution_workspace_generation)>=1;
+}
 export function decodeNamedSecretReceipt(value: unknown): NamedSecretReceipt {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new NamedSecretRequestError();
   const row = value as Record<string, unknown>;

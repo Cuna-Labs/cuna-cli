@@ -640,6 +640,7 @@ function outputEvent(intent, sequence, bytes, generation = 1, signal = new Abort
 
 test("named-secret popout consumes decoded chord bytes and masks while all three provider viewports advance", async () => {
   for (const agent of ["claude-code", "codex", "opencode"]) {
+    for (const scope of ["binding", "execution"]) {
     const writes = [], reads = []; let receipt;
     const namedSecrets = {
       async prepare() { return "66666666-6666-4666-8666-666666666666"; },
@@ -648,7 +649,9 @@ test("named-secret popout consumes decoded chord bytes and masks while all three
     };
     const { coordinator, callbacks, host, intents, runtime, calls } = harness({ coordinatorOptions: { namedSecrets, predictiveEcho: "experimental" } });
     intents[0].agent = agent;
-    runtime.namedSecretContext = () => ({ agent_session_id: intents[0].agentSessionId, machine_id: "machine-1", workspace_binding_id: "binding-1", process_epoch: `epoch-${intents[0].agentSessionId}`, terminal_connection_id: "connection-1", connect_token: "private-proof", writer_epoch: 1 });
+    runtime.namedSecretContext = () => ({ agent_session_id: intents[0].agentSessionId, machine_id: "machine-1",
+      ...(scope==="binding"?{workspace_binding_id:"binding-1"}:{execution_workspace_id:"33333333-3333-4333-8333-333333333333",execution_workspace_generation:4}),
+      process_epoch: `epoch-${intents[0].agentSessionId}`, terminal_connection_id: "connection-1", connect_token: "private-proof", writer_epoch: 1 });
     try {
       await coordinator.start([intents[0]]);
       host.emitInput(encoder.encode("\x11Database\tCANARY_PASSWORD"));
@@ -666,6 +669,7 @@ test("named-secret popout consumes decoded chord bytes and masks while all three
       await waitUntil(() => !decoder.decode(host.writes.at(-1)).includes("Secret Name:"), "close restores latest viewport");
       assert.match(decoder.decode(host.writes.at(-1)), /LATEST_REMOTE_VIEW/); assert.deepEqual(calls.input, []);
     } finally { await coordinator.stop(); }
+    }
   }
 });
 

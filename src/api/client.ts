@@ -71,7 +71,7 @@ import { decodeMachineDefaultWorkspace, decodeAgentSessionWorkspaceContext, deco
   type MachineDefaultWorkspace, type AgentSessionWorkspaceContext, type AgentSessionWorkspaceEnvelope } from "./remote-workspace.js";
 import { classifyCapabilitySnapshot, isPermanentSnapshotFault } from "./capability-evidence.js";
 import { isTerminalConnectToken } from "../core/namespace.js";
-import { decodeNamedSecretReceipt, isNamedSecretUuid, validNamedSecretName, NamedSecretRequestError, type NamedSecretCreate, type NamedSecretReceipt } from "./named-secrets.js";
+import { decodeNamedSecretReceipt, isNamedSecretUuid, validNamedSecretName, validNamedSecretScope, NamedSecretRequestError, type NamedSecretCreate, type NamedSecretReceipt } from "./named-secrets.js";
 
 export interface MachineCreateInput {
   readonly name: string;
@@ -534,12 +534,13 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       if (!isNamedSecretUuid(input.operation_id) || !validNamedSecretName(input.name) || typeof input.password !== "string" ||
           new TextEncoder().encode(input.password).byteLength < 1 || new TextEncoder().encode(input.password).byteLength > 4096 ||
           [...input.password].some((point) => point.length === 1 && point.charCodeAt(0) >= 0xd800 && point.charCodeAt(0) <= 0xdfff) ||
-          !isNamedSecretUuid(input.context.agent_session_id) || !isNamedSecretUuid(input.context.machine_id) || !isNamedSecretUuid(input.context.workspace_binding_id) ||
+          !validNamedSecretScope(input.context) || !isNamedSecretUuid(input.context.agent_session_id) || !isNamedSecretUuid(input.context.machine_id) ||
           !isNamedSecretUuid(input.context.process_epoch) || !isNamedSecretUuid(input.context.terminal_connection_id) || !Number.isSafeInteger(input.context.writer_epoch) || input.context.writer_epoch < 1 ||
           !isTerminalConnectToken(input.context.connect_token)) throw new NamedSecretRequestError();
       try {
         const context = { agent_session_id: input.context.agent_session_id, machine_id: input.context.machine_id,
-          workspace_binding_id: input.context.workspace_binding_id, process_epoch: input.context.process_epoch,
+          ...(Object.hasOwn(input.context,"workspace_binding_id") ? { workspace_binding_id: input.context.workspace_binding_id }
+            : { execution_workspace_id: input.context.execution_workspace_id, execution_workspace_generation: input.context.execution_workspace_generation }), process_epoch: input.context.process_epoch,
           terminal_connection_id: input.context.terminal_connection_id, connect_token: input.context.connect_token,
           writer_epoch: input.context.writer_epoch };
         return decodeNamedSecretReceipt(await transport.request({ method: "POST", path: "/v1/named-secrets", sensitive: "named-secret",

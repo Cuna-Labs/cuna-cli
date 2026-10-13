@@ -1374,7 +1374,8 @@ export class ForegroundTerminalCoordinator {
       if (abort.signal.aborted || this.#state !== "active" || this.#activeTabId !== tabId || current === undefined ||
           current.accessMode !== "writer" || current.userId !== before.userId || current.machineId !== before.machineId ||
           current.agentSessionId !== before.agentSessionId || current.processEpoch !== before.processEpoch ||
-          current.workspaceBindingId !== before.workspaceBindingId || current.writerEpoch !== before.writerEpoch) {
+          current.workspaceBindingId !== before.workspaceBindingId || current.executionWorkspaceId !== before.executionWorkspaceId ||
+          current.executionWorkspaceGeneration !== before.executionWorkspaceGeneration || current.writerEpoch !== before.writerEpoch) {
         this.#browserNotice = "Writer identity changed · no secret input collected"; return;
       }
       if (!this.#secretInput.safeToEdit) { this.#browserNotice = "Finish the paste boundary, then press Ctrl+Q again"; return; }

@@ -301,6 +301,27 @@ test("named-secret proof is redeemed-writer only, privately inspected, absent fr
   finally { await observer.shutdown(); }
 });
 
+test("real API Workspace context reaches redeemed V2 secret writer without fabricating a legacy binding", async () => {
+  for(const role of ["writer","observer"]) {
+    const system=new FakeTerminalSystem();system.seatOnReady.set("agent-a",{accessMode:role,writerEpoch:1});
+    const execution="33333333-3333-4333-8333-333333333333";let generation=4;
+    const client={getIdentity:async()=>({id:"user-1",workspaceAssigned:true}),getAgentSession:async id=>({id,machineId:"machine-1",cwd:`/workspace/workspaces/${execution}`,processEpoch:`epoch-${id}`,processState:"running",runtimeObservedAt:new Date(NOW-500).toISOString(),runtimeExpiresAt:new Date(NOW+30000).toISOString(),rowVersion:1}),
+      discoverCapabilities:async(_scope,id)=>{const result=capabilitySnapshot(id);result.capabilities.push({id:"agent_sessions.workspace.read",availability:"supported",interaction:"read_only",mutationClass:"none",surfaces:["cli"],requiredPermissions:[]});return result;},
+      getAgentSessionWorkspaceContext:async id=>({agentSessionId:id,machineId:"machine-1",executionWorkspaceId:execution,workspaceGeneration:generation,remoteRoot:`/workspace/workspaces/${execution}`}),
+      createTerminalConnection:async(id,input,key)=>system.controlPlane.createTerminalConnection({agentSessionId:id,...input,idempotencyKey:key}),cancelTerminalConnection:async()=>({cancelled:true})};
+    const {runtime}=createRuntime(system,{controlPlane:createApiTerminalControlPlane({client,clock:()=>NOW})});
+    try {
+      const attached=await runtime.attach({tabId:"tab-a",agentSessionId:"agent-a",columns:80,rows:24});assert.equal(attached.workspaceBindingId,null);assert.equal(attached.executionWorkspaceId,execution);assert.equal(attached.executionWorkspaceGeneration,4);
+      if(role==="observer"){assert.throws(()=>runtime.namedSecretContext("tab-a"),/observes/);continue;}
+      const proof=runtime.namedSecretContext("tab-a");assert.equal(proof.execution_workspace_id,execution);assert.equal(proof.execution_workspace_generation,4);assert.equal(Object.hasOwn(proof,"workspace_binding_id"),false);assert.equal(system.grants.has(proof.connect_token),true);
+      assert.doesNotMatch(JSON.stringify(runtime.listTerminals(),(_key,value)=>typeof value==="bigint"?String(value):value),/connect_token|runa_tc|resumeHandle/);
+      system.connections[0].incoming.close();await waitUntil(()=>runtime.listTerminals()[0]?.state==="interrupted");await runtime.reconnect({tabId:"tab-a"});assert.equal(runtime.namedSecretContext("tab-a").execution_workspace_generation,4);
+      system.connections[1].incoming.close();await waitUntil(()=>runtime.listTerminals()[0]?.state==="interrupted");generation=5;
+      await assert.rejects(runtime.reconnect({tabId:"tab-a"}),{code:"session_discontinuous"});assert.equal(system.createCalls.length,2,"changed Workspace cannot obtain another terminal grant");assert.throws(()=>runtime.namedSecretContext("tab-a"));
+    } finally {await runtime.shutdown();}
+  }
+});
+
 test("canonical view waits for reset and rendered boundary, then reconnect starts at one", async () => {
   const system = new FakeTerminalSystem(); system.canonicalViews = true;
   let release; let resetEntered = false;

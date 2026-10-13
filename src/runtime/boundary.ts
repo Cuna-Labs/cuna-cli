@@ -166,6 +166,8 @@ export interface RuntimeTerminalSnapshot {
   readonly machineId: string;
   readonly workspaceBindingId: string | null;
   readonly workspaceBindingGeneration: number | null;
+  readonly executionWorkspaceId?: string;
+  readonly executionWorkspaceGeneration?: number;
   readonly agentSessionId: string;
   readonly processEpoch: string;
   readonly state: RuntimeTerminalState;
@@ -703,11 +705,14 @@ export class CunaRuntimeBoundary {
     if (entry.connectionProofRole !== "writer" || entry.connectionProofEpoch !== entry.writerEpoch) {
       throw runtimeFailure("terminal_writer_unavailable", "A fresh writer grant is required before storing a secret.");
     }
-    if (entry.terminalView?.ready === false || entry.observation.workspaceBindingId == null) {
+    const legacyBinding=entry.observation.workspaceBindingId;
+    const execution=entry.observation.executionWorkspaceId, executionGeneration=entry.observation.executionWorkspaceGeneration;
+    if (entry.terminalView?.ready === false || (legacyBinding == null && (execution === undefined || executionGeneration === undefined))) {
       throw runtimeFailure("terminal_disconnected", "The current terminal cannot prove a workspace-bound writer.");
     }
     const context = { agent_session_id: entry.observation.agentSessionId, machine_id: entry.observation.machineId,
-      workspace_binding_id: entry.observation.workspaceBindingId, process_epoch: entry.observation.processEpoch,
+      ...(legacyBinding == null ? { execution_workspace_id: execution, execution_workspace_generation: executionGeneration }
+        : {workspace_binding_id:legacyBinding}), process_epoch: entry.observation.processEpoch,
       terminal_connection_id: entry.connection.connectionId, writer_epoch: entry.writerEpoch };
     Object.defineProperty(context, "connect_token", { enumerable: false,
       value: entry.connectionProof.withBytes((bytes) => new TextDecoder().decode(bytes)) });
@@ -726,7 +731,7 @@ export class CunaRuntimeBoundary {
     const entry = this.#requireActiveTerminal(tabId);
     this.#requireWriterSeat(entry);
     if (!this.needsNamedSecretAuthorityRefresh(tabId)) return this.namedSecretContext(tabId);
-    const identity = `${entry.observation.userId}:${entry.observation.machineId}:${entry.observation.agentSessionId}:${entry.observation.processEpoch}:${entry.observation.workspaceBindingId}:${entry.writerEpoch}`;
+    const identity = `${entry.observation.userId}:${entry.observation.machineId}:${entry.observation.agentSessionId}:${entry.observation.processEpoch}:${entry.observation.workspaceBindingId}:${entry.observation.executionWorkspaceId??""}:${entry.observation.executionWorkspaceGeneration??""}:${entry.writerEpoch}`;
     entry.state = "interrupted";
     await this.reconnect({ tabId, signal });
     while (this.#requireActiveTerminal(tabId).terminalView?.ready === false) {
@@ -734,7 +739,7 @@ export class CunaRuntimeBoundary {
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
     }
     const refreshed = this.#requireActiveTerminal(tabId);
-    if (`${refreshed.observation.userId}:${refreshed.observation.machineId}:${refreshed.observation.agentSessionId}:${refreshed.observation.processEpoch}:${refreshed.observation.workspaceBindingId}:${refreshed.writerEpoch}` !== identity) {
+    if (`${refreshed.observation.userId}:${refreshed.observation.machineId}:${refreshed.observation.agentSessionId}:${refreshed.observation.processEpoch}:${refreshed.observation.workspaceBindingId}:${refreshed.observation.executionWorkspaceId??""}:${refreshed.observation.executionWorkspaceGeneration??""}:${refreshed.writerEpoch}` !== identity) {
       throw runtimeFailure("grant_scope_mismatch", "Writer proof refresh changed the admitted session identity.");
     }
     return this.namedSecretContext(tabId);
@@ -1041,6 +1046,8 @@ export class CunaRuntimeBoundary {
         admitted.observation.machineId !== entry.observation.machineId ||
         admitted.observation.workspaceBindingId !== entry.observation.workspaceBindingId ||
         admitted.observation.workspaceBindingGeneration !== entry.observation.workspaceBindingGeneration ||
+        admitted.observation.executionWorkspaceId !== entry.observation.executionWorkspaceId ||
+        admitted.observation.executionWorkspaceGeneration !== entry.observation.executionWorkspaceGeneration ||
         admitted.observation.agentSessionId !== entry.observation.agentSessionId ||
         admitted.observation.processEpoch !== entry.observation.processEpoch
       ) {
@@ -1621,6 +1628,8 @@ export class CunaRuntimeBoundary {
       expected.machineId !== actual.machineId ||
       expected.workspaceBindingId !== actual.workspaceBindingId ||
       expected.workspaceBindingGeneration !== actual.workspaceBindingGeneration ||
+      expected.executionWorkspaceId !== actual.executionWorkspaceId ||
+      expected.executionWorkspaceGeneration !== actual.executionWorkspaceGeneration ||
       expected.agentSessionId !== actual.agentSessionId ||
       expected.processEpoch !== actual.processEpoch
     ) {
@@ -2335,6 +2344,8 @@ function snapshot(entry: TerminalEntry, heartbeatTimeoutMs = 45_000, now = Date.
     machineId: entry.observation.machineId,
     workspaceBindingId: entry.observation.workspaceBindingId,
     workspaceBindingGeneration: entry.observation.workspaceBindingGeneration,
+    ...(entry.observation.executionWorkspaceId===undefined?{}:{executionWorkspaceId:entry.observation.executionWorkspaceId,
+      executionWorkspaceGeneration:entry.observation.executionWorkspaceGeneration}),
     agentSessionId: entry.observation.agentSessionId,
     processEpoch: entry.observation.processEpoch,
     state: entry.state,

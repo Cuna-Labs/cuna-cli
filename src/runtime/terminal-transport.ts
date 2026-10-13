@@ -21,6 +21,9 @@ export interface RemoteAgentSessionEvidence {
   readonly processEpoch: string;
   readonly workspaceBindingId: string | null;
   readonly workspaceBindingGeneration: number | null;
+  /** Authenticated V2 Workspace context; never substituted for a legacy binding. */
+  readonly executionWorkspaceId?: string;
+  readonly executionWorkspaceGeneration?: number;
   readonly state: "starting" | "ready" | "running" | "exited" | "failed" | "terminating" | "terminated" | "unknown";
   readonly observedAt: string;
   readonly expiresAt: string;
@@ -135,6 +138,9 @@ export function assertRemoteAgentSessionEvidence(input: {
     (workspaceBindingId !== null && !canonicalUuid(workspaceBindingId)) ||
     (workspaceBindingGeneration !== null &&
       (!Number.isSafeInteger(workspaceBindingGeneration) || workspaceBindingGeneration < 1)) ||
+    (evidence.executionWorkspaceId === undefined) !== (evidence.executionWorkspaceGeneration === undefined) ||
+    (evidence.executionWorkspaceId !== undefined && (!canonicalUuid(evidence.executionWorkspaceId) || workspaceBindingId !== null)) ||
+    (evidence.executionWorkspaceGeneration !== undefined && (!Number.isSafeInteger(evidence.executionWorkspaceGeneration) || evidence.executionWorkspaceGeneration < 1)) ||
     evidence.evidenceRevision.length === 0 ||
     observedAt === null ||
     expiresAt === null ||

@@ -80,6 +80,10 @@ export function createApiTerminalControlPlane(input: {
         processEpoch: session.processEpoch,
         workspaceBindingId: session.workspaceBindingId ?? null,
         workspaceBindingGeneration: session.workspaceGeneration ?? null,
+        ...(session.workspaceBindingId == null && workspaceContexts.has(agentSessionId) ? {
+          executionWorkspaceId: workspaceContexts.get(agentSessionId)!.executionWorkspaceId,
+          executionWorkspaceGeneration: workspaceContexts.get(agentSessionId)!.workspaceGeneration,
+        } : {}),
         state: session.processState,
         observedAt: session.runtimeObservedAt,
         expiresAt: session.runtimeExpiresAt,
