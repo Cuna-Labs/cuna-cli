@@ -385,11 +385,15 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
    if(error instanceof OwnerGrantError||(error instanceof Error&&error.name==='AbortError'))throw error;
    throw new OwnerGrantError('unavailable',`Cuna was not contacted. This CLI could not ${what}: ${error instanceof Error?error.message:String(error)}`,error);
   }};
- const run=async(label:string,work:()=>Promise<void>)=>{if(busy||stopped)return;busy=true;const previous=phase;phase='working';settled=undefined;await screen(label,['Waiting for Cuna...'],'');
+ const flights=new Set<Promise<void>>();
+ const run=(label:string,work:()=>Promise<void>):Promise<void>=>{if(busy||stopped)return Promise.resolve();
+  const flight=(async()=>{busy=true;const previous=phase;phase='working';settled=undefined;await screen(label,['Waiting for Cuna...'],'');
   try{await work();}
   catch(error){if(stopped)return;failure=error instanceof OwnerGrantError?error:classifyTransportFailure(error,false);
    if(failure.effectUnknown||previous==='unresolved'){cursor=0;await paintUnresolved();}else await paintFailure();}
-  finally{busy=false;}};
+  finally{busy=false;}})();
+  flights.add(flight);void flight.then(()=>{flights.delete(flight);},()=>{flights.delete(flight);});return flight;
+ };
  /**
   * Drop a resolved record.
   *
@@ -649,9 +653,10 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
  options.signal?.addEventListener('abort',stop,{once:true});
  try{
   if(options.signal?.aborted)stop();
-  else await run('Reading local state',async()=>{
+  else void run('Reading local state',async()=>{
    // Recover operation identity from an earlier process before anything else.
    unresolved=[...await localState('read its record of unresolved changes',()=>store.list(abort.signal))];
+   abort.signal.throwIfAborted();
    await readSessions();
    // `--grant` names one explicit subject the owner came here for, and reaching
    // it is how a grant is revoked. An unresolved SHARING change must not hide
@@ -664,5 +669,13 @@ export async function runOwnerGrantsScreen(api:Api,sessions:ShareableSessionSour
   });
   await done;
  }
- finally{stop();remove();options.signal?.removeEventListener('abort',stop);await hostWrites;await lease.restore();}
+ finally{stop();remove();options.signal?.removeEventListener('abort',stop);
+  try{await hostWrites;await lease.restore();}
+  finally{
+   // Closing releases the TTY promptly, but an admitted operation still owns
+   // its durable writes/outcome. Native filesystem completion remains required.
+   // No new run can enter after stop; no retry or remote replay is introduced.
+   await Promise.allSettled(flights);
+  }
+ }
 }

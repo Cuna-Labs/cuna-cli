@@ -45,11 +45,98 @@ test("secret popup paints orange and binds clipped field/reveal cells to the act
     assert.equal(workbenchNamedSecretTargetAt(hidden,0,targets[0].row),undefined);
     assert.match(hidden.text,/◉ show/u);
     const shown=withNamedSecretOverlay(base,{...view,revealed:true,revealedValue:"a\n😀"});
-    assert.match(shown.text,/a\\n😀/u); assert.match(shown.text,/◉ hide/u);
+    assert.match(shown.text,columns === 30 ? /a\\…/u : /a\\n😀/u); assert.match(shown.text,/◉ hide/u);
     assert.doesNotMatch(withNamedSecretOverlay(base,{...view,revealedValue:"UNREVEALED_CANARY"}).text,/UNREVEALED_CANARY/u);
     assert.deepEqual(withNamedSecretOverlay(base,{...view,resizeRequired:true}).secretTargets,[]);
     assert.equal(withNamedSecretOverlay(base,{...view}).appbarTargets.length,0);
   }
+});
+
+test("a password scalar always changes visible progress after the mask fills, without moving reveal targets", async () => {
+  const { NamedSecretOverlay } = await import("../dist/named-secrets/overlay.js");
+  const context={agent_session_id:"11111111-1111-4111-8111-111111111111",machine_id:"22222222-2222-4222-8222-222222222222",workspace_binding_id:"33333333-3333-4333-8333-333333333333",process_epoch:"44444444-4444-4444-8444-444444444444",terminal_connection_id:"55555555-5555-4555-8555-555555555555",connect_token:"runa_tc_"+"A".repeat(43),writer_epoch:1};
+  let serviceCalls=0;
+  const unexpected=async()=>{serviceCalls++;throw new Error("editing must not contact the service");};
+  for (const [columns,rows,length] of [[30,8,20],[80,24,60],[120,32,60],[30,8,4095]]) {
+    const allTabs=tabs();
+    const base=renderWorkbenchFrame({columns,rows,tabs:allTabs,activeTabId:allTabs[0].id,appbar:model()});
+    const overlay=new NamedSecretOverlay({prepare:unexpected,create:unexpected,read:unexpected},()=>({context,userId:"66666666-6666-4666-8666-666666666666"}),()=>{});
+    const terminal=new xterm.Terminal({cols:columns,rows,allowProposedApi:true});
+    const input=value=>overlay.input(new TextEncoder().encode(value));
+    const paint=async()=>{const frame=withNamedSecretOverlay(base,overlay.view);await new Promise(resolve=>terminal.write(frame.bytes,resolve));return {frame,lines:Array.from({length:rows},(_,row)=>terminal.buffer.active.getLine(row)?.translateToString(true)??"").join("\n")};};
+    try {
+      overlay.open();input("Demo\tX");const one=await paint();input("X");const two=await paint();
+      assert.notEqual(one.lines,two.lines,"short-value input must visibly progress");
+      input("X".repeat(length-2));const before=await paint();input("X");const after=await paint();
+      assert.notEqual(before.lines,after.lines,"an additional scalar must change the actual screen after clipping");
+      assert.match(after.lines,new RegExp(`\\(${length+1}\\)\\s+◉ show`,"u"));
+      assert.match(after.lines,/Secret Name: Demo/u);
+      assert.match(after.lines,/Up\/Down or Tab changes field/u);
+      assert.match(after.lines,/Enter saves · Esc cancels/u);
+      assert.deepEqual(before.frame.secretTargets,after.frame.secretTargets);
+      const reveal=after.frame.secretTargets.find(target=>target.target==="reveal");
+      assert.equal(reveal.lastColumn-reveal.firstColumn+1,6);
+      assert.equal(workbenchNamedSecretTargetAt(after.frame,reveal.firstColumn,reveal.row),"reveal");
+      assert.equal(workbenchNamedSecretTargetAt(after.frame,reveal.lastColumn,reveal.row),"reveal");
+      input("\x7f");const back=await paint();assert.match(back.lines,new RegExp(`\\(${length}\\)\\s+◉ show`,"u"));
+      overlay.close();overlay.open();input("Demo\t\x1b[200~a\n😀\x1b[201~");overlay.toggleReveal();
+      const shown=await paint();assert.match(shown.lines,/\(3\)\s+◉ hide/u);
+      assert.equal(overlay.view.revealedValue,"a\n😀");
+      assert.ok(shown.frame.text.includes(columns===30?"a\\…":"a\\n"),"revealed escape text is safely clipped with the value");
+      assert.equal(shown.frame.text.includes("a\n"),false,"the literal newline never reaches the frame");
+      if(columns>30)assert.ok(shown.lines.includes("😀"));
+      input("\x7f");const unicodeBack=await paint();assert.match(unicodeBack.lines,/\(2\)\s+◉ hide/u);
+      overlay.close();overlay.open();const cleared=await paint();
+      assert.doesNotMatch(cleared.lines,/\(\d+\)\s+◉ show/u,"cleared material must not look like a saved zero-length value");
+      assert.deepEqual(withNamedSecretOverlay(base,{...overlay.view,resizeRequired:true}).secretTargets,[]);
+    } finally { overlay.dispose();terminal.dispose(); }
+  }
+  assert.equal(serviceCalls,0);
+});
+
+test("real overlay transitions clear the UI count during submission, outcomes and expiry", async () => {
+  const {NamedSecretOverlay}=await import("../dist/named-secrets/overlay.js");
+  const context={agent_session_id:"11111111-1111-4111-8111-111111111111",machine_id:"22222222-2222-4222-8222-222222222222",workspace_binding_id:"33333333-3333-4333-8333-333333333333",process_epoch:"44444444-4444-4444-8444-444444444444",terminal_connection_id:"55555555-5555-4555-8555-555555555555",connect_token:"runa_tc_"+"A".repeat(43),writer_epoch:1};
+  const allTabs=tabs(),base=renderWorkbenchFrame({columns:80,rows:24,tabs:allTabs,activeTabId:allTabs[0].id,appbar:model()});
+  const until=async predicate=>{for(let n=0;n<300;n++){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,1));}assert.fail("overlay transition did not settle");};
+  for(const outcome of ["COMMITTED","REJECTED","UNKNOWN","expired"]){
+    let release,committed;
+    const service={prepare:async()=>"66666666-6666-4666-8666-666666666666",create:async(op,name)=>{
+      committed={operation_id:op,state:"committed",secret_id:"77777777-7777-4777-8777-777777777777",name,workspace_id:"66666666-6666-4666-8666-666666666666",committed_at:"2026-10-15T00:00:00Z"};
+      if(outcome==="COMMITTED")await new Promise(resolve=>{release=resolve;});
+      if(outcome==="UNKNOWN")throw new Error("synthetic unknown");
+      return outcome==="REJECTED"?{operation_id:op,state:"rejected",secret_id:null,name:null,workspace_id:null,committed_at:null}:committed;
+    },read:async()=>{if(outcome==="UNKNOWN")throw new Error("synthetic unavailable");return committed;}};
+    const overlay=new NamedSecretOverlay(service,()=>({context,userId:"66666666-6666-4666-8666-666666666666"}),()=>{},outcome==="expired"?{plaintextLifetimeMs:5}:{});
+    const cleared=()=>{assert.equal(overlay.view.masked,"");assert.doesNotMatch(withNamedSecretOverlay(base,overlay.view).text,/\(\d+\)\s+◉ show/u);};
+    try{
+      overlay.open();overlay.input(new TextEncoder().encode("Demo\tXYZ"));
+      assert.match(withNamedSecretOverlay(base,overlay.view).text,/\(3\)\s+◉ show/u);
+      if(outcome==="expired"){await until(()=>overlay.view.feedback.includes("expired"));cleared();continue;}
+      overlay.input(Uint8Array.of(13));
+      if(outcome==="COMMITTED"){await until(()=>typeof release==="function");assert.equal(overlay.state,"SUBMITTING");cleared();release();}
+      await until(()=>overlay.persistence===outcome&&overlay.state!=="SUBMITTING"&&overlay.state!=="RECONCILING");cleared();
+    }finally{release?.();overlay.dispose();}
+  }
+});
+
+test("resize refusal has no field targets or count even at defensive sub-minimum renderer widths", async () => {
+  const {NamedSecretOverlay}=await import("../dist/named-secrets/overlay.js");
+  let canEdit=true;
+  const context={agent_session_id:"session",machine_id:"machine",workspace_binding_id:"binding",process_epoch:"epoch",terminal_connection_id:"connection",writer_epoch:1};
+  const unexpected=async()=>{throw new Error("resize must not dispatch");};
+  const overlay=new NamedSecretOverlay({prepare:unexpected,create:unexpected,read:unexpected},()=>({context,userId:"user"}),()=>{},{canEdit:()=>canEdit});
+  try{
+    overlay.open();overlay.input(new TextEncoder().encode("Demo\tXYZ"));canEdit=false;overlay.geometryChanged(false);
+    assert.equal(overlay.view.resizeRequired,true);assert.equal(overlay.view.masked,"");
+    const allTabs=tabs(),base=renderWorkbenchFrame({columns:20,rows:3,tabs:allTabs,activeTabId:allTabs[0].id,appbar:model()});
+    for(const [columns,rows] of [[20,3],[30,7],[1,1],[8,3],[13,7]]){
+      // Below 20 columns is outside foreground admission; this separately
+      // checks the exported renderer's defensive resize-only projection.
+      const frame=withNamedSecretOverlay({...base,columns,rows},overlay.view);
+      assert.deepEqual(frame.secretTargets,[]);assert.doesNotMatch(frame.text,/\(\d+\)\s+◉ show/u);
+    }
+  }finally{overlay.dispose();}
 });
 
 test("incremental workbench writes preserve host cells, colors and cursor across edits and clears", async () => {

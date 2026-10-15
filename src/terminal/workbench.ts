@@ -115,7 +115,10 @@ export function withNamedSecretOverlay(frame: WorkbenchFrame, view: SecretOverla
       return code > 0xffff ? `\\u{${code.toString(16)}}` : `\\u${code.toString(16).padStart(4, "0")}`;
     }) : view.masked;
   const reveal = view.revealed === true ? "◉ hide" : "◉ show";
-  const passwordLine = `${padLine(truncateMarked(` ${view.focus === "secret" ? ">" : " "} Password: ${password}`, width - 7), width - 7)} ${reveal}`;
+  // The mask has one ASCII star per input scalar. Keep its count visible even
+  // when identical stars fill the field; revealed escape text is not the count.
+  const count = view.masked.length === 0 ? "       " : `(${view.masked.length})`.padStart(7);
+  const passwordLine = `${padLine(truncateMarked(` ${view.focus === "secret" ? ">" : " "} Password: ${password}`, width - 14), width - 14)}${count} ${reveal}`;
   const lines = view.resizeRequired ? [view.feedback] : [` ${view.focus === "name" ? ">" : " "} Secret Name: ${view.name}`, passwordLine, ...feedback];
   const top = Math.max(frame.appbarRows + 1, Math.floor((frame.rows - lines.length - 1) / 2) + 1);
   for (let index = 0; index < lines.length && top + index <= frame.rows; index += 1) {

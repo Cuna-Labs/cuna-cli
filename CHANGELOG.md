@@ -16,6 +16,14 @@ follow [Semantic Versioning](https://semver.org/).
   faithful to the known result: saved, rejected or unknown. It no longer says
   “no write sent” after a confirmed or rejected write.
 
+- Owner-grant screens restore terminal input promptly when cancelled and wait for
+  admitted local journal work before completing, preserving unknown operation IDs.
+- Long masked passwords show a local character count when the visible stars fill
+  the field. Attached-terminal help now lists Ctrl+Q when saving is available.
+- Windows credential ACL checks use native descriptor APIs without loading the
+  PowerShell security provider. Owner, group, access checks and existing deadlines
+  are preserved.
+
 These corrections are in source and are **not included in npm 0.1.8**.
 
 ## [0.1.8] - 2026-10-15

@@ -150,9 +150,10 @@ unusable, the CLI refuses rather than quietly falling back to your login.
 
 ## Exit codes
 
-For anything scripting this CLI, the exit code is the whole contract. `3`, `7`
-and `8` all mean "that did not happen", and each asks for something different:
-replace the credential, distrust the answer, or stop asking this deployment.
+For scripts, `3` requests usable authentication, `7` means the answer does not
+establish a valid result, and `8` means this deployment does not serve the
+capability. An invalid answer after a mutation does not prove the change failed;
+reconcile its recorded operation before sending another write.
 
 <!-- BEGIN GENERATED: exit-codes -->
 | Exit code | Name | Meaning | One reachable path |
@@ -188,13 +189,24 @@ Inspect a build without touching the network:
 node dist/bin/cuna.js self-test --offline --json
 ```
 
-Or install the packed artifact and take the journey a user takes:
+To test a local package, first build a verified candidate from a clean checkout:
 
 ```sh
-npm install --global ./cuna_labs-cli-0.1.8.tgz
+npm run candidate:local -- --output ./local-release-candidate
+```
+
+Install the tarball named by `tarball.file` in that directory's
+`release-envelope.json`. For example, in PowerShell:
+
+```powershell
+$localEnvelope = Get-Content -Raw ./local-release-candidate/release-envelope.json | ConvertFrom-Json
+npm install --global (Join-Path ./local-release-candidate $localEnvelope.tarball.file)
 cuna login
 cuna
 ```
+
+This is a local candidate with its own build identity; it does not replace the
+published npm package or authorize a release.
 
 The public OpenAPI contract decides what goes over the wire. The CLI owns the
 interactive parts: terminal behaviour, the local daemon and file

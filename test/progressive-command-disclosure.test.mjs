@@ -178,7 +178,7 @@ test("the documented first-run transcript ends in a foreground provider attach",
   assert.deepEqual(attached[0].expectedAgentKinds, ["claude-code"]);
 });
 
-test("README first run uses the local package and ends in the guided terminal journey", () => {
+test("README first run installs the registry package and contributors install the verified local envelope", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
 
   /* THE ANCHORS ARE ASSERTED BEFORE THEY ARE USED, and that is the repair this
@@ -192,15 +192,24 @@ test("README first run uses the local package and ends in the guided terminal jo
   const commands = readme.indexOf("## Commands");
   assert.ok(quickStart !== -1, "README must carry a Quick start heading");
   assert.ok(commands > quickStart, "README must carry a Commands heading after Quick start");
+  const nextSection = readme.indexOf("\n## ", quickStart + "## Quick start".length);
+  assert.ok(nextSection > quickStart && nextSection <= commands, "Quick start must have a following section");
 
-  // The packed artifact is still how a contributor takes a user's journey.
-  assert.match(readme, /npm install --global .*cuna_labs-cli-0\.1\.0\.tgz/u);
+  const quickStartText = readme.slice(quickStart, nextSection);
+  assert.match(quickStartText, /npm install -g @cuna_labs\/cli\s+cuna login\s+cuna\s+```/u);
+  // Build first and install the artifact named by its verified envelope. A
+  // guessed versioned filename can refer to no artifact or an older pack.
+  const { scripts } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(typeof scripts["candidate:local"], "string", "the documented builder must exist");
+  assert.match(readme, /npm run candidate:local -- --output \.\/local-release-candidate/u);
+  assert.match(readme, /Get-Content -Raw \.\/local-release-candidate\/release-envelope\.json \| ConvertFrom-Json/u);
+  assert.match(readme, /npm install --global \(Join-Path \.\/local-release-candidate \$localEnvelope\.tarball\.file\)/u);
+  assert.doesNotMatch(readme, /npm install --global \.\/cuna_labs-cli-[^\s]+\.tgz/u);
   // Sign in, then the bare command, and the block ends there: no resource IDs.
   assert.match(readme, /cuna login\s+cuna\s+```/u);
-  // The first run a reader meets asks for no identifiers. Bounded to the region
-  // above Commands, because the command reference legitimately names MACHINE_ID
-  // and --idempotency-key.
-  assert.doesNotMatch(readme.slice(quickStart, commands), UUID_HEAVY);
+  // The first-run section asks for no identifiers. Later creation and command
+  // references legitimately document explicit financial/idempotency choices.
+  assert.doesNotMatch(quickStartText, UUID_HEAVY);
   // And the exact resource commands are reachable from it.
   assert.match(readme, /`cuna help --all`/u);
 });
