@@ -18,7 +18,6 @@ const bridge = path.join(root, "scripts/harness/named-secret-unix-pty.py");
 const require = createRequire(path.join(root, "test/windows-conpty/package.json"));
 const native = require("node-pty");
 const password = "NATIVE_CANARY_nativé界🔒\nsecond line";
-const expectedHash = createHash("sha256").update(password).digest("hex");
 await mkdir(audit, { recursive: true });
 const mutant = path.join(audit, "native-pty-mutant-installed");
 await cp(installed, mutant, { recursive: true });
@@ -95,7 +94,7 @@ for (const platform of ["windows", "unix"]) for (const removedIsolation of [fals
     child.write("\x1dd"); await Promise.race([exitPromise, sleep(3000)]);
     const api = await receipt(outputFile, runId); const sink = await receipt(sinkFile, runId);
     result.api = api; result.sink = sink; result.native = nativeInfo;
-    result.oracle.exact_password = api?.password_sha256 === expectedHash;
+    result.oracle.exact_password = api?.exact_canary_matched === true;
     result.oracle.repeated_enter_once = api?.api_posts === 1;
     result.oracle.real_resize = api?.resize_calls > 0;
     result.oracle.secret_absent_remote_pty = sink?.canary_seen === false;

@@ -1,5 +1,4 @@
 import { createServer } from "node:http";
-import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
@@ -35,8 +34,9 @@ if (process.argv.includes("--sink")) {
     module("terminal/foreground.js"), module("pty/node-host-terminal.js"), module("api/client.js"), module("api/http.js"), module("named-secrets/service.js"), module("core/deployed-wire-compatibility.js"),
   ]);
   const ids = { user: "11111111-1111-4111-8111-111111111111", machine: "22222222-2222-4222-8222-222222222222", binding: "33333333-3333-4333-8333-333333333333", epoch: "44444444-4444-4444-8444-444444444444", connection: "55555555-5555-4555-8555-555555555555", workspace: "66666666-6666-4666-8666-666666666666", session: "77777777-7777-4777-8777-777777777777" };
-  const passwordHash = (value) => createHash("sha256").update(value).digest("hex");
-  const receipts = new Map(); const report = lifecycleReport = { ...lifecycleReport, native_host_tty: process.stdin.isTTY, api_posts: 0, password_sha256: null, operation_id: null, same_process_epoch: true, resize_calls: 0, fixture_api: "loopback-memory-only", stage: "fixture-ready" };
+  // Public test payload, matched exactly; this fixture stores no password verifier.
+  const exactCanaryMatches = (value) => value === "NATIVE_CANARY_nativé界🔒\nsecond line";
+  const receipts = new Map(); const report = lifecycleReport = { ...lifecycleReport, native_host_tty: process.stdin.isTTY, api_posts: 0, exact_canary_matched: null, operation_id: null, same_process_epoch: true, resize_calls: 0, fixture_api: "loopback-memory-only", stage: "fixture-ready" };
   const context = { agent_session_id: ids.session, machine_id: ids.machine, workspace_binding_id: ids.binding, process_epoch: ids.epoch, terminal_connection_id: ids.connection, connect_token: `${DEPLOYED_WIRE_COMPATIBILITY.credentialBrand}_tc_${"A".repeat(43)}`, writer_epoch: 1 };
   const server = createServer(async (request, response) => {
     const send = (status, row) => { response.writeHead(status, { "content-type": "application/json" }); response.end(JSON.stringify(row)); };
@@ -51,7 +51,7 @@ if (process.argv.includes("--sink")) {
         typeof body.name !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u.test(body.name) || typeof body.password !== "string" || Buffer.byteLength(body.password) > 4096 ||
         Object.keys(body).sort().join() !== "context,name,operation_id,password" || Object.keys(body.context ?? {}).sort().join() !== Object.keys(context).sort().join() ||
         Object.entries(context).some(([key, value]) => body.context[key] !== value)) return send(422, {});
-      report.api_posts++; report.password_sha256 = passwordHash(body.password); report.operation_id = body.operation_id;
+      report.api_posts++; report.exact_canary_matched = exactCanaryMatches(body.password); report.operation_id = body.operation_id;
       const row = { operation_id: body.operation_id, state: "committed", secret_id: ids.connection, name: body.name, workspace_id: ids.workspace, committed_at: "2026-10-12T12:00:00Z" };
       receipts.set(body.operation_id, row); return send(201, row);
     }
