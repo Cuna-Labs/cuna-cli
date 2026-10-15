@@ -9,38 +9,6 @@
   </p>
 </div>
 
-In an attached rich terminal, press **Ctrl+Q** (one simultaneous chord) to save
-a named password to your Cuna Workspace vault. The local popout contains Secret
-Name and Password; passwords are masked. Tab changes field, Enter saves and
-Escape cancels. Unicode and multiline bracketed paste are supported. Saving
-does not grant an agent or Machine access to the secret. Names are case-sensitive
-ASCII identifiers (letter first, then letters, digits, `.`, `_` or `-`, up to
-64 characters); passwords are limited to 4096 UTF-8 bytes. Existing names are
-never overwritten.
-
-The agent keeps running and its current view continues updating. The popout
-requires a current writer seat, a Workspace-bound session and isolated rich mode;
-plain mode refuses it. Ctrl+Q reserves direct XON for Cuna; `Ctrl+]` then `q`
-still sends XON remotely. Host or custom provider bindings that intercept Ctrl+Q
-must be corrected before using it. Verify keyboard support on the actual host.
-
-“Saved in Cuna” appears only after durable operation readback. If a response is
-lost, the outcome remains unknown; Enter checks the same operation without
-writing again. Closing after dispatch does not undo a committed write. Mutable
-input buffers are cleared, but JavaScript and network copies cannot be guaranteed
-erased from memory. The API must support named-secret storage for saves to work.
-Editing expires after two minutes from opening; values are cleared and no write
-is sent. Each validation, save or confirmation request has a ten-second bound.
-Unicode, Tab and CR/LF line breaks stay in the masked local buffer. Requires
-trustworthy host bracketed-paste framing; terminal control sequences are
-unsupported. Raw terminal bytes cannot distinguish embedded paste delimiters
-from host framing or prove that Enter was physically pressed. Detectable
-delimiter ambiguity is refused; a paste-end callback containing extra input is
-quarantined. Cancel and re-enter instead of saving a truncated value.
-After detach or process exit, Cuna prints a safe recovery command:
-`cuna secrets operation OPERATION_ID [--json]`. It reads metadata with the current
-account and needs no running process, Machine or writer seat.
-
 Claude Code, Codex and OpenCode feel like they are running on your laptop. They
 are not: the processes, the sessions and the files live on a Cuna cloud machine,
 and they survive when you close the lid.
@@ -63,11 +31,16 @@ cuna login
 cuna
 ```
 
+The published npm version is **0.1.8**. Source under
+[Unreleased](CHANGELOG.md#unreleased) includes corrections that are not in that
+package; see the [0.1.8 named-secret limitations](docs/named-secrets.md#known-limitations-in-018)
+before saving a password.
+
 `cuna` with no arguments walks you through choosing a machine, a provider and a
 session. You never type a resource ID on the normal path.
 
-Needs Node.js 22.17.1+ or 24.4.1+. npm is the only channel, on Windows, macOS
-and Linux.
+Requires Node.js 22.x from 22.17.1, or 24.x from 24.4.1. npm is the only
+channel, on Windows, macOS and Linux.
 
 ## A minimal session
 
@@ -94,6 +67,51 @@ Inside a session, `Ctrl+]` is the escape prefix: `?` for help, `d` to detach,
 `c` to send a real `Ctrl+C` to the agent, `n` for the next tab, `1`-`4` to pick
 one. Pasted text never triggers them.
 
+## Save a named secret
+
+In an attached rich terminal, press **Ctrl+Q** — one simultaneous chord — to
+open the orange local popout. It has only **Secret Name** and **Password**.
+Use ↑/↓ or Tab/Shift+Tab to change field, Enter to save and Escape to cancel.
+Each password character has one `*`; click **show/hide** to reveal or mask it
+locally, or click a field to focus it. Saving does not grant an agent or Machine
+access to the secret.
+
+A save is confirmed only after an operation GET verifies the stored receipt.
+An unknown outcome must be checked with the same operation ID, never by creating
+another write. See the [named-secret guide](docs/named-secrets.md) for recovery,
+paste requirements, shortcut collisions and the known 0.1.8 limitations.
+
+## Machine creation and local folders
+
+When a new Machine is needed and the server advertises support, Cuna asks
+`Install Tetragon? [y/n]` before creation. It accepts `y`/`yes` and `n`/`no`,
+ignoring case and surrounding whitespace. The separate Machine-creation
+confirmation accepts `y`/`yes` the same way. To choose explicitly:
+
+```sh
+cuna claude ./my-project --new --install-tetragon false
+```
+
+The flag accepts exactly `true` or `false`, applies only to creation and refuses
+unsupported servers. It does not alter the mandatory sandbox or guarantee a
+startup time. For noninteractive `machines create`, provide the choice and the
+separate financial confirmation:
+
+```sh
+cuna machines create --name my-machine --idempotency-key UNIQUE_KEY --install-tetragon false --yes
+```
+
+When launched from your home directory without an explicit path, the local-folder
+journey selects an account-scoped folder under `Cuna Workspaces`. A legacy folder
+is reused only when its binding proves the same account and profile. An explicit
+path is never redirected to another account's folder.
+
+If you see `binding_owner_mismatch`, check `cuna whoami` and use the account that
+owns that folder, or select a new empty folder outside any bound project and run
+the normal sync journey there. Keep the original folder and its `.cuna` data.
+`--no-sync` requires an existing remotely committed binding and generation; it
+does not bypass ownership checks or initialize a new folder.
+
 ## Commands
 
 ```text
@@ -107,6 +125,7 @@ cuna machines start | pause | resume | stop | delete ID --yes
 
 cuna agent-sessions list --machine ID
 cuna agent-sessions create --machine ID --agent claude-code --idempotency-key KEY --yes
+cuna secrets operation OPERATION_ID --json
 
 cuna claude | codex | opencode [PATH]
 cuna self-test --offline --json
@@ -123,8 +142,8 @@ Settings resolve flag first, then environment variable, then your profile, then
 the default. Production always talks to `https://api.getcuna.com`.
 
 `cuna login` opens your browser and you paste back the `cuna_login_` value it
-shows once. It is stored encrypted, scoped to your OS user, and exchanged for a
-short-lived token on every run. `cuna logout` revokes it before deleting it.
+shows once. It is stored encrypted, scoped to your OS user, and exchanged for
+short-lived access tokens when needed. `cuna logout` revokes it before deleting it.
 
 `CUNA_API_KEY` is for automation and is never saved for you. If it is set but
 unusable, the CLI refuses rather than quietly falling back to your login.
@@ -172,7 +191,7 @@ node dist/bin/cuna.js self-test --offline --json
 Or install the packed artifact and take the journey a user takes:
 
 ```sh
-npm install --global ./cuna_labs-cli-0.1.0.tgz
+npm install --global ./cuna_labs-cli-0.1.8.tgz
 cuna login
 cuna
 ```
