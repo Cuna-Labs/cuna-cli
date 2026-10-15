@@ -39,9 +39,18 @@ const PROBLEM_ACTIONS = new Set(["retry", "sign_in", "open_web", "contact_suppor
 // throwing, because an unusable sentence must degrade to the generic message
 // rather than turn a server refusal into a client crash.
 const FORBIDDEN_PUBLIC_CHARACTER = /[\p{Cc}\p{Cf}]/u;
+// Upstream errors can echo credentials outside the product namespace. Preserve
+// their diagnostic prose while withholding the foreign credential shapes.
+const FOREIGN_CREDENTIAL_SHAPE = new RegExp([
+  String.raw`\bBearer\s+[A-Za-z0-9._~+/-]+=*`,
+  String.raw`\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{16,}\b`,
+  String.raw`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`,
+  String.raw`\bgh[pousr]_[A-Za-z0-9]{20,}\b`,
+  String.raw`\bAKIA[0-9A-Z]{16}\b`,
+].join("|"), "giu");
 function publicProse(value: string): string | undefined {
   if (FORBIDDEN_PUBLIC_CHARACTER.test(value) || containsCredentialValue(value)) return undefined;
-  return value;
+  return value.replace(FOREIGN_CREDENTIAL_SHAPE, "[redacted credential]");
 }
 const AGENT_SESSION_CREATE_PATH = /^\/v1\/sessions\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/agent-sessions$/u;
 const WORKSPACE_SYNC_CAPABILITIES = Object.freeze([
