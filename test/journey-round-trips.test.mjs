@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { createOwnedTempDirectory, removeOwnedTempDirectory } from "../scripts/lib/owned-temp.mjs";
 import test from "node:test";
 
 import { createApiAgentJourneyEffects } from "../dist/journey/api-effects.js";
@@ -161,7 +159,7 @@ test("a refused capability still decides the admission: no grant, whatever the s
 });
 
 async function selectThenCreate(clockAfterSelection) {
-  const stateDirectory = await mkdtemp(join(tmpdir(), "cuna-round-trips-"));
+  const stateDirectory = await createOwnedTempDirectory("cuna-round-trips-");
   let now = NOW;
   let machineReads = 0;
   const execution = "33333333-3333-4333-8333-333333333333";
@@ -188,7 +186,7 @@ async function selectThenCreate(clockAfterSelection) {
     await effects.createAgentSession({ machineId: MACHINE, agent: "opencode", authMode: "interactive_login", workspace, idempotencyKey: "k", signal: new AbortController().signal });
     return machineReads;
   } finally {
-    await rm(stateDirectory, { recursive: true, force: true });
+    await removeOwnedTempDirectory(stateDirectory);
   }
 }
 

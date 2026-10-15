@@ -96,6 +96,7 @@ const ROUTE_OPERATIONS: Readonly<Record<string, readonly string[]>> = Object.fre
     "POST /v1/collaboration/2/agent-sessions/{id}/audience-state",
   ],
   "capabilities": [CAPABILITIES],
+  "secrets operation": ["GET /v1/named-secrets/operations/{operation_id}"],
   "machines": ["GET /v1/sessions"],
   "machines list": ["GET /v1/sessions"],
   "machines create": [CAPABILITIES, "POST /v1/sessions", "GET /v1/sessions/{id}"],
@@ -183,6 +184,7 @@ export const CLI_ROUTE_REGISTRY: readonly CliRouteDefinition[] = Object.freeze([
   routed("observe", "observe --project PROJECT_ID", ["observe","--project","00000000-0000-4000-8000-000000000001"], "Observe an authorized shared session read-only"),
   routed("share", "share --project PROJECT_ID [--grant GRANT_ID]", ["share","--project","00000000-0000-4000-8000-000000000001"], "Grant, inspect or revoke a member's read-only observation, and share or unshare the session itself"),
   routed("capabilities", "capabilities", ["capabilities"], "Inspect live server capability truth"),
+  routed("secrets operation", "secrets operation OPERATION_ID", ["secrets", "operation", "00000000-0000-4000-8000-000000000001"], "Read a named-secret operation without creating a secret"),
   // Off a terminal, bare `machines` prints the nested inventory as `machines.overview`.
   routed("machines", "machines", ["machines"], "Browse machines and AgentSessions interactively", "exact", "machines.overview"),
   routed("machines list", "machines list", ["machines", "list"], "List exact machine resources"),
@@ -352,6 +354,7 @@ const BOOLEAN_OPTIONS = new Set([
  * decides the shape of the parse.
  */
 const VALUE_OPTIONS = new Set([
+  "install-tetragon",
   "project",
   "grant",
   "after",

@@ -331,11 +331,23 @@ test("without --timeout-ms a create is bounded by its own budget, not by the glo
   // durable receipt instead of ending there (installed 0.1.5, 2026-09-29).
   // The receipt here answers at once with a settled failure, so the run ends
   // without the follow loop's own waits.
+  const wallSetTimeout = globalThis.setTimeout, wallClearTimeout = globalThis.clearTimeout;
+  const bounded = async (promise, label) => {
+    let timer;
+    try {
+      return await Promise.race([promise, new Promise((_resolve, reject) => {
+        timer = wallSetTimeout(() => reject(new Error(`The fixture did not ${label} within 5 s of real time.`)), 5_000);
+      })]);
+    } finally { wallClearTimeout(timer); }
+  };
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const streams = memoryStreams();
   let settled;
   let postAborted = false;
   const receiptReads = [];
+  let announcePost, rejectPost, cleaningUp = false;
+  const postStarted = new Promise(resolve => { announcePost = resolve; });
+  t.after(() => { cleaningUp = true; rejectPost?.(new Error("Disposable POST fixture cleanup")); });
   const run = runCli(["machines", "create", "--name", "dev", "--yes", "--json"], {
     streams: streams.streams,
     platform,
@@ -374,23 +386,29 @@ test("without --timeout-ms a create is bounded by its own budget, not by the glo
           retryable: false, action: "none", updated_at: "2026-08-08T00:01:30.000Z",
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
+      if (cleaningUp) throw new Error("Disposable POST fixture cleanup");
       return new Promise((_resolve, reject) => {
+        rejectPost = reject;
         init.signal.addEventListener("abort", () => { postAborted = true; reject(init.signal.reason); }, { once: true });
+        announcePost();
       });
     },
   }).then((exit) => { settled = exit; });
 
-  // The create request is dispatched after an awaited capability read, so let the
-  // microtask queue drain before the clock is moved.
-  await new Promise((resolve) => process.nextTick(resolve));
-  await new Promise((resolve) => process.nextTick(resolve));
+  // Capability, identity and local durable-history reads precede dispatch.
+  // nextTick cannot drain filesystem I/O: start the clock only once the actual
+  // synthetic POST has installed its abort listener and its budget is armed.
+  await bounded(postStarted, "dispatch the POST");
   t.mock.timers.tick(DEFAULT_REQUEST_BUDGET_MS + 1);
   await new Promise((resolve) => process.nextTick(resolve));
   assert.equal(settled, undefined, "The create was cut off at the global default instead of its own budget.");
   assert.equal(postAborted, false, "The create was cut off at the global default instead of its own budget.");
 
-  t.mock.timers.tick(MACHINE_CREATE_REQUEST_BUDGET_MS);
-  await run;
+  t.mock.timers.tick(MACHINE_CREATE_REQUEST_BUDGET_MS - DEFAULT_REQUEST_BUDGET_MS - 2);
+  await new Promise((resolve) => process.nextTick(resolve));
+  assert.equal(postAborted, false, "the create is not aborted one millisecond before its own budget");
+  t.mock.timers.tick(1);
+  await bounded(run, "finish after the create's own budget");
   assert.equal(postAborted, true, "the create's own budget ends the wait for its POST");
   assert.equal(receiptReads.length, 1, "an unanswered create is followed through its receipt");
   assert.equal(settled, EXIT_CODES.remote);

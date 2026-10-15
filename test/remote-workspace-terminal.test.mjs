@@ -30,6 +30,8 @@ test('unchanged remote context remains observable without fabricating a local bi
   const f=fixture();await f.plane.observeAgentSession('session');
   const observation=await f.plane.observeAgentSession('session');
   assert.equal(f.reads(),2);assert.equal(observation.workspaceBindingId,null);assert.equal(observation.workspaceBindingGeneration,null);
+  assert.equal(observation.executionWorkspaceId,'33333333-3333-4333-8333-333333333333');
+  assert.equal(observation.executionWorkspaceGeneration,3);
 });
 test('foreign context or missing capability cannot admit remote terminal authority',async()=>{
   for(const value of [{machineId:'other'},{agentSessionId:'other'},{remoteRoot:'/root'},{executionWorkspaceId:'other'}]){

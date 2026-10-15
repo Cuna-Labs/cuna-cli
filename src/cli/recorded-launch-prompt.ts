@@ -28,7 +28,7 @@
  * compared without guessing which build produced a transcript.
  */
 export const RECORDED_LAUNCH_QUESTION =
-  "A previous launch is recorded. Create another session? [y/N; No resumes the recorded launch] ";
+  "A previous launch is recorded. Create another session? [y/n] (No resumes the recorded launch) ";
 
 /**
  * Asked instead when the recorded launch's session is known to have ended:
@@ -36,7 +36,7 @@ export const RECORDED_LAUNCH_QUESTION =
  * 2026-09-23, run j6: "No resumes" led to a dead session called "reused").
  */
 export const RECORDED_LAUNCH_ENDED_QUESTION =
-  "The last session for this folder has ended. Start a new session? [y/N; No starts nothing] ";
+  "The last session for this folder has ended. Start a new session? [y/n] (No starts nothing) ";
 
 /**
  * Asked instead when the recorded launch used another Workspace version or
@@ -44,7 +44,7 @@ export const RECORDED_LAUNCH_ENDED_QUESTION =
  * 2026-10-04: the default No led straight to `recorded_launch_mismatch`).
  */
 export const RECORDED_LAUNCH_UNRESUMABLE_QUESTION =
-  "The last launch for this folder used another Workspace version or preset and cannot be resumed. Start a new session? [y/N; No starts nothing] ";
+  "The last launch for this folder used another Workspace version or preset and cannot be resumed. Start a new session? [y/n] (No starts nothing) ";
 
 /**
  * How long the screen may stay unchanged after the answer is accepted.

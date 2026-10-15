@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createOwnedTempDirectory, removeOwnedTempDirectory } from "../scripts/lib/owned-temp.mjs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -509,7 +510,7 @@ test("AES-256-GCM session uses separate restricted key/ciphertext files and dele
 });
 
 test("Windows ACL work uses a fresh SID, verifies first, and never repairs a tampered session file", { skip: process.platform !== "win32" }, async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "cuna-local-session-acl-sequencing-"));
+  const directory = await createOwnedTempDirectory("cuna-local-session-acl-sequencing-");
   const paths = localEncryptedSessionPaths(directory, "acl-sequencing");
   const sessionDirectory = path.dirname(paths.sessionFile);
   const compliant = new Set();
@@ -563,7 +564,7 @@ test("Windows ACL work uses a fresh SID, verifies first, and never repairs a tam
       "an existing ACL change is security-unverified, not corruption or a retryable repair",
     );
     assert.equal(calls.reconcile.length, 0, "a tampered existing session file fails closed instead of being repaired");
-  } finally { await rm(directory, { recursive: true, force: true }); }
+  } finally { await removeOwnedTempDirectory(directory); }
 });
 
 test("Windows never repairs an existing noncompliant session directory", { skip: process.platform !== "win32" }, async () => {

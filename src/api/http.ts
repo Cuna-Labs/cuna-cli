@@ -23,6 +23,7 @@ import {
   observationBudgetElapsed,
 } from "../core/observation-budget.js";
 import { CLI_VERSION } from "../version.js";
+import { NamedSecretRequestError } from "./named-secrets.js";
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 // A 16 MiB body is never a legitimate answer on this contract, so the remedy is
@@ -38,9 +39,18 @@ const PROBLEM_ACTIONS = new Set(["retry", "sign_in", "open_web", "contact_suppor
 // throwing, because an unusable sentence must degrade to the generic message
 // rather than turn a server refusal into a client crash.
 const FORBIDDEN_PUBLIC_CHARACTER = /[\p{Cc}\p{Cf}]/u;
+// Upstream errors can echo credentials outside the product namespace. Preserve
+// their diagnostic prose while withholding the foreign credential shapes.
+const FOREIGN_CREDENTIAL_SHAPE = new RegExp([
+  String.raw`\bBearer\s+[A-Za-z0-9._~+/-]+=*`,
+  String.raw`\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{16,}\b`,
+  String.raw`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`,
+  String.raw`\bgh[pousr]_[A-Za-z0-9]{20,}\b`,
+  String.raw`\bAKIA[0-9A-Z]{16}\b`,
+].join("|"), "giu");
 function publicProse(value: string): string | undefined {
   if (FORBIDDEN_PUBLIC_CHARACTER.test(value) || containsCredentialValue(value)) return undefined;
-  return value;
+  return value.replace(FOREIGN_CREDENTIAL_SHAPE, "[redacted credential]");
 }
 const AGENT_SESSION_CREATE_PATH = /^\/v1\/sessions\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/agent-sessions$/u;
 const WORKSPACE_SYNC_CAPABILITIES = Object.freeze([
@@ -142,6 +152,8 @@ interface ProblemMetadata {
 }
 
 export interface HttpRequest {
+  /** Named-secret traffic must never use generic server-prose/cause diagnostics. */
+  readonly sensitive?: "named-secret";
   readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   readonly path: string;
   readonly query?: Readonly<Record<string, string | undefined>>;
@@ -912,6 +924,14 @@ export function createHttpTransport(input: {
             redirect: "error",
           });
           const bytes = await readLimited(response);
+          if (request.sensitive === "named-secret") {
+            try {
+              if (!response.ok && response.status !== 409) throw new NamedSecretRequestError(response.status);
+              const decoded = decodeJson(bytes);
+              if (!decoded.decoded) throw new NamedSecretRequestError();
+              return decoded.value;
+            } finally { bytes.fill(0); }
+          }
           if (!response.ok) {
             const decoded = decodeJson(bytes);
             throw apiError({
@@ -939,6 +959,7 @@ export function createHttpTransport(input: {
           try {
             return await dispatch(bearer);
           } catch (error) {
+            if (request.sensitive === "named-secret") throw error instanceof NamedSecretRequestError ? error : new NamedSecretRequestError();
             if (error instanceof CunaError || error instanceof CredentialBoundaryError) throw error;
             if (controller.signal.aborted) throw error;
             // Checked BEFORE the phase classification, deliberately. For an
@@ -955,6 +976,7 @@ export function createHttpTransport(input: {
           return await dispatchWithConnectRetry(requestCredential);
         } catch (error) {
           const canRetryUnauthorized = error instanceof CunaError &&
+            request.sensitive !== "named-secret" &&
             error.code === "cuna.auth.rejected" &&
             input.bearerTokenProvider !== undefined &&
             requestCredential !== undefined &&
@@ -980,6 +1002,7 @@ export function createHttpTransport(input: {
           return await dispatchWithConnectRetry(refreshedCredential);
         }
       } catch (error) {
+        if (request.sensitive === "named-secret") throw error instanceof NamedSecretRequestError ? error : new NamedSecretRequestError();
         if (error instanceof CunaError) throw error;
         // Token acquisition is a local credential boundary, not a network
         // dispatch. Preserve its typed failure so the CLI can name the exact

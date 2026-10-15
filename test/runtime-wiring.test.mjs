@@ -10,6 +10,7 @@ import { createNodeProcessAdapter } from "../dist/pty/node-process.js";
 import { createApiTerminalControlPlane } from "../dist/runtime/api-terminal-control-plane.js";
 import { admitCapability } from "../dist/runtime/capability-gate.js";
 import { CunaRuntimeBoundary } from "../dist/runtime/boundary.js";
+import { createNodeForegroundTerminalHost } from "../dist/pty/node-host-terminal.js";
 import { RuntimeBoundaryError } from "../dist/runtime/errors.js";
 import { DurableSyncJournal } from "../dist/sync/journal.js";
 import { assertRemoteAgentSessionEvidence, createUnavailableTerminalControlPlane, validateTerminalGrant } from "../dist/runtime/terminal-transport.js";
@@ -37,6 +38,42 @@ const API_ORIGIN = "https://api.getcuna.com";
  */
 const resources = new TestResourceLedger();
 test.after(() => resources.cleanup());
+
+test("vertical geometry: native 120x50 writer sends body48 before replay and grows without a 24-row clamp", async () => {
+  const stdout = { isTTY: true, columns: 120, rows: 50 };
+  const host = createNodeForegroundTerminalHost({ stdin: { isTTY: true, setRawMode() {} }, stdout });
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  try {
+    assert.deepEqual(host.dimensions(), { columns: 120, rows: 50 });
+    const size = host.dimensions();
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: size.columns, rows: size.rows - 2 });
+    let frames = system.connections[0].sent.map(decodeTerminalFrame);
+    assert.deepEqual(frames.slice(0, 2).map(f => f.type), ["resize", "resume"]);
+    assert.deepEqual(decodeTerminalControl(frames[0]), { columns: 120, rows: 48 });
+    stdout.rows = 70;
+    const grown = host.dimensions();
+    await runtime.resize(grown.columns, grown.rows - 2, "tab-a");
+    frames = system.connections[0].sent.map(decodeTerminalFrame);
+    assert.equal(frames.at(-1).type, "resize");
+    assert.deepEqual(decodeTerminalControl(frames.at(-1)), { columns: 120, rows: 68 });
+  } finally { await runtime.shutdown(); }
+});
+
+test("vertical geometry: an observer preserves the writer's 24 rows and sends no resize", async () => {
+  const system = new FakeTerminalSystem();
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  const { runtime } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 120, rows: 48 });
+    const wire = system.connections[0];
+    wire.incoming.push(geometryWire({ columns: 80, rows: 24, writerEpoch: 1 }));
+    await waitUntil(() => runtime.listTerminals()[0].geometry?.rows === 24, "observer keeps actual writer height");
+    await assert.rejects(runtime.resize(120, 48, "tab-a"));
+    assert.equal(wire.sent.map(decodeTerminalFrame).some(frame => frame.type === "resize"), false);
+    assert.equal(runtime.listTerminals()[0].geometry.rows, 24);
+  } finally { await runtime.shutdown(); }
+});
 
 function capabilitySnapshot(agentSessionId, overrides = {}) {
   return {
@@ -260,6 +297,67 @@ const VIEW_ID = "11111111-2222-4333-8444-555555555555";
 const viewStart = (id = VIEW_ID) => encodeTerminalControl("view_started", 0n, { protocol: "cuna.terminal-view.v1", operation: "new", viewId: id, columns: 80, rows: 24 });
 const viewReady = (sequence = "1", id = VIEW_ID) => encodeTerminalControl("view_ready", 0n, { viewId: id, afterOutputSequence: sequence });
 const viewOutput = (sequence = 1n) => encodeTerminalFrame({ type: "output", critical: true, sequence, payload: new TextEncoder().encode("CURRENT") });
+
+test("an observer promoted in place needs a fresh issued writer proof without changing its process or owner", async () => {
+  const system = new FakeTerminalSystem(); system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  system.controlPlane.observeAgentSession = async (agentSessionId) => ({ ...observation(agentSessionId), workspaceBindingId: "33333333-3333-4333-8333-333333333333", workspaceBindingGeneration: 1 });
+  const { runtime } = createRuntime(system);
+  try {
+    const initial = await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    const firstToken = [...system.grants.keys()][0];
+    system.connections[0].incoming.push(encodeTerminalControl("writer_epoch", 1n, { writerEpoch: 2, writerClientInstanceId: "client-1", accessMode: "writer" }));
+    await waitUntil(() => runtime.listTerminals()[0]?.accessMode === "writer", "server transfer arrived");
+    assert.equal(runtime.needsNamedSecretAuthorityRefresh("tab-a"), true); assert.throws(() => runtime.namedSecretContext("tab-a"), /fresh writer/);
+    system.seatOnReady.set("agent-a", { accessMode: "writer", writerEpoch: 2 });
+    const proof = await runtime.refreshNamedSecretAuthority("tab-a", new AbortController().signal);
+    assert.notEqual(proof.connect_token, firstToken); assert.equal(system.grants.has(proof.connect_token), true);
+    assert.equal(proof.writer_epoch, 2); assert.equal(proof.agent_session_id, initial.agentSessionId); assert.equal(proof.process_epoch, initial.processEpoch);
+    assert.equal(runtime.needsNamedSecretAuthorityRefresh("tab-a"), false); assert.equal(system.createCalls.length, 2);
+  } finally { await runtime.shutdown(); }
+});
+
+test("named-secret proof is redeemed-writer only, privately inspected, absent from snapshots, and refreshed on reconnect", async () => {
+  const system = new FakeTerminalSystem();
+  system.controlPlane.observeAgentSession = async (agentSessionId) => ({ ...observation(agentSessionId), workspaceBindingId: "33333333-3333-4333-8333-333333333333", workspaceBindingGeneration: 1 });
+  const { runtime } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 });
+    const first = runtime.namedSecretContext("tab-a");
+    assert.equal(system.grants.has(first.connect_token), true, "proof came from the grant authority, not a diagnostic placeholder");
+    assert.doesNotMatch(JSON.stringify(runtime.listTerminals(), (_key, value) => typeof value === "bigint" ? String(value) : value), /connect_token|runa_tc|resumeHandle/);
+    assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(first)), "connect_token"), false);
+    system.connections[0].incoming.close();
+    await waitUntil(() => runtime.listTerminals()[0]?.state === "interrupted");
+    await runtime.reconnect({ tabId: "tab-a" });
+    const second = runtime.namedSecretContext("tab-a"); assert.notEqual(first.connect_token, second.connect_token);
+    await runtime.detach("tab-a"); assert.throws(() => runtime.namedSecretContext("tab-a"));
+  } finally { await runtime.shutdown(); }
+  const observerSystem = new FakeTerminalSystem(); observerSystem.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 2 });
+  const { runtime: observer } = createRuntime(observerSystem);
+  try { await observer.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 80, rows: 24 }); assert.throws(() => observer.namedSecretContext("tab-a"), /observes/); }
+  finally { await observer.shutdown(); }
+});
+
+test("real API Workspace context reaches redeemed V2 secret writer without fabricating a legacy binding", async () => {
+  for(const role of ["writer","observer"]) {
+    const system=new FakeTerminalSystem();system.seatOnReady.set("agent-a",{accessMode:role,writerEpoch:1});
+    const execution="33333333-3333-4333-8333-333333333333";let generation=4;
+    const client={getIdentity:async()=>({id:"user-1",workspaceAssigned:true}),getAgentSession:async id=>({id,machineId:"machine-1",cwd:`/workspace/workspaces/${execution}`,processEpoch:`epoch-${id}`,processState:"running",runtimeObservedAt:new Date(NOW-500).toISOString(),runtimeExpiresAt:new Date(NOW+30000).toISOString(),rowVersion:1}),
+      discoverCapabilities:async(_scope,id)=>{const result=capabilitySnapshot(id);result.capabilities.push({id:"agent_sessions.workspace.read",availability:"supported",interaction:"read_only",mutationClass:"none",surfaces:["cli"],requiredPermissions:[]});return result;},
+      getAgentSessionWorkspaceContext:async id=>({agentSessionId:id,machineId:"machine-1",executionWorkspaceId:execution,workspaceGeneration:generation,remoteRoot:`/workspace/workspaces/${execution}`}),
+      createTerminalConnection:async(id,input,key)=>system.controlPlane.createTerminalConnection({agentSessionId:id,...input,idempotencyKey:key}),cancelTerminalConnection:async()=>({cancelled:true})};
+    const {runtime}=createRuntime(system,{controlPlane:createApiTerminalControlPlane({client,clock:()=>NOW})});
+    try {
+      const attached=await runtime.attach({tabId:"tab-a",agentSessionId:"agent-a",columns:80,rows:24});assert.equal(attached.workspaceBindingId,null);assert.equal(attached.executionWorkspaceId,execution);assert.equal(attached.executionWorkspaceGeneration,4);
+      if(role==="observer"){assert.throws(()=>runtime.namedSecretContext("tab-a"),/observes/);continue;}
+      const proof=runtime.namedSecretContext("tab-a");assert.equal(proof.execution_workspace_id,execution);assert.equal(proof.execution_workspace_generation,4);assert.equal(Object.hasOwn(proof,"workspace_binding_id"),false);assert.equal(system.grants.has(proof.connect_token),true);
+      assert.doesNotMatch(JSON.stringify(runtime.listTerminals(),(_key,value)=>typeof value==="bigint"?String(value):value),/connect_token|runa_tc|resumeHandle/);
+      system.connections[0].incoming.close();await waitUntil(()=>runtime.listTerminals()[0]?.state==="interrupted");await runtime.reconnect({tabId:"tab-a"});assert.equal(runtime.namedSecretContext("tab-a").execution_workspace_generation,4);
+      system.connections[1].incoming.close();await waitUntil(()=>runtime.listTerminals()[0]?.state==="interrupted");generation=5;
+      await assert.rejects(runtime.reconnect({tabId:"tab-a"}),{code:"session_discontinuous"});assert.equal(system.createCalls.length,2,"changed Workspace cannot obtain another terminal grant");assert.throws(()=>runtime.namedSecretContext("tab-a"));
+    } finally {await runtime.shutdown();}
+  }
+});
 
 test("canonical view waits for reset and rendered boundary, then reconnect starts at one", async () => {
   const system = new FakeTerminalSystem(); system.canonicalViews = true;

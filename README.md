@@ -9,6 +9,38 @@
   </p>
 </div>
 
+In an attached rich terminal, press **Ctrl+Q** (one simultaneous chord) to save
+a named password to your Cuna Workspace vault. The local popout contains Secret
+Name and Password; passwords are masked. Tab changes field, Enter saves and
+Escape cancels. Unicode and multiline bracketed paste are supported. Saving
+does not grant an agent or Machine access to the secret. Names are case-sensitive
+ASCII identifiers (letter first, then letters, digits, `.`, `_` or `-`, up to
+64 characters); passwords are limited to 4096 UTF-8 bytes. Existing names are
+never overwritten.
+
+The agent keeps running and its current view continues updating. The popout
+requires a current writer seat, a Workspace-bound session and isolated rich mode;
+plain mode refuses it. Ctrl+Q reserves direct XON for Cuna; `Ctrl+]` then `q`
+still sends XON remotely. Host or custom provider bindings that intercept Ctrl+Q
+must be corrected before using it. Verify keyboard support on the actual host.
+
+“Saved in Cuna” appears only after durable operation readback. If a response is
+lost, the outcome remains unknown; Enter checks the same operation without
+writing again. Closing after dispatch does not undo a committed write. Mutable
+input buffers are cleared, but JavaScript and network copies cannot be guaranteed
+erased from memory. The API must support named-secret storage for saves to work.
+Editing expires after two minutes from opening; values are cleared and no write
+is sent. Each validation, save or confirmation request has a ten-second bound.
+Unicode, Tab and CR/LF line breaks stay in the masked local buffer. Requires
+trustworthy host bracketed-paste framing; terminal control sequences are
+unsupported. Raw terminal bytes cannot distinguish embedded paste delimiters
+from host framing or prove that Enter was physically pressed. Detectable
+delimiter ambiguity is refused; a paste-end callback containing extra input is
+quarantined. Cancel and re-enter instead of saving a truncated value.
+After detach or process exit, Cuna prints a safe recovery command:
+`cuna secrets operation OPERATION_ID [--json]`. It reads metadata with the current
+account and needs no running process, Machine or writer seat.
+
 Claude Code, Codex and OpenCode feel like they are running on your laptop. They
 are not: the processes, the sessions and the files live on a Cuna cloud machine,
 and they survive when you close the lid.

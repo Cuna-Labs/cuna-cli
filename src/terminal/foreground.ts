@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { NamedSecretInputGate, NamedSecretOverlay } from "../named-secrets/overlay.js";
+import type { NamedSecretService } from "../named-secrets/service.js";
+import type { NamedSecretContext } from "../api/named-secrets.js";
 
 import {
   startCallbackRelay,
@@ -41,8 +44,10 @@ import {
   CONTINUED_MARKER,
   renderWorkbenchFrame,
   workbenchAppbarTargetAt,
+  workbenchNamedSecretTargetAt,
   workbenchUpdate,
   withPredictionOverlay,
+  withNamedSecretOverlay,
   type WorkbenchFrame,
   type WorkbenchLinkSpan,
   type WorkbenchSelectionRow,
@@ -167,6 +172,9 @@ const ATTACH_STAGE_LABELS: Readonly<Record<TerminalAttachStage | "first_screen",
 const ATTACH_STAGE_ELAPSED_AFTER_MS = 3_000;
 
 export interface ForegroundTerminalRuntime {
+  namedSecretContext?(tabId: string): NamedSecretContext;
+  needsNamedSecretAuthorityRefresh?(tabId: string): boolean;
+  refreshNamedSecretAuthority?(tabId: string, signal: AbortSignal): Promise<NamedSecretContext>;
   readonly activeTabId: string | undefined;
   attach(input: {
     readonly tabId: string;
@@ -269,6 +277,7 @@ interface PendingPrintableInput {
 }
 
 export interface ForegroundTerminalCoordinatorOptions {
+  readonly namedSecrets?: NamedSecretService;
   readonly host: ForegroundTerminalHost;
   readonly browser?: BrowserOpener;
   readonly copyText?: (text: string) => Promise<void>;
@@ -377,6 +386,11 @@ export class ForegroundTerminalCoordinator {
   readonly #clock: () => number;
   readonly #inputClock: () => number;
   #runtime: ForegroundTerminalRuntime | undefined;
+  readonly #secretInput = new NamedSecretInputGate();
+  #secretOverlay: NamedSecretOverlay | undefined;
+  #secretPreparing = false;
+  #secretPrepareAbort: AbortController | undefined;
+  get secretRecoveryNotice(): string | undefined { return this.#secretOverlay?.recoveryNotice; }
   #lease: HostTerminalLease | undefined;
   #state: ForegroundTerminalState = "idle";
   #activeTabId: string | undefined;
@@ -580,6 +594,16 @@ export class ForegroundTerminalCoordinator {
   }
 
   bindRuntime(runtime: ForegroundTerminalRuntime): void {
+    if (this.#options.namedSecrets !== undefined) {
+      this.#secretOverlay = new NamedSecretOverlay(this.#options.namedSecrets, () => {
+        const tabId = this.#activeTabId;
+        const tab = tabId === undefined ? undefined : this.#tabs.get(tabId);
+        if (tabId === undefined || tab === undefined || this.#state !== "active" || tab.snapshot.accessMode !== "writer" ||
+            tab.snapshot.state !== "active" || this.#endedTabs.has(tabId) || tab.snapshot.terminalView?.ready === false) return undefined;
+        try { const context = runtime.namedSecretContext?.(tabId); return context === undefined ? undefined : { context, userId: tab.snapshot.userId }; }
+        catch { return undefined; }
+      }, () => { this.#lastHostFrame = undefined; void this.#render().catch(() => undefined); }, { canEdit: () => { const size = this.#options.host.dimensions(); return size.columns >= 30 && size.rows >= 8; } });
+    }
     if (this.#runtime !== undefined) throw runtimeFailure("session_conflict", "The foreground runtime is already bound.");
     if (this.#state !== "idle") throw runtimeFailure("session_conflict", "The foreground runtime must be bound before startup.");
     this.#runtime = runtime;
@@ -766,6 +790,8 @@ export class ForegroundTerminalCoordinator {
   async #stopNow(): Promise<void> {
     if (this.#state === "stopped") return;
     this.#state = "stopping";
+    this.#secretPrepareAbort?.abort();
+    this.#secretOverlay?.dispose();
     this.#stopAttachingAnimation();
     this.#lifetimeAbort.abort();
     this.#removeAbort?.();
@@ -1131,6 +1157,7 @@ export class ForegroundTerminalCoordinator {
         tab.providerAuthentication = undefined;
       }
       tab.snapshot = snapshot;
+      this.#secretOverlay?.authorityChanged();
       if (becameWriter) this.#reconcileSeatGeometry(snapshot);
       if (
         snapshot.state === "active" &&
@@ -1287,6 +1314,92 @@ export class ForegroundTerminalCoordinator {
   }
 
   #queueInput(bytes: Uint8Array): void {
+    this.#fenceSecretGeometry();
+    this.#secretInput.process(bytes, () => this.#secretPreparing || this.#secretOverlay?.active === true, () => this.#openSecretOverlay(),
+      (local) => {
+        try {
+          if (this.#secretPreparing) { if (local.includes(3) || local.includes(27)) this.#secretPrepareAbort?.abort(); }
+          else this.#secretOverlay?.input(local);
+        } finally { local.fill(0); }
+      }, (remote) => this.#queueOrdinaryInput(remote), (event) => this.#handleSecretMouse(event));
+    if (!this.#secretPreparing && !this.#secretOverlay?.active && this.#secretInput.draining) {
+      this.#browserNotice = "Paste boundary pending · input withheld locally";
+      void this.#render().catch(() => undefined);
+    }
+  }
+
+  #fenceSecretGeometry(): void {
+    const size = this.#options.host.dimensions(); const available = size.columns >= 30 && size.rows >= 8;
+    this.#secretOverlay?.geometryChanged(available, this.#secretPreparing);
+    if (!available && this.#secretPreparing) this.#secretPrepareAbort?.abort();
+  }
+
+  #handleSecretMouse(event: HostMouseEvent): void {
+    this.#fenceSecretGeometry();
+    if (this.#secretPreparing || !this.#secretOverlay?.active || event.release || event.button !== 0) return;
+    const frame = this.#lastWorkbenchFrame;
+    const size = this.#options.host.dimensions();
+    if (frame === undefined || frame.columns !== size.columns || frame.rows !== size.rows) return;
+    const target = workbenchNamedSecretTargetAt(frame, event.column, event.row);
+    if (target === "reveal") this.#secretOverlay.toggleReveal();
+    else if (target !== undefined) this.#secretOverlay.focusField(target);
+  }
+
+  #openSecretOverlay(): void {
+    const dimensions = this.#options.host.dimensions();
+    if (this.#pasteActive || this.#prefixPending || this.#pendingBrowserAction !== undefined || this.#pendingRelay !== undefined ||
+        this.#switchCutoff !== undefined || this.#closingTabId !== undefined || dimensions.columns < 30 || dimensions.rows < 8 ||
+        this.#secretOverlay === undefined) {
+      this.#browserNotice = "Secret popout unavailable in this terminal state";
+      void this.#render().catch(() => undefined); return;
+    }
+    this.#flushInputBatch();
+    this.#predictiveEcho.barrier(); this.#selection = undefined;
+    if (this.#secretOverlay.persistence === "UNKNOWN" || this.#secretOverlay.persistence === "IN_FLIGHT") {
+      this.#secretOverlay.open(); return;
+    }
+    const tabId = this.#activeTabId;
+    try {
+      if (tabId !== undefined && this.#runtime?.needsNamedSecretAuthorityRefresh?.(tabId)) {
+        this.#prepareSecretWriter(tabId); return;
+      }
+    } catch { /* The normal opener renders the writer refusal without exposing proof. */ }
+    if (!this.#secretOverlay.open()) { this.#browserNotice = "Secrets require an attached workspace-bound writer"; void this.#render().catch(() => undefined); }
+  }
+
+  #prepareSecretWriter(tabId: string): void {
+    if (this.#secretPreparing) return;
+    const refresh = this.#runtime?.refreshNamedSecretAuthority;
+    if (refresh === undefined) return;
+    const before = this.#tabs.get(tabId)?.snapshot;
+    if (before === undefined || before.accessMode !== "writer") return;
+    this.#secretPreparing = true;
+    const abort = new AbortController(); this.#secretPrepareAbort = abort;
+    this.#browserNotice = "Preparing a fresh writer proof · input stays local";
+    void this.#render().catch(() => undefined);
+    const timer = setTimeout(() => abort.abort(), 10_000);
+    const lifetime = () => abort.abort(); this.#lifetimeAbort.signal.addEventListener("abort", lifetime, { once: true });
+    const cancelled = new Promise<never>((_resolve, reject) => abort.signal.addEventListener("abort", () => reject(new Error("Writer proof preparation cancelled.")), { once: true }));
+    void Promise.race([Promise.resolve().then(() => refresh.call(this.#runtime, tabId, abort.signal)), cancelled]).then(() => {
+      this.#fenceSecretGeometry();
+      const current = this.#tabs.get(tabId)?.snapshot;
+      if (abort.signal.aborted || this.#state !== "active" || this.#activeTabId !== tabId || current === undefined ||
+          current.accessMode !== "writer" || current.userId !== before.userId || current.machineId !== before.machineId ||
+          current.agentSessionId !== before.agentSessionId || current.processEpoch !== before.processEpoch ||
+          current.workspaceBindingId !== before.workspaceBindingId || current.executionWorkspaceId !== before.executionWorkspaceId ||
+          current.executionWorkspaceGeneration !== before.executionWorkspaceGeneration || current.writerEpoch !== before.writerEpoch) {
+        this.#browserNotice = "Writer identity changed · no secret input collected"; return;
+      }
+      if (!this.#secretInput.safeToEdit) { this.#browserNotice = "Finish the paste boundary, then press Ctrl+Q again"; return; }
+      if (!this.#secretOverlay?.open()) this.#browserNotice = "Secrets require a fresh workspace-bound writer";
+    }).catch(() => { this.#browserNotice = "Writer proof unavailable · no secret input collected"; }).finally(() => {
+      clearTimeout(timer); this.#lifetimeAbort.signal.removeEventListener("abort", lifetime);
+      this.#secretPreparing = false; this.#secretPrepareAbort = undefined;
+      void this.#render().catch(() => undefined);
+    });
+  }
+
+  #queueOrdinaryInput(bytes: Uint8Array): void {
     if (bytes.byteLength < 1) return;
     if (this.#options.mouseReporting === false) {
       this.#queueInputBytes(bytes);
@@ -1326,6 +1439,7 @@ export class ForegroundTerminalCoordinator {
    * Only the writer sends; clicks go only to a remote that asked for them.
    */
   #handleHostMouse(event: HostMouseEvent): void {
+    if (this.#secretPreparing || this.#secretOverlay?.active) return;
     if (this.#state !== "active" || this.#closingTabId !== undefined || this.#switchCutoff !== undefined) return;
     const frame = this.#lastWorkbenchFrame;
     if (frame !== undefined && this.#lastHostFrame !== undefined && event.row <= frame.appbarRows) {
@@ -3042,6 +3156,7 @@ export class ForegroundTerminalCoordinator {
   }
 
   #queueResize(): void {
+    this.#fenceSecretGeometry();
     if (this.#state !== "active") return;
     this.#flushInputBatch();
     this.#resizeInputBarrier = this.#inputTail;
@@ -3288,7 +3403,9 @@ export class ForegroundTerminalCoordinator {
         activeTab.snapshot.accessMode === "writer"
         ? this.#predictiveEcho.overlay(activeViewport, predictionKey(activeTab, activeViewport))
         : undefined;
-      const frame = prediction === undefined ? trueFrame : withPredictionOverlay(trueFrame, prediction);
+      const overlay = this.#secretOverlay?.view;
+      const frame = overlay !== undefined ? withNamedSecretOverlay(trueFrame, overlay)
+        : prediction === undefined ? trueFrame : withPredictionOverlay(trueFrame, prediction);
       // Every accepted keystroke and every output frame renders a complete
       // absolute-addressed frame. Most of them repaint exactly what the host
       // already shows (measured 2026-09-15: three of four frames per typed

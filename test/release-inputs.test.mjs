@@ -5,12 +5,28 @@ import { fileURLToPath } from "node:url";
 
 import {
   buildReleaseInputs,
+  deriveContractReleaseAuthority,
+  APPROVED_RELEASE_AUTHORITY,
+  UNRESOLVED_RELEASE_AUTHORITY,
   INFRA_OPENAPI_CONTRACT_IDENTITY,
   verifyReleaseInputsAgainstRoot,
 } from "../scripts/lib/release-inputs.mjs";
 
 const repositoryRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const expected = Object.freeze({ npmVersion: "11.4.2", runner: "fixture-runner" });
+
+test("a committed candidate with an older valid contract approval remains unresolved, and malformed approvals still refuse", () => {
+  const identity = INFRA_OPENAPI_CONTRACT_IDENTITY;
+  const declaration = { schemaVersion: 1, authority: "CUNA_CANONICAL_PUBLIC_API_CONTRACT", status: "APPROVED", producerRepository: identity.producer_repository,
+    sourceCommit: "a".repeat(40), contractSha256: identity.infra_openapi_canonical_sha256, approvalAttestationSha256: "b".repeat(64) };
+  const committed = { ...identity, producer_content_state: "committed" };
+  assert.equal(deriveContractReleaseAuthority(committed, declaration), APPROVED_RELEASE_AUTHORITY);
+  assert.equal(deriveContractReleaseAuthority(committed, { ...declaration, contractSha256: "f".repeat(64) }), UNRESOLVED_RELEASE_AUTHORITY);
+  assert.equal(deriveContractReleaseAuthority(committed, undefined), UNRESOLVED_RELEASE_AUTHORITY);
+  assert.equal(deriveContractReleaseAuthority({ ...identity, producer_content_state: "working_tree_product_delta" }, declaration), UNRESOLVED_RELEASE_AUTHORITY);
+  assert.throws(() => deriveContractReleaseAuthority(committed, { ...declaration, status: "PENDING" }), /not a valid canonical contract authority/);
+  assert.throws(() => deriveContractReleaseAuthority(committed, { ...declaration, contractSha256: "invalid" }), /not a valid canonical contract authority/);
+});
 
 async function fixture() {
   return buildReleaseInputs({

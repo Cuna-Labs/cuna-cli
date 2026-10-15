@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createOutputWriter } from "../dist/cli/output.js";
 
 import {
   API_ORIGINS,
@@ -28,6 +29,71 @@ import {
 
 const future = "2026-08-08T00:00:30.000Z";
 const past = "2000-01-01T00:00:00.000Z";
+
+// Synthetic foreign credentials exercise the real response decoder and both CLI sinks.
+const foreignCredentialFixtures = [
+  ["JWT", "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic3ludGhldGljIn0.QWxsU3ludGhldGljTm90QVNlY3JldA"],
+  ["GitHub", `ghp_${"A1b2C3d4E5f6G7h8I9j0"}`],
+  ["AWS", "AKIA1234567890ABCDEF"],
+  ["Supabase secret", `sb_secret_${"xY9".repeat(8)}`],
+  ["Supabase publishable", `sb_publishable_${"xY9".repeat(8)}`],
+  ["Bearer", "Bearer SYNTHETIC_FOREIGN_TOKEN_1234567890"],
+];
+const foreignProblemTransport = detail => createHttpTransport({
+  baseUrl: "https://api.getcuna.com",
+  fetch: async () => new Response(JSON.stringify({
+    type: "https://api.getcuna.com/problems/request_failed", title: "Request failed", status: 503,
+    code: "request_failed", request_id: "88888888-8888-4888-8888-888888888888", retryable: false, detail,
+  }), { status: 503, headers: { "content-type": "application/problem+json" } }),
+});
+function renderProblem(error, json) {
+  let output = "";
+  const sink = { write(value) { output += value; } };
+  createOutputWriter({ json, streams: { stdout: sink, stderr: sink, stdoutIsTTY: !json, stdinIsTTY: !json, stderrIsTTY: !json } }).error("machines list", error);
+  return output;
+}
+for (const [label, secret] of foreignCredentialFixtures) {
+  test(`foreign Problem redaction: ${label} never reaches human or JSON output`, async () => {
+    await assert.rejects(foreignProblemTransport(`upstream rejected ${secret}; no capacity in yyz`).request({ method: "GET", path: "/v1/sessions" }), error => {
+      assert.ok(error instanceof CunaError);
+      for (const json of [false, true]) {
+        const rendered = renderProblem(error, json);
+        assert.equal(rendered.includes(secret), false, `${label} leaked to ${json ? "JSON" : "human"} output`);
+        assert.ok(rendered.includes("[redacted credential]"));
+        assert.ok(rendered.includes("upstream rejected"));
+        assert.ok(rendered.includes("no capacity in yyz"));
+      }
+      assert.equal(error.code, "cuna.remote.rejected");
+      assert.equal(error.details.reason, "request_failed");
+      assert.equal(error.details.request_id, "88888888-8888-4888-8888-888888888888");
+      assert.equal(error.retryable, false);
+      return true;
+    });
+  });
+}
+test("foreign Problem redaction: public diagnostic prose and short non-token labels survive", async () => {
+  const detail = "GitHub and AWS refused capacity in yyz; JWT validation and sb_secret_ labels remain diagnostic.";
+  await assert.rejects(foreignProblemTransport(detail).request({ method: "GET", path: "/v1/sessions" }), error => {
+    assert.equal(error.hint, detail);
+    assert.ok(renderProblem(error, false).includes(detail));
+    assert.equal(JSON.parse(renderProblem(error, true)).error.hint, detail);
+    return true;
+  });
+});
+
+test("foreign Problem redaction: an existing product credential in a URL stays withheld", async () => {
+  const secret = `cuna_sk_${"q".repeat(43)}`;
+  const url = `https://upstream.example.invalid/path?key=${secret}`;
+  await assert.rejects(foreignProblemTransport(`upstream rejected ${url}`).request({ method: "GET", path: "/v1/sessions" }), error => {
+    for (const json of [false, true]) {
+      const rendered = renderProblem(error, json);
+      assert.equal(rendered.includes(secret), false);
+      assert.equal(rendered.includes(url), false);
+    }
+    assert.equal(error.details.reason, "request_failed");
+    return true;
+  });
+});
 
 function capability(overrides = {}) {
   return {

@@ -70,6 +70,8 @@ import { decodeManagedCommandResult, type ManagedCommandInput, type ManagedComma
 import { decodeMachineDefaultWorkspace, decodeAgentSessionWorkspaceContext, decodeAgentSessionWorkspaceEnvelope,
   type MachineDefaultWorkspace, type AgentSessionWorkspaceContext, type AgentSessionWorkspaceEnvelope } from "./remote-workspace.js";
 import { classifyCapabilitySnapshot, isPermanentSnapshotFault } from "./capability-evidence.js";
+import { isTerminalConnectToken } from "../core/namespace.js";
+import { decodeNamedSecretReceipt, isNamedSecretUuid, validNamedSecretName, validNamedSecretScope, NamedSecretRequestError, type NamedSecretCreate, type NamedSecretReceipt } from "./named-secrets.js";
 
 export interface MachineCreateInput {
   readonly name: string;
@@ -77,6 +79,7 @@ export interface MachineCreateInput {
   readonly vcpus?: number;
   readonly memoryMiB?: number;
   readonly background?: boolean;
+  readonly installTetragon?: boolean;
 }
 
 export interface AgentSessionCreateInput {
@@ -139,6 +142,8 @@ export interface TerminalWriterTransferInput {
 }
 
 export interface CunaApiClient {
+  createNamedSecret(input: NamedSecretCreate, signal?: AbortSignal): Promise<NamedSecretReceipt>;
+  getNamedSecretOperation(operationId: string, signal?: AbortSignal): Promise<NamedSecretReceipt>;
   getIdentity(signal?: AbortSignal): Promise<CunaIdentity>;
   discoverCapabilities(scope: CapabilityScope, resourceId?: string, signal?: AbortSignal): Promise<CapabilitySnapshot>;
   listMachines(signal?: AbortSignal): Promise<MachinePage>;
@@ -453,6 +458,7 @@ function validateAgentSessionCreate(input: Omit<AgentSessionCreateInput, "worksp
 }
 
 function validateMachineCreate(input: MachineCreateInput, idempotencyKey: string): void {
+  if (input.installTetragon !== undefined && typeof input.installTetragon !== "boolean") throw usageError("install_tetragon must be a boolean.");
   assertIdempotencyKey(idempotencyKey);
   assertSafeDisplayText(input.name, "machine name");
   if (input.name.length < 1 || input.name.length > 80) {
@@ -524,6 +530,30 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
   /** Set once this server has refused the AgentSession read opt-ins; see `getAgentSession`. */
   let agentSessionReadOptInUnserved = false;
   const client: CunaApiClient = {
+    async createNamedSecret(input, signal) {
+      if (!isNamedSecretUuid(input.operation_id) || !validNamedSecretName(input.name) || typeof input.password !== "string" ||
+          new TextEncoder().encode(input.password).byteLength < 1 || new TextEncoder().encode(input.password).byteLength > 4096 ||
+          [...input.password].some((point) => point.length === 1 && point.charCodeAt(0) >= 0xd800 && point.charCodeAt(0) <= 0xdfff) ||
+          !validNamedSecretScope(input.context) || !isNamedSecretUuid(input.context.agent_session_id) || !isNamedSecretUuid(input.context.machine_id) ||
+          !isNamedSecretUuid(input.context.process_epoch) || !isNamedSecretUuid(input.context.terminal_connection_id) || !Number.isSafeInteger(input.context.writer_epoch) || input.context.writer_epoch < 1 ||
+          !isTerminalConnectToken(input.context.connect_token)) throw new NamedSecretRequestError();
+      try {
+        const context = { agent_session_id: input.context.agent_session_id, machine_id: input.context.machine_id,
+          ...(Object.hasOwn(input.context,"workspace_binding_id") ? { workspace_binding_id: input.context.workspace_binding_id }
+            : { execution_workspace_id: input.context.execution_workspace_id, execution_workspace_generation: input.context.execution_workspace_generation }), process_epoch: input.context.process_epoch,
+          terminal_connection_id: input.context.terminal_connection_id, connect_token: input.context.connect_token,
+          writer_epoch: input.context.writer_epoch };
+        return decodeNamedSecretReceipt(await transport.request({ method: "POST", path: "/v1/named-secrets", sensitive: "named-secret",
+          body: { operation_id: input.operation_id, name: input.name, password: input.password, context }, idempotencyKey: input.operation_id,
+          automaticRedispatch: false, budgetMs: 10_000, ...(signal === undefined ? {} : { signal }) }));
+      } catch (error) { throw error instanceof NamedSecretRequestError ? error : new NamedSecretRequestError(); }
+    },
+    async getNamedSecretOperation(operationId, signal) {
+      if (!isNamedSecretUuid(operationId)) throw new NamedSecretRequestError();
+      try { return decodeNamedSecretReceipt(await transport.request({ method: "GET", path: `/v1/named-secrets/operations/${operationId}`,
+        sensitive: "named-secret", automaticRedispatch: false, budgetMs: 5_000, ...(signal === undefined ? {} : { signal }) })); }
+      catch (error) { throw error instanceof NamedSecretRequestError ? error : new NamedSecretRequestError(); }
+    },
     async getIdentity(signal) {
       return fetchDecoded(
         { method: "GET", path: "/v1/me", ...(signal === undefined ? {} : { signal }) },
@@ -600,6 +630,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
     },
     async createMachine(input, idempotencyKey, requestId, signal) {
       validateMachineCreate(input, idempotencyKey);
+      if (input.installTetragon !== undefined) await requireCapability({ client, scope: "account", capabilityId: "machines.create.install_tetragon", allowedInteractions: ["native"], ...(signal === undefined ? {} : { signal }) });
       if (requestId !== undefined) assertCanonicalUuid(requestId, "machine create request ID");
       const body = {
         name: input.name,
@@ -607,6 +638,7 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
         ...(input.vcpus === undefined ? {} : { vcpus: input.vcpus }),
         ...(input.memoryMiB === undefined ? {} : { memory_mib: input.memoryMiB }),
         ...(input.background === undefined ? {} : { background: input.background }),
+        ...(input.installTetragon === undefined ? {} : { install_tetragon: input.installTetragon }),
       };
       return fetchDecoded(
         {

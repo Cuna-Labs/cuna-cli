@@ -522,6 +522,10 @@ export class PassthroughTerminalCoordinator {
       if (!this.#prefixPending) {
         if (byte === FLOW_PAUSE) {
           remote.push(FLOW_RESUME);
+        } else if (byte === FLOW_RESUME) {
+          await flush();
+          await this.#options.host.write(new TextEncoder().encode("\r\nCuna: secrets require isolated rich terminal mode. No secret input was collected.\r\n"));
+          return;
         } else if (byte === INTERRUPT) {
           await flush();
           await this.#detachLocal(snapshot);

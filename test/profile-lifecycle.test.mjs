@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { createOwnedTempDirectory, removeOwnedTempDirectory } from "../scripts/lib/owned-temp.mjs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
@@ -39,7 +39,7 @@ const IDENTITY_RESULT = Object.freeze({
 });
 
 async function scratchConfigFile() {
-  const root = await mkdtemp(join(tmpdir(), "cuna-profile-lifecycle-"));
+  const root = await createOwnedTempDirectory("cuna-profile-lifecycle-");
   return { root, configFile: join(root, "Cuna", "config.json") };
 }
 
@@ -181,7 +181,7 @@ test("recording a profile creates the file, and the next ordinary invocation res
     assert.equal(await ensureProfileRecorded({ platform, config }), false);
     assert.equal(await readFile(configFile, "utf8"), text);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await removeOwnedTempDirectory(root);
   }
 });
 
@@ -230,7 +230,7 @@ test("a login into an existing profile leaves every other profile's settings byt
     assert.equal(lab.developmentProfile, true);
     if (POSIX) assert.equal((await lstat(configFile)).mode & 0o077, 0);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await removeOwnedTempDirectory(root);
   }
 });
 
@@ -276,7 +276,7 @@ test("the writer refuses every file the reader would refuse", async () => {
       assert.equal(await readFile(elsewhere, "utf8"), "{}\n");
     }
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await removeOwnedTempDirectory(root);
   }
 });
 
@@ -313,7 +313,7 @@ test("`cuna login --profile <name>` creates the profile the flag names", async (
   } finally {
     // Windows can report ENOTEMPTY while removal of an already-unlinked child
     // is still settling. Bound native rm retries; a persistent residue fails.
-    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    await removeOwnedTempDirectory(root);
   }
 });
 
@@ -337,6 +337,6 @@ test("a login that fails leaves no profile behind", async () => {
     assert.notEqual(exit, EXIT_CODES.success);
     await assert.rejects(lstat(configFile), (error) => error.code === "ENOENT");
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await removeOwnedTempDirectory(root);
   }
 });

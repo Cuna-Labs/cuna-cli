@@ -170,6 +170,7 @@ const AVAILABLE_NOW_ENTRIES = `  signup                               Create a w
   machines                             Browse machines and their AgentSessions
   machines list                        List owned Cuna machines
   machines create [options]            Create a machine when server-advertised
+                                       --install-tetragon true|false requires advertised support
   machines start|pause|resume|stop ID  Change lifecycle when server-advertised
   machines update-supervisor ID        Recover a stopped machine's terminal supervisor
   machines live-update-supervisor ID   Update a running terminal supervisor in place;
@@ -185,6 +186,7 @@ const AVAILABLE_NOW_ENTRIES = `  signup                               Create a w
   authorizations list --machine ID     List active credential injection rules
   api-keys create --name NAME --yes    Create an API key and print its secret once
   api-keys list                        List API-key metadata without secret values
+  secrets operation ID                Check a named-secret outcome without another write
   api-keys revoke ID --yes             Revoke one API key when server-advertised
   agent-sessions list --machine ID     List child agent processes
   agent-sessions create --machine ID --workspace-binding-id ID --workspace-generation N
@@ -287,6 +289,9 @@ Automatic local-to-cloud journey:
   Ambiguous, stale, cancelled, or unknown outcomes fail closed without silently
   choosing a target or retrying with a second identity.
   --credential-binding ID is required exactly when --auth-mode is credential_binding.
+  --install-tetragon true|false selects Tetragon only when creating a Machine.
+  Without this option, supported servers ask Install Tetragon? [y/n] before creation.
+  This choice does not change the mandatory sandbox or promise cold-start readiness.
   OpenCode is interactive-only: after Cuna attaches its remote terminal, use
   /connect to choose and sign in to a provider, then /models to choose a model.
   Cuna does not broker an OpenCode device-sign-in page. Provider credentials remain

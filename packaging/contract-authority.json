@@ -3,7 +3,7 @@
   "authority": "CUNA_CANONICAL_PUBLIC_API_CONTRACT",
   "status": "APPROVED",
   "producerRepository": "Cuna-Labs/infra-proxy-mvp",
-  "sourceCommit": "d5b1783fd91e570c0039aef0cfc3ca588b492a7f",
-  "contractSha256": "7805d96c670f6b9134598e1ccbd0afff1cb3d8a6803ee2107df1fb78e6170818",
-  "approvalAttestationSha256": "0832c2a8208e16aafa64e0faa6269590ad360d5ffb044777751931f7e030ecd5"
+  "sourceCommit": "9a1018c732dab9b2d4fc3f41befd1b53fa53cd79",
+  "contractSha256": "b960654fa64cd4bbeaab75123099216b0b5a6dcb72b7ccaf919531c5e55018a5",
+  "approvalAttestationSha256": "76c1678f5c2308c352dcb6a9fe805526346352a22c3ec292b01815ba2a3b0181"
 }
