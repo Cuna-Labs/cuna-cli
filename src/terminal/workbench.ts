@@ -100,6 +100,11 @@ export function withNamedSecretOverlay(frame: WorkbenchFrame, view: SecretOverla
   const rows = [...frame.rowCommands];
   const width = Math.min(frame.columns, 64);
   const left = Math.max(1, Math.floor((frame.columns - width) / 2) + 1);
+  const countColumns = 7;
+  const revealColumns = 6;
+  const valueColumns = width - countColumns - 1 - revealColumns;
+  const countColumn = left + valueColumns;
+  const revealColumn = countColumn + countColumns + 1;
   const feedback: string[] = []; let line = "";
   for (const word of view.feedback.split(" ")) {
     if (line && displayCellWidth(`${line} ${word}`) > width - 1) { feedback.push(` ${line}`); line = word; }
@@ -117,21 +122,26 @@ export function withNamedSecretOverlay(frame: WorkbenchFrame, view: SecretOverla
   const reveal = view.revealed === true ? "◉ hide" : "◉ show";
   // The mask has one ASCII star per input scalar. Keep its count visible even
   // when identical stars fill the field; revealed escape text is not the count.
-  const count = view.masked.length === 0 ? "       " : `(${view.masked.length})`.padStart(7);
-  const passwordLine = `${padLine(truncateMarked(` ${view.focus === "secret" ? ">" : " "} Password: ${password}`, width - 14), width - 14)}${count} ${reveal}`;
+  const count = view.masked.length === 0 ? " ".repeat(countColumns) : `(${view.masked.length})`.padStart(countColumns);
+  const passwordLine = truncateMarked(` ${view.focus === "secret" ? ">" : " "} Password: ${password}`, valueColumns);
   const lines = view.resizeRequired ? [view.feedback] : [` ${view.focus === "name" ? ">" : " "} Secret Name: ${view.name}`, passwordLine, ...feedback];
   const top = Math.max(frame.appbarRows + 1, Math.floor((frame.rows - lines.length - 1) / 2) + 1);
   for (let index = 0; index < lines.length && top + index <= frame.rows; index += 1) {
     const focused = index === (view.focus === "name" ? 0 : 1) && !view.resizeRequired;
     const style = frame.color === false ? `${ESC}0;7m` : `${ESC}0;${focused ? CUNA_ORANGE : CUNA_ORANGE_DARK};${index < 2 ? WHITE : MUTED}m`;
-    rows[top + index - 1] = `${rows[top + index - 1] ?? ""}${ESC}${top + index};${left}H${style}${padLine(truncateMarked(lines[index]!, width), width)}${ESC}0m`;
+    // Absolute control positions cannot drift when the host counts a revealed
+    // Unicode glyph differently. Clear the entire styled row before its runs.
+    const paint = index === 1 && !view.resizeRequired
+      ? `${" ".repeat(width)}${ESC}${top + index};${left}H${passwordLine}${ESC}${top + index};${countColumn}H${count} ${ESC}${top + index};${revealColumn}H${reveal}`
+      : padLine(truncateMarked(lines[index]!, width), width);
+    rows[top + index - 1] = `${rows[top + index - 1] ?? ""}${ESC}${top + index};${left}H${style}${paint}${ESC}0m`;
   }
   const cursorCommand = `${ESC}?25l`;
   const text = `${ESC}?25l${ESC}H${rows.join("")}${cursorCommand}`;
   const secretTargets = view.resizeRequired ? [] : [
     { row: top, firstColumn: left, lastColumn: left + width - 1, target: "name" as const },
-    { row: top + 1, firstColumn: left, lastColumn: left + width - 8, target: "secret" as const },
-    { row: top + 1, firstColumn: left + width - 6, lastColumn: left + width - 1, target: "reveal" as const },
+    { row: top + 1, firstColumn: left, lastColumn: countColumn + countColumns - 1, target: "secret" as const },
+    { row: top + 1, firstColumn: revealColumn, lastColumn: revealColumn + revealColumns - 1, target: "reveal" as const },
   ];
   return Object.freeze({ ...frame, rowCommands: Object.freeze(rows), cursorCommand, text, bytes: new TextEncoder().encode(text), appbarTargets: Object.freeze([]), secretTargets: Object.freeze(secretTargets) });
 }

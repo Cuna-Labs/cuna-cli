@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
 import xterm from "@xterm/headless";
 import { workbenchAppbarTargetAt, workbenchUpdate, withNamedSecretOverlay, workbenchNamedSecretTargetAt } from "../dist/terminal/workbench.js";
 
@@ -26,6 +27,40 @@ test("revealing Unicode control characters cannot execute commands or erase the 
     await new Promise(resolve=>terminal.write(frame.bytes,resolve));
     assert.match(terminal.buffer.active.getLine(0).translateToString(true),/CUNA/u);
   } finally { terminal.dispose(); }
+});
+
+test("named-secret visible count and reveal cells stay in their declared targets across Unicode widths", async (t) => {
+  const failures = [];
+  const totals = { ascii: 0, cjk: 0, emoji: 0 };
+  for (const [columns, rows] of [[30, 8], [80, 24], [120, 32]]) {
+    const allTabs = tabs();
+    const base = renderWorkbenchFrame({ columns, rows, tabs: allTabs, activeTabId: allTabs[0].id, appbar: model() });
+    for (const [variant, value] of [["ascii", "aZ"], ["cjk", "a界"], ["emoji", "a🔒"]]) {
+      const hiddenView = { name: "Demo", masked: "**", focus: "secret", feedback: "Enter saves · Esc cancels", revealed: false };
+      const hidden = withNamedSecretOverlay(base, hiddenView);
+      for (const mode of ["fresh", "incremental"]) for (const revealed of [false, true]) {
+        const frame = revealed ? withNamedSecretOverlay(base, { ...hiddenView, revealed: true, revealedValue: value }) : hidden;
+        const terminal = new xterm.Terminal({ cols: columns, rows, allowProposedApi: true });
+        try {
+          if (mode === "incremental") await new Promise(resolve => terminal.write(hidden.bytes, resolve));
+          await new Promise(resolve => terminal.write(mode === "incremental" ? workbenchUpdate(hidden, frame) : frame.bytes, resolve));
+          const target = frame.secretTargets.find(item => item.target === "reveal");
+          assert.ok(target);
+          const line = terminal.buffer.active.getLine(terminal.buffer.active.viewportY + target.row - 1);
+          const observed = [];
+          for (let column = 0; column < columns; column++) if (line?.getCell(column)?.getChars() === "◉") observed.push(column + 1);
+          const countStart = target.firstColumn - 8;
+          const countCells = Array.from({ length: 7 }, (_, offset) => line?.getCell(countStart - 1 + offset)?.getChars() ?? "").join("");
+          const valid = observed.length === 1 && observed[0] === target.firstColumn &&
+            workbenchNamedSecretTargetAt(frame, observed[0], target.row) === "reveal" && countCells === "    (2)";
+          totals[variant]++;
+          if (!valid) failures.push({ variant, columns, rows, mode, revealed, icon_columns: observed, target_column: target.firstColumn, count_aligned: countCells === "    (2)" });
+        } finally { terminal.dispose(); }
+      }
+    }
+  }
+  t.diagnostic(JSON.stringify({ checks: totals, mismatches: failures }));
+  assert.equal(failures.length, 0, "actual terminal control cells must coincide with the declared click geometry");
 });
 
 test("secret popup paints orange and binds clipped field/reveal cells to the actual frame", () => {
@@ -108,10 +143,10 @@ test("real overlay transitions clear the UI count during submission, outcomes an
       return outcome==="REJECTED"?{operation_id:op,state:"rejected",secret_id:null,name:null,workspace_id:null,committed_at:null}:committed;
     },read:async()=>{if(outcome==="UNKNOWN")throw new Error("synthetic unavailable");return committed;}};
     const overlay=new NamedSecretOverlay(service,()=>({context,userId:"66666666-6666-4666-8666-666666666666"}),()=>{},outcome==="expired"?{plaintextLifetimeMs:5}:{});
-    const cleared=()=>{assert.equal(overlay.view.masked,"");assert.doesNotMatch(withNamedSecretOverlay(base,overlay.view).text,/\(\d+\)\s+◉ show/u);};
+    const cleared=()=>{assert.equal(overlay.view.masked,"");assert.doesNotMatch(stripVTControlCharacters(withNamedSecretOverlay(base,overlay.view).text),/\(\d+\)\s+◉ show/u);};
     try{
       overlay.open();overlay.input(new TextEncoder().encode("Demo\tXYZ"));
-      assert.match(withNamedSecretOverlay(base,overlay.view).text,/\(3\)\s+◉ show/u);
+      assert.match(stripVTControlCharacters(withNamedSecretOverlay(base,overlay.view).text),/\(3\)\s+◉ show/u);
       if(outcome==="expired"){await until(()=>overlay.view.feedback.includes("expired"));cleared();continue;}
       overlay.input(Uint8Array.of(13));
       if(outcome==="COMMITTED"){await until(()=>typeof release==="function");assert.equal(overlay.state,"SUBMITTING");cleared();release();}
