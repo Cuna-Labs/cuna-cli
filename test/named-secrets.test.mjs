@@ -17,6 +17,54 @@ function fixture(overrides = {}, options = {}) {
   const input = (text) => gate.process(typeof text === "string" ? encoder.encode(text) : text, () => overlay.active, () => overlay.open(), (bytes) => overlay.input(bytes), (bytes) => remote.push(...bytes));
   return { overlay, input, calls, remote, authority(next) { current = next; overlay.authorityChanged(); } };
 }
+test("vertical arrows move between fields without wrapping or leaking control bytes", () => {
+  for (const [up, down] of [["\x1b[A", "\x1b[B"], ["\x1bOA", "\x1bOB"]]) {
+    const f = fixture(); f.input("\x11Database");
+    for (const byte of encoder.encode(up)) f.input(Uint8Array.of(byte));
+    assert.equal(f.overlay.view.focus, "name");
+    for (const byte of encoder.encode(down)) f.input(Uint8Array.of(byte));
+    assert.equal(f.overlay.view.focus, "secret"); f.input("first");
+    f.input(down); assert.equal(f.overlay.view.focus, "secret"); f.input("second");
+    f.input(up); assert.equal(f.overlay.view.focus, "name"); f.input("2");
+    assert.equal(f.overlay.view.name, "Database2");
+    assert.equal(f.overlay.view.masked, "***********");
+    f.input("\t"); assert.equal(f.overlay.view.focus, "secret");
+    f.input("\x1b[Z"); assert.equal(f.overlay.view.focus, "name");
+    assert.deepEqual(f.remote, []); assert.equal(f.calls.create.length, 0); f.overlay.dispose();
+  }
+});
+test("mask grows by Unicode character and shrinks on Backspace", () => {
+  const f = fixture(); f.input("\x11Database\t");
+  for (const [character, expected] of [["a", "*"], ["b", "**"], ["🔒", "***"], ["á", "****"]]) {
+    f.input(character); assert.equal(f.overlay.view.masked, expected);
+    assert.equal(f.overlay.view.revealedValue, undefined);
+  }
+  f.input("\x7f"); assert.equal(f.overlay.view.masked, "***");
+  f.input("\x7f"); assert.equal(f.overlay.view.masked, "**");
+  assert.deepEqual(f.remote, []); f.overlay.dispose();
+});
+test("explicit reveal is local and resets before submission and on close", async () => {
+  const f = fixture(); f.input("\x11Database\tFAKE_KEY");
+  f.overlay.toggleReveal(); assert.equal(f.overlay.view.revealed, true);
+  assert.equal(f.overlay.view.revealedValue, "FAKE_KEY"); assert.equal(f.overlay.view.masked, "********");
+  f.overlay.toggleReveal(); assert.equal(f.overlay.view.revealedValue, undefined);
+  f.overlay.toggleReveal(); f.input("\r");
+  assert.equal(f.overlay.view.revealed, false); assert.equal(f.overlay.view.revealedValue, undefined);
+  f.overlay.toggleReveal(); assert.equal(f.overlay.view.revealed, false);
+  await until(() => f.overlay.state === "SUCCESS");
+  assert.equal(f.calls.create[0].secret, "FAKE_KEY"); assert.deepEqual(f.remote, []);
+  f.input("\r"); f.input("\x11Other\tSECOND_FAKE");
+  assert.equal(f.overlay.view.revealed, false); f.overlay.toggleReveal();
+  f.overlay.close(); f.overlay.open(); assert.equal(f.overlay.view.revealed, false);
+  assert.equal(f.overlay.view.revealedValue, undefined); assert.equal(f.overlay.view.masked, ""); f.overlay.dispose();
+});
+test("reveal presentation does not change the UTF-8 credential sent for storage", async () => {
+  const f=fixture(); const value="FAKE\u009b2J\u202eAFTER";
+  f.input("\x11Demo\t"+value); f.overlay.toggleReveal();
+  assert.equal(f.overlay.view.revealedValue,value);
+  f.input("\r"); await until(()=>f.overlay.state==="SUCCESS");
+  assert.equal(f.calls.create[0].secret,value); assert.deepEqual(f.remote,[]); f.overlay.dispose();
+});
 test("plaintext lifetime expiry clears edit buffers and still captures late paste without dispatch", async () => {
   const f = fixture({}, { plaintextLifetimeMs: 10 }); f.input("\x11Database\tPRIVATE");
   await until(() => f.overlay.view?.feedback.includes("expired")); assert.equal(f.overlay.view.masked, ""); f.input("\x1b[200~PRIVATE_LATE\x1b[201~\r");
@@ -66,7 +114,7 @@ test("a fresh UpArrow after bare Escape is reprocessed as ordinary terminal inpu
 test("UTF-8 split and multiline bracketed paste preserve value; pasted Enter never saves", async () => {
   const f = fixture(); f.input("\x11Database\t");
   for (const byte of encoder.encode("\x1b[200~páss🔒\nsecond\tline\x1b[201~")) f.input(Uint8Array.of(byte));
-  assert.equal(f.calls.create.length, 0); assert.equal(f.overlay.view.masked, "********"); f.input("\r"); await until(() => f.overlay.state === "SUCCESS");
+  assert.equal(f.calls.create.length, 0); assert.equal(f.overlay.view.masked, "*".repeat(Array.from("páss🔒\nsecond\tline").length)); f.input("\r"); await until(() => f.overlay.state === "SUCCESS");
   assert.equal(f.calls.create[0].secret, "páss🔒\nsecond\tline"); f.overlay.dispose();
 });
 test("pasted unsupported C0 controls and DEL refuse the complete value without local actions or dispatch", () => {

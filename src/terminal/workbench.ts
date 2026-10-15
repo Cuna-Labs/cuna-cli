@@ -91,9 +91,11 @@ export interface WorkbenchFrame {
   readonly appbarRows: number;
   readonly viewportRows: number;
   readonly appbarTargets: readonly WorkbenchAppbarTarget[];
+  readonly color?: boolean;
+  readonly secretTargets?: readonly { readonly row: number; readonly firstColumn: number; readonly lastColumn: number; readonly target: "name" | "secret" | "reveal" }[];
 }
 
-/** Only field metadata and a constant mask enter the rendered frame. */
+/** Revealed text is local presentation only; it never enters the remote viewport. */
 export function withNamedSecretOverlay(frame: WorkbenchFrame, view: SecretOverlayView): WorkbenchFrame {
   const rows = [...frame.rowCommands];
   const width = Math.min(frame.columns, 64);
@@ -104,14 +106,35 @@ export function withNamedSecretOverlay(frame: WorkbenchFrame, view: SecretOverla
     else line = line ? `${line} ${word}` : word;
   }
   if (line) feedback.push(` ${line}`);
-  const lines = view.resizeRequired ? [view.feedback] : [` ${view.focus === "name" ? ">" : " "} Secret Name: ${view.name}`, ` ${view.focus === "secret" ? ">" : " "} Password: ${view.masked}`, ...feedback];
+  const password = view.revealed === true && typeof view.revealedValue === "string"
+    ? view.revealedValue.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, character => {
+      if (character === "\r") return "\\r";
+      if (character === "\n") return "\\n";
+      if (character === "\t") return "\\t";
+      const code = character.codePointAt(0)!;
+      return code > 0xffff ? `\\u{${code.toString(16)}}` : `\\u${code.toString(16).padStart(4, "0")}`;
+    }) : view.masked;
+  const reveal = view.revealed === true ? "◉ hide" : "◉ show";
+  const passwordLine = `${padLine(truncateMarked(` ${view.focus === "secret" ? ">" : " "} Password: ${password}`, width - 7), width - 7)} ${reveal}`;
+  const lines = view.resizeRequired ? [view.feedback] : [` ${view.focus === "name" ? ">" : " "} Secret Name: ${view.name}`, passwordLine, ...feedback];
   const top = Math.max(frame.appbarRows + 1, Math.floor((frame.rows - lines.length - 1) / 2) + 1);
   for (let index = 0; index < lines.length && top + index <= frame.rows; index += 1) {
-    rows[top + index - 1] = `${rows[top + index - 1] ?? ""}${ESC}${top + index};${left}H${ESC}0;7m${padLine(truncateMarked(lines[index]!, width), width)}${ESC}0m`;
+    const focused = index === (view.focus === "name" ? 0 : 1) && !view.resizeRequired;
+    const style = frame.color === false ? `${ESC}0;7m` : `${ESC}0;${focused ? CUNA_ORANGE : CUNA_ORANGE_DARK};${index < 2 ? WHITE : MUTED}m`;
+    rows[top + index - 1] = `${rows[top + index - 1] ?? ""}${ESC}${top + index};${left}H${style}${padLine(truncateMarked(lines[index]!, width), width)}${ESC}0m`;
   }
   const cursorCommand = `${ESC}?25l`;
   const text = `${ESC}?25l${ESC}H${rows.join("")}${cursorCommand}`;
-  return Object.freeze({ ...frame, rowCommands: Object.freeze(rows), cursorCommand, text, bytes: new TextEncoder().encode(text), appbarTargets: Object.freeze([]) });
+  const secretTargets = view.resizeRequired ? [] : [
+    { row: top, firstColumn: left, lastColumn: left + width - 1, target: "name" as const },
+    { row: top + 1, firstColumn: left, lastColumn: left + width - 8, target: "secret" as const },
+    { row: top + 1, firstColumn: left + width - 6, lastColumn: left + width - 1, target: "reveal" as const },
+  ];
+  return Object.freeze({ ...frame, rowCommands: Object.freeze(rows), cursorCommand, text, bytes: new TextEncoder().encode(text), appbarTargets: Object.freeze([]), secretTargets: Object.freeze(secretTargets) });
+}
+
+export function workbenchNamedSecretTargetAt(frame: WorkbenchFrame, column: number, row: number): "name" | "secret" | "reveal" | undefined {
+  return frame.secretTargets?.find(target => target.row === row && column >= target.firstColumn && column <= target.lastColumn)?.target;
 }
 
 /** The tab under a host cell, if the frame drew one there. */
@@ -246,6 +269,7 @@ export function renderWorkbenchFrame(input: WorkbenchFrameInput): WorkbenchFrame
     appbarRows,
     viewportRows,
     appbarTargets,
+    color,
   });
 }
 

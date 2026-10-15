@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import xterm from "@xterm/headless";
-import { workbenchAppbarTargetAt, workbenchUpdate } from "../dist/terminal/workbench.js";
+import { workbenchAppbarTargetAt, workbenchUpdate, withNamedSecretOverlay, workbenchNamedSecretTargetAt } from "../dist/terminal/workbench.js";
 
 import {
   buildAppbarModel,
@@ -11,6 +11,46 @@ import {
 } from "../dist/index.js";
 
 const now = Date.parse("2026-08-08T00:00:00.000Z");
+
+test("revealing Unicode control characters cannot execute commands or erase the frame", async () => {
+  const allTabs = tabs();
+  const base = renderWorkbenchFrame({columns:120,rows:32,tabs:allTabs,activeTabId:allTabs[0].id,appbar:model()});
+  const frame = withNamedSecretOverlay(base,{name:"Demo",masked:"********",focus:"secret",feedback:"Esc cancels",revealed:true,
+    revealedValue:"FAKE\u009b2J\u202eAFTER\u2028"});
+  assert.equal(frame.text.includes("\u009b"),false);
+  assert.equal(frame.text.includes("\u202e"),false);
+  assert.equal(frame.text.includes("\u2028"),false);
+  assert.ok(frame.text.includes("\\u009b2J\\u202eAFTER\\u2028"));
+  const terminal = new xterm.Terminal({cols:120,rows:32,allowProposedApi:true});
+  try {
+    await new Promise(resolve=>terminal.write(frame.bytes,resolve));
+    assert.match(terminal.buffer.active.getLine(0).translateToString(true),/CUNA/u);
+  } finally { terminal.dispose(); }
+});
+
+test("secret popup paints orange and binds clipped field/reveal cells to the actual frame", () => {
+  const allTabs = tabs();
+  for (const [columns, rows] of [[30,8],[80,24],[120,32]]) {
+    const base = renderWorkbenchFrame({ columns, rows, tabs: allTabs, activeTabId: allTabs[0].id, appbar:model() });
+    const view={name:"Database",masked:"***",focus:"secret",feedback:"Enter saves · Esc cancels",revealed:false};
+    const hidden=withNamedSecretOverlay(base,view);
+    assert.match(hidden.text,/48;2;235;86;37/u);
+    const targets=hidden.secretTargets;
+    assert.equal(targets.length,3);
+    for(const target of targets) {
+      assert.ok(target.row>=1&&target.row<=rows&&target.firstColumn>=1&&target.lastColumn<=columns);
+      assert.equal(workbenchNamedSecretTargetAt(hidden,target.firstColumn,target.row),target.target);
+      assert.equal(workbenchNamedSecretTargetAt(hidden,target.lastColumn,target.row),target.target);
+    }
+    assert.equal(workbenchNamedSecretTargetAt(hidden,0,targets[0].row),undefined);
+    assert.match(hidden.text,/◉ show/u);
+    const shown=withNamedSecretOverlay(base,{...view,revealed:true,revealedValue:"a\n😀"});
+    assert.match(shown.text,/a\\n😀/u); assert.match(shown.text,/◉ hide/u);
+    assert.doesNotMatch(withNamedSecretOverlay(base,{...view,revealedValue:"UNREVEALED_CANARY"}).text,/UNREVEALED_CANARY/u);
+    assert.deepEqual(withNamedSecretOverlay(base,{...view,resizeRequired:true}).secretTargets,[]);
+    assert.equal(withNamedSecretOverlay(base,{...view}).appbarTargets.length,0);
+  }
+});
 
 test("incremental workbench writes preserve host cells, colors and cursor across edits and clears", async () => {
   const full = new xterm.Terminal({ cols: 80, rows: 24, allowProposedApi: true });

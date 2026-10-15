@@ -44,6 +44,7 @@ import {
   CONTINUED_MARKER,
   renderWorkbenchFrame,
   workbenchAppbarTargetAt,
+  workbenchNamedSecretTargetAt,
   workbenchUpdate,
   withPredictionOverlay,
   withNamedSecretOverlay,
@@ -1320,7 +1321,7 @@ export class ForegroundTerminalCoordinator {
           if (this.#secretPreparing) { if (local.includes(3) || local.includes(27)) this.#secretPrepareAbort?.abort(); }
           else this.#secretOverlay?.input(local);
         } finally { local.fill(0); }
-      }, (remote) => this.#queueOrdinaryInput(remote));
+      }, (remote) => this.#queueOrdinaryInput(remote), (event) => this.#handleSecretMouse(event));
     if (!this.#secretPreparing && !this.#secretOverlay?.active && this.#secretInput.draining) {
       this.#browserNotice = "Paste boundary pending · input withheld locally";
       void this.#render().catch(() => undefined);
@@ -1331,6 +1332,17 @@ export class ForegroundTerminalCoordinator {
     const size = this.#options.host.dimensions(); const available = size.columns >= 30 && size.rows >= 8;
     this.#secretOverlay?.geometryChanged(available, this.#secretPreparing);
     if (!available && this.#secretPreparing) this.#secretPrepareAbort?.abort();
+  }
+
+  #handleSecretMouse(event: HostMouseEvent): void {
+    this.#fenceSecretGeometry();
+    if (this.#secretPreparing || !this.#secretOverlay?.active || event.release || event.button !== 0) return;
+    const frame = this.#lastWorkbenchFrame;
+    const size = this.#options.host.dimensions();
+    if (frame === undefined || frame.columns !== size.columns || frame.rows !== size.rows) return;
+    const target = workbenchNamedSecretTargetAt(frame, event.column, event.row);
+    if (target === "reveal") this.#secretOverlay.toggleReveal();
+    else if (target !== undefined) this.#secretOverlay.focusField(target);
   }
 
   #openSecretOverlay(): void {

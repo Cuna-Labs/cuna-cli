@@ -10,6 +10,7 @@ import { createNodeProcessAdapter } from "../dist/pty/node-process.js";
 import { createApiTerminalControlPlane } from "../dist/runtime/api-terminal-control-plane.js";
 import { admitCapability } from "../dist/runtime/capability-gate.js";
 import { CunaRuntimeBoundary } from "../dist/runtime/boundary.js";
+import { createNodeForegroundTerminalHost } from "../dist/pty/node-host-terminal.js";
 import { RuntimeBoundaryError } from "../dist/runtime/errors.js";
 import { DurableSyncJournal } from "../dist/sync/journal.js";
 import { assertRemoteAgentSessionEvidence, createUnavailableTerminalControlPlane, validateTerminalGrant } from "../dist/runtime/terminal-transport.js";
@@ -37,6 +38,42 @@ const API_ORIGIN = "https://api.getcuna.com";
  */
 const resources = new TestResourceLedger();
 test.after(() => resources.cleanup());
+
+test("vertical geometry: native 120x50 writer sends body48 before replay and grows without a 24-row clamp", async () => {
+  const stdout = { isTTY: true, columns: 120, rows: 50 };
+  const host = createNodeForegroundTerminalHost({ stdin: { isTTY: true, setRawMode() {} }, stdout });
+  const system = new FakeTerminalSystem();
+  const { runtime } = createRuntime(system);
+  try {
+    assert.deepEqual(host.dimensions(), { columns: 120, rows: 50 });
+    const size = host.dimensions();
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: size.columns, rows: size.rows - 2 });
+    let frames = system.connections[0].sent.map(decodeTerminalFrame);
+    assert.deepEqual(frames.slice(0, 2).map(f => f.type), ["resize", "resume"]);
+    assert.deepEqual(decodeTerminalControl(frames[0]), { columns: 120, rows: 48 });
+    stdout.rows = 70;
+    const grown = host.dimensions();
+    await runtime.resize(grown.columns, grown.rows - 2, "tab-a");
+    frames = system.connections[0].sent.map(decodeTerminalFrame);
+    assert.equal(frames.at(-1).type, "resize");
+    assert.deepEqual(decodeTerminalControl(frames.at(-1)), { columns: 120, rows: 68 });
+  } finally { await runtime.shutdown(); }
+});
+
+test("vertical geometry: an observer preserves the writer's 24 rows and sends no resize", async () => {
+  const system = new FakeTerminalSystem();
+  system.seatOnReady.set("agent-a", { accessMode: "observer", writerEpoch: 1 });
+  const { runtime } = createRuntime(system);
+  try {
+    await runtime.attach({ tabId: "tab-a", agentSessionId: "agent-a", columns: 120, rows: 48 });
+    const wire = system.connections[0];
+    wire.incoming.push(geometryWire({ columns: 80, rows: 24, writerEpoch: 1 }));
+    await waitUntil(() => runtime.listTerminals()[0].geometry?.rows === 24, "observer keeps actual writer height");
+    await assert.rejects(runtime.resize(120, 48, "tab-a"));
+    assert.equal(wire.sent.map(decodeTerminalFrame).some(frame => frame.type === "resize"), false);
+    assert.equal(runtime.listTerminals()[0].geometry.rows, 24);
+  } finally { await runtime.shutdown(); }
+});
 
 function capabilitySnapshot(agentSessionId, overrides = {}) {
   return {

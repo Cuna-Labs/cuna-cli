@@ -480,7 +480,8 @@ function agentHelp(command: "claude" | "codex" | "opencode"): string {
       "A read-only view and the plain fallback detach on Ctrl+C.",
       "Ctrl+C over a Cuna selection copies it instead.",
       "Ctrl+Q opens the local named-secret popout in an attached rich writer view.",
-      "Tab changes its field, Enter saves, Escape cancels. Saving grants no agent access.",
+      "Up/Down or Tab changes its field; click Show/Hide to reveal the password.",
+      "Enter saves, Escape cancels. Saving grants no agent access.",
     ].join("\n"),
   );
 }
