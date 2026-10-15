@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { prepareMachineCreateChoice, performMachineCreateChoice, hasMachineCreateChoice, machineCreateChoiceState, type MachineCreateChoiceScope } from "../journey/machine-create-options.js";
 
 import {
   requireCapability,
@@ -382,6 +383,13 @@ function requireOption(parsed: ParsedInvocation, name: string, hint?: string): s
   return value;
 }
 
+function installTetragonOption(parsed: ParsedInvocation): boolean | undefined {
+  const raw = stringOption(parsed, "install-tetragon");
+  if (raw === undefined) return undefined;
+  if (raw !== "true" && raw !== "false") throw usageError("Option --install-tetragon requires exactly true or false.");
+  return raw === "true";
+}
+
 function integerOption(
   parsed: ParsedInvocation,
   name: string,
@@ -522,8 +530,8 @@ function idempotencyKey(parsed: ParsedInvocation): string {
  * credential kinds, and no credential material enters the derivation: the
  * request id, sent in a header and printed, says nothing about the key.
  */
-async function machineCreateRequestId(context: CommandContext, key: string): Promise<string> {
-  const account = (await context.client.getIdentity()).id;
+async function machineCreateRequestId(context: CommandContext, key: string, knownAccount?: string): Promise<string> {
+  const account = knownAccount ?? (await context.client.getIdentity()).id;
   const scope = `${context.config.apiKey === undefined ? "human" : "automation"}:${account}`;
   const bytes = createHash("sha256").update("cuna.machine-create-request.v1\0")
     .update(scope).update("\0").update(key).digest();
@@ -693,7 +701,7 @@ async function followMachineCreate(context: CommandContext, follow: MachineCreat
     try {
       current = await read(`GET /v1/machine-creates/${follow.requestId}`,
         (signal) => client.getMachineCreateRequest(follow.requestId, signal));
-      if (current.state === "unknown" || current.action === "reconcile") {
+      if (follow.input.installTetragon === undefined && (current.state === "unknown" || current.action === "reconcile")) {
         current = await read(`POST /v1/machine-creates/${follow.requestId}/reconcile`,
           (signal) => client.reconcileMachineCreateRequest(follow.requestId, signal));
       }
@@ -729,7 +737,7 @@ async function followMachineCreate(context: CommandContext, follow: MachineCreat
             throw machineCreateFailed(follow, `Machine ${name} was created but is ${machine.state}.`, current, machine);
           }
         }
-      } else if (current.state === "prepared" && current.action === "retry_create" && !posted) {
+      } else if (follow.input.installTetragon === undefined && current.state === "prepared" && current.action === "retry_create" && !posted) {
         posted = true;
         try {
           await read("POST /v1/sessions", (signal) => client.createMachine(follow.input, follow.key, follow.requestId, signal));
@@ -1228,6 +1236,10 @@ export function preflightInvocation(
 ): void {
   assertRouteServedByContract(assertRegisteredCliRoute(parsed), contractOperations);
   switch (parsed.command) {
+    case "secrets":
+      rejectUnknownOptions(parsed, []);
+      if (parsed.operands.length !== 2 || parsed.operands[0] !== "operation") throw usageError("Use secrets operation OPERATION_ID.");
+      assertCanonicalUuid(parsed.operands[1]!, "named-secret operation ID"); return;
     case "config":
       rejectUnknownOptions(parsed, []);
       if (parsed.operands.length !== 1 || parsed.operands[0] !== "get") {
@@ -1501,7 +1513,7 @@ function preflightMachines(parsed: ParsedInvocation): void {
     return;
   }
   if (action === "create") {
-    rejectUnknownOptions(parsed, ["name", "agent", "vcpus", "memory-mib", "background", "yes", "idempotency-key"]);
+    rejectUnknownOptions(parsed, ["name", "agent", "vcpus", "memory-mib", "background", "yes", "idempotency-key", "install-tetragon"]);
     if (parsed.operands.length !== 1) throw usageError("machines create accepts no operands.");
     requireConfirmation(parsed, "machines.create");
     idempotencyKey(parsed);
@@ -1512,6 +1524,7 @@ function preflightMachines(parsed: ParsedInvocation): void {
     agentOption(parsed, false);
     integerOption(parsed, "vcpus", 1, 8);
     integerOption(parsed, "memory-mib", 512, 16_384);
+    installTetragonOption(parsed);
     return;
   }
   if (action === "update-supervisor") {
@@ -1621,6 +1634,19 @@ function preflightAgentSessions(parsed: ParsedInvocation): void {
 export async function executeCommand(context: CommandContext): Promise<CommandResult> {
   const { parsed, config, client } = context;
   switch (parsed.command) {
+    case "secrets": {
+      requireCredential(context);
+      const operationId = assertCanonicalUuid(parsed.operands[1]!, "named-secret operation ID");
+      try {
+        const receipt = await context.client.getNamedSecretOperation(operationId);
+        if (receipt.operation_id !== operationId) throw new Error("mismatch");
+        return Object.freeze({ command: "secrets.operation", data: { ...receipt },
+          human: receipt.state === "committed" ? `Secret ${receipt.name} is durably stored in Cuna Workspace ${receipt.workspace_id}. No agent access was granted.` : "The operation was rejected; nothing was stored." });
+      } catch {
+        throw new CunaError({ code: "cuna.secrets.outcome_unknown", message: "The named-secret operation outcome remains unknown.", exitCode: EXIT_CODES.network,
+          hint: `Check the same operation without writing again: cuna secrets operation ${operationId}` });
+      }
+    }
     case "config": {
       rejectUnknownOptions(parsed, []);
       if (parsed.operands.length !== 1 || parsed.operands[0] !== "get") {
@@ -3171,7 +3197,7 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     });
   }
   if (action === "create") {
-    rejectUnknownOptions(parsed, ["name", "agent", "vcpus", "memory-mib", "background", "yes", "idempotency-key"]);
+    rejectUnknownOptions(parsed, ["name", "agent", "vcpus", "memory-mib", "background", "yes", "idempotency-key", "install-tetragon"]);
     if (parsed.operands.length !== 1) throw usageError("machines create accepts no operands.");
     requireConfirmation(parsed, "machines.create");
     const key = idempotencyKey(parsed);
@@ -3184,18 +3210,30 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
     const agent = agentOption(parsed, false);
     const vcpus = integerOption(parsed, "vcpus", 1, 8);
     const memoryMiB = integerOption(parsed, "memory-mib", 512, 16_384);
-    await requireCapability({ client, scope: "account", capabilityId: "machines.create", now: context.capabilityClock ?? now });
-    const input: MachineCreateInput = {
+    const installTetragon = installTetragonOption(parsed);
+    if (installTetragon === undefined) await requireCapability({ client, scope: "account", capabilityId: "machines.create", now: context.capabilityClock ?? now });
+    const input: MachineCreateInput = Object.freeze({
       name,
+      ...(installTetragon === undefined ? {} : { installTetragon }),
       ...(agent === undefined ? {} : { agent }),
       ...(vcpus === undefined ? {} : { vcpus }),
       ...(memoryMiB === undefined ? {} : { memoryMiB }),
       ...(booleanOption(parsed, "background") ? { background: true } : {}),
-    };
+    });
     // A create names a durable request before it is sent. When its answer does
     // not arrive, that request's receipt is what the CLI reads, never a second
     // POST; the same key given again resumes reading it.
-    const requestId = await machineCreateRequestId(context, key);
+    const account = await client.getIdentity();
+    const requestId = await machineCreateRequestId(context, key, account.id);
+    let choiceScope: MachineCreateChoiceScope | undefined;
+    if (context.platform !== undefined && account.workspaceId !== undefined) {
+      const possibleScope:MachineCreateChoiceScope={stateDirectory:context.platform.paths.stateDirectory,apiOrigin:context.config.baseUrl,profileId:context.config.profile,userId:account.id,workspaceId:account.workspaceId,
+        canonicalLocalRoot:context.platform.paths.stateDirectory,agent:agent??"claude-code",machine:{kind:"automatic"},...(installTetragon===undefined?{}:{installTetragon}),direct:{key,requestId,body:input}};
+      // Remote control-body creation has no cwd semantics. Removing its option
+      // or changing directories cannot erase the original keyed body evidence.
+      if(installTetragon!==undefined || await hasMachineCreateChoice(possibleScope)) choiceScope=possibleScope;
+    }
+    if (installTetragon !== undefined && choiceScope === undefined) throw new CunaError({code:"cuna.journey.machine_create_choice_unresolved",message:"This creation choice requires durable local state and authenticated Workspace identity.",exitCode:EXIT_CODES.policy});
     const poller = context.convergencePoller ?? productionConvergencePoller();
     const startedAt = poller.now();
     const follow = (posted: boolean): MachineCreateFollow => ({ requestId, key, input, startedAt, posted });
@@ -3208,20 +3246,27 @@ async function executeMachines(context: CommandContext): Promise<CommandResult> 
         if (!(error instanceof CunaError && error.details?.http_status === 404)) throw error;
       }
     }
+    if (choiceScope !== undefined && known && !await hasMachineCreateChoice(choiceScope)) throw new CunaError({code:"cuna.journey.machine_create_policy_unproven",message:"The existing operation does not prove its original Tetragon choice. Nothing was sent.",exitCode:EXIT_CODES.conflict,details:{request_id:requestId},hint:"Recover the original command and local operation record. Do not change its creation choice or create another Machine to resolve an unknown result."});
+    const preparedChoice=choiceScope===undefined?undefined:await prepareMachineCreateChoice(choiceScope,async()=>({kind:"choice",...(installTetragon===undefined?{}:{installTetragon})}));
+    if (choiceScope !== undefined && preparedChoice !== undefined && await machineCreateChoiceState(choiceScope,preparedChoice) === "queued") {
+      await requireCapability({ client, scope: "account", capabilityId: "machines.create", now: context.capabilityClock ?? now });
+      await requireCapability({ client, scope: "account", capabilityId: "machines.create.install_tetragon", allowedInteractions: ["native"], now: context.capabilityClock ?? now });
+    }
     // `machine` is what the create named; `observed` is a read made after it.
     // A follow's own Machine read is that read, so nothing is read after the
     // one that shows the Machine running: a further read can only fail (BL-6:
     // a renewal failure was the whole answer for a Machine Cuna had started).
     let machine: Machine;
     let observed: Machine;
-    if (known) {
+    if (known && choiceScope === undefined) {
       // This key already named a create. Follow it; its receipt alone decides
       // whether the POST is ever sent again (`retry_create`).
       machine = observed = await followMachineCreate(context, follow(false));
     } else {
       let answered: Machine | undefined;
       try {
-        answered = await client.createMachine(input, key, requestId);
+        answered = choiceScope===undefined || preparedChoice===undefined ? await client.createMachine(input,key,requestId) : await performMachineCreateChoice(choiceScope,preparedChoice,{
+          signal:new AbortController().signal,create:signal=>client.createMachine(input,key,requestId,signal),readReceipt:signal=>client.getMachineCreateRequest(requestId,signal),readMachine:(id,signal)=>client.getMachine(id,signal)});
       } catch (error) {
         if (!machineCreateOutcomeUnobserved(error)) throw error;
       }

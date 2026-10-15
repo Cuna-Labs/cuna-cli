@@ -1,11 +1,13 @@
-import {mkdtemp,rm} from "node:fs/promises";
-import {tmpdir} from "node:os";
+import {lstat,readdir} from "node:fs/promises";
+import {randomUUID} from "node:crypto";
 import {join} from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
+import {createOwnedTempDirectory,removeOwnedTempDirectory} from "../scripts/lib/owned-temp.mjs";
 
 import { EXIT_CODES, CunaError } from "../dist/index.js";
 import { createApiAgentJourneyEffects } from "../dist/journey/api-effects.js";
+import {DurableSyncJournal,inspectSyncJournal} from "../dist/sync/journal.js";
 
 const MACHINE_ID = "22222222-2222-4222-8222-222222222222";
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
@@ -359,15 +361,32 @@ test("only a live session is asked for its seat", async () => {
     assert.equal(observed.attachment, "detached", processState);
   }
 });
-for(const agent of ['opencode','codex','claude-code'])test(`explicit published Workspace ${agent} uses V2 preset and exact same-key uncertain replay without old create or inspect`,async()=>{
- const stateDirectory=await mkdtemp(join(tmpdir(),'cuna-v2-launch-'));
+for(const agent of ['opencode','codex','claude-code'])test(`explicit published Workspace ${agent} uses V2 preset and exact same-key uncertain replay without old create or inspect`,async(t)=>{
+ const stateDirectory=await createOwnedTempDirectory('cuna-v2-launch-');
+ t.after(()=>removeOwnedTempDirectory(stateDirectory));
  const calls=[];const execution='44444444-4444-4444-8444-444444444444';const workspace={bindingId:BINDING_ID,workspaceIdentity:BINDING_ID,executionWorkspaceId:execution,generation:7,remoteCwd:`/workspace/workspaces/${execution}`};
  const client={async discoverCapabilities(){return capability();},async createAgentSession(){throw Error('old create forbidden');},async inspectAgentSessionCreate(){throw Error('old inspect forbidden');},async createProviderSessionV2(machine,request){calls.push({machine,request});if(calls.length===1)throw new CunaError({code:'cuna.network.failed',message:'lost',exitCode:EXIT_CODES.network});return{agentSession:recoveredSession({agent,cwd:workspace.remoteCwd,workspaceBindingId:undefined,workspaceGeneration:undefined})};}};
  const effect=createApiAgentJourneyEffects({client,requestedAgent:agent,providerLaunchState:{stateDirectory,ownerId:'owner',workspaceId:'account'},inspectWorkspace:async()=>({canonicalLocalRoot:'x'}),synchronizeWorkspace:async()=>workspace,attach:async()=>{},authorizeMachineCreate:async()=>false,now:()=>NOW,selectProviderPreset:async()=>({kind:agent==='opencode'?'provider_preset':'native_interactive',agent,label:'Selected preset',profile_id:'55555555-5555-4555-8555-555555555555',profile_revision:2})});
  assert.equal((await effect.createAgentSession({machineId:MACHINE_ID,agent,authMode:'interactive_login',workspace,idempotencyKey:'random-journey-agent',signal:new AbortController().signal})).id,SESSION_ID);
  assert.equal(calls[0].request.agent,agent);
  assert.equal(calls.length,2);assert.deepEqual(calls[0],calls[1]);assert.equal(calls[0].request.execution_workspace_id,execution);assert.equal(calls[0].request.workspace_generation,7);assert.equal(calls[0].request.profile_revision,2);assert.match(calls[0].request.operation_id,/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
- await assert.rejects(effect.createAgentSession({machineId:MACHINE_ID,agent,authMode:'interactive_login',workspace:{...workspace,executionWorkspaceId:undefined},idempotencyKey:'x',signal:new AbortController().signal}),e=>e.code==='cuna.provider.v2_unavailable');assert.equal(calls.length,2);await rm(stateDirectory,{recursive:true,force:true});
+ await assert.rejects(effect.createAgentSession({machineId:MACHINE_ID,agent,authMode:'interactive_login',workspace:{...workspace,executionWorkspaceId:undefined},idempotencyKey:'x',signal:new AbortController().signal}),e=>e.code==='cuna.provider.v2_unavailable');assert.equal(calls.length,2);
+ // Bounded filesystem retries must not conceal an unfinished journal writer.
+ const parent=join(stateDirectory,'provider-launch-v2');
+ const entries=await readdir(parent);
+ assert.equal(entries.length,1);
+ const directory=join(parent,entries[0]);
+ await assert.rejects(lstat(join(directory,'writer.lease')),{code:'ENOENT'});
+ const view=await inspectSyncJournal(directory);
+ assert.equal(view.requiresReconciliation,false);
+ assert.equal(view.records.at(-1).state,'applied');
+ const openWriter=()=>DurableSyncJournal.open({directory,bindingId:view.metadata.bindingId,bindingGeneration:view.metadata.bindingGeneration,ownerId:randomUUID(),leaseMs:10_000});
+ const probe=await openWriter();
+ try{
+  // A real active writer rejects this exact ownership probe.
+  await assert.rejects(openWriter(),e=>e.code==='cuna.workspace.workspace_busy');
+ }finally{await probe.close();}
+ await assert.rejects(lstat(join(directory,'writer.lease')),{code:'ENOENT'});
 });
 
 

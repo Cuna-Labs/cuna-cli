@@ -204,6 +204,12 @@ export function isLoginCode(value: string): boolean {
 }
 
 /** A one-use terminal connection token. */
+/** Named vault entries cannot impersonate platform or deployed provider-login names. */
+export function isReservedSecretName(value: string): boolean {
+  const upper = value.toUpperCase();
+  return CREDENTIAL_BRANDS.some((brand) => upper.startsWith(`${brand.toUpperCase()}_`)) || upper.startsWith("RUNTA_");
+}
+
 export function isTerminalConnectToken(value: string): boolean {
   return TERMINAL_CONNECT_TOKEN.test(value);
 }

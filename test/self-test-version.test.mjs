@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
 
 import { runCli, memoryStreams } from "../dist/cli/run.js";
 import { packageBuildManifest } from "../dist/build-identity.js";
 import { evaluateRuntimeSupport, isSupportedNodeVersion } from "../dist/platform/support.js";
+const PACKAGE_VERSION = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
 
 function parseSingleRecord(value) {
   const lines = value.trim().split("\n");
@@ -28,7 +30,7 @@ test("version JSON carries a candidate-bound runtime identity", async () => {
   assert.equal(record.schema_version, "1");
   assert.equal(record.type, "result");
   assert.equal(record.command, "version");
-  assert.equal(record.data.version, "0.1.7");
+  assert.equal(record.data.version, PACKAGE_VERSION);
   assert.match(record.data.buildDigest, /^[0-9a-f]{64}$/u);
   assert.equal(record.data.platform, process.platform);
   assert.equal(record.data.architecture, process.arch);

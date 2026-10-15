@@ -81,6 +81,15 @@ function event(bytes, overrides = {}) {
   };
 }
 
+test("plain Ctrl+Q is consumed locally with refusal and quarantines its callback tail", async () => {
+  const { coordinator, host, calls, intent } = harness();
+  try {
+    await coordinator.start([intent]); host.emitInput(encoder.encode("\x11PRIVATE_TAIL"));
+    await waitUntil(() => host.writes.some((bytes) => new TextDecoder().decode(bytes).includes("secrets require isolated")), "plain mode names the refusal");
+    assert.deepEqual(calls.input, []); assert.doesNotMatch(host.writes.map((bytes) => new TextDecoder().decode(bytes)).join(""), /PRIVATE_TAIL/);
+  } finally { await coordinator.stop(); }
+});
+
 function harness({ deferredAttach = false, deferredInput = false, resizeCapability = "live", accessMode = "writer", detachStateSequence = ["detached"] } = {}) {
   const host = new FakeHost();
   const coordinator = new PassthroughTerminalCoordinator({ host, resizeCoalesceMs: 1 });

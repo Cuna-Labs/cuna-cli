@@ -10,6 +10,7 @@ import {
 } from "../api/contracts.js";
 import type { CunaApiClient } from "../api/client.js";
 import type { BrowserOpener } from "../auth/browser.js";
+import { createNamedSecretService } from "../named-secrets/service.js";
 import { createNodeForegroundTerminalHost } from "../pty/node-host-terminal.js";
 import {
   ForegroundTerminalCoordinator,
@@ -144,6 +145,7 @@ interface ForegroundRunOutcome {
  * owned across a switch, and the Machine roster keeps its numbers.
  */
 interface ForegroundSwitchContext {
+  readonly secretRecoveryNotices: Set<string>;
   readonly host: HeldForegroundHost;
   roster: PollingSessionRoster | undefined;
   /** Ctrl+C between two attachments: the run ends, nothing more is attached. */
@@ -170,6 +172,7 @@ export async function runNodeForegroundSessions(
   dependencies: NodeForegroundSessionDependencies = {},
 ): Promise<void> {
   const context: ForegroundSwitchContext = {
+    secretRecoveryNotices: new Set(),
     host: holdForegroundHost(dependencies.host ?? createNodeForegroundTerminalHost()),
     roster: undefined,
     switching: undefined,
@@ -190,6 +193,12 @@ export async function runNodeForegroundSessions(
     cleanupFailures.push(error);
   }
   // PRD-PM-008 E14-D6. Only after the host terminal is restored, and only for
+  for (const notice of context.secretRecoveryNotices) {
+    try {
+      if (input.onNotice !== undefined) input.onNotice(notice);
+      else await context.host.write(new TextEncoder().encode(`${notice}\n`));
+    } catch { /* The metadata-only notice cannot turn terminal cleanup into a second failure. */ }
+  }
   // detaches the person asked for and the runtime confirmed: one line per
   // session that survived and how to come back. A failed run says nothing
   // here; its error is the message. A session the roster saw end is not
@@ -752,6 +761,7 @@ async function runClaimedForeground(
     ? new ForegroundTerminalCoordinator({
         ...dependencies.coordinatorOptions,
         host,
+        namedSecrets: createNamedSecretService(input.client),
         ...(input.browser === undefined ? {} : { browser: input.browser }),
         clock,
         color: input.color ?? true,
@@ -819,6 +829,9 @@ async function runClaimedForeground(
     await coordinator.stop();
   } catch (error) {
     cleanupFailures.push(error);
+  }
+  if (coordinator instanceof ForegroundTerminalCoordinator && coordinator.secretRecoveryNotice !== undefined) {
+    context.switchContext.secretRecoveryNotices.add(coordinator.secretRecoveryNotice);
   }
   // The "keeps running" lines are written by `runNodeForegroundSessions` once
   // the host is restored; a switch keeps the host, so they cannot go here.

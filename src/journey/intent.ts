@@ -23,6 +23,7 @@ export interface ReconciledAgentJourneyIntent extends AgentJourneyIntentBase {
   readonly localPath?: string;
   readonly syncMode: Exclude<AgentJourneySyncMode, "not-applicable">;
   readonly newSession: boolean;
+  readonly installTetragon?: boolean;
   readonly authMode?: AgentAuthMode;
   readonly credentialBindingId?: string;
 }
@@ -45,6 +46,7 @@ const JOURNEY_OPTIONS = new Set([
   "new",
   "new-session",
   "no-sync",
+  "install-tetragon",
 ]);
 const GLOBAL_OPTIONS = new Set([
   "base-url",
@@ -56,6 +58,7 @@ const GLOBAL_OPTIONS = new Set([
 ]);
 const BOOLEAN_OPTIONS = new Set(["json", "new", "new-session", "no-color", "no-sync"]);
 const STRING_OPTIONS = new Set([
+  "install-tetragon",
   "agent-session",
   "auth-mode",
   "base-url",
@@ -162,7 +165,7 @@ function explicitAgentSessionIntent(
   identity: ReturnType<typeof commandAgent>,
   agentSessionId: string,
 ): ExplicitAgentSessionJourneyIntent {
-  const forbidden = ["auth-mode", "credential-binding", "machine", "new", "new-session", "no-sync"].filter(
+  const forbidden = ["auth-mode", "credential-binding", "machine", "new", "new-session", "no-sync", "install-tetragon"].filter(
     (name) => parsed.options[name] !== undefined,
   );
   if (parsed.operands.length > 0 || forbidden.length > 0) {
@@ -202,6 +205,8 @@ export function preflightAgentJourneyInvocation(parsed: ParsedInvocation): Agent
   const forceNew = booleanOption(parsed, "new");
   const newSession = booleanOption(parsed, "new-session");
   const noSync = booleanOption(parsed, "no-sync");
+  const rawInstallTetragon = stringOption(parsed, "install-tetragon");
+  if (rawInstallTetragon !== undefined && rawInstallTetragon !== "true" && rawInstallTetragon !== "false") throw usageError("Option --install-tetragon requires exactly true or false.");
   const machineName = stringOption(parsed, "machine");
   const requestedAuthMode = normalizedAuthMode(parsed);
   const rawCredentialBindingId = stringOption(parsed, "credential-binding");
@@ -258,6 +263,7 @@ export function preflightAgentJourneyInvocation(parsed: ParsedInvocation): Agent
     machine,
     ...(localPath === undefined ? {} : { localPath: safeLocalPath(localPath) }),
     syncMode: noSync ? "disabled" : "enabled",
+    ...(rawInstallTetragon === undefined ? {} : { installTetragon: rawInstallTetragon === "true" }),
     newSession,
     ...(authMode === undefined ? {} : { authMode }),
     ...(credentialBindingId === undefined ? {} : { credentialBindingId }),

@@ -9,10 +9,9 @@ import { Writable } from "node:stream";
 import { terminalCellWidth } from "../terminal/cell-width.js";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { mkdir } from "node:fs/promises";
-import { createHash } from "node:crypto";
 import { launchRemoteWorkspaceSession } from "../journey/remote-workspace.js";
-import { join, resolve } from "node:path";
+import { selectManagedWorkspaceRoot } from "../journey/managed-workspace-root.js";
+import { resolve } from "node:path";
 
 import { createCunaApiClient, type CunaApiClient } from "../api/client.js";
 import type { AgentSession } from "../api/contracts.js";
@@ -76,6 +75,7 @@ import {
 import { askRecordedLaunch, recordedLaunchConfirmation } from "./recorded-launch-prompt.js";
 import type { RecordedLaunchContext } from "../journey/provider-launch-intent.js";
 import { settledAgentSessionDisposition } from "../journey/session-disposition.js";
+import type { MachineCreateChoiceAnswer } from "../journey/machine-create-options.js";
 import {
   agentJourneyCommand,
   rootJourneyArgv,
@@ -187,6 +187,7 @@ export interface RunCliDependencies {
     readonly signal?: AbortSignal;
   }) => AgentJourneyEffects;
   readonly authorizeMachineCreate?: (agent: "claude-code" | "codex" | "openclaw" | "opencode", signal: AbortSignal) => Promise<boolean>;
+  readonly selectInstallTetragon?: (signal: AbortSignal) => Promise<MachineCreateChoiceAnswer>;
   /** Internal navigation context; direct command refusals retain their exit code. */
   readonly returnToMachinesOnCreateDeclined?: boolean;
 }
@@ -195,12 +196,38 @@ async function confirmMachineCreate(agent: "claude-code" | "codex" | "openclaw" 
   if (signal.aborted) return false;
   const prompt = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
   try {
-    const answer = await prompt.question(`No compatible machine is available. Create one for ${agent}? [y/N] `, { signal });
+    const answer = await prompt.question(`No compatible machine is available. Create one for ${agent}? [y/n] `, { signal });
     return answer.trim().toLocaleLowerCase("en-US") === "y" || answer.trim().toLocaleLowerCase("en-US") === "yes";
   } catch {
     return false;
   } finally {
     prompt.close();
+  }
+}
+
+export async function selectInstallTetragon(signal: AbortSignal, io: {
+  readonly input?: NodeJS.ReadableStream & { readonly isTTY?: boolean; readonly isRaw?: boolean; readonly readableEnded?: boolean; isPaused?(): boolean; setRawMode?(raw: boolean): unknown };
+  readonly output?: NodeJS.WritableStream;
+} = {}): Promise<MachineCreateChoiceAnswer> {
+  if (signal.aborted) return { kind: "cancel" };
+  const input=io.input??process.stdin, output=io.output??process.stderr;
+  if(input.isTTY!==true) throw new CunaError({code:"cuna.journey.machine_create_choice_required",message:"Choose the Tetragon policy explicitly when input is not an interactive terminal.",exitCode:EXIT_CODES.usage,hint:"Use --install-tetragon true|false. For `machines create`, include --yes to authorize the financial action."});
+  if(input.readableEnded===true) return {kind:"cancel"};
+  const wasRaw=input.isRaw, wasPaused=input.isPaused?.();
+  const prompt = createInterface({ input, output, terminal: true });
+  const closed=new AbortController(), questionSignal=AbortSignal.any([signal,closed.signal]);
+  const onClose=():void=>closed.abort(); prompt.once("close",onClose);
+  try {
+    for (;;) {
+      const answer = (await prompt.question("Install Tetragon? [y/n] ", { signal:questionSignal })).trim().toLocaleLowerCase("en-US");
+      if (answer === "yes" || answer === "y") return { kind: "choice", installTetragon: true };
+      if (answer === "no" || answer === "n") return { kind: "choice", installTetragon: false };
+      output.write("Please answer y/yes or n/no.\n");
+    }
+  } catch { return { kind: "cancel" }; } finally {
+    prompt.removeListener("close",onClose); prompt.close();
+    if(typeof wasRaw==="boolean") input.setRawMode?.(wasRaw);
+    if(wasPaused===true) input.pause(); else if(wasPaused===false) input.resume();
   }
 }
 
@@ -511,7 +538,7 @@ function needsRemoteCredential(command: string | undefined, foreground: Foregrou
   // binding authority and runs the folder's sync.
   if (command === "sync") return action === "recover";
   return command === "observe" || command === "share" || command === "capabilities" || command === "machines" || command === "agent-sessions" ||
-    command === "agent" || command === "executions" ||
+    command === "agent" || command === "executions" || command === "secrets" ||
     command === "records" || command === "authorizations" || command === "api-keys" ||
     command === "account" || command === "workspace" || command === "usage" ||
     command === "claude" || command === "codex" || command === "opencode" || foreground !== undefined;
@@ -588,18 +615,6 @@ function sameHostPath(left: string, right: string, platform: NodeJS.Platform): b
   return platform === "win32"
     ? canonicalLeft.toLocaleLowerCase("en-US") === canonicalRight.toLocaleLowerCase("en-US")
     : canonicalLeft === canonicalRight;
-}
-
-function managedWorkspaceScope(intent: ReconciledAgentJourneyIntent, machineId?: string): string {
-  if (machineId !== undefined) {
-    const digest = createHash("sha256").update(machineId, "utf8").digest("hex").slice(0, 16);
-    return `machine-${digest}`;
-  }
-  if (intent.machine.kind === "exact-name") {
-    const digest = createHash("sha256").update(intent.machine.name, "utf8").digest("hex").slice(0, 16);
-    return `machine-${digest}`;
-  }
-  return `${intent.agent}-${intent.machine.kind}`;
 }
 
 type BrowserLoginRemoteProbe = Readonly<{
@@ -792,9 +807,9 @@ interface RecordedSessionEnd {
 }
 
 /**
- * `terminal_owner_unrecoverable` names two facts the refusal cannot tell
- * apart; the session's own record can. Read it once, bounded, and use it only
- * when it says the process ended. A failed or slow read keeps the general text.
+ * A terminal refusal can race the selected process ending; the session's own
+ * record can distinguish it. Read once, bounded, and use it only when the
+ * selected AgentSession records an ended process. A failed or slow read keeps uncertainty.
  */
 async function recordedSessionEnd(
   client: CunaApiClient | undefined,
@@ -863,7 +878,7 @@ function writeTerminalSupervisorReadiness(
     stream.write(`${accent("◆ CUNA")}  Terminal connection not ready\n`);
     stream.write("Cuna could not verify this machine's terminal authority yet.\n");
   } else {
-    stream.write(`${accent("◆ CUNA")}  Machine terminal supervisor unavailable\n`);
+    stream.write(`${accent("◆ CUNA")}  This AgentSession's terminal control is unavailable\n`);
     stream.write("Cuna could not verify live terminal control for this AgentSession.\n");
   }
   // This error can follow a redeemed connection and an automatic retry. Its
@@ -1052,6 +1067,7 @@ function batchProgressLabel(parsed: ParsedInvocation): string | undefined {
         : action === "revoke"
           ? "Revoking API key"
           : "Reading your API keys";
+    case "secrets": return "Checking the named-secret operation";
     case "capabilities":
       return "Reading what this account can do";
     case "records":
@@ -1306,26 +1322,6 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
       : undefined;
     const remoteMenuLaunch = journeyIntent?.target === "reconcile" && journeyIntent.newSession &&
       dependencies.managedWorkspaceMachineId !== undefined && journeyIntent.localPath === undefined;
-    if (journeyIntent?.target === "reconcile" && journeyIntent.localPath === undefined && !remoteMenuLaunch) {
-      const homeDirectory = platformHomeDirectory(effectiveEnvironment, process.platform);
-      if (homeDirectory !== undefined && sameHostPath(process.cwd(), homeDirectory, process.platform)) {
-        // Keep HOME safe without forcing every machine to share one local
-        // binding. Exact machine selections get a stable private root; the
-        // automatic root remains stable so its committed binding can guide
-        // later automatic selection.
-        // Do not nest these roots under the former single-root `~/Cuna`.
-        // Workspace binding discovery intentionally walks ancestors, so a
-        // child below that already-bound root would inherit its record and
-        // then fail the child-root compare-and-swap.
-        const managedWorkspace = join(
-          homeDirectory,
-          "Cuna Workspaces",
-          managedWorkspaceScope(journeyIntent, dependencies.managedWorkspaceMachineId),
-        );
-        await mkdir(managedWorkspace, { recursive: true });
-        journeyIntent = Object.freeze({ ...journeyIntent, localPath: managedWorkspace });
-      }
-    }
 
     const foreground = foregroundSelection(parsed);
     if ((foreground !== undefined || journeyIntent?.target === "reconcile") &&
@@ -2064,6 +2060,15 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
         });
       }
       const journeyScope = Object.freeze({ userId: identity.id, workspaceId });
+      if (journeyIntent.localPath === undefined && !remoteMenuLaunch) {
+        const homeDirectory = platformHomeDirectory(effectiveEnvironment, process.platform);
+        if (homeDirectory !== undefined && sameHostPath(process.cwd(), homeDirectory, process.platform)) {
+          const localPath = await selectManagedWorkspaceRoot({ homeDirectory, baseUrl: config.baseUrl, profileId: config.profile,
+            userId: identity.id, workspaceId, intent: journeyIntent,
+            ...(dependencies.managedWorkspaceMachineId === undefined ? {} : { machineId: dependencies.managedWorkspaceMachineId }) });
+          journeyIntent = Object.freeze({ ...journeyIntent, localPath });
+        }
+      }
       if (remoteMenuLaunch && dependencies.managedWorkspaceMachineId !== undefined) {
         const picked = await pickProviderPreset(dependencies.signal);
         if (picked === undefined) {
@@ -2138,6 +2143,14 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
           requestedAgent: journeyAgent,
           confirmNewProviderLaunch: recordedLaunchConfirmation(journeyIntent.newSession, askCreateAnotherSession),
           providerLaunchState:{stateDirectory:platform.paths.stateDirectory,ownerId:identity.id,workspaceId},
+          machineCreateState:{stateDirectory:platform.paths.stateDirectory,apiOrigin:config.baseUrl,profileId:config.profile},
+          selectInstallTetragon: async signal => {
+            const resume = inlineJourneyProgress;
+            inlineJourneyProgress?.stop(); inlineJourneyProgress = undefined;
+            try { return await (dependencies.selectInstallTetragon ?? selectInstallTetragon)(signal); }
+            finally { if (resume !== undefined && streams.stderrIsTTY === true) inlineJourneyProgress = startInlineProgress(streams.stderr,
+              !booleanOption(parsed,"no-color") && !Object.hasOwn(effectiveEnvironment,"NO_COLOR"), journeyPhaseLabel("create-machine",journeyAgent)); }
+          },
           selectProviderPreset: async (signal, context) => {
             const preset = await pickProviderPreset(signal, context?.machineName);
             if (!preset) {
@@ -2519,12 +2532,15 @@ export async function runCli(argv: readonly string[], dependencies: RunCliDepend
     // that host classification is conservative; render the same plain-language
     // recovery instead.
     if (interactiveCloseUi && supervisorReadiness !== undefined) {
+      const recordedEnd = supervisorReadiness === "ended" || supervisorReadiness === "waiting"
+        ? await recordedSessionEnd(refusalReader, terminalSessionIds)
+        : undefined;
       writeTerminalSupervisorReadiness(
         streams.stderr,
         interactiveCloseColor && streams.stderrIsTTY === true,
-        supervisorReadiness,
+        recordedEnd === undefined ? supervisorReadiness : "ended",
         terminalSessionIds,
-        supervisorReadiness === "ended" ? await recordedSessionEnd(refusalReader, terminalSessionIds) : undefined,
+        recordedEnd,
       );
       // An unattested owner is a refusal of this attempt, not a network
       // condition: an automatic retry cannot change it, so the exit code must

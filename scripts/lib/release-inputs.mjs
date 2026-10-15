@@ -205,7 +205,8 @@ export const APPROVED_RELEASE_AUTHORITY = "CUNA_CANONICAL_PUBLIC_API_CONTRACT_AP
  * Two conditions, both necessary. The vendored producer content must be a
  * committed revision -- a working-tree delta is by definition not something the
  * producer approved -- and `packaging/contract-authority.json` must exist and
- * name the exact contract digest this candidate vendors.
+ * name the exact contract digest this candidate vendors. A valid declaration
+ * for another digest leaves this local candidate unresolved; it does not approve it.
  *
  * This is a claim, not a proof. The claim is checked against the producer
  * repository itself by scripts/verify-contract-authority.mjs during the
@@ -222,6 +223,11 @@ function loadContractReleaseAuthority(identity) {
     if (error?.code === "ENOENT") return UNRESOLVED_RELEASE_AUTHORITY;
     throw error;
   }
+  return deriveContractReleaseAuthority(identity, declaration);
+}
+
+export function deriveContractReleaseAuthority(identity, declaration) {
+  if (identity.producer_content_state !== "committed" || declaration === undefined) return UNRESOLVED_RELEASE_AUTHORITY;
   invariant(
     declaration?.schemaVersion === 1 && declaration.authority === "CUNA_CANONICAL_PUBLIC_API_CONTRACT" &&
       declaration.status === "APPROVED" && declaration.producerRepository === identity.producer_repository &&
@@ -229,11 +235,8 @@ function loadContractReleaseAuthority(identity) {
       SHA256.test(declaration.approvalAttestationSha256 ?? ""),
     "packaging/contract-authority.json is present but is not a valid canonical contract authority",
   );
-  invariant(
-    declaration.contractSha256 === identity.infra_openapi_canonical_sha256,
-    "packaging/contract-authority.json approves a different contract than this candidate vendors",
-  );
-  return APPROVED_RELEASE_AUTHORITY;
+  return declaration.contractSha256 === identity.infra_openapi_canonical_sha256
+    ? APPROVED_RELEASE_AUTHORITY : UNRESOLVED_RELEASE_AUTHORITY;
 }
 
 export const INFRA_OPENAPI_CONTRACT_IDENTITY = loadInfraOpenapiIdentity();

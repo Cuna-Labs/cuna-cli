@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import type { AgentAuthMode, AgentKind } from "../api/contracts.js";
 import { EXIT_CODES, CunaError } from "../core/errors.js";
 import { deriveMachineCreateIdentity } from "./derived-identity.js";
+import type { PreparedMachineCreate } from "./machine-create-options.js";
 import { isDefinitiveCreateRefusal } from "./definitive-refusal.js";
 import type { ReconciledAgentJourneyIntent } from "./intent.js";
 import {
@@ -92,6 +93,7 @@ export interface JourneyResourceLedger {
 }
 
 export interface AgentJourneyEffects {
+  prepareMachineCreate?(input: { readonly identity: import("./derived-identity.js").MachineCreateIdentityInput; readonly signal: AbortSignal }): Promise<PreparedMachineCreate>;
   inspectWorkspace(input: {
     readonly localPath: string;
     readonly syncMode: ReconciledAgentJourneyIntent["syncMode"];
@@ -113,6 +115,7 @@ export interface AgentJourneyEffects {
     readonly requestedAgent: AgentKind;
     readonly idempotencyKey: string;
     readonly requestId: string;
+    readonly installTetragon?: boolean;
     /**
      * Called immediately before the create request leaves this process, and
      * never if it does not. Only what may have been sent can be reconciled.
@@ -451,19 +454,26 @@ export async function orchestrateAgentJourney(input: {
 
     let machine: JourneyMachine;
     if (machinePlan.kind === "select" && machinePlan.target === "machine") {
+      if (input.intent.installTetragon !== undefined) throw new CunaError({ code: "cuna.journey.machine_create_option_requires_creation",
+        message: "--install-tetragon applies only to a new Machine. This journey selected an existing Machine.", exitCode: EXIT_CODES.usage,
+        hint: "Reuse this Machine without the option, or explicitly choose --new to create another Machine." });
       machine = { id: machinePlan.machineId, state: machinePlan.machine.state };
     } else if (machinePlan.kind === "create-required" && machinePlan.target === "machine") {
       // Derived, not minted. A re-run of this exact invocation re-derives this
       // identity and finds its own previous attempt; a random one is lost with
       // the process that held it, and the orphan it leaves behind bills with
       // nothing able to name it.
-      const createIdentity = deriveMachineCreateIdentity({
+      const identityInput = {
         userId: input.scope.userId,
         workspaceId: input.scope.workspaceId,
         canonicalLocalRoot: workspaceInspection.canonicalLocalRoot,
         agent: input.intent.agent,
         machine: input.intent.machine,
-      });
+        ...(input.intent.installTetragon === undefined ? {} : { installTetragon: input.intent.installTetragon }),
+      };
+      const createIdentity = input.effects.prepareMachineCreate === undefined ? deriveMachineCreateIdentity(identityInput)
+        : await boundary({ phase: "create-machine", signal, effects: input.effects, ledger,
+          action: () => input.effects.prepareMachineCreate!({ identity: identityInput, signal }) });
       const requestId = createIdentity.requestId;
       // Set when the request actually leaves this process. A capability check
       // or a declined confirmation fails BEFORE that, and reconciling then asks
@@ -478,6 +488,7 @@ export async function orchestrateAgentJourney(input: {
             requestedAgent: input.intent.agent,
             idempotencyKey: createIdentity.idempotencyKey,
             requestId,
+            ...(createIdentity.installTetragon === undefined ? {} : { installTetragon: createIdentity.installTetragon }),
             onDispatch: () => {
               // From here on an interrupted journey has a request identity to
               // reconcile against.
