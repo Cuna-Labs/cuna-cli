@@ -134,7 +134,10 @@ export class NamedSecretOverlay {
       if (this.#persistence === "IN_FLIGHT") this.#persistence = "UNKNOWN";
       this.#clear(); this.#state = "ERROR";
       this.#expired = true;
-      this.#feedback = this.#persistence === "UNKNOWN" ? "Connection changed · outcome unknown · Esc closes" : "Connection changed · no write sent · Esc closes";
+      this.#feedback = this.#persistence === "COMMITTED" ? "Connection changed · secret saved · Esc closes"
+        : this.#persistence === "REJECTED" ? "Connection changed · write rejected · nothing stored · Esc closes"
+        : this.#persistence === "UNKNOWN" ? "Connection changed · outcome unknown · Esc closes"
+        : "Connection changed · no write sent · Esc closes";
       this.changed();
     }
   }
@@ -257,6 +260,15 @@ export class NamedSecretOverlay {
     if (generation !== this.#generation || signal.aborted || this.#small) return;
     const admitted = this.authority();
     if (admitted === undefined || authorityKey(admitted) !== this.#authorityKey) { this.close(); return; }
+    // Input callbacks can detect invalid or unfinished framing while authority
+    // preparation awaits. Fence that state again before allocating a write identity.
+    if (this.#invalidContent || this.#unsupportedContent || this.#overflow || this.#pasting ||
+        this.#escape.length > 0 || this.#pasteEnd.length > 0 || this.#ignoredControl) {
+      if (this.#escape.length === 1 && this.#escape[0] === 27) { this.close(); return; }
+      this.#generation += 1; this.#abort.abort(); this.#clear(); this.#expired = true;
+      this.#state = "ERROR"; this.#feedback = "Input framing changed · no write sent · Esc closes";
+      this.changed(); return;
+    }
     const operation: { id: string; name: string; workspaceId: string; userId: string; secretId?: string } = { id: randomUUID(), name: this.#name, workspaceId, userId: admitted.userId };
     this.#operation = operation;
     const secret = SecretMaterial.fromBytes(this.#secret.subarray(0, this.#length));

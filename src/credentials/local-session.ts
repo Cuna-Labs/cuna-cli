@@ -42,15 +42,21 @@ const LOCK_RETRY_MS = 20;
  * a child-only environment instead of being interpolated into `-Command`.
  * This keeps the Restricted-policy-compatible invocation while avoiding
  * encoded/dynamically generated PowerShell source.
+ * Read the fresh Windows descriptor directly: the cmdlet provider/module
+ * startup adds work to every bounded helper. Access, owner and group match
+ * Get-Acl without -Audit; requesting a SACL would add a privilege requirement.
+ * The exact SID/DACL checks and the surrounding metadata fences are unchanged.
  */
 export const WINDOWS_ACL_COMMAND_PROGRAMS = Object.freeze({
   inspect: [
     "$ErrorActionPreference = 'Stop'",
-    "Import-Module 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1' -ErrorAction Stop",
+    "$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Group",
     "$path = $env:CUNA_SESSION_ACL_PATH_V1",
     "if ([string]::IsNullOrWhiteSpace($path)) { throw 'Cuna session ACL path is unavailable.' }",
     "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-    "$sddl = (Get-Acl -LiteralPath $path).Sddl",
+    "$attributes = [System.IO.File]::GetAttributes($path)",
+    "$security = if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) { [System.IO.Directory]::GetAccessControl($path) } else { [System.IO.File]::GetAccessControl($path) }",
+    "$sddl = $security.GetSecurityDescriptorSddlForm($sections)",
     "[Console]::WriteLine('CUNA_CURRENT_SID=' + $current)",
     "[Console]::WriteLine('CUNA_SDDL=' + $sddl)",
   ].join("; "),
@@ -59,7 +65,7 @@ export const WINDOWS_ACL_COMMAND_PROGRAMS = Object.freeze({
   // index as "not inspected", never as "safe", and falls back to `inspect`.
   inspectMany: [
     "$ErrorActionPreference = 'Stop'",
-    "Import-Module 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1' -ErrorAction Stop",
+    "$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Group",
     "$list = $env:CUNA_SESSION_ACL_PATHS_V1",
     "if ([string]::IsNullOrWhiteSpace($list)) { throw 'Cuna session ACL paths are unavailable.' }",
     "$paths = $list.Split([char]10)",
@@ -68,7 +74,11 @@ export const WINDOWS_ACL_COMMAND_PROGRAMS = Object.freeze({
     "for ($i = 0; $i -lt $paths.Length; $i++) {",
     "  $path = $paths[$i]",
     "  if ([string]::IsNullOrWhiteSpace($path)) { continue }",
-    "  try { $sddl = (Get-Acl -LiteralPath $path).Sddl } catch { continue }",
+    "  try {",
+    "    $attributes = [System.IO.File]::GetAttributes($path)",
+    "    $security = if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) { [System.IO.Directory]::GetAccessControl($path) } else { [System.IO.File]::GetAccessControl($path) }",
+    "    $sddl = $security.GetSecurityDescriptorSddlForm($sections)",
+    "  } catch { continue }",
     "  [Console]::WriteLine('CUNA_SDDL:' + $i + '=' + $sddl)",
     "}",
     // A caught per-path error leaves `$?` false, which `-Command` would report
@@ -77,11 +87,11 @@ export const WINDOWS_ACL_COMMAND_PROGRAMS = Object.freeze({
   ].join("; "),
   reconcileFile: [
     "$ErrorActionPreference = 'Stop'",
-    "Import-Module 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1' -ErrorAction Stop",
+    "$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Group",
     "$path = $env:CUNA_SESSION_ACL_PATH_V1",
     "if ([string]::IsNullOrWhiteSpace($path)) { throw 'Cuna session ACL path is unavailable.' }",
     "$beforeCurrent = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-    "$beforeSddl = (Get-Acl -LiteralPath $path).Sddl",
+    "$beforeSddl = ([System.IO.File]::GetAccessControl($path)).GetSecurityDescriptorSddlForm($sections)",
     "$beforeOwner = [regex]::Match($beforeSddl, '^O:(S-1-[0-9-]+)(?:G:|D:|S:)').Groups[1].Value",
     "if ([string]::IsNullOrWhiteSpace($beforeOwner) -or $beforeOwner -ne $beforeCurrent) { throw 'Cuna session ACL owner is not the current user.' }",
     "$daclStart = $beforeSddl.IndexOf('D:')",
@@ -99,11 +109,11 @@ export const WINDOWS_ACL_COMMAND_PROGRAMS = Object.freeze({
     "  $acl.SetAccessRuleProtection($true, $false)",
     "  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]::None, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)",
     "  $acl.AddAccessRule($rule)",
-    "  Set-Acl -LiteralPath $path -AclObject $acl",
+    "  [System.IO.File]::SetAccessControl($path, $acl)",
     "  $repaired = 1",
     "}",
     "$afterCurrent = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-    "$afterSddl = (Get-Acl -LiteralPath $path).Sddl",
+    "$afterSddl = ([System.IO.File]::GetAccessControl($path)).GetSecurityDescriptorSddlForm($sections)",
     "[Console]::WriteLine('CUNA_BEFORE_CURRENT_SID=' + $beforeCurrent)",
     "[Console]::WriteLine('CUNA_BEFORE_SDDL=' + $beforeSddl)",
     "[Console]::WriteLine('CUNA_AFTER_CURRENT_SID=' + $afterCurrent)",
@@ -112,11 +122,11 @@ export const WINDOWS_ACL_COMMAND_PROGRAMS = Object.freeze({
   ].join("; "),
   reconcileDirectory: [
     "$ErrorActionPreference = 'Stop'",
-    "Import-Module 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1' -ErrorAction Stop",
+    "$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Group",
     "$path = $env:CUNA_SESSION_ACL_PATH_V1",
     "if ([string]::IsNullOrWhiteSpace($path)) { throw 'Cuna session ACL path is unavailable.' }",
     "$beforeCurrent = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-    "$beforeSddl = (Get-Acl -LiteralPath $path).Sddl",
+    "$beforeSddl = ([System.IO.Directory]::GetAccessControl($path)).GetSecurityDescriptorSddlForm($sections)",
     "$beforeOwner = [regex]::Match($beforeSddl, '^O:(S-1-[0-9-]+)(?:G:|D:|S:)').Groups[1].Value",
     "if ([string]::IsNullOrWhiteSpace($beforeOwner) -or $beforeOwner -ne $beforeCurrent) { throw 'Cuna session ACL owner is not the current user.' }",
     "$daclStart = $beforeSddl.IndexOf('D:')",
@@ -134,11 +144,11 @@ export const WINDOWS_ACL_COMMAND_PROGRAMS = Object.freeze({
     "  $acl.SetAccessRuleProtection($true, $false)",
     "  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]::ObjectInherit -bor [System.Security.AccessControl.InheritanceFlags]::ContainerInherit, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)",
     "  $acl.AddAccessRule($rule)",
-    "  Set-Acl -LiteralPath $path -AclObject $acl",
+    "  [System.IO.Directory]::SetAccessControl($path, $acl)",
     "  $repaired = 1",
     "}",
     "$afterCurrent = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-    "$afterSddl = (Get-Acl -LiteralPath $path).Sddl",
+    "$afterSddl = ([System.IO.Directory]::GetAccessControl($path)).GetSecurityDescriptorSddlForm($sections)",
     "[Console]::WriteLine('CUNA_BEFORE_CURRENT_SID=' + $beforeCurrent)",
     "[Console]::WriteLine('CUNA_BEFORE_SDDL=' + $beforeSddl)",
     "[Console]::WriteLine('CUNA_AFTER_CURRENT_SID=' + $afterCurrent)",

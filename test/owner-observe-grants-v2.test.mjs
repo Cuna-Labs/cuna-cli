@@ -195,6 +195,60 @@ async function harness(handler,options={},reuse){
 }
 const route=r=>r.path.split('/').at(-1);
 
+test('closing during the initial local read restores the TTY before draining that read',async()=>{
+ const context=await newStore();let release,enteredResolve,finished=false;
+ const blocked=new Promise(resolve=>{release=resolve;}),entered=new Promise(resolve=>{enteredResolve=resolve;});
+ const store={...context.store,async list(signal){enteredResolve();await blocked;return context.store.list(signal);}};
+ const h=await harness(()=>{throw Error('cancelled startup must not contact Cuna');},{},{...context,store});
+ try{
+  await entered;void h.done.then(()=>{finished=true;});h.key('\x03');
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.restored,1,'initial local IO must not retain terminal ownership after close');
+  assert.equal(finished,false,'startup still owns its admitted local work');
+ }finally{release();await h.done;}
+ assert.equal(finished,true);assert.equal(h.requests.length,0);
+});
+
+test('closing restores the terminal promptly but owns a pending durable reservation until it finishes',async()=>{
+ const context=await newStore();let release,enteredResolve;
+ const blocked=new Promise(resolve=>{release=resolve;}),entered=new Promise(resolve=>{enteredResolve=resolve;});
+ const base=context.platform;
+ const platform={...base,async writeSafeConfig(...args){enteredResolve();await blocked;return base.writeSafeConfig(...args);}};
+ const store=ownerGrantOperationStore(platform,{baseUrl:'https://api.getcuna.com',profile:'default',ownerPrincipalId:owner,projectId:project});
+ let effects=0,finished=false;
+ const h=await harness(r=>{if(route(r)==='inspect')return active;if(route(r)==='revoke'){r.signal.throwIfAborted();effects++;return revoking;}throw Error(r.path);},{initialGrantId:active.grant_id},{...context,platform,store});
+ try{
+  await h.wait(/x revokes/u);h.key('x');await entered;
+  void h.done.then(()=>{finished=true;});h.key('\x03');
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.restored,1,'TTY ownership is released without waiting for disk completion');
+  assert.equal(finished,false,'done must not permit teardown while its admitted local write is held');
+ }finally{release();await h.done;}
+ assert.equal(effects,0,'cancellation fences the remote effect after the reservation finishes');
+ assert.equal(finished,true);
+ const records=await store.list();assert.equal(records.length,1,'the conservative unknown identity survives close');
+});
+
+test('closing an already dispatched change aborts it and drains its outcome work without erasing UNKNOWN identity',async()=>{
+ let enteredResolve,release,rejected=false,finished=false;
+ const entered=new Promise(resolve=>{enteredResolve=resolve;}),cleanup=new Promise(resolve=>{release=resolve;});
+ const h=await harness(async r=>{
+  if(route(r)==='inspect')return active;
+  if(route(r)==='revoke'){
+   enteredResolve();await new Promise(resolve=>{if(r.signal.aborted)resolve();else r.signal.addEventListener('abort',resolve,{once:true});});
+   await cleanup;rejected=true;throw new CunaError({code:'cuna.network.cancelled',message:'synthetic cancelled outcome',exitCode:EXIT_CODES.network});
+  }throw Error(r.path);
+ },{initialGrantId:active.grant_id});
+ try{
+  await h.wait(/x revokes/u);h.key('x');await entered;
+  void h.done.then(()=>{finished=true;});h.key('\x03');await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.restored,1);assert.equal(finished,false,'the admitted request still owns outcome work');
+ }finally{release();await h.done;}
+ assert.equal(rejected,true);assert.equal(finished,true);
+ const records=await h.records();assert.equal(records.length,1);assert.equal(records[0].kind,'revoke');
+ assert.equal(h.requests.filter(r=>route(r)==='revoke').length,1,'close never replays the mutation');
+});
+
 test('owner flow: session -> distinct member -> duration -> active grant -> revoke pending -> inspect effective; keys never reach the wire',async()=>{
  let state=active;const h=await harness(r=>{if(route(r)==='observers')return memberPage;if(route(r)==='observe-grants')return active;if(route(r)==='revoke'){state=revoking;return revoking;}if(route(r)==='inspect'){const out=state;if(state===revoking)state=revoked;return out;}throw Error(r.path);});
  await h.wait(/Share a session - read-only observation/u);assert.match(h.last(),/> box \/ claude-live/u);assert.doesNotMatch(h.last(),/elsewhere/u,'sessions of another Project are not offered');

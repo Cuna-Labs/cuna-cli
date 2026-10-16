@@ -3722,6 +3722,30 @@ test("DISCRIMINATING CONTROL: a selection scrolled out of view does not take Ctr
   } finally { await coordinator.stop(); }
 });
 
+test("attached help makes Ctrl+Q discoverable at ordinary widths only when secret collection is available", async () => {
+  let serviceCalls=0;
+  const unexpected=async()=>{serviceCalls++;throw new Error("help must not contact the named-secret service");};
+  for(const columns of [80,120]) {
+    const {coordinator,callbacks,host,intents,calls}=harness({host:Object.assign(new FakeHost(),{columns}),coordinatorOptions:{namedSecrets:{prepare:unexpected,create:unexpected,read:unexpected}}});
+    try {
+      await coordinator.start(intents.slice(0,1));host.emitInput(Uint8Array.of(0x1d,0x3f));
+      await waitUntil(()=>decoder.decode(host.writes.at(-1)).includes("Keys: "),"writer help opens");
+      const writer=await visibleHostText(host);assert.match(writer,/Keys: Ctrl\+C to agent \| Ctrl\+Q secrets/u);
+      callbacks.onTerminalState({...snapshot(intents[0]),accessMode:"observer",writerEpoch:2});
+      await waitUntil(()=>decoder.decode(host.writes.at(-1)).includes("Keys: Ctrl+C detach"),"observer help updates");
+      assert.doesNotMatch(await visibleHostText(host),/Ctrl\+Q secrets/u);
+      assert.equal(calls.input.length,0);
+    } finally {await coordinator.stop();}
+  }
+  const {coordinator,host,intents}=harness();
+  try {
+    await coordinator.start(intents.slice(0,1));host.emitInput(Uint8Array.of(0x1d,0x3f));
+    await waitUntil(()=>decoder.decode(host.writes.at(-1)).includes("Keys: "),"help without a collection service opens");
+    assert.doesNotMatch(await visibleHostText(host),/Ctrl\+Q secrets/u);
+  } finally {await coordinator.stop();}
+  assert.equal(serviceCalls,0);
+});
+
 test("help names Ctrl+C by seat: to the agent for a writer, detach only for an observer", async () => {
   const { coordinator, callbacks, host, intents } = harness({ host: Object.assign(new FakeHost(), { columns: 400 }) });
   try {

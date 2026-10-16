@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { createOwnedTempDirectory, removeOwnedTempDirectory } from "../scripts/lib/owned-temp.mjs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from "node:fs/promises";
+import { createOwnedTempDirectory, removeOwnedTempDirectory, withOwnedTempDirectory } from "../scripts/lib/owned-temp.mjs";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -38,14 +38,18 @@ test("Windows ACL commands are static and isolate case-insensitive child environ
       assert.match(program, /\$env:CUNA_SESSION_ACL_PATH_V1/u);
       assert.doesNotMatch(program, /CUNA_SESSION_ACL_PATHS_V1/u);
     }
-    assert.match(program, /Import-Module 'C:\\Windows\\System32\\WindowsPowerShell\\v1\.0\\Modules\\Microsoft\.PowerShell\.Security\\Microsoft\.PowerShell\.Security\.psd1'/u);
+    assert.doesNotMatch(program, /Import-Module|Get-Acl|Set-Acl|\.Sddl\b/u, "fresh OS descriptors do not require the cmdlet provider");
+    assert.match(program, /GetAccessControl\(\$path\)/u);
+    assert.match(program, /GetSecurityDescriptorSddlForm\(\$sections\)/u);
+    assert.match(program, /AccessControlSections\]::Access -bor .*AccessControlSections\]::Owner -bor .*AccessControlSections\]::Group/u);
+    assert.doesNotMatch(program, /AccessControlSections\]::(?:All|Audit)/u, "no privileged SACL read is introduced");
     assert.doesNotMatch(program, /(?:FromBase64String|EncodedCommand|Invoke-Expression|\bIEX\b|ExecutionPolicy)/iu);
     assert.doesNotMatch(program, /(?:^|\s)-File(?:\s|$)/u);
   }
   assert.doesNotMatch(WINDOWS_ACL_COMMAND_PROGRAMS.inspect, /CUNA_SESSION_ACL_SID_V1/u);
   assert.doesNotMatch(WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany, /CUNA_SESSION_ACL_SID_V1/u);
   assert.match(WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany, /CUNA_SDDL:' \+ \$i \+ '='/u, "batched output is indexed per path");
-  assert.doesNotMatch(WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany, /Set-Acl/u, "inspection never mutates");
+  assert.doesNotMatch(WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany, /SetAccessControl/u, "inspection never mutates");
   for (const program of [WINDOWS_ACL_COMMAND_PROGRAMS.reconcileFile, WINDOWS_ACL_COMMAND_PROGRAMS.reconcileDirectory]) {
     assert.doesNotMatch(program, /CUNA_SESSION_ACL_SID_V1/u);
     assert.match(program, /WindowsIdentity\]::GetCurrent\(\)\.User\.Value/u);
@@ -53,7 +57,7 @@ test("Windows ACL commands are static and isolate case-insensitive child environ
     assert.match(program, /\.SetOwner\(\$sid\)/u);
     assert.match(program, /\.SetAccessRuleProtection\(\$true, \$false\)/u);
     assert.match(program, /FileSystemRights\]::FullControl/u);
-    assert.match(program, /Set-Acl -LiteralPath \$path/u);
+    assert.match(program, /SetAccessControl\(\$path, \$acl\)/u);
     assert.match(program, /CUNA_BEFORE_SDDL/u);
     assert.match(program, /CUNA_AFTER_SDDL/u);
   }
@@ -145,6 +149,120 @@ test("the real batched inspection observes several paths in one spawn and skips 
     assert.equal(results[1].daclOwnerOnly, false, "an inherited default ACL is not owner-only");
     assert.equal(results[2], undefined, "an absent path is reported as not inspected, never as safe");
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("native file and directory descriptors agree with the independent cmdlet before and after reconciliation", { skip: process.platform !== "win32" }, async () => {
+  const root = await createOwnedTempDirectory("cuna-local-session-native-descriptors-");
+  const file = path.join(root, "public-é ; $literal.key");
+  const absent = path.join(root, "absent.json");
+  const payload = Buffer.from("disposable nonsecret descriptor fixture");
+  const requests = [{ path: root, directory: true }, { path: file, directory: false }, { path: absent, directory: false }];
+  // This test-only oracle deliberately retains the previous cmdlet authority.
+  // Paths remain data; production does not pay for this second observation.
+  const oracleProgram = [
+    "$ErrorActionPreference = 'Stop'",
+    "Import-Module 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1' -ErrorAction Stop",
+    "$paths = $env:CUNA_SESSION_ACL_PATHS_V1.Split([char]10)",
+    "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "[Console]::WriteLine('CUNA_CURRENT_SID=' + $current)",
+    "for ($i = 0; $i -lt $paths.Length; $i++) {",
+    "  try { $sddl = (Get-Acl -LiteralPath $paths[$i]).Sddl } catch { continue }",
+    "  [Console]::WriteLine('CUNA_SDDL:' + $i + '=' + $sddl)",
+    "}",
+    "exit 0",
+  ].join("; ");
+  const observe = async (program) => {
+    let stdout;
+    try {
+      ({ stdout } = await execFileAsync("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", program], {
+        windowsHide: true, timeout: 15_000, maxBuffer: 64 * 1024, encoding: "utf8",
+        env: isolateWindowsAclBatchChildEnvironment(process.env, requests.map((request) => request.path)),
+      }));
+    } catch {
+      // Child errors can retain stdout descriptors and command/path data.
+      // The test only needs a closed refusal; never attach that raw cause.
+      throw new Error("Native ACL descriptor comparison did not complete.");
+    }
+    const inspections = parseWindowsAclBatchInspection(stdout, requests.map((request) => request.directory));
+    const sections = requests.map((_, index) => {
+      const sddl = new RegExp(`^CUNA_SDDL:${index}=(.+)$`, "mu").exec(stdout)?.[1];
+      if (sddl === undefined) return undefined;
+      const match = /^O:(.*?)G:(.*?)D:(.*?)(?:S:.*)?$/u.exec(sddl);
+      assert.equal(match !== null, true, "the native observation contains owner, group and access sections");
+      return { owner: match[1], group: match[2], access: match[3] };
+    });
+    return { inspections, sections };
+  };
+  const assertEquivalent = (native, oracle) => {
+    assert.equal(JSON.stringify(native.inspections) === JSON.stringify(oracle.inspections), true, "fresh SID and strict verdict match without printing identities");
+    for (let index = 0; index < requests.length; index += 1) {
+      for (const section of ["owner", "group", "access"]) {
+        assert.equal(native.sections[index]?.[section] === oracle.sections[index]?.[section], true, `independently read ${section} section matches at index ${index}`);
+      }
+    }
+  };
+  try {
+    await writeFile(file, payload, { flag: "wx" });
+    const before = await observe(WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany);
+    assertEquivalent(before, await observe(oracleProgram));
+    assert.equal(before.inspections[1].daclOwnerOnly, false, "the inherited default file ACL is not accepted as exact owner-only");
+    assert.equal(before.inspections[2], undefined, "absence is not an owner-only observation");
+    for (const request of requests.slice(0, 2)) {
+      let result;
+      try { result = await WINDOWS_ACL_AUTHORITY.reconcileNewOwnerOnly(request.path, request.directory); }
+      catch { throw new Error("Native ACL reconciliation did not complete."); }
+      assert.equal(result.before.ownerSid === result.before.currentSid, true);
+      assert.equal(result.after.currentSid === result.before.currentSid, true);
+      assert.equal(result.after.ownerSid === result.after.currentSid, true);
+      assert.equal(result.after.daclOwnerOnly, true);
+      assert.equal(result.repaired, !result.before.daclOwnerOnly);
+    }
+    const after = await observe(WINDOWS_ACL_COMMAND_PROGRAMS.inspectMany);
+    assertEquivalent(after, await observe(oracleProgram));
+    assert.equal(after.inspections[0].daclOwnerOnly, true, "the directory retains the exact inheritable owner-only ACE");
+    assert.equal(after.inspections[1].daclOwnerOnly, true, "the file retains the exact non-inheritable owner-only ACE");
+    assert.equal(after.inspections[2], undefined);
+    for (const index of [0, 1]) {
+      assert.equal(after.sections[index].group === before.sections[index].group, true, `reconciliation preserves the existing group at index ${index}`);
+    }
+    let absentRefused = false;
+    try { await WINDOWS_ACL_AUTHORITY.inspectOwnerOnly(absent, false); } catch { absentRefused = true; }
+    assert.equal(absentRefused, true, "a missing single-path observation must reject");
+    assert.equal((await readFile(file)).equals(payload), true, "ACL observations and reconciliation never rewrite fixture bytes");
+  } finally { await removeOwnedTempDirectory(root); }
+});
+
+test("the real backend refuses an owned junction without touching its target", { skip: process.platform !== "win32" }, async () => {
+  const calls = { single: 0, batch: 0, reconcile: 0 };
+  const countedNativeAuthority = {
+    inspectOwnerOnly: async (...args) => { calls.single += 1; return await WINDOWS_ACL_AUTHORITY.inspectOwnerOnly(...args); },
+    inspectManyOwnerOnly: async (...args) => { calls.batch += 1; return await WINDOWS_ACL_AUTHORITY.inspectManyOwnerOnly(...args); },
+    reconcileNewOwnerOnly: async (...args) => { calls.reconcile += 1; return await WINDOWS_ACL_AUTHORITY.reconcileNewOwnerOnly(...args); },
+  };
+  let junction;
+  await withOwnedTempDirectory("cuna-local-session-native-junction-", async (root) => {
+    const paths = localEncryptedSessionPaths(root, "junction");
+    junction = path.dirname(paths.sessionFile);
+    const target = path.join(root, "owned-target");
+    const sentinel = path.join(target, "public-sentinel");
+    await mkdir(target);
+    await writeFile(sentinel, "unchanged", { flag: "wx" });
+    const beforeEntries = await readdir(target);
+    await symlink(target, path.dirname(paths.sessionFile), "junction");
+    const backend = new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl: countedNativeAuthority });
+    assert.equal((await backend.probe()).status, "unavailable");
+    assert.deepEqual(calls, { single: 0, batch: 0, reconcile: 0 }, "the metadata boundary rejects the junction before any native ACL read or mutation");
+    assert.equal(JSON.stringify(await readdir(target)) === JSON.stringify(beforeEntries), true, "the owned target directory entries are unchanged");
+    assert.equal(await readFile(sentinel, "utf8"), "unchanged");
+    await assert.rejects(stat(paths.keyFile), (error) => error?.code === "ENOENT");
+    await assert.rejects(stat(paths.sessionFile), (error) => error?.code === "ENOENT");
+  }, {
+    // The owned helper preserves both an assertion failure and cleanup errors.
+    beforeRemove: async () => {
+      if (junction === undefined) return;
+      try { await unlink(junction); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    },
+  });
 });
 
 function countingAcl(compliant, counters) {
@@ -694,6 +812,35 @@ test("Windows ACL reconciliation timeout fails closed before any encrypted sessi
     await assert.rejects(stat(paths.keyFile), (error) => error?.code === "ENOENT");
     await assert.rejects(stat(paths.sessionFile), (error) => error?.code === "ENOENT");
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a denied Windows ACL observation preserves the encrypted pair and cannot become an absent or repaired session", { skip: process.platform !== "win32" }, async () => {
+  const root = await createOwnedTempDirectory("cuna-local-session-denied-observation-");
+  const paths = localEncryptedSessionPaths(root, "denied");
+  const currentSid = "S-1-5-21-123-456-789-1001";
+  const inspection = { currentSid, ownerSid: currentSid, daclOwnerOnly: true };
+  const safeAcl = {
+    inspectOwnerOnly: async () => inspection,
+    reconcileNewOwnerOnly: async () => ({ before: inspection, after: inspection, repaired: false }),
+  };
+  let batches = 0;
+  let singles = 0;
+  let repairs = 0;
+  const deniedAcl = {
+    inspectManyOwnerOnly: async () => { batches += 1; throw Object.assign(new Error("disposable ACL denial"), { code: "EACCES" }); },
+    inspectOwnerOnly: async () => { singles += 1; throw new Error("unexpected fallback"); },
+    reconcileNewOwnerOnly: async () => { repairs += 1; throw new Error("unexpected repair"); },
+  };
+  try {
+    const writer = new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl: safeAcl });
+    await writer.replace("ignored", Buffer.from("disposable nonsecret payload"));
+    const before = await Promise.all([readFile(paths.keyFile), readFile(paths.sessionFile)]);
+    const reader = new LocalEncryptedSessionBackend({ ...paths, platform: process.platform, windowsAcl: deniedAcl });
+    await assert.rejects(reader.read("ignored"), (error) => error?.code === "credential_backend_unverified" && error.retryable === false);
+    assert.deepEqual({ batches, singles, repairs }, { batches: 1, singles: 0, repairs: 0 });
+    assert.deepEqual(await Promise.all([readFile(paths.keyFile), readFile(paths.sessionFile)]), before);
+    assert.deepEqual(Buffer.from(await writer.read("ignored")), Buffer.from("disposable nonsecret payload"));
+  } finally { await removeOwnedTempDirectory(root); }
 });
 
 test("Windows ACL verification timeout is a retryable backend failure and preserves an existing encrypted session", { skip: process.platform !== "win32" }, async () => {

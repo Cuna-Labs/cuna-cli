@@ -6,18 +6,74 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Named-secret validation now rechecks invalid or incomplete terminal input after
+  asynchronous authority preparation, before allocating an operation or sending
+  a write. Detected framing changes refuse the unsent value and clear the input;
+  valid input and repeated Enter still produce one write.
+- Losing terminal authority after a named-secret receipt now keeps the feedback
+  faithful to the known result: saved, rejected or unknown. It no longer says
+  “no write sent” after a confirmed or rejected write.
+
+- Owner-grant screens restore terminal input promptly when cancelled and wait for
+  admitted local journal work before completing, preserving unknown operation IDs.
+- Long masked passwords show a local character count when the visible stars fill
+  the field. Attached-terminal help now lists Ctrl+Q when saving is available.
+- Windows credential ACL checks use native descriptor APIs without loading the
+  PowerShell security provider. Owner, group, access checks and existing deadlines
+  are preserved.
+
+These corrections are in source and are **not included in npm 0.1.8**.
+
+## [0.1.8] - 2026-10-15
+
 ### Added
 
-- **Typed characters appear at once in an attached cloud terminal.** In the
-  rich terminal, a printable character typed at the input point is painted
-  immediately, dim and underlined, and replaced by the remote's own echo when it
-  arrives. A different echo, a key the screen cannot predict (Enter, Backspace,
-  arrows, a paste, a Ctrl+] chord), or no echo within 1 s repaints the true
-  screen. Guesses are shown only while the measured echo is slower than 60 ms
-  and the remote echoed the last three guesses exactly, never on a line that
-  asks for a password, token or key, and never to an observer. The local copy
-  of the remote screen never contains a guess. `CUNA_PREDICTIVE_ECHO=off`
-  disables it; `on` drops only the 60 ms threshold.
+- **Save a named secret from an attached terminal.** Ctrl+Q is one simultaneous
+  chord opening an orange local popout with Secret Name and Password. Navigate
+  with ↑/↓ or Tab/Shift+Tab, see one `*` per password character, and click the
+  fields or local show/hide control. Saving does not grant an agent access.
+  Confirmation requires operation GET readback; unknown outcomes retain their
+  original operation ID for read-only recovery. See the
+  [guide and known limitations](docs/named-secrets.md).
+- **Choose Tetragon before creating a Machine.** On servers advertising support,
+  the interactive journey asks `Install Tetragon? [y/n]`. Answers accept
+  y/yes/n/no regardless of case or surrounding whitespace. The strict
+  `--install-tetragon true|false` flag is available for automatic journeys and
+  `machines create`; it applies only to creation. The mandatory sandbox remains
+  enabled, and this option makes no startup-time guarantee.
+- Home-directory local journeys use account-scoped managed folders and reuse
+  legacy folders only with matching ownership. Explicit paths keep their
+  identity; `--no-sync` still requires a previously committed remote binding.
+
+### Known issues
+
+- In the named-secret popout, input arriving while “Checking vault authority…”
+  is pending can invalidate framing or request cancellation without reliably
+  preventing the pending write. Finish the paste before pressing Enter and do
+  not type or paste during validation. If cancellation races validation, check
+  the original operation's result before attempting another save.
+- After a confirmed or rejected write, a connection or writer change can
+  incorrectly display “no write sent”. Use the original operation GET if its ID
+  was printed; otherwise check your Cuna vault before trying another save.
+  Closing the popout does not roll back a save.
+
+## Earlier source notes (release attribution unverified)
+
+The following behavior was documented before 0.1.8. Its original release version
+was not recorded here; it is not announced as new in 0.1.8.
+
+- **Local predictive echo in an attached cloud terminal.** In the rich terminal,
+  a printable character typed at the input point is painted immediately, dim and
+  underlined, and replaced by the remote's own echo when it arrives. A different
+  echo, a key the screen cannot predict (Enter, Backspace, arrows, a paste, a
+  Ctrl+] chord), or no echo within 1 s repaints the true screen. Guesses are shown
+  only while the measured echo is slower than 60 ms and the remote echoed the
+  last three guesses exactly, never on a line that asks for a password, token or
+  key, and never to an observer. The local copy of the remote screen never
+  contains a guess. `CUNA_PREDICTIVE_ECHO=off` disables it; `on` drops only the
+  60 ms threshold.
 
 ## [0.1.1] - 2026-09-22
 

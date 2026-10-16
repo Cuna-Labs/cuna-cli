@@ -847,9 +847,9 @@ export function createCunaApiClient(transport: HttpTransport): CunaApiClient {
       assertCanonicalUuid(input.projectId, "project ID");
       assertCanonicalUuid(input.machineId, "machine ID");
       if (input.after !== undefined) assertCanonicalUuid(input.after, "execution workspace cursor");
-      const query = new URLSearchParams({ workspace_id: input.workspaceId, project_id: input.projectId, machine_id: input.machineId });
-      if (input.after !== undefined) query.set("after", input.after);
-      const request: HttpRequest = { method: "GET", path: `/v1/execution-workspaces?${query}`, ...(signal === undefined ? {} : { signal }) };
+      const query = { workspace_id: input.workspaceId, project_id: input.projectId, machine_id: input.machineId,
+        ...(input.after === undefined ? {} : { after: input.after }) };
+      const request: HttpRequest = { method: "GET", path: "/v1/execution-workspaces", query, ...(signal === undefined ? {} : { signal }) };
       const page = await fetchDecoded(request, decodeExecutionWorkspacePage);
       if (page.items.some(row => row.workspaceId !== input.workspaceId || row.projectId !== input.projectId || row.machineId !== input.machineId ||
         (input.after !== undefined && row.executionWorkspaceId <= input.after))) {

@@ -3383,6 +3383,7 @@ export class ForegroundTerminalCoordinator {
                 ? { notice: scrolledBackNotice(this.#tabs.get(activeTabId)?.viewport.scrollOffset ?? 0) }
               : this.#helpVisible
                 ? { notice: "Keys: " + (this.#tabs.get(activeTabId)?.snapshot.accessMode === "writer" ? "Ctrl+C to agent | " : "Ctrl+C detach | ") +
+                    (this.#secretOverlay !== undefined && this.#tabs.get(activeTabId)?.snapshot.accessMode === "writer" ? "Ctrl+Q secrets | " : "") +
                     (remoteMouse ? "Shift+drag select | " : "Drag select, Ctrl+C copy | Ctrl+click open link | ") + (process.platform === "win32" ? "Ctrl+Shift+V paste | " : "") + "Wheel scroll | Ctrl+S keep active | Ctrl+] c/s/q remote | " + (this.#rosterActive() ? "1-9 or click switch session" : "1-4 tab") + " | n next | r retry" +
                     (this.#tabs.get(activeTabId)?.snapshot.accessMode === "observer" &&
                      writerCapabilityRefusal(this.#tabs.get(activeTabId)!.snapshot) === undefined

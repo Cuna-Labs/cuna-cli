@@ -17,6 +17,29 @@ function fixture(overrides = {}, options = {}) {
   const input = (text) => gate.process(typeof text === "string" ? encoder.encode(text) : text, () => overlay.active, () => overlay.open(), (bytes) => overlay.input(bytes), (bytes) => remote.push(...bytes));
   return { overlay, input, calls, remote, authority(next) { current = next; overlay.authorityChanged(); } };
 }
+
+test("authority loss preserves known write truth and does not relabel a dispatched operation as unsent", async (t) => {
+  for (const outcome of ["COMMITTED", "REJECTED", "UNKNOWN", "NOT_SENT"]) await t.test(outcome, async () => {
+    const f = fixture(outcome === "REJECTED" ? { async create(op) {
+      f.calls.create.push({ op }); return { operation_id: op, state: "rejected", secret_id: null, name: null, workspace_id: null, committed_at: null, reason: "named_secret_name_exists" };
+    } } : outcome === "UNKNOWN" ? { async create(op) { f.calls.create.push({ op }); throw new Error("synthetic dispatch ambiguity"); }, async read() { throw new NamedSecretRequestError(404); } } : {});
+    try {
+      f.input("\x11Database\tLOCAL_FIXTURE");
+      if (outcome !== "NOT_SENT") { f.input("\r"); await until(() => f.overlay.persistence === outcome && f.overlay.state !== "SUBMITTING"); }
+      const op = f.calls.create[0]?.op;
+      f.authority(undefined);
+      assert.equal(f.overlay.persistence, outcome);
+      assert.equal(f.overlay.view.masked, ""); assert.deepEqual(f.remote, []);
+      assert.equal(f.calls.create.length, outcome === "NOT_SENT" ? 0 : 1);
+      if (outcome === "COMMITTED") assert.match(f.overlay.view.feedback, /saved/i);
+      else if (outcome === "REJECTED") assert.match(f.overlay.view.feedback, /rejected/i);
+      else if (outcome === "UNKNOWN") { assert.match(f.overlay.view.feedback, /outcome unknown/); assert.ok(f.overlay.recoveryNotice.includes(op)); }
+      else assert.match(f.overlay.view.feedback, /no write sent/);
+      if (outcome !== "NOT_SENT") assert.doesNotMatch(f.overlay.view.feedback, /no write sent/);
+      f.input("\r\r"); assert.equal(f.calls.create.length, outcome === "NOT_SENT" ? 0 : 1);
+    } finally { f.overlay.dispose(); }
+  });
+});
 test("vertical arrows move between fields without wrapping or leaking control bytes", () => {
   for (const [up, down] of [["\x1b[A", "\x1b[B"], ["\x1bOA", "\x1bOB"]]) {
     const f = fixture(); f.input("\x11Database");
@@ -149,6 +172,52 @@ test("cancel during authority preflight dispatches nothing", async () => {
   let release; const f = fixture({ prepare: () => new Promise((resolve) => { release = resolve; }) });
   f.input("\x11Database\tPRIVATE\r"); assert.equal(f.overlay.state, "VALIDATING"); f.input("\x1b"); await until(() => !f.overlay.active); release(id("6"));
   await new Promise((resolve) => setImmediate(resolve)); assert.equal(f.calls.create.length, 0);
+});
+
+test("framing invalidated or left pending during authority preparation cannot dispatch", async (t) => {
+  const start = "\x1b[200~", end = "\x1b[201~";
+  for (const [name, callbacks] of [
+    ["unexpected END in Enter callback", ["\rIGNORED" + end]],
+    ["unexpected END split across callbacks", ["\rIGNORED\x1b[20", "1~"]],
+    ["partial START", ["\r\x1b[20"]],
+    ["new paste still active", ["\r" + start]],
+    ["partial END inside new paste", ["\r" + start + "IGNORED\x1b[201"]],
+    ["bare Escape before authority resolves", ["\r\x1b"]],
+    ["unfinished ignored control", ["\r\x1b[?"]],
+  ]) {
+    await t.test(name, async () => {
+      let release;
+      const f = fixture({ prepare: () => new Promise((resolve) => { release = resolve; }) });
+      try {
+        f.input("\x11Database\tDISPOSABLE_VALIDATION_VALUE");
+        for (const callback of callbacks) f.input(callback);
+        assert.equal(f.overlay.state, "VALIDATING");
+        assert.equal(f.calls.create.length, 0);
+        release(id("6")); await until(() => f.overlay.state !== "VALIDATING");
+        assert.equal(f.calls.create.length, 0, "invalid or unresolved local framing must fence the final POST");
+        assert.equal(f.overlay.persistence, "NOT_SENT");
+        assert.equal(f.overlay.recoveryNotice, undefined, "no operation identity was dispatched");
+        assert.equal(f.overlay.view?.masked ?? "", "");
+        assert.equal(f.overlay.view?.revealedValue, undefined);
+        assert.deepEqual(f.remote, []);
+        f.input("\r\r"); await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(f.calls.create.length, 0, "the cleared value cannot silently retry");
+      } finally { f.overlay.dispose(); }
+    });
+  }
+});
+
+test("valid asynchronous authority preparation ignores ordinary keys and complete arrows without changing the saved value", async () => {
+  let release;
+  const f = fixture({ prepare: () => new Promise((resolve) => { release = resolve; }) });
+  try {
+    f.input("\x11Database\tDISPOSABLE_VALIDATION_VALUE\r");
+    f.input("IGNORED\x1b[A\x1b[B\r\r");
+    release(id("6")); await until(() => f.overlay.state === "SUCCESS");
+    assert.equal(f.calls.create.length, 1); assert.equal(f.calls.read.length, 1);
+    assert.equal(f.calls.create[0].secret, "DISPOSABLE_VALIDATION_VALUE");
+    assert.deepEqual(f.remote, []);
+  } finally { f.overlay.dispose(); }
 });
 test("lost response after commit is UNKNOWN and same operation GET eventually commits, never a second POST", async () => {
   let saved; let reads = 0;
